@@ -167,8 +167,9 @@ Fedora 使用 systemd 管理，Mac 使用 launchd；服务管理器运行前台�
 **后台任务（`task`）不是第七个工具，是一条编排操作（2026-10-16 定并落地）。** 模型把一件自包含的事交给一个**独立的任务会话**去跑，自己不等：
 
 ```text
-task(prompt, title, task_id?, model?, effort?, contract?)
+task(prompt, title, task_id?, model?, effort?, contract?, context?)
   无 task_id → 新开任务会话（kind = task，同一个 Agent），回"已派出 #2a9c：标题"，这一轮照常往下
+               context = "fork" 时任务带着这段对话起步（见下）
   有 task_id → prompt 提交进那个已有的任务会话，它带着自己的历史接着做
   只有 task_id → 查进度：回那个任务最近一条 Run 的快照（状态、已跑多久、正在执行的调用与输出尾部），不提交任何输入
   任务的 Run 进终态 → 结果作为一条内部输入交回派它的会话（请求键 task-result:{run}，只交回一次）
@@ -179,7 +180,7 @@ task(prompt, title, task_id?, model?, effort?, contract?)
 - **`contract`**：结构化结果的契约（JSON Schema，校验器认得的子集，与旧 `delegate` 的 `output_schema` 同一形状）。它冻结进任务 Run 的快照（`RunSnapshot.contract`），装配时补在那条 Run 的任务后面（系统提示不变）；交回之前用**同一份校验器**（`executor::check_contract`）复验任务的最后回复，复验结论写进交回的那条输入。
 - **查进度（2026-10-19）**：只给 `task_id`、不给 `prompt` 是只读查询，计划是 `Operation::TaskStatus`、`SafeReread`（中断后可直接重查），不建会话、不受理 Run。快照取自任务会话的 JSONL（`fold::progress_of`，最近一条 Run：状态、已跑多久、轮数与调用数、上次活动、正在执行的调用与参数摘要、等什么、终态的结论），渲染成一段中文（`TaskProgress::render`）；正在执行的调用再带 stdout 尾部（至多读末尾 2 KiB、留最后 8 个非空行），读 `tool-output/<run>/<call>/<attempt>/stdout.txt.partial`（已发布就读 `stdout.txt`，stdout 为空退到 stderr），读不到不是错误。起因：会话 01a151ec（2026-10-19）里用户两次问"为什么要这么久"，没人说得出任务在做什么。主动报进度（任务自己隔一阵说一句）没做，见 `docs/background-tasks.md` §7。
 - **追问是插话（2026-10-23，§6）**：有 `task_id` 且没有 `contract` 的追问以插话受理，任务正忙时在它下一步之前并进它正在跑的那条 Run，结果由宿主那一次交回；带 `contract` 的追问照旧排在后面（并入会沿用宿主的契约，新契约会丢）。
-- **`context: "fork"`（2026-10-23 定，未实现）**：新开任务时可以带着父会话此刻的对话起步，而不是只拿 `prompt`。派出时把父 Run 下一次请求的系统提示与消息序列按值冻结进任务会话目录；fork 沿用父 Run 的能力面（含 `task`，调用由 `prepare` 拒——下面"能力面"那条唯一的例外）、模型与 effort，首请求以父的上一次请求为逐字节前缀，复用父的提示缓存。设计见 `docs/background-tasks.md` §2b。
+- **`context: "fork"`（2026-10-23 定并落地）**：新开任务时可以带着父会话此刻的对话起步，而不是只拿 `prompt`。派出时把父 Run 下一次请求的系统提示与消息序列按值冻结进任务会话目录；fork 沿用父 Run 的能力面（含 `task`，派出那一步拒——下面"能力面"那条唯一的例外）、模型与 effort，首请求以父的上一次请求为逐字节前缀，复用父的提示缓存。见 `docs/background-tasks.md` §2b。
 - **Cron 触发的 Run 不能派任务**：交回 Cron 会话的那条结果没有对端也没有看客，回复投不到任何人。`prepare` 拒绝，理由让它自己把事做完。
 - **同一轮派几个就是几个在并行**，各自交回；宿主还在跑时并入（§6 插话），否则各开一条 Run。"派几个、等齐了汇总"因此不在同一轮里完成。
 - 交回、重启补挂看客、"需要你判断"的投递见 `docs/background-tasks.md`。
@@ -194,7 +195,7 @@ task(prompt, title, task_id?, model?, effort?, contract?)
 
 工具执行的公共能力放在 ToolExecutor：参数校验、执行计划生成、执行状态保存、取消和输出限制。
 
-**每次运行有它自己的能力面（`AgentSurface`）。** 这次允许调用哪些工具是一个显式的集合：**交给模型的工具 schema 与执行时查找的表出自同一份能力面**，所以两边不可能分家。schema 是能力面的投影：`exposure = "codemode"` 的 MCP 工具在能力面里、不进 schema（只在 codemode 脚本里调，`docs/mcp.md` §3）——隐藏 schema 不等于撤权。能力面里没有的名字，执行器不认——模型自己拼出这个名字，拿到的是"这次运行的工具集里没有它"，而不是"进去试试看"。执行器手里那份全局工具目录只用于**发现与构造**（`komo skills` 的 `requires_tools` 门控也问它），**执行时一次都不回退到它**：能回退就等于能力边界只是一句建议。任务会话是这条边界的使用者之一（它的 schema 里没有 `task`，于是它也调不动 `task`；2026-10-16 之前是子代理的能力面里没有 `delegate`）。**唯一的例外是 fork 任务会话**（2026-10-23 定，未实现，`docs/background-tasks.md` §2b）：为了与父的请求逐字节同前缀、复用提示缓存，它的能力面照抄父 Run 的、含 `task`，派任务由 `task` 的 `prepare` 拒——拒绝仍在能力面给出的那一层之内，执行器照旧不回退到全局目录。
+**每次运行有它自己的能力面（`AgentSurface`）。** 这次允许调用哪些工具是一个显式的集合：**交给模型的工具 schema 与执行时查找的表出自同一份能力面**，所以两边不可能分家。schema 是能力面的投影：`exposure = "codemode"` 的 MCP 工具在能力面里、不进 schema（只在 codemode 脚本里调，`docs/mcp.md` §3）——隐藏 schema 不等于撤权。能力面里没有的名字，执行器不认——模型自己拼出这个名字，拿到的是"这次运行的工具集里没有它"，而不是"进去试试看"。执行器手里那份全局工具目录只用于**发现与构造**（`komo skills` 的 `requires_tools` 门控也问它），**执行时一次都不回退到它**：能回退就等于能力边界只是一句建议。任务会话是这条边界的使用者之一（它的 schema 里没有 `task`，于是它也调不动 `task`；2026-10-16 之前是子代理的能力面里没有 `delegate`）。**唯一的例外是 fork 任务会话**（2026-10-23，`docs/background-tasks.md` §2b）：为了与父的请求逐字节同前缀、复用提示缓存，它的能力面照抄父 Run 的、含 `task`，派任务在派出那一步被拒（`GatewayTaskSpawner::parent_of`），调用照常落一条失败结果——schema 与执行仍出自同一份能力面，执行器照旧不回退到全局目录。
 
 工具**能不能**调用由能力面决定；一次**具体调用**能不能做由工具自己的 `prepare` 决定（参数、版本、目标；§7 那条硬限制也在这里）。没有第三层：能力面给了、`prepare` 过了，就执行（§7）。
 

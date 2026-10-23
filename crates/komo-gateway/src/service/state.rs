@@ -1254,6 +1254,38 @@ impl GatewayState {
             projection: Some(config.execution.projection()),
             direct_command: None,
             contract: None,
+            fork: None,
+        })
+    }
+
+    /// fork 任务会话里之后受理的 Run（追问）沿用 fork 那条 Run 的身份（`docs/background-tasks.md`
+    /// §2b）：它的每一段都以父会话冻结的前缀开头，能力面、工作目录、投影换了，前缀后面接的
+    /// 就不是同一副面孔。模型照这次解析的（追问可以换模型，只是缓存不中）。
+    async fn inherit_fork(
+        &self,
+        session: &SessionId,
+        record: Option<&komo_store::repos::session::SessionRecord>,
+        frozen: RunSnapshot,
+    ) -> Result<RunSnapshot, GatewayError> {
+        if !record.is_some_and(|record| record.kind == komo_store::models::SessionKind::Task) {
+            return Ok(frozen);
+        }
+        let events = super::compaction::read_events(self.routed.as_ref(), session).await?;
+        let base = events.iter().find_map(|event| match &event.payload {
+            komo_kernel::events::EventPayload::RunAccepted(body) => body
+                .snapshot
+                .as_deref()
+                .filter(|snapshot| snapshot.fork.is_some())
+                .cloned(),
+            _ => None,
+        });
+        Ok(match base {
+            Some(base) => RunSnapshot {
+                model: frozen.model,
+                fork: None,
+                ..base
+            },
+            None => frozen,
         })
     }
 
@@ -1299,8 +1331,18 @@ impl GatewayState {
         peer: Option<ChannelPeer>,
         model: Option<ModelConfig>,
     ) -> Result<SubmitRunResponse, GatewayError> {
-        self.accept(session, request_key, text, peer, model, None, None, false)
-            .await
+        self.accept(
+            session,
+            request_key,
+            text,
+            peer,
+            model,
+            None,
+            None,
+            false,
+            None,
+        )
+        .await
     }
 
     /// 同 [`Self::submit`]，再带上 `task` 的结果契约（冻结进这条 Run 的快照，§4），以及
@@ -1325,6 +1367,32 @@ impl GatewayState {
             None,
             contract,
             interject,
+            None,
+        )
+        .await
+    }
+
+    /// fork 任务的第一条输入（`docs/background-tasks.md` §2b）：身份不现场冻结，用派它的
+    /// Run 那一份（[`super::tasks`] 已经按 fork 改好）。不插话——任务会话刚建，没有宿主。
+    pub async fn submit_fork(
+        self: &Arc<Self>,
+        session: &SessionId,
+        request_key: RequestKey,
+        text: String,
+        peer: Option<ChannelPeer>,
+        snapshot: RunSnapshot,
+        contract: Option<DelegateContract>,
+    ) -> Result<SubmitRunResponse, GatewayError> {
+        self.accept(
+            session,
+            request_key,
+            text,
+            peer,
+            Some(snapshot.model.clone()),
+            None,
+            contract,
+            false,
+            Some(snapshot),
         )
         .await
     }
@@ -1341,8 +1409,18 @@ impl GatewayState {
         peer: Option<ChannelPeer>,
         model: Option<ModelConfig>,
     ) -> Result<SubmitRunResponse, GatewayError> {
-        self.accept(session, request_key, text, peer, model, None, None, true)
-            .await
+        self.accept(
+            session,
+            request_key,
+            text,
+            peer,
+            model,
+            None,
+            None,
+            true,
+            None,
+        )
+        .await
     }
 
     /// TUI 的 `!`：受理一条**不经模型**直接跑的 shell 命令。
@@ -1375,6 +1453,7 @@ impl GatewayState {
             Some(command),
             None,
             false,
+            None,
         )
         .await
     }
@@ -1390,6 +1469,7 @@ impl GatewayState {
         direct_command: Option<String>,
         contract: Option<DelegateContract>,
         interject: bool,
+        prebuilt: Option<RunSnapshot>,
     ) -> Result<SubmitRunResponse, GatewayError> {
         if let Some(state) = self.input_refusal(session).await? {
             return Err(GatewayError::InvalidRequest(format!(
@@ -1410,9 +1490,15 @@ impl GatewayState {
                 .map(|record| record.agent_id.clone())
                 .unwrap_or_default(),
         );
-        let mut frozen = self
-            .freeze_run(&config, &agent_id, session, record.as_ref(), model)
-            .await?;
+        let mut frozen = match prebuilt {
+            Some(snapshot) => snapshot,
+            None => {
+                let frozen = self
+                    .freeze_run(&config, &agent_id, session, record.as_ref(), model)
+                    .await?;
+                self.inherit_fork(session, record.as_ref(), frozen).await?
+            }
+        };
         // 这条 Run 的窗口若还没探到（或上次失败），顺手补一次后台探测，不等它。
         self.spawn_window_probes();
         let skip_memory = direct_command.is_some();

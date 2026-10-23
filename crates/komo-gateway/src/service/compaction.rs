@@ -53,6 +53,8 @@ pub(crate) struct ContextTemplate {
     pub skills: Option<String>,
     pub invocation: InvocationContext,
     pub projection: ProjectionContext,
+    /// fork 任务会话冻结的前缀（`docs/background-tasks.md` §2b）。
+    pub fork: Option<Arc<komo_kernel::types::turn::ForkPrefix>>,
 }
 
 impl ContextTemplate {
@@ -75,6 +77,7 @@ impl ContextTemplate {
             skills: self.skills,
             invocation: self.invocation,
             projection: self.projection,
+            fork: self.fork,
         })
     }
 }

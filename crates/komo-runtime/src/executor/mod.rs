@@ -937,7 +937,7 @@ impl ToolExecutor {
         env: &CallEnv,
         plan: &ExecutionPlan,
     ) -> Result<Option<Begin>, ExecError> {
-        match self.orchestration(&plan.operation, env) {
+        match self.orchestration(&plan.operation, &request.call, env) {
             Ok(None) => Ok(None),
             Ok(Some(kind)) => self
                 .begin_orchestration(request, env, plan.clone(), kind)
@@ -954,6 +954,7 @@ impl ToolExecutor {
     fn orchestration(
         &self,
         operation: &Operation,
+        call: &ToolCallId,
         env: &CallEnv,
     ) -> Result<Option<Orchestration>, String> {
         let spawner = || {
@@ -990,6 +991,7 @@ impl ToolExecutor {
                 model,
                 effort,
                 contract,
+                fork,
             } => {
                 let options = TaskOptions {
                     model: model.clone(),
@@ -1004,6 +1006,7 @@ impl ToolExecutor {
                             task: prompt.clone(),
                             title: title.clone().unwrap_or_default(),
                             options,
+                            fork: fork.then(|| call.clone()),
                         },
                     },
                     Some(task_id) => Orchestration::Follow {
@@ -1023,6 +1026,7 @@ impl ToolExecutor {
                     task: task.clone(),
                     title: title.clone(),
                     options: TaskOptions::default(),
+                    fork: None,
                 },
             },
             Operation::Follow { task_id, text } => Orchestration::Follow {

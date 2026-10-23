@@ -874,6 +874,7 @@ mod tests {
             tools: vec![],
             memories: vec![],
             covers: None,
+            cache_session: None,
         }
     }
 
@@ -1946,6 +1947,7 @@ mod live {
             }],
             memories: vec![],
             covers: None,
+            cache_session: None,
         };
 
         let mut driver = llm.begin_turn(request).await.expect("这一路要通");

@@ -357,6 +357,7 @@ impl MemoryManager {
             tools: vec![],
             memories: vec![],
             covers: None,
+            cache_session: None,
         };
         let mut driver = llm.begin_turn(request).await?;
         let round = crate::telemetry::turn(

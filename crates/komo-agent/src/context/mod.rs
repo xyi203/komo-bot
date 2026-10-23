@@ -14,13 +14,14 @@ mod prompt;
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use komo_kernel::projection::ProjectionContext;
 use komo_kernel::types::agent::ProjectFile;
 use komo_kernel::types::delegate::{DelegateContract, DelegateSpec};
 use komo_kernel::types::ids::ToolCallId;
 use komo_kernel::types::tool::ToolNamespace;
-use komo_kernel::types::turn::{ReplayMessage, Role};
+use komo_kernel::types::turn::{ForkPrefix, ReplayMessage, Role};
 
 pub use history::{
     COMPACTION_PREFIX, DecayCandidate, Entry, EntryKind, ReplayScope, ResolvedMessage,
@@ -68,6 +69,9 @@ pub struct ContextInput<'s> {
     pub projection: ProjectionContext,
     /// 这条 Run 已经决定换成短视图的结果（`RunView.decayed`）：回放只按它选视图。
     pub decayed: BTreeSet<ToolCallId>,
+    /// fork 任务会话冻结的前缀（`docs/background-tasks.md` §2b）。有它时系统提示就是它那份，
+    /// 回放以它的消息开头——上面那些拼系统提示的事实只用来挑 RULES 之外的东西（这时用不到）。
+    pub fork: Option<Arc<ForkPrefix>>,
 }
 
 /// 这一段是主 Agent 的对话，还是一次委派（`docs/agent.md` §11）。
@@ -100,6 +104,21 @@ pub struct AgentContext {
 /// Contract（仅子代理）→ Memory（最后，`\n\n` + 正文）。`task` 的结果契约不进系统提示，
 /// 补在这条 Run 的任务后面。
 pub fn assemble(input: ContextInput<'_>) -> AgentContext {
+    let fork = input.fork.clone();
+    let mut context = assemble_own(input);
+    if let Some(fork) = fork {
+        // 父会话的系统提示与消息原样在前：首请求与父的上一次请求逐字节同前缀，提示缓存命中。
+        // 前缀在这条 Run 之前，压缩只在 `run_from` 之后切，碰不到它。
+        context.system_prompt = fork.system_prompt.clone();
+        let mut messages = fork.messages.clone();
+        context.run_from += messages.len();
+        messages.append(&mut context.messages);
+        context.messages = messages;
+    }
+    context
+}
+
+fn assemble_own(input: ContextInput<'_>) -> AgentContext {
     let mut prompt = prompt::build(
         &input.workspace,
         &input.tools,

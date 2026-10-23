@@ -120,6 +120,7 @@ async fn render(case: &Case) -> String {
             model_result_bytes: case.model_result_bytes,
             decay: None,
         },
+        fork: None,
     });
     let prompt = context.system_prompt;
 

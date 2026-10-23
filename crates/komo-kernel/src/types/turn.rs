@@ -143,6 +143,18 @@ pub struct TurnRequest {
     /// 本次请求覆盖的事件范围，写进检查点（§8.3）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub covers: Option<SeqRange>,
+    /// 提示缓存按哪个会话的键路由（Responses 的 `prompt_cache_key`）。`None` = 按
+    /// `session`；fork 任务给派它的会话，前缀与父的请求相同才命中同一份缓存。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_session: Option<SessionId>,
+}
+
+/// fork 任务冻结的前缀（`docs/background-tasks.md` §2b）：派它的那一刻，父会话下一次请求
+/// 的系统提示与消息序列，切口处没有结果的调用已经补上结果。fork 会话每一段都以它开头。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForkPrefix {
+    pub system_prompt: String,
+    pub messages: Vec<ReplayMessage>,
 }
 
 /// 交给模型回放的一条消息。

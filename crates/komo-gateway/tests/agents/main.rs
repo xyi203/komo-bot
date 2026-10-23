@@ -554,11 +554,27 @@ fn last_user_text(req: &TurnRequest) -> String {
         .unwrap_or_default()
 }
 
+/// 最后一条用户消息之后已经有工具结果了（这一段是接着上一段跑的）。
+fn answered_since_last_user(req: &TurnRequest) -> bool {
+    use komo_kernel::types::turn::Role;
+    req.messages
+        .iter()
+        .rev()
+        .take_while(|message| message.role != Role::User)
+        .any(|message| message.role == Role::Tool)
+}
+
 #[async_trait::async_trait]
 impl LlmClient for TasksLlm {
     async fn begin_turn(&self, req: TurnRequest) -> Result<Box<dyn TurnDriver>, LlmError> {
         self.requests.lock().expect("请求").push(req.clone());
         let input = last_user_text(&req);
+        // fork 任务的输入开头是那段说明（`FORK_NOTICE`），要它做的事在最后一行。
+        let input = if input.starts_with("（以上是派你的那个会话") {
+            input.lines().last().unwrap_or_default().to_string()
+        } else {
+            input
+        };
         let script = if input.starts_with("[后台任务") {
             let result = input.lines().nth(2).unwrap_or_default();
             Script::Reply(format!("转告：{result}"))
@@ -650,6 +666,26 @@ impl LlmClient for TasksLlm {
                 "进度呢 zzzz" => {
                     Script::Calls(vec![("task", serde_json::json!({ "task_id": "zzzz" }))])
                 }
+                "先看一眼" => Script::Reply("看完了：B1 在 Drop.php 的 invokeDrop。".into()),
+                "派个 fork 去修" => Script::Calls(vec![(
+                    "task",
+                    serde_json::json!({ "prompt": "修 B1", "title": "修 B1", "context": "fork" }),
+                )]),
+                "修 B1" => Script::Reply("B1 修好了。".into()),
+                "派个会停的 fork" => Script::Calls(vec![(
+                    "task",
+                    serde_json::json!({ "prompt": "fork 里等人", "title": "等人", "context": "fork" }),
+                )]),
+                // 重启后接着跑的那一段已经带着 `unsure` 的结果：这回直接答。
+                "fork 里等人" if answered_since_last_user(&req) => {
+                    Script::Reply("等到了。".into())
+                }
+                "fork 里等人" => Script::Calls(vec![("unsure", serde_json::json!({}))]),
+                "B1 测了吗" => Script::Reply("测过了。".into()),
+                "fork 里再派" => Script::Calls(vec![(
+                    "task",
+                    serde_json::json!({ "prompt": "里面那层", "title": "里层" }),
+                )]),
                 "再派一层" => Script::Calls(vec![(
                     "task",
                     serde_json::json!({ "prompt": "里面那层", "title": "里层" }),
@@ -1171,6 +1207,216 @@ async fn a_task_session_cannot_spawn_another_task() {
             .all(|call| call.state == komo_kernel::types::status::ToolCallState::Failed),
         "{detail:?}"
     );
+
+    gateway.stop().await;
+}
+
+/// `context: "fork"`（`docs/background-tasks.md` §2b）：任务带着 home 此刻的对话起步——
+/// 首请求的系统提示、工具定义与 home 上一次请求相同，消息以 home 上一次请求的消息为前缀，
+/// 之后才是派它的那次调用、补的结果与任务；缓存按 home 路由；模型沿用 home 的。fork 里的
+/// 追问照样带着前缀，即使 home 的目录已经不在；fork 里不能再派任务。
+#[tokio::test]
+async fn a_fork_starts_from_the_parents_conversation_and_shares_its_prefix() {
+    let home = Home::with_config(&tasks_config());
+    let llm = TasksLlm::new();
+    let sender = MemSender::new(ChannelPlatform::Telegram);
+    let gateway = home
+        .start_with(Arc::clone(&llm) as Arc<dyn LlmClient>, Arc::clone(&sender))
+        .await;
+
+    let (home_session, first) = dm(&gateway, "先看一眼", "dm-1").await;
+    gateway.wait_terminal(&first).await;
+    let (_, forking) = dm(&gateway, "派个 fork 去修", "dm-2").await;
+    gateway.wait_terminal(&forking).await;
+
+    let task = komo_store::repos::session::list(&gateway.state().db, false)
+        .await
+        .expect("读会话列表")
+        .into_iter()
+        .find(|record| record.kind == komo_store::models::SessionKind::Task)
+        .expect("派出了一个 fork");
+    let task_run = runs_of(&gateway, &task.session).await[0].run.clone();
+    let done = gateway.wait_terminal(&task_run).await;
+    assert_eq!(done.summary.state, RunState::Completed, "{done:?}");
+
+    let requests = llm.requests.lock().expect("请求").clone();
+    let parent = requests
+        .iter()
+        .find(|request| {
+            request.session == home_session && last_user_text(request) == "派个 fork 去修"
+        })
+        .cloned()
+        .expect("home 派任务的那次请求");
+    let fork = requests
+        .iter()
+        .find(|request| request.session == task.session)
+        .cloned()
+        .expect("fork 发过请求");
+
+    // ① 同一个前缀：系统提示、工具定义逐字相同，消息以 home 上一次请求的消息开头。
+    assert_eq!(fork.system_prompt, parent.system_prompt);
+    assert_eq!(fork.tools, parent.tools, "fork 的工具定义与父相同，含 task");
+    assert!(
+        fork.tools
+            .iter()
+            .any(|tool| tool.name == komo_agent::TASK_TOOL)
+    );
+    let n = parent.messages.len();
+    assert_eq!(fork.messages[..n], parent.messages[..]);
+    use komo_kernel::types::turn::Role;
+    let call = &fork.messages[n];
+    assert_eq!(call.role, Role::Assistant);
+    assert_eq!(call.tool_calls[0].name, "task");
+    let closed = &fork.messages[n + 1];
+    assert_eq!(closed.role, Role::Tool);
+    assert_eq!(closed.tool_results[0].call_id, call.tool_calls[0].call_id);
+    assert!(
+        closed.tool_results[0].content.contains("派出的就是你"),
+        "{closed:?}"
+    );
+    let own = fork.messages[n + 2].text.clone().unwrap_or_default();
+    assert!(own.starts_with("（以上是派你的那个会话"), "{own}");
+    assert!(own.ends_with("\n\n修 B1"), "{own}");
+    assert_eq!(
+        fork.cache_session.as_ref(),
+        Some(&home_session),
+        "缓存按父会话路由"
+    );
+    assert_eq!(fork.model.model, parent.model.model, "fork 沿用父的模型");
+
+    // 结果照常经 home 转告。
+    let report = wait_report(&gateway, &home_session, &task_run).await;
+    gateway.wait_terminal(&report).await;
+    eventually("home 转告了 fork 的结果", || {
+        texts_to(&sender, "111")
+            .iter()
+            .any(|text| text == "转告：B1 修好了。")
+    })
+    .await;
+
+    // ② fork 里看得见 task，但派不出去：调用落一条失败结果，没有新的任务会话。
+    let inner = gateway
+        .submit(&task.session, "inner-1", "fork 里再派")
+        .await
+        .run;
+    let detail = gateway.wait_terminal(&inner).await;
+    assert!(
+        detail
+            .calls
+            .iter()
+            .all(|call| call.state == komo_kernel::types::status::ToolCallState::Failed),
+        "{detail:?}"
+    );
+    let tasks = komo_store::repos::session::list(&gateway.state().db, false)
+        .await
+        .expect("读会话列表")
+        .into_iter()
+        .filter(|record| record.kind == komo_store::models::SessionKind::Task)
+        .count();
+    assert_eq!(tasks, 1, "fork 里没有再派出任务");
+
+    // ④ fork 只读自己的目录：把 home 的目录挪走（放在最后，挪走之后 home 自己跑不了），
+    // 追问照样带着前缀跑完。
+    let home_dir = gateway
+        .state()
+        .ledgers
+        .paths_for(&home_session)
+        .root()
+        .to_path_buf();
+    let moved = home_dir.with_extension("moved");
+    std::fs::rename(&home_dir, &moved).expect("挪走 home 的目录");
+    let follow = gateway
+        .submit(&task.session, "follow-1", "B1 测了吗")
+        .await
+        .run;
+    let followed = gateway.wait_terminal(&follow).await;
+    assert_eq!(followed.summary.state, RunState::Completed, "{followed:?}");
+    let follow_request = llm
+        .requests
+        .lock()
+        .expect("请求")
+        .iter()
+        .rev()
+        .find(|request| request.session == task.session)
+        .cloned()
+        .expect("追问发过请求");
+    assert_eq!(follow_request.system_prompt, parent.system_prompt);
+    assert_eq!(follow_request.messages[..n], parent.messages[..]);
+    assert_eq!(follow_request.tools, parent.tools, "追问沿用 fork 的能力面");
+
+    gateway.stop().await;
+}
+
+/// fork 停在一条介入上、Gateway 重启之后接着跑：恢复那一段的请求以重启前那次请求为
+/// 逐字节前缀——冻结的前缀从任务会话自己的目录读回，系统提示、工具与缓存键都不变（§2b）。
+#[tokio::test]
+async fn a_fork_resumed_after_a_restart_sends_the_same_prefix() {
+    let home = Home::with_config(&tasks_config());
+    home.install_tools(vec![Unsure::new().tool()]);
+    let llm = TasksLlm::new();
+    let sender = MemSender::new(ChannelPlatform::Telegram);
+    let gateway = home
+        .start_with(Arc::clone(&llm) as Arc<dyn LlmClient>, Arc::clone(&sender))
+        .await;
+
+    let (_, home_run) = dm(&gateway, "派个会停的 fork", "dm-1").await;
+    gateway.wait_terminal(&home_run).await;
+    let task_run = {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            if let Some(run) = gateway
+                .interventions()
+                .await
+                .into_iter()
+                .find_map(|one| one.run)
+            {
+                break run;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "fork 一直没停在介入上"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    };
+    let pending = gateway.wait_intervention(&task_run).await;
+    let task_session = komo_store::repos::runs::get(&gateway.state().db, &task_run)
+        .await
+        .expect("读得出 fork 的 Run")
+        .expect("fork 的 Run 在账本里")
+        .session;
+    gateway.stop().await;
+
+    let resumed_llm = TasksLlm::new();
+    let gateway = home
+        .start_with(
+            Arc::clone(&resumed_llm) as Arc<dyn LlmClient>,
+            Arc::clone(&sender),
+        )
+        .await;
+    gateway.answer(&pending.handle, "satisfied").await;
+    let detail = gateway.wait_terminal(&task_run).await;
+    assert_eq!(detail.summary.state, RunState::Completed, "{detail:?}");
+
+    let of_task = |llm: &TasksLlm| {
+        llm.requests
+            .lock()
+            .expect("请求")
+            .iter()
+            .find(|request| request.session == task_session)
+            .cloned()
+            .expect("fork 发过请求")
+    };
+    let before = of_task(&llm);
+    let after = of_task(&resumed_llm);
+    assert_eq!(after.system_prompt, before.system_prompt);
+    assert_eq!(after.tools, before.tools);
+    assert_eq!(after.cache_session, before.cache_session);
+    assert!(
+        after.messages.len() > before.messages.len(),
+        "恢复那一段多了调用与结果"
+    );
+    assert_eq!(after.messages[..before.messages.len()], before.messages[..]);
 
     gateway.stop().await;
 }

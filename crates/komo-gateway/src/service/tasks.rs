@@ -16,17 +16,37 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use komo_kernel::events::EventPayload;
 use komo_kernel::traits::{SpawnError, TaskSpawner};
+use komo_kernel::types::agent::{ForkOrigin, MemoryMode, RunSnapshot};
 use komo_kernel::types::chat::ChannelPeer;
 use komo_kernel::types::chat::{DeliveryTarget, Outbound};
 use komo_kernel::types::delegate::DelegateContract;
-use komo_kernel::types::ids::{RequestKey, RunId, SessionId};
+use komo_kernel::types::ids::{RequestKey, RunId, SessionId, ToolCallId};
 use komo_kernel::types::model::ModelConfig;
 use komo_kernel::types::status::RunState;
 use komo_kernel::types::task::{self, FollowOutcome, TaskHandle, TaskOptions, TaskSpec};
+use komo_kernel::types::turn::{ForkPrefix, ReplayMessage, Role, ToolResultForModel};
 use komo_store::models::SessionKind;
 use komo_store::repos::session;
 
 use super::state::GatewayState;
+
+/// fork 任务第一条 Run 的快照：父 Run 的身份照抄（能力面含 `task`、模型、档位、工作目录、
+/// 投影），系统提示由冻结的前缀给出，所以指向父会话 `payloads/` 的引用一概不带——它们在
+/// 任务会话的目录里读不到，也用不上。记忆不召回：召回的段在父的系统提示里已经有了，再按
+/// 任务会话召回一次，前缀就不是同一个了（§2b）。
+fn fork_snapshot(parent: RunSnapshot, origin: ForkOrigin) -> RunSnapshot {
+    RunSnapshot {
+        instructions_ref: None,
+        project_files_ref: None,
+        project_files_update_ref: None,
+        skills_ref: None,
+        memory_mode: MemoryMode::Off,
+        direct_command: None,
+        contract: None,
+        fork: Some(origin),
+        ..parent
+    }
+}
 
 /// 任务会话的 `origin`：`task:{parent_session}`。`task_id` 的解析与收尾时"结果交回谁"
 /// 都按它——任务属于哪个会话不需要新列。
@@ -62,6 +82,69 @@ pub struct GatewayTaskSpawner {
     state: Arc<GatewayState>,
 }
 
+/// fork 任务第一条输入的开头（`docs/background-tasks.md` §2b）：紧跟在父会话的对话与补的
+/// 结果之后。放在输入里而不是系统提示里——系统提示是父会话那份，改一个字缓存就不中。
+pub const FORK_NOTICE: &str = "（以上是派你的那个会话到此刻为止的对话。你是从那里分出来的后台任务：\
+只做下面这件事。派你的会话同时还在跑，同一个工作目录里的文件可能正在变——不要接着做它没做完的事，\
+不要改它正在改的东西，也不要再派任务。做完就停，你最后的回复会作为那次 task 调用的结果交回给它。）";
+
+/// 派出这个 fork 的那次调用在 fork 里的结果。
+const FORK_CALL_RESULT: &str = "这次调用派出的就是你（fork）。派你的会话在继续它自己的事，你最后的回复会作为这次调用的结果交回给它。";
+
+/// 同一轮里排在派出那次之后、还没执行的调用在 fork 里的结果。
+const FORK_LATER_CALL_RESULT: &str = "派你的会话在派出你之后才执行这次调用，你看不到它的结果。";
+
+/// 给父会话最后一轮里还没有结果的调用补上结果（`docs/background-tasks.md` §2b）：派出这个
+/// fork 的那次，以及同一轮里排在它后面、还没执行的那些（编排调用是屏障，排在前面的都已经
+/// 收尾）。补的结果只进 fork 的视图，不进任何账。没有它们，provider 看到一个没有输出的调用
+/// 直接 400。
+fn close_open_calls(messages: &mut Vec<ReplayMessage>, call: &ToolCallId) -> Result<(), String> {
+    let Some(turn) = messages
+        .iter()
+        .rposition(|message| message.role == Role::Assistant && !message.tool_calls.is_empty())
+    else {
+        return Err("派任务的会话最后一轮里没有调用".into());
+    };
+    let answered: Vec<&ToolCallId> = messages[turn + 1..]
+        .iter()
+        .flat_map(|message| &message.tool_results)
+        .map(|result| &result.call_id)
+        .collect();
+    let calls = &messages[turn].tool_calls;
+    if !calls.iter().any(|request| &request.call_id == call) {
+        return Err("派出这个 fork 的调用不在派任务的会话最后一轮里".into());
+    }
+    let results: Vec<ToolResultForModel> = calls
+        .iter()
+        .filter(|request| !answered.contains(&&request.call_id))
+        .map(|request| ToolResultForModel {
+            provider_call_id: request.provider_call_id.clone(),
+            call_id: request.call_id.clone(),
+            content: if &request.call_id == call {
+                FORK_CALL_RESULT
+            } else {
+                FORK_LATER_CALL_RESULT
+            }
+            .into(),
+            is_error: false,
+            images: Vec::new(),
+        })
+        .collect();
+    let seq = messages
+        .last()
+        .map(|message| message.seq)
+        .unwrap_or_default();
+    messages.push(ReplayMessage {
+        role: Role::Tool,
+        seq,
+        text: None,
+        tool_calls: Vec::new(),
+        tool_results: results,
+        provider_blocks: None,
+    });
+    Ok(())
+}
+
 impl GatewayTaskSpawner {
     pub fn new(state: Arc<GatewayState>) -> Arc<Self> {
         Arc::new(Self { state })
@@ -83,6 +166,31 @@ impl GatewayTaskSpawner {
             .ok_or_else(|| SpawnError::Failed(format!("派它的会话 {} 不在库里", run.session)))?;
         let peer = run.peer.as_deref().and_then(ChannelPeer::parse);
         Ok((caller, peer))
+    }
+
+    /// fork 的种子：父会话这条 Run 下一次请求的样子（切口处的调用已补上结果）与它冻结的身份。
+    async fn fork_seed(
+        &self,
+        parent: &SessionId,
+        from: &RunId,
+        call: &ToolCallId,
+    ) -> Result<(ForkPrefix, RunSnapshot), SpawnError> {
+        let (context, snapshot) = self
+            .state
+            .segments
+            .fork_view(parent, from)
+            .await
+            .map_err(|reason| SpawnError::Failed(format!("fork 不出来：{reason}")))?;
+        let mut messages = context.messages;
+        close_open_calls(&mut messages, call)
+            .map_err(|reason| SpawnError::Failed(format!("fork 不出来：{reason}")))?;
+        Ok((
+            ForkPrefix {
+                system_prompt: context.system_prompt,
+                messages,
+            },
+            snapshot,
+        ))
     }
 
     /// 派它的那条 Run 属于哪个会话（任务会话的 parent）、该投给哪个渠道对端。
@@ -176,6 +284,11 @@ impl TaskSpawner for GatewayTaskSpawner {
         spec: TaskSpec,
     ) -> Result<TaskHandle, SpawnError> {
         let (parent, origin_peer) = self.parent_of(from).await?;
+        // fork 的种子先取：取不到就不该留下一个空的任务会话。
+        let fork = match &spec.fork {
+            Some(call) => Some(self.fork_seed(&parent.session, from, call).await?),
+            None => None,
+        };
         let now = self.state.clock.now();
         let task_session = SessionId::new_at(now);
         let origin = task_origin(&parent.session);
@@ -187,8 +300,11 @@ impl TaskSpawner for GatewayTaskSpawner {
             .map_err(|error| {
                 SpawnError::Failed(format!("读不出派它的会话归哪个 Agent：{error}"))
             })?;
-        // 模型先解析：解析不出来就不该留下一个空的任务会话。
-        let model = self.task_model(&spec.options, None, &worker)?;
+        // 模型先解析：解析不出来就不该留下一个空的任务会话。fork 沿用父 Run 的那个。
+        let model = match &fork {
+            Some((_, snapshot)) => Some(snapshot.model.clone()),
+            None => self.task_model(&spec.options, None, &worker)?,
+        };
 
         // 会话行**写死**在受理任何输入之前：`kind = Task`、`agent_id` 与派它的会话相同；
         // 幂等——同一个 id 重放只会原样返回已有的那一行。
@@ -217,19 +333,50 @@ impl TaskSpawner for GatewayTaskSpawner {
             .await
             .map_err(|error| SpawnError::Failed(format!("标题记不上：{error}")))?;
 
-        let response = self
-            .state
-            .submit_task(
-                &task_session,
-                request_key,
-                spec.task,
-                origin_peer,
-                model,
-                spec.options.contract,
-                false,
-            )
-            .await
-            .map_err(|error| SpawnError::Failed(format!("提交第一条输入失败：{error}")))?;
+        let response = match (fork, &spec.fork) {
+            (Some((prefix, parent_snapshot)), Some(call)) => {
+                // 前缀按值存进**任务会话自己的** `payloads/`：父会话删掉之后它照样读得到（§2b）。
+                let prefix = komo_store::PayloadStore::new(
+                    self.state.routed.ledgers().paths_for(&task_session),
+                )
+                .put_json(&prefix, None)
+                .await
+                .map_err(|error| SpawnError::Failed(format!("fork 的前缀存不下来：{error}")))?;
+                let snapshot = fork_snapshot(
+                    parent_snapshot,
+                    ForkOrigin {
+                        parent_session: parent.session.clone(),
+                        parent_run: from.clone(),
+                        call: call.clone(),
+                        prefix,
+                    },
+                );
+                self.state
+                    .submit_fork(
+                        &task_session,
+                        request_key,
+                        format!("{FORK_NOTICE}\n\n{}", spec.task),
+                        origin_peer,
+                        snapshot,
+                        spec.options.contract,
+                    )
+                    .await
+            }
+            _ => {
+                self.state
+                    .submit_task(
+                        &task_session,
+                        request_key,
+                        spec.task,
+                        origin_peer,
+                        model,
+                        spec.options.contract,
+                        false,
+                    )
+                    .await
+            }
+        }
+        .map_err(|error| SpawnError::Failed(format!("提交第一条输入失败：{error}")))?;
 
         Ok(TaskHandle {
             session: response.session,
@@ -534,5 +681,55 @@ mod tests {
         let blank = dir.path().join("blank");
         std::fs::write(&blank, "\n  \n").expect("写文件");
         assert_eq!(read_tail(&blank).await, None);
+    }
+
+    /// fork 切口（`docs/background-tasks.md` §2b）：同一轮里排在派出那次前面、已经收尾的调用
+    /// 不补；派出那次补"派出的就是你"，排在它后面的补"你看不到结果"，按调用顺序。
+    #[test]
+    fn the_cut_closes_the_fork_call_and_the_ones_after_it() {
+        use komo_kernel::types::ids::{Seq, ToolCallId};
+        use komo_kernel::types::turn::{ReplayMessage, Role, ToolCallRequest, ToolResultForModel};
+
+        let call = |id: &str| ToolCallRequest {
+            call_id: ToolCallId::from_raw(id),
+            provider_call_id: format!("p-{id}"),
+            name: "x".into(),
+            arguments: serde_json::json!({}),
+            arguments_ref: None,
+        };
+        let message = |role: Role, seq: u64| ReplayMessage {
+            role,
+            seq: Seq(seq),
+            text: None,
+            tool_calls: Vec::new(),
+            tool_results: Vec::new(),
+            provider_blocks: None,
+        };
+        let mut turn = message(Role::Assistant, 2);
+        turn.tool_calls = vec![call("read"), call("fork"), call("later")];
+        let mut done = message(Role::Tool, 3);
+        done.tool_results = vec![ToolResultForModel {
+            provider_call_id: "p-read".into(),
+            call_id: ToolCallId::from_raw("read"),
+            content: "读到了".into(),
+            is_error: false,
+            images: Vec::new(),
+        }];
+        let mut messages = vec![message(Role::User, 1), turn, done];
+
+        super::close_open_calls(&mut messages, &ToolCallId::from_raw("fork")).unwrap();
+        let closed = messages.last().unwrap();
+        assert_eq!(closed.role, Role::Tool);
+        let ids: Vec<&str> = closed
+            .tool_results
+            .iter()
+            .map(|result| result.provider_call_id.as_str())
+            .collect();
+        assert_eq!(ids, ["p-fork", "p-later"]);
+        assert!(closed.tool_results[0].content.contains("派出的就是你"));
+        assert!(closed.tool_results[1].content.contains("看不到它的结果"));
+
+        let mut unrelated = vec![message(Role::User, 1)];
+        assert!(super::close_open_calls(&mut unrelated, &ToolCallId::from_raw("fork")).is_err());
     }
 }

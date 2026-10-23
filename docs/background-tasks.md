@@ -4,7 +4,7 @@
 > 与 `docs/komo_bot.md` 冲突处以本文为准。
 > 2026-10-16 定并落地：`dispatch` + `follow` 合成 `task`，同步 `delegate` 删掉、子代理并进来，
 > 加 `model` / `effort` / `contract`，交回的结果在宿主还在跑时并入（§2a；`docs/komo_bot.md` §2、§4、§6）。
-> 2026-10-23 定、未实现：`context: "fork"`，任务带着父会话的上下文起步、复用父的提示缓存（§2b）。
+> 2026-10-23 定并落地：`context: "fork"`，任务带着父会话的上下文起步、复用父的提示缓存（§2b）。
 
 ## 1. 问题
 
@@ -85,7 +85,7 @@ task(prompt, title, task_id?, model?, effort?, contract?)
   结果只由宿主那一次交回；带 `contract` 的追问照旧排队（并入会沿用宿主的契约，新契约会丢）。
 - 旧的 `dispatch` / `follow` / `delegate` 调用按落盘时的名字回放，不改写。
 
-## 2b. `context: "fork"`：带着父会话的上下文派任务（2026-10-23 定，未实现）
+## 2b. `context: "fork"`：带着父会话的上下文派任务（2026-10-23 定并落地）
 
 fresh 任务只拿到 `prompt`，父会话里聊清楚的东西要靠模型写进简报，写漏了任务就猜。fork 让任务
 从父会话**此刻**的对话接着想，并且首请求复用父会话的提示缓存——前缀与父的上一次请求逐字节
@@ -105,47 +105,69 @@ task(prompt, title, task_id?, model?, effort?, contract?, context?)   context: "
   历史）。fork 时给 `model` / `effort` 也拒：fork 沿用父 Run 的模型与 effort，换了就不是同一个
   缓存前缀。`contract` 照常，补在任务后面。
 - **按值冻结前缀，不存指针。** `GatewayTaskSpawner` 派出时按父会话这条 Run **下一次请求**的样子
-  装配一遍——走同一条装配路径，但不做新的衰减 / 压缩决定——得到系统提示正文与消息序列：截止到
-  含这次 `task` 调用的那条 assistant 消息，连同同轮排在它前面、已经收尾的调用结果（编排调用是
-  屏障，§6）。两样写进任务会话目录的 payload，任务会话 JSONL 的第一条事件记下它的引用与
-  来处（父会话、父 Run、调用号）；写入顺序照 §8.5：正文 → JSONL → db。不存"父会话 + seq 上限"
+  装配一遍（`GatewaySegments::fork_view`：父会话每装配一段，就按会话记下这一段的模板；派任务
+  只发生在这一段里，所以模板一定在，重启后续跑的那一段装配时先把它补上。拿模板与此刻的日志
+  走 `compaction::assemble_context`，与在线压缩判断时的重新装配同一条路，不做新的衰减 / 压缩
+  决定），得到系统提示正文与消息序列：截止到含这次 `task` 调用的那条 assistant 消息，连同同轮
+  排在它前面、已经收尾的调用结果（编排调用是屏障，§6）。两样（`ForkPrefix`）写进任务会话目录的
+  payload，引用与来处（父会话、父 Run、调用号）记在 fork 第一条 Run 的快照上
+  （`RunSnapshot.fork: ForkOrigin`，随 `run.accepted` 落账）；先落正文再受理，§8.5。不存"父会话 + seq 上限"
   的指针：父会话可以被删除、purge（`purge_blockers` 不看子会话），父的 payload / `output.json`
   在父的目录里，而一个会话的上下文应当从它自己的目录读得出来（§8.2）。代价是磁盘上多一份，
   上限是父的上下文大小。
-- **身份沿用父 Run。** fork 任务 Run 的快照用父 Run 的能力面（**含 `task`**）、模型、effort；任务
-  会话行的 `workdir` 写父 Run 实际用的工作目录。系统提示用冻结的正文，**这个任务会话此后每一段
-  都用它**：记忆不按任务会话重新召回，skills 与项目规范不重新冻结——换了就不是同一个前缀。工具
-  schema 照常由能力面渲染（与执行同源）；派出到首请求之间 `[model.*]` 或 MCP 工具变了，只是这一次
-  缓存不中，不影响对错。
-- **开的口子：schema 里有 `task`，调用由 `prepare` 拒。** 这是"交给模型的 schema 与执行时的能力面
-  出自同一份"（`docs/komo_bot.md` §4）唯一的例外——严格说能力面里确实有它，拒绝落在 `prepare`
-  这一层（"任务会话不能再派任务"），执行器照旧不回退到全局目录。理由：Anthropic 的请求里工具
+- **身份沿用父 Run。** fork 任务 Run 的快照照抄父 Run 的（能力面**含 `task`**、模型、effort、工作
+  目录、投影），指向父会话 `payloads/` 的那几格（身份指令、项目规范、skills 目录）一概不带——
+  系统提示由冻结的前缀给出，用不上它们，在任务会话的目录里也读不到；记忆模式写成 `off`（不召回
+  也不提取：召回的段在父的系统提示里已经有了）。**这个任务会话此后每一段都用冻结的系统提示**；
+  之后用 `task_id` 追问受理的 Run 也照抄 fork 那条 Run 的身份（`GatewayState::inherit_fork`），
+  只有模型按这次解析——追问可以换模型，只是缓存不中。工具 schema 照常由能力面渲染（与执行
+  同源）；派出到首请求之间 `[model.*]` 或 MCP 工具变了，只是这一次缓存不中，不影响对错。
+- **开的口子：schema 里有 `task`，派不出去。** 这是"任务会话的 schema 里没有 `task`"
+  （`docs/komo_bot.md` §4）唯一的例外——能力面里确实有它，schema 与执行仍同源；拒绝落在派出那一步
+  （`GatewayTaskSpawner::parent_of`："这里已经是一个后台任务了，不能再派任务"），调用照常落一条
+  失败结果，执行器不回退到全局目录。理由：Anthropic 的请求里工具
   定义在最前面，少一个工具，整段前缀缓存失效，fork 省下的就只剩"不用写简报"。fresh 任务会话照旧
   从能力面里去掉 `task`，没有缓存要保。
 - **切口处的调用补结果。** 派出这次 `task` 的调用此刻没有结果，同一条 assistant 消息里排在它
-  后面的调用还没计划。装配 fork 的请求时给它们补结果，只进 fork 的模型视图，不进任何账：
+  后面的调用还没计划。冻结前缀时给它们补结果（`tasks::close_open_calls`），只进 fork 的模型视图，
+  不进任何账：
   `task` 那次是"这次调用派出的就是你（fork）。父会话在继续它自己的事，你最后的回复会作为这次
   调用的结果交回给它"；排在后面的是"父会话在派出你之后才执行这次调用，你看不到它的结果"。
-- **角色说明在输入里，不在系统提示里。** 紧跟补的结果，作为 fork 第一条 Run 的输入开头：上面是
+- **角色说明在输入里，不在系统提示里。** 紧跟补的结果，作为 fork 第一条 Run 的输入开头
+  （`tasks::FORK_NOTICE`）：上面是
   父会话的对话，你只做下面这件事；父会话同时还在跑，同一个工作目录里的文件可能正在变，不要接着
   做父会话没做完的事，不要改父正在改的东西；做完就停，最后的回复交回父会话。然后是 `prompt`。
-- **缓存标识。** Responses 接口的 `prompt_cache_key` 用父会话的 id（记在 fork 的来处里），否则
-  键不同，前缀相同也路由不到同一份缓存；Anthropic 靠前缀命中，不需要键。
-- **往后。** fork 任务会话的回放 = 冻结前缀 → 补的结果 → 它自己的各条 Run（规则同
-  `docs/komo_bot.md` §8.3）。压缩时冻结前缀算在"早先那段"里一起收进摘要，压过之后装配成"任务 →
-  摘要 → 切点起原样"，前缀不再出现。用 `task_id` 追问 fork 任务照常。结果交回、并入、查进度与
-  fresh 任务完全相同。
-- **局限。** 前缀里的 `artifact://` 与 `tool-output/` 引用指向父会话，fork 里 `read` 不到（只读根
-  是当前会话的）。先不做；要做就把父会话的 `tool-output/` 加进 fork 的只读根。
+- **缓存标识。** Responses 接口的 `prompt_cache_key` 用父会话的 id（`TurnRequest.cache_session`，
+  取自 fork 的来处），否则键不同，前缀相同也路由不到同一份缓存；Anthropic 靠前缀命中，不需要键。
+- **往后。** fork 任务会话的回放 = 冻结前缀 → 它自己的各条 Run（规则同 `docs/komo_bot.md` §8.3），
+  `komo_agent::context::assemble` 把前缀接在最前、`run_from` 顺延。前缀与别的 Run 的转写同一个
+  地位：在线压缩只在正在跑的这条 Run 里切，碰不到它；回放边界（`conversation.boundary`）之后
+  fork 那条 Run 不在窗口里，前缀也就不在。用 `task_id` 追问 fork 任务照常。结果交回、并入、查
+  进度与 fresh 任务完全相同。
+- **局限。** ① 前缀压不掉：父会话已经贴着窗口时派 fork，fork 自己跑几轮就可能超长，而压缩只切
+  fork 自己那条 Run——工具说明因此让模型在对话很长时用 fresh。要压，就给前缀单独记一刀（存储
+  格式不用改：前缀本来就是一份消息序列）。② 前缀里的 `artifact://` 与 `tool-output/` 引用指向父
+  会话，fork 里 `read` 不到（只读根是当前会话的）；要做就把父会话的 `tool-output/` 加进 fork 的
+  只读根。③ 前缀里工具结果带的图片不随前缀冻结（`ToolResultForModel.images` 不序列化），fork 只
+  看得到文字。
 - **不做。** 用户手动分叉会话（Claude Code 的 `--fork-session` / `/branch`、pi 的 `/fork`）是另一件
   事，这里只管模型派任务。
 
-验收（未做）：① 假 provider 上 fork 首请求的系统提示、工具定义与消息序列，以父的上一次请求为
-逐字节前缀，只多出这一轮的 assistant 消息、补的结果、说明与任务；② fork 里调 `task` 被 `prepare`
-拒、账上有结果；fresh 任务的 schema 里仍没有 `task`；③ 带 `task_id`，或带 `model` / `effort` 时
-`context: "fork"` 被拒；④ 父会话 purge 之后，fork 任务的续跑与追问照常；⑤ 重启在 fork 跑到一半，
-恢复后的窗口与重启前逐字节相同；⑥ 真实 Anthropic：fork 首请求的 `cache_read_input_tokens` 接近父
-上下文的长度。
+验收（2026-10-23）：① 假 provider 上 fork 首请求的系统提示、工具定义与 home 上一次请求逐字相同，
+消息以它为前缀，之后是派它的 assistant 消息、补的结果、说明 + 任务；缓存键是 home；模型沿用 home 的
+（`tests/agents` 的 `a_fork_starts_from_the_parents_conversation_and_shares_its_prefix`）；② fork 里
+看得见 `task`、派不出去，调用落一条失败结果（同一个测试）；fresh 任务的 schema 里仍没有 `task`
+（`a_background_task_reports_back_through_home`）；③ 带 `task_id`，或带 `model` / `effort`，或 context
+不认识时被 `prepare` 拒（`tools::task::tests`）；④ 把 home 的会话目录挪走之后，fork 的追问照样带着
+前缀跑完（①那个测试的最后一步——purge 删的就是这个目录）；⑤ fork 停在介入上、重启后接着跑，那一段
+的请求以重启前那次为逐字节前缀（`a_fork_resumed_after_a_restart_sends_the_same_prefix`）；切口的
+补法见 `tasks::tests::the_cut_closes_the_fork_call_and_the_ones_after_it`，装配见 `komo-agent`
+`context::tests::a_task_contract_trails_the_task_not_the_system_prompt` 的 fork 段，Responses 缓存键见
+`llm::tests::a_fork_routes_its_cache_by_the_parent_session`。⑥ 真机（本机 magpie →
+claude-opus-5-5，Responses）：同一组 home / fork 请求依次真发，fork 首请求 4810 个输入 token 里
+4016 个读自缓存（83%）。那条路偶尔回 400 `safety filter: content_filter`，同一份请求重发就过，换哪段
+文字都会碰到，与 fork 无关。**未做**：Anthropic 原生接口上的核对（本机的 relay 不回报缓存用量）；
+komo 在真机上被模型自己选中 fork 的端到端。
 
 ## 3. 重启
 

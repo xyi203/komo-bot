@@ -182,6 +182,25 @@ pub struct RunSnapshot {
     /// 会话之前按它复验最后回复。`None` = 没有契约，或者这一格出现之前受理的 Run。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub contract: Option<crate::types::delegate::DelegateContract>,
+    /// fork 任务会话的第一条 Run（`docs/background-tasks.md` §2b）：它从哪个会话的哪次调用
+    /// 分出来、冻结的前缀在哪。同一个任务会话之后的 Run 不带它，身份照抄这一条。`None` =
+    /// 不是 fork，或者这一格出现之前受理的 Run。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fork: Option<ForkOrigin>,
+}
+
+/// fork 任务从哪里分出来（`docs/background-tasks.md` §2b）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForkOrigin {
+    /// 派它的会话。它的 id 也是 fork 请求的提示缓存键：与父会话同一个键，前缀相同的请求才
+    /// 路由到同一份缓存。
+    pub parent_session: crate::types::ids::SessionId,
+    pub parent_run: crate::types::ids::RunId,
+    /// 派它的那次 `task` 调用。
+    pub call: crate::types::ids::ToolCallId,
+    /// 冻结的前缀（[`crate::types::turn::ForkPrefix`] 的 JSON），存在**任务会话自己的**
+    /// `payloads/` 里：父会话删掉之后它照样读得到。
+    pub prefix: PayloadRef,
 }
 
 /// 一份项目规范文件（`AGENTS.md` / `CLAUDE.md`）：受理时从工作目录往上找到的，正文原样。
@@ -308,6 +327,7 @@ mod tests {
             projection: None,
             direct_command: None,
             contract: None,
+            fork: None,
         };
         let json = serde_json::to_value(&snapshot).unwrap();
         assert!(json.get("project_files_ref").is_none(), "{json}");
@@ -354,6 +374,7 @@ mod tests {
             projection: None,
             direct_command: None,
             contract: None,
+            fork: None,
         })
         .unwrap();
         assert_eq!(snapshot["memory_mode"], "private");

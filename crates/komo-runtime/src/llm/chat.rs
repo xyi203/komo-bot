@@ -544,6 +544,7 @@ mod tests {
             tools: vec![],
             memories: vec![],
             covers: None,
+            cache_session: None,
         }
     }
 

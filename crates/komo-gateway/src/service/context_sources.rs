@@ -26,7 +26,7 @@ use komo_kernel::events::{Event, EventPayload, MemoryInjected};
 use komo_kernel::fold::{Surface, SurfaceMessage};
 use komo_kernel::projection::ProjectionContext;
 use komo_kernel::traits::{Ledger, LedgerError, ToolOutputStore};
-use komo_kernel::types::agent::{MemoryMode, ProjectFile, RunSnapshot};
+use komo_kernel::types::agent::{ForkOrigin, MemoryMode, ProjectFile, RunSnapshot};
 use komo_kernel::types::delegate::DelegateContract;
 use komo_kernel::types::ids::RunId;
 use komo_kernel::types::memory::{Injection, MemoryScope};
@@ -34,6 +34,7 @@ use komo_kernel::types::model::ModelConfig;
 use komo_kernel::types::surface::AgentSurface;
 use komo_kernel::types::tool::ToolDefinition;
 use komo_kernel::types::tool::ToolImage;
+use komo_kernel::types::turn::ForkPrefix;
 use komo_runtime::config::ConfigHolder;
 use komo_runtime::memory::MemoryManager;
 use komo_runtime::tools::paths;
@@ -229,11 +230,46 @@ fn ambient_identity(fallback: Fallback<'_>, catalog: &[ToolDefinition]) -> Ident
 ///
 /// 它落在**事件**里（`run.accepted`），所以重启之后读得到——这正是"恢复时按它装配"
 /// 那句话的落点。
-fn frozen_snapshot(events: &[Event], run: &RunId) -> Option<Box<RunSnapshot>> {
+pub(crate) fn frozen_snapshot(events: &[Event], run: &RunId) -> Option<Box<RunSnapshot>> {
     events.iter().find_map(|event| match &event.payload {
         EventPayload::RunAccepted(body) if event.run.as_ref() == Some(run) => body.snapshot.clone(),
         _ => None,
     })
+}
+
+/// fork 任务会话（`docs/background-tasks.md` §2b）的来处与冻结前缀：回放窗口里第一条
+/// 快照带 `fork` 的 Run 的那一份。`None` = 不是 fork，或者 fork 那条 Run 已在边界之前。
+///
+/// 前缀读不出来 = 会话缺内容（§8.3）：由调用方停下来报告，不能当成"没有前缀"把一个只有
+/// 任务正文的请求发出去——那会让 fork 答一个它看不见上下文的问题。
+pub(crate) async fn fork_prefix(
+    events: &[Event],
+    surface: &Surface,
+    payloads: &PayloadStore,
+) -> Result<Option<(ForkOrigin, ForkPrefix)>, LedgerError> {
+    let in_window = |run: &RunId| {
+        surface
+            .replay()
+            .iter()
+            .any(|message| message.run.as_ref() == Some(run))
+    };
+    let origin = events
+        .iter()
+        .find_map(|event| match (&event.payload, &event.run) {
+            (EventPayload::RunAccepted(body), Some(run)) if in_window(run) => body
+                .snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.fork.clone()),
+            _ => None,
+        });
+    let Some(origin) = origin else {
+        return Ok(None);
+    };
+    let prefix: ForkPrefix = payloads
+        .open_json(&origin.prefix)
+        .await
+        .map_err(store_to_ledger)?;
+    Ok(Some((origin, prefix)))
 }
 
 /// 派这一条 Run 的那条 Run（§4；普通 Run 是 `None`）。
@@ -588,6 +624,7 @@ mod tests {
                 model_result_bytes: 8 * 1024,
                 decay: None,
             },
+            fork: None,
         }))
     }
 

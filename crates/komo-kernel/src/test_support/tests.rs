@@ -252,6 +252,7 @@ fn the_scripted_driver_hands_back_the_rounds_in_order() {
                 tools: vec![],
                 memories: vec![],
                 covers: None,
+                cache_session: None,
             })
             .await
             .unwrap();

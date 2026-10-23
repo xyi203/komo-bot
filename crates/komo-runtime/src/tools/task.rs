@@ -18,6 +18,9 @@
 //! `model` / `effort` 在这里按**当前配置快照**校验（§13.3），可选的 alias 以 enum 写进
 //! schema；只给 `effort` 不给 `model` 时，所选模型（Agent 的默认，或那个任务上一条 Run 的）
 //! 只有执行侧知道，档位在那边校验。
+//!
+//! `context: "fork"`（`docs/background-tasks.md` §2b）只在新派时成立，且不能同时指定
+//! `model` / `effort`：fork 沿用派它的 Run 的模型与档位，换了就不是同一个缓存前缀。
 
 use std::sync::Arc;
 
@@ -52,6 +55,10 @@ pub struct TaskArgs {
     /// 结果契约：一份 JSON Schema（kernel 认得的那个子集）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub contract: Option<serde_json::Value>,
+    /// `"fresh"`（默认）或 `"fork"`：新任务只拿 prompt，还是带着这段对话起步
+    /// （`docs/background-tasks.md` §2b）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<String>,
 }
 
 pub struct TaskTool {
@@ -120,8 +127,8 @@ impl Tool for TaskTool {
             name: "task".into(),
             description: "派一个后台任务：建一个独立的任务会话去做要跑很久的事（长时间的排查、\
                           批量操作、要等外部设备的事），你自己不等它，这一轮照常往下。\
-                          任务会话**看不到这段对话**，所以 prompt 要自包含——把用户的原话和已知的\
-                          结论都写进去。提交成功就告诉用户\"已派出 #短号：标题\"。任务结束时，\
+                          任务会话默认**看不到这段对话**，所以 prompt 要自包含——把用户的原话和已知的\
+                          结论都写进去；要它接着这段对话想，给 context: \"fork\"。提交成功就告诉用户\"已派出 #短号：标题\"。任务结束时，\
                           结果会作为一条以 [后台任务 #短号…] 开头的消息交回给你，用户看不到\
                           那条消息，由你把结论转告用户。几秒钟能做完的事直接做，不要派。\n\
                           用户问进度时先用 task_id 查再答，别凭印象。\n\
@@ -132,8 +139,14 @@ impl Tool for TaskTool {
                 "properties": {
                     "prompt": {
                         "type": "string",
-                        "description": "交给任务会话的自包含任务；它看不到这段对话，所以别写\"见上文\"。\
+                        "description": "交给任务会话的任务。fresh 任务看不到这段对话，所以别写\"见上文\"。\
                                         只查进度时不给（只给 task_id）"
+                    },
+                    "context": {
+                        "type": "string",
+                        "enum": ["fresh", "fork"],
+                        "description": "fresh（默认）：任务只拿到 prompt。fork：任务带着这段对话起步，\
+                                        接着你此刻的上下文去做；只用于新派，不能同时给 model / effort"
                     },
                     "title": {
                         "type": "string",
@@ -167,7 +180,12 @@ impl Tool for TaskTool {
                  - 要结构化的结果就给 contract（一份 JSON Schema），任务的最后回复会按它复验，\
                  复验结论随结果一起交回。\n\
                  - 只给 task_id、不给 prompt 是查进度：返回那个任务现在在跑什么、跑了多久、\
-                 最近的输出，不打扰它；用户问进度时先查再答，别凭印象。"
+                 最近的输出，不打扰它；用户问进度时先查再答，别凭印象。\n\
+                 - context: \"fork\"：任务从这段对话此刻的样子接着想，prompt 只写要它做的那件事，\
+                 不用复述背景；它沿用你的模型，并复用你的提示缓存，起步比 fresh 便宜。要它知道的\
+                 东西已经散在对话里、写成简报容易漏的时候用 fork；对话已经很长、而任务只需要\
+                 一小块背景的时候用 fresh 并把那一块写进 prompt——fork 的每一次请求都带着整段\
+                 对话。fork 里不能再派任务。"
                     .into(),
             ),
         }
@@ -185,6 +203,27 @@ impl Tool for TaskTool {
             });
         }
         let args: TaskArgs = parse_args(args, "task")?;
+        let fork = match args.context.as_deref().map(str::trim) {
+            None | Some("fresh") => false,
+            Some("fork") => true,
+            Some(other) => {
+                return Err(ToolError::InvalidArguments {
+                    message: format!("context 只能是 fresh 或 fork，不是 `{other}`"),
+                });
+            }
+        };
+        if args.context.is_some() && args.task_id.is_some() {
+            return Err(ToolError::InvalidArguments {
+                message: "context 只用于新派：已有的任务会话带着它自己的历史接着做".into(),
+            });
+        }
+        if fork && (args.model.is_some() || args.effort.is_some()) {
+            return Err(ToolError::InvalidArguments {
+                message: "fork 沿用你的模型与档位（换了就复用不了你的提示缓存）：去掉 model / \
+                          effort，或者改用 fresh"
+                    .into(),
+            });
+        }
         let status_query = args.prompt.trim().is_empty() && args.task_id.is_some();
         if args.prompt.trim().is_empty() && !status_query {
             return Err(ToolError::InvalidArguments {
@@ -275,6 +314,7 @@ impl Tool for TaskTool {
                 model,
                 effort: args.effort.clone(),
                 contract,
+                fork,
             },
             run: Some(ctx.run.clone()),
             tool_call: Some(ctx.call.clone()),
@@ -338,6 +378,7 @@ mod tests {
             model,
             effort,
             contract,
+            fork,
         } = &plan.operation
         else {
             panic!("{:?}", plan.operation)
@@ -351,8 +392,69 @@ mod tests {
             contract.as_ref().unwrap().schema["required"],
             serde_json::json!(["on"])
         );
+        assert!(!fork, "没给 context 就是 fresh");
         assert!(plan.targets.is_empty());
         assert_eq!(plan.recovery, RecoveryMode::VerifyTarget);
+        assert!(
+            plan.args.get("context").is_none(),
+            "不给 context 时参数与旧计划逐字相同：{}",
+            plan.args
+        );
+    }
+
+    #[tokio::test]
+    async fn a_fork_is_a_new_task_that_carries_the_conversation() {
+        let fixture = Fixture::valid();
+        let dir = tempfile::tempdir().unwrap();
+        let plan = tool(&fixture)
+            .prepare(
+                serde_json::json!({ "prompt": "修 B1", "title": "修 B1", "context": "fork" }),
+                &context(dir.path()),
+            )
+            .await
+            .unwrap();
+        let Operation::Task { fork, task_id, .. } = &plan.operation else {
+            panic!("{:?}", plan.operation)
+        };
+        assert!(*fork);
+        assert!(task_id.is_none());
+
+        let fresh = tool(&fixture)
+            .prepare(
+                serde_json::json!({ "prompt": "修 B1", "title": "修 B1", "context": "fresh" }),
+                &context(dir.path()),
+            )
+            .await
+            .unwrap();
+        let Operation::Task { fork, .. } = &fresh.operation else {
+            panic!("{:?}", fresh.operation)
+        };
+        assert!(!fork);
+    }
+
+    /// fork 只用于新派，且沿用派它的 Run 的模型与档位。
+    #[tokio::test]
+    async fn a_fork_with_a_task_id_a_model_or_an_effort_is_refused() {
+        let fixture = Fixture::valid();
+        let dir = tempfile::tempdir().unwrap();
+        let tool = tool(&fixture);
+        for args in [
+            serde_json::json!({ "prompt": "接着", "task_id": "3f2a", "context": "fork" }),
+            serde_json::json!({ "prompt": "接着", "task_id": "3f2a", "context": "fresh" }),
+            serde_json::json!({ "task_id": "3f2a", "context": "fork" }),
+            serde_json::json!({ "prompt": "干活", "title": "t", "context": "fork", "model": "chat" }),
+            serde_json::json!({ "prompt": "干活", "title": "t", "context": "fork", "effort": "low" }),
+            serde_json::json!({ "prompt": "干活", "title": "t", "context": "branch" }),
+        ] {
+            let error = tool
+                .prepare(args.clone(), &context(dir.path()))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(error, ToolError::InvalidArguments { .. }),
+                "{args}：{error:?}"
+            );
+        }
     }
 
     /// 接着做：短号去掉井号，标题不用给。

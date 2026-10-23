@@ -51,6 +51,7 @@ fn request(config: &ModelConfig) -> TurnRequest {
         tools: vec![],
         memories: vec![],
         covers: None,
+        cache_session: None,
     }
 }
 
@@ -104,6 +105,20 @@ async fn an_unset_effort_leaves_the_reasoning_field_out_of_the_request() {
         transport.requests()[0].url,
         "https://llm.example.com/v1/responses"
     );
+}
+
+/// fork 任务（`docs/background-tasks.md` §2b）的请求按派它的会话路由缓存：前缀与父的请求
+/// 相同，键也要相同才落到同一份缓存上。
+#[tokio::test]
+async fn a_fork_routes_its_cache_by_the_parent_session() {
+    let transport = ScriptedTransport::new(vec![one_word()]);
+    let config = model(None);
+    let llm = factory(&transport).build(&config, ModelRole::Main).unwrap();
+    let mut req = request(&config);
+    req.cache_session = Some(SessionId::from_raw("s-parent"));
+    let mut driver = llm.begin_turn(req).await.unwrap();
+    driver.next(RoundInput::First).await.unwrap();
+    assert_eq!(transport.bodies()[0]["prompt_cache_key"], json!("s-parent"));
 }
 
 #[tokio::test]

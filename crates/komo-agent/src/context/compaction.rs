@@ -160,6 +160,7 @@ pub fn summary_request(
         tools: Vec::new(),
         memories: Vec::new(),
         covers: None,
+        cache_session: None,
     }
 }
 

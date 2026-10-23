@@ -109,6 +109,10 @@ pub enum Operation {
         effort: Option<super::model::Effort>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         contract: Option<super::delegate::DelegateContract>,
+        /// `context: "fork"`：任务带着派它的会话此刻的上下文起步（`docs/background-tasks.md`
+        /// §2b）。只在新派时可能为真；为假时不写，旧计划的哈希不变。
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        fork: bool,
     },
     /// 查一个后台任务现在跑到哪了（`task` 只带 `task_id`、没有 `prompt`）：只读，不往任务会话里
     /// 提交任何东西，也不碰文件。`task_id` 是模型给的任务短号原文，解析在执行侧做，同

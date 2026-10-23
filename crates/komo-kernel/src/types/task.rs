@@ -26,6 +26,10 @@ pub struct TaskSpec {
     pub title: String,
     #[serde(default)]
     pub options: TaskOptions,
+    /// `context: "fork"` 时是派它的那次调用：任务从派它的会话此刻的上下文起步，这次调用
+    /// 在 fork 的视图里要补一个结果（`docs/background-tasks.md` §2b）。`None` = fresh。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fork: Option<ToolCallId>,
 }
 
 /// 任务那条 Run 的模型、档位与结果契约（`docs/komo_bot.md` §4）。新派与接着做共用。

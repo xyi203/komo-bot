@@ -24,6 +24,7 @@ fn input(instructions: Option<&str>, memory: Option<&str>) -> ContextInput<'stat
             decay: None,
         },
         decayed: Default::default(),
+        fork: None,
     }
 }
 
@@ -161,4 +162,46 @@ fn a_task_contract_trails_the_task_not_the_system_prompt() {
         .unwrap_or_default();
     assert!(task.starts_with("查一下空调\n\n（结果契约）"), "{task}");
     assert!(task.contains("\"required\""), "{task}");
+
+    // fork（`docs/background-tasks.md` §2b）：系统提示换成冻结的那份，回放以前缀开头，
+    // 这条 Run 的任务（连同它的契约）排在前缀之后。
+    let prefix = komo_kernel::types::turn::ForkPrefix {
+        system_prompt: "父会话的系统提示".into(),
+        messages: vec![
+            ReplayMessage {
+                role: Role::User,
+                seq: Seq(7),
+                text: Some("父会话里用户说的".into()),
+                tool_calls: Vec::new(),
+                tool_results: Vec::new(),
+                provider_blocks: None,
+            },
+            ReplayMessage {
+                role: Role::Assistant,
+                seq: Seq(8),
+                text: Some("父会话里答的".into()),
+                tool_calls: Vec::new(),
+                tool_results: Vec::new(),
+                provider_blocks: None,
+            },
+        ],
+    };
+    let forked = assemble(ContextInput {
+        history: history(),
+        contract: Some(DelegateContract {
+            schema: serde_json::json!({ "type": "object", "required": ["on"] }),
+            mode: Default::default(),
+        }),
+        fork: Some(std::sync::Arc::new(prefix.clone())),
+        ..input(Some("不该出现的指令"), Some("不该出现的记忆"))
+    });
+    assert_eq!(forked.system_prompt, "父会话的系统提示");
+    assert_eq!(forked.messages[..2], prefix.messages[..]);
+    assert_eq!(forked.run_from, 2, "压缩只在这条 Run 里切，前缀在它之前");
+    assert_eq!(
+        forked.messages[2].text.as_deref(),
+        with_contract.messages[with_contract.run_from]
+            .text
+            .as_deref()
+    );
 }

@@ -199,7 +199,8 @@ impl LlmClient for OpenAiResponsesLlm {
             transport: Arc::clone(&self.transport),
             role: self.role,
             model: req.model,
-            session: req.session,
+            // fork 任务按派它的会话路由缓存：前缀与父的请求相同，键也得相同。
+            session: req.cache_session.unwrap_or(req.session),
             tools: req.tools,
             instructions,
             input: replay(&req.messages),
@@ -303,6 +304,8 @@ struct ResponsesDriver {
     transport: Arc<dyn HttpTransport>,
     role: ModelRole,
     model: ModelConfig,
+    /// 提示缓存的路由键（`prompt_cache_key` 与 ChatGPT 的 `session_id` 头）：通常是本会话，
+    /// fork 任务是派它的会话（`TurnRequest::cache_session`）。
     session: SessionId,
     tools: Vec<ToolDefinition>,
     instructions: String,

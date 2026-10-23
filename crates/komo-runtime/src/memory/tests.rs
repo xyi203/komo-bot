@@ -451,6 +451,7 @@ fn accepted_with(mut event: Event, agent: &str, mode: MemoryMode) -> Event {
         projection: None,
         direct_command: None,
         contract: None,
+        fork: None,
     }));
     event
 }

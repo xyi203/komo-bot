@@ -26,12 +26,13 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use komo_agent::DELEGATE_TOOL;
-use komo_agent::context::InvocationContext;
 use komo_agent::context::history::{self, ReplayScope};
+use komo_agent::context::{AgentContext, InvocationContext};
 use komo_kernel::compaction::Reshape;
 use komo_kernel::events::{Event, EventPayload};
 use komo_kernel::fold::fold;
 use komo_kernel::traits::{Clock, Ledger, LedgerError, ToolOutputStore};
+use komo_kernel::types::agent::RunSnapshot;
 use komo_kernel::types::ids::{RunId, SessionId, ToolCallId};
 use komo_kernel::types::plan::{ExecutionPlan, PlanSource};
 use komo_kernel::types::resource::{ResourceMounts, SkillMount};
@@ -94,6 +95,11 @@ pub struct GatewaySegments {
     executor: Option<Arc<ToolExecutor>>,
     /// 提示缓存冷没冷按它的"现在"算（与 Gateway 其余各处同一个时钟）。
     clock: Arc<dyn Clock>,
+    /// 每个会话**正在跑的这一段**的装配模板（`docs/background-tasks.md` §2b）：派 fork 时按它
+    /// 与日志重新装配出父会话下一次请求的样子，与在线压缩判断时的重新装配同一条路。按会话
+    /// 记——同一会话同一时刻只有一段在跑；派任务只发生在这一段里，所以重启之后续跑的那一段
+    /// 装配时会先把它补上。
+    templates: Mutex<BTreeMap<SessionId, (RunId, compaction::ContextTemplate)>>,
 }
 
 impl std::fmt::Debug for GatewaySegments {
@@ -129,6 +135,7 @@ impl GatewaySegments {
             skills: None,
             executor: None,
             clock: Arc::new(super::state::SystemClock),
+            templates: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -576,7 +583,16 @@ impl SegmentSource for GatewaySegments {
             Some(_) => None,
             None => identity.contract.clone(),
         };
+        // fork 任务会话：父会话冻结的前缀在前，系统提示也是它那份，缓存按父会话路由（§2b）。
+        let fork = match context_sources::fork_prefix(&events, &surface, &payloads).await {
+            Ok(fork) => fork,
+            Err(error) => return Err(self.halt_if_corrupt(&run, error).await),
+        };
+        let cache_session = fork
+            .as_ref()
+            .map(|(origin, _)| origin.parent_session.clone());
         let template = compaction::ContextTemplate {
+            fork: fork.map(|(_, prefix)| Arc::new(prefix)),
             instructions: identity.instructions.clone(),
             project_files,
             project_update,
@@ -595,6 +611,10 @@ impl SegmentSource for GatewaySegments {
             .map(|view| view.decayed.clone())
             .unwrap_or_default();
         let context = template.clone().assemble(resolved, decayed);
+        self.templates
+            .lock()
+            .expect("装配模板")
+            .insert(session.clone(), (run.clone(), template.clone()));
 
         let agent_surface = identity.surface.clone();
 
@@ -743,6 +763,7 @@ impl SegmentSource for GatewaySegments {
             tools,
             memories: injection.uses,
             covers: None,
+            cache_session,
         };
 
         let conversation = Self::is_conversation(
@@ -811,6 +832,39 @@ impl SegmentSource for GatewaySegments {
 }
 
 impl GatewaySegments {
+    /// 父会话这条 Run **下一次请求**的样子（`docs/background-tasks.md` §2b）：按这一段的模板
+    /// 与此刻的日志重新装配，不做新的衰减 / 压缩决定。派 fork 时冻结的前缀就是它。
+    ///
+    /// 只在派任务的那一刻调：那时父会话这一段正在跑，模板一定在。不在（这一段已经换了，或者
+    /// 根本不是这条 Run 在跑）就拒绝，不拿当前配置另编一份——那不是父会话看见的样子。
+    pub(crate) async fn fork_view(
+        &self,
+        session: &SessionId,
+        run: &RunId,
+    ) -> Result<(AgentContext, RunSnapshot), String> {
+        let template = match self.templates.lock().expect("装配模板").get(session) {
+            Some((current, template)) if current == run => template.clone(),
+            _ => return Err("派任务的那一段不在跑，读不到它此刻的上下文".into()),
+        };
+        let events = self
+            .events_of(session)
+            .await
+            .map_err(|error| format!("读不出派任务的会话：{error}"))?;
+        let snapshot = context_sources::frozen_snapshot(&events, run)
+            .ok_or_else(|| "派任务的那条 Run 没有冻结的身份，fork 不出同一副面孔".to_string())?;
+        let context = compaction::assemble_context(
+            &events,
+            run,
+            None,
+            template,
+            &self.payloads_for(session),
+            self.outputs.as_deref(),
+        )
+        .await
+        .map_err(|error| format!("派任务的会话装配不出来：{error}"))?;
+        Ok((context, *snapshot))
+    }
+
     /// 装配读不出上下文时怎么收场。
     ///
     /// **损坏就停下来，不要放回队列**（§8.4「停止受影响会话，报告损坏」）：一个中间损坏

@@ -26,7 +26,7 @@ use komo_kernel::protocol::{InboundAck, InboundMessage};
 use komo_kernel::traits::{GatewayError, Inbound};
 use komo_kernel::types::ids::{RunId, SessionId};
 
-use super::api::FeishuApi;
+use super::api::{FeishuApi, ThreadMessage};
 
 /// 假平台上机器人自己的 open_id。
 pub const BOT_OPEN_ID: &str = "ou_komo_bot";
@@ -74,6 +74,10 @@ pub struct Behavior {
     pub refuse_chat_info: bool,
     /// 每次回复先睡这么久——让"终态先于卡片"变得可复现。
     pub reply_delay: Duration,
+    /// 读话题消息一律被拒（没有 `im:message` 读权限之类）。
+    pub refuse_thread_list: bool,
+    /// 读话题消息先睡这么久——让超时变得可复现。
+    pub thread_list_delay: Duration,
 }
 
 impl Behavior {
@@ -133,6 +137,20 @@ impl Behavior {
         }
     }
 
+    pub fn refuse_thread_list() -> Self {
+        Self {
+            refuse_thread_list: true,
+            ..Self::default()
+        }
+    }
+
+    pub fn slow_thread_list(delay: Duration) -> Self {
+        Self {
+            thread_list_delay: delay,
+            ..Self::default()
+        }
+    }
+
     pub fn slow_replies(delay: Duration) -> Self {
         Self {
             reply_delay: delay,
@@ -149,6 +167,8 @@ struct FakeState {
     next_message_id: AtomicI64,
     /// 消息里的图片：`image_key` → 字节。
     resources: Mutex<HashMap<String, Vec<u8>>>,
+    /// 话题里的消息：`thread_id` → 按时间正序。
+    threads: Mutex<HashMap<String, Vec<ThreadMessage>>>,
 }
 
 /// 一个跑起来的假开放平台。
@@ -173,6 +193,7 @@ impl FakeOpenApi {
             log: EventLog::default(),
             next_message_id: AtomicI64::new(1000),
             resources: Mutex::new(HashMap::new()),
+            threads: Mutex::new(HashMap::new()),
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -228,6 +249,15 @@ impl FakeOpenApi {
             .lock()
             .expect("图片")
             .insert(image_key.to_string(), bytes.to_vec());
+    }
+
+    /// 放一个话题的全部消息（按时间正序），`list_thread_messages` 按倒序分页读它。
+    pub fn host_thread(&self, thread_id: &str, items: Vec<ThreadMessage>) {
+        self.state
+            .threads
+            .lock()
+            .expect("话题")
+            .insert(thread_id.to_string(), items);
     }
 
     /// 被 PATCH 过的 `message_id`，按顺序。
@@ -316,6 +346,17 @@ async fn handle(
             let external = state.behavior.external_chats.contains(&last);
             json!({ "code": 0, "msg": "ok", "data": { "name": "群", "external": external } })
         }
+    } else if method == Method::GET && path.ends_with("/im/v1/messages") {
+        let query = parse_query(uri.query().unwrap_or_default());
+        state.record("thread_list", &json!(query));
+        if !state.behavior.thread_list_delay.is_zero() {
+            tokio::time::sleep(state.behavior.thread_list_delay).await;
+        }
+        if state.behavior.refuse_thread_list {
+            refuse(230027, "Lack of necessary permissions")
+        } else {
+            thread_page(&state, &query)
+        }
     } else if path.ends_with("/im/v1/messages") {
         state.record("messages", &body);
         if state.behavior.refuse_sends {
@@ -328,6 +369,41 @@ async fn handle(
         refuse(404, "no such fake endpoint")
     };
     Json(reply)
+}
+
+fn parse_query(query: &str) -> HashMap<String, String> {
+    query
+        .split('&')
+        .filter_map(|pair| pair.split_once('='))
+        .map(|(key, value)| (key.to_string(), value.to_string()))
+        .collect()
+}
+
+/// 话题的一页：`ByCreateTimeDesc` 倒序，`page_token` 就是下一页从第几条开始。
+fn thread_page(state: &FakeState, query: &HashMap<String, String>) -> Value {
+    let threads = state.threads.lock().expect("话题");
+    let mut items: Vec<&ThreadMessage> = threads
+        .get(query.get("container_id").map_or("", String::as_str))
+        .map(|items| items.iter().collect())
+        .unwrap_or_default();
+    if query.get("sort_type").map(String::as_str) == Some("ByCreateTimeDesc") {
+        items.reverse();
+    }
+    let size: usize = query
+        .get("page_size")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(20);
+    let start: usize = query
+        .get("page_token")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let end = (start + size).min(items.len());
+    let page = &items[start.min(end)..end];
+    let mut data = json!({ "items": page, "has_more": end < items.len() });
+    if end < items.len() {
+        data["page_token"] = json!(end.to_string());
+    }
+    json!({ "code": 0, "msg": "success", "data": data })
 }
 
 impl FakeState {
@@ -444,6 +520,43 @@ pub fn text_event_replying(
     })
     .to_string()
     .into_bytes()
+}
+
+/// 话题列表里的一条消息。`sender` 以 `cli_` 打头是应用（机器人），否则是用户；
+/// `mentions` 是 `(占位符, open_id, 名字)`。
+pub fn thread_item(
+    message_id: &str,
+    created_ms: i64,
+    sender: &str,
+    msg_type: &str,
+    content: &Value,
+    mentions: &[(&str, &str, &str)],
+) -> ThreadMessage {
+    let is_app = sender.starts_with("cli_");
+    serde_json::from_value(json!({
+        "message_id": message_id,
+        "msg_type": msg_type,
+        "create_time": created_ms.to_string(),
+        "deleted": false,
+        "sender": {
+            "id": sender,
+            "id_type": if is_app { "app_id" } else { "open_id" },
+            "sender_type": if is_app { "app" } else { "user" },
+        },
+        "mentions": mentions
+            .iter()
+            .map(|(key, id, name)| json!({ "key": key, "id": id, "id_type": "open_id", "name": name }))
+            .collect::<Vec<_>>(),
+        "body": { "content": content.to_string() },
+    }))
+    .expect("自己造的话题消息")
+}
+
+/// 给事件里的消息补上 `create_time`（毫秒）。
+pub fn with_message_time(payload: Vec<u8>, created_ms: i64) -> Vec<u8> {
+    let mut payload: Value = serde_json::from_slice(&payload).expect("自己构造的负载");
+    payload["event"]["message"]["create_time"] = json!(created_ms.to_string());
+    payload.to_string().into_bytes()
 }
 
 /// 一条私聊图片消息的原始负载。`message_id` 是 `om_{event_id}`。

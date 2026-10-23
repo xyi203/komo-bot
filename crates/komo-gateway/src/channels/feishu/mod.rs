@@ -25,6 +25,7 @@
 pub mod api;
 pub mod inbound;
 pub mod send;
+pub mod topic;
 pub mod ws;
 
 #[cfg(any(test, feature = "test-support"))]
@@ -290,11 +291,32 @@ impl FeishuChannel {
             None => None,
         };
 
-        let Some(message) = message else {
+        let Some(mut message) = message else {
             // 群里没 @机器人、语音 / 文件之类的消息：`Ignored`，不进 Dispatcher。
             tracing::debug!(%event_id, "飞书：忽略");
             return;
         };
+
+        // 话题里被 @：把话题里 komo 没收到的消息读来当上下文（§11.3）。主流里的 @ 开新
+        // 话题，事件没有 `thread_id`，没有"此前"可读。读不到只记 WARN，原文照常交出去。
+        let thread_id = event.message.thread_id.trim();
+        if !thread_id.is_empty() {
+            message.context = topic::context(
+                self.api(),
+                thread_id,
+                topic::Current {
+                    message_id: event.message.message_id.trim(),
+                    created_ms: event.message.created_ms(),
+                },
+                topic::Me {
+                    app_id: self.api().app_id(),
+                    open_id: &bot.open_id,
+                },
+                &jiff::tz::TimeZone::system(),
+                topic::FETCH_TIMEOUT,
+            )
+            .await;
+        }
 
         let peer = message.peer.clone();
         match inbound.handle(message).await {
@@ -543,7 +565,7 @@ mod tests {
 
     use super::fake::{
         BOT_OPEN_ID, Behavior, FakeOpenApi, RecordingInbound, card_action_event, image_event,
-        text_event, text_event_from_tenant,
+        text_event, text_event_from_tenant, text_event_replying, thread_item, with_message_time,
     };
 
     /// 一个事件源可注入的渠道 + 往里塞事件的那一头。
@@ -1165,6 +1187,167 @@ mod tests {
     }
 
     // ⑨ shutdown 之后 serve 返回。
+    /// 群话题里 @机器人 的事件：`root_id` / `thread_id` 都带，时间 `at_ms`。
+    fn thread_mention(event_id: &str, text: &str, at_ms: i64) -> Vec<u8> {
+        with_message_time(
+            text_event_replying(
+                event_id,
+                "oc_g",
+                "group",
+                "ou_op",
+                text,
+                &[("@_user_1", BOT_OPEN_ID)],
+                "om_root",
+                "omt_1",
+            ),
+            at_ms,
+        )
+    }
+
+    fn said(id: &str, at_ms: i64, sender: &str, text: &str) -> super::api::ThreadMessage {
+        thread_item(
+            id,
+            at_ms,
+            sender,
+            "text",
+            &serde_json::json!({ "text": text }),
+            &[],
+        )
+    }
+
+    // §11.3 话题上下文：话题里被 @，交给 Dispatcher 之前读话题，上下文随消息一起交出，
+    // 原文不变。
+    #[tokio::test]
+    async fn a_mention_inside_a_thread_hands_over_what_the_bot_missed() {
+        let fake = FakeOpenApi::start(Behavior::default()).await;
+        let mention_bot = thread_item(
+            "om_prev_at",
+            2500,
+            "ou_op",
+            "text",
+            &serde_json::json!({ "text": "@_user_1 上一问" }),
+            &[("@_user_1", BOT_OPEN_ID, "komo")],
+        );
+        fake.host_thread(
+            "omt_1",
+            vec![
+                said("om_root", 1000, "ou_a", "根消息"),
+                said("om_bot_prev", 2000, "cli_test", "komo 上一次的回答"),
+                mention_bot,
+                said("om_missed", 3000, "ou_b", "komo 没收到的这句"),
+                said("om_evt-1", 4000, "ou_op", "@_user_1 看看"),
+            ],
+        );
+        let harness = harness(&fake);
+        let recorder = RecordingInbound::new(fake.log());
+        harness
+            .events
+            .send(thread_mention("evt-1", "@_user_1 看看", 4000))
+            .unwrap();
+        serve_until(harness.channel, recorder.clone(), || {
+            !recorder.received().is_empty()
+        })
+        .await;
+
+        let received = recorder.received();
+        assert_eq!(received.len(), 1, "{received:?}");
+        assert_eq!(received[0].text, "看看", "原文不动");
+        let context = received[0].context.as_deref().expect("带了上下文");
+        assert_eq!(
+            context.lines().count(),
+            1,
+            "只有机器人上次回答之后、没 @ 它的：{context}"
+        );
+        assert!(
+            context.starts_with("ou_b ") && context.ends_with("：komo 没收到的这句"),
+            "{context}"
+        );
+        assert_eq!(fake.calls_to("thread_list").len(), 1);
+        assert_eq!(fake.calls_to("thread_list")[0]["container_id"], "omt_1");
+    }
+
+    // 主流里的 @ 开新话题：事件没有 thread_id，没有"此前"，不读。
+    #[tokio::test]
+    async fn a_mention_in_the_main_flow_does_not_read_any_thread() {
+        let fake = FakeOpenApi::start(Behavior::default()).await;
+        let harness = harness(&fake);
+        let recorder = RecordingInbound::new(fake.log());
+        harness
+            .events
+            .send(text_event(
+                "evt-1",
+                "oc_g",
+                "group",
+                "ou_op",
+                "@_user_1 看看",
+                &[("@_user_1", BOT_OPEN_ID)],
+            ))
+            .unwrap();
+        serve_until(harness.channel, recorder.clone(), || {
+            !recorder.received().is_empty()
+        })
+        .await;
+        let received = recorder.received();
+        assert_eq!(received[0].context, None);
+        assert!(fake.calls_to("thread_list").is_empty(), "新话题不拉");
+    }
+
+    // 话题里没 @机器人 的消息仍然不触发、也不读。
+    #[tokio::test]
+    async fn a_thread_message_that_does_not_name_the_bot_reads_nothing() {
+        let fake = FakeOpenApi::start(Behavior::default()).await;
+        let harness = harness(&fake);
+        let recorder = RecordingInbound::new(fake.log());
+        harness
+            .events
+            .send(text_event_replying(
+                "evt-1",
+                "oc_g",
+                "group",
+                "ou_op",
+                "随便说说",
+                &[],
+                "om_root",
+                "omt_1",
+            ))
+            .unwrap();
+        harness
+            .events
+            .send(thread_mention("evt-2", "@_user_1 看看", 4000))
+            .unwrap();
+        serve_until(harness.channel, recorder.clone(), || {
+            !recorder.received().is_empty()
+        })
+        .await;
+        assert_eq!(recorder.received().len(), 1);
+        assert_eq!(
+            fake.calls_to("thread_list").len(),
+            1,
+            "只有被 @ 的那一条读了话题"
+        );
+    }
+
+    // 读话题失败（没权限）：只记 WARN，原文照常交出去，不报错给用户。
+    #[tokio::test]
+    async fn a_failed_thread_read_still_hands_over_the_message() {
+        let fake = FakeOpenApi::start(Behavior::refuse_thread_list()).await;
+        let harness = harness(&fake);
+        let recorder = RecordingInbound::new(fake.log());
+        harness
+            .events
+            .send(thread_mention("evt-1", "@_user_1 看看", 4000))
+            .unwrap();
+        serve_until(harness.channel, recorder.clone(), || {
+            !recorder.received().is_empty()
+        })
+        .await;
+        let received = recorder.received();
+        assert_eq!(received.len(), 1, "{received:?}");
+        assert_eq!(received[0].text, "看看");
+        assert_eq!(received[0].context, None);
+        assert!(fake.calls_to("messages").is_empty(), "没有给用户的报错文本");
+    }
+
     #[tokio::test]
     async fn serve_returns_once_it_is_told_to_stop() {
         let fake = FakeOpenApi::start(Behavior::default()).await;

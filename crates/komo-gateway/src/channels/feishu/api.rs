@@ -11,6 +11,7 @@
 //! | `PATCH /open-apis/im/v1/messages/{id}` | Run 终态时换掉处理中卡片（§11.3） |
 //! | `POST /open-apis/im/v1/messages/{id}/reply` | 回复原消息发一张处理中卡片；`reply_in_thread` 时以话题回复（目标已在话题里就进那个话题）。话题只能这样进：发消息接口不能指定话题 |
 //! | `POST /open-apis/im/v1/messages/{id}/reactions` | 给原消息加表情回复（收到了） |
+//! | `GET /open-apis/im/v1/messages?container_id_type=thread&…` | 读一个话题里的全部消息（话题上下文，§11.3）：bot 身份即可，按时间倒序分页；卡片要带 `card_msg_content_type=raw_card_content` 才给原始 JSON |
 //! | `GET /open-apis/im/v1/messages/{id}/resources/{key}?type=image` | 下载用户发来的图片（要 `im:resource` 权限） |
 //!
 //! 只解析用得到的字段，其余一律忽略：开放平台每月加字段，而一个多出来的键不应该让一
@@ -22,8 +23,8 @@
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use serde::Deserialize;
 use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 /// 官方端点。
@@ -34,6 +35,9 @@ const CALL_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// 下载一张图的超时。图比一次 JSON 调用大得多。
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// 话题列表每页多少条（接口上限 50）。
+pub const THREAD_PAGE_SIZE: usize = 50;
 
 /// 提前多久换一张新 token。
 ///
@@ -86,6 +90,75 @@ pub struct BotIdentity {
     pub open_id: String,
     #[serde(default)]
     pub app_name: String,
+}
+
+/// 话题列表里的一条消息。只取话题上下文用得到的字段（§11.3）。
+///
+/// 与 ws 事件里的 `message` **形状不同**：`sender` 是 `{id, id_type, sender_type}`（机器人
+/// 是 `app_id` 类型，**没有名字**），`mentions[].id` 是字符串而不是 `{open_id}`，
+/// `create_time` 是毫秒时间戳字符串，正文在 `body.content`。
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize, Serialize)]
+pub struct ThreadMessage {
+    #[serde(default)]
+    pub message_id: String,
+    #[serde(default)]
+    pub msg_type: String,
+    #[serde(default)]
+    pub create_time: String,
+    /// 已撤回 / 删除。
+    #[serde(default)]
+    pub deleted: bool,
+    #[serde(default)]
+    pub sender: ThreadSender,
+    #[serde(default)]
+    pub mentions: Vec<ThreadMention>,
+    #[serde(default)]
+    pub body: ThreadBody,
+}
+
+impl ThreadMessage {
+    /// 创建时间（毫秒）。解不出就是 `None`。
+    pub fn created_ms(&self) -> Option<i64> {
+        self.create_time.trim().parse().ok()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize, Serialize)]
+pub struct ThreadSender {
+    /// 用户是 `ou_*`，应用是 `cli_*`。
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub id_type: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize, Serialize)]
+pub struct ThreadMention {
+    /// 正文里的占位符（`@_user_1`）。
+    #[serde(default)]
+    pub key: String,
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize, Serialize)]
+pub struct ThreadBody {
+    /// 一个 JSON 字符串；卡片是 `{"json_card": "<又一层 JSON 字符串>", …}`。
+    #[serde(default)]
+    pub content: String,
+}
+
+/// 话题消息的一页。
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
+pub struct ThreadPage {
+    #[serde(default)]
+    pub items: Vec<ThreadMessage>,
+    #[serde(default)]
+    pub has_more: bool,
+    #[serde(default)]
+    pub page_token: Option<String>,
 }
 
 /// `komo channel probe` 的连通性核对结果。**不含 token 本身。**
@@ -240,6 +313,27 @@ impl FeishuApi {
             )
             .await?;
         Ok(chat.external)
+    }
+
+    /// 话题里的一页消息，**最新的在前**（话题上下文只要最近那一段，§11.3）。
+    pub async fn list_thread_messages(
+        &self,
+        thread_id: &str,
+        page_token: Option<&str>,
+    ) -> Result<ThreadPage, FeishuError> {
+        let token = self.tenant_token().await?;
+        let mut path = format!(
+            "/open-apis/im/v1/messages?container_id_type=thread&container_id={}\
+             &sort_type=ByCreateTimeDesc&page_size={THREAD_PAGE_SIZE}\
+             &card_msg_content_type=raw_card_content",
+            query_value(thread_id)
+        );
+        if let Some(page_token) = page_token {
+            path.push_str("&page_token=");
+            path.push_str(&query_value(page_token));
+        }
+        self.call_data(reqwest::Method::GET, &path, Some(&token), None)
+            .await
     }
 
     /// 发一条消息，返回它的 `message_id`——决定之后要按它原地改（§11.3）。
@@ -488,6 +582,20 @@ enum Extract {
     Whole,
     /// `data` 字段。
     Data,
+}
+
+/// 查询串里的一个值：除未保留字符外一律百分号编码。`page_token` 里可能有 `=` / `+`。
+fn query_value(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char)
+            }
+            other => out.push_str(&format!("%{other:02X}")),
+        }
+    }
+    out
 }
 
 /// reqwest 的错误里带 URL。飞书的 URL 里没有凭证，但错误会进日志，少一样是一样。

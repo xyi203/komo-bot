@@ -88,6 +88,59 @@ async fn a_plain_chat_message_is_accepted_as_an_interjection() {
     assert!(accepted.interject, "渠道的普通消息带插话标记");
 }
 
+/// 渠道带来的话题上下文：普通文本把它拼进提交的正文（引用块 + "发给你的消息："），
+/// 命令只解析原文、不受影响（§11.3 话题上下文）。
+#[tokio::test]
+async fn thread_context_is_prepended_to_plain_text_but_never_to_commands() {
+    let gateway = TestGateway::start().await;
+
+    let mut plain = operator_dm("看看 owl 的两条 Blocking", "telegram:60");
+    plain.context = Some("张三 10:23：B1 在 Drop，B2 在 escape".into());
+    let ack = gateway.dispatcher().handle(plain).await.expect("处理了");
+    let InboundAck::Queued { session, run } = ack else {
+        panic!("应该排队：{ack:?}");
+    };
+    let paths = gateway.state().ledgers.paths_for(&session);
+    let (events, _) = komo_store::session_log::read_events(
+        &paths,
+        &session,
+        komo_kernel::types::ids::Seq::ZERO,
+        0,
+    )
+    .await
+    .expect("读得出会话");
+    let text = events
+        .into_iter()
+        .find_map(|event| match event.payload {
+            komo_kernel::events::EventPayload::RunAccepted(body)
+                if event.run.as_ref() == Some(&run) =>
+            {
+                body.text
+            }
+            _ => None,
+        })
+        .expect("这条 Run 受理过");
+    assert!(text.starts_with("> 【话题上下文】"), "{text}");
+    assert!(
+        text.contains("> 张三 10:23：B1 在 Drop，B2 在 escape\n"),
+        "{text}"
+    );
+    assert!(
+        text.ends_with("发给你的消息：\n看看 owl 的两条 Blocking"),
+        "{text}"
+    );
+
+    // 命令：照旧按原文解析，上下文被丢掉，不起 Run。
+    let mut status = operator_dm("/status", "telegram:61");
+    status.context = Some("张三 10:23：这段不该影响命令".into());
+    let ack = gateway.dispatcher().handle(status).await.expect("处理了");
+    assert!(matches!(ack, InboundAck::Replied { .. }), "{ack:?}");
+    let runs = komo_store::repos::runs::list_for_session(&gateway.state().db, &session)
+        .await
+        .expect("读得到");
+    assert_eq!(runs.len(), 1, "命令没有起第二个 Run");
+}
+
 /// ① 的另一半：重发的 `/answer` 只答一次。
 ///
 /// 停住 Run 的是一次"结果不明"（测试工具 `unsure`，§7.5 的 `verify`）：平台重投同一条

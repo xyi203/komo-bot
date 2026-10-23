@@ -89,6 +89,7 @@ pub fn from_wire(
         is_private: true,
         sender: PeerId::new(incoming.user_id.clone()),
         text,
+        context: None,
         same_org: false,
         request_key,
     })

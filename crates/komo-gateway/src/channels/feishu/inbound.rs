@@ -101,6 +101,9 @@ pub struct Message {
     pub thread_id: String,
     #[serde(default)]
     pub chat_id: String,
+    /// 创建时间，毫秒时间戳字符串。话题上下文用它切出"早于这条"的消息（§11.3）。
+    #[serde(default)]
+    pub create_time: String,
     /// `p2p` / `group`。
     #[serde(default)]
     pub chat_type: String,
@@ -115,6 +118,11 @@ pub struct Message {
 }
 
 impl Message {
+    /// 创建时间（毫秒）。事件没带或解不出就是 `None`。
+    pub fn created_ms(&self) -> Option<i64> {
+        self.create_time.trim().parse().ok()
+    }
+
     /// 私聊不看 @提及。**哪个**会话是 Dispatcher 的事，渠道只负责把这个布尔填对
     /// （§11.2）。
     pub fn is_private(&self) -> bool {
@@ -227,6 +235,7 @@ impl Accepted {
             is_private: self.is_private,
             sender: self.sender,
             text,
+            context: None,
             same_org: self.same_org,
             request_key,
         })
@@ -428,6 +437,7 @@ mod tests {
                 message_id: "om_1".into(),
                 root_id: String::new(),
                 thread_id: String::new(),
+                create_time: String::new(),
                 chat_id: chat_id.into(),
                 chat_type: chat_type.into(),
                 message_type: "text".into(),

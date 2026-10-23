@@ -3,6 +3,7 @@
 pub mod agent;
 pub mod codemode;
 pub mod config;
+pub mod durable;
 pub mod embedding;
 pub mod executor;
 pub mod limits;

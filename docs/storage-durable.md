@@ -161,8 +161,8 @@ pi-durable 不变量 3："There is no volatile publication path." SSE 只推已�
 
 - **生产：Turso，WAL 模式，新文件。** D0 实测：单写入者下 MVCC 与 WAL 的提交延迟一样；MVCC 下读不在事务里
   会大量报 `database is locked`，在事务里也只能和提交差不多的频率读到（300 次提交期间读成 601 次，WAL 是
-  2 万多次）。单线用不上 MVCC 的并发提交，只剩它的读代价，所以用 WAL。迁移本来就是导入到新表，干脆导入到一个
-  **新库文件**（老 `state.db` 原样留着做回滚），不在老库上切日志模式。cron、投递、Memory 表随迁移一起拷过去。
+  2 万多次）。单线用不上 MVCC 的并发提交，只剩它的读代价，所以用 WAL。新版本用一个
+  **新库文件**（不迁移，§8；老 `state.db` 原样留在盘上），不在老库上切日志模式。cron、投递、Memory 表在新库里从空开始。
   MVCC 专属的规则（DDL 必须走非 MVCC 连接、`BEGIN CONCURRENT`、`with_write_retry`）随之退役。
 - **测试：内存实现**，进 `komo-kernel` 的 `test-support`，取代 `MemLedger`。两个实现跑同一套 conformance 测试
   （移植 pi-durable 的 `registerStorageConformance` 用例）。
@@ -337,58 +337,21 @@ pi-durable 没有删除。komo 保留 `closing → deleted → purged`：
 5. **pi-durable 是实验性的。** 固定在 `8efd314fa` 移植契约；之后它变了不跟。
 6. **进度提交变多。** 节流提交生成与工具进度会增加写放大，需要 §10 实测。
 
-## 8. 迁移
+## 8. 不迁移（2026-10-23 定）
 
-- 新二进制首次启动时，对每个 Session **只读**旧目录、按旧解码器（v1 线性事件、v2 树形 entry、退役的
-  `approval.*`）折出 entry，一个 Session 一次提交导入；导入成功后在 `sessions` 行上记 `imported_from_format`，
-  旧 `events.jsonl` 原地保留不动、不再写。
-- v2 树：每个兄弟分支导入成一个 fork，当前位置 = 文件里最后一条 entry 所在分支（pi 的规则）。
-- 旧 blob 原地保留；旧 `artifact://<run>/<call>/<attempt>/...` 通过导入时写的映射表 `legacy_refs` 解析。
-- Memory 证据里的 `(session, event_id / seq)` 也记进 `legacy_refs`，指到对应 entry。
-- 新库格式带版本；旧二进制打开新库要拒绝（`sessions` 上多一列不够，用一张 `durable_meta` 记格式版本，旧二进制
-  启动时检查）。
+**不做兼容，新版本直接用新格式起步。** 2026-10-23 之前的"先排空、再导入收尾"方案（原 §8.1，以及为它准备的
+`komo gateway drain` 前置版本）作废，没有实现。
 
-### 8.1 未结束的 Run：先排空，剩下的收尾（2026-10-23 定）
-
-不写"把旧的半截执行状态翻译成任务 checkpoint"的转换器：那段代码只在升级时跑一次，真实样本太少测不全，
-翻错的后果是重跑 unsafe 调用（§8.6 要防的事）。改为两步：
-
-**第一步：旧二进制排空。** 迁移版本之前先发一个版本（仍是旧格式），加 `komo gateway drain [--timeout 5m]`，
-`komo update` 与 `scripts/install-local.sh` 换二进制前自动调用它：
-
-- 排空期间**照常受理**输入（渠道消息不丢），但**不再领取从没开始过的 Run**——它们留在 `queued` /
-  `waiting + dependency`，迁移时原样搬走，这是安全的。
-- **已经开始的 Run 继续跑**：`running` 的跑到终态；`waiting + retry` 的到点照常重领。
-- `waiting + intervention` 不等（人可能一直不答），直接留给第二步。
-- 所有已开始的 Run 都进终态，或超时到了，就停 Gateway、换二进制。超时默认 5 分钟。
-
-**第二步：新二进制导入时收尾。** 导入每个 Session 时按 Run 的状态分三类：
-
-| 旧状态 | 导入成 |
-|---|---|
-| 五个终态 | 历史 entry，与普通导入相同 |
-| **从没开始**：`queued`、`waiting + dependency`、正文完整的 `accepted`（JSONL 里没有 `run.started`） | 按输入 seq 的顺序进 `komo.inbox`，成为 `queued` submission；保留原请求键作为 `request_id`，客户端重发仍然幂等 |
-| **开始了没结束**：`running`、`waiting + retry`、`waiting + intervention`、带 `waiting + approval` 的旧行 | 已落盘的历史照常导入；submission 记 `unanswered{reason: "migration"}`；处理方式见下 |
-| 正文没写完的 `accepted` | 丢弃（今天也只能等客户端重传，§8.5）；请求键不占用，重传按新输入受理 |
-
-"开始了没结束"的那条 Run：
-
-- **`started` 了、没有结果的调用**：盘上有身份齐全、哈希对得上的 `output.json` 就当完成结果导入（§8.4 第 5 行）；
-  否则导入成一条**中断结果**：正文和 §8.6 重启时写的一样（"被打断、不会自动重跑"，加判断方法，加 `.partial`
-  末尾各 2 KiB），完整的 `.partial` 发布成那次尝试的 `stdout.txt` / `stderr.txt`。不看重放策略，一律不重跑。
-- **只 `planned` 过、从没 `started` 的调用**：导入成一条"未执行"的错误结果，保证调用与结果配对完整。
-- **codemode 跑到一半**：外层调用按上面两条处理；journal 里已交付的子调用不再接回，在中断结果正文里列出它们的
-  名字与是否完成。
-- 被这条 Run 并走了、还没真正放进去的插话（`run.absorbed` 之后宿主没跑到）：当作"从没开始"进收件箱。
-- 最后追加一条只展示、不进上下文的 entry：`这条任务在升级迁移时被收尾，没有做完；要继续请再发一次`，TUI 与
-  渠道都能看到。渠道会话同时生成一条投递，告诉对方这件事。
-
-导入的提交里，Session 若有排队的 submission 且没有在跑的 run，**同一提交跑一次 final boundary**，排队的输入
-立即开跑——今天前一条 Run 进终态就会放出后一条，迁移后保持这个行为，不必等下一条新输入来触发（pi-durable
-的规则是失败后收件箱不动，这里是有意偏离）。
-
-跳过了排空版本、直接升到迁移版本的用户，所有已开始的 Run 都落到第二步，结果相同，只是被收尾的更多。迁移结束后
-打印一张表：每个 Session 搬了几条排队输入、收尾了几条 Run、写了几条中断结果。
+- 新版本只认 `<data_dir>/durable.db` 与新的 blob 目录；**不读**旧的 `sessions/*/events.jsonl`、旧 `state.db` 的
+  `runs` / `tool_calls` 等表，不导入、不翻译未结束的 Run。
+- 旧数据**原地留着、不删**：`sessions/`、`state.db*` 照旧在盘上，想看可以用旧二进制或直接读文件；新版本不碰它们，
+  也不在启动时清理。
+- 因此不需要：`legacy_refs` 映射表、旧 `artifact://` URI 解析、旧 Memory 证据的重定位、旧格式解码器在新路径上的
+  兼容、"旧二进制打开新库要拒绝"的保护（`durable_meta` 的格式版本仍保留，给新格式自己以后演进用）。
+- cron 定义、Memory 条目、投递记录这些在旧 `state.db` 里的东西也**不带过来**；新版本从空开始。
+- AGENTS.md 里只为兼容旧记录存在的规则（`approval.*` 退役事件要能解码、`waiting + approval` 旧行按批准续跑、
+  退役的 delivery / outbox 行要跳过、"Schema 只做加法"对新库首个版本之前的改动）在 D7 一并删改。
+- `komo session export`（pi v3 树形 JSONL）仍然要做，它是新格式的导出，不是兼容。
 
 ## 9. 分阶段
 
@@ -397,13 +360,12 @@ pi-durable 没有删除。komo 保留 `closing → deleted → purged`：
 | 阶段 | 内容 | 验收 |
 |---|---|---|
 | D0 基准（**已完成 2026-10-23**） | 在 Turso 上测单线提交吞吐（每次 fsync）、节流进度的写放大、MVCC vs WAL | 数字写回本文 §10 |
-| D1 kernel 模型 | entry / conversation / task / submission / document 值类型，上下文推导（§2.1 规则 1–10），fork 遍历，`Storage` trait，内存实现 + conformance 用例 | 移植 pi-durable 的上下文与 fork 用例全部通过 |
-| D2 store | `Line` + Turso `Storage`，新表 DDL 与字节对等测试，blob 写入顺序 | conformance 在 Turso 上通过；崩溃注入（提交前 / 后杀进程）后重开一致 |
-| D3 任务调度 | 任务状态机、step 规则、reservation / reconciliation、waiting / completing / abort 自底向上 | 移植 pi-durable 的 child-tasks / abort / restart 示例 |
-| D4 生成与工具 | `komo.generation` / `komo.tool` / `komo.compaction`，收件箱与 boundary，`komo.live` 节流 | 现有 `tests/recovery`、`tests/agents` 改写后通过；§8.6 重放表逐行有测试 |
+| D1 kernel 模型（**已完成 2026-10-23**，分支 `worktree-agent-a4d253c12a28d49e6`） | entry / conversation / task / submission / document 值类型，上下文推导（§2.1 规则 1–10），fork 遍历，`Storage` trait，内存实现 + conformance 用例 | 移植 pi-durable 的上下文与 fork 用例全部通过 |
+| D2 store（**已完成 2026-10-23**，分支 `worktree-agent-a6a91579496b9a658`） | `Line` + Turso `Storage`，新表 DDL 与字节对等测试，blob 写入顺序 | conformance 在 Turso 上通过；崩溃注入（提交前 / 后杀进程）后重开一致 |
+| D3 任务调度（**已完成 2026-10-23**，分支 `worktree-agent-a892138486df40e22`） | 任务状态机、step 规则、reservation / reconciliation、waiting / completing / abort 自底向上 | 移植 pi-durable 的 child-tasks / abort / restart 示例 |
+| D4 生成与工具（无状态模型调用 D4a **已完成 2026-10-23**，分支 `worktree-agent-a980c2d14079302d0`） | `komo.generation` / `komo.tool` / `komo.compaction`，收件箱与 boundary，`komo.live` 节流 | 现有 `tests/recovery`、`tests/agents` 改写后通过；§8.6 重放表逐行有测试 |
 | D5 gateway 与树 | 会话树映射到 fork、HTTP / SSE 改读新存储、`task` / cron / 投递 | §8.11 的端到端测试（`session_tree/tests.rs`）原样通过 |
-| D6a 排空（旧格式版本，先发） | `komo gateway drain`，`komo update` / `install-local.sh` 换二进制前调用（§8.1 第一步） | 有 running / retry / 排队 Run 时 drain：排队的不被领，开始了的跑完或超时 |
-| D6 迁移 | 旧会话导入、未结束 Run 收尾（§8.1 第二步）、`legacy_refs`、`komo session export` | 本机 `~/.komo/sessions`（60 个）全部导入，抽查回放与导出；手写夹具覆盖 §8.1 表的每一行，含 started 无结果、codemode 半截、排队输入导入后立即开跑 |
+| D6 导出 | `komo session export SESSION_ID`：输出 pi v3 树形 JSONL（带 blob 引用）；不导入旧会话（§8） | 导出的文件能被 pi 的 session-manager 读入，分支与当前位置一致 |
 | D7 收尾 | 删旧 ledger 代码，改写 `docs/komo_bot.md` §8、AGENTS.md 结构规则、§14 验收表 | — |
 
 ## 10. D0 实测（2026-10-23）
@@ -431,7 +393,7 @@ tmpfs，fsync 不算数）。代码：`.scratch/komo-v08-rewrite/spikes/durable-
 - MVCC 读被锁这一条**可能也影响现在的生产代码**：今天的读经 toasty 连接池，D0 只测了裸 turso 连接，没测 toasty 那一层，
   值得单独查一次现有读路径会不会碰到这个错误。
 
-还没测：导入 60 个旧会话的耗时与库大小（D6 时测）；长期运行下 WAL checkpoint 的节奏与库增长。
+还没测：长期运行下 WAL checkpoint 的节奏与库增长。
 
 ## 11. 决定（2026-10-23 全部按建议定）
 
@@ -439,7 +401,7 @@ tmpfs，fsync 不算数）。代码：`.scratch/komo-v08-rewrite/spikes/durable-
 2. **会话树用 fork 表达**（§4.2）；**`/fork` 与 `/clone` 都复制**，跨 Session 不共享（§6.1）。
 3. **Intervention 退役**：子进程走 `probe` 阶段自动重探，blob 损坏记 faulted，清单列 faulted 任务；`WaitReason` 退役（§6.2）。
 4. **流式进度走节流提交**（§3.6），SSE 只推已提交的东西；D0 之后补充：进度提交用 `synchronous=OFF`，不用退回易失例外。
-5. **未结束的 Run**：先排空、剩下的导入时收尾（§8.1）。
+5. ~~未结束的 Run：先排空、剩下的导入时收尾~~ → **不迁移**（2026-10-23 改定，§8）：新版本直接用新格式，旧数据原地留着不读。
 6. **有未结束 Run 时仍禁止导航**（首版，§4.2）。
 
 7. **agent loop**：照 pi 的钩子组织，通用 Task 引擎一起移植（§12.4）；去掉执行段、有状态 driver、租约与段装配（§12.3）。

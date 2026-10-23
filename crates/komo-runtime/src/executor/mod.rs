@@ -1935,7 +1935,7 @@ struct Recorded {
 
 /// 把工具交出来的图片写进这次尝试的输出目录，结果里只留引用；返回写下来的那几张，这一次
 /// 直接交给模型。超过上限或写不下来的那张不让整次调用失败：正文里补一句，模型知道少了什么。
-async fn store_images(
+pub(crate) async fn store_images(
     writer: &mut dyn OutputWriter,
     body: &mut ToolResultBody,
     images: &[ToolImage],
@@ -2103,10 +2103,10 @@ fn safe_to_redo(plan: &ExecutionPlan) -> bool {
 }
 
 /// 中断结果里每条流最多带多少字节的末尾。
-const INTERRUPTED_TAIL_BYTES: usize = 2048;
+pub(crate) const INTERRUPTED_TAIL_BYTES: usize = 2048;
 
 /// 被重启打断、又不能重跑的那次调用交给模型的正文。
-fn interrupted_message(tool: &str, left: &InterruptedOutput) -> String {
+pub(crate) fn interrupted_message(tool: &str, left: &InterruptedOutput) -> String {
     let mut out = format!(
         "上一次执行被 Gateway 重启打断，{tool} 重启后不会自动重跑，副作用是否已经发生未知。\
          {UNCERTAIN_ADVICE}。"
@@ -2137,13 +2137,13 @@ fn interrupted_message(tool: &str, left: &InterruptedOutput) -> String {
 /// 工具守着 `call_timeout` 自己超时之后，还要终止进程组、回收（TERM 与 KILL 各等 5s）、
 /// 写完输出。兜底计时器多给这么一段，否则两边同时到点，赢的总是执行器——一个本来
 /// 说得清"超时被杀"的结果就成了"结果不明"。
-const REAP_GRACE: Duration = Duration::from_secs(15);
+pub(crate) const REAP_GRACE: Duration = Duration::from_secs(15);
 
 /// 活动执行时限到了。
 ///
 /// 读取可以说"失败了，再读一次就是"；其余动作在超时这一刻**不知道**副作用发没发生，
 /// 所以是 `Uncertain` 而不是 `Failed`——后者会让模型自己再发一次，把效果做两遍。
-fn timeout_error(plan: &ExecutionPlan, limit: Duration) -> ToolError {
+pub(crate) fn timeout_error(plan: &ExecutionPlan, limit: Duration) -> ToolError {
     if safe_to_redo(plan) {
         ToolError::Timeout {
             after_secs: limit.as_secs(),
@@ -2158,7 +2158,7 @@ fn timeout_error(plan: &ExecutionPlan, limit: Duration) -> ToolError {
     }
 }
 
-fn result_body(outcome: &Result<ToolOutput, ToolError>) -> ToolResultBody {
+pub(crate) fn result_body(outcome: &Result<ToolOutput, ToolError>) -> ToolResultBody {
     match outcome {
         Ok(output) => ToolResultBody {
             status: output.status,

@@ -14,6 +14,7 @@ pub mod codex_auth;
 mod model_stream;
 mod models;
 mod responses;
+mod routing_stream;
 mod sse;
 pub mod transport;
 mod wire;
@@ -38,6 +39,7 @@ pub use model_stream::{
 };
 pub use models::{ProbeError, probe_context_window};
 pub use responses::{Credential, OpenAiResponsesLlm};
+pub use routing_stream::RoutingStream;
 pub use transport::{HttpTransport, ReqwestTransport, TransportError};
 
 use crate::config::{EffortCapabilities, Secrets};
@@ -385,7 +387,7 @@ impl std::fmt::Debug for RoutingLlm {
 }
 
 /// 一份模型配置的身份：换了端点、模型或凭证变量就是另一个实例。
-fn model_key(config: &ModelConfig) -> String {
+pub(crate) fn model_key(config: &ModelConfig) -> String {
     format!(
         "{}|{}|{}|{}",
         config.provider, config.base_url, config.model, config.api_key_env

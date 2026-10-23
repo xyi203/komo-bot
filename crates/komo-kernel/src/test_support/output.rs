@@ -183,6 +183,36 @@ impl ToolOutputStore for MemOutputStore {
         })
     }
 
+    async fn find_published(
+        &self,
+        attempt: &AttemptRef,
+    ) -> Result<Option<PublishedOutput>, StoreError> {
+        let path = format!(
+            "tool-output/{}/{}/{}/output.json",
+            attempt.run, attempt.call, attempt.attempt
+        );
+        let Some(body) = self.published.lock().expect("输出存储").get(&path).cloned() else {
+            return Ok(None);
+        };
+        let text = serde_json::to_string(&body).map_err(|e| StoreError::Io(e.to_string()))?;
+        let preview = body.event_preview();
+        let status = body.status;
+        Ok(Some(PublishedOutput {
+            body: Some(Box::new(body)),
+            output: OutputRef(ContentRef {
+                path,
+                size: text.len() as u64,
+                hash: crate::types::digest::ContentHash::of_str(&text),
+                pointer: None,
+            }),
+            status,
+            elapsed_ms: 0,
+            preview,
+            stdout: None,
+            stderr: None,
+        }))
+    }
+
     async fn interrupted(
         &self,
         attempt: &AttemptRef,

@@ -258,13 +258,13 @@ impl TaskRuntime {
             .await
     }
 
-    /// conversation 已提交的活动 transcript 与模型上下文（可截到 `at`）。不缓存：每次读
-    /// 可见历史再推导（pi 的 range 缓存是性能优化，这里留给 D4 需要时再加）。
-    pub async fn context(
+    /// conversation 沿 fork 祖先拼出来的已提交 entry，按 ID 升序（可截到 `at`，含）。D4
+    /// 的生成阶段要按 entry 的 `kind` 规划 system 段，所以单独露出来。
+    pub async fn entries(
         &self,
         conversation: ConversationId,
         at: Option<EntryId>,
-    ) -> Result<ContextView, DurableError> {
+    ) -> Result<Vec<EntryRecord>, DurableError> {
         self.check()?;
         let sched = self.sched.clone();
         let invocation = self.invocation.clone();
@@ -291,10 +291,21 @@ impl TaskRuntime {
                             None => break,
                         }
                     }
-                    Ok(derive_context(&entries, at))
+                    Ok(entries)
                 })
             })
             .await
+    }
+
+    /// conversation 已提交的活动 transcript 与模型上下文（可截到 `at`）。不缓存：每次读
+    /// 可见历史再推导（pi 的 range 缓存是性能优化，这里留给 D4 需要时再加）。
+    pub async fn context(
+        &self,
+        conversation: ConversationId,
+        at: Option<EntryId>,
+    ) -> Result<ContextView, DurableError> {
+        let entries = self.entries(conversation, at).await?;
+        Ok(derive_context(&entries, at))
     }
 
     /// 时钟（毫秒）。

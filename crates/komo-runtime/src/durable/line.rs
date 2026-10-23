@@ -246,14 +246,22 @@ impl Line {
         }
     }
 
-    /// 唯一调 `Storage::commit` 的地方。
+    /// 唯一调 `Storage::commit` / `Storage::commit_progress` 的地方。
     ///
-    /// TODO(D2/D4)：进度类提交（只有 `DocumentChange`、不要求 fsync）将来走
-    /// `Storage::commit_progress`，在这里按写入内容选；这一阶段没有进度写入，全部是结构性提交。
+    /// 进度类提交——只有 `DocumentChange`（整值替换 document，§3.6）——走
+    /// `commit_progress`，后端可以用更低的落盘档位；任何一条别的写入（entry、任务、
+    /// submission、document 的建与退役）都让整批是结构性提交，走 `commit`。
     async fn commit_to_storage(
         &self,
         writes: &[StorageWrite],
     ) -> Result<Seq, komo_kernel::durable::StorageError> {
+        if !writes.is_empty()
+            && writes
+                .iter()
+                .all(|write| matches!(write, StorageWrite::DocumentChange { .. }))
+        {
+            return self.shared.storage.commit_progress(writes).await;
+        }
         self.shared.storage.commit(writes).await
     }
 

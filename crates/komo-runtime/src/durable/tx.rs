@@ -14,7 +14,7 @@ use komo_kernel::durable::task::{Overlay, check_checkpoint};
 use komo_kernel::durable::{
     ConversationId, ConversationRecord, Cursor, DocumentAddress, DocumentId, DocumentRecord,
     DocumentScope, EntryId, EntryRecord, ROOT_CONVERSATION_ID, Storage, StorageExt, StorageWrite,
-    TaskId, TaskRecord, TaskState, TaskStatus,
+    SubmissionId, SubmissionKind, SubmissionRecord, TaskId, TaskRecord, TaskState, TaskStatus,
 };
 
 use super::error::DurableError;
@@ -107,6 +107,7 @@ pub struct Tx {
     conversations: Vec<ConversationRecord>,
     entries: Vec<EntryRecord>,
     tasks: BTreeMap<TaskId, (bool, TaskRecord)>,
+    submissions: BTreeMap<SubmissionId, SubmissionRecord>,
     documents: HashMap<DocumentAddress, DocState>,
 }
 
@@ -120,6 +121,7 @@ impl Tx {
             conversations: Vec::new(),
             entries: Vec::new(),
             tasks: BTreeMap::new(),
+            submissions: BTreeMap::new(),
             documents: HashMap::new(),
         }
     }
@@ -403,6 +405,76 @@ impl Tx {
         }
     }
 
+    // ------------------------------------------------------------- submission
+
+    /// 一条 submission 的当前记录：本次事务暂存的候选优先，其次已提交的。像 spec §6 的
+    /// `tx.settleSubmission` 那样不算"表读"，所以第一次表写之后也能用。
+    pub async fn submission(
+        &mut self,
+        id: SubmissionId,
+    ) -> Result<Option<SubmissionRecord>, DurableError> {
+        if let Some(record) = self.submissions.get(&id) {
+            return Ok(Some(record.clone()));
+        }
+        Ok(self.storage.submission(id).await?)
+    }
+
+    /// conversation 内按 `request_id` 去重的那条（含本次事务里刚建的）。
+    pub async fn submission_by_request(
+        &mut self,
+        conversation: ConversationId,
+        request_id: &str,
+    ) -> Result<Option<SubmissionRecord>, DurableError> {
+        if let Some(record) = self.submissions.values().find(|record| {
+            record.conversation == conversation && record.request_id.as_deref() == Some(request_id)
+        }) {
+            return Ok(Some(record.clone()));
+        }
+        self.read_guard("submission_by_request")?;
+        Ok(self
+            .storage
+            .submission_by_request(conversation, request_id)
+            .await?)
+    }
+
+    /// 建一条 submission（铸 ID）。
+    pub async fn create_submission(
+        &mut self,
+        conversation: ConversationId,
+        request_id: Option<&str>,
+        kind: SubmissionKind,
+    ) -> Result<SubmissionRecord, DurableError> {
+        self.mark_table_write();
+        self.require_conversation(conversation).await?;
+        let id: SubmissionId = self.storage.mint().await?;
+        let record = SubmissionRecord {
+            id,
+            conversation,
+            request_id: request_id.map(str::to_owned),
+            kind,
+        };
+        self.submissions.insert(id, record.clone());
+        Ok(record)
+    }
+
+    /// 整条替换一条 submission（状态转换的合法性由调用方的规则保证）。
+    pub fn put_submission(&mut self, record: SubmissionRecord) {
+        self.mark_table_write();
+        self.submissions.insert(record.id, record);
+    }
+
+    /// `at_or_before`（含）以内对 conversation 可见的最新一条带 `head` 的 entry。
+    pub async fn latest_head_marker(
+        &mut self,
+        conversation: ConversationId,
+    ) -> Result<Option<EntryRecord>, DurableError> {
+        self.read_guard("latest_head_marker")?;
+        Ok(self
+            .storage
+            .find_latest_head_marker(conversation, None)
+            .await?)
+    }
+
     // ------------------------------------------------------------- document
 
     async fn load_document(&mut self, address: &DocumentAddress) -> Result<(), DurableError> {
@@ -532,6 +604,11 @@ impl Tx {
         let mut writes = Vec::new();
         writes.extend(self.conversations.drain(..).map(StorageWrite::Conversation));
         writes.extend(self.entries.drain(..).map(StorageWrite::Entry));
+        writes.extend(
+            std::mem::take(&mut self.submissions)
+                .into_values()
+                .map(StorageWrite::Submission),
+        );
         writes.extend(
             std::mem::take(&mut self.tasks)
                 .into_values()

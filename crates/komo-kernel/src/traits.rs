@@ -392,6 +392,18 @@ pub trait ToolOutputStore: Send + Sync {
         attempt: &AttemptRef,
         tail_bytes: usize,
     ) -> Result<InterruptedOutput, StoreError>;
+
+    /// 这次尝试盘上有没有一份**完整**的输出：`output.json` 在，身份（Session / run / call /
+    /// attempt）与这个 [`AttemptRef`] 对得上，stdout / stderr 的引用也对得上（§5 恢复表
+    /// "盘上有身份齐全、哈希对得上的 output.json"）。有就返回发布时那份 [`PublishedOutput`]，
+    /// 调用方据此补提交结果、复用原输出，不重做。没有（或对不上）就是 `None`——`.partial`
+    /// 不算完成。默认不支持：没有落盘的替身不用管它。
+    async fn find_published(
+        &self,
+        _attempt: &AttemptRef,
+    ) -> Result<Option<PublishedOutput>, StoreError> {
+        Ok(None)
+    }
 }
 
 /// 一次尝试的流式写入器。

@@ -385,6 +385,65 @@ impl ToolOutputStore for FileToolOutputStore {
         Ok(bytes)
     }
 
+    async fn find_published(
+        &self,
+        attempt: &AttemptRef,
+    ) -> Result<Option<PublishedOutput>, StoreError> {
+        let dir = self.attempt_dir(attempt);
+        let bytes = match tokio::fs::read(dir.join("output.json")).await {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(StoreError::Io(format!("读 output.json 失败：{e}"))),
+        };
+        // 读不懂、或身份对不上的文件不算完成结果：只留作诊断。
+        let Ok(document) = serde_json::from_slice::<OutputDocument>(&bytes) else {
+            return Ok(None);
+        };
+        if document.session != self.session.as_str()
+            || document.run != attempt.run.as_str()
+            || document.call != attempt.call.as_str()
+            || document.attempt != attempt.attempt.as_str()
+        {
+            return Ok(None);
+        }
+        // 引用的两条流必须真在盘上、大小与哈希对得上（发布时先于 output.json 同步）。
+        let relative = FileToolOutputStore::attempt_relative(attempt);
+        for (name, reference) in [
+            ("stdout.txt", &document.stdout),
+            ("stderr.txt", &document.stderr),
+        ] {
+            let Some(reference) = reference else {
+                continue;
+            };
+            let content = match tokio::fs::read(dir.join(name)).await {
+                Ok(content) => content,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(e) => return Err(StoreError::Io(format!("读 {name} 失败：{e}"))),
+            };
+            if content.len() as u64 != reference.size
+                || ContentHash::of_bytes(&content) != reference.hash
+                || reference.path != format!("{relative}/{name}")
+            {
+                return Ok(None);
+            }
+        }
+        let preview = document.body.event_preview();
+        Ok(Some(PublishedOutput {
+            body: Some(Box::new(document.body)),
+            output: OutputRef(ContentRef {
+                path: format!("{relative}/output.json"),
+                size: bytes.len() as u64,
+                hash: ContentHash::of_bytes(&bytes),
+                pointer: None,
+            }),
+            status: document.status,
+            elapsed_ms: document.elapsed_ms,
+            preview,
+            stdout: document.stdout,
+            stderr: document.stderr,
+        }))
+    }
+
     async fn interrupted(
         &self,
         attempt: &AttemptRef,
@@ -577,6 +636,61 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    /// 设计 `docs/storage-durable.md` §5 "盘上有身份齐全、哈希对得上的 output.json"：只有完整发布过的
+    /// 尝试找得到；`.partial` 不算，别的尝试的 output.json（身份对不上）也不算，流被动过也不算。
+    #[tokio::test]
+    async fn only_a_complete_published_output_with_matching_identity_is_found() {
+        let (_dir, store, session) = store().await;
+        let attempt = attempt(&session);
+
+        // 只有 .partial：不是完成结果。
+        let mut writer = store.begin(&attempt).await.unwrap();
+        writer.write_stdout(b"half").await.unwrap();
+        assert!(store.find_published(&attempt).await.unwrap().is_none());
+
+        // 发布之后重开存储也找得到，引用与发布时返回的一模一样。
+        writer.write_stdout(b" done").await.unwrap();
+        let published = store
+            .publish(writer, body(ToolResultStatus::Completed))
+            .await
+            .unwrap();
+        let restarted = FileToolOutputStore::new(store.paths().clone(), session.clone());
+        let found = restarted.find_published(&attempt).await.unwrap().unwrap();
+        assert_eq!(found.output, published.output);
+        assert_eq!(found.stdout, published.stdout);
+        assert_eq!(found.status, ToolResultStatus::Completed);
+        assert_eq!(
+            found.body.as_deref(),
+            Some(&body(ToolResultStatus::Completed))
+        );
+
+        // 另一次尝试没有。
+        let other = AttemptRef {
+            attempt: AttemptId::from_raw("attempt-2"),
+            ..attempt.clone()
+        };
+        assert!(restarted.find_published(&other).await.unwrap().is_none());
+
+        // 身份对不上（output.json 里写的是别的调用）：不算。
+        let dir = store
+            .paths()
+            .resolve("tool-output/run-1/call-7/attempt-1")
+            .unwrap();
+        let text = std::fs::read_to_string(dir.join("output.json")).unwrap();
+        std::fs::write(
+            dir.join("output.json"),
+            text.replace("\"call\":\"call-7\"", "\"call\":\"call-8\""),
+        )
+        .unwrap();
+        assert!(restarted.find_published(&attempt).await.unwrap().is_none());
+        std::fs::write(dir.join("output.json"), text).unwrap();
+        assert!(restarted.find_published(&attempt).await.unwrap().is_some());
+
+        // 引用的流被动过（哈希对不上）：不算。
+        std::fs::write(dir.join("stdout.txt"), b"tampered").unwrap();
+        assert!(restarted.find_published(&attempt).await.unwrap().is_none());
     }
 
     #[tokio::test]

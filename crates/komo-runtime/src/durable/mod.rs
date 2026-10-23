@@ -6,6 +6,7 @@
 
 pub mod engine;
 pub mod error;
+pub mod harness;
 pub mod kind;
 pub mod line;
 pub mod runtime;

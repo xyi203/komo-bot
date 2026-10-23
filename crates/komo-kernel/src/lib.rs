@@ -3,12 +3,12 @@
 pub mod compaction;
 pub mod cron;
 pub mod events;
-pub mod session_events;
 pub mod fold;
 pub mod projection;
 pub mod protocol;
 pub mod recovery;
 pub mod session;
+pub mod session_events;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
 pub mod traits;

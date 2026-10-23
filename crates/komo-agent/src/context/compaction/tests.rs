@@ -556,3 +556,24 @@ fn frozen_prefix_sequences_cannot_become_tree_compaction_references() {
     let pricing = price_branch(&context, &[]);
     assert!(!pricing.candidates[1].2);
 }
+
+#[test]
+fn a_serialized_conversation_truncates_tool_results_and_skips_thinking() {
+    use serde_json::json;
+    let long = "x".repeat(2500);
+    let text = super::serialize_conversation(&[
+        json!({"role":"user","content":"hello"}),
+        json!({"role":"assistant","content":[
+            {"type":"thinking","thinking":"private"},
+            {"type":"text","text":"on it"},
+            {"type":"toolCall","id":"c1","name":"read","arguments":{"path":"a"}}]}),
+        json!({"role":"toolResult","toolCallId":"c1","content":[{"type":"text","text":long}]}),
+        json!({"role":"compactionSummary","summary":"earlier"}),
+    ]);
+    assert!(text.contains("[User]: hello"));
+    assert!(text.contains("[Assistant]: on it"));
+    assert!(text.contains("[Assistant tool calls]: read({\"path\":\"a\"})"));
+    assert!(!text.contains("private"));
+    assert!(text.contains("500 more characters truncated"));
+    assert!(text.contains("[Earlier summary]: earlier"));
+}

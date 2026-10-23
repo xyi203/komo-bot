@@ -1,6 +1,6 @@
 # Session 树（pi 对齐）：实现说明与待验证项
 
-设计决策在 `docs/komo_bot.md` §8.11；本文记录**已经实现了什么、怎么验证、还差什么**。对照基线是 pi coding-agent 1.4.0（`core/session-manager`、`AgentSession.navigateTree`）。状态截至 2026-10-23，分支 `feat/session-tree`。
+设计决策在 `docs/komo_bot.md` §8.11；本文记录**已经实现了什么、怎么验证、还差什么**。对照基线是 pi coding-agent 1.4.0（`core/session-manager`、`AgentSession.navigateTree`）。状态截至 2026-10-23。
 
 ## 1. 已实现
 
@@ -47,34 +47,40 @@
 - gateway：`http::session_tree::tests`（分支只让新路径进模型、编辑/标签/命名、clone 在源会话清除后仍可读、摘要与压缩落成 entry）。
 - client：311 项，含 API 线格式与 TUI 状态。
 
-## 2. 待验证与未完成
+## 2. 验证结果与剩余缺口
 
-### 2.1 真机端到端（未做）
+### 2.1 端到端场景（已用集成测试覆盖，2026-10-23）
 
-用真实 Gateway 与 TUI 走一遍，期望都成立才算验证：
+测试在 `komo-gateway/src/http/session_tree/tests.rs`，走真实 `service::start`、真实 HTTP、真实 state.db 与 JSONL，模型是脚本化替身。
 
-1. 发两轮对话，`/tree` 选第一条用户消息：输入框回填原文，提交后出现兄弟分支；旧分支仍在树里；模型请求里没有旧分支内容。
-2. 切回旧分支继续对话，两条线互不串上下文。
-3. 一条 Run 运行中重启 Gateway：恢复后按该 Run 自己的路径继续，工具不重放。
-4. `/clone`、`/fork` 后对源会话 `delete` + `purge`：新会话仍能读历史、工具输出和产物。
-5. 运行中、压缩中执行 `/tree`：被拒绝并给出原因。
+| 场景 | 测试 |
+|---|---|
+| 编辑历史输入形成兄弟分支，模型只看新路径 | `navigating_and_editing_an_input_creates_a_sibling_that_alone_reaches_the_model` |
+| 重启后分支与位置不变，之后的请求仍只带当前路径 | `a_branch_and_its_current_position_survive_a_gateway_restart` |
+| 有未结束 Run 时导航、压缩、命名、fork 被拒（409） | `tree_changes_are_refused_while_a_run_is_unfinished` |
+| clone 后清除源会话，新会话仍可读且无可执行 Run | `cloned_messages_and_artifacts_survive_source_purge_without_copying_executable_runs` |
+| 标签、命名、`context_edit` 只改模型视图，原记录保留 | `context_edits_and_labels_preserve_raw_history_and_apply_only_on_the_selected_path` |
+| 分支摘要与压缩落成 entry | `summaries_and_compaction_are_entries_on_the_new_path` |
+| 执行恢复（重启接续、调用不重放） | 既有 `tests/recovery`、`tests/agents` 等，树格式下全部通过 |
 
-### 2.2 手动分支摘要与 `/compact`（未做）
+### 2.2 手动分支摘要与 `/compact`（已完成）
 
-`session_tree.rs::summarize` 把原始 entry 的 JSON 逐行当文本发给模型。应改为经 `compaction::assemble_tree_context` 取已投影的上下文，再用 `context::compaction::summary_request` 构造请求，使摘要输入与模型实际看到的一致（含工具结果投影与图片）。验收：摘要请求里不出现 entry 的 JSON 字段名，工具结果按投影视图出现。
+摘要输入改为 pi 的 `serializeConversation` 形状（`komo_agent::context::compaction::serialize_conversation`）：`[User]` / `[Assistant]` / `[Assistant tool calls]` / `[Tool result]`，思考块不进，工具结果截到 2000 字符；系统提示用 pi 的结构化摘要格式（`TREE_SUMMARY_INSTRUCTIONS`）。分支摘要只序列化被放弃的那一段（重新挂根后投影，不带共享祖先）；`/compact` 序列化整条当前分支的投影。
 
-### 2.3 旧会话迁移（仅单元覆盖）
+### 2.3 旧会话（已用手写旧格式夹具验证）
 
-旧记录（无 entry）读取时由 `TreeState` 现算 entry。需要用真实旧目录验证：
+`a_pre_tree_session_is_browsable_without_rewriting_and_continues_in_the_same_tree`：只读浏览不改文件；继续对话后旧字节是前缀、旧上下文进模型；新记录 `v:2` 且无 `seq`，旧二进制按线性日志解析会失败。
 
-1. 复制一份有工具调用、插话、压缩、已 `approval.*` 事件的旧会话。
-2. 只读浏览（`GET …/tree`、`events`）不改写文件。
-3. 在其上继续对话后，旧部分与新部分在同一棵树里，`resume` 正常。
-4. 旧二进制打开含新记录的会话时明确报错，而不是静默读出线性历史。
+### 2.4 设计文档（已完成）
 
-### 2.4 设计文档里的旧规则（未改）
+`docs/komo_bot.md` §8.3 的回放规则已改写为按分支路径，压缩段落标注了新范围，§8.11 写明状态，§14 增加了“Session 树验收”。
 
-`docs/komo_bot.md` §8.3“历史 Run 只发布两件事…”及“压缩只处理当前 Run”相关段落正文还在，与 §1.2 冲突；§14 也没有对应验收行。需要：在这些段落标注“已被 §8.11 取代”并改写，在 §14 加入 2.1–2.3 的验收条目和结果。
+### 2.5 仍未验证
+
+- 真实模型 provider（只用了脚本化替身）。
+- 真人在交互式 TUI 里的操作：客户端只有单元与线格式测试（311 项），没有驱动真实终端。
+- 线上积累的真实旧会话目录：只有按旧格式手写的夹具。
+- 被取消 / 失败留下的半轮调用在完整回放下不触发 provider 400：只有 `repair_pending` 的单元测试，没有真实 provider 验证。
 
 ## 3. 已知取舍
 

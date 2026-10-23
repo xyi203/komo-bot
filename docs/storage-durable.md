@@ -1,6 +1,6 @@
 # 存储重设计：整套采用 pi-durable 的提交模型
 
-> 状态：**已拍板（2026-10-23），未实现**；§11 的决定全部定了，D0 基准已测（§10），下一步 D1。实现完成后改写 `docs/komo_bot.md` §8，本文留作推导记录。
+> 状态：**实现中（2026-10-23）**。D0–D3、D4a、D4b 已完成并合入 `main`，下一步 D4c；进度与实现中的偏离见 §13。新旧代码并存，新存储还没接到 gateway。全部完成后改写 `docs/komo_bot.md` §8，本文留作推导记录。
 >
 > 对照基线：本机 `../pi` 提交 `8efd314fa` 的 `packages/durable`（`docs/spec.md` 为规范，`README.md`）。
 > pi-durable 自称 **Experimental**，API 随版本变；pi coding-agent 在这个提交上**并不依赖它**（仍是
@@ -360,10 +360,12 @@ pi-durable 没有删除。komo 保留 `closing → deleted → purged`：
 | 阶段 | 内容 | 验收 |
 |---|---|---|
 | D0 基准（**已完成 2026-10-23**） | 在 Turso 上测单线提交吞吐（每次 fsync）、节流进度的写放大、MVCC vs WAL | 数字写回本文 §10 |
-| D1 kernel 模型（**已完成 2026-10-23**，分支 `worktree-agent-a4d253c12a28d49e6`） | entry / conversation / task / submission / document 值类型，上下文推导（§2.1 规则 1–10），fork 遍历，`Storage` trait，内存实现 + conformance 用例 | 移植 pi-durable 的上下文与 fork 用例全部通过 |
-| D2 store（**已完成 2026-10-23**，分支 `worktree-agent-a6a91579496b9a658`） | `Line` + Turso `Storage`，新表 DDL 与字节对等测试，blob 写入顺序 | conformance 在 Turso 上通过；崩溃注入（提交前 / 后杀进程）后重开一致 |
-| D3 任务调度（**已完成 2026-10-23**，分支 `worktree-agent-a892138486df40e22`） | 任务状态机、step 规则、reservation / reconciliation、waiting / completing / abort 自底向上 | 移植 pi-durable 的 child-tasks / abort / restart 示例 |
-| D4 生成与工具（无状态模型调用 D4a **已完成 2026-10-23**，分支 `worktree-agent-a980c2d14079302d0`） | `komo.generation` / `komo.tool` / `komo.compaction`，收件箱与 boundary，`komo.live` 节流 | 现有 `tests/recovery`、`tests/agents` 改写后通过；§8.6 重放表逐行有测试 |
+| D1 kernel 模型（**已完成 2026-10-23**） | entry / conversation / task / submission / document 值类型，上下文推导（§2.1 规则 1–10），fork 遍历，`Storage` trait，内存实现 + conformance 用例 | 移植 pi-durable 的上下文与 fork 用例全部通过 |
+| D2 store（**已完成 2026-10-23**） | `Line` + Turso `Storage`，新表 DDL 与字节对等测试，blob 写入顺序 | conformance 在 Turso 上通过；崩溃注入（提交前 / 后杀进程）后重开一致 |
+| D3 任务调度（**已完成 2026-10-23**） | 任务状态机、step 规则、reservation / reconciliation、waiting / completing / abort 自底向上 | 移植 pi-durable 的 child-tasks / abort / restart 示例 |
+| D4a 无状态模型调用（**已完成 2026-10-23**） | 三家 provider 的 `ModelStream::stream`：每次给完整 context，返回一条 assistant 消息；路由 `RoutingStream` | 请求体与旧的有状态 driver 逐字节相同 |
+| D4b 生成与工具（**已完成 2026-10-23**） | `komo.generation` / `komo.tool`，收件箱与 boundary，`komo.live` 节流 | §5 恢复表逐行有测试；§8.6 中断正文逐字一致 |
+| D4c 压缩与其余工具 | `komo.compaction`（阻塞与后台）、衰减写成 `edits`、上下文超长时压缩重试、codemode 嵌套调用、编排工具（`task` / `monitor`）、子进程 probe 阶段 | 现有 `tests/recovery`、`tests/agents` 的对应场景改写后通过 |
 | D5 gateway 与树 | 会话树映射到 fork、HTTP / SSE 改读新存储、`task` / cron / 投递 | §8.11 的端到端测试（`session_tree/tests.rs`）原样通过 |
 | D6 导出 | `komo session export SESSION_ID`：输出 pi v3 树形 JSONL（带 blob 引用）；不导入旧会话（§8） | 导出的文件能被 pi 的 session-manager 读入，分支与当前位置一致 |
 | D7 收尾 | 删旧 ledger 代码，改写 `docs/komo_bot.md` §8、AGENTS.md 结构规则、§14 验收表 | — |
@@ -517,3 +519,41 @@ finalize     → blob 收尾同步 → 提交结果 entry（projection.rs 的 fu
 - §9 的 D3（任务调度）保留；D4 是"generation / tool / compaction 三个任务 + 收件箱与 boundary + 无状态 driver"。
 - 结论：**存储与执行都照 pi-durable；每个任务阶段里的逻辑按 pi agent loop 的钩子组织**，读代码时能对着
   `runLoop` 一段段找到。
+
+## 13. 实现进度与偏离（2026-10-23）
+
+### 13.1 已合入 `main` 的部分
+
+| 阶段 | 位置 | 测试 |
+|---|---|---|
+| D1 | `crates/komo-kernel/src/durable/`（`ids` `message` `records` `context` `fork` `storage` `memory` `conformance`） | 34 项；conformance 24 个用例 |
+| D2 | `crates/komo-store/src/durable/`（`schema` `write` `line` `ids` `blob` `storage` `crash_tests`） | 22 项，含 Turso 上的 conformance 与崩溃注入 |
+| D3 | `crates/komo-kernel/src/durable/task/`（纯逻辑）、`crates/komo-runtime/src/durable/`（`line` `tx` `kind` `runtime` `scheduler` `engine`） | kernel 37 项、runtime 52 项 |
+| D4a | `crates/komo-runtime/src/llm/{model_stream,routing_stream,stream_tests}.rs`、各 provider 的 `stateless.rs` | 字节等价：9 种场景 × 3 家 |
+| D4b | `crates/komo-runtime/src/durable/harness/`（`hooks` `inbox` `live` `system` `generation` `tool` `submit` `entries`） | 约 50 项 |
+
+合入时（`durable-integration` 分支）强制重编后 `cargo test --workspace`：**2558 通过，0 失败**。
+
+### 13.2 实现与本文的偏离（都已接受）
+
+- **document 只存当前值**（D1）：没有历史，所以 fork 无法按 `asOf` 复制 document（§3.3 里 `komo.agent` 那一行）。fork 时怎么带 document，D5 定。
+- **同一 conversation 里 `request_id` 重复会被拒绝**（D1）：pi 的内存后端静默覆盖；这里更严。
+- **ID 上限 `i64::MAX`**（D1）：数据库整数列是有符号 64 位。
+- **进度提交是显式的**：`Storage::commit_progress`（D2）与 `Tx::mark_progress`（集成时改）。不按"整批都是 document 改动"推断——只改 document 的提交也可能是已确认给客户端的结构性改动。
+- **校验失败只拒绝这一笔、线照常可用；只有引擎 / IO 错误让线失败**（D2）。pi 把所有存储错误都当致命。
+- **新库的写走裸 `turso::Connection`**，不经 toasty：要逐次切 `PRAGMA synchronous`，连接池做不到。裸 SQL 在 `komo-store/src/durable/{schema,write,line,storage}.rs`；AGENTS.md"裸 SQL 只许在三个模块"这条在 D7 改写。
+- **Task 引擎的所有权索引更简单**（D3）：不做 pi 的候选集增量裁剪，每轮扫活任务、从已提交记录重新推出标记。取消用 `CancellationToken`；阶段里的 panic 按错误处理。
+- **工具轮按组执行**（D4b）：连续的只读调用一组并行，其他调用各自一组顺序执行；pi 只有全并行 / 全顺序。
+- **不可用的工具也建工具任务**（D4b），结果经输出存储落盘，视图与今天一致；pi 直接在生成提交里写结果。
+- **工具输出路径是 `tool-output/{conversation}/{tool_task}/{attempt}/`**（D4b），不是 §3.5 的两级，复用现有输出存储。
+- **`komo.usage` 没做**（D4b）：预算用的轮数与 token 记在 `komo.live.run`。新增未答原因 `budget`。
+- **意图 checkpoint 存完整 `ExecutionPlan`**（D4b），Safe 重跑用原计划。
+- **Anthropic 衰减时的额外缓存断点**要调用方传 `revised_from`（D4a），对应旧 driver 的行为。
+
+### 13.3 已知缺口（按阶段）
+
+- **D4c**：上下文超长现在直接 `model_error` 失败，要接压缩；衰减视图已存在结果 entry 的 `data.decayed`，等压缩决策写 `edits`；codemode、`task`、`monitor` 还没有执行路径；`komo.live.tools[].pid` 没人写。
+- **D5**：gateway 实现 `AgentHooks`（`ToolExecutor::tools()` 要公开）；`RoutedOutputs` 要转发 `ToolOutputStore::find_published`，否则"盘上已有完整输出就复用"在 gateway 里不生效；`conversations.session_id` 现在总是 NULL，`/tree` 按 Session 查分支时补；`TursoStorage` 的读共用一条连接，读多了再换连接池；新存储至今只在 `MemoryStorage` 上跑过生成与工具任务，Turso 接线没测。
+- **崩溃安全**：进度提交 `synchronous=OFF` 后"进程崩溃不丢"是按机制推的，崩溃注入测试只跑在 tmpfs 上，没有真盘掉电验证。
+- **开发环境**：多个 worktree 共用一个 `target/` 时，cargo 可能复用别的 worktree 编出来的 crate；共享 target 跑测试前先 `touch crates/*/src/lib.rs`。
+

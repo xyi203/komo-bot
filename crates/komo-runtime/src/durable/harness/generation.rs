@@ -735,6 +735,7 @@ async fn commit_partials(
         let committed = rt
             .commit(move |tx, _| {
                 Box::pin(async move {
+                    tx.mark_progress();
                     let mut live = live::load(tx, conversation).await?;
                     let generation = live.generation.get_or_insert(GenerationLive {
                         attempt,

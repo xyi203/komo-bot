@@ -878,6 +878,7 @@ async fn commit_output(
         let committed = rt
             .commit(move |tx, task| {
                 Box::pin(async move {
+                    tx.mark_progress();
                     let mut live = live::load(tx, conversation).await?;
                     let Some(slot) = live.slot_mut(task.id()) else {
                         return Ok(None);

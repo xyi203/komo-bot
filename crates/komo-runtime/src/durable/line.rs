@@ -227,6 +227,7 @@ impl Line {
             Ok(value) => value,
             Err(error) => return Err(self.settle_error(error)),
         };
+        let progress = tx.is_progress();
         let writes = match tx.assemble().await {
             Ok(writes) => writes,
             Err(error) => return Err(self.settle_error(error)),
@@ -234,7 +235,7 @@ impl Line {
         if writes.is_empty() {
             return Ok(value);
         }
-        match self.commit_to_storage(&writes).await {
+        match self.commit_to_storage(&writes, progress).await {
             Ok(seq) => {
                 self.publish(Publication { seq, writes });
                 Ok(value)
@@ -248,18 +249,15 @@ impl Line {
 
     /// 唯一调 `Storage::commit` / `Storage::commit_progress` 的地方。
     ///
-    /// 进度类提交——只有 `DocumentChange`（整值替换 document，§3.6）——走
-    /// `commit_progress`，后端可以用更低的落盘档位；任何一条别的写入（entry、任务、
-    /// submission、document 的建与退役）都让整批是结构性提交，走 `commit`。
+    /// 只有用 [`Tx::mark_progress`] 声明过的提交走 `commit_progress`（§3.6，后端不
+    /// fsync）；其余一律走 `commit`。不按写入内容推断：只改 document 的提交也可能是
+    /// 已确认给客户端的结构性事实。声明了却混进别的写入，由存储拒绝。
     async fn commit_to_storage(
         &self,
         writes: &[StorageWrite],
+        progress: bool,
     ) -> Result<Seq, komo_kernel::durable::StorageError> {
-        if !writes.is_empty()
-            && writes
-                .iter()
-                .all(|write| matches!(write, StorageWrite::DocumentChange { .. }))
-        {
+        if progress {
             return self.shared.storage.commit_progress(writes).await;
         }
         self.shared.storage.commit(writes).await

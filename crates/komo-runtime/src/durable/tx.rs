@@ -109,6 +109,7 @@ pub struct Tx {
     tasks: BTreeMap<TaskId, (bool, TaskRecord)>,
     submissions: BTreeMap<SubmissionId, SubmissionRecord>,
     documents: HashMap<DocumentAddress, DocState>,
+    progress: bool,
 }
 
 impl Tx {
@@ -123,6 +124,7 @@ impl Tx {
             tasks: BTreeMap::new(),
             submissions: BTreeMap::new(),
             documents: HashMap::new(),
+            progress: false,
         }
     }
 
@@ -133,6 +135,18 @@ impl Tx {
     /// 本次提交的时刻（毫秒），也是任务 `started_at` / `ended_at` 的戳。
     pub fn now(&self) -> i64 {
         self.now
+    }
+
+    /// 声明这是一笔进度提交（§3.6）：走 `Storage::commit_progress`，不 fsync。只给节流写
+    /// `komo.live` 进度的地方用；整批必须只有 document 整值替换，否则存储拒绝这笔提交。
+    /// 不声明的提交一律是结构性的——哪怕碰巧只改了 document（inbox、agent 设置这类改动
+    /// 已经确认给客户端，掉电不能丢），所以这里不按写入内容去猜。
+    pub fn mark_progress(&mut self) {
+        self.progress = true;
+    }
+
+    pub(super) fn is_progress(&self) -> bool {
+        self.progress
     }
 
     // ------------------------------------------------------------- 表读

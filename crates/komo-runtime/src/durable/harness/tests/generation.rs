@@ -530,3 +530,57 @@ async fn the_request_checkpoint_pins_the_model_cutoff_and_limits() {
     world.harness.wait(&engine, id).await.unwrap();
     engine.close().await.unwrap();
 }
+
+/// §3.6：只有声明了 `mark_progress` 的提交走 `commit_progress`。一笔只改 document、
+/// 但没声明的提交（例如 inbox 或 agent 设置这类已经确认给客户端的改动）仍是结构性的。
+#[tokio::test(start_paused = true)]
+async fn only_a_declared_progress_commit_skips_the_durable_path() {
+    let world = World::new();
+    let engine = world.open().await;
+    let address = super::super::live::live_address(CONV);
+    let declared = engine
+        .commit(move |tx| {
+            Box::pin(async move {
+                tx.put_document(address, 1, json!({"step": 1})).await?;
+                Ok(())
+            })
+        })
+        .await;
+    declared.unwrap();
+    let before = world.storage.commit_log().len();
+    let address = super::super::live::live_address(CONV);
+    engine
+        .commit(move |tx| {
+            Box::pin(async move {
+                tx.put_document(address, 1, json!({"step": 2})).await?;
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+    let address = super::super::live::live_address(CONV);
+    engine
+        .commit(move |tx| {
+            Box::pin(async move {
+                tx.mark_progress();
+                tx.put_document(address, 1, json!({"step": 3})).await?;
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+    let log = world.storage.commit_log();
+    let undeclared = &log[before];
+    assert_eq!(undeclared.writes, ["document.change"], "{undeclared:?}");
+    assert!(
+        !undeclared.progress,
+        "an undeclared change stays structural"
+    );
+    let declared = &log[before + 1];
+    assert_eq!(declared.writes, ["document.change"], "{declared:?}");
+    assert!(
+        declared.progress,
+        "a declared progress commit uses commit_progress"
+    );
+    engine.close().await.unwrap();
+}

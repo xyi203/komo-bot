@@ -13,7 +13,7 @@ use serde_json::Value;
 use super::ids::{ConversationId, DocumentId, EntityId, EntryId, Seq, SubmissionId, TaskId};
 use super::records::{
     ConversationRecord, DocumentAddress, DocumentRecord, DocumentScope, EntryRecord,
-    SubmissionRecord, SubmissionStatus, TaskRecord, TaskStatus,
+    SessionLifecycle, SessionRecord, SubmissionRecord, SubmissionStatus, TaskRecord, TaskStatus,
 };
 
 /// 存储错误。除 [`StorageError::Request`] 之外都对打开它的 Session 是致命的（spec §10.1）：
@@ -207,6 +207,83 @@ pub struct DocumentQuery {
     pub kind: Option<String>,
 }
 
+/// 默认**降序**（最新的 Session 在前；UUIDv7 的字符串序就是创建序）。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SessionQuery {
+    pub lifecycle: Option<SessionLifecycle>,
+    pub order: Option<ScanOrder>,
+}
+
+/// Session 扫描的续扫位置：Session 的 id 是字符串，不能用数字 [`Cursor`]。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionCursor {
+    after: String,
+    order: ScanOrder,
+}
+
+impl SessionCursor {
+    pub fn new(after: impl Into<String>, order: ScanOrder) -> Self {
+        Self {
+            after: after.into(),
+            order,
+        }
+    }
+
+    pub fn after(&self) -> &str {
+        &self.after
+    }
+
+    pub fn order(&self) -> ScanOrder {
+        self.order
+    }
+}
+
+/// 一页 Session；`next` 为空表示没有更多。
+#[derive(Debug, Clone, PartialEq)]
+pub struct SessionPage {
+    pub items: Vec<SessionRecord>,
+    pub next: Option<SessionCursor>,
+}
+
+/// 解出 Session 扫描的方向与位置（规则同 [`scan_start`]）。
+pub fn session_scan_start(
+    requested: Option<ScanOrder>,
+    cursor: Option<&SessionCursor>,
+) -> StorageResult<(ScanOrder, Option<String>)> {
+    match cursor {
+        None => Ok((requested.unwrap_or(ScanOrder::Descending), None)),
+        Some(cursor) => match requested {
+            Some(requested) if requested != cursor.order => Err(StorageError::request(format!(
+                "the cursor continues a {:?} scan; the query asks for {:?}",
+                cursor.order, requested
+            ))),
+            _ => Ok((cursor.order, Some(cursor.after.clone()))),
+        },
+    }
+}
+
+/// 把最多 `limit + 1` 条已排好的 Session 切成一页。
+pub fn session_page_of(
+    mut values: Vec<SessionRecord>,
+    limit: usize,
+    order: ScanOrder,
+) -> SessionPage {
+    if values.len() <= limit {
+        return SessionPage {
+            items: values,
+            next: None,
+        };
+    }
+    values.truncate(limit);
+    let next = values
+        .last()
+        .map(|last| SessionCursor::new(last.id.clone(), order));
+    SessionPage {
+        items: values,
+        next,
+    }
+}
+
 /// entry 与创建它的提交序号。
 #[derive(Debug, Clone, PartialEq)]
 pub struct StoredEntry {
@@ -246,6 +323,25 @@ pub enum StorageWrite {
     DocumentRetire {
         id: DocumentId,
     },
+    /// komo Session：整条替换（id 是字符串，不占数字命名空间）。
+    Session(SessionRecord),
+}
+
+/// 进度提交只允许整值替换 document（§3.6）：落盘档位更低，混进别的写就等于把结构性事实
+/// 交给了不 fsync 的档位。不通过就是 [`StorageError::Rejected`]。
+pub fn check_progress(writes: &[StorageWrite]) -> StorageResult<()> {
+    if writes.is_empty() {
+        return Err(StorageError::rejected("an empty progress commit"));
+    }
+    if writes
+        .iter()
+        .any(|write| !matches!(write, StorageWrite::DocumentChange { .. }))
+    {
+        return Err(StorageError::rejected(
+            "a progress commit may only replace document values",
+        ));
+    }
+    Ok(())
 }
 
 // ------------------------------------------------------------------------ trait
@@ -258,6 +354,15 @@ pub enum StorageWrite {
 pub trait Storage: Send + Sync {
     /// 原子提交一批写入，返回这次提交的序号（严格递增，可有空洞）。任何一条被拒整批不生效。
     async fn commit(&self, writes: &[StorageWrite]) -> StorageResult<Seq>;
+
+    /// 进度提交：只允许 [`StorageWrite::DocumentChange`]（否则 `Rejected`），后端可以用
+    /// 更低的落盘档位（Turso：`synchronous=OFF`，下一次 `commit` 的 fsync 连带落盘；
+    /// 掉电最多丢到上一次 `commit` 之后的进度）。默认实现只做校验、照常 `commit`——
+    /// 不区分落盘的后端（内存）不必覆盖。**已经确认给客户端的结构性改动别走这条。**
+    async fn commit_progress(&self, writes: &[StorageWrite]) -> StorageResult<Seq> {
+        check_progress(writes)?;
+        self.commit(writes).await
+    }
 
     /// 在整个库唯一的数字命名空间里铸一个比已铸过、已存过的都大的 ID（跨重开也成立）。
     /// 铸成什么实体类型用 [`StorageExt::mint`]。
@@ -327,6 +432,15 @@ pub trait Storage: Send + Sync {
         limit: usize,
         cursor: Option<&Cursor>,
     ) -> StorageResult<Page<DocumentRecord>>;
+
+    async fn session(&self, id: &str) -> StorageResult<Option<SessionRecord>>;
+    /// 按 id（UUIDv7，即创建序）分页，可按生命周期过滤。
+    async fn scan_sessions(
+        &self,
+        query: &SessionQuery,
+        limit: usize,
+        cursor: Option<&SessionCursor>,
+    ) -> StorageResult<SessionPage>;
 
     /// 关闭之后所有操作都报 [`StorageError::Closed`]。
     async fn close(&self) -> StorageResult<()>;

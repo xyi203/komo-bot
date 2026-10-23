@@ -10,12 +10,14 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 use super::fork::{ForkError, fork_chain, is_visible, visible_entries};
 use super::ids::{ConversationId, DocumentId, EntryId, Seq, SubmissionId, TaskId};
 use super::records::{
-    ConversationRecord, DocumentAddress, DocumentRecord, EntryRecord, SubmissionRecord, TaskRecord,
+    ConversationRecord, DocumentAddress, DocumentRecord, EntryRecord, SessionRecord,
+    SubmissionRecord, TaskRecord,
 };
 use super::storage::{
     ConversationQuery, Cursor, DocumentQuery, EntryQuery, MAX_ID, Page, ScanOrder, ScanStart,
-    Storage, StorageError, StorageResult, StorageWrite, StoredEntry, SubmissionQuery, TaskQuery,
-    check_limit, page_of, scan_start,
+    SessionCursor, SessionPage, SessionQuery, Storage, StorageError, StorageResult, StorageWrite,
+    StoredEntry, SubmissionQuery, TaskQuery, check_limit, page_of, scan_start, session_page_of,
+    session_scan_start,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,6 +62,7 @@ struct State {
     submissions: BTreeMap<SubmissionId, SubmissionRecord>,
     requests: HashMap<(ConversationId, String), SubmissionId>,
     documents: BTreeMap<DocumentId, DocumentRecord>,
+    sessions: BTreeMap<String, SessionRecord>,
 }
 
 /// 内存里的 `Storage`。
@@ -89,6 +92,7 @@ impl MemoryStorage {
                 submissions: BTreeMap::new(),
                 requests: HashMap::new(),
                 documents: BTreeMap::new(),
+                sessions: BTreeMap::new(),
             }),
         }
     }
@@ -160,6 +164,7 @@ impl State {
                     self.collect_document_action(write, &mut actions)?;
                     continue;
                 }
+                StorageWrite::Session(_) => continue,
             };
             if id > MAX_ID {
                 return Err(StorageError::rejected(format!("ID {id} is out of range")));
@@ -340,6 +345,9 @@ impl State {
                             .insert((record.conversation, request.clone()), record.id);
                     }
                     self.submissions.insert(record.id, record.clone());
+                }
+                StorageWrite::Session(record) => {
+                    self.sessions.insert(record.id.clone(), record.clone());
                 }
                 StorageWrite::DocumentCreate(_)
                 | StorageWrite::DocumentChange { .. }
@@ -642,6 +650,52 @@ impl Storage for MemoryStorage {
                     .is_none_or(|wanted| &doc.address.kind == wanted)
         });
         Ok(page_of(values, limit, start.order, |doc| doc.id.get()))
+    }
+
+    async fn session(&self, id: &str) -> StorageResult<Option<SessionRecord>> {
+        Ok(self.open()?.sessions.get(id).cloned())
+    }
+
+    async fn scan_sessions(
+        &self,
+        query: &SessionQuery,
+        limit: usize,
+        cursor: Option<&SessionCursor>,
+    ) -> StorageResult<SessionPage> {
+        check_limit(limit)?;
+        let state = self.open()?;
+        let (order, after) = session_scan_start(query.order, cursor)?;
+        let keep = |record: &&SessionRecord| {
+            query
+                .lifecycle
+                .is_none_or(|wanted| record.lifecycle == wanted)
+        };
+        let values: Vec<SessionRecord> = match order {
+            ScanOrder::Ascending => {
+                let lower = after.as_deref().map_or(Bound::Unbounded, Bound::Excluded);
+                state
+                    .sessions
+                    .range::<str, _>((lower, Bound::Unbounded))
+                    .map(|(_, record)| record)
+                    .filter(keep)
+                    .take(limit + 1)
+                    .cloned()
+                    .collect()
+            }
+            ScanOrder::Descending => {
+                let upper = after.as_deref().map_or(Bound::Unbounded, Bound::Excluded);
+                state
+                    .sessions
+                    .range::<str, _>((Bound::Unbounded, upper))
+                    .rev()
+                    .map(|(_, record)| record)
+                    .filter(keep)
+                    .take(limit + 1)
+                    .cloned()
+                    .collect()
+            }
+        };
+        Ok(session_page_of(values, limit, order))
     }
 
     async fn close(&self) -> StorageResult<()> {

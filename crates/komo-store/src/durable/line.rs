@@ -5,19 +5,22 @@
 //!
 //! 三条纪律：
 //!
-//! - **存储错误让整条线失败**（spec §10.1）：任何 SQL / 提交错误都先 `ROLLBACK`，再把线置为
+//! - **校验失败与存储故障分开**：能在事务里通过读判出来的失败（见 [`super::write`] 的模块文档）是
+//!   [`LineError::Rejected`]——`ROLLBACK`、线保持健康、不占 seq；提交前的检查
+//!   （Progress 混入别的写、同批重复的 document 命令）同属此类。
+//! - **存储错误让整条线失败**（spec §10.1）：引擎或 I/O 的错误先 `ROLLBACK`，再把线置为
 //!   失败，此后所有 `commit` 返回**同一个**错误。提交了没有是未知的，重开是唯一干净的判断方式。
-//!   提交前的检查（空提交、Progress 混入别的写）是调用方的错，不让线失败。
 //! - **提交里没有外部 await**：线只收已准备好的 [`Write`]（或一个同步闭包，见
 //!   [`Line::commit_with`]），形状上就做不到在事务里等模型、子进程、文件同步或用户。
-//! - **seq 严格递增**：每次成功提交 +1，随事务写进 `durable_meta.last_seq`，重开后接着走。
-//!   失败的提交不占号（线随即失败，号也无处可用）。
+//!
+//! seq 严格递增：每次成功提交 +1，随事务写进 `durable_meta.last_seq`，重开后接着走；
+//! 被拒的提交不占号。
 //!
 //! 落盘档位（§3.6）：`Structural` 提交前把 `synchronous` 设为 FULL，`Progress` 设为 OFF；
 //! 只在档位变化时才发 pragma。
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicI64;
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use thiserror::Error;
@@ -26,20 +29,20 @@ use turso::{Connection, Database, Value};
 
 use super::ids::{self, IdMint};
 use super::schema::{self, META_LAST_SEQ};
-use super::write::{self, CommitKind, Write};
+use super::write::{self, ApplyError, CommitKind, Write};
 
 /// 提交序号：从 1 起，严格递增，重开后接续。
 pub type Seq = u64;
 
 #[derive(Debug, Clone, Error, PartialEq, Eq)]
 pub enum LineError {
-    /// 提交前被拒（调用方的错）。线不受影响。
+    /// 提交被拒（调用方的错，或事务内读出的校验失败）。线不受影响，整批没有生效。
     #[error("提交被拒：{0}")]
     Rejected(String),
     /// 存储错误。线已失败，之后所有提交都返回这同一条。
     #[error("存储错误，提交线已失败：{0}")]
     Failed(String),
-    /// 线已关闭（任务已退出）。
+    /// 线已关闭（[`Line::close`] 之后，或任务已退出）。
     #[error("提交线已关闭")]
     Closed,
     /// 打开库文件失败。
@@ -52,19 +55,25 @@ pub enum LineError {
 
 type Build = Box<dyn for<'a> FnOnce(&mut IdMint<'a>) -> Vec<Write> + Send>;
 
-struct Request {
-    kind: CommitKind,
-    build: Build,
-    reply: oneshot::Sender<Result<Seq, LineError>>,
+enum Request {
+    Commit {
+        kind: CommitKind,
+        build: Build,
+        reply: oneshot::Sender<Result<Seq, LineError>>,
+    },
+    Close {
+        done: oneshot::Sender<()>,
+    },
 }
 
 struct Shared {
     database: Database,
     path: PathBuf,
-    /// 已分配的最大 ID。
+    /// 已分配（或已落库）的最大 ID。
     ids: AtomicI64,
     /// 线的失败原因；一旦置上就不再改。
     failed: Mutex<Option<LineError>>,
+    closed: AtomicBool,
 }
 
 impl Shared {
@@ -99,7 +108,8 @@ impl Line {
 
     pub async fn open_file(path: &Path) -> Result<Line, LineError> {
         let (database, conn) = schema::open(path).await?;
-        let max_id = max_id(&conn).await?;
+        // 1 留给根 conversation：取号从 2 起。
+        let max_id = max_id(&conn).await?.max(1);
         let last_seq = schema::query_one_text(
             &conn,
             &format!("SELECT value FROM durable_meta WHERE name = '{META_LAST_SEQ}'"),
@@ -113,6 +123,7 @@ impl Line {
             path: path.to_path_buf(),
             ids: AtomicI64::new(max_id),
             failed: Mutex::new(None),
+            closed: AtomicBool::new(false),
         });
         let (tx, rx) = mpsc::channel(256);
         tokio::spawn(run(
@@ -146,9 +157,17 @@ impl Line {
         ids::next(&self.shared.ids)
     }
 
+    /// 同 [`Line::mint_id`]，但 ID 空间（有符号 64 位）用尽时是 `None`，不回绕。
+    pub fn try_mint_id(&self) -> Option<i64> {
+        ids::try_next(&self.shared.ids)
+    }
+
     /// 一条只读连接（同一 `turso::Database`）。WAL 下读不阻塞写，也不被写阻塞；
-    /// 读到的是某个已提交状态。
+    /// 读到的是某个已提交状态。关闭之后是 `Closed`。
     pub fn read_connection(&self) -> Result<Connection, LineError> {
+        if self.shared.closed.load(Ordering::SeqCst) {
+            return Err(LineError::Closed);
+        }
         self.shared
             .database
             .connect()
@@ -164,13 +183,25 @@ impl Line {
         &self.shared.path
     }
 
+    /// 关闭：等线任务把已排队的提交处理完、释放写连接，之后所有操作返回 `Closed`。幂等。
+    pub async fn close(&self) {
+        self.shared.closed.store(true, Ordering::SeqCst);
+        let (done, wait) = oneshot::channel();
+        if self.tx.send(Request::Close { done }).await.is_ok() {
+            let _ = wait.await;
+        }
+    }
+
     async fn send(&self, kind: CommitKind, build: Build) -> Result<Seq, LineError> {
+        if self.shared.closed.load(Ordering::SeqCst) {
+            return Err(LineError::Closed);
+        }
         if let Some(error) = self.shared.failure() {
             return Err(error);
         }
         let (reply, wait) = oneshot::channel();
         self.tx
-            .send(Request { kind, build, reply })
+            .send(Request::Commit { kind, build, reply })
             .await
             .map_err(|_| LineError::Closed)?;
         wait.await.map_err(|_| LineError::Closed)?
@@ -186,12 +217,21 @@ struct Writer {
 
 async fn run(mut rx: mpsc::Receiver<Request>, mut writer: Writer, shared: Arc<Shared>) {
     while let Some(request) = rx.recv().await {
-        let result = match shared.failure() {
-            Some(error) => Err(error),
-            None => writer.process(&shared, request.kind, request.build).await,
-        };
-        // 调用方已经不等了也无妨：提交已经发生或已经失败，结果只是没人收。
-        let _ = request.reply.send(result);
+        match request {
+            Request::Commit { kind, build, reply } => {
+                let result = match shared.failure() {
+                    Some(error) => Err(error),
+                    None => writer.process(&shared, kind, build).await,
+                };
+                // 调用方已经不等了也无妨：提交已经发生或已经失败，结果只是没人收。
+                let _ = reply.send(result);
+            }
+            Request::Close { done } => {
+                drop(writer);
+                let _ = done.send(());
+                return;
+            }
+        }
     }
 }
 
@@ -208,20 +248,36 @@ impl Writer {
         match self.commit(kind, &writes).await {
             Ok(seq) => {
                 self.seq = seq;
+                // 取号器越过这批写落下的最大 ID（调用方可以自己挑 ID）。
+                if let Some(max) = writes.iter().filter_map(Write::minted_id).max() {
+                    shared.ids.fetch_max(max, Ordering::SeqCst);
+                }
                 Ok(seq)
             }
-            Err(message) => {
+            Err(ApplyError::Rejected(message)) => {
+                // 校验没过：整批回滚，线照常。回滚本身失败就是引擎故障。
+                match self.conn.execute("ROLLBACK", ()).await {
+                    Ok(_) => Err(LineError::Rejected(message)),
+                    Err(error) => Err(self.fail(shared, format!("ROLLBACK：{error}"))),
+                }
+            }
+            Err(ApplyError::Engine(message)) => {
                 // 先回滚；回滚本身失败也无所谓——线马上就是失败态，重开才是判断。
                 let _ = self.conn.execute("ROLLBACK", ()).await;
-                let error = LineError::Failed(message);
-                tracing::error!(%error, "提交线失败");
-                *shared.failed.lock().unwrap_or_else(|e| e.into_inner()) = Some(error.clone());
-                Err(error)
+                Err(self.fail(shared, message))
             }
         }
     }
 
-    async fn commit(&mut self, kind: CommitKind, writes: &[Write]) -> Result<Seq, String> {
+    fn fail(&self, shared: &Shared, message: String) -> LineError {
+        let error = LineError::Failed(message);
+        tracing::error!(%error, "提交线失败");
+        *shared.failed.lock().unwrap_or_else(|e| e.into_inner()) = Some(error.clone());
+        error
+    }
+
+    async fn commit(&mut self, kind: CommitKind, writes: &[Write]) -> Result<Seq, ApplyError> {
+        let engine = |what: &str, e: turso::Error| ApplyError::Engine(format!("{what}：{e}"));
         if self.sync != kind {
             let pragma = match kind {
                 CommitKind::Structural => "PRAGMA synchronous = FULL",
@@ -230,16 +286,17 @@ impl Writer {
             self.conn
                 .execute(pragma, ())
                 .await
-                .map_err(|e| format!("{pragma}：{e}"))?;
+                .map_err(|e| engine(pragma, e))?;
             self.sync = kind;
         }
         let seq = self.seq + 1;
         self.conn
             .execute("BEGIN", ())
             .await
-            .map_err(|e| format!("BEGIN：{e}"))?;
-        for write in writes {
-            write.apply(&self.conn, seq as i64).await?;
+            .map_err(|e| engine("BEGIN", e))?;
+        let batch = write::ordered(writes);
+        for write in &batch.ordered {
+            write.apply(&self.conn, seq as i64, &batch).await?;
         }
         self.conn
             .execute(
@@ -247,11 +304,11 @@ impl Writer {
                 [Value::Text(seq.to_string())],
             )
             .await
-            .map_err(|e| format!("last_seq：{e}"))?;
+            .map_err(|e| engine("last_seq", e))?;
         self.conn
             .execute("COMMIT", ())
             .await
-            .map_err(|e| format!("COMMIT：{e}"))?;
+            .map_err(|e| engine("COMMIT", e))?;
         Ok(seq)
     }
 }
@@ -304,6 +361,7 @@ mod tests {
             scope_kind: "conversation".into(),
             owner_id: 1,
             key_value: String::new(),
+            version: 1,
             value: value.into(),
         }
     }
@@ -348,13 +406,13 @@ mod tests {
     async fn ids_continue_from_the_largest_stored_id_across_all_entity_tables() {
         let dir = tempfile::tempdir().unwrap();
         let line = Line::open(dir.path()).await.unwrap();
-        assert_eq!(line.mint_id(), 1);
+        assert_eq!(line.mint_id(), 2, "1 留给根 conversation");
         line.commit(CommitKind::Structural, vec![entry(5, 1), doc(9, "{}")])
             .await
             .unwrap();
         line.commit(
             CommitKind::Structural,
-            vec![Write::InsertSubmission {
+            vec![Write::UpsertSubmission {
                 id: 12,
                 conversation_id: 1,
                 request_id: Some("r1".into()),
@@ -402,7 +460,7 @@ mod tests {
             else {
                 panic!("列类型不对")
             };
-            assert_eq!(id, n);
+            assert_eq!(id, n + 1);
             assert_eq!(seq, n);
         }
         assert_eq!(n, 8);
@@ -420,6 +478,7 @@ mod tests {
                 CommitKind::Progress,
                 vec![
                     Write::ReplaceDocument {
+                        version: 1,
                         id: 1,
                         value: "{\"p\":1}".into(),
                     },
@@ -436,6 +495,7 @@ mod tests {
             .commit(
                 CommitKind::Progress,
                 vec![Write::ReplaceDocument {
+                    version: 1,
                     id: 1,
                     value: "{\"p\":2}".into(),
                 }],
@@ -446,46 +506,41 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_failing_transaction_rolls_back_and_fails_the_line_with_the_same_error() {
+    async fn a_rejected_batch_rolls_back_without_failing_the_line_or_using_a_seq() {
         let dir = tempfile::tempdir().unwrap();
         let line = Line::open(dir.path()).await.unwrap();
         line.commit(CommitKind::Structural, vec![entry(1, 1)])
             .await
             .unwrap();
 
-        // 第二条写主键冲突：第一条（entry 2）必须随事务回滚。
-        let first = line
+        // 第二条写重复了 entry 1（不可变）：第一条（entry 2）必须随事务回滚。
+        let error = line
             .commit(CommitKind::Structural, vec![entry(2, 1), entry(1, 1)])
             .await
             .unwrap_err();
-        assert!(matches!(first, LineError::Failed(_)), "{first:?}");
+        assert!(matches!(error, LineError::Rejected(_)), "{error:?}");
+        assert_eq!(line.failure(), None);
         assert_eq!(count(&line, "SELECT COUNT(*) FROM entries").await, 1);
 
-        // 此后所有提交——哪怕本身没问题——都返回同一个错误。
-        let again = line
-            .commit(CommitKind::Structural, vec![entry(3, 1)])
-            .await
-            .unwrap_err();
-        let progress = line
+        // 同一个数字不能同时当两种实体。
+        let error = line
             .commit(
-                CommitKind::Progress,
-                vec![Write::ReplaceDocument {
+                CommitKind::Structural,
+                vec![Write::UpsertTask {
                     id: 1,
-                    value: "{}".into(),
+                    conversation_id: 1,
+                    kind: "k".into(),
+                    status: "pending".into(),
+                    abort_requested: false,
+                    background: false,
+                    record: "{}".into(),
                 }],
             )
             .await
             .unwrap_err();
-        assert_eq!(again, first);
-        assert_eq!(progress, first);
-        assert_eq!(line.failure(), Some(first));
-        assert_eq!(count(&line, "SELECT COUNT(*) FROM entries").await, 1);
+        assert!(matches!(error, LineError::Rejected(_)), "{error:?}");
 
-        // 重开：失败前的提交都在，seq 没被失败的提交占用。
-        drop(line);
-        tokio::task::yield_now().await;
-        let line = Line::open(dir.path()).await.unwrap();
-        assert_eq!(count(&line, "SELECT COUNT(*) FROM entries").await, 1);
+        // 线照常工作，seq 没被被拒的提交占用。
         assert_eq!(
             line.commit(CommitKind::Structural, vec![entry(2, 1)])
                 .await
@@ -495,21 +550,62 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn updating_a_missing_row_fails_the_commit_instead_of_silently_doing_nothing() {
+    async fn changing_a_missing_or_retired_document_is_rejected_and_the_line_stays_healthy() {
         let dir = tempfile::tempdir().unwrap();
         let line = Line::open(dir.path()).await.unwrap();
-        let error = line
+        for id in [7, 8] {
+            let error = line
+                .commit(
+                    CommitKind::Structural,
+                    vec![entry(1, 1), Write::RetireDocument { id }],
+                )
+                .await
+                .unwrap_err();
+            assert!(matches!(error, LineError::Rejected(_)), "{error:?}");
+        }
+        assert_eq!(line.failure(), None);
+        assert_eq!(count(&line, "SELECT COUNT(*) FROM entries").await, 0);
+    }
+
+    /// 引擎故障（这里：表被人从外面拿走）才让线失败，且之后一直是同一个错误。
+    #[tokio::test]
+    async fn an_engine_error_fails_the_line_for_good() {
+        let dir = tempfile::tempdir().unwrap();
+        let line = Line::open(dir.path()).await.unwrap();
+        line.commit(CommitKind::Structural, vec![entry(1, 1)])
+            .await
+            .unwrap();
+        line.read_connection()
+            .unwrap()
+            .execute("DROP TABLE tasks", ())
+            .await
+            .unwrap();
+        let first = line
             .commit(
                 CommitKind::Structural,
-                vec![Write::UpdateSubmission {
-                    id: 7,
-                    status: "done".into(),
-                    record: "{}".into(),
-                }],
+                vec![
+                    entry(2, 1),
+                    Write::UpsertTask {
+                        id: 3,
+                        conversation_id: 1,
+                        kind: "k".into(),
+                        status: "pending".into(),
+                        abort_requested: false,
+                        background: false,
+                        record: "{}".into(),
+                    },
+                ],
             )
             .await
             .unwrap_err();
-        assert!(matches!(error, LineError::Failed(_)), "{error:?}");
+        assert!(matches!(first, LineError::Failed(_)), "{first:?}");
+        assert_eq!(
+            line.commit(CommitKind::Structural, vec![entry(4, 1)])
+                .await
+                .unwrap_err(),
+            first
+        );
+        assert_eq!(count(&line, "SELECT COUNT(*) FROM entries").await, 1);
     }
 
     #[tokio::test]
@@ -547,7 +643,7 @@ mod tests {
                     background: false,
                     record: "{\"v\":1}".into(),
                 },
-                Write::InsertSubmission {
+                Write::UpsertSubmission {
                     id: 5,
                     conversation_id: 1,
                     request_id: Some("req".into()),
@@ -578,8 +674,10 @@ mod tests {
                     background: false,
                     record: "{\"v\":2}".into(),
                 },
-                Write::UpdateSubmission {
+                Write::UpsertSubmission {
                     id: 5,
+                    conversation_id: 1,
+                    request_id: Some("req".into()),
                     status: "done".into(),
                     record: "{\"a\":1}".into(),
                 },
@@ -597,6 +695,7 @@ mod tests {
         line.commit(
             CommitKind::Progress,
             vec![Write::ReplaceDocument {
+                version: 1,
                 id: 6,
                 value: "{\"p\":1}".into(),
             }],
@@ -636,7 +735,7 @@ mod tests {
         );
         assert_eq!(
             count(&line, "SELECT version FROM documents WHERE id = 6").await,
-            2
+            1
         );
         assert_eq!(
             count(&line, "SELECT retired_seq FROM documents WHERE id = 6").await,
@@ -655,13 +754,14 @@ mod tests {
             .commit(
                 CommitKind::Progress,
                 vec![Write::ReplaceDocument {
+                    version: 1,
                     id: 6,
                     value: "{}".into(),
                 }],
             )
             .await
             .unwrap_err();
-        assert!(matches!(error, LineError::Failed(_)));
+        assert!(matches!(error, LineError::Rejected(_)));
     }
 
     #[tokio::test]
@@ -735,6 +835,7 @@ mod tests {
                 line.commit(
                     CommitKind::Progress,
                     vec![Write::ReplaceDocument {
+                        version: 1,
                         id: 1,
                         value: payload(2048, i),
                     }],

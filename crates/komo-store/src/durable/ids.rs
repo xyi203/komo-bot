@@ -33,3 +33,11 @@ impl<'a> IdMint<'a> {
 pub(crate) fn next(counter: &AtomicI64) -> i64 {
     counter.fetch_add(1, Ordering::SeqCst) + 1
 }
+
+/// 同 [`next`]，但到 `i64::MAX` 就停（`None`），不回绕。
+pub(crate) fn try_next(counter: &AtomicI64) -> Option<i64> {
+    counter
+        .try_update(Ordering::SeqCst, Ordering::SeqCst, |c| c.checked_add(1))
+        .ok()
+        .map(|old| old + 1)
+}

@@ -491,6 +491,38 @@ impl DocumentRecord {
     }
 }
 
+// --------------------------------------------------------------------- session
+
+/// komo Session 的生命周期（§8.10）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SessionLifecycle {
+    Active,
+    Closing,
+    Deleted,
+    Purged,
+}
+
+/// 对外的 komo Session：id 是 UUIDv7 字符串（不在数字命名空间里），整条替换。
+///
+/// 一个 Session 是一组 conversation 加一个"当前分支"指针（§4.2）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionRecord {
+    pub id: String,
+    pub lifecycle: SessionLifecycle,
+    /// 下一条输入落在哪个分支（导航只改它，不追加 entry）。
+    pub current_branch: ConversationId,
+    pub root_conversation: ConversationId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// 来源（channel / cli / cron……），调用方自己的约定。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;

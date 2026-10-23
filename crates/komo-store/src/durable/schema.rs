@@ -77,8 +77,9 @@ pub const SUBMISSIONS_TABLE_DDL: &str = "CREATE TABLE submissions (
     record TEXT NOT NULL CHECK (json_valid(record))
 ) STRICT";
 
-/// 整值，不做 delta 表（§3.3）。`version` 每次替换加一，所以每次写的值一定不同
-/// （D0 的坑：同值反复 UPDATE，WAL 认出页面没变就不写）。
+/// 整值，不做 delta 表（§3.3）。`version` 是调用方的**定义版本**（D1 的 `DocumentRecord::version`），
+/// 不是自增计数。`key_value` 由调用方编码，使 `None` 与 `Some("")` 分得开（见 `storage.rs`）。
+/// 值没变的 UPDATE，WAL 认出页面没变就不写盘（D0 的坑）——语义上没有东西要持久化，所以是对的。
 pub const DOCUMENTS_TABLE_DDL: &str = "CREATE TABLE documents (
     id INTEGER PRIMARY KEY NOT NULL,
     kind TEXT NOT NULL,
@@ -87,6 +88,7 @@ pub const DOCUMENTS_TABLE_DDL: &str = "CREATE TABLE documents (
     key_value TEXT NOT NULL,
     version INTEGER NOT NULL,
     created_seq INTEGER NOT NULL,
+    changed_seq INTEGER NOT NULL,
     retired_seq INTEGER,
     value TEXT NOT NULL CHECK (json_valid(value))
 ) STRICT";
@@ -186,6 +188,7 @@ pub const TABLES: &[TableSpec] = &[
             col("key_value", "TEXT NOT NULL DEFAULT ''"),
             col("version", "INTEGER NOT NULL DEFAULT 0"),
             col("created_seq", "INTEGER NOT NULL DEFAULT 0"),
+            col("changed_seq", "INTEGER NOT NULL DEFAULT 0"),
             col("retired_seq", "INTEGER"),
             col("value", "TEXT NOT NULL DEFAULT '{}'"),
         ],

@@ -15,12 +15,12 @@ use super::ids::{
 };
 use super::records::{
     ConversationOwner, ConversationRecord, DocumentAddress, DocumentScope, EntryRecord, InputState,
-    JoinPolicy, SubmissionKind, SubmissionRecord, SubmissionStatus, TaskOutcome, TaskOutcomeError,
-    TaskRecord, TaskState, TaskStatus, WriteState,
+    JoinPolicy, SessionLifecycle, SessionRecord, SubmissionKind, SubmissionRecord,
+    SubmissionStatus, TaskOutcome, TaskOutcomeError, TaskRecord, TaskState, TaskStatus, WriteState,
 };
 use super::storage::{
     ConversationQuery, Cursor, DocumentCreate, DocumentQuery, EntryQuery, MAX_ID, ScanOrder,
-    Storage, StorageError, StorageExt, StorageWrite, SubmissionQuery, TaskQuery,
+    SessionQuery, Storage, StorageError, StorageExt, StorageWrite, SubmissionQuery, TaskQuery,
 };
 
 pub type CaseFuture<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
@@ -64,6 +64,9 @@ pub fn cases() -> Vec<Case> {
         case!(record_ids_share_one_namespace_and_minting_stops_at_the_limit),
         case!(invalid_reads_are_request_errors_without_effects),
         case!(every_operation_is_rejected_after_close),
+        case!(progress_commits_only_replace_document_values),
+        case!(sessions_replace_whole_and_scan_by_lifecycle),
+        case!(session_and_progress_operations_are_rejected_after_close),
     ]
 }
 
@@ -1600,6 +1603,188 @@ async fn every_operation_is_rejected_after_close(storage: &dyn Storage) {
     assert_eq!(
         storage
             .find_document(&doc_address("k", DocumentScope::Session, None))
+            .await,
+        Err(StorageError::Closed)
+    );
+}
+
+async fn progress_commits_only_replace_document_values(storage: &dyn Storage) {
+    let root = create_root(storage).await;
+    let address = doc_address(
+        "komo.live",
+        DocumentScope::Conversation { conversation: root },
+        None,
+    );
+    let id: DocumentId = mint(storage).await;
+    let created = commit(storage, vec![doc_create(id, address, json!({"n": 0}))]).await;
+
+    let change = |n: u64| StorageWrite::DocumentChange {
+        id,
+        version: 3,
+        value: json!({"n": n}),
+    };
+    let seq = storage
+        .commit_progress(&[change(1)])
+        .await
+        .expect("progress");
+    assert!(seq > created);
+    let doc = storage.document(id).await.unwrap().unwrap();
+    assert_eq!(
+        (doc.version, doc.value, doc.changed_at),
+        (3, json!({"n": 1}), seq)
+    );
+
+    // 混进别的写、退役、空提交都被拒，而且什么都没改。
+    let entry_id: EntryId = mint(storage).await;
+    expect_rejected(
+        storage
+            .commit_progress(&[change(2), put(entry(entry_id, root))])
+            .await,
+    );
+    expect_rejected(
+        storage
+            .commit_progress(&[StorageWrite::DocumentRetire { id }])
+            .await,
+    );
+    expect_rejected(storage.commit_progress(&[]).await);
+    assert_eq!(storage.entry(entry_id).await.unwrap(), None);
+    assert_eq!(
+        storage.document(id).await.unwrap().unwrap().value,
+        json!({"n": 1})
+    );
+
+    // 被拒之后照常可用；对不存在的 document 的进度提交同样是 Rejected。
+    let next = storage.commit_progress(&[change(3)]).await.unwrap();
+    assert!(next > seq);
+    expect_rejected(
+        storage
+            .commit_progress(&[StorageWrite::DocumentChange {
+                id: DocumentId::new(424_242),
+                version: 1,
+                value: json!(null),
+            }])
+            .await,
+    );
+    commit(storage, vec![put(entry(entry_id, root))]).await;
+}
+
+fn session(id: &str, lifecycle: SessionLifecycle, branch: u64) -> SessionRecord {
+    SessionRecord {
+        id: id.to_owned(),
+        lifecycle,
+        current_branch: ConversationId::new(branch),
+        root_conversation: ROOT,
+        title: Some(format!("title of {id}")),
+        source: Some("cli".into()),
+        cwd: Some("/work".into()),
+    }
+}
+
+async fn sessions_replace_whole_and_scan_by_lifecycle(storage: &dyn Storage) {
+    assert_eq!(storage.session("s1").await.unwrap(), None);
+    // UUIDv7 的字符串序就是创建序；这里用同形的短串。
+    let ids = ["s1", "s2", "s3", "s4", "s5"];
+    let writes: Vec<_> = ids
+        .iter()
+        .enumerate()
+        .map(|(i, id)| {
+            let lifecycle = if i % 2 == 0 {
+                SessionLifecycle::Active
+            } else {
+                SessionLifecycle::Closing
+            };
+            StorageWrite::Session(session(id, lifecycle, 1))
+        })
+        .collect();
+    commit(storage, writes).await;
+    assert_eq!(
+        storage.session("s2").await.unwrap(),
+        Some(session("s2", SessionLifecycle::Closing, 1))
+    );
+
+    // 整条替换：当前分支与生命周期都换了，旧值不残留（含 Option 字段变空）。
+    let mut moved = session("s2", SessionLifecycle::Active, 7);
+    moved.title = None;
+    commit(storage, vec![StorageWrite::Session(moved.clone())]).await;
+    assert_eq!(storage.session("s2").await.unwrap(), Some(moved));
+
+    let names = |items: &[SessionRecord]| items.iter().map(|s| s.id.clone()).collect::<Vec<_>>();
+    // 默认降序，分页带 cursor，cursor 保持方向。
+    let all = SessionQuery::default();
+    let first = storage.scan_sessions(&all, 2, None).await.unwrap();
+    assert_eq!(names(&first.items), ["s5", "s4"]);
+    let cursor = first.next.clone().expect("more");
+    let cursor: super::storage::SessionCursor =
+        serde_json::from_str(&serde_json::to_string(&cursor).unwrap()).unwrap();
+    let second = storage.scan_sessions(&all, 2, Some(&cursor)).await.unwrap();
+    assert_eq!(names(&second.items), ["s3", "s2"]);
+    let third = storage
+        .scan_sessions(&all, 2, second.next.as_ref())
+        .await
+        .unwrap();
+    assert_eq!(names(&third.items), ["s1"]);
+    assert_eq!(third.next, None);
+    expect_request(
+        storage
+            .scan_sessions(
+                &SessionQuery {
+                    lifecycle: None,
+                    order: Some(ScanOrder::Ascending),
+                },
+                2,
+                Some(&cursor),
+            )
+            .await,
+    );
+    expect_request(storage.scan_sessions(&all, 0, None).await);
+
+    let active = SessionQuery {
+        lifecycle: Some(SessionLifecycle::Active),
+        order: Some(ScanOrder::Ascending),
+    };
+    let page = storage.scan_sessions(&active, 10, None).await.unwrap();
+    assert_eq!(names(&page.items), ["s1", "s2", "s3", "s5"]);
+    let closing = SessionQuery {
+        lifecycle: Some(SessionLifecycle::Closing),
+        order: None,
+    };
+    let page = storage.scan_sessions(&closing, 10, None).await.unwrap();
+    assert_eq!(names(&page.items), ["s4"]);
+    // 过滤之后续扫不丢不重。
+    let page = storage.scan_sessions(&active, 3, None).await.unwrap();
+    let rest = storage
+        .scan_sessions(&active, 3, page.next.as_ref())
+        .await
+        .unwrap();
+    assert_eq!(names(&page.items), ["s1", "s2", "s3"]);
+    assert_eq!(names(&rest.items), ["s5"]);
+}
+
+async fn session_and_progress_operations_are_rejected_after_close(storage: &dyn Storage) {
+    commit(
+        storage,
+        vec![StorageWrite::Session(session(
+            "s1",
+            SessionLifecycle::Active,
+            1,
+        ))],
+    )
+    .await;
+    storage.close().await.unwrap();
+    assert_eq!(storage.session("s1").await, Err(StorageError::Closed));
+    assert_eq!(
+        storage
+            .scan_sessions(&SessionQuery::default(), 1, None)
+            .await,
+        Err(StorageError::Closed)
+    );
+    assert_eq!(
+        storage
+            .commit_progress(&[StorageWrite::DocumentChange {
+                id: DocumentId::new(2),
+                version: 1,
+                value: json!(null),
+            }])
             .await,
         Err(StorageError::Closed)
     );

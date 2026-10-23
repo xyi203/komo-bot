@@ -54,6 +54,7 @@ fn setup_writes() -> Vec<Write> {
             scope_kind: "conversation".into(),
             owner_id: 1,
             key_value: String::new(),
+            version: 1,
             value: "{\"k\":-1}".into(),
         },
     ]
@@ -82,7 +83,7 @@ async fn crash_child() {
         "structural" => {
             for i in 0..n {
                 line.commit_with(CommitKind::Structural, move |mint| {
-                    vec![entry(mint.mint() + 2, format!("{{\"i\":{i}}}"))]
+                    vec![entry(mint.mint(), format!("{{\"i\":{i}}}"))]
                 })
                 .await
                 .unwrap();
@@ -103,6 +104,7 @@ async fn crash_child() {
                     line.commit(
                         CommitKind::Progress,
                         vec![Write::ReplaceDocument {
+                            version: 1,
                             id: 2,
                             value: format!("{{\"k\":{i}}}"),
                         }],

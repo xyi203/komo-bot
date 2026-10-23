@@ -24,12 +24,14 @@ pub mod blob;
 pub mod ids;
 pub mod line;
 pub mod schema;
+pub mod storage;
 pub mod write;
 
 pub use blob::{PublishedBlob, publish_blob};
 pub use ids::IdMint;
 pub use line::{Line, LineError, Seq};
 pub use schema::{DURABLE_DB_FILE, FORMAT_VERSION, durable_db_path};
+pub use storage::TursoStorage;
 pub use write::{CommitKind, Write};
 
 #[cfg(test)]

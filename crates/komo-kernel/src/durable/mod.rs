@@ -28,7 +28,11 @@ pub use message::{
 };
 pub use records::{
     ContextEdit, ConversationRecord, DocumentAddress, DocumentRecord, DocumentScope, EditAction,
-    EntryRecord, InputState, SubmissionKind, SubmissionRecord, SubmissionSettlement,
-    SubmissionStatus, TaskOutcome, TaskRecord, TaskState, TaskStatus, WriteState,
+    EntryRecord, InputState, SessionLifecycle, SessionRecord, SubmissionKind, SubmissionRecord,
+    SubmissionSettlement, SubmissionStatus, TaskOutcome, TaskRecord, TaskState, TaskStatus,
+    WriteState,
 };
-pub use storage::{Cursor, Page, ScanOrder, Storage, StorageError, StorageExt, StorageWrite};
+pub use storage::{
+    Cursor, Page, ScanOrder, SessionCursor, SessionPage, SessionQuery, Storage, StorageError,
+    StorageExt, StorageWrite, check_progress,
+};

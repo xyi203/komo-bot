@@ -21,6 +21,7 @@
 pub mod checkpoint;
 pub mod coordinator;
 pub mod db;
+pub mod durable;
 pub mod models;
 pub mod payloads;
 pub mod repos;

@@ -20,6 +20,8 @@ use super::transport::{HttpRequest, HttpTransport, TransportError};
 use super::wire;
 use crate::config::EffortCapabilities;
 
+mod stateless;
+
 pub struct ChatCompletionsLlm {
     config: ModelConfig,
     role: ModelRole,

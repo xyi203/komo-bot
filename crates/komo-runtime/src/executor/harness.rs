@@ -324,6 +324,7 @@ impl Tool for RecordingTool {
             name: self.name.into(),
             description: "测试用".into(),
             parameters: serde_json::json!({ "type": "object" }),
+            doc: None,
         }
     }
 

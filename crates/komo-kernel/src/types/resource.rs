@@ -36,7 +36,8 @@ use crate::types::tool::ToolDefinition;
 pub enum ToolPart {
     /// 交给模型的那份 JSON Schema。
     Schema,
-    /// 这个工具做什么、参数怎么给（就是它给模型看的那段说明）。
+    /// 这个工具做什么、参数怎么给：给模型看的那段说明，加上按需读的长文档（有的话，
+    /// `ToolDefinition::doc`）。
     Doc,
 }
 
@@ -645,6 +646,7 @@ mod tests {
                 name: "read".into(),
                 description: "读文件".into(),
                 parameters: serde_json::json!({ "type": "object" }),
+                doc: None,
             }]
             .into(),
         };

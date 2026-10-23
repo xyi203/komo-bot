@@ -39,8 +39,7 @@ pub fn schema(what: &str) -> serde_json::Value {
     serde_json::json!({
         "type": "object",
         "description": format!(
-            "{what}成功之后紧接着对这个文件跑的命令——运行、构建、启动/重启、安装或检查它；\
-             可选超时（秒）。{what}失败就不跑；命令非零退出会如实报告，但{what}保留。"
+            "{what}成功后紧接着跑一条命令（运行、构建、检查等）；{what}失败则不跑，非零退出照实报告、{what}保留。"
         ),
         "properties": {
             "command": { "type": "string", "description": "要执行的命令，交给 /bin/sh -c，在会话工作目录里跑" },

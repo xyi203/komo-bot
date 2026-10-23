@@ -37,7 +37,7 @@
 ```
 
 - **没有分发器。** home 用会话自己的 Agent 跑；什么时候派、什么时候自己做，由模型按
-  `task` 的工具说明判断（几秒能做完的直接做）。
+  `task` 的工具说明判断（几秒能做完的直接做）。2026-10-23 起 description 只留这条判断、prompt 要自包含与结果交回的方式，追问、查进度、`contract`、并行的细则在 `tool://task/doc`（按需读、不进工具定义，`docs/komo_bot.md` §4）。
 - **结果交回 home。** 任务会话的 Run 进终态时，`service::run_watch::finish` 调
   `service::tasks::report_to_parent`：任务的最终回复（或失败 / 取消的原因）拼成一条以
   `[后台任务 #短号「标题」…]` 开头的输入，`submit` 进派它的会话，peer 是任务 Run 的来源对端。

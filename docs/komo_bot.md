@@ -187,7 +187,7 @@ task(prompt, title, task_id?, model?, effort?, contract?)
 
 **`update_plan` 已退役（2026-10-16）。** 它曾让模型报一份整份的工作计划，唯一的消费方是在线压缩的"计划边界"；压缩改为只按上下文窗口触发之后就没有用处了，工具、提示里那句话、计划折叠一并删掉。`Operation::UpdatePlan` 留着只为旧日志里的计划还能解码：fold 不认它，旧日志里在途的那次调用不再执行，按工具不可用（或 §8.6 的结果不明）收尾交给模型。
 
-**`codemode` 是组合，不是新能力。** 模型写一段 Python，在 Monty（pydantic 的 Python 子集解释器）里跑，跑在 komo 自己起的 worker 子进程中——语言本身没有网络、子进程，文件只读（宿主 `/` 只读挂载，komo 自己的状态除 `sessions/` 外连读也拒，写类一律拒；要写文件走 `write` / `edit`，要完整 Python 走 `bash` 的 `python3`（`python` 工具已于 2026-10-15 删除）；2026-10-15 起取代此前的 CPython + 操作系统沙箱：Seatbelt / Landlock + seccomp，以及启动自检），脚本里经 `tools.<name>()` 调其他工具——放行 `Operation::ReadFile`（`read`、`rg`）与 `Operation::McpCall`（含写操作）的计划；本地 `write` / `edit` / `bash`、带 `then_run` 的、编排操作与 codemode 自己仍要在脚本外调。只有脚本的输出回到模型。2026-10-11 之前还要"Policy 直接 Allow"；Policy 删掉之后范围外的读也放行（与当时的 auto 一致），边界是语言本身（§7）。**脚本里的子调用逐次持久化**（2026-10-13，此前只放行只读、整段重跑）：每次子调用按 intent → started → delivered 记成 `codemode.journal` 事件、正文外置到 `tool-output/`，fold 不看它，不生成顶层 `tool.result`，模型只看见外层结果。中断后整段重跑脚本：已交付的子结果按序原样接回，started 而没交付的按双 Safe 准则判（§8.6），unsafe 的那次绝不重做；脚本的时钟与随机数经宿主、记进 journal，恢复时原样还回去，所以重跑是确定的，越过已记录的前缀之后新调用照常执行（2026-10-15）；分歧（工具名 / 参数 / 读数对不上）或结果不明整段记 uncertain 交给模型。因为脚本里可能有 MCP 写，codemode 不再算只读计划（`is_read_only()` 为 false），是同一轮里的屏障（§6）。见 `docs/codemode.md` §5、§7。
+**`codemode` 是组合，不是新能力。** 模型写一段 Python，在 Monty（pydantic 的 Python 子集解释器）里跑，跑在 komo 自己起的 worker 子进程中——语言本身没有网络、子进程，文件只读（宿主 `/` 只读挂载，komo 自己的状态除 `sessions/` 外连读也拒，写类一律拒；要写文件走 `write` / `edit`，要完整 Python 走 `bash` 的 `python3`（`python` 工具已于 2026-10-15 删除）；2026-10-15 起取代此前的 CPython + 操作系统沙箱：Seatbelt / Landlock + seccomp，以及启动自检），脚本里经 `tools.<name>()` 调其他工具——放行 `Operation::ReadFile`（`read`、`rg`）与 `Operation::McpCall`（含写操作）的计划；本地 `write` / `edit` / `bash`、带 `then_run` 的、编排操作与 codemode 自己仍要在脚本外调。只有脚本的输出回到模型。2026-10-11 之前还要"Policy 直接 Allow"；Policy 删掉之后范围外的读也放行（与当时的 auto 一致），边界是语言本身（§7）。**脚本里的子调用逐次持久化**（2026-10-13，此前只放行只读、整段重跑）：每次子调用按 intent → started → delivered 记成 `codemode.journal` 事件、正文外置到 `tool-output/`，fold 不看它，不生成顶层 `tool.result`，模型只看见外层结果。中断后整段重跑脚本：已交付的子结果按序原样接回，started 而没交付的按双 Safe 准则判（§8.6），unsafe 的那次绝不重做；脚本的时钟与随机数经宿主、记进 journal，恢复时原样还回去，所以重跑是确定的，越过已记录的前缀之后新调用照常执行（2026-10-15）；分歧（工具名 / 参数 / 读数对不上）或结果不明整段记 uncertain 交给模型。因为脚本里可能有 MCP 写，codemode 不再算只读计划（`is_read_only()` 为 false），是同一轮里的屏障（§6）。见 `docs/codemode.md` §5、§7。工具发现函数、子调用持久化与重跑语义、256 次上限、输出落盘与结果预算的说明在 `tool://codemode/doc`，不在工具定义里（见上文「工具定义瘦身」）。
 
 **MCP 工具也不是第七个工具，是操作者接进来的外部能力。** `[mcp.servers.<name>]` 里配的服务器在 Gateway 启动时连上（要登录的，登录后下一条 Run 受理时连上，不用重启；`docs/mcp.md` §2.2），每个工具注册成 `mcp__<server>__<tool>`，与内置工具走同一条 `prepare` / 落账的路；只读与否由操作者声明，不信服务器自报——它决定恢复时能不能直接重读（§8.6）。codemode 脚本里 MCP 工具都能调，只读声明只决定中断后能不能重做（2026-10-13 之前它还决定 codemode 能不能调）。**默认不声明给模型**（2026-10-14，照 pi 的 `exposure`）：`exposure = "codemode"` 的 MCP 工具不进 schema、只在 codemode 脚本里调，脚本用 `search_tools` / `describe_tool` / `describe_namespace` 找；系统提示只给每台服务器一行摘要（配置的 `description`，没写就是服务器 instructions 的第一行），instructions 全文只在脚本里读。`direct` 照常声明，`hidden` 不挂。见 `docs/mcp.md` §3。
 
@@ -231,6 +231,15 @@ ToolContext 由 Gateway 创建，包含 Session / Run / ToolCall 身份、工作
 
 bash 子进程使用明确的环境变量集合。取消时停止所属进程组并等待回收，而不仅仅是丢弃异步等待。Tokio 默认不会因为进程 handle 被丢弃就终止进程。[Tokio process](https://docs.rs/tokio/latest/tokio/process/index.html)
 
+**工具定义瘦身：长说明按需读，不进工具定义（2026-10-23）。** 每次模型请求都带全部工具定义，它排在提示最前面、跨会话共享，基本是缓存读，但仍约占 komo 等效成本的 4%（2026-10-23 统计），而低频工具的细则大多数 Run 根本用不到。做法：
+
+- `ToolDefinition` 多一个**不发给模型**的 `doc: Option<String>`（`#[serde(skip)]`；Responses / Anthropic / Chat Completions 三条路的请求体都是逐字段拼的，不带它，各有一条测试守着）。`tool://<工具>/doc` 有 `doc` 时返回"简短说明 + 长文档"，没有就照旧只返回说明。
+- 有 `doc` 的工具：`monitor`（写脚本的后几条守则、事件合并、轮询间隔、时限、`resume_after_restart`）、`task`（并行、追问、`contract`、查进度）、`codemode`（发现函数 `ALL_TOOLS` / `search_tools` / `describe_tool` / `describe_namespace`、子调用持久化与中断重跑、256 次上限、输出落盘与结果预算）、`read`（`path` 认的 `skill://` / `tool://` / `artifact://` 各种形式）。它们的 `description` 只留做什么、何时用 / 不用和最关键的规则，末尾一句"用前先 read tool://<名>/doc"（`monitor` / `task`）或指向 doc（`codemode`）。**只是换了位置，细则一个字没丢。**
+- **路由规则只留一处**：系统提示的 `rules()` 按这次挂了哪些工具写"找代码用 `rg`、看文件用 `read`、多处用 `codemode`……"，`bash` / `rg` / `codemode` 的 description 不再重复这几句；`bash` 里 `timeout_secs`、等状态挂 `monitor`、对话会话里 sleep 被拒这类**不重复**的约束照旧。
+- `edit` / `write` 共用的 `then_run` 描述缩成一句；`rg` 的参数描述精简（语义不变）。
+- 代价：第一次用 `monitor` / `task` 多一次 `read tool://…/doc` 的往返（使用频率约 4% / 3%，旧数据）；改工具定义让工具前缀的提示缓存失效一次。
+- 效果（9 个工具的 name + description + parameters 的 JSON 字符数）：8973 → 7729，其中 `monitor` 1232 → 846、`task` 1184 → 1013、`codemode` 1970 → 1691、`read` 688 → 493。工具定义里只剩每次都要用的东西；以后新增低频工具，细则放 `doc`，不要写进 description。
+
 ### 资源命名空间：`skill://` / `tool://` / `artifact://`
 
 模型仍然只用现有的 `read` / `rg`，把资源 URI 当路径交给它们。**URI 不是"特殊文件路径"**：它在执行计划里是一个明确的目标类型（`TargetRef`），计划同时带着**逻辑** URI 与解析出来的**真实**目标——审计与界面显示的是"读了哪个逻辑资源"，越界与只读根的判断看的仍是真实路径。
@@ -246,6 +255,7 @@ artifact://<run>/<call>/<attempt>/<stdout|stderr|result>
 ```
 
 - **`tool://` 是说明入口，不是执行入口**：读它不改任何状态；真实动作仍走 native tool call 与 `ExecutionPlan`。
+- **`tool://<tool>/doc` 是长说明的家**（2026-10-23）：返回工具的简短说明加上 `ToolDefinition.doc` 里按需读的长文档；`doc` 不进发给模型的工具定义，原因与做法见上面「工具定义瘦身」。`tool://<tool>/schema` 仍是发给模型的那份 JSON Schema。
 - **越权当场是错**：`..`、空段、`tool://` 里能力面之外的工具、别的会话的 `run`、没有会话目录，一律在 `prepare` 就拒绝（`ToolError::Failed` 说清原因），**不进计划就没有执行**；解析链接之后还要再核一次"仍在挂载点里面"。
 - **挂载由装配决定，不能由模型参数提升**：skill 根来自当前配置快照的 `paths.skill_dirs`，会话内容目录来自这一次的 Session，`tool://` 只认这一次的 `AgentSurface`。三者随 `ToolContext` / `CallEnv` 走。
 - **计划里的两种目标**：本地路径（序列化成 `{"path": …}`，与改造前逐字相同——旧计划的哈希不变）与资源（`{"uri": …, "resolved": …}`）。**没有磁盘目标的读**（`tool://`）不编假路径——给虚拟入口编一个假路径才是真的越权口子。

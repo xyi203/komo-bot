@@ -47,24 +47,16 @@ impl Tool for MonitorTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "monitor".into(),
-            description: format!(
-                "在后台挂一个长时间跑的脚本盯着某件事（CI 流水线、发布工单、日志里的报错、\
-                 指标阈值），你不用等它，这一轮可以直接回复用户。脚本往 stdout 每打一行就是一个\
-                 事件：事件以 [监听 #短号…] 开头的消息交回给你，用户看不到那条消息，需要告诉\
-                 用户的由你转告。几秒内连着出的行合成一条；你处理上一条期间出的行会合进下一条。\
-                 脚本退出、超时或被停时还会交回一条结束消息。\n\
-                 写脚本时：① 只打印需要处理的行，先过滤（每一行都会让你跑一轮）；\
-                 ② 管道每一段都要逐行刷新（grep --line-buffered、awk 里 fflush()，别用 head）；\
-                 ③ 失败状态也要打印（failed / canceled / Error / 进程崩溃），只打成功标志的话出事时\
-                 什么也看不到；④ 盯有终点的事（流水线跑完）就让脚本到终态时自己退出；\
-                 ⑤ 轮询循环里 sleep 不要短于 15 秒。在跟用户对话的会话里，等一个状态（流水线、工单、\
-                 部署进度）一律挂监听，脚本只在完成或出错时打一行——bash 里 10 秒以上的 sleep 会被拒绝；\
-                 构建、下载这类慢命令照常交给 bash（跑久了自动转后台）。后台任务会话里别挂：任务这一轮一结束，结果就交回去了。timeout_minutes 省略 = 30，上限 {MAX_MONITOR_MINUTES}。\n\
-                 Gateway 重启时监听会中断：脚本只读、重跑一遍没有副作用（轮询状态、查进度、\
-                 tail 日志）就设 resume_after_restart = true，重启后按原短号自动重挂、剩余时限\
-                 接着算，不用你再挂；会改东西的脚本（发消息、写文件、触发操作）别设，中断时会\
-                 通知你。"
-            ),
+            description:
+                "在后台挂一个脚本盯着某件事（流水线、工单、日志报错、指标阈值），你不用等，\
+                这一轮可以直接回复用户。脚本往 stdout 每打一行就是一个事件，以 [监听 #短号…] 开头的\
+                消息交回给你；用户看不到它，需要告知的由你转告。\n\
+                写脚本：① 只打印要处理的行，先过滤（每行都会让你跑一轮）；② 管道每段逐行刷新\
+                （grep --line-buffered、awk fflush()，别用 head）；③ 失败状态（failed / canceled / \
+                Error / 崩溃）也要打印；④ 有终点的事让脚本到终态自己退出。对话会话里等状态一律挂\
+                监听，后台任务会话里别挂。\n\
+                用前先 read tool://monitor/doc。"
+                    .into(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -93,6 +85,19 @@ impl Tool for MonitorTool {
                 "required": ["command", "title"],
                 "additionalProperties": false
             }),
+            doc: Some(format!(
+                "- 事件：几秒内连着出的行合成一条；你处理上一条期间出的行会合进下一条。脚本退出、\
+                 超时或被停时还会交回一条结束消息。\n\
+                 - 轮询循环里 sleep 不要短于 15 秒。对话会话里 bash 里 10 秒以上的 sleep 会被拒绝，\
+                 等状态（流水线、工单、部署进度）挂监听，脚本只在完成或出错时打一行；构建、下载这类\
+                 慢命令照常交给 bash（跑久了自动转后台）。后台任务会话里别挂：任务这一轮一结束，\
+                 结果就交回去了。\n\
+                 - timeout_minutes 省略 = 30，上限 {MAX_MONITOR_MINUTES}。\n\
+                 - Gateway 重启时监听会中断：脚本只读、重跑一遍没有副作用（轮询状态、查进度、\
+                 tail 日志）就设 resume_after_restart = true，重启后按原短号自动重挂、剩余时限\
+                 接着算，不用你再挂；会改东西的脚本（发消息、写文件、触发操作）别设，中断时会\
+                 通知你。"
+            )),
         }
     }
 
@@ -191,6 +196,7 @@ impl Tool for MonitorStopTool {
                 "required": ["monitor_id"],
                 "additionalProperties": false
             }),
+            doc: None,
         }
     }
 

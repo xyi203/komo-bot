@@ -81,6 +81,7 @@ impl Tool for WriteTool {
                 "required": ["path", "content"],
                 "additionalProperties": false
             }),
+            doc: None,
         }
     }
 

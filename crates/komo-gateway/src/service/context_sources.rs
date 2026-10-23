@@ -746,11 +746,13 @@ mod tests {
                 name: "read".into(),
                 description: String::new(),
                 parameters: serde_json::Value::Null,
+                doc: None,
             },
             ToolDefinition {
                 name: "bash".into(),
                 description: String::new(),
                 parameters: serde_json::Value::Null,
+                doc: None,
             },
         ];
         let workspaces = PathBuf::from("/workspaces");

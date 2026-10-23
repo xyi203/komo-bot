@@ -66,6 +66,15 @@ pub struct UnreadRange {
     pub reason: String,
 }
 
+/// `tool://read/doc` 的长说明：`path` 认的资源入口。不进工具定义（`ToolDefinition::doc`）。
+const READ_DOC: &str = "\
+path 除本地路径（相对路径按工作目录解析）外，还认三种只读资源入口：\n\
+- `skill://<skill>/<文件>`：那份 skill 里的文件，例如 skill://review/SKILL.md\n\
+- `tool://<工具>/schema|doc`：这次能力面里的工具参数 schema 或说明；`tool://` 列出这次能用的工具名\n\
+- `artifact://files/<名字>`：本次会话自己的产物\n\
+- `artifact://<run>/<call>/<attempt>/stdout|stderr|result`：某次工具输出的完整正文——\
+正文被截断时里面会给这条引用";
+
 #[derive(Debug)]
 pub struct ReadTool {
     byte_limit: u64,
@@ -103,13 +112,14 @@ impl Tool for ReadTool {
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "path": { "type": "string", "description": "要读的东西。可以是本地路径（相对路径按工作目录解析），也可以是资源入口：`skill://<skill>/<文件>`（那份 skill 里的文件，例如 skill://review/SKILL.md）、`tool://<工具>/schema|doc`（这次能力面里的工具参数 schema 或说明）、`artifact://files/<名字>`（本次会话自己的产物）、`artifact://<run>/<call>/<attempt>/stdout|stderr|result`（某次工具输出的完整正文——正文被截断时里面会给这条引用）" },
+                    "path": { "type": "string", "description": "本地路径（相对路径按工作目录解析），或 skill:// / tool:// / artifact:// 资源入口，见 tool://read/doc" },
                     "start_line": { "type": "integer", "minimum": 1, "description": "从第几行开始读，1 起" },
                     "line_count": { "type": "integer", "minimum": 1, "description": "最多读几行" }
                 },
                 "required": ["path"],
                 "additionalProperties": false
             }),
+            doc: Some(READ_DOC.into()),
         }
     }
 
@@ -438,6 +448,7 @@ mod tests {
                         "properties": { "path": { "type": "string" } },
                         "required": ["path"]
                     }),
+                    doc: None,
                 }]),
             }
         }

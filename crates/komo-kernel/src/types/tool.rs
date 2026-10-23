@@ -19,6 +19,11 @@ pub struct ToolDefinition {
     pub description: String,
     /// JSON Schema。
     pub parameters: serde_json::Value,
+    /// 按需读的长说明：**不发给模型**（任何一家 provider 的请求体里都没有它），只由
+    /// `tool://<名>/doc` 返回（简短的 `description` + 这份长文档）。低频工具把细则放这里，
+    /// 工具定义排在提示最前面、每次请求都带，写进 `description` 的每个字都要付缓存读的钱。
+    #[serde(skip)]
+    pub doc: Option<String>,
 }
 
 /// 模型怎么够到一个工具（`docs/mcp.md` §3，照 pi 的 exposure）。

@@ -30,6 +30,16 @@ pub const NOT_IN_SCRIPTS: &[&str] = &[
     "monitor_stop",
 ];
 
+/// `tool://codemode/doc` 的长说明：不进工具定义（`ToolDefinition::doc`）。
+const CODEMODE_DOC: &str = "\
+- 工具发现：ALL_TOOLS（变量，不是函数：[{name, description}] 列表）、\
+search_tools(query, limit=8, namespace=None)、describe_tool(name)（说明与参数 schema）、\
+describe_namespace(name)（一台 MCP 服务器的说明、instructions 与工具名）：\
+找没声明给你的工具，比如 MCP 工具。\n\
+- 子调用逐次持久化，unsafe 中断不重跑；中断后重跑脚本，已记录的调用原样回放，\
+之后的调用照常执行，分歧或结果不明会终止整段脚本。\n\
+- 一段脚本最多调 256 次工具；完整输出会落盘，给模型的视图统一受结果预算限制。";
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CodemodeArgs {
     pub code: String,
@@ -51,8 +61,7 @@ impl Tool for CodemodeTool {
             name: CODEMODE_TOOL.into(),
             description: "写一段 Python 脚本，在脚本里调其他工具、在本地过滤和汇总，只有脚本的\
                           输出回到你这里。适合：一次读很多文件或搜很多处、从大段结果里挑出要的\
-                          那几行、把几处结果拼成一张表。只读一个文件、只搜一次，直接调 read / rg \
-                          更省。\n\
+                          那几行、把几处结果拼成一张表。\n\
                           例子（读两个文件，只留函数签名）：\n\
                           for p in [\"src/a.rs\", \"src/b.rs\"]:\n\
                           \x20   r = tools.read(path=p)\n\
@@ -81,16 +90,11 @@ impl Tool for CodemodeTool {
                           工具名里的 - 写成 _，写错名字得到 AttributeError，能调的名字见 TOOLS。\
                           能调 read、rg 与 MCP 工具（MCP 含写操作）；\
                           bash、edit、write 与编排工具（task、monitor 等）\
-                          只能在脚本外直接调，脚本里写了 tools.bash(...) 会在运行前被拒。\
-                          子调用逐次持久化，unsafe 中断不重跑；中断后重跑脚本，已记录的调用原样\
-                          回放，之后的调用照常执行，分歧或结果不明会终止整段脚本。\n\
+                          只能在脚本外直接调，脚本里写了 tools.bash(...) 会在运行前被拒。\n\
                           - text(value)：加一段输出（非字符串转 JSON）。print 的内容附在最后。\n\
                           - TOOLS：能调的工具名。\n\
-                          - ALL_TOOLS（变量，不是函数：[{name, description}] 列表）、search_tools(query, limit=8, \
-                          namespace=None)、describe_tool(name)（说明与参数 schema）、\
-                          describe_namespace(name)（一台 MCP 服务器的说明、instructions 与工具名）：\
-                          找没声明给你的工具，比如 MCP 工具。\n\
-                          一段脚本最多调 256 次工具；完整输出会落盘，给模型的视图统一受结果预算限制。"
+                          工具发现（找没声明给你的 MCP 工具）、中断重跑语义、调用次数上限与结果预算\
+                          见 tool://codemode/doc。"
                 .into(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -100,6 +104,7 @@ impl Tool for CodemodeTool {
                 "required": ["code"],
                 "additionalProperties": false
             }),
+            doc: Some(CODEMODE_DOC.into()),
         }
     }
 

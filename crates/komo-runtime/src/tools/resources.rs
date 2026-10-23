@@ -354,10 +354,17 @@ pub fn virtual_content(resource: &VirtualResource, definitions: &[ToolDefinition
                     "{name} 的参数 schema：\n{}\n",
                     pretty(&definition.parameters)
                 ),
-                ToolPart::Doc => format!(
-                    "{name}：{}\n（它的参数 schema 在 tool://{name}/schema）\n",
-                    definition.description
-                ),
+                ToolPart::Doc => match &definition.doc {
+                    Some(doc) => format!(
+                        "{name}：{}\n\n{}\n\n（它的参数 schema 在 tool://{name}/schema）\n",
+                        definition.description,
+                        doc.trim_end()
+                    ),
+                    None => format!(
+                        "{name}：{}\n（它的参数 schema 在 tool://{name}/schema）\n",
+                        definition.description
+                    ),
+                },
             }
         }
         VirtualResource::ToolNames => match definitions.is_empty() {
@@ -403,6 +410,7 @@ mod tests {
                 "properties": { "path": { "type": "string" } },
                 "required": ["path"]
             }),
+            doc: None,
         }
     }
 
@@ -778,6 +786,51 @@ mod tests {
         let names = virtual_content(&VirtualResource::ToolNames, &definitions);
         assert!(names.contains("read、rg"), "{names}");
         assert!(!names.contains("write"), "{names}");
+    }
+
+    /// 有长文档的工具：`tool://<名>/doc` 是"简短说明 + 长文档"，长文档不在 description 里。
+    #[test]
+    fn the_doc_entry_returns_the_short_description_plus_the_long_doc() {
+        use komo_kernel::traits::Tool;
+
+        let definitions = vec![
+            crate::tools::MonitorTool::new().definition(),
+            crate::tools::ReadTool::new().definition(),
+        ];
+        let doc_of = |name: &str| {
+            virtual_content(
+                &VirtualResource::Tool {
+                    name: name.into(),
+                    part: ToolPart::Doc,
+                },
+                &definitions,
+            )
+        };
+
+        let monitor = doc_of("monitor");
+        assert!(
+            monitor.contains("用前先 read tool://monitor/doc"),
+            "{monitor}"
+        );
+        assert!(monitor.contains("resume_after_restart = true"), "{monitor}");
+        assert!(monitor.contains("tool://monitor/schema"), "{monitor}");
+        assert!(
+            !definitions[0]
+                .description
+                .contains("resume_after_restart = true"),
+            "长文档不该留在 description 里"
+        );
+
+        let read = doc_of("read");
+        assert!(read.contains("skill://<skill>/<文件>"), "{read}");
+        assert!(
+            read.contains("artifact://<run>/<call>/<attempt>/stdout|stderr|result"),
+            "{read}"
+        );
+        assert!(
+            !definitions[1].parameters.to_string().contains("<attempt>"),
+            "资源入口列表不该留在 path 的参数描述里"
+        );
     }
 
     /// 计划那一刻在能力面里、执行时却不在说明书里（装配不同源）：如实说，不编空 schema。

@@ -54,6 +54,7 @@ impl McpTool {
             name,
             description: format!("[MCP {}] {description}", server.name()),
             parameters: serde_json::Value::Object((*remote.input_schema).clone()),
+            doc: None,
         };
         Self {
             server,

@@ -134,7 +134,7 @@ impl Tool for EditTool {
                             "properties": {
                                 "match_text": { "type": "string", "description": "这一处要替换掉的原文，逐字匹配；在原文件里必须唯一，且不与别处的 match_text 重叠。够唯一就行，别为了连起远处的改动带上大段没改的内容" },
                                 "replace_text": { "type": "string", "description": "这一处替换成什么" },
-                                "replace_all": { "type": "boolean", "description": "这一���匹配到多处时全部替换；默认报错" }
+                                "replace_all": { "type": "boolean", "description": "这一处匹配到多处时全部替换；默认报错" }
                             },
                             "required": ["match_text", "replace_text"],
                             "additionalProperties": false
@@ -145,6 +145,7 @@ impl Tool for EditTool {
                 "required": ["path", "edits"],
                 "additionalProperties": false
             }),
+            doc: None,
         }
     }
 

@@ -1060,6 +1060,7 @@ impl Tool for CodemodeOnly {
             name: "mcp__demo__bump".into(),
             description: "[MCP demo] 加一".into(),
             parameters: serde_json::json!({ "type": "object" }),
+            doc: None,
         }
     }
 
@@ -2255,6 +2256,7 @@ impl Tool for Probe {
             name: self.name.into(),
             description: "测试用".into(),
             parameters: serde_json::json!({ "type": "object" }),
+            doc: None,
         }
     }
 
@@ -4231,6 +4233,7 @@ mod fused {
                 name: "read".into(),
                 description: "测试用".into(),
                 parameters: serde_json::json!({ "type": "object" }),
+                doc: None,
             }
         }
 

@@ -173,6 +173,8 @@ MCP 的 `read_only` 仍由操作者声明，只决定中断后能否安全重做
 
 ## 6. 模型看到的接口
 
+> 2026-10-23：下面这些接口里，工具发现（`ALL_TOOLS` / `search_tools` / `describe_tool` / `describe_namespace`）、子调用持久化与中断重跑语义、256 次调用上限、输出落盘与结果预算不再写进 `codemode` 的 description，而是放在 `tool://codemode/doc`，description 只留一句指向它；原因与做法见 `docs/komo_bot.md` §4「工具定义瘦身」。
+
 工具 `codemode`，参数 `{"code": "<Python 源码>"}`。脚本是模块级代码：
 
 每次调用都是独立脚本，`json`、`re`、`time` 等要在本段显式 import。Monty 1.1.0 的 `json` 只有
@@ -216,7 +218,7 @@ worker 在脚本前拼一段前置代码（`codemode/prelude.py`：`ToolError = 
 都能用。Monty 不支持 `__getattr__`（1.1.0 里 `class T: def __getattr__` 定义得了、但属性缺失时不调它，
 仍是 `AttributeError`），写错工具名（或调不在表里的名字）得到的是 `AttributeError: 'Tools'
 object has no attribute 'x'`，不是原来的 `ToolError`（那条错误会列出能调的名字）；要找工具用 `TOOLS` /
-`search_tools`——`codemode` 的工具说明里点明了这一点。（POC 试过把 `tools` 做成宿主类实例、调用时暂停：未知名字能给出 `ToolError`，但
+`search_tools`——`codemode` 的工具说明点明了 `TOOLS`，发现函数的接口在 `tool://codemode/doc`（2026-10-23 起，长说明按需读、不进工具定义，`docs/komo_bot.md` §4）。（POC 试过把 `tools` 做成宿主类实例、调用时暂停：未知名字能给出 `ToolError`，但
 `f = tools.read` 取不到属性，`getattr` 动态派发全断，所以没采用。）
 
 发现函数照 pi 的 `searchTools` / `describeTool` / `describeNamespace`：宿主把这次能调的工具说明、

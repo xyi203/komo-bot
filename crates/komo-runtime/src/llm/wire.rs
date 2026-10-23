@@ -383,6 +383,7 @@ mod tests {
             name: "read".into(),
             description: "读文件".into(),
             parameters: json!({ "type": "object" }),
+            doc: None,
         };
         let body = responses_request(&config(None), "sys", &[], &[tool], None, None);
         assert_eq!(body["tools"][0]["type"], json!("function"));
@@ -392,6 +393,28 @@ mod tests {
             "名字在 item 上，不再包一层 function"
         );
         assert_eq!(body["tool_choice"], json!("auto"));
+    }
+
+    /// `doc` 是 `tool://<名>/doc` 才读的长说明，不进任何一家 provider 的请求体。
+    #[test]
+    fn a_tools_long_doc_never_reaches_the_responses_request() {
+        let tool = ToolDefinition {
+            name: "monitor".into(),
+            description: "短说明".into(),
+            parameters: json!({ "type": "object" }),
+            doc: Some("只在 tool://monitor/doc 里的长文档".into()),
+        };
+        let body = responses_request(&config(None), "sys", &[], &[tool], None, None);
+        assert_eq!(
+            body["tools"][0],
+            json!({
+                "type": "function",
+                "name": "monitor",
+                "description": "短说明",
+                "parameters": { "type": "object" },
+            })
+        );
+        assert!(!body.to_string().contains("长文档"), "{body}");
     }
 
     #[test]

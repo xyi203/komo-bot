@@ -94,6 +94,7 @@ fn tools() -> Vec<ToolDefinition> {
         name: "read".into(),
         description: "读文件".into(),
         parameters: serde_json::json!({ "type": "object" }),
+        doc: None,
     }]
 }
 

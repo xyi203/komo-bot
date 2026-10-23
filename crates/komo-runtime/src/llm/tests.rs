@@ -143,6 +143,7 @@ async fn tools_are_sent_flat_with_a_tool_choice() {
         name: "read".into(),
         description: "读文件".into(),
         parameters: json!({ "type": "object", "properties": {} }),
+        doc: None,
     }];
     let mut driver = llm.begin_turn(req).await.unwrap();
     driver.next(RoundInput::First).await.unwrap();

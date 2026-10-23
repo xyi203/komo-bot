@@ -379,6 +379,7 @@ fn tools(names: &[&str]) -> Vec<ToolDefinition> {
             name: (*name).into(),
             description: format!("{name} 工具"),
             parameters: serde_json::json!({}),
+            doc: None,
         })
         .collect()
 }

@@ -160,21 +160,21 @@ impl Tool for RgTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "rg".into(),
-            description: "搜索文件正文返回「路径:行号:正文」；list_files=true 时列出文件路径（类似 rg --files）。\
-                 搜代码、文字和列文件用它，不要用 bash 里的 rg / grep / find / ls 拼搜索。"
+            description: "搜索文件正文返回「路径:行号:正文」；list_files=true 时列出文件路径（类似 rg --files）。"
                 .into(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "pattern": { "type": "string", "description": "搜正文时必填；ripgrep 语法的正则（Rust regex）；搜字面量时把 fixed_strings 打开；list_files=true 时不要传" },
-                    "list_files": { "type": "boolean", "description": "只列文件路径（类似 rg --files），缺省 false；为 true 时不要传 pattern" },
-                    "path": { "type": "string", "description": "要搜的目录或文件，缺省是工作目录；也可以是资源入口：`skill://`（搜全部 skill 根）、`artifact://files`（本次会话的产物目录）" },
+                    "pattern": { "type": "string", "description": "搜正文时必填；Rust regex 语法，字面量搜索开 fixed_strings；list_files=true 时不传" },
+                    "list_files": { "type": "boolean", "description": "只列文件路径，缺省 false；为 true 时不传 pattern" },
+                    "path": { "type": "string", "description": "目录或文件，缺省工作目录；也可以是 `skill://`（全部 skill 根）、`artifact://files`（本会话产物）" },
                     "glob": { "type": "string", "description": "只搜匹配这个 glob 的文件，例如 '*.rs' 或 '!target/**'" },
                     "ignore_case": { "type": "boolean", "description": "忽略大小写；缺省区分大小写" },
                     "fixed_strings": { "type": "boolean", "description": "把 pattern 当字面量，不解释正则元字符" }
                 },
                 "additionalProperties": false
             }),
+            doc: None,
         }
     }
 

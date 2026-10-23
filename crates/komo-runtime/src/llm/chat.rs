@@ -547,6 +547,30 @@ mod tests {
         }
     }
 
+    /// `doc` 是 `tool://<名>/doc` 才读的长说明，不进任何一家 provider 的请求体。
+    #[test]
+    fn a_tools_long_doc_never_reaches_the_chat_completions_request() {
+        let tool = ToolDefinition {
+            name: "monitor".into(),
+            description: "短说明".into(),
+            parameters: json!({ "type": "object" }),
+            doc: Some("只在 tool://monitor/doc 里的长文档".into()),
+        };
+        let body = request_body(&model(), &[], &[tool], None);
+        assert_eq!(
+            body["tools"][0],
+            json!({
+                "type": "function",
+                "function": {
+                    "name": "monitor",
+                    "description": "短说明",
+                    "parameters": { "type": "object" },
+                },
+            })
+        );
+        assert!(!body.to_string().contains("长文档"), "{body}");
+    }
+
     #[tokio::test]
     async fn text_tool_calls_and_usage_are_assembled_and_replayed() {
         let transport = ScriptedTransport::new(vec![

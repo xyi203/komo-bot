@@ -485,6 +485,7 @@ fn test_definition(name: &str, description: &str) -> komo_kernel::types::tool::T
         name: name.into(),
         description: description.into(),
         parameters: serde_json::json!({ "type": "object" }),
+        doc: None,
     }
 }
 

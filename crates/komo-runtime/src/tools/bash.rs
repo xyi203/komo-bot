@@ -287,8 +287,7 @@ impl Tool for BashTool {
             name: "bash".into(),
             description:
                 "在自己的进程组里跑一条 bash 命令，返回退出码与输出。默认在会话工作目录里跑，\
-                 换目录给 cwd。git、构建、测试、跑程序走它；只是看文件、搜代码、列文件用 read / rg\
-                 （列文件设 list_files=true），要读要搜好几处用 codemode。\n\
+                 换目录给 cwd。git、构建、测试、跑程序走它。\n\
                  构建、下载、部署这类慢事照常写成一条命令，timeout_secs 按预计时长给足（省略 = 120）。\
                  要等一个状态（流水线、工单、部署进度）别在这里 sleep 轮询——挂 monitor，脚本在完成或\
                  出错时打一行；对话会话里 10 秒以上的 sleep 会被拒绝。\n\
@@ -309,6 +308,7 @@ impl Tool for BashTool {
                 "required": ["command"],
                 "additionalProperties": false
             }),
+            doc: None,
         }
     }
 
@@ -550,15 +550,6 @@ mod tests {
     use crate::tools::process::{ChildOutcome, drive};
     use crate::tools::test_support::{context, context_with_cancel, writer};
     use komo_kernel::types::tool::CancelToken;
-
-    /// 列文件也指到 rg 的 list_files，不在 shell 里跑 ls / find。
-    #[test]
-    fn shell_description_routes_file_listing_to_rg() {
-        use komo_kernel::traits::Tool;
-        let description = BashTool::new().definition().description;
-        assert!(description.contains("列文件用 read / rg"), "{description}");
-        assert!(description.contains("list_files=true"), "{description}");
-    }
 
     fn shell_result(output: &ToolOutput) -> BashResult {
         serde_json::from_value(output.result.clone()).expect("bash 的结果")

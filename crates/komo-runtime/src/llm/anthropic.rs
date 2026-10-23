@@ -885,6 +885,28 @@ mod tests {
         format!("event: {name}\n{}", frame(data))
     }
 
+    /// `doc` 是 `tool://<名>/doc` 才读的长说明，不进任何一家 provider 的请求体。
+    #[test]
+    fn a_tools_long_doc_never_reaches_the_anthropic_request() {
+        let tool = ToolDefinition {
+            name: "monitor".into(),
+            description: "短说明".into(),
+            parameters: json!({ "type": "object" }),
+            doc: Some("只在 tool://monitor/doc 里的长文档".into()),
+        };
+        let body = request_body(&model(None), "system", &[], &[tool], None, None, 1024);
+        assert_eq!(
+            body["tools"][0],
+            json!({
+                "name": "monitor",
+                "description": "短说明",
+                "input_schema": { "type": "object" },
+                "cache_control": { "type": "ephemeral" },
+            })
+        );
+        assert!(!body.to_string().contains("长文档"), "{body}");
+    }
+
     // ---- 纯文本 ----
 
     #[tokio::test]
@@ -1458,6 +1480,7 @@ mod tests {
             name: "read".into(),
             description: "读文件".into(),
             parameters: json!({ "type": "object" }),
+            doc: None,
         }];
         let mut driver = llm.begin_turn(req).await.unwrap();
 
@@ -1639,6 +1662,7 @@ mod tests {
             name: "read".into(),
             description: "读文件".into(),
             parameters: json!({ "type": "object" }),
+            doc: None,
         }];
         // 回放窗口从一条工具结果开始：它前面没有 user 消息可以补断点。
         req.messages = vec![ReplayMessage {
@@ -1918,6 +1942,7 @@ mod live {
                     "properties": { "city": { "type": "string" } },
                     "required": ["city"],
                 }),
+                doc: None,
             }],
             memories: vec![],
             covers: None,

@@ -301,10 +301,11 @@ impl FeishuChannel {
             return;
         };
 
-        // 话题里被 @：把话题里 komo 没收到的消息读来当上下文（§11.3）。主流里的 @ 开新
-        // 话题，事件没有 `thread_id`，没有"此前"可读。读不到只记 WARN，原文照常交出去。
+        // 群话题里被 @：把话题里 komo 没收到的消息读来当上下文（§11.3）。主流里的 @ 开新
+        // 话题，事件没有 `thread_id`，没有"此前"可读；私聊话题里每条消息本来就交给 komo，
+        // 没有它漏掉的话，读了只是白等一次往返。读不到只记 WARN，原文照常交出去。
         let thread_id = event.message.thread_id.trim();
-        if !thread_id.is_empty() {
+        if !thread_id.is_empty() && !message.is_private {
             message.context = topic::context(
                 self.api(),
                 &self.names,
@@ -1298,6 +1299,34 @@ mod tests {
     }
 
     // 话题里没 @机器人 的消息仍然不触发、也不读。
+    #[tokio::test]
+    async fn a_private_thread_message_reads_nothing() {
+        let fake = FakeOpenApi::start(Behavior::default()).await;
+        let harness = harness(&fake);
+        let recorder = RecordingInbound::new(fake.log());
+        harness
+            .events
+            .send(text_event_replying(
+                "evt-1",
+                "oc_p",
+                "p2p",
+                "ou_op",
+                "接着说",
+                &[],
+                "om_root",
+                "omt_1",
+            ))
+            .unwrap();
+        serve_until(harness.channel, recorder.clone(), || {
+            !recorder.received().is_empty()
+        })
+        .await;
+        let received = recorder.received();
+        assert!(received[0].is_private);
+        assert!(received[0].context.is_none());
+        assert!(fake.calls_to("thread_list").is_empty(), "私聊话题不读历史");
+    }
+
     #[tokio::test]
     async fn a_thread_message_that_does_not_name_the_bot_reads_nothing() {
         let fake = FakeOpenApi::start(Behavior::default()).await;

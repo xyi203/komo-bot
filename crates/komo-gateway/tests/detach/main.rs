@@ -15,6 +15,8 @@ use komo_kernel::types::model::TokenUsage;
 use komo_kernel::types::status::RunState;
 use komo_kernel::types::turn::{LlmError, Round, RoundInput, TurnRequest};
 
+mod durable;
+
 fn config(detach_after_secs: u64) -> String {
     format!(
         r#"

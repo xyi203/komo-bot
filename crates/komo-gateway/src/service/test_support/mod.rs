@@ -9,6 +9,7 @@
 //! 各自抄了一份"真 Gateway + MemSender + FakeLlm + 数据目录"，四份的差别只在各自特有的
 //! 那几个助手上。
 
+pub mod driver_stream;
 pub mod harness;
 
 #[cfg(test)]

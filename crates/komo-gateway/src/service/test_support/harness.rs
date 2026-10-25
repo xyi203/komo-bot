@@ -533,7 +533,7 @@ impl ModelStream for FakeLlm {
 }
 
 /// 一个回合的身份：缓存键 + 最后一条用户消息的位置与正文。续轮请求与开头那一条请求同键。
-fn stream_key(request: &ModelRequest<'_>) -> String {
+pub(super) fn stream_key(request: &ModelRequest<'_>) -> String {
     let (index, text) = request
         .messages
         .iter()
@@ -580,7 +580,7 @@ fn tool_result_of(result: &ToolResultMessage) -> ToolResultForModel {
 }
 
 /// 消息序列末尾那一串连续的工具结果（一轮的全部结果）。
-fn trailing_tool_results(messages: &[Message]) -> Vec<ToolResultForModel> {
+pub(super) fn trailing_tool_results(messages: &[Message]) -> Vec<ToolResultForModel> {
     let mut results: Vec<_> = messages
         .iter()
         .rev()
@@ -596,7 +596,7 @@ fn trailing_tool_results(messages: &[Message]) -> Vec<ToolResultForModel> {
 
 /// 把请求投成旧 `TurnRequest` 的形状：系统提示与工具表是 system 消息回放的结果，user /
 /// assistant 各一条，紧挨着的工具结果并成一条 `Role::Tool`。
-fn turn_request(request: &ModelRequest<'_>) -> TurnRequest {
+pub(super) fn turn_request(request: &ModelRequest<'_>) -> TurnRequest {
     let system = replay_system(request.messages);
     let mut messages: Vec<ReplayMessage> = Vec::new();
     let mut index = 0;
@@ -686,7 +686,10 @@ fn turn_request(request: &ModelRequest<'_>) -> TurnRequest {
 }
 
 /// 脚本里的一轮 → 一条 assistant 消息（`extra` 同真 provider：api / provider / model / usage）。
-fn assistant_of(model: &komo_kernel::types::model::ModelConfig, round: &Round) -> AssistantMessage {
+pub(super) fn assistant_of(
+    model: &komo_kernel::types::model::ModelConfig,
+    round: &Round,
+) -> AssistantMessage {
     let mut content = Vec::new();
     if let Some(text) = round.text.as_deref().filter(|text| !text.is_empty()) {
         content.push(ContentBlock::text(text));

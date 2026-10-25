@@ -14,6 +14,8 @@ use komo_kernel::types::model::TokenUsage;
 use komo_kernel::types::status::RunState;
 use komo_kernel::types::turn::{LlmError, Round, RoundInput, TurnRequest};
 
+mod durable;
+
 fn config() -> String {
     r#"
 default_agent = "assistant"

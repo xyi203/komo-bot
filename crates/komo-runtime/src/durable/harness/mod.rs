@@ -25,8 +25,9 @@
 //!   [`Tool`](komo_kernel::traits::Tool)（`prepare` / `execute` / `replay`）；完整输出落盘走
 //!   [`ToolOutputStore`](komo_kernel::traits::ToolOutputStore)，模型视图由
 //!   `komo_kernel::projection` 在收尾时算一次、存进结果 entry。
-//! - 压缩、衰减、codemode 嵌套调用、子进程 probe 是 D4c / D5。
+//! - 压缩与衰减（D4c）在 [`compaction`]；codemode 嵌套调用、子进程 probe 是 D4c 的另一半 / D5。
 
+pub mod compaction;
 pub mod entries;
 pub mod generation;
 pub mod hooks;
@@ -40,6 +41,7 @@ pub mod tool;
 #[cfg(test)]
 mod tests;
 
+pub use compaction::{CompactionSettings, CompactionSetup, CompactionTask, SummaryPrompt};
 pub use generation::GenerationTask;
 pub use hooks::{
     AgentHooks, AgentSetup, HarnessDeps, HarnessSettings, HookError, PromptSection, QueueMode,
@@ -55,3 +57,4 @@ pub use tool::ToolTask;
 /// 任务种类名（`TaskRecord::kind`）。
 pub const GENERATION_KIND: &str = "komo.generation";
 pub const TOOL_KIND: &str = "komo.tool";
+pub const COMPACTION_KIND: &str = "komo.compaction";

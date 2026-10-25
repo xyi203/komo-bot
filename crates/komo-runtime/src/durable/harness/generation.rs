@@ -32,15 +32,29 @@
 //!   codemode 自成一组、一个一个来；`pending` 是还没建的调用。一轮结束在 postTools
 //!   boundary 把 run 交给下一个 generation，或在 final boundary 收尾。
 //!
+//! - **压缩**（`docs/storage-durable.md` §4.5；pi spec §8.3 / §8.7）：`prepare` 在装配之后调
+//!   `compaction::plan`。贴着窗口——先换短视图（一条只带 `edits` 的 `komo.decay` write entry，
+//!   和 `komo.system` 一起在同一次提交里追加）；没有可换的就建一个**阻塞压缩**（生成拥有的
+//!   子任务）并 `waiting`，checkpoint `{ phase: "prepare", compacted, threshold: true }`，压缩
+//!   完回到 `prepare` 读一次它的结局再接着这一轮。到了后台阈值只在移到 `request` 的那次提交里
+//!   多建一个 conversation 所有的后台压缩，不等它。
+//! - **超长**：`request` 收到 provider 的上下文超长错误（`is_context_overflow`）、这个生成还没
+//!   压过（`compacted` 空）、旧实现的"压成之后至少有一次成功请求"也满足时，追加错误 entry、建
+//!   阻塞压缩（`reason: overflow`，决策记 `context_overflow: true`）并 `waiting`，checkpoint
+//!   `{ phase: "prepare", compacted, overflow }`；这次恢复请求不算重试预算。压缩没产出摘要、或
+//!   压过之后又超长，都照旧以 `model_error` 失败——不会无限循环。
+//!
 //! 预算（轮数、token）落在 `komo.live.run`，重启不重置。被截断的回复（`length`）不按半轮调用
 //! 执行：它记成一条失败的 assistant entry，run 以 `model_error` 收场（沿用今天的规则）。
 
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use komo_kernel::compaction::PROMPT_CACHE_TTL;
+use komo_kernel::durable::compaction::{DECAY_ENTRY_KIND, cache_cold, decay_edits, online_state};
 use komo_kernel::durable::task::RunningTask;
 use komo_kernel::durable::{
-    AssistantMessage, ContentBlock, ConversationId, EntryId, Message, StopReason,
+    AssistantMessage, ContentBlock, ConversationId, EntryId, EntryRecord, Message, StopReason,
     SubmissionSettlement, TaskId, derive_context,
 };
 use komo_kernel::types::model::ModelConfig;
@@ -49,6 +63,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use tokio_util::sync::CancellationToken;
 
+use super::compaction::{self, CompactionTask, Plan, PlanInput, Reason, Settled};
 use super::entries::append_assistant;
 use super::hooks::{HarnessDeps, HookError, RetryPolicy, ToolSet};
 use super::inbox::{self, At, QueueModes};
@@ -60,8 +75,8 @@ use super::{GENERATION_KIND, entries};
 use crate::durable::error::{DurableError, TaskError};
 use crate::durable::kind::TaskKind;
 use crate::durable::runtime::TaskRuntime;
-use crate::durable::tx::{Ownership, TaskOptions};
-use crate::llm::{ModelRequest, RequestOptions, retry_cause, usage_of};
+use crate::durable::tx::{EntryDraft, Ownership, TaskOptions};
+use crate::llm::{ModelRequest, RequestOptions, is_context_overflow, retry_cause, usage_of};
 
 /// 被截断的回复失败时的文字（沿用 `AgentLoop` 的）。
 const TRUNCATED: &str = "模型回复被截断，调用参数未收齐——不按半轮调用执行";
@@ -83,9 +98,24 @@ pub struct Limits {
 pub enum Checkpoint {
     Prepare {
         attempt: u32,
+        /// 这个生成等过的阻塞压缩：之后不再起别的压缩（要么这一轮已经压过，要么压不动）。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        compacted: Option<TaskId>,
+        /// 起 `compacted` 的那次超长的错误文字；`prepare` 恢复时查一次它有没有产出摘要。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        overflow: Option<String>,
+        /// `compacted` 是越过阻塞阈值起的；`prepare` 恢复时查一次它的结局。
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        threshold: bool,
     },
     Request {
         attempt: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        compacted: Option<TaskId>,
+        /// 这一轮刚把 `messages[i]` 起的工具结果换了短视图（衰减）：Anthropic 的缓存断点要补在
+        /// 它之前（`RequestOptions::revised_from`）。重启后重发时带同一个值。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        revised_from: Option<usize>,
         /// 这次请求冻结的模型与 effort（配置热重载不换正在发的这一个）。
         model: ModelConfig,
         /// 这次请求包含的最新 entry。
@@ -100,6 +130,8 @@ pub enum Checkpoint {
         attempt: u32,
         /// 到点时刻（毫秒）。
         until: i64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        compacted: Option<TaskId>,
     },
     Tools {
         /// 发起这一轮调用的 assistant entry。
@@ -115,6 +147,45 @@ fn encode(checkpoint: &Checkpoint) -> Value {
     serde_json::to_value(checkpoint).expect("Checkpoint 可序列化")
 }
 
+impl Checkpoint {
+    fn prepare(attempt: u32, compacted: Option<TaskId>) -> Self {
+        Checkpoint::Prepare {
+            attempt,
+            compacted,
+            overflow: None,
+            threshold: false,
+        }
+    }
+}
+
+/// 只有定义没有行为的生成任务：`inbox` / `compaction` 在一次提交里建生成任务时只要它的名字、
+/// 版本与初始 checkpoint（`Tx::create_task` 的 `&dyn TaskKind`），真正跑它的是注册表里的
+/// [`GenerationTask`]。
+pub(super) struct GenerationDefinition;
+
+#[async_trait]
+impl TaskKind for GenerationDefinition {
+    fn name(&self) -> &str {
+        GENERATION_KIND
+    }
+
+    fn initial(&self, _input: &Value) -> Value {
+        encode(&Checkpoint::prepare(1, None))
+    }
+
+    async fn run_phase(&self, _task: &RunningTask, _rt: &TaskRuntime) -> Result<(), TaskError> {
+        Err(TaskError::new(
+            "GenerationDefinition only describes the task",
+        ))
+    }
+
+    async fn abort(&self, _task: &RunningTask, _rt: &TaskRuntime) -> Result<(), TaskError> {
+        Err(TaskError::new(
+            "GenerationDefinition only describes the task",
+        ))
+    }
+}
+
 fn decode(task: &RunningTask) -> Result<Checkpoint, TaskError> {
     serde_json::from_value(task.checkpoint.clone())
         .map_err(|e| TaskError::new(format!("generation checkpoint is malformed: {e}")))
@@ -125,11 +196,22 @@ fn decode(task: &RunningTask) -> Result<Checkpoint, TaskError> {
 pub struct GenerationTask {
     deps: Arc<HarnessDeps>,
     tool: ToolTask,
+    compaction: CompactionTask,
 }
 
 impl GenerationTask {
     pub fn new(deps: Arc<HarnessDeps>, tool: ToolTask) -> Self {
-        Self { deps, tool }
+        let compaction = CompactionTask::new(deps.clone());
+        Self {
+            deps,
+            tool,
+            compaction,
+        }
+    }
+
+    /// 它建的压缩任务的定义：`Harness::install` 一并装进注册表。
+    pub fn compaction(&self) -> &CompactionTask {
+        &self.compaction
     }
 
     pub fn deps(&self) -> &Arc<HarnessDeps> {
@@ -146,8 +228,43 @@ impl GenerationTask {
 
     // ------------------------------------------------------------------ prepare
 
-    async fn prepare(&self, rt: &TaskRuntime, attempt: u32) -> Result<(), TaskError> {
+    async fn prepare(
+        &self,
+        rt: &TaskRuntime,
+        attempt: u32,
+        resumed: Resumed,
+    ) -> Result<(), TaskError> {
         let conversation = rt.conversation();
+        let Resumed {
+            compacted,
+            overflow,
+            threshold,
+        } = resumed;
+        // 阻塞压缩回来了：读一次它的结局（spec §8.3）。有摘要，或阈值压缩"没有可收的"，接着
+        // 这一轮；超长救不回来、压缩失败 / 被 abort 都以 `model_error` 收场，不发请求。
+        if let Some(task) = compacted
+            && (overflow.is_some() || threshold)
+        {
+            let outcome = rt
+                .outcomes(&[task])
+                .await?
+                .into_iter()
+                .next()
+                .ok_or_else(|| TaskError::new("the awaited compaction has no outcome"))?;
+            let settled = compaction::task::settled(&outcome);
+            let proceed = match &settled {
+                Settled::Done { summary } => *summary || overflow.is_none(),
+                Settled::Broke(_) => false,
+            };
+            if !proceed {
+                let text = overflow.unwrap_or_else(|| match settled {
+                    Settled::Broke(text) => text,
+                    Settled::Done { .. } => "Compaction produced no summary".to_owned(),
+                });
+                return self.fail_run(rt, "model_error", text, None).await;
+            }
+        }
+
         let entries = rt.entries(conversation, None).await?;
         let view = derive_context(&entries, None);
         let setup = match self.deps.hooks.setup(conversation, &view.messages).await {
@@ -157,16 +274,71 @@ impl GenerationTask {
             }
             Err(HookError::Failed(message)) => return Err(TaskError::new(message)),
         };
-        let drafts = plan_system_entries(
+        let mut drafts = plan_system_entries(
             &entries,
             &view,
             &setup.sections,
             &setup.tools.definitions(),
             rt.now()?,
         );
+
+        // 压缩判断（spec §8.3 / §8.7）：这个生成还没等过压缩才判。
+        let mut revised_from = None;
+        let mut background = None;
+        if compacted.is_none() {
+            let csetup = match self.deps.hooks.compaction(conversation).await {
+                Ok(csetup) => csetup,
+                Err(HookError::NoModel(message)) => {
+                    return self.fail_run(rt, "no_model", message, None).await;
+                }
+                Err(HookError::Failed(message)) => return Err(TaskError::new(message)),
+            };
+            let live = compaction::read_live(rt, conversation).await?;
+            let online = online_state(&entries, compaction::refused_after(&live));
+            let cold = cache_cold(&entries, rt.now()?, PROMPT_CACHE_TTL.as_millis() as i64);
+            let planned: Vec<Message> = drafts
+                .iter()
+                .flat_map(|draft| draft.model.iter().flatten().cloned())
+                .collect();
+            let plan = compaction::plan(PlanInput {
+                entries: &entries,
+                view: &view,
+                planned: &planned,
+                online: &online,
+                setup: &csetup,
+                model: &setup.model,
+                decay: setup.tools.env.projection.decay,
+                cache_cold: cold,
+                compaction_running: live.compactions.as_ref().is_some_and(|c| !c.is_empty()),
+            });
+            match plan {
+                Plan::Nothing => {}
+                Plan::Compact { decision } => {
+                    return self.wait_for_compaction(rt, attempt, decision).await;
+                }
+                Plan::Background { decision } => background = Some(decision),
+                Plan::Decay {
+                    candidates,
+                    decision,
+                } => {
+                    let mut draft = EntryDraft::new(DECAY_ENTRY_KIND);
+                    draft.edits = decay_edits(&candidates);
+                    draft.data = Some(json!({
+                        "decayed": candidates.iter().map(|c| c.entry).collect::<Vec<_>>(),
+                        "debt": decision.debt(),
+                        "decision": decision,
+                    }));
+                    drafts.insert(0, draft);
+                    revised_from = first_revised(conversation, &entries, &view, &drafts);
+                }
+            }
+        }
+
         let newest = entries.last().map(|entry| entry.id);
         let request = Checkpoint::Request {
             attempt,
+            compacted,
+            revised_from,
             model: setup.model.clone(),
             // 提交里会换成最后一条 system entry 的 ID。
             cutoff: newest.unwrap_or(EntryId::new(0)),
@@ -178,6 +350,7 @@ impl GenerationTask {
             max_output_tokens: setup.max_output_tokens,
         };
         let max_rounds = setup.budget.max_rounds;
+        let compaction_task = self.compaction.clone();
         rt.commit(move |tx, task| {
             Box::pin(async move {
                 let mut live = live::load(tx, conversation).await?;
@@ -206,6 +379,21 @@ impl GenerationTask {
                         "Conversation {conversation} has no entries to send"
                     )));
                 };
+                // 后台压缩：不等它，只在这次提交里把它建出来（它自己落点，见 `compaction::task`）。
+                if let Some(decision) = background
+                    && live.compactions.as_ref().is_none_or(Vec::is_empty)
+                {
+                    compaction::task::create(
+                        tx,
+                        &compaction_task,
+                        conversation,
+                        &mut live,
+                        &compaction::Input::new(Reason::Threshold, Some(decision)),
+                        None,
+                    )
+                    .await?;
+                    live::store(tx, conversation, &live).await?;
+                }
                 let mut request = request;
                 if let Checkpoint::Request { cutoff: slot, .. } = &mut request {
                     *slot = cutoff;
@@ -215,6 +403,102 @@ impl GenerationTask {
         })
         .await?;
         Ok(())
+    }
+
+    /// 越过阻塞阈值：建一个生成拥有的压缩并 `waiting`（spec §8.3）。
+    async fn wait_for_compaction(
+        &self,
+        rt: &TaskRuntime,
+        attempt: u32,
+        decision: komo_kernel::compaction::CompactionDecision,
+    ) -> Result<(), TaskError> {
+        let conversation = rt.conversation();
+        let compaction_task = self.compaction.clone();
+        rt.commit(move |tx, task| {
+            Box::pin(async move {
+                let mut live = live::load(tx, conversation).await?;
+                let id = compaction::task::create(
+                    tx,
+                    &compaction_task,
+                    conversation,
+                    &mut live,
+                    &compaction::Input::new(Reason::Threshold, Some(decision)),
+                    Some(task.id()),
+                )
+                .await?;
+                live::store(tx, conversation, &live).await?;
+                let checkpoint = Checkpoint::Prepare {
+                    attempt,
+                    compacted: Some(id),
+                    overflow: None,
+                    threshold: true,
+                };
+                Ok(Some(waiting(encode(&checkpoint), vec![id])))
+            })
+        })
+        .await?;
+        Ok(())
+    }
+
+    /// 上下文超长：能救就追加错误 entry、建阻塞压缩并 `waiting`，返回 `true`；救不了
+    /// （这个生成已经压过、刚压成摘要还没有成功的请求、切不出可收的一段）返回 `false`，调用方
+    /// 照旧失败。这次恢复请求不算重试预算：`attempt` 原样带回 `prepare`。
+    async fn start_overflow_compaction(
+        &self,
+        rt: &TaskRuntime,
+        request: &RequestCheckpoint,
+        message: &AssistantMessage,
+        text: &str,
+    ) -> Result<bool, TaskError> {
+        if request.compacted.is_some() {
+            return Ok(false);
+        }
+        let conversation = rt.conversation();
+        let csetup = match self.deps.hooks.compaction(conversation).await {
+            Ok(csetup) => csetup,
+            // 拿不到设置就救不了：照旧按超长失败。
+            Err(_) => return Ok(false),
+        };
+        let entries = rt.entries(conversation, None).await?;
+        let view = derive_context(&entries, None);
+        let online = online_state(&entries, None);
+        let cold = cache_cold(&entries, rt.now()?, PROMPT_CACHE_TTL.as_millis() as i64);
+        let Some((decision, _)) =
+            compaction::plan_overflow(&view, &online, &csetup.settings, &request.model, cold)
+        else {
+            return Ok(false);
+        };
+        tracing::warn!(attempt = request.attempt, "上下文超长，压缩一次后重发");
+        let attempt = request.attempt;
+        let message = message.clone();
+        let text = text.to_owned();
+        let compaction_task = self.compaction.clone();
+        rt.commit(move |tx, task| {
+            Box::pin(async move {
+                let mut live = live::load(tx, conversation).await?;
+                append_assistant(tx, conversation, message).await?;
+                live.generation = None;
+                let id = compaction::task::create(
+                    tx,
+                    &compaction_task,
+                    conversation,
+                    &mut live,
+                    &compaction::Input::new(Reason::Overflow, Some(decision)),
+                    Some(task.id()),
+                )
+                .await?;
+                live::store(tx, conversation, &live).await?;
+                let checkpoint = Checkpoint::Prepare {
+                    attempt,
+                    compacted: Some(id),
+                    overflow: Some(text),
+                    threshold: false,
+                };
+                Ok(Some(waiting(encode(&checkpoint), vec![id])))
+            })
+        })
+        .await?;
+        Ok(true)
     }
 
     // ------------------------------------------------------------------ request
@@ -279,7 +563,7 @@ impl GenerationTask {
                 images: tools.env.images.as_deref(),
                 cache_key: request.cache_key.as_deref(),
                 max_output_tokens: request.max_output_tokens,
-                revised_from: None,
+                revised_from: request.revised_from,
             });
         let sink = latest.clone();
         let mut progress = move |partial: &AssistantMessage| {
@@ -355,10 +639,18 @@ impl GenerationTask {
     ) -> Result<(), TaskError> {
         let text = error.to_string();
         let message = error_message(&request.model, &text, rt.now()?);
+        if is_context_overflow(&error)
+            && self
+                .start_overflow_compaction(rt, request, &message, &text)
+                .await?
+        {
+            return Ok(());
+        }
         let retryable = retry_cause(&error).is_some();
         if retryable && request.limits.retry.allows_another(request.attempt) {
             let conversation = rt.conversation();
             let attempt = request.attempt;
+            let compacted = request.compacted;
             let until = rt.now()? + request.limits.retry.delay_ms(attempt) as i64;
             tracing::warn!(attempt, until, %error, "模型请求失败，持久化退避后再试");
             return rt
@@ -375,7 +667,11 @@ impl GenerationTask {
                             }),
                         });
                         live::store(tx, conversation, &live).await?;
-                        Ok(Some(running(encode(&Checkpoint::Retry { attempt, until }))))
+                        Ok(Some(running(encode(&Checkpoint::Retry {
+                            attempt,
+                            until,
+                            compacted,
+                        }))))
                     })
                 })
                 .await
@@ -645,6 +941,37 @@ impl GenerationTask {
     }
 }
 
+/// `prepare` 是从什么恢复的：等过的阻塞压缩与它的起因。
+struct Resumed {
+    compacted: Option<TaskId>,
+    overflow: Option<String>,
+    threshold: bool,
+}
+
+/// 追加 `drafts` 之后，请求里第一条被换了视图的工具结果的下标（Anthropic 缓存断点要补在它
+/// 之前）。追加的 entry 在模拟里按顺序编号，推导出来的消息与现在的逐条比。
+fn first_revised(
+    conversation: ConversationId,
+    entries: &[EntryRecord],
+    view: &komo_kernel::durable::ContextView,
+    drafts: &[EntryDraft],
+) -> Option<usize> {
+    let mut simulated = entries.to_vec();
+    let mut next = entries.last().map_or(0, |entry| entry.id.get());
+    for draft in drafts {
+        next += 1;
+        let mut record = EntryRecord::new(EntryId::new(next), conversation, draft.kind.clone());
+        record.model = draft.model.clone();
+        record.edits = draft.edits.clone();
+        simulated.push(record);
+    }
+    let after = derive_context(&simulated, None).messages;
+    after
+        .iter()
+        .zip(&view.messages)
+        .position(|(new, old)| matches!(new, Message::ToolResult(_)) && new != old)
+}
+
 /// 这条消息里的工具调用 `(id, name)`，按调用顺序。
 fn entries_tool_calls(message: &AssistantMessage) -> Vec<(String, String)> {
     message
@@ -763,6 +1090,8 @@ async fn commit_partials(
 #[derive(Debug, Clone)]
 pub(super) struct RequestCheckpoint {
     attempt: u32,
+    compacted: Option<TaskId>,
+    revised_from: Option<usize>,
     model: ModelConfig,
     cutoff: EntryId,
     limits: Limits,
@@ -777,14 +1106,28 @@ impl TaskKind for GenerationTask {
     }
 
     fn initial(&self, _input: &Value) -> Value {
-        encode(&Checkpoint::Prepare { attempt: 1 })
+        encode(&Checkpoint::prepare(1, None))
     }
 
     async fn run_phase(&self, task: &RunningTask, rt: &TaskRuntime) -> Result<(), TaskError> {
         match decode(task)? {
-            Checkpoint::Prepare { attempt } => self.prepare(rt, attempt).await,
+            Checkpoint::Prepare {
+                attempt,
+                compacted,
+                overflow,
+                threshold,
+            } => {
+                let resumed = Resumed {
+                    compacted,
+                    overflow,
+                    threshold,
+                };
+                self.prepare(rt, attempt, resumed).await
+            }
             Checkpoint::Request {
                 attempt,
+                compacted,
+                revised_from,
                 model,
                 cutoff,
                 limits,
@@ -795,6 +1138,8 @@ impl TaskKind for GenerationTask {
                     rt,
                     RequestCheckpoint {
                         attempt,
+                        compacted,
+                        revised_from,
                         model,
                         cutoff,
                         limits,
@@ -804,7 +1149,11 @@ impl TaskKind for GenerationTask {
                 )
                 .await
             }
-            Checkpoint::Retry { attempt, until } => {
+            Checkpoint::Retry {
+                attempt,
+                until,
+                compacted,
+            } => {
                 rt.sleep_until(until).await?;
                 let conversation = rt.conversation();
                 rt.commit(move |tx, _| {
@@ -816,9 +1165,10 @@ impl TaskKind for GenerationTask {
                             retry: None,
                         });
                         live::store(tx, conversation, &live).await?;
-                        Ok(Some(running(encode(&Checkpoint::Prepare {
-                            attempt: attempt + 1,
-                        }))))
+                        Ok(Some(running(encode(&Checkpoint::prepare(
+                            attempt + 1,
+                            compacted,
+                        )))))
                     })
                 })
                 .await?;

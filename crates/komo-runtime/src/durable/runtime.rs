@@ -11,8 +11,8 @@ use komo_kernel::durable::records::TaskOutcome;
 use komo_kernel::durable::storage::EntryQuery;
 use komo_kernel::durable::task::{NextTaskState, RunningTask, memo_of, put_memo};
 use komo_kernel::durable::{
-    ContextView, ConversationId, Cursor, EntryId, EntryRecord, ScanOrder, TaskId, TaskRecord,
-    TaskState, derive_context,
+    ContextView, ConversationId, Cursor, DocumentAddress, DocumentRecord, EntryId, EntryRecord,
+    ScanOrder, TaskId, TaskRecord, TaskState, derive_context,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -147,6 +147,22 @@ impl TaskRuntime {
         self.sched
             .line
             .read_on_line(move || Box::pin(async move { Ok(sched.storage.task(id).await?) }))
+            .await
+    }
+
+    /// 地址上已提交的 document（读不经过线）。
+    pub async fn find_document(
+        &self,
+        address: &DocumentAddress,
+    ) -> Result<Option<DocumentRecord>, DurableError> {
+        self.check()?;
+        let sched = self.sched.clone();
+        let address = address.clone();
+        self.sched
+            .line
+            .read_on_line(move || {
+                Box::pin(async move { Ok(sched.storage.find_document(&address).await?) })
+            })
             .await
     }
 

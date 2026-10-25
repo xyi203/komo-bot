@@ -26,6 +26,7 @@ use komo_kernel::types::surface::AgentSurface;
 use komo_kernel::types::tool::{ToolDefinition, ToolExposure, WorkspaceRoot};
 use serde::{Deserialize, Serialize};
 
+use super::compaction::{CompactionSetup, SummaryPrompt};
 use crate::agent::RetryBudget;
 use crate::llm::ImageResolver;
 
@@ -240,6 +241,22 @@ pub trait AgentHooks: Send + Sync {
     /// 只要工具表（工具任务、图片解析）。默认从 [`Self::setup`] 里取；钩子可以覆盖成更便宜的。
     async fn tools(&self, conversation: ConversationId) -> Result<ToolSet, HookError> {
         Ok(self.setup(conversation, &[]).await?.tools)
+    }
+
+    /// 压缩要的：阈值与账的旋钮、摘要提示、摘要用的模型（`komo.compaction` 任务与生成的
+    /// `prepare` / 溢出恢复问）。默认从 [`Self::setup`] 推：在线压缩关着、旋钮取 `[compaction]`
+    /// 默认值、摘要用这一轮的模型与 pi 的结构化提示——衰减与溢出恢复照样工作。gateway 覆盖它，
+    /// 接上配置与 komo-agent 的摘要提示（D5）。
+    async fn compaction(&self, conversation: ConversationId) -> Result<CompactionSetup, HookError> {
+        let setup = self.setup(conversation, &[]).await?;
+        Ok(CompactionSetup {
+            enabled: false,
+            settings: Default::default(),
+            model: setup.model,
+            prompt: SummaryPrompt::default(),
+            retry: setup.budget.retry,
+            cache_key: setup.cache_key,
+        })
     }
 }
 

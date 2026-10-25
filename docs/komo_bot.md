@@ -81,6 +81,7 @@ Gateway 持有模型连接、数据库、Session JSONL 写入器、工具环境�
 | `komo resume SESSION_ID`                     | 连接原会话并查看进度或处理待办；恢复调度由 Gateway 自动进行，不重复创建 Run |
 | `komo session list`                          | 查看会话列表和状态；`--all` 才列出已逻辑删除的会话（§8.10）                  |
 | `komo session delete/purge SESSION_ID`       | 逻辑删除（`closing` → `deleted`）与回收（`purged`）。**删除只有这一条路**：`--now` 把未完成 Run 各写一条明确取消，`purge` 前先算引用（§8.10） |
+| `komo session export SESSION_ID [-o FILE]`   | 导出成 pi v3 树形 JSONL（header + 全部分支 entry，当前位置落在末条；blob 保持引用，`komoBlobRoot` 指向 Session 目录）；默认写 stdout，只读，不导入（`docs/storage-durable.md` §9 D6） |
 | `komo run inspect RUN_ID`                    | 查看执行过程、工具结果与产物                                                |
 | `komo run cancel RUN_ID`                     | 请求取消运行                                                                |
 | `komo gateway`                               | 启动后台 Gateway，等待就绪后返回                                            |

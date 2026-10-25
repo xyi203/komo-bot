@@ -131,6 +131,14 @@ enum SessionCommand {
         #[arg(long)]
         now: bool,
     },
+    /// 把一个会话导出成 pi v3 树形 JSONL（带 blob 引用与当前位置）；默认写 stdout。
+    Export {
+        /// 会话 ID。
+        session_id: String,
+        /// 写到这个文件，而不是 stdout。
+        #[arg(short, long, value_name = "FILE")]
+        output: Option<std::path::PathBuf>,
+    },
     /// 回收一个会话的内容（`purged`）；引用未处置完会列出要先处理什么（§8.10）。
     Purge {
         /// 会话 ID。
@@ -618,6 +626,9 @@ async fn operator(
             SessionCommand::List { all } => commands::session_list(client, all).await,
             SessionCommand::Delete { session_id, now } => {
                 commands::session_delete(client, &session_id, now).await
+            }
+            SessionCommand::Export { session_id, output } => {
+                commands::session_export(client, &session_id, output.as_deref()).await
             }
             SessionCommand::Purge { session_id } => {
                 commands::session_purge(client, &session_id).await

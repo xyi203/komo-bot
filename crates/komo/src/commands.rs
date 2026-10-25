@@ -85,6 +85,29 @@ pub async fn session_purge(client: &KomoClient, session: &str) -> Outcome {
     }
 }
 
+/// `komo session export`（D6）：pi v3 树形 JSONL。不给 `-o` 就写 stdout（`println!` 补末行的换行）；
+/// 给了就写文件，只回一句摘要，免得它混进可管道的输出。
+pub async fn session_export(
+    client: &KomoClient,
+    session: &str,
+    output: Option<&std::path::Path>,
+) -> Outcome {
+    let session = SessionId::from_raw(session);
+    let body = client.export_session(&session).await.map_err(failed)?;
+    match output {
+        None => Ok(body.trim_end_matches('\n').to_owned()),
+        Some(path) => {
+            std::fs::write(path, &body)
+                .map_err(|error| format!("写 {} 失败：{error}", path.display()))?;
+            Ok(format!(
+                "{session} 已导出到 {}（{} 条记录，首行是 header）",
+                path.display(),
+                body.lines().count()
+            ))
+        }
+    }
+}
+
 pub async fn run_inspect(client: &KomoClient, run: &str) -> Outcome {
     let run = RunId::from_raw(run);
     let detail = client.run(&run).await.map_err(failed)?;

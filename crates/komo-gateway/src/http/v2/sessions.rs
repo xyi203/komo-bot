@@ -212,6 +212,8 @@ async fn submit(
     if let Some(model) = model {
         input = input.model(model);
     }
+    // W3a：先挂看客再提交（标题、聊天来源的内部输入回复都靠它）。
+    crate::service::durable::watch::ensure(&api.state, &id);
     let accepted = core.submit_input(&id, input).await?;
     receipt(core, accepted).await
 }

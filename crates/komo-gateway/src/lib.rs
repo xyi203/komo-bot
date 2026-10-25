@@ -5,6 +5,7 @@ pub mod auth;
 pub mod channels;
 pub mod deliveries;
 pub mod dispatcher;
+pub mod dispatcher_v2;
 pub mod http;
 pub mod lock;
 pub mod notifier;

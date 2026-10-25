@@ -39,7 +39,7 @@ use crate::service::state::{GatewayState, HOME_ORIGIN};
 const SEEN_LIMIT: usize = 4_096;
 
 /// 群聊会话在 `sessions.origin` 里的样子。
-fn chat_origin(peer: &ChannelPeer) -> String {
+pub(crate) fn chat_origin(peer: &ChannelPeer) -> String {
     format!("chat:{peer}")
 }
 
@@ -66,7 +66,7 @@ impl Dispatcher {
         &self.state
     }
 
-    fn remember(&self, key: &RequestKey, ack: &InboundAck) {
+    pub(crate) fn remember(&self, key: &RequestKey, ack: &InboundAck) {
         let mut seen = self.seen.lock().expect("去重表");
         if seen.len() >= SEEN_LIMIT {
             seen.pop_front();
@@ -74,7 +74,7 @@ impl Dispatcher {
         seen.push_back((key.clone(), ack.clone()));
     }
 
-    fn recall(&self, key: &RequestKey) -> Option<InboundAck> {
+    pub(crate) fn recall(&self, key: &RequestKey) -> Option<InboundAck> {
         self.seen
             .lock()
             .expect("去重表")
@@ -92,7 +92,7 @@ impl Dispatcher {
     /// 第 2 步：发送者在该渠道 `allow_from` 里（或 `allow_tenant` 且渠道核实了同一组织）
     /// 就是操作者，否则不是。**每条消息现读**
     /// 当前快照（§3 第 2 步、§11.2）。
-    fn principal(&self, msg: &InboundMessage) -> Principal {
+    pub(crate) fn principal(&self, msg: &InboundMessage) -> Principal {
         let snapshot = self.state.snapshot();
         let operator = match snapshot.channels.get(msg.peer.platform) {
             Some(channel) => channel.admits(&msg.sender, msg.same_org),
@@ -197,7 +197,7 @@ impl Dispatcher {
         }
     }
     /// 待处理的 Intervention，两类一起（§7.5）。
-    async fn pending(&self) -> Result<Vec<InterventionSummary>, GatewayError> {
+    pub(crate) async fn pending(&self) -> Result<Vec<InterventionSummary>, GatewayError> {
         self.state
             .interventions(&InterventionListQuery::default())
             .await
@@ -207,7 +207,7 @@ impl Dispatcher {
     ///
     /// 结论按种类分派：拼错了就把这一类**能答的**列出来（[`InterventionSummary::verdicts`]
     /// 是权威），而不是猜一个。
-    async fn answer(
+    pub(crate) async fn answer(
         &self,
         handle: &str,
         verdict: InterventionVerdict,
@@ -294,6 +294,10 @@ impl GatewayState {
 #[async_trait]
 impl Inbound for Dispatcher {
     async fn handle(&self, msg: InboundMessage) -> Result<InboundAck, GatewayError> {
+        // Durable 存储走 `dispatcher_v2`（D5）。
+        if self.state.durable.is_some() {
+            return self.handle_v2(msg).await;
+        }
         // ① 去重：平台重投命中同一个键。
         if let Some(ack) = self.recall(&msg.request_key) {
             return Ok(ack);
@@ -398,7 +402,7 @@ impl Inbound for Dispatcher {
 }
 
 /// 被拒绝的那条固定提示：带上他在这个平台的 id，操作者抄进 `allow_from` 即可。
-fn reject(msg: &InboundMessage) -> InboundAck {
+pub(crate) fn reject(msg: &InboundMessage) -> InboundAck {
     InboundAck::Rejected {
         hint: format!(
             "这台 komo 只听它的操作者。把 {} 加进 config.toml 的 [channels.{}] allow_from 就可以了（当前会话：{}）。",
@@ -409,13 +413,13 @@ fn reject(msg: &InboundMessage) -> InboundAck {
     }
 }
 
-fn id_reply(msg: &InboundMessage) -> String {
+pub(crate) fn id_reply(msg: &InboundMessage) -> String {
     format!("会话：{}\n发送者：{}", config_chat(msg), msg.sender)
 }
 
 /// 普通文本提交的正文：渠道带来了"此前的话"就放在前面，引用块里每行都以 `> ` 开头，
 /// 标明它不是发给模型的、是数据不是指令；再接"发给你的消息："与原文。命令不走这里。
-fn with_context(msg: &InboundMessage) -> String {
+pub(crate) fn with_context(msg: &InboundMessage) -> String {
     let Some(context) = msg
         .context
         .as_deref()
@@ -436,7 +440,7 @@ fn with_context(msg: &InboundMessage) -> String {
 }
 
 /// 抄进 `home_chat` 的那个串：不带话题，那一项只认会话本身。
-fn config_chat(msg: &InboundMessage) -> ChannelPeer {
+pub(crate) fn config_chat(msg: &InboundMessage) -> ChannelPeer {
     ChannelPeer::new(msg.peer.platform, msg.peer.chat_id.as_str())
 }
 
@@ -453,7 +457,7 @@ fn stamp(at: time::OffsetDateTime) -> String {
 }
 
 /// 一个 Run 状态的中文说法。
-fn state_text(state: RunState) -> &'static str {
+pub(crate) fn state_text(state: RunState) -> &'static str {
     match state {
         RunState::Accepted => "正在接收",
         RunState::Queued => "排队中",
@@ -489,7 +493,7 @@ fn wait_text(wait: &WaitReason) -> String {
 }
 
 /// 一行"状态 + 在等什么"。
-fn state_line(state: RunState, wait: Option<&WaitReason>) -> String {
+pub(crate) fn state_line(state: RunState, wait: Option<&WaitReason>) -> String {
     match (state, wait) {
         (RunState::Waiting, Some(wait)) => format!("{}：{}", state_text(state), wait_text(wait)),
         (RunState::Waiting, None) => "在等一个条件（没说清在等什么）".to_string(),
@@ -498,7 +502,7 @@ fn state_line(state: RunState, wait: Option<&WaitReason>) -> String {
 }
 
 /// `/pending`：两类一起，句柄 + 种类 + 问题 + 可答的结论（§11.3）。
-fn render_pending(pending: &[InterventionSummary]) -> String {
+pub(crate) fn render_pending(pending: &[InterventionSummary]) -> String {
     if pending.is_empty() {
         return "现在没有待处理的 Intervention。".to_string();
     }
@@ -532,7 +536,7 @@ fn kind_text(kind: InterventionKind) -> &'static str {
 ///
 /// 认不出结论就**列可选项**，不猜：`/answer run-1 done` 与 `/answer run-1 notperformed`
 /// 都认（`InterventionVerdict::parse` 的手滑表），别的到不了这里。句柄缺失时也要说清楚。
-fn parse_answer(text: &str) -> Option<(String, InterventionVerdict)> {
+pub(crate) fn parse_answer(text: &str) -> Option<(String, InterventionVerdict)> {
     let trimmed = text.trim();
     let mut parts = trimmed.split_whitespace();
     let head = parts.next()?;
@@ -555,7 +559,7 @@ fn parse_answer(text: &str) -> Option<(String, InterventionVerdict)> {
 }
 
 /// `/answer` 拼错了什么，以及它接受哪些写法。
-fn parse_answer_help(text: &str) -> Option<String> {
+pub(crate) fn parse_answer_help(text: &str) -> Option<String> {
     let parts: Vec<&str> = text.split_whitespace().collect();
     let head = parts.first()?.trim_start_matches('/').split('@').next()?;
     if !head.eq_ignore_ascii_case("answer") {
@@ -580,7 +584,7 @@ fn parse_answer_help(text: &str) -> Option<String> {
 /// 已经删掉的审批命令（§7，2026-10-11）：`/approve`、`/reject`、`/deny`。认出来就答一句
 /// 帮助——它们不再是命令，也不该被当成普通消息跑一轮模型。`y` / `n` 不在这里：它们就是
 /// 普通消息。
-fn retired_command_help(text: &str) -> Option<String> {
+pub(crate) fn retired_command_help(text: &str) -> Option<String> {
     let head = text.split_whitespace().next()?;
     let name = head
         .strip_prefix('/')?

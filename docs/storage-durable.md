@@ -1,6 +1,6 @@
 # 存储重设计：整套采用 pi-durable 的提交模型
 
-> 状态：**实现中（2026-10-23）**。D0–D3、D4a、D4b 已完成并合入 `main`，下一步 D4c；进度与实现中的偏离见 §13。新旧代码并存，新存储还没接到 gateway。全部完成后改写 `docs/komo_bot.md` §8，本文留作推导记录。
+> 状态：**实现中（2026-10-25）**。D0–D3、D4a、D4b 已完成并合入 `main`；D4c 已做完工具任务的 `probe` 阶段与 `komo.live.tools[].pid`，以及生成 / 工具任务在 Turso 上的接线测试（分支 `d4c-probe-gaps`），其余 D4c（压缩、codemode、`task`、`monitor`）还在做；进度与实现中的偏离见 §13。新旧代码并存，新存储还没接到 gateway。全部完成后改写 `docs/komo_bot.md` §8，本文留作推导记录。
 >
 > 对照基线：本机 `../pi` 提交 `8efd314fa` 的 `packages/durable`（`docs/spec.md` 为规范，`README.md`）。
 > pi-durable 自称 **Experimental**，API 随版本变；pi coding-agent 在这个提交上**并不依赖它**（仍是
@@ -531,8 +531,10 @@ finalize     → blob 收尾同步 → 提交结果 entry（projection.rs 的 fu
 | D3 | `crates/komo-kernel/src/durable/task/`（纯逻辑）、`crates/komo-runtime/src/durable/`（`line` `tx` `kind` `runtime` `scheduler` `engine`） | kernel 37 项、runtime 52 项 |
 | D4a | `crates/komo-runtime/src/llm/{model_stream,routing_stream,stream_tests}.rs`、各 provider 的 `stateless.rs` | 字节等价：9 种场景 × 3 家 |
 | D4b | `crates/komo-runtime/src/durable/harness/`（`hooks` `inbox` `live` `system` `generation` `tool` `submit` `entries`） | 约 50 项 |
+| D4c（probe 与接线，`d4c-probe-gaps`） | `harness/tool.rs`（`Checkpoint::Probe`、`ChildRef`、`resolve`）、`harness/live.rs`（槽位 `pid` / `pgid` / `startedAt`）、`harness/hooks.rs`（`HarnessDeps::probe`、`probe_interval`）、`recovery/processes.rs`（`IdentityProbe`）、kernel `OutputWriter::child_started`、`tools/process.rs`（起进程后报告）；gateway `RoutedOutputs::find_published`；`ToolExecutor::tools()` 公开 | `harness/tests/probe.rs` 10 项（含真进程的身份核对）、`harness/tests/turso.rs` 6 项（Turso 文件库上的生成 / 工具任务 / 重启）、`IdentityProbe` 3 项、`child_started` 1 项、`RoutedOutputs` 1 项 |
+| `komo init` | `komo-runtime/src/config/init.rs`；bin 的 `Command::Init` 只分发 | init 7 项、bin 1 项加一条 clap 解析断言 |
 
-合入时（`durable-integration` 分支）强制重编后 `cargo test --workspace`：**2558 通过，0 失败**。
+合入时（`durable-integration` 分支）强制重编后 `cargo test --workspace`：**2558 通过，0 失败**。D4c 的 probe 与接线（`d4c-probe-gaps`，基于 `main` 的 52ae527c）：**2587 通过，0 失败，11 忽略**。
 
 ### 13.2 实现与本文的偏离（都已接受）
 
@@ -549,11 +551,18 @@ finalize     → blob 收尾同步 → 提交结果 entry（projection.rs 的 fu
 - **`komo.usage` 没做**（D4b）：预算用的轮数与 token 记在 `komo.live.run`。新增未答原因 `budget`。
 - **意图 checkpoint 存完整 `ExecutionPlan`**（D4b），Safe 重跑用原计划。
 - **Anthropic 衰减时的额外缓存断点**要调用方传 `revised_from`（D4a），对应旧 driver 的行为。
+- **子进程身份由工具经 `OutputWriter::child_started` 报告**（D4c）：kernel 的 trait 加了一个默认空实现的方法，`tools/process.rs` 的 `run_child_detachable` 起进程后调它；工具任务的 `Tee` 把身份记进输出尾巴的同一份快照，叫醒进度提交（不等 250 ms 节流），经 `commit_progress` 写进槽位的 `pid` / `pgid` / `startedAt`（Unix 毫秒）。槽位在重跑与收尾时连同输出尾巴一起清掉。旧 `ChildRegistry` 的登记照旧写，新路径不读它。
+- **`probe` 是第三个 checkpoint 阶段**（D4c）：`execute` 恢复时槽位里记着这次尝试的 pid 就写 `Probe { …同 execute…, child, until }` 并返回，`probe` 阶段 `sleep_until(until)` → 探一次 → 还在就 `until += probe_interval`（默认 5 s，`HarnessSettings`）再来，结束了回到 `execute` 那张表（`resolve`，不再探子进程）。每一轮探测是一次 checkpoint 提交；重启后从 checkpoint 里的 `child` 与 `until` 接着探，不依赖槽位。`output.json` 完整性先于子进程判断：盘上已有完整输出就直接复用，不进 probe。
+- **探测返回 `Unknown` 当作还在**（§8.7：阻止重复启动比重复执行安全），所以核实不了的子进程会让任务一直 probe，直到进程确实没了或用户取消。
+- **取消 probe 中的任务不终止那个子进程**（D4c）：abort handler 照常写 `aborted` 结果（带 `.partial` 末尾），再探一次，进程还在就在正文里写明"重启前这次调用起的子进程（pid N）取消时还在运行，komo 没有终止它"。旧 `monitors.rs` 会按身份核对后 `kill_process_group`；工具任务这边没有杀进程的注入口，暂不做。
+- **新增 `IdentityProbe`，不改 `SysProcessProbe`**（D4c）：登记行带 `started_at` 时核对起来的时刻（Linux 读 `/proc/<pid>/stat` 第 22 字段 + `btime` + `CLK_TCK`，其他平台 `ps -o stat=,etime=`，容差 10 s），对不上就是 pid 被复用 → `Gone`；僵尸进程也是 `Gone`；读不出来 `Unknown`。旧路径（`LockHolderLiveness`、gateway 锁）仍用只看 pid 在不在的 `SysProcessProbe`，行为不变。
+- **工具任务读自己的槽位用一次"不改状态的提交"**（D4c，`recorded_child`）：`TaskRuntime` 没有读 document 的入口，没有为此扩引擎。
+- **测试里的 Turso 世界**（D4c）：`World::turso(dir)` 用真时钟与真文件输出存储；`restart` 是关引擎（连库一起关）、`TursoStorage::open` 重新开库、重建引擎。引擎关着时读辅助不可用。
 
 ### 13.3 已知缺口（按阶段）
 
-- **D4c**：上下文超长现在直接 `model_error` 失败，要接压缩；衰减视图已存在结果 entry 的 `data.decayed`，等压缩决策写 `edits`；codemode、`task`、`monitor` 还没有执行路径；`komo.live.tools[].pid` 没人写。
-- **D5**：gateway 实现 `AgentHooks`（`ToolExecutor::tools()` 要公开）；`RoutedOutputs` 要转发 `ToolOutputStore::find_published`，否则"盘上已有完整输出就复用"在 gateway 里不生效；`conversations.session_id` 现在总是 NULL，`/tree` 按 Session 查分支时补；`TursoStorage` 的读共用一条连接，读多了再换连接池；新存储至今只在 `MemoryStorage` 上跑过生成与工具任务，Turso 接线没测。
-- **崩溃安全**：进度提交 `synchronous=OFF` 后"进程崩溃不丢"是按机制推的，崩溃注入测试只跑在 tmpfs 上，没有真盘掉电验证。
-- **开发环境**：多个 worktree 共用一个 `target/` 时，cargo 可能复用别的 worktree 编出来的 crate；共享 target 跑测试前先 `touch crates/*/src/lib.rs`。
-
+- **D4c**：上下文超长现在直接 `model_error` 失败，要接压缩；衰减视图已存在结果 entry 的 `data.decayed`，等压缩决策写 `edits`；codemode、`task`、`monitor` 还没有执行路径。
+- **D4c 的 probe**：没有杀进程的注入口（取消只在结果里说明子进程还在）；`bash` 转后台（`detach_after`）交给 gateway 的监听接手后，那条路径不写槽位也不进 probe；只有走 `run_child_detachable` 的工具会报告子进程（codemode worker、MCP 子进程不报）。
+- **D5**：gateway 实现 `AgentHooks`（`ToolExecutor::tools()` 与 `RoutedOutputs::find_published` 已就绪）；`conversations.session_id` 现在总是 NULL，`/tree` 按 Session 查分支时补；`TursoStorage` 的读共用一条连接，读多了再换连接池。
+- **崩溃安全**：进度提交 `synchronous=OFF` 后"进程崩溃不丢"是按机制推的，崩溃注入测试只跑在 tmpfs 上，没有真盘掉电验证。Turso 接线测试里的"重启"是关库再开库（干净关闭），不是杀进程。
+- **开发环境**：多个 worktree 共用一个 `target/` 时，cargo 可能复用别的 worktree 编出来的 crate；`scripts/install-local.sh` 现在在上一次不是本检出编的时候先 `touch` `crates/*/src/lib.rs`，但手动 `cargo test` 共用 target 前仍要自己 `touch crates/*/src/lib.rs`。

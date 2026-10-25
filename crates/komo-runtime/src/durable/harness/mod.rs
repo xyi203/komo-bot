@@ -25,7 +25,7 @@
 //!   [`Tool`](komo_kernel::traits::Tool)（`prepare` / `execute` / `replay`）；完整输出落盘走
 //!   [`ToolOutputStore`](komo_kernel::traits::ToolOutputStore)，模型视图由
 //!   `komo_kernel::projection` 在收尾时算一次、存进结果 entry。
-//! - 压缩、衰减、codemode 嵌套调用、子进程 probe 是 D4c / D5。
+//! - 压缩、衰减、codemode 嵌套调用是 D4c / D5；子进程 `probe` 阶段在 `tool.rs`（D4c）。
 
 pub mod entries;
 pub mod generation;

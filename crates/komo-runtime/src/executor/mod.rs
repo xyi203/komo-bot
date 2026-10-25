@@ -371,8 +371,9 @@ impl ToolExecutor {
         self.tools().keys().cloned().collect()
     }
 
-    /// 此刻的工具表。拿的是快照：之后 [`Self::install`] 进来的不在里面。
-    fn tools(&self) -> Arc<BTreeMap<String, Arc<dyn Tool>>> {
+    /// 此刻的工具表。拿的是快照：之后 [`Self::install`] 进来的不在里面。新存储的
+    /// `AgentHooks`（gateway，D5）按它组 `ToolSet`。
+    pub fn tools(&self) -> Arc<BTreeMap<String, Arc<dyn Tool>>> {
         Arc::clone(&self.tools.read().expect("工具目录"))
     }
 

@@ -8,7 +8,7 @@
 //!   `an_http_run_sends_its_intervention_to_home_only`：意图（NeedsAttention 投到来源会话 + home chat、
 //!   各一条、HTTP 来源只投 home、第二个答复得到"已经答复过了"）新存储里仍然成立，只是触发它的不再是
 //!   "结果不明"而是 **faulted 任务**。写成 Durable 版（用 `poison_agent_doc` 让下一条输入的生成任务 fault），
-//!   先 `#[ignore = "W4a: faulted NeedsAttention"]`，W4a（`interventions.rs`、NeedsAttention 投递）合并后放开；
+//!   W4a（`interventions.rs`、NeedsAttention 投递）合并后已放开（faulted 的生成任务按输入里记的 run 对回）；
 //! - `a_round_stopped_at_its_first_call_still_finishes_the_rest`：**不迁**。它守的是"第一个调用停在介入上时，
 //!   续跑要把后面没有计划的调用也跑完，否则转写里有调用没输出、provider 400"。新存储没有"停在半轮"这个
 //!   状态：harness 在一轮的全部调用都有结果（结果不明的也是一条结果）之后才发下一次请求，runtime 的
@@ -780,7 +780,6 @@ fn attentions(sender: &MemSender) -> Vec<String> {
 /// 改了做法：Legacy 用 `unsure` 停住 Run（`verify`，答 `satisfied`）；新存储里要人处理的只有 faulted
 /// 任务，可答的结论只有 `abandon`（决定 13）。让第二条输入的生成任务 fault，等两处收到，答两次 `abandon`。
 #[tokio::test]
-#[ignore = "W4a: faulted NeedsAttention"]
 async fn an_intervention_reaches_both_the_source_and_home() {
     let sender = MemSender::new(ChannelPlatform::Telegram);
     let gateway = GatewayBuilder::new(&telegram_config("111"))
@@ -832,7 +831,6 @@ async fn an_intervention_reaches_both_the_source_and_home() {
 ///
 /// 改了做法同上（`unsure` 换成 faulted）。home chat 故意与私聊不是同一个会话，这样"各一条"才说得清。
 #[tokio::test]
-#[ignore = "W4a: faulted NeedsAttention"]
 async fn a_waiting_run_sends_its_intervention_to_the_chat_and_home() {
     let sender = MemSender::new(ChannelPlatform::Telegram);
     let gateway = GatewayBuilder::new(&config_toml(
@@ -881,7 +879,6 @@ home_chat = 999
 /// HTTP 提交的 Run 没有来源会话：介入**只投 home chat**（§11.4「来源是 Cron 或已断开的 TUI 时只有
 /// home chat」）。改了做法同上（`unsure` 换成 faulted）。
 #[tokio::test]
-#[ignore = "W4a: faulted NeedsAttention"]
 async fn an_http_run_sends_its_intervention_to_home_only() {
     let sender = MemSender::new(ChannelPlatform::Telegram);
     let gateway = GatewayBuilder::new(&telegram_config("111"))

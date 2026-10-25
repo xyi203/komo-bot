@@ -667,7 +667,7 @@ pub async fn start_run(
     live: &mut LiveState,
     inputs: Vec<SubmissionId>,
 ) -> Result<komo_kernel::durable::TaskId, DurableError> {
-    let task = create_generation(tx, generation, conversation).await?;
+    let task = create_generation(tx, generation, conversation, inputs.first().copied()).await?;
     live.run = Some(RunControl {
         task,
         inputs,
@@ -677,16 +677,22 @@ pub async fn start_run(
     Ok(task)
 }
 
-/// 一个 conversation 所有的生成任务。
+/// 一个 conversation 所有的生成任务。输入里记着它跑的是哪条 run（`{"run": 首个输入的 submission}`）：
+/// 生成任务被调度器写成 faulted 之后 `komo.live.run` 已经收掉，gateway 的介入清单靠它把任务对回 run。
 pub async fn create_generation(
     tx: &mut Tx,
     generation: &dyn TaskKind,
     conversation: ConversationId,
+    run: Option<SubmissionId>,
 ) -> Result<komo_kernel::durable::TaskId, DurableError> {
     debug_assert_eq!(generation.name(), GENERATION_KIND);
+    let input = match run {
+        Some(run) => json!({ "run": run }),
+        None => json!({}),
+    };
     tx.create_task(
         generation,
-        json!({}),
+        input,
         Ownership::Conversation,
         TaskOptions {
             conversation: Some(conversation),

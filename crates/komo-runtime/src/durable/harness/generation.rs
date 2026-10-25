@@ -977,7 +977,11 @@ impl GenerationTask {
                     }
                 } else {
                     live.tools = None;
-                    let next = inbox::create_generation(tx, &this, conversation).await?;
+                    let run_of = live
+                        .run
+                        .as_ref()
+                        .and_then(|run| run.inputs.first().copied());
+                    let next = inbox::create_generation(tx, &this, conversation, run_of).await?;
                     if let Some(run) = live.run.as_mut()
                         && run.task == task.id()
                     {

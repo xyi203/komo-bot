@@ -407,7 +407,8 @@ impl DurableCore {
             .map(ToolCallId::from_raw);
         let run = match task_entry(task) {
             Some(entry) => runs.run_of(self, &faulted.session.id, entry).await,
-            None => None,
+            // 生成任务的输入记着它跑的 run（首个输入的 submission）。
+            None => generation_run(task),
         };
         InterventionSummary {
             handle: faulted.handle(),
@@ -486,6 +487,17 @@ impl DurableCore {
             already_answered: false,
         })
     }
+}
+
+/// 生成任务输入里的 run（`{"run": 首个输入的 submission}`，`inbox::create_generation` 写）。
+fn generation_run(task: &TaskRecord) -> Option<RunId> {
+    if task.kind != GENERATION_KIND {
+        return None;
+    }
+    task.input
+        .get("run")
+        .and_then(Value::as_u64)
+        .map(|id| legacy_ids::run_id(komo_kernel::durable::SubmissionId::new(id)))
 }
 
 /// 工具任务输入里的 assistant entry（`{"kind":"model","assistant":13,…}`）；嵌套调用与别的任务没有。

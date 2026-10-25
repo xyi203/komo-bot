@@ -28,7 +28,7 @@ use tokio::sync::{mpsc, oneshot};
 use turso::{Connection, Database, Value};
 
 use super::ids::{self, IdMint};
-use super::schema::{self, META_LAST_SEQ};
+use super::schema::{self, META_LAST_SEQ, META_MAX_ID};
 use super::write::{self, ApplyError, CommitKind, Write};
 
 /// 提交序号：从 1 起，严格递增，重开后接续。
@@ -108,8 +108,27 @@ impl Line {
 
     pub async fn open_file(path: &Path) -> Result<Line, LineError> {
         let (database, conn) = schema::open(path).await?;
-        // 1 留给根 conversation：取号从 2 起。
-        let max_id = max_id(&conn).await?.max(1);
+        // 取号器从"表里剩余的最大 ID"与"持久化的高水位"里较大的一个起：purge 删掉末尾行之后，
+        // 表里的最大值会回退，高水位不会（ID 不复用，设计 §6.1）。1 留给根 conversation：取号从 2 起。
+        let stored = schema::query_one_text(
+            &conn,
+            &format!("SELECT value FROM durable_meta WHERE name = '{META_MAX_ID}'"),
+        )
+        .await?
+        .and_then(|v| v.parse::<i64>().ok());
+        let max_id = max_id(&conn).await?.max(stored.unwrap_or(0)).max(1);
+        if stored.is_none() {
+            // 旧库没有这一行：按表里的最大值补上，之后每次提交 UPDATE 它。
+            conn.execute(
+                "INSERT INTO durable_meta (name, value) VALUES (?1, ?2)",
+                [
+                    Value::Text(META_MAX_ID.into()),
+                    Value::Text(max_id.to_string()),
+                ],
+            )
+            .await
+            .map_err(|e| LineError::Open(format!("max_id：{e}")))?;
+        }
         let last_seq = schema::query_one_text(
             &conn,
             &format!("SELECT value FROM durable_meta WHERE name = '{META_LAST_SEQ}'"),
@@ -131,6 +150,7 @@ impl Line {
             Writer {
                 conn,
                 seq: last_seq,
+                persisted_max_id: max_id,
                 sync: CommitKind::Structural, // `schema::open` 刚设成 FULL
             },
             shared.clone(),
@@ -211,6 +231,8 @@ impl Line {
 struct Writer {
     conn: Connection,
     seq: Seq,
+    /// `durable_meta.max_id` 里已落盘的高水位。
+    persisted_max_id: i64,
     /// 连接上当前生效的同步档位（Structural = FULL，Progress = OFF）。
     sync: CommitKind,
 }
@@ -245,13 +267,20 @@ impl Writer {
         let writes = build(&mut IdMint::new(&shared.ids));
         write::validate(kind, &writes).map_err(LineError::Rejected)?;
 
-        match self.commit(kind, &writes).await {
+        // 高水位 = 取号器当前值与这批写自带 ID 的较大者（调用方可以自己挑 ID），随这次提交落盘。
+        let written = writes
+            .iter()
+            .filter_map(Write::minted_id)
+            .max()
+            .unwrap_or(0);
+        let high = shared.ids.load(Ordering::SeqCst).max(written);
+
+        match self.commit(kind, &writes, high).await {
             Ok(seq) => {
                 self.seq = seq;
-                // 取号器越过这批写落下的最大 ID（调用方可以自己挑 ID）。
-                if let Some(max) = writes.iter().filter_map(Write::minted_id).max() {
-                    shared.ids.fetch_max(max, Ordering::SeqCst);
-                }
+                self.persisted_max_id = self.persisted_max_id.max(high);
+                // 取号器越过这批写落下的最大 ID。
+                shared.ids.fetch_max(written, Ordering::SeqCst);
                 Ok(seq)
             }
             Err(ApplyError::Rejected(message)) => {
@@ -276,7 +305,12 @@ impl Writer {
         error
     }
 
-    async fn commit(&mut self, kind: CommitKind, writes: &[Write]) -> Result<Seq, ApplyError> {
+    async fn commit(
+        &mut self,
+        kind: CommitKind,
+        writes: &[Write],
+        high: i64,
+    ) -> Result<Seq, ApplyError> {
         let engine = |what: &str, e: turso::Error| ApplyError::Engine(format!("{what}：{e}"));
         if self.sync != kind {
             let pragma = match kind {
@@ -305,6 +339,15 @@ impl Writer {
             )
             .await
             .map_err(|e| engine("last_seq", e))?;
+        if high > self.persisted_max_id {
+            self.conn
+                .execute(
+                    "UPDATE durable_meta SET value = ?1 WHERE name = 'max_id'",
+                    [Value::Text(high.to_string())],
+                )
+                .await
+                .map_err(|e| engine("max_id", e))?;
+        }
         self.conn
             .execute("COMMIT", ())
             .await

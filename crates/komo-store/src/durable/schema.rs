@@ -30,6 +30,9 @@ pub fn durable_db_path(data_dir: &Path) -> PathBuf {
 /// `durable_meta` 里的键。
 pub(crate) const META_FORMAT_VERSION: &str = "format_version";
 pub(crate) const META_LAST_SEQ: &str = "last_seq";
+/// 已分配过的最大 ID 的高水位（设计 §6.1：ID 不复用）。随分配它的那次提交同事务推进；
+/// purge 删光末尾的行之后重开，取号器仍从它起，不会重铸已发出的 ID。
+pub(crate) const META_MAX_ID: &str = "max_id";
 
 // 每张表的 DDL 常量。`STRICT` + `json_valid`：坏 JSON 在写入点就被挡住，而不是等 serde 读到。
 

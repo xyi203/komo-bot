@@ -53,6 +53,7 @@ pub fn cases() -> Vec<Case> {
         case!(a_conversation_records_its_session),
         case!(conversations_scan_by_session_and_parent),
         case!(purge_removes_every_row_of_the_listed_conversations),
+        case!(purged_ids_are_never_reissued),
         case!(deep_fork_history_scans_through_every_ancestor_cap),
         case!(tables_scan_in_either_order_and_a_cursor_keeps_its_direction),
         case!(task_records_replace_whole_and_filter),
@@ -840,6 +841,31 @@ async fn purge_removes_every_row_of_the_listed_conversations(storage: &dyn Stora
         vec![StorageWrite::Submission(input(next, root, Some("req")))],
     )
     .await;
+}
+
+/// purge 掉当前最大 ID 所在的 conversation 之后，取号器不回退（设计 §6.1）。
+/// 重开之后的同一条见各后端自己的测试（Turso：`purged_ids_are_never_reissued_after_reopen`）。
+async fn purged_ids_are_never_reissued(storage: &dyn Storage) {
+    create_root(storage).await;
+    let conversation = mint::<ConversationId>(storage).await;
+    let entry_id = mint::<EntryId>(storage).await;
+    commit(
+        storage,
+        vec![
+            StorageWrite::Conversation(ConversationRecord::root(conversation).in_session("gone")),
+            put(entry(entry_id, conversation)),
+        ],
+    )
+    .await;
+    commit(
+        storage,
+        vec![StorageWrite::PurgeConversations {
+            conversations: vec![conversation],
+        }],
+    )
+    .await;
+    let next = mint::<EntryId>(storage).await;
+    assert!(next.get() > entry_id.get(), "{next:?} 复用了 {entry_id:?}");
 }
 
 async fn deep_fork_history_scans_through_every_ancestor_cap(storage: &dyn Storage) {

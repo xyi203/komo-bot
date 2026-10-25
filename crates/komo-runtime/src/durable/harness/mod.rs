@@ -25,14 +25,17 @@
 //!   [`Tool`](komo_kernel::traits::Tool)（`prepare` / `execute` / `replay`）；完整输出落盘走
 //!   [`ToolOutputStore`](komo_kernel::traits::ToolOutputStore)，模型视图由
 //!   `komo_kernel::projection` 在收尾时算一次、存进结果 entry。
-//! - 压缩与衰减（D4c）在 [`compaction`]；子进程 `probe` 阶段在 `tool.rs`（D4c）；codemode 嵌套调用、`task` / `monitor` 是 D4c 剩下的部分。
+//! - 压缩与衰减（D4c）在 [`compaction`]；子进程 `probe` 阶段在 `tool.rs`（D4c）；codemode 嵌套调用：外层脚本在
+//!   `codemode.rs`，嵌套任务的数据与收尾在 `nested.rs`（D4c）；`task` / `monitor` 是 D4c 剩下的部分。
 
+pub mod codemode;
 pub mod compaction;
 pub mod entries;
 pub mod generation;
 pub mod hooks;
 pub mod inbox;
 pub mod live;
+pub mod nested;
 pub mod outcome;
 pub mod submit;
 pub mod system;

@@ -4,6 +4,7 @@
 
 mod support;
 
+mod codemode;
 mod compaction;
 mod generation;
 mod inbox;

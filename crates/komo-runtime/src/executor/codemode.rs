@@ -25,26 +25,26 @@ use crate::codemode::{ScriptCatalog, ScriptTool};
 use crate::tools::codemode::NOT_IN_SCRIPTS;
 
 /// 摘要里每次调用的参数最多留这么长。
-const ARGS_PREVIEW: usize = 512;
+pub(crate) const ARGS_PREVIEW: usize = 512;
 /// 正文只列少量子调用；完整清单保存在 result.calls，由统一投影给出完整结果入口。
 const SUMMARY_CALLS: usize = 8;
 
 /// 一次内层调用的摘要（外层 `output.json` 的 `result.calls`）。
 #[derive(Debug, Clone, Serialize)]
-struct NestedCall {
-    id: String,
-    tool: String,
-    args: String,
+pub(crate) struct NestedCall {
+    pub(crate) id: String,
+    pub(crate) tool: String,
+    pub(crate) args: String,
     /// 宿主是否正常返回；不等同于工具结果的 status，保留旧字段含义。
-    ok: bool,
+    pub(crate) ok: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
-    status: Option<ToolResultStatus>,
+    pub(crate) status: Option<ToolResultStatus>,
     /// 已发布子输出的可读入口，来自 journal 里的原尝试（恢复时不换成当前 attempt）。
     #[serde(skip_serializing_if = "Option::is_none")]
-    output: Option<String>,
-    elapsed_ms: u64,
+    pub(crate) output: Option<String>,
+    pub(crate) elapsed_ms: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
-    error: Option<String>,
+    pub(crate) error: Option<String>,
 }
 
 impl ToolExecutor {
@@ -297,7 +297,7 @@ impl ToolExecutor {
     /// `start` 记下的指纹：脚本、引擎与 worker 协议版本、能力表、cwd 任一变了，恢复就是分歧。
     /// 升级前（CPython driver 时代）在途的调用指纹里是 `driver` / `env`，对不上，按分歧返回
     /// uncertain。
-    pub(super) fn codemode_fingerprint(
+    pub(crate) fn codemode_fingerprint(
         code: &str,
         names: &[String],
         ctx: &ToolContext,
@@ -615,7 +615,7 @@ impl ToolExecutor {
     }
 }
 
-fn summary(calls: &[NestedCall]) -> String {
+pub(crate) fn summary(calls: &[NestedCall]) -> String {
     let mut counts: Vec<(&str, usize)> = Vec::new();
     for call in calls {
         match counts.iter_mut().find(|(tool, _)| *tool == call.tool) {
@@ -653,7 +653,7 @@ fn summary(calls: &[NestedCall]) -> String {
     text
 }
 
-fn failure_prefix(error: &str, calls: &[NestedCall]) -> String {
+pub(crate) fn failure_prefix(error: &str, calls: &[NestedCall]) -> String {
     let reason = error
         .lines()
         .rev()
@@ -734,7 +734,7 @@ fn diagnostic(reason: &str) -> Option<String> {
 
 /// 多段 `text()` 拼起来：两段以上时每段前加 `==> text N/M <==`（学 pi 1.1.0）——直接用换行
 /// 拼，模型分不清一段多行输出和两段输出的边界。只有一段时原样给，不多一个字。
-fn join_outputs(outputs: &[String]) -> String {
+pub(crate) fn join_outputs(outputs: &[String]) -> String {
     if outputs.len() <= 1 {
         return outputs.join("\n");
     }
@@ -747,7 +747,7 @@ fn join_outputs(outputs: &[String]) -> String {
         .join("\n")
 }
 
-fn truncate(text: &str, limit: usize) -> String {
+pub(crate) fn truncate(text: &str, limit: usize) -> String {
     if text.len() <= limit {
         return text.to_string();
     }

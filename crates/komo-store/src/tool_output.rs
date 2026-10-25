@@ -102,6 +102,12 @@ impl FileToolOutputStore {
             .join(attempt.attempt.as_str())
     }
 
+    /// 打开着的流按完整身份存（run / call / attempt）：新存储的工具任务与 codemode 的嵌套任务
+    /// 的尝试号都从 1 数，只按 attempt ID 存会让同时在飞的两个任务互相顶掉对方的流。
+    fn stream_key(attempt: &AttemptRef) -> String {
+        format!("{}/{}/{}", attempt.run, attempt.call, attempt.attempt)
+    }
+
     fn attempt_relative(attempt: &AttemptRef) -> String {
         format!(
             "tool-output/{}/{}/{}",
@@ -110,7 +116,7 @@ impl FileToolOutputStore {
     }
 }
 
-/// 一次尝试的流式写入器。真正的文件句柄在 [`FileToolOutputStore`] 里，按 attempt ID 存。
+/// 一次尝试的流式写入器。真正的文件句柄在 [`FileToolOutputStore`] 里，按尝试的完整身份存。
 #[derive(Debug)]
 pub struct FileOutputWriter {
     attempt: AttemptRef,
@@ -127,7 +133,7 @@ impl FileOutputWriter {
         let path = self.dir.join(format!("{name}.partial"));
         let mut guard = self.streams.lock().await;
         let entry = guard
-            .get_mut(self.attempt.attempt.as_str())
+            .get_mut(&FileToolOutputStore::stream_key(&self.attempt))
             .ok_or_else(|| {
                 StoreError::Other(format!(
                     "尝试 {} 的流已经发布或不属于本存储",
@@ -227,7 +233,7 @@ impl ToolOutputStore for FileToolOutputStore {
         let (stdout, stdout_bytes) = adopt_partial(&dir, "stdout.txt").await?;
         let (stderr, stderr_bytes) = adopt_partial(&dir, "stderr.txt").await?;
         self.streams.lock().await.insert(
-            attempt.attempt.to_string(),
+            Self::stream_key(attempt),
             Streams {
                 stdout,
                 stderr,
@@ -257,7 +263,7 @@ impl ToolOutputStore for FileToolOutputStore {
             .streams
             .lock()
             .await
-            .remove(attempt.attempt.as_str())
+            .remove(&Self::stream_key(&attempt))
             .ok_or_else(|| {
                 StoreError::Other(format!("尝试 {} 没有在本存储上开过流", attempt.attempt))
             })?;
@@ -691,6 +697,34 @@ mod tests {
         // 引用的流被动过（哈希对不上）：不算。
         std::fs::write(dir.join("stdout.txt"), b"tampered").unwrap();
         assert!(restarted.find_published(&attempt).await.unwrap().is_none());
+    }
+
+    /// 两个同时在飞的调用尝试号都是 1（新存储的工具任务按任务目录分、尝试号从 1 数；codemode 的
+    /// 嵌套任务与它的外层同时开着流）：各自的流互不顶替，都能发布。
+    #[tokio::test]
+    async fn two_calls_with_the_same_attempt_number_keep_separate_streams() {
+        let (_dir, store, session) = store().await;
+        let first = attempt(&session);
+        let second = AttemptRef {
+            call: ToolCallId::from_raw("call-8"),
+            ..first.clone()
+        };
+
+        let mut a = store.begin(&first).await.unwrap();
+        let mut b = store.begin(&second).await.unwrap();
+        a.write_stdout(b"from a").await.unwrap();
+        b.write_stdout(b"from b!").await.unwrap();
+        let published_b = store
+            .publish(b, body(ToolResultStatus::Completed))
+            .await
+            .unwrap();
+        let published_a = store
+            .publish(a, body(ToolResultStatus::Completed))
+            .await
+            .unwrap();
+
+        assert_eq!(published_a.stdout.as_ref().unwrap().size, 6);
+        assert_eq!(published_b.stdout.as_ref().unwrap().size, 7);
     }
 
     #[tokio::test]

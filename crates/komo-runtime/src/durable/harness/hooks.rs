@@ -307,6 +307,9 @@ pub struct HarnessDeps {
     pub stream: Arc<dyn crate::llm::ModelStream>,
     /// 工具任务 `probe` 阶段探子进程用的（生产是带身份核对的 [`IdentityProbe`]，测试里换替身）。
     pub probe: Arc<dyn ProcessProbe>,
+    /// codemode 的 worker 怎么起（`docs/codemode.md` §4）；`None` = 这台 Gateway 没有接 codemode，
+    /// `codemode` 工具的任务以 Failed 收场。热换：Gateway 重装配时 [`Self::set_codemode`]。
+    codemode: arc_swap::ArcSwapOption<crate::codemode::Worker>,
     settings: arc_swap::ArcSwap<HarnessSettings>,
 }
 
@@ -316,12 +319,18 @@ impl HarnessDeps {
             hooks,
             stream,
             probe: Arc::new(IdentityProbe),
+            codemode: arc_swap::ArcSwapOption::empty(),
             settings: arc_swap::ArcSwap::from_pointee(HarnessSettings::default()),
         }
     }
 
     pub fn with_probe(mut self, probe: Arc<dyn ProcessProbe>) -> Self {
         self.probe = probe;
+        self
+    }
+
+    pub fn with_codemode(self, worker: Option<crate::codemode::Worker>) -> Self {
+        self.set_codemode(worker);
         self
     }
 
@@ -333,6 +342,15 @@ impl HarnessDeps {
     /// 当前设置：每个决定点现读。
     pub fn settings(&self) -> Arc<HarnessSettings> {
         self.settings.load_full()
+    }
+
+    /// codemode 的 worker：每次脚本现读。
+    pub fn codemode(&self) -> Option<crate::codemode::Worker> {
+        self.codemode.load_full().map(|worker| (*worker).clone())
+    }
+
+    pub fn set_codemode(&self, worker: Option<crate::codemode::Worker>) {
+        self.codemode.store(worker.map(Arc::new));
     }
 
     pub fn set_settings(&self, settings: HarnessSettings) {

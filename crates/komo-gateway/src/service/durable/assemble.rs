@@ -8,12 +8,9 @@
 
 use std::sync::{Arc, OnceLock, Weak};
 
-use async_trait::async_trait;
-use komo_kernel::durable::{ConversationId, Message};
-use komo_runtime::durable::harness::{
-    AgentHooks, AgentSetup, HookError, NoOrchestration, OrchestrationHooks,
-};
+use komo_runtime::durable::harness::{AgentHooks, OrchestrationHooks};
 
+use super::{hooks, orchestration};
 use crate::service::state::GatewayState;
 
 /// 钩子拿到 `GatewayState` 的槽。
@@ -30,34 +27,13 @@ pub fn wire(slot: &StateSlot, state: &Arc<GatewayState>) {
     }
 }
 
-/// 占位钩子：W1b 换成真正的实现（`hooks/` 下按 `docs/storage-durable-d5.md` §6）。
-struct PlaceholderHooks {
-    /// W1b：`setup` / `tools` / `compaction` 都从这里拿 `GatewayState`。
-    #[allow(dead_code)]
-    state: StateSlot,
-}
-
-#[async_trait]
-impl AgentHooks for PlaceholderHooks {
-    async fn setup(
-        &self,
-        _conversation: ConversationId,
-        _context: &[Message],
-    ) -> Result<AgentSetup, HookError> {
-        Err(HookError::Failed(
-            "Durable 模式的 Agent 钩子还没有装配（W1b）".into(),
-        ))
-    }
-}
-
-/// `AgentHooks` 的装配点。W1b 把 `PlaceholderHooks` 换成 `hooks::GatewayHooks`。
+/// `AgentHooks` 的装配点：[`hooks::GatewayHooks`]（`docs/storage-durable-d5.md` §6）。
 pub fn build_hooks(slot: &StateSlot) -> Arc<dyn AgentHooks> {
-    Arc::new(PlaceholderHooks {
-        state: Arc::clone(slot),
-    })
+    hooks::GatewayHooks::new(Arc::clone(slot))
 }
 
-/// `OrchestrationHooks` 的装配点。W1b 换成 `orchestration::GatewayOrchestration`。
-pub fn build_orchestration(_slot: &StateSlot) -> Arc<dyn OrchestrationHooks> {
-    Arc::new(NoOrchestration)
+/// `OrchestrationHooks` 的装配点：[`orchestration::GatewayOrchestration`]。监听的进程那一半
+/// （`MonitorRunner`）W2c 实现并在这里装上；没装配时 `monitor` 干净地失败。
+pub fn build_orchestration(slot: &StateSlot) -> Arc<dyn OrchestrationHooks> {
+    orchestration::GatewayOrchestration::new(Arc::clone(slot), None)
 }

@@ -215,7 +215,7 @@ fn golden_system_sections_match_legacy_prompt() {
     use komo_kernel::types::delegate::DelegateSpec;
     use komo_kernel::types::ids::{RunId, ToolCallId};
 
-    let project = vec![
+    let project = [
         ProjectFile {
             path: "/w/AGENTS.md".into(),
             content: "外层规范\n".into(),
@@ -229,7 +229,7 @@ fn golden_system_sections_match_legacy_prompt() {
             content: "  \n".into(),
         },
     ];
-    let servers = vec![ToolNamespace {
+    let servers = [ToolNamespace {
         name: "mcp__fs".into(),
         server: "fs".into(),
         description: Some("文件服务".into()),

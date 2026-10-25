@@ -4,12 +4,14 @@
 //! 定义）、一个 `Storage`（读不经过线）。HTTP、渠道、cron 这些入口拿它：
 //! `state.core()?`（或 `state.durable.as_ref()`）。
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
-use komo_kernel::durable::{Storage, SubmissionId, SubmissionRecord};
+use komo_kernel::durable::{ConversationId, Storage, SubmissionId, SubmissionRecord};
 use komo_kernel::traits::Clock;
+use komo_kernel::types::tool::InterjectSignal;
 use komo_runtime::codemode::Worker;
 use komo_runtime::durable::harness::{AgentHooks, Harness, HarnessDeps, OrchestrationHooks};
 use komo_runtime::durable::{DurableError, Engine, EngineOptions, Registry};
@@ -25,6 +27,8 @@ pub struct DurableCore {
     /// 数据目录：`durable.db` 在这里，blob 在 `sessions/{uuid}/`。
     pub home: PathBuf,
     closed: AtomicBool,
+    /// 用户插话的旗子，按 conversation 一面（`bash` 转后台，`docs/monitor.md` §8）。
+    interjections: Mutex<HashMap<ConversationId, InterjectSignal>>,
 }
 
 impl std::fmt::Debug for DurableCore {
@@ -70,6 +74,7 @@ impl DurableCore {
             clock,
             home: home.to_path_buf(),
             closed: AtomicBool::new(false),
+            interjections: Mutex::new(HashMap::new()),
         }))
     }
 
@@ -86,12 +91,41 @@ impl DurableCore {
         self.harness.wait(&self.engine, id).await
     }
 
-    /// 关闭：封住受理、等已受理的提交结算与 invocation 走完、关库（放掉 Turso 的文件锁）。
-    /// 幂等：第二次调用什么都不做。
+    /// 这个 conversation 的插话旗（没有就造一面）。工具环境里放的就是它。
+    pub fn interjection(&self, conversation: ConversationId) -> InterjectSignal {
+        self.interjections
+            .lock()
+            .expect("插话旗表")
+            .entry(conversation)
+            .or_default()
+            .clone()
+    }
+
+    /// 放下旗子：新的一段（下一次模型请求）从没有插话开始——插话并进去以后自然落下，
+    /// 没人看的旧旗不会让后面每条命令都提前转后台。
+    pub fn lower_interjection(&self, conversation: ConversationId) {
+        if let Some(signal) = self
+            .interjections
+            .lock()
+            .expect("插话旗表")
+            .get(&conversation)
+        {
+            signal.take();
+        }
+    }
+
+    /// 用户往忙着的对话会话里插话了：前台的长 `bash` 提前转后台，别让这句话等它跑完。
+    pub fn interject(&self, conversation: ConversationId) {
+        self.interjection(conversation).raise();
+    }
+
+    /// 关闭：先让编排钩子终止自己起的进程（登记留给下一代对账），再封住受理、等已受理的提交结算与
+    /// invocation 走完、关库（放掉 Turso 的文件锁）。幂等：第二次调用什么都不做。
     pub async fn close(&self) -> Result<(), DurableError> {
         if self.closed.swap(true, Ordering::SeqCst) {
             return Ok(());
         }
+        self.harness.deps().orchestration.shutdown().await;
         self.engine.close().await
     }
 }

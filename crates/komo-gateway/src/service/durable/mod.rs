@@ -19,6 +19,8 @@
 //! | `submit` | 提交输入：路由到当前分支、惰性 fork、model / effort 覆盖、`/new`、`/cancel` | W1c |
 //! | `tree` | 读树（`read_tree`）、导航、label / name、context-edit、分支摘要、compact、忙时守卫 | W1c |
 //! | `copy` | `/fork`、`/clone`：复制 entry 与 blob | W1c |
+//! | `monitor_runner` | `MonitorRunner`：监听与转后台命令的进程、泵、合批、时限、遗留进程核对 | W2c |
+//! | `tasks` | 任务会话的展示：短号 `#<conversation>`、列表一行、标签 | W2c |
 
 pub mod agent_doc;
 pub mod assemble;
@@ -26,9 +28,11 @@ pub mod background;
 pub mod copy;
 pub mod core;
 pub mod hooks;
+pub mod monitor_runner;
 pub mod orchestration;
 pub mod sessions;
 pub mod submit;
+pub mod tasks;
 pub mod tree;
 
 pub use self::core::DurableCore;

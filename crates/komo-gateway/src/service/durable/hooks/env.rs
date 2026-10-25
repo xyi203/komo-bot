@@ -91,6 +91,11 @@ pub(super) fn build(
         call_timeout: Duration::from_secs(config.execution.call_timeout_secs),
         // 只有对话会话转后台：任务会话、cron 没有"这条会话等着用户说话"的问题（`docs/monitor.md` §8）。
         detach_after,
+        // 用户插话的旗子：只有对话会话会转后台，也只有它们会被插话顶到。
+        interjected: match (&state.durable, conversation) {
+            (Some(core), true) => Some(core.interjection(resolved.conversation)),
+            _ => None,
+        },
         conversation,
         outputs,
         images: Some(Arc::new(SessionImages {

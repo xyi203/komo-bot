@@ -24,6 +24,10 @@ use komo_kernel::types::ids::ToolCallId;
 use komo_kernel::types::tool::ToolNamespace;
 use komo_kernel::types::turn::{ForkPrefix, ReplayMessage, Role};
 
+pub use prompt::{
+    SECTION_BASE, SECTION_INSTRUCTIONS, SECTION_MEMORY, SECTION_PROJECT, SECTION_SKILLS,
+};
+
 pub use history::{
     COMPACTION_PREFIX, DecayCandidate, Entry, EntryKind, ReplayScope, ResolvedMessage,
     StoredOutput, entries, latest_user_text,
@@ -159,6 +163,36 @@ fn assemble_own(input: ContextInput<'_>) -> AgentContext {
         run_from,
         decay_candidates,
     }
+}
+
+/// 同 [`assemble`] 的系统提示，但按段交回 `(key, 正文)`（新存储的 `komo.system` entry 按段名
+/// 补丁，`docs/storage-durable-d5.md` §6）：`instructions` / `base` / `project` / `skills` /
+/// `memory`，空的段不出现，key 常量见 [`SECTION_INSTRUCTIONS`] 等。用 `"\n\n"` 连起来与
+/// `assemble(input).system_prompt` 逐字相同。只看 `input` 里拼系统提示的那几样事实（身份、
+/// 项目规范、工作目录、工具名、服务器、记忆、skills、调用方式）；fork 的前缀与回放不管，那是
+/// 调用方的事。
+pub fn system_sections(input: &ContextInput<'_>) -> Vec<(String, String)> {
+    prompt::sections(
+        input.instructions.as_deref(),
+        &input.workspace,
+        &input.tools,
+        &input.mcp_servers,
+        &input.invocation,
+        &input.project_files,
+        input.skills.as_deref(),
+        input.memory.as_deref(),
+    )
+}
+
+/// `task` 带契约时补在任务后面的那一段（与子代理的 Result Contract 同一套说法）。
+/// 新 harness 的 `OrchestrationHooks::contract_block` 直接调它，两处文字不会漂。
+pub fn task_contract_block(contract: &DelegateContract) -> String {
+    prompt::task_contract_block(contract)
+}
+
+/// 会话里规范改过之后补在任务后面的那一块（见 [`ContextInput::project_update`]）。
+pub fn project_update_block(files: &[ProjectFile]) -> String {
+    prompt::project_update_block(files)
 }
 
 /// 把身份指令放在系统提示**最前面**，基座提示排在它后面。

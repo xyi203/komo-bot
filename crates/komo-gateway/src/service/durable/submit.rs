@@ -28,7 +28,7 @@
 
 use komo_kernel::durable::{
     Content, ConversationId, InputState, Message, SubmissionId, SubmissionKind, SubmissionRecord,
-    SubmissionStatus, legacy_ids,
+    SubmissionStatus, WriteState, legacy_ids,
 };
 use komo_kernel::types::digest::ContentHash;
 use komo_kernel::types::ids::RunId;
@@ -125,6 +125,17 @@ pub struct Accepted {
     pub status: SubmissionStatus,
 }
 
+/// [`DurableCore::land`] 要的、与 submission 本身无关的那几样。
+pub(super) struct Landing {
+    /// 内容哈希（请求键重发时比内容）。
+    pub hash: String,
+    /// 标题为空时取它的首行。
+    pub text: String,
+    /// 遇忙就拒（`WhenBusy::Reject`）：什么都不写。
+    pub reject_when_busy: bool,
+    pub model: Option<ModelOverride>,
+}
+
 struct Landed {
     conversation: ConversationId,
     submission: SubmissionId,
@@ -155,8 +166,33 @@ async fn same_input(
     hash: &str,
     key: &str,
 ) -> Result<(), SessionError> {
-    let SubmissionKind::Input { state } = &existing.kind else {
-        return Err(SessionError::RequestKeyConflict(key.to_owned()));
+    let state = match &existing.kind {
+        SubmissionKind::Input { state } => state,
+        // `!` 命令是 write submission：内容靠它的 entry 上的 `data.inputHash` 比。
+        SubmissionKind::Write { state } => {
+            let stored = match state {
+                WriteState::Done { entry } => storage
+                    .entry(*entry)
+                    .await?
+                    .and_then(|stored| hash_of(stored.entry.data.as_ref())),
+                WriteState::Queued => {
+                    let inbox = Harness::inbox(storage, existing.conversation).await?;
+                    inbox.items.iter().find_map(|item| match item {
+                        InboxItem::Write { id, entry } if *id == existing.id => {
+                            hash_of(entry.data.as_ref())
+                        }
+                        _ => None,
+                    })
+                }
+                WriteState::Unanswered { .. } => None,
+            };
+            return match stored {
+                Some(stored) if stored != hash => {
+                    Err(SessionError::RequestKeyConflict(key.to_owned()))
+                }
+                _ => Ok(()),
+            };
+        }
     };
     let stored = match state {
         InputState::Placed { entry }
@@ -216,14 +252,72 @@ impl DurableCore {
             request_id: request.request_id.clone(),
             internal: false,
         };
+        self.land(
+            session,
+            draft,
+            Landing {
+                hash,
+                text: request.text,
+                reject_when_busy: request.when_busy == WhenBusy::Reject,
+                model: request.model,
+            },
+        )
+        .await
+    }
 
+    /// 同一个请求键是不是已经受理过（`!` 命令在真跑之前先问：重发不该把命令再跑一遍）。命中且内容
+    /// 相同返回原 submission（`deduplicated`），内容不同是 [`SessionError::RequestKeyConflict`]，
+    /// 没有返回 `None`。会话不存在是 `NotFound`，不收输入是 `NotOpen`。
+    pub(super) async fn already_accepted(
+        &self,
+        session: &str,
+        key: &str,
+        hash: &str,
+    ) -> Result<Option<Accepted>, SessionError> {
+        let tree = load_tree(&*self.storage, session).await?;
+        ensure_open(&tree.session)?;
+        for branch in &tree.branches {
+            let found = self
+                .storage
+                .submission_by_request(branch.conversation.id, key)
+                .await?;
+            if let Some(existing) = found {
+                same_input(&*self.storage, &existing, hash, key).await?;
+                return Ok(Some(Accepted {
+                    session: session.to_owned(),
+                    conversation: existing.conversation,
+                    submission: existing.id,
+                    run: legacy_ids::run_id(existing.id),
+                    deduplicated: true,
+                    status: existing.status(),
+                }));
+            }
+        }
+        Ok(None)
+    }
+
+    /// 受理一个 submission 的共用一步（输入与 `!` 命令的 write 都走它）：路由到 `current_branch`
+    /// （`leaf` 不在末端时同一提交先 fork / 建新根）、请求键去重、sticky 的 model / effort 覆盖、
+    /// 受理、更新会话行。
+    pub(super) async fn land(
+        &self,
+        session: &str,
+        draft: SubmissionDraft,
+        landing: Landing,
+    ) -> Result<Accepted, SessionError> {
+        let Landing {
+            hash,
+            text,
+            reject_when_busy,
+            model,
+        } = landing;
+        let request_id = match &draft {
+            SubmissionDraft::Input { request_id, .. }
+            | SubmissionDraft::Write { request_id, .. } => request_id.clone(),
+        };
         let storage = self.storage.clone();
         let harness = self.harness.clone();
         let id = session.to_owned();
-        let text = request.text.clone();
-        let request_id = request.request_id.clone();
-        let when_busy = request.when_busy;
-        let model = request.model.clone();
         self.engine.resume();
         let landed = self
             .engine
@@ -257,7 +351,7 @@ impl DurableCore {
                         }
                     }
                     let place = placement(&tree, tree.leaf_pos());
-                    if when_busy == WhenBusy::Reject
+                    if reject_when_busy
                         && let super::tree::Placement::Existing(conversation) = place
                     {
                         match busy_reason(&*storage, conversation).await {

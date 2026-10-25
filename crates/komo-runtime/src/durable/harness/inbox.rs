@@ -891,18 +891,26 @@ pub async fn place_idle_input(
     request_id: Option<&str>,
     now: i64,
 ) -> Result<SubmissionId, DurableError> {
-    let record = tx
-        .append_entry(conversation, entries::input_draft(content, entry, now))
-        .await?;
-    let submission = tx
+    // 先铸 submission 的 ID、再铸 entry 的：**submission 的 ID 恒小于放置它的 entry 的 ID**。排队的
+    // 输入本来就是这个次序（submission 先建、boundary 才放 entry）；空闲直接放置也得一样，gateway 的
+    // 事件投影（`legacy_events`）按记录 ID 序折叠，要在输入 entry 出现之前就认得它的 submission，
+    // 才出得了 `RunAccepted` → `RunQueued` → `RunStarted` 的次序、把后面的 entry 归给这条 run。
+    let mut submission = tx
         .create_submission(
             conversation,
             request_id,
             SubmissionKind::Input {
-                state: InputState::Placed { entry: record.id },
+                state: InputState::Queued,
             },
         )
         .await?;
+    let record = tx
+        .append_entry(conversation, entries::input_draft(content, entry, now))
+        .await?;
+    submission.kind = SubmissionKind::Input {
+        state: InputState::Placed { entry: record.id },
+    };
+    tx.put_submission(submission.clone());
     start_run(tx, generation, conversation, live, vec![submission.id]).await?;
     Ok(submission.id)
 }

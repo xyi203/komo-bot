@@ -1207,6 +1207,47 @@ impl Home {
         }
     }
 
+    /// 起一台跑在新存储上的 Gateway（`docs/storage-durable-d5.md` §1）。**同一个数据目录**，
+    /// 再调一次就是"重启"。`llm` 同时当辅助调用的 `LlmClient` 与 harness 的 `ModelStream`。
+    pub async fn start_durable(&self, llm: Arc<FakeLlm>) -> Gw {
+        let sender = MemSender::new(ChannelPlatform::Telegram);
+        self.start_durable_with(llm, sender).await
+    }
+
+    /// 同上，但发送口自己给。
+    pub async fn start_durable_with(&self, llm: Arc<FakeLlm>, sender: Arc<MemSender>) -> Gw {
+        let running = start(ServiceOptions {
+            home: Some(self.dir.path().to_path_buf()),
+            listen: Some("127.0.0.1:0".into()),
+            channels: vec![FixedFactory::sender_only(
+                Arc::clone(&sender) as Arc<dyn ChannelSender>
+            )],
+            storage: StorageMode::Durable,
+            llm: Some(Arc::clone(&llm) as Arc<dyn LlmClient>),
+            stream: Some(llm as Arc<dyn ModelStream>),
+            embeddings: None,
+            shared_home: Some(self.dir.path().to_path_buf()),
+            telemetry: None,
+        })
+        .await
+        .expect("Gateway 起得来");
+        let base = running.base_url.clone();
+        let token = running.state.token.clone();
+        Gw {
+            running,
+            base,
+            token,
+            home: sender,
+        }
+    }
+
+    /// 停机之后单独打开 durable.db 读（同样要**先 stop**：Turso 对库文件持进程独占锁）。
+    pub async fn open_durable(&self) -> komo_store::durable::TursoStorage {
+        komo_store::durable::TursoStorage::open(self.dir.path())
+            .await
+            .expect("打开 durable.db")
+    }
+
     /// 停机之后单独打开 state.db（Turso 对 db 文件持进程独占锁，所以**必须先 stop**）。
     pub async fn open_db(&self) -> komo_store::Db {
         komo_store::Db::connect(self.dir.path().join("state.db"))
@@ -1346,8 +1387,12 @@ impl Gw {
         serde_json::from_str(&body).map_err(|error| error.to_string())
     }
 
-    /// 直接问账本这个 Run 现在什么状态（HTTP 那条路读的是同一行）。
+    /// 直接问账本这个 Run 现在什么状态（HTTP 那条路读的是同一行）。Durable 下没有 run 表：
+    /// 状态由 submission / entry 拼（`GET /v1/runs/{id}` 读的就是那份），所以读详情。
     pub async fn db_state(&self, run: &RunId) -> RunState {
+        if self.state().durable.is_some() {
+            return self.run_detail(run).await.summary.state;
+        }
         komo_store::repos::runs::get(&self.state().db, run)
             .await
             .expect("读得到")

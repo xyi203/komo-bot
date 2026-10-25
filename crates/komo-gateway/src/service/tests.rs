@@ -661,7 +661,11 @@ async fn an_end_to_end_turn_completes_and_reaches_the_event_stream() {
 /// 认证：除 `/healthz` 外统一 Bearer。
 #[tokio::test]
 async fn everything_but_health_needs_the_token() {
-    let gateway = TestGateway::start().await;
+    let gateway = TestGateway::durable(
+        &telegram_config("111"),
+        crate::service::test_support::harness::FakeLlm::finisher("好"),
+    )
+    .await;
 
     let health = reqwest::get(format!("{}/healthz", gateway.base_url()))
         .await
@@ -682,7 +686,11 @@ async fn everything_but_health_needs_the_token() {
 /// 幂等请求键：同键同内容返回原结果，同键不同内容 409。
 #[tokio::test]
 async fn the_same_request_key_with_other_content_is_a_conflict() {
-    let gateway = TestGateway::start().await;
+    let gateway = TestGateway::durable(
+        &telegram_config("111"),
+        crate::service::test_support::harness::FakeLlm::finisher("好"),
+    )
+    .await;
     let (_, body) = gateway.post("/v1/sessions", serde_json::json!({})).await;
     let session: komo_kernel::protocol::http::SessionSummary = serde_json::from_str(&body).unwrap();
 
@@ -718,8 +726,70 @@ async fn the_same_request_key_with_other_content_is_a_conflict() {
 }
 
 /// `/new` 在当前会话上追加一条边界，**不切 Session**。
+///
+/// Durable 下的 `/new` 有两个入口：这里测的是 HTTP 的 `POST /boundary`（TUI 用）；聊天渠道
+/// 的 `/new` 经 `dispatcher_v2`（W3a），到时候把下面那条 Legacy 的聊天版迁过去。
 #[tokio::test]
 async fn slash_new_appends_a_boundary_to_the_same_session() {
+    use crate::service::test_support::harness::FakeLlm;
+    use komo_kernel::protocol::http::{BoundaryResponse, SessionSummary, SubmitRunResponse};
+    use komo_kernel::session::EntryKind;
+
+    let gateway = TestGateway::durable(&telegram_config("111"), FakeLlm::finisher("好")).await;
+    let home = |body: String| {
+        serde_json::from_str::<SessionSummary>(&body)
+            .unwrap()
+            .session
+    };
+    let (status, body) = gateway.get("/v1/home-session").await;
+    assert_eq!(status, 200, "{body}");
+    let session = home(body);
+    let (status, body) = gateway
+        .post(
+            &format!("/v1/sessions/{session}/runs"),
+            serde_json::json!({"request_key": "home-1", "text": "在"}),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let run = serde_json::from_str::<SubmitRunResponse>(&body)
+        .unwrap()
+        .run;
+    gateway.wait_run(&run).await;
+    let entries_of = |body: String| {
+        serde_json::from_str::<komo_kernel::protocol::SessionTreeResponse>(&body)
+            .unwrap()
+            .entries
+    };
+    let (_, body) = gateway.get(&format!("/v1/sessions/{session}/tree")).await;
+    let before = entries_of(body);
+
+    let (status, body) = gateway
+        .post(
+            &format!("/v1/sessions/{session}/boundary"),
+            serde_json::json!({}),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let boundary: BoundaryResponse = serde_json::from_str(&body).unwrap();
+    assert_eq!(boundary.session, session);
+
+    // 还是同一个 home session，边界落在它的历史里（"自此重新开始"在 pi 里是一条压缩）。
+    let (_, body) = gateway.get("/v1/home-session").await;
+    assert_eq!(home(body), session);
+    let (_, body) = gateway.get(&format!("/v1/sessions/{session}/tree")).await;
+    let after = entries_of(body);
+    assert!(after.len() > before.len(), "{after:?}");
+    assert!(
+        after[before.len()..]
+            .iter()
+            .any(|entry| matches!(entry.kind, EntryKind::Compaction { .. })),
+        "{after:?}"
+    );
+}
+
+/// 聊天渠道的 `/new`（Legacy 存储）：W3a 把它迁到 `dispatcher_v2` 之后并进上面那条。
+#[tokio::test]
+async fn slash_new_appends_a_boundary_to_the_same_session_through_chat_legacy() {
     let gateway = TestGateway::start().await;
     let first = gateway
         .dispatcher()
@@ -905,9 +975,7 @@ async fn the_session_list_shows_the_first_message_as_its_title() {
     let llm = crate::service::test_support::harness::FakeLlm::new(vec![vec![
         crate::service::test_support::harness::text_round(1, "好。"),
     ]]);
-    let gateway = home
-        .start(Arc::clone(&llm) as Arc<dyn komo_kernel::traits::LlmClient>)
-        .await;
+    let gateway = home.start_durable(Arc::clone(&llm)).await;
     let session = gateway.open_session().await;
     gateway
         .submit(&session, "title-1", "空调状态\n顺便看看湿度")
@@ -2055,9 +2123,7 @@ async fn a_bang_command_runs_without_the_model_and_lands_in_the_history() {
     let home = Home::new();
     let count = home.workspace().join("bang.count");
     let llm = FakeLlm::new(vec![vec![text_round(1, "看到了。")]]);
-    let gateway = home
-        .start(Arc::clone(&llm) as Arc<dyn komo_kernel::traits::LlmClient>)
-        .await;
+    let gateway = home.start_durable(Arc::clone(&llm)).await;
     let session = gateway.open_session().await;
 
     for (key, word) in [("bang-1", "first-out"), ("bang-2", "second-out")] {
@@ -2116,9 +2182,7 @@ async fn an_empty_bang_command_is_refused() {
     use crate::service::test_support::harness::{FakeLlm, Home};
 
     let home = Home::new();
-    let gateway = home
-        .start(FakeLlm::new(vec![]) as Arc<dyn komo_kernel::traits::LlmClient>)
-        .await;
+    let gateway = home.start_durable(FakeLlm::new(vec![])).await;
     let session = gateway.open_session().await;
     let (status, body) = gateway
         .post(
@@ -2251,7 +2315,7 @@ async fn a_completed_run_reports_end_time_duration_model_and_token_totals() {
 
     let home = Home::new();
     let gateway = home
-        .start(FakeLlm::new(vec![vec![
+        .start_durable(FakeLlm::new(vec![vec![
             call_round(1, "pc-1", "read", serde_json::json!({"path": "nope"})),
             usage_round(
                 2,
@@ -2263,7 +2327,7 @@ async fn a_completed_run_reports_end_time_duration_model_and_token_totals() {
                     ..TokenUsage::default()
                 },
             ),
-        ]]) as Arc<dyn komo_kernel::traits::LlmClient>)
+        ]]))
         .await;
     let session = gateway.open_session().await;
     let run = gateway.submit(&session, "ins-1", "看一下").await.run;
@@ -2292,8 +2356,7 @@ async fn a_run_without_reported_usage_leaves_token_totals_absent() {
 
     let home = Home::new();
     let gateway = home
-        .start(FakeLlm::new(vec![vec![text_round(1, "好。")]])
-            as Arc<dyn komo_kernel::traits::LlmClient>)
+        .start_durable(FakeLlm::new(vec![vec![text_round(1, "好。")]]))
         .await;
     let session = gateway.open_session().await;
     let run = gateway.submit(&session, "ins-2", "嗯").await.run;
@@ -2316,10 +2379,10 @@ async fn a_failed_run_reports_why() {
 
     let home = Home::new();
     let gateway = home
-        .start(FakeLlm::always(vec![Err(LlmError::Rejected {
+        .start_durable(FakeLlm::always(vec![Err(LlmError::Rejected {
             status: 400,
             message: "额度用完了".into(),
-        })]) as Arc<dyn komo_kernel::traits::LlmClient>)
+        })]))
         .await;
     let session = gateway.open_session().await;
     let run = gateway.submit(&session, "ins-3", "来").await.run;

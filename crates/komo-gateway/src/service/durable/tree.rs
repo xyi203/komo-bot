@@ -444,7 +444,7 @@ pub fn input_text(entry: &EntryRecord) -> Option<String> {
     }
 }
 
-fn content_text(content: &Content) -> String {
+pub(super) fn content_text(content: &Content) -> String {
     match content {
         Content::Text(text) => text.clone(),
         Content::Blocks(blocks) => blocks

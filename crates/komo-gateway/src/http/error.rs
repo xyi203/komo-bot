@@ -182,6 +182,28 @@ impl From<GatewayError> for ApiFailure {
     }
 }
 
+/// Durable 模式会话服务层的错误（`service::durable::SessionError`）：每个变体只在这里映射一次——
+/// `NotFound` 404、`Invalid` 400、`NotOpen` 409（带那一种状态）、`Busy` / `Conflict` 409、
+/// 请求键冲突 409（`request_key_conflict`）、`Internal` 500。
+impl From<crate::service::durable::SessionError> for ApiFailure {
+    fn from(error: crate::service::durable::SessionError) -> Self {
+        use crate::service::durable::SessionError;
+        match error {
+            SessionError::NotFound(what) => ApiFailure::not_found(what),
+            SessionError::Invalid(message) => ApiFailure::invalid(message),
+            SessionError::NotOpen(state) => ApiFailure::session_not_open(state),
+            SessionError::Busy(message) | SessionError::Conflict(message) => {
+                ApiFailure::new(ErrorCode::Conflict, message)
+            }
+            SessionError::RequestKeyConflict(key) => ApiFailure::new(
+                ErrorCode::RequestKeyConflict,
+                format!("请求键 {key} 已经用于另一条内容不同的输入"),
+            ),
+            SessionError::Internal(message) => ApiFailure::new(ErrorCode::Internal, message),
+        }
+    }
+}
+
 /// 处理器的返回类型。
 pub type ApiResult<T> = Result<T, ApiFailure>;
 

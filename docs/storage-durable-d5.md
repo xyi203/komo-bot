@@ -258,5 +258,5 @@
 - **kernel**：`Ledger` / `RunQueue` / `LedgerError` 与 `AcceptInput` / `Accepted` / `AssistantRound` / `EventBatch` / `PlannedCall` / `RunEnd` / `Claimed` / `ForkPrefix`、`recovery.rs`、`session_events`、compaction 的 `CompactionJob` / `DecayJob` / `Reshape` / `find_cut`、`MemLedger` / `MemRunQueue` 删。保留：`events` / `fold` / `projection` / `session`（客户端、`legacy_events` 投影、`pi_tree`、导出仍用）、`LlmClient` / `TurnDriver`（记忆提取、标题、分支摘要）。
 - **agent**：`context` 只剩系统段装配（`system_sections` / `task_contract_block` / `project_*`）、压缩摘要提示与 `serialize_conversation`、记忆渲染；`assemble` / `AgentContext` / 回放 `history` / `tree`、压缩估价与 plan 删。
 - **测试**：gateway 里拿旧 `assemble` 当对照的黄金测试改成断言段的顺序与内容；`compaction` 测试的估价内联在测试里。
-- **偶发失败**：`tests/recovery` 的 `a_killed_bash_is_handed_to_the_model_as_interrupted` 单独跑时约一半会挂（`stop` 时在飞的 `bash` 被取消，那次调用记成 `failed`「已取消」而不是 `uncertain`）。出在 durable harness 的关停取消路径（D7b 没动那里），不是这次删除引入的，留待之后查。
+- **偶发失败（已修）**：`tests/recovery` 的 `a_killed_bash_is_handed_to_the_model_as_interrupted` 单独跑时约一半会挂（`stop` 时在飞的 `bash` 被记成 `failed`「已取消」而不是 `uncertain`）。原因：`bash` 自己看到取消旗、杀掉命令后以 `ToolError::Cancelled` 返回，常抢在 `race` 25ms 的轮询之前，于是被当成正常完成写了结果。修法：`durable/harness/tool.rs` 里取消旗已设且结果是 `Cancelled` 时，同样当作取消赢了（不发布、不写结果，交给 abort handler 或重启后的 `execute` 阶段）。
 - 编译时间见 `storage-durable.md` §13。

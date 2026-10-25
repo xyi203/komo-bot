@@ -664,7 +664,12 @@ impl ToolTask {
         let _ = bridge.await;
 
         // 取消赢了（abort 标记或关闭）：不发布、不写结果。`.partial` 留在盘上，abort handler
-        // 或重启后的 `execute` 阶段接管它。
+        // 或重启后的 `execute` 阶段接管它。工具自己看到同一个取消旗、抢在 `race` 的轮询之前
+        // 以 `Cancelled` 返回，也是取消赢了。
+        let executed = match executed {
+            Some(Ok(Err(ToolError::Cancelled))) if cancel.is_cancelled() => None,
+            executed => executed,
+        };
         let Some(executed) = executed else {
             return Err(TaskError::new("the tool call was cancelled"));
         };

@@ -35,6 +35,8 @@ impl TempStore {
         let root =
             tempfile::tempdir().map_err(|e| StoreError::Io(format!("建立临时目录失败：{e}")))?;
         let db = Db::connect_with(root.path().join("aux.db"), options).await?;
+        // 同 Gateway 启动：先写一次，之后同进程重开才不报 `database is locked`。
+        db.first_write().await?;
         Ok(TempStore { root, db })
     }
 

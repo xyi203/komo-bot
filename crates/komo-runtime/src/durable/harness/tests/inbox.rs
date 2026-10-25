@@ -9,7 +9,8 @@ use tokio::sync::Notify;
 
 use super::super::inbox::{InboxItem, WriteHead};
 use super::super::{
-    Harness, HarnessSettings, QueueMode, SubmissionDraft, SubmitError, WithdrawResult, WriteDraft,
+    Harness, HarnessSettings, HookError, QueueMode, RunBudget, SubmissionDraft, SubmitError,
+    WithdrawResult, WriteDraft,
 };
 use super::support::*;
 
@@ -684,6 +685,366 @@ async fn a_display_only_write_behind_a_queued_reset_lands_after_it() {
         input_state(&world.submission(first).await),
         InputState::Unanswered { ref reason, .. } if reason == "reset"
     ));
+    engine.close().await.unwrap();
+}
+
+// ------------------------------------------------------------ 内部输入
+
+/// 系统递的内部输入（后台任务交回的结果、监听消息的形状）：steer，请求键去重。
+fn internal_steer(text: &str, key: &str) -> SubmissionDraft {
+    SubmissionDraft::input(text)
+        .steer()
+        .internal()
+        .with_request_id(key)
+}
+
+fn unanswered_reason(record: &komo_kernel::durable::SubmissionRecord) -> String {
+    match input_state(record) {
+        InputState::Unanswered { reason, .. } => reason,
+        other => panic!("unanswered expected, got {other:?}"),
+    }
+}
+
+/// 旧数据没有 `internal` 字段：按用户输入读；用户输入写回时不带它，旧读者照样认得。
+#[test]
+fn an_inbox_item_without_the_internal_field_reads_as_a_user_input() {
+    let old: InboxItem =
+        serde_json::from_value(json!({ "mode": "steer", "id": 5, "content": "x" })).unwrap();
+    assert!(!old.is_internal());
+    let value = serde_json::to_value(&old).unwrap();
+    assert!(value.get("internal").is_none(), "{value}");
+    let internal: InboxItem = serde_json::from_value(
+        json!({ "mode": "followUp", "id": 6, "content": "y", "internal": true }),
+    )
+    .unwrap();
+    assert!(internal.is_internal());
+    assert_eq!(serde_json::to_value(&internal).unwrap()["internal"], true);
+}
+
+/// `Conversation.abort()` 只撤用户的输入；内部输入（任务结果）留着，run 一收尾就在同一次提交里用它
+/// 起后继 run，模型看得见它并回复——旧 komo 取消 home 的 Run 不动任务结果的行为。
+#[tokio::test(start_paused = true)]
+async fn cancelling_a_busy_run_keeps_internal_inputs_and_runs_them_next() {
+    let (world, engine, _gate) = busy_world(|world| world.script.reply("relayed")).await;
+    let first = world.submit(&engine, "go").await;
+    world.until_log("start slow #1").await;
+    let steer = world
+        .harness
+        .submit(&engine, CONV, SubmissionDraft::input("user steer").steer())
+        .await
+        .unwrap();
+    let follow = world.submit(&engine, "user follow").await;
+    let result = world
+        .harness
+        .submit(
+            &engine,
+            CONV,
+            internal_steer("task finished: 42", "task-result:t:1"),
+        )
+        .await
+        .unwrap();
+
+    world
+        .harness
+        .abort_conversation(&engine, CONV)
+        .await
+        .unwrap();
+    let settled = world.harness.wait(&engine, result).await.unwrap();
+
+    // 用户的 steer / followUp 撤回了，没有放置过；任务结果是后继 run 的输入。
+    assert_eq!(unanswered_reason(&world.submission(first).await), "aborted");
+    for id in [steer, follow] {
+        assert!(matches!(
+            input_state(&world.submission(id).await),
+            InputState::Unanswered { entry: None, ref reason, .. } if reason == "aborted"
+        ));
+    }
+    assert!(matches!(input_state(&settled), InputState::Done { .. }));
+    assert!(world.inbox().await.items.is_empty());
+    let requests = world.script.requests();
+    assert_eq!(requests.len(), 2, "the original run and its successor");
+    assert_eq!(
+        outline(&requests[1]).last().unwrap(),
+        "user: task finished: 42"
+    );
+    assert!(
+        !user_texts(&requests[1])
+            .iter()
+            .any(|text| text.starts_with("user")),
+        "the withdrawn user inputs never reached the model"
+    );
+    assert!(world.live().await.run.is_none());
+    engine.close().await.unwrap();
+}
+
+fn user_texts(messages: &[komo_kernel::durable::Message]) -> Vec<String> {
+    messages
+        .iter()
+        .filter(|message| message.is_user())
+        .map(text_of)
+        .collect()
+}
+
+/// 取消时排队的 write 照旧留着；有内部输入要起后继 run 时，write 先放、内部输入后放（boundary 的
+/// 次序），所以排在内部输入前的 reset 把它放进了新上下文。
+#[tokio::test(start_paused = true)]
+async fn the_successor_run_places_queued_writes_before_the_internal_input() {
+    let (world, engine, _gate) = busy_world(|world| world.script.reply("relayed")).await;
+    world.submit(&engine, "go").await;
+    world.until_log("start slow #1").await;
+    let reset = world.harness.reset(&engine, CONV, None).await.unwrap();
+    let result = world
+        .harness
+        .submit(
+            &engine,
+            CONV,
+            internal_steer("late result", "task-result:t:2"),
+        )
+        .await
+        .unwrap();
+
+    world
+        .harness
+        .abort_conversation(&engine, CONV)
+        .await
+        .unwrap();
+    world.harness.wait(&engine, result).await.unwrap();
+
+    assert!(matches!(
+        write_state(&world.submission(reset).await),
+        WriteState::Done { .. }
+    ));
+    let kinds: Vec<_> = world.entries().await.into_iter().map(|e| e.kind).collect();
+    let reset_at = kinds.iter().position(|k| k == "komo.reset").unwrap();
+    let last_user = kinds.iter().rposition(|k| k == "komo.user").unwrap();
+    assert!(reset_at < last_user, "{kinds:?}");
+    assert_eq!(
+        outline(&world.script.requests()[1]),
+        ["system", "user: late result"]
+    );
+    engine.close().await.unwrap();
+}
+
+/// 模型失败（`model_error`）不动收件箱——但内部输入不等下一条用户输入：同一次提交里起后继 run。
+/// 用户排队的 followUp 照 pi 不跟着放，留在收件箱里，等后继 run 的 final boundary（普通的下一个
+/// boundary）才轮到。
+#[tokio::test(start_paused = true)]
+async fn a_failed_run_runs_the_queued_internal_input_before_the_user_ones() {
+    let world = World::new();
+    let gate = Arc::new(Notify::new());
+    world.script.push(super::support::Step::Gate(
+        gate.clone(),
+        Box::new(super::support::Step::Error(rejected(400))),
+    ));
+    let release = Arc::new(Notify::new());
+    world.script.push(super::support::Step::Gate(
+        release.clone(),
+        Box::new(super::support::Step::Reply(text_reply("relayed"))),
+    ));
+    world.script.reply("then the follow-up");
+    let engine = world.open().await;
+
+    let first = world.submit(&engine, "one").await;
+    let user = world.submit(&engine, "user follow").await;
+    let result = world
+        .harness
+        .submit(&engine, CONV, internal_steer("job done", "task-result:t:3"))
+        .await
+        .unwrap();
+    gate.notify_one();
+    let failed = world.harness.wait(&engine, first).await.unwrap();
+    assert_eq!(unanswered_reason(&failed), "model_error");
+
+    // 后继 run 已经起来（卡在模型请求上）：内部输入放置了，用户的 followUp 还在收件箱里排着。
+    world
+        .until(|| async { world.script.request_count() == 2 })
+        .await;
+    assert!(matches!(
+        input_state(&world.submission(result).await),
+        InputState::Placed { .. }
+    ));
+    assert_eq!(
+        input_state(&world.submission(user).await),
+        InputState::Queued
+    );
+    assert_eq!(
+        world
+            .inbox()
+            .await
+            .items
+            .iter()
+            .map(InboxItem::id)
+            .collect::<Vec<_>>(),
+        [user]
+    );
+    release.notify_one();
+    world.harness.wait(&engine, user).await.unwrap();
+
+    let requests = world.script.requests();
+    assert_eq!(outline(&requests[1]).last().unwrap(), "user: job done");
+    assert_eq!(
+        outline(&requests[2]).last().unwrap(),
+        "user: user follow",
+        "the left-over follow-up runs at the successor's final boundary"
+    );
+    engine.close().await.unwrap();
+}
+
+/// 预算（轮数）收尾同样走后继放置。
+#[tokio::test(start_paused = true)]
+async fn a_run_stopped_by_the_budget_runs_the_queued_internal_input() {
+    let (world, engine, gate) = busy_world(|world| world.script.reply("relayed")).await;
+    world.hooks.set_budget(RunBudget {
+        max_rounds: Some(1),
+        ..RunBudget::default()
+    });
+    let first = world.submit(&engine, "go").await;
+    world.until_log("start slow #1").await;
+    // followUp 形状的内部输入：postTools boundary 不放，等 final / 后继放置。
+    let result = world
+        .harness
+        .submit(
+            &engine,
+            CONV,
+            SubmissionDraft::input("budget result")
+                .internal()
+                .with_request_id("monitor-end:7"),
+        )
+        .await
+        .unwrap();
+    gate.notify_one();
+    let stopped = world.harness.wait(&engine, first).await.unwrap();
+    assert_eq!(unanswered_reason(&stopped), "budget");
+    world.harness.wait(&engine, result).await.unwrap();
+
+    assert_eq!(
+        outline(world.script.requests().last().unwrap())
+            .last()
+            .unwrap(),
+        "user: budget result"
+    );
+    engine.close().await.unwrap();
+}
+
+/// 调度器写的 `faulted`（钩子失败）经 `settle_scheduler_outcome` 收尾——那笔提交已经写过任务记录，
+/// 放置照样能读 head 标记；内部输入因此成了后继 run 的输入（run 同样 fault，输入随它 settle）。
+#[tokio::test(start_paused = true)]
+async fn a_faulted_run_places_the_queued_internal_input_in_the_same_commit() {
+    let (world, engine, gate) = busy_world(|_| {}).await;
+    let first = world.submit(&engine, "go").await;
+    world.until_log("start slow #1").await;
+    let result = world
+        .harness
+        .submit(
+            &engine,
+            CONV,
+            SubmissionDraft::input("after the fault")
+                .internal()
+                .with_request_id("monitor-end:8"),
+        )
+        .await
+        .unwrap();
+    world
+        .hooks
+        .set_failure(Some(HookError::Failed("the registry is on fire".into())));
+    gate.notify_one();
+    let faulted = world.harness.wait(&engine, first).await.unwrap();
+    assert_eq!(unanswered_reason(&faulted), "faulted");
+    let settled = world.harness.wait(&engine, result).await.unwrap();
+
+    // 后继 run 也 fault 了，但内部输入确实被放置过（`entry` 有值），之后收件箱是空的：不会重放。
+    assert!(matches!(
+        input_state(&settled),
+        InputState::Unanswered { entry: Some(_), ref reason, .. } if reason == "faulted"
+    ));
+    assert!(world.inbox().await.items.is_empty());
+    assert!(world.live().await.run.is_none());
+    engine.close().await.unwrap();
+}
+
+/// 显式的单条撤回对内部输入仍然有效。
+#[tokio::test(start_paused = true)]
+async fn an_explicit_withdraw_still_removes_an_internal_input() {
+    let (world, engine, gate) = busy_world(|_| {}).await;
+    let first = world.submit(&engine, "go").await;
+    world.until_log("start slow #1").await;
+    let result = world
+        .harness
+        .submit(
+            &engine,
+            CONV,
+            internal_steer("never mind", "task-result:t:4"),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        world
+            .harness
+            .withdraw(&engine, result, Some(CONV))
+            .await
+            .unwrap(),
+        WithdrawResult::Aborted
+    );
+    assert_eq!(
+        unanswered_reason(&world.submission(result).await),
+        "aborted"
+    );
+    assert!(world.inbox().await.items.is_empty());
+
+    gate.notify_one();
+    world.script.reply("done");
+    world.harness.wait(&engine, first).await.unwrap();
+    assert_eq!(
+        world.script.request_count(),
+        2,
+        "no successor run was started"
+    );
+    engine.close().await.unwrap();
+}
+
+/// 后继 run 再被取消不会死循环：内部输入放置后就是那条 run 的输入，随它 settle
+/// （`unanswered{aborted}`），收件箱里没有了，第二次取消收尾时没有可放的东西。
+#[tokio::test(start_paused = true)]
+async fn cancelling_the_successor_run_does_not_loop() {
+    let (world, engine, _gate) = busy_world(|world| world.script.push(Step::Hang)).await;
+    world.submit(&engine, "go").await;
+    world.until_log("start slow #1").await;
+    let result = world
+        .harness
+        .submit(&engine, CONV, internal_steer("result", "task-result:t:5"))
+        .await
+        .unwrap();
+
+    world
+        .harness
+        .abort_conversation(&engine, CONV)
+        .await
+        .unwrap();
+    // 后继 run 在跑（卡在模型请求上），输入已放置。
+    world
+        .until(|| async { world.script.request_count() == 2 })
+        .await;
+    assert!(world.live().await.run.is_some());
+    assert!(matches!(
+        input_state(&world.submission(result).await),
+        InputState::Placed { .. }
+    ));
+
+    world
+        .harness
+        .abort_conversation(&engine, CONV)
+        .await
+        .unwrap();
+    assert_eq!(
+        unanswered_reason(&world.submission(result).await),
+        "aborted"
+    );
+    assert!(world.live().await.run.is_none());
+    assert!(world.inbox().await.items.is_empty());
+    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    assert_eq!(world.script.request_count(), 2, "no third run");
+    assert!(world.live().await.run.is_none());
     engine.close().await.unwrap();
 }
 

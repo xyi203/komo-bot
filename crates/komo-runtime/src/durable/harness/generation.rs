@@ -355,6 +355,7 @@ impl GenerationTask {
         let max_rounds = setup.budget.max_rounds;
         let compaction_task = self.compaction.clone();
         let this = self.clone();
+        let modes = self.modes();
         rt.commit(move |tx, task| {
             Box::pin(async move {
                 let mut live = live::load(tx, conversation).await?;
@@ -364,13 +365,16 @@ impl GenerationTask {
                     && run.rounds >= max
                 {
                     let message = format!("超过总轮数预算（{max}）");
-                    report::end_run(
+                    // 非正常收尾要放内部输入：表读（head）先于第一次表写，这里还没写过。
+                    let successor = inbox::prepare_boundary(tx, conversation, modes).await?;
+                    report::end_run_abnormal(
                         tx,
                         &this,
                         conversation,
                         &mut live,
                         task.id(),
                         &unanswered("budget", Some(&message)),
+                        successor,
                     )
                     .await?;
                     live::store(tx, conversation, &live).await?;
@@ -703,17 +707,20 @@ impl GenerationTask {
     ) -> Result<(), TaskError> {
         let conversation = rt.conversation();
         let this = self.clone();
+        let modes = self.modes();
         rt.commit(move |tx, task| {
             Box::pin(async move {
+                let successor = inbox::prepare_boundary(tx, conversation, modes).await?;
                 let mut live = live::load(tx, conversation).await?;
                 append_assistant(tx, conversation, message).await?;
-                report::end_run(
+                report::end_run_abnormal(
                     tx,
                     &this,
                     conversation,
                     &mut live,
                     task.id(),
                     &unanswered("model_error", Some(&text)),
+                    successor,
                 )
                 .await?;
                 live::store(tx, conversation, &live).await?;
@@ -734,18 +741,21 @@ impl GenerationTask {
     ) -> Result<(), TaskError> {
         let conversation = rt.conversation();
         let this = self.clone();
+        let modes = self.modes();
         rt.commit(move |tx, task| {
             Box::pin(async move {
+                let successor = inbox::prepare_boundary(tx, conversation, modes).await?;
                 let mut live = live::load(tx, conversation).await?;
                 live::convert_partial(tx, conversation, &mut live).await?;
                 let text = detail.unwrap_or_else(|| message.clone());
-                report::end_run(
+                report::end_run_abnormal(
                     tx,
                     &this,
                     conversation,
                     &mut live,
                     task.id(),
                     &unanswered(reason, Some(&text)),
+                    successor,
                 )
                 .await?;
                 live::store(tx, conversation, &live).await?;
@@ -803,8 +813,15 @@ impl GenerationTask {
         let spent = crate::agent::spent(&usage_of(&message));
         let max_tokens = request.limits.max_tokens;
         let this = self.clone();
+        let modes = self.modes();
         rt.commit(move |tx, task| {
             Box::pin(async move {
+                // token 预算超了要以非正常收尾放内部输入：表读先于第一次表写，所以有预算才先备好。
+                let successor = if max_tokens.is_some() {
+                    Some(inbox::prepare_boundary(tx, conversation, modes).await?)
+                } else {
+                    None
+                };
                 let mut live = live::load(tx, conversation).await?;
                 let entry = append_assistant(tx, conversation, message).await?;
                 // 预算：先记这一轮，再看 token 有没有超（回复已落账，调用不执行）。
@@ -817,13 +834,14 @@ impl GenerationTask {
                         && run.tokens > limit
                     {
                         let text = format!("超过 token 预算（{limit}）");
-                        report::end_run(
+                        report::end_run_abnormal(
                             tx,
                             &this,
                             conversation,
                             &mut live,
                             task.id(),
                             &unanswered("budget", Some(&text)),
+                            successor.expect("有预算时备过"),
                         )
                         .await?;
                         live::store(tx, conversation, &live).await?;
@@ -1229,8 +1247,10 @@ impl TaskKind for GenerationTask {
             _ => Vec::new(),
         };
         let this = self.clone();
+        let modes = self.modes();
         rt.commit(move |tx, task| {
             Box::pin(async move {
+                let successor = inbox::prepare_boundary(tx, conversation, modes).await?;
                 let mut live = live::load(tx, conversation).await?;
                 live::convert_partial(tx, conversation, &mut live).await?;
                 for (call_id, name) in &unstarted {
@@ -1244,13 +1264,17 @@ impl TaskKind for GenerationTask {
                     )
                     .await?;
                 }
-                report::end_run(
+                // 取消不撤内部输入（`withdraw_queued_inputs` 只撤用户的）：run 收尾后立刻用它们起
+                // 后继 run，把任务结果转告用户。后继 run 若再被取消，内部输入已是它的输入、随它
+                // settle，收件箱里不会再有，不会死循环。
+                report::end_run_abnormal(
                     tx,
                     &this,
                     conversation,
                     &mut live,
                     task.id(),
                     &unanswered("aborted", None),
+                    successor,
                 )
                 .await?;
                 live::store(tx, conversation, &live).await?;
@@ -1270,11 +1294,23 @@ pub(super) async fn settle_scheduler_outcome(
     task: TaskId,
     settlement: &SubmissionSettlement,
 ) -> Result<(), DurableError> {
+    // 这笔提交已经写过任务记录，但 head 标记只来自 entry、这里在 `convert_partial` 之前读，
+    // `Tx::latest_head_marker` 认这种读。
+    let successor = inbox::prepare_boundary(tx, conversation, this.modes()).await?;
     let mut live = live::load(tx, conversation).await?;
     if live.run.as_ref().is_none_or(|run| run.task != task) {
         return Ok(());
     }
     live::convert_partial(tx, conversation, &mut live).await?;
-    report::end_run(tx, this, conversation, &mut live, task, settlement).await?;
+    report::end_run_abnormal(
+        tx,
+        this,
+        conversation,
+        &mut live,
+        task,
+        settlement,
+        successor,
+    )
+    .await?;
     live::store(tx, conversation, &live).await
 }

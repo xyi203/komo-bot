@@ -240,6 +240,8 @@ pub fn event_draft(id: u64, title: &str, suffix: &str, text: impl Into<String>) 
         )),
         when_busy: WhenBusy::Steer,
         request_id: Some(format!("monitor:{id}:{suffix}")),
+        // 内部输入：父被取消时不撤（见 `inbox` 模块文档）。
+        internal: true,
     }
 }
 
@@ -282,6 +284,7 @@ pub(crate) async fn finish_in_tx(
             )),
             when_busy: WhenBusy::Steer,
             request_id: Some(format!("monitor-end:{id}")),
+            internal: true,
         };
         inbox::admit(tx, generation, conversation, &draft, modes).await?;
     }

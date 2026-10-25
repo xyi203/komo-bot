@@ -478,7 +478,13 @@ async fn a_result_for_a_busy_parent_waits_in_the_inbox_for_the_boundary() {
     let inbox = world.inbox().await;
     assert_eq!(inbox.items.len(), 1);
     let queued = match &inbox.items[0] {
-        InboxItem::Steer { id, content, entry } => {
+        InboxItem::Steer {
+            id,
+            content,
+            entry,
+            internal,
+        } => {
+            assert!(*internal, "交回的结果是内部输入");
             assert_eq!(entry.as_ref().unwrap().kind, TASK_RESULT_ENTRY);
             assert!(
                 matches!(content, komo_kernel::durable::Content::Text(text) if text.starts_with("[后台任务")),
@@ -1344,6 +1350,168 @@ async fn a_task_conversation_cannot_start_a_monitor() {
     engine.close().await.unwrap();
 }
 
+// ------------------------------------------------------------ 取消与失败不丢内部输入
+
+/// 父忙时排着的任务结果是内部输入：取消父不撤它。父的 run 一收尾就在同一次提交里用它起后继 run，
+/// 模型看到 `task.result` 并把结论转告用户（旧 komo 取消 home 的 Run 不动任务结果；
+/// `docs/background-tasks.md`）。
+#[tokio::test(start_paused = true)]
+async fn a_task_result_queued_for_a_busy_parent_survives_cancelling_the_parent() {
+    let world = World::new();
+    let (_fixture, ..) = install(&world);
+    world.script.calls(&[
+        ("c1", "task", spawn_call("CHILD quick", "快")),
+        ("c2", "slow", json!({})),
+    ]);
+    world.script.reply("told the user");
+    world.script.reply_for("CHILD quick", "quick answer");
+    let engine = world.open().await;
+    let id = world.submit(&engine, "go").await;
+    world
+        .until(|| async { !world.inbox().await.items.is_empty() })
+        .await;
+    let queued = world.inbox().await.items[0].id();
+
+    world
+        .harness
+        .abort_conversation(&engine, CONV)
+        .await
+        .unwrap();
+    let settled = world.harness.wait(&engine, id).await.unwrap();
+    assert!(matches!(
+        input_state(&settled),
+        InputState::Unanswered { ref reason, .. } if reason == "aborted"
+    ));
+    let delivered = world.harness.wait(&engine, queued).await.unwrap();
+
+    assert!(matches!(input_state(&delivered), InputState::Done { .. }));
+    assert!(world.inbox().await.items.is_empty());
+    let entries = world.entries_of(TASK_RESULT_ENTRY).await;
+    assert_eq!(entries.len(), 1, "the result became a task.result input");
+    let last = world.script.requests().last().unwrap().clone();
+    assert!(
+        user_texts(&last).last().unwrap().contains("quick answer"),
+        "the model saw the task result"
+    );
+    assert_eq!(
+        outline(&world.messages().await).last().unwrap(),
+        "assistant: told the user"
+    );
+    engine.close().await.unwrap();
+}
+
+/// 父的 run 模型失败（`model_error`）时排着的任务结果也紧接着跑，不卡到用户下次说话。
+#[tokio::test(start_paused = true)]
+async fn a_task_result_queued_for_a_parent_whose_model_fails_runs_right_after() {
+    let world = World::new();
+    let (_fixture, ..) = install(&world);
+    let (model_gate, child_gate) = (Arc::new(Notify::new()), Arc::new(Notify::new()));
+    world
+        .script
+        .calls(&[("c1", "task", spawn_call("CHILD slow", "慢"))]);
+    world.script.push(Step::Gate(
+        model_gate.clone(),
+        Box::new(Step::Error(rejected(400))),
+    ));
+    world.script.reply("told the user");
+    world
+        .script
+        .push_for("CHILD slow", gated(&child_gate, "late answer"));
+    let engine = world.open().await;
+    let id = world.submit(&engine, "go").await;
+    // 父的第二次请求卡在 `model_gate` 上（父忙），这时子收尾：交回的结果排进收件箱。
+    world
+        .until(|| async { world.script.request_count() >= 2 })
+        .await;
+    child_gate.notify_one();
+    world
+        .until(|| async { !world.inbox().await.items.is_empty() })
+        .await;
+    let queued = world.inbox().await.items[0].id();
+
+    model_gate.notify_one();
+    let failed = world.harness.wait(&engine, id).await.unwrap();
+    assert!(matches!(
+        input_state(&failed),
+        InputState::Unanswered { ref reason, .. } if reason == "model_error"
+    ));
+    let delivered = world.harness.wait(&engine, queued).await.unwrap();
+
+    assert!(matches!(input_state(&delivered), InputState::Done { .. }));
+    assert!(
+        user_texts(&world.messages().await)
+            .last()
+            .unwrap()
+            .contains("late answer")
+    );
+    assert_eq!(
+        outline(&world.messages().await).last().unwrap(),
+        "assistant: told the user"
+    );
+    engine.close().await.unwrap();
+}
+
+/// 监听的事件与结束消息同样是内部输入：父被取消后仍送达，父再跑一轮。
+#[tokio::test(start_paused = true)]
+async fn monitor_messages_queued_for_a_busy_parent_survive_cancelling_it() {
+    let world = World::new();
+    let (_fixture, ..) = install(&world);
+    world.script.calls(&[
+        ("m1", "monitor", monitor_call("盯", false, 30)),
+        ("c2", "slow", json!({})),
+    ]);
+    world.script.reply("told the user");
+    world.script.reply("and the rest");
+    let engine = world.open().await;
+    let id = world.submit(&engine, "go").await;
+    world.until_log("start slow #1").await;
+    let monitor_id = monitors(&world).await[0].id;
+
+    let event = world
+        .harness
+        .submit(
+            &engine,
+            CONV,
+            monitor::event_draft(monitor_id, "盯", "1:1", "[监听 #x「盯」]\nline"),
+        )
+        .await
+        .unwrap();
+    let message = format!("[监听 #{monitor_id}「盯」已结束]\n\nexit=0");
+    assert!(
+        world
+            .harness
+            .finish_monitor(&engine, monitor_id, "exit", None, message.clone())
+            .await
+            .unwrap()
+    );
+    let end = submissions_with(&world, CONV, "monitor-end:")
+        .await
+        .remove(0)
+        .id;
+    assert_eq!(world.inbox().await.items.len(), 2);
+
+    world
+        .harness
+        .abort_conversation(&engine, CONV)
+        .await
+        .unwrap();
+    world.harness.wait(&engine, id).await.unwrap();
+    for submission in [event, end] {
+        let settled = world.harness.wait(&engine, submission).await.unwrap();
+        assert!(
+            matches!(input_state(&settled), InputState::Done { .. }),
+            "{settled:?}"
+        );
+    }
+    let texts = user_texts(&world.messages().await);
+    assert!(texts.contains(&message), "{texts:?}");
+    assert!(texts.iter().any(|text| text.contains("line")), "{texts:?}");
+    assert_eq!(world.entries_of("monitor.event").await.len(), 1);
+    assert_eq!(world.entries_of("monitor.end").await.len(), 1);
+    assert!(world.inbox().await.items.is_empty());
+    engine.close().await.unwrap();
+}
+
 // ------------------------------------------------------------ Turso 文件库
 
 /// 派出 → 子 run → 交回，全在 Turso 的提交线上：锚任务 / 子 conversation / 第一条输入同一次提交，
@@ -1389,6 +1557,65 @@ async fn a_dispatched_task_reports_back_once_on_a_turso_database() {
         outline(&world.messages_in(child).await),
         ["system", "user: CHILD on disk", "assistant: stored"]
     );
+    engine.close().await.unwrap();
+}
+
+/// 取消父之后"重启"：排着的任务结果没丢——取消提交里它已经成了后继 run 的输入，重启后那条 run 照常
+/// 接着跑（重放请求），父把结论转告用户；结果不会补交第二次。
+#[tokio::test]
+async fn a_task_result_kept_through_a_cancel_runs_on_after_reopening_a_turso_database() {
+    let dir = tempfile::tempdir().unwrap();
+    let world = World::turso(dir.path());
+    let (_fixture, ..) = install(&world);
+    let stuck = Arc::new(Notify::new());
+    world.script.calls(&[
+        ("c1", "task", spawn_call("CHILD on disk", "落盘")),
+        ("c2", "slow", json!({})),
+    ]);
+    // 后继 run 的请求卡住，"重启"落在它进行中；重启后重放的请求拿下一步。
+    world
+        .script
+        .push(Step::Gate(stuck.clone(), Box::new(Step::Hang)));
+    world.script.reply("told the user");
+    world.script.reply_for("CHILD on disk", "stored");
+    let engine = world.open().await;
+    let id = world.submit(&engine, "go").await;
+    world
+        .until(|| async { !world.inbox().await.items.is_empty() })
+        .await;
+    let queued = world.inbox().await.items[0].id();
+
+    world
+        .harness
+        .abort_conversation(&engine, CONV)
+        .await
+        .unwrap();
+    assert!(matches!(
+        input_state(&world.harness.wait(&engine, id).await.unwrap()),
+        InputState::Unanswered { ref reason, .. } if reason == "aborted"
+    ));
+    // 取消之后：结果是后继 run 的输入（已放置），收件箱空了。
+    assert!(world.inbox().await.items.is_empty());
+    assert!(matches!(
+        input_state(&world.submission(queued).await),
+        InputState::Placed { .. }
+    ));
+    assert!(world.live().await.run.is_some());
+
+    let engine = world.restart(engine).await;
+    world
+        .until(|| async {
+            outline(&world.messages().await).contains(&"assistant: told the user".to_owned())
+        })
+        .await;
+    let delivered = world.harness.wait(&engine, queued).await.unwrap();
+    assert!(matches!(input_state(&delivered), InputState::Done { .. }));
+    assert_eq!(world.entries_of(TASK_RESULT_ENTRY).await.len(), 1);
+    assert_eq!(
+        submissions_with(&world, CONV, "task-result:").await.len(),
+        1
+    );
+    assert!(world.live().await.run.is_none());
     engine.close().await.unwrap();
 }
 

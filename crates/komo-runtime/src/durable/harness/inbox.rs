@@ -22,8 +22,15 @@
 //! | 输入或别的 write，忙或收件箱非空 | `queued` | 往 `komo.inbox` 加一项 |
 //! | boundary 放置 write / 用户项 | `done` / `placed` | 追加 entry，用户项加进当前或后继 run |
 //! | run 回答 | 输入 `done` | 移除 `run`，或交给后继 |
-//! | run 失败 / 它的任务 abort | 输入 `unanswered`（原因） | 移除 `run`，**收件箱不动** |
-//! | 撤回排队项 | `unanswered{aborted}` | 移除这一项 |
+//! | run 失败 / 它的任务 abort | 输入 `unanswered`（原因） | 移除 `run`；收件箱里有**内部输入**时同一次提交放 write 与内部输入、起后继 run，否则不动 |
+//! | `Conversation.abort()` | 排队的用户输入 `unanswered{aborted}` | 从收件箱移除；write 与内部输入留着 |
+//! | 撤回排队项（显式，单条） | `unanswered{aborted}` | 移除这一项（内部输入也行） |
+//!
+//! **内部输入**（`internal: true`）是系统往 conversation 里递的 steer / followUp：后台任务交回的
+//! 结果（`task.result`）、监听的事件与结束消息（`monitor.event` / `monitor.end`）。它们不是用户
+//! 说的话，所以用户取消（`Conversation.abort()`）不撤它们——结果丢了就没人转告用户；run 非正常
+//! 收尾（取消、模型失败、预算、fault、orphan）后也不等下一条用户输入，立刻用它们起后继 run
+//! （[`Boundary`] 的 [`At::Successor`]）。这是对 pi 的有意偏离，见 `docs/storage-durable.md` §13.2。
 //!
 //! boundary 的选择是按 ID 序的确定规则：`postTools` 放全部 write 与 steer，`final` 再加
 //! followUp；每种模式按设置取第一项或全部。先放 write 再放用户项，所以排在 reset 前的用户项
@@ -174,12 +181,17 @@ pub enum InboxItem {
         content: Content,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         entry: Option<InputEntry>,
+        /// 系统递的内部输入（见模块文档）。旧数据没有这个字段，按用户输入读。
+        #[serde(default, skip_serializing_if = "is_false")]
+        internal: bool,
     },
     FollowUp {
         id: SubmissionId,
         content: Content,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         entry: Option<InputEntry>,
+        #[serde(default, skip_serializing_if = "is_false")]
+        internal: bool,
     },
     Write {
         id: SubmissionId,
@@ -187,7 +199,19 @@ pub enum InboxItem {
     },
 }
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 impl InboxItem {
+    /// 是不是系统递的内部输入（write 不算：它不是输入）。
+    pub fn is_internal(&self) -> bool {
+        matches!(
+            self,
+            InboxItem::Steer { internal: true, .. } | InboxItem::FollowUp { internal: true, .. }
+        )
+    }
+
     pub fn id(&self) -> SubmissionId {
         match self {
             InboxItem::Steer { id, .. }
@@ -257,6 +281,9 @@ pub enum SubmissionDraft {
         entry: Option<InputEntry>,
         when_busy: WhenBusy,
         request_id: Option<String>,
+        /// 内部输入：由调用方（后台任务交回、监听消息）声明，不靠 entry kind 猜。排队后
+        /// `Conversation.abort()` 不撤它，run 非正常收尾后用它起后继 run（见模块文档）。
+        internal: bool,
     },
     Write {
         entry: WriteDraft,
@@ -271,6 +298,7 @@ impl SubmissionDraft {
             entry: None,
             when_busy: WhenBusy::FollowUp,
             request_id: None,
+            internal: false,
         }
     }
 
@@ -284,6 +312,14 @@ impl SubmissionDraft {
     pub fn steer(mut self) -> Self {
         if let SubmissionDraft::Input { when_busy, .. } = &mut self {
             *when_busy = WhenBusy::Steer;
+        }
+        self
+    }
+
+    /// 标成内部输入（只对输入有意义）。
+    pub fn internal(mut self) -> Self {
+        if let SubmissionDraft::Input { internal, .. } = &mut self {
+            *internal = true;
         }
         self
     }
@@ -354,6 +390,11 @@ pub struct QueueModes {
 pub enum At {
     PostTools,
     Final,
+    /// run 非正常收尾（取消、失败、预算、fault、orphan）后的放置：全部 write，加**内部输入**
+    /// （steer 与 followUp 都算，各按设置取第一项或全部）；用户输入不放——取消时已撤，失败后
+    /// 照 pi 留在收件箱等下一条输入。调用方先确认有内部输入（[`Boundary::has_internal`]），
+    /// 没有就不该调——那时 write 也照 pi 留着。
+    Successor,
 }
 
 /// boundary 在第一次表写之前读的东西，与它见到的最新 head。
@@ -370,6 +411,13 @@ pub struct Boundary {
 pub struct BoundaryResult {
     pub users: Vec<SubmissionId>,
     pub reset: bool,
+}
+
+impl Boundary {
+    /// 收件箱里有没有内部输入：run 非正常收尾时只有它才值得起后继 run。
+    pub fn has_internal(&self) -> bool {
+        self.inbox.items.iter().any(InboxItem::is_internal)
+    }
 }
 
 /// 表读必须先于本次提交的第一次表写，所以调用方在闭包开头准备 boundary。
@@ -411,7 +459,9 @@ pub async fn apply_boundary(
     let conversation = boundary.conversation;
     let items = std::mem::take(&mut boundary.inbox.items);
     let reset = queued_reset(&items);
-    let final_boundary = at == At::Final || reset;
+    let final_boundary = at != At::PostTools || reset;
+    // 后继放置只认内部输入。
+    let internal_only = at == At::Successor;
 
     let pick = |wanted: fn(&InboxItem) -> bool, mode: QueueMode| -> Vec<usize> {
         let indexes: Vec<usize> = items
@@ -432,12 +482,20 @@ pub async fn apply_boundary(
         .map(|(index, _)| index)
         .collect();
     let mut users = pick(
-        |item| matches!(item, InboxItem::Steer { .. }),
+        if internal_only {
+            |item| matches!(item, InboxItem::Steer { internal: true, .. })
+        } else {
+            |item| matches!(item, InboxItem::Steer { .. })
+        },
         boundary.modes.steering,
     );
     if final_boundary {
         users.extend(pick(
-            |item| matches!(item, InboxItem::FollowUp { .. }),
+            if internal_only {
+                |item| matches!(item, InboxItem::FollowUp { internal: true, .. })
+            } else {
+                |item| matches!(item, InboxItem::FollowUp { .. })
+            },
             boundary.modes.follow_up,
         ));
     }
@@ -473,8 +531,12 @@ pub async fn apply_boundary(
     let mut placed = Vec::new();
     for &index in &users {
         let (id, content, entry) = match &items[index] {
-            InboxItem::Steer { id, content, entry }
-            | InboxItem::FollowUp { id, content, entry } => (*id, content, entry.as_ref()),
+            InboxItem::Steer {
+                id, content, entry, ..
+            }
+            | InboxItem::FollowUp {
+                id, content, entry, ..
+            } => (*id, content, entry.as_ref()),
             InboxItem::Write { .. } => continue,
         };
         let record = tx
@@ -727,17 +789,20 @@ pub async fn admit(
                 content,
                 entry,
                 when_busy,
+                internal,
                 ..
             } => match when_busy {
                 WhenBusy::Steer => InboxItem::Steer {
                     id: submission.id,
                     content: content.clone(),
                     entry: entry.clone(),
+                    internal: *internal,
                 },
                 _ => InboxItem::FollowUp {
                     id: submission.id,
                     content: content.clone(),
                     entry: entry.clone(),
+                    internal: *internal,
                 },
             },
         };
@@ -877,8 +942,10 @@ pub async fn withdraw(
     }
 }
 
-/// `Conversation.abort()` 的一半：撤回排队的 steer / followUp（`unanswered{aborted}`），
-/// 排队的 write 留着等之后放置。
+/// `Conversation.abort()` 的一半：撤回排队的**用户** steer / followUp（`unanswered{aborted}`），
+/// 排队的 write 与内部输入留着——内部输入是后台任务的结果、监听消息，丢了没人转告用户；它们在
+/// run 的 abort handler 里随后继 run 放置（[`At::Successor`]）。显式 [`withdraw`] 单条撤回对内部
+/// 输入仍然有效。
 pub async fn withdraw_queued_inputs(
     tx: &mut Tx,
     conversation: ConversationId,
@@ -886,7 +953,7 @@ pub async fn withdraw_queued_inputs(
     let mut inbox = load(tx, conversation).await?;
     let mut kept = Vec::new();
     for item in std::mem::take(&mut inbox.items) {
-        if matches!(item, InboxItem::Write { .. }) {
+        if matches!(item, InboxItem::Write { .. }) || item.is_internal() {
             kept.push(item);
             continue;
         }

@@ -342,6 +342,8 @@ async fn follow(cx: &Cx<'_>, raw: &str, request: Request) -> Result<(), TaskErro
                     entry: None,
                     when_busy,
                     request_id: Some(format!("task:{}", task.id())),
+                    // 父的模型递给子任务的追问，不是系统往父递的结果。
+                    internal: false,
                 };
                 let Admitted::Id(id) = inbox::admit(tx, &generation, child, &draft, modes).await?
                 else {

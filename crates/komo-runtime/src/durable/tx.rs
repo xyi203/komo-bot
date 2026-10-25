@@ -529,13 +529,22 @@ impl Tx {
         self.submissions.insert(record.id, record);
     }
 
-    /// `at_or_before`（含）以内对 conversation 可见的最新一条带 `head` 的 entry。
+    /// 对 conversation 可见的最新一条带 `head` 的 entry。
+    ///
+    /// head 标记只来自 entry，可见范围只随 conversation 的 fork 关系变。所以这次提交暂存的写入里
+    /// 既没有带 `head` 的 entry、也没有新建的 conversation 时，已提交的读依然精确，表写之后也能
+    /// 读——调度器写的 faulted / orphaned 收尾要在任务记录写下之后放置收件箱
+    /// （`harness::generation::settle_scheduler_outcome`）。否则照常守表读先于表写的规则。
     pub async fn latest_head_marker(
         &mut self,
         conversation: ConversationId,
     ) -> Result<Option<EntryRecord>, DurableError> {
-        self.read_guard_for("latest_head_marker", conversation)
-            .await?;
+        let head_unchanged =
+            self.conversations.is_empty() && self.entries.iter().all(|entry| entry.head.is_none());
+        if !head_unchanged {
+            self.read_guard_for("latest_head_marker", conversation)
+                .await?;
+        }
         Ok(self
             .storage
             .find_latest_head_marker(conversation, None)

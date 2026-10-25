@@ -95,7 +95,7 @@ impl Engine {
         self.sched.wait_for_idle(conversation).await
     }
 
-    /// `Conversation.abort()`；`background` 时穿过后台边界并等被标记的任务终结。
+    /// `Conversation.abort()`：等被标记的任务终结（不等取消之后起的后继 run）；`background` 时穿过后台边界。
     pub async fn abort_conversation(
         &self,
         conversation: ConversationId,

@@ -66,7 +66,7 @@
 //!
 //! - `Seq` 在一个 Session 内严格递增：记录按 ID 序，同一记录的帧 `k` 递增（见 [`legacy_ids`]）。
 //! - `event_id` = `evt-{seq}`，`ts` 取记录里第一条消息的毫秒时间戳，没有的沿用前一条记录的
-//!   （第一条之前是 0）。
+//!   （第一条之前是 0）；`RunAccepted` / `RunQueued` 取 submission 的 `created_at`（提交时刻，没有才沿用）。
 //! - 工具调用的 `call_id` 与 `provider_call_id` 都是消息里的 `toolCallId`；`ToolResult` 的输出引用取
 //!   工具结果 entry 的 `data.output`，没有就合成一个占位路径。
 //! - `AssistantDelta`、`RunStatus` 不在这里：前者来自 `komo.live` 文档，后者由 hub 照旧派生。
@@ -214,7 +214,12 @@ impl Projection {
             .request_id
             .clone()
             .unwrap_or_else(|| format!("submission-{}", record.id));
-        let accepted = Frame::at(self, record.id.raw(), self.last_ms);
+        // 提交时刻；没有（旧记录、`queued_input` 直接构造的）就沿用前一条记录的时间。
+        let accepted = Frame::at(
+            self,
+            record.id.raw(),
+            record.created_at.unwrap_or(self.last_ms),
+        );
         let first = accepted.emit(
             out,
             0,

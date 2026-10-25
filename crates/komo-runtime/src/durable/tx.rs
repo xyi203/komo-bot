@@ -619,6 +619,7 @@ impl Tx {
             id,
             conversation,
             request_id: request_id.map(str::to_owned),
+            created_at: Some(self.now),
             kind,
         };
         self.submissions.insert(id, record.clone());

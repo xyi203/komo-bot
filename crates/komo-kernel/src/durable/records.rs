@@ -382,6 +382,10 @@ pub struct SubmissionRecord {
     pub conversation: ConversationId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_id: Option<String>,
+    /// 提交时刻（Unix 毫秒，提交线上的时钟）。只在 JSON 里加的字段：旧记录没有，调用方用到它的
+    /// 地方（`legacy_events` 的 `run.accepted` / `run.queued` 时间）退回前一条记录的时间。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<i64>,
     #[serde(flatten)]
     pub kind: SubmissionKind,
 }
@@ -420,6 +424,7 @@ impl SubmissionRecord {
             id,
             conversation,
             request_id: request_id.map(str::to_owned),
+            created_at: None,
             kind: SubmissionKind::Input {
                 state: InputState::Queued,
             },
@@ -435,6 +440,7 @@ impl SubmissionRecord {
             id,
             conversation,
             request_id: request_id.map(str::to_owned),
+            created_at: None,
             kind: SubmissionKind::Write {
                 state: WriteState::Queued,
             },
@@ -608,6 +614,7 @@ mod tests {
             id: SubmissionId::new(5),
             conversation: ConversationId::new(1),
             request_id: Some("r".into()),
+            created_at: None,
             kind: SubmissionKind::Input {
                 state: InputState::Placed {
                     entry: EntryId::new(4),

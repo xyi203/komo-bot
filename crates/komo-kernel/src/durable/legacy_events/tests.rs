@@ -71,6 +71,7 @@ fn input_sub(id: u64, state: InputState) -> SubmissionRecord {
         id: sid(id),
         conversation: cid(1),
         request_id: Some(format!("req-{id}")),
+        created_at: None,
         kind: SubmissionKind::Input { state },
     }
 }
@@ -201,6 +202,41 @@ fn legacy_events_backfill_equals_live_projection() {
     let live = live(&scenario);
     assert_eq!(live, backfill);
     assert!(!backfill.is_empty());
+}
+
+/// `run.accepted` / `run.queued` 的时间是 submission 的提交时刻（第一条之前没有别的记录可沿用，
+/// 以前是 1970）；补读与直播逐帧一致。
+#[test]
+fn run_accepted_and_queued_carry_the_submission_time() {
+    let mut first = input_sub(1, placed(2));
+    first.created_at = Some(1_700_000_000_123);
+    let entries = vec![user(2, "q1")];
+    let backfill = legacy_events(SESSION, &entries, std::slice::from_ref(&first));
+    let millis = |event: &Event| (event.ts.unix_timestamp_nanos() / 1_000_000) as i64;
+    let stamped: Vec<(&str, i64)> = backfill
+        .iter()
+        .map(|event| (event.type_name(), millis(event)))
+        .collect();
+    assert_eq!(
+        stamped,
+        [
+            ("run.accepted", 1_700_000_000_123),
+            ("run.queued", 1_700_000_000_123),
+            // 输入 entry 上那条用户消息的时间戳照旧。
+            ("run.started", 2_000),
+            ("message.user", 2_000),
+        ]
+    );
+
+    // 直播：先喂排队的 submission（还没有输入 entry），再喂放置。
+    let mut queued = first.clone();
+    queued.kind = SubmissionKind::Input {
+        state: InputState::Queued,
+    };
+    let mut projection = Projection::new(SESSION);
+    let mut live = projection.project(&[Record::Submission(&queued)]);
+    live.extend(projection.project(&[Record::Submission(&first), Record::Entry(&entries[0])]));
+    assert_eq!(live, backfill);
 }
 
 #[test]

@@ -281,10 +281,22 @@ pub async fn start(options: ServiceOptions) -> Result<Running, ServiceError> {
     let _ = state
         .inbound
         .set(Arc::clone(&dispatcher) as Arc<dyn Inbound>);
+    let shutdown = Shutdown::new();
     if let Some(core) = &durable {
         // Durable：把 `GatewayState` 交给钩子，然后才开始调度。旧的 `task` / `monitor` 接缝
         // 不接（编排走 harness；W2c 起监听由 `MonitorRunner` 接）。
         durable::assemble::wire(&state_slot, &state, &detach_slot);
+        // 重启时的订阅顺序（W4a）：**订阅与看客都在引擎恢复之前就位**，恢复里结算的 run（崩溃时在飞的）
+        // 产生的终态帧才不会落在没人听的空档里。顺序有讲究：
+        //   1. feed——提交 → SSE 帧（看客读的就是它推进 hub 的帧）；
+        //   2. faulted 任务的提醒订阅（回放放后台任务里做）；
+        //   3. blob 引用检查——恢复一开始 `execute` 阶段的任务会把读不到的输出当成"没有结果"重判，
+        //      所以要先让这些任务 `faulted`；
+        //   4. 看客与未结算输入的小任务（`wait_submission` 内部会 `resume`，所以排在 3 之后）。
+        durable::feed::spawn(core, &state.hub, &shutdown).await;
+        durable::interventions::spawn_attention(&state, &shutdown);
+        durable::lifecycle::boot(&state).await;
+        durable::watch::reattach(&state).await;
         core.resume();
     } else {
         // `task` 的接缝：`GatewayTaskSpawner` 自己要一份 `Arc<GatewayState>`
@@ -330,8 +342,6 @@ pub async fn start(options: ServiceOptions) -> Result<Running, ServiceError> {
         },
     )?;
 
-    let shutdown = Shutdown::new();
-
     // 7–8. 启动对账、审计补写、记忆队列复位、重挂看客、遗留监听：Legacy 的恢复链。
     //      Durable 一步不做——恢复由引擎开库时的 reconciliation 与 W4a 的启动补做负责。
     if durable_mode {
@@ -342,18 +352,14 @@ pub async fn start(options: ServiceOptions) -> Result<Running, ServiceError> {
         if let Err(error) = state.requeue_memory_work().await {
             tracing::warn!(%error, "记忆处理队列的复位没做成");
         }
-        // W4a：做完停在 `closing` 的删除；W3a：重挂看客。
     } else {
         legacy_recovery(&state, &home).await;
     }
 
     // 9. 后台任务：调度器、Cron、配置轮询、SIGHUP（Durable：只有配置轮询与 SIGHUP，其余各包再加）。
     if durable_mode {
+        // feed 与看客已在 `core.resume()` 之前起好（上面），这里只起 resume 之后的后台循环。
         durable::background::spawn(&state, &shutdown);
-        // 提交订阅 → 旧事件词汇 → `EventHub`（SSE 与渠道看客都从这里读）。返回时订阅已生效。
-        if let Some(core) = state.durable.as_ref() {
-            durable::feed::spawn(core, &state.hub, &shutdown).await;
-        }
     } else {
         spawn_background(&state, &shutdown);
     }

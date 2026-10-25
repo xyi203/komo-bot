@@ -215,6 +215,25 @@ impl Dispatcher {
     ) -> Result<InboundAck, GatewayError> {
         // 先看这一条的结论拼对了没有：`InterventionVerdict::parse` 认几个手滑得不算离谱
         // 的拼法，认不出来的到不了这里。
+        // Durable（W4a）：只有 faulted 任务（`Blocked`），只答 `abandon`；别的结论列出能答的。
+        if self.state.durable.is_some() {
+            return match self
+                .state
+                .answer_intervention(handle, verdict, Some(by))
+                .await
+            {
+                Ok(response) => Ok(InboundAck::Replied {
+                    text: response.note,
+                }),
+                Err(GatewayError::InvalidRequest(message)) => Ok(InboundAck::Replied {
+                    text: format!("`{handle}`：{message}。"),
+                }),
+                Err(GatewayError::NotFound { .. }) => Ok(InboundAck::Replied {
+                    text: format!("没有待处理的 `{handle}`（`/pending` 看现在有哪些）。"),
+                }),
+                Err(error) => Err(error),
+            };
+        }
         let detail = self.state.intervention(handle).await?;
         if let Some(detail) = detail {
             let kind = match &detail {

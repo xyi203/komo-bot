@@ -83,6 +83,15 @@ impl Engine {
         self.sched.abort(id, false).await
     }
 
+    /// 给没有 invocation 在跑的活任务写 `faulted`（见 `Sched::fault_idle`）。
+    pub async fn fault_idle_task(
+        &self,
+        id: TaskId,
+        message: impl Into<String>,
+    ) -> Result<bool, DurableError> {
+        self.sched.fault_idle(id, message.into()).await
+    }
+
     pub async fn wait_for_task(&self, id: TaskId) -> Result<TaskRecord, DurableError> {
         self.sched.wait_for_task(id).await
     }

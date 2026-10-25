@@ -307,3 +307,33 @@ async fn aborting_an_unknown_task_is_an_error() {
     ));
     engine.close().await.unwrap();
 }
+
+/// 外部（gateway 的 reconcile）给一个没有 invocation 在跑的任务写 `faulted`；在跑的不替它判。
+#[tokio::test(start_paused = true)]
+async fn fault_idle_task_faults_only_a_task_nobody_is_running() {
+    let env = Env::new();
+    let log = Log::default();
+    let sleepy = sleepy(&env, &log);
+    env.install(&sleepy);
+    // 调度暂停：任务建出来了，没有 invocation。
+    let engine = env.open().await;
+    let idle = spawn(&engine, &sleepy, json!({})).await;
+    assert!(engine.fault_idle_task(idle, "blob 读不到").await.unwrap());
+    let task = settle(&engine, idle).await;
+    assert_eq!(status(outcome_of(&task)), "faulted");
+    assert_eq!(faulted_message(&task), "blob 读不到");
+    assert!(
+        !engine.fault_idle_task(idle, "again").await.unwrap(),
+        "已经 terminal"
+    );
+
+    // 调度开始后，在跑的任务自己说了算。
+    let live = spawn(&engine, &sleepy, json!({})).await;
+    engine.resume();
+    running(&engine, live).await;
+    assert!(!engine.fault_idle_task(live, "no").await.unwrap());
+    assert_eq!(engine.abort_task(live).await.unwrap(), AbortOutcome::Marked);
+    let task = settle(&engine, live).await;
+    assert_eq!(status(outcome_of(&task)), "aborted");
+    engine.close().await.unwrap();
+}

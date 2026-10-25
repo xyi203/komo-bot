@@ -65,7 +65,7 @@ pub enum Source {
 }
 
 /// 一条 entry 的来源。
-fn source_of_entry(entry: &EntryRecord) -> Source {
+pub(super) fn source_of_entry(entry: &EntryRecord) -> Source {
     if entry.kind == CHAT_INPUT {
         return entry
             .data
@@ -379,8 +379,8 @@ async fn is_absorbed(core: &DurableCore, record: &SubmissionRecord) -> bool {
     }
 }
 
-/// 启动时重挂看客（`background::spawn` 调）：每个非任务的会话一个看客；每个未结算的输入
-/// submission 一个"等它结算再收尾"的小任务。
+/// 启动时重挂看客（`service::start` 调，**在 `core.resume()` 之前、feed 订阅之后**）：每个非任务的
+/// 会话一个看客；每个未结算的输入 submission 一个"等它结算再收尾"的小任务。
 pub async fn reattach(state: &Arc<GatewayState>) {
     let Ok(core) = state.core() else { return };
     let core = Arc::clone(core);
@@ -460,10 +460,36 @@ pub async fn reattach(state: &Arc<GatewayState>) {
             }
         });
     }
-    // 最近结算的那些再收尾一遍：终态帧在 Gateway 起来之前、或者 feed 订阅生效之前就发出去了，
-    // 上面的看客与小任务都看不见它们。投递按逻辑键幂等（`deliver_once`），已经投过的原样返回，
-    // 没投过的补上。**必须在上面两步之后做**：先挂上看客与小任务、再扫已结算的，一条 run 在两次
-    // 扫描之间结算也不会落空。
+    if reattached > 0 {
+        tracing::info!(reattached, "重启后补挂了未结算输入的看客");
+    }
+}
+
+/// 启动时把**最近结算**的输入收尾一遍（`background::spawn` 调，引擎恢复之后）。
+///
+/// # 为什么还要它，以及为什么还是"最近 N 条"
+///
+/// W3a 的第一版靠它兜两种丢帧：feed 订阅之前落下的终态帧、和引擎恢复到 feed 订阅之间产生的。W4a
+/// 把 feed 订阅与 [`reattach`] 都提到 `core.resume()` 之前，这两种不再存在——崩溃时在飞的 run 在
+/// 恢复里结算时，feed 与看客都已就位。剩下的只有一种窗口：**结算提交已经落盘、投递记录还没写**就崩了
+/// （上一代进程里 feed → hub → 看客 → `deliver_once` 的那几毫秒）。
+///
+/// 要把这个窗口判准，得知道"哪些结算过的输入还没有投递记录"：`deliveries` 在 `aux.db`、没有按逻辑键
+/// 的查询（`record_once` 是 O(该 peer 的行) 的扫描），结算时刻也不在 submission 上；要精确就得加
+/// 一个投递索引或结算水位线，动 aux 表或 runtime，超出 W4a。所以**决定保留"最近 N 条"**：投递紧跟在
+/// 结算后面，丢的只可能是崩溃前最后几条；`deliver_once` 幂等，扫多了只是多几次查找。N 仍取
+/// [`REPLAY_RECENT`]（每种结局各取）。D7 之后若 aux 表合进 `durable.db`，可以改成"结算与投递记录同提交"，
+/// 这个窗口就不存在了（设计里推迟的"同库同提交"，决定 4）。
+pub async fn replay_recent(state: &Arc<GatewayState>) {
+    let Ok(core) = state.core() else { return };
+    let core = Arc::clone(core);
+    let sessions = match core.list_sessions(false).await {
+        Ok(sessions) => sessions,
+        Err(error) => {
+            tracing::warn!(%error, "读不出会话列表，重启后的补投没做成");
+            return;
+        }
+    };
     for status in [SubmissionStatus::Done, SubmissionStatus::Unanswered] {
         let query = SubmissionQuery {
             conversation: None,
@@ -497,8 +523,5 @@ pub async fn reattach(state: &Arc<GatewayState>) {
                 finish(state, &session, &legacy_ids::run_id(record.id), outcome).await;
             }
         }
-    }
-    if reattached > 0 {
-        tracing::info!(reattached, "重启后补挂了未结算输入的看客");
     }
 }

@@ -140,7 +140,7 @@ async fn load_log(
 }
 
 /// 一个 Session 的全部 conversation（按 ID 升序）。
-async fn session_conversations(
+pub(super) async fn session_conversations(
     storage: &dyn Storage,
     session: &str,
 ) -> Result<Vec<ConversationRecord>, SessionError> {

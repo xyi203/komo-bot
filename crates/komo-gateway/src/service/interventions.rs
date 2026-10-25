@@ -50,6 +50,13 @@ impl GatewayState {
         &self,
         query: &InterventionListQuery,
     ) -> Result<Vec<InterventionSummary>, GatewayError> {
+        // Durable（W4a）：清单是 faulted 任务。
+        if let Some(core) = &self.durable {
+            return core
+                .interventions(query)
+                .await
+                .map_err(|error| GatewayError::Internal(error.to_string()));
+        }
         Ok(komo_store::repos::interventions::list(&self.db, query).await?)
     }
 
@@ -58,6 +65,12 @@ impl GatewayState {
         &self,
         handle: &str,
     ) -> Result<Option<InterventionDetail>, GatewayError> {
+        if let Some(core) = &self.durable {
+            return core
+                .intervention(handle)
+                .await
+                .map_err(|error| GatewayError::Internal(error.to_string()));
+        }
         Ok(komo_store::repos::interventions::find(&self.db, handle).await?)
     }
 
@@ -72,6 +85,10 @@ impl GatewayState {
         verdict: InterventionVerdict,
         by: Option<PeerId>,
     ) -> Result<InterventionAnswerResponse, GatewayError> {
+        if let Some(core) = &self.durable {
+            let _ = by;
+            return core.answer_intervention(handle, verdict).await;
+        }
         let Some(found) = self.intervention(handle).await? else {
             return self.answer_settled(handle, verdict).await;
         };

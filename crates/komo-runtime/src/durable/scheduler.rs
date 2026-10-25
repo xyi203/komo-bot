@@ -1388,6 +1388,46 @@ impl Sched {
         Ok(result)
     }
 
+    /// 给一个**此刻没有 invocation 在跑**的活任务写 `faulted`（gateway 的 reconcile 发现它引用的 blob
+    /// 读不到时用，D5 W4a）。返回写了没有：已经 terminal、或有 invocation 在跑（它自己会走完或失败，
+    /// 外面不该替它判）都是 `false`。同 `abort` 的"没有 invocation"那一支，经 `terminate` 写结局，所以
+    /// 名下有活工作时先 `completing`、Harness 清理（槽位、run 收尾）照常发生。
+    pub async fn fault_idle(
+        self: &Arc<Self>,
+        id: TaskId,
+        message: String,
+    ) -> Result<bool, DurableError> {
+        let sched = self.clone();
+        self.line
+            .commit(None, move |tx| {
+                Box::pin(async move {
+                    let Some(current) = tx.task(id).await? else {
+                        return Err(DurableError::NoSuchTask(id));
+                    };
+                    if matches!(current.state, TaskState::Terminal { .. })
+                        || sched.st().invocations.contains_key(&id)
+                    {
+                        return Ok(false);
+                    }
+                    sched.load_scopes().await?;
+                    sched
+                        .terminate(
+                            tx,
+                            &current,
+                            TaskOutcome::Faulted {
+                                error: TaskOutcomeError {
+                                    message,
+                                    detail: None,
+                                },
+                            },
+                        )
+                        .await?;
+                    Ok(true)
+                })
+            })
+            .await
+    }
+
     pub async fn wait_for_task(self: &Arc<Self>, id: TaskId) -> Result<TaskRecord, DurableError> {
         #[allow(clippy::large_enum_variant)]
         enum Found {

@@ -1,7 +1,7 @@
 //! Durable 模式的 `/v1/sessions`（`docs/storage-durable-d5.md` §4 W2a）：create / list / detail /
 //! submit / boundary / resume，加 `/v1/home-session`。
 //!
-//! delete / purge 与 `/v1/reconcile` 是 W4a 的（生命周期）；事件流是 W2b 的。
+//! delete / purge（W4a，`service::durable::lifecycle`）；`/v1/reconcile` 在 `interventions`；事件流是 W2b 的。
 //!
 //! 状态码映射在 `http::error`（`SessionError`）：`NotFound` 404、`Invalid` 400、`NotOpen` /
 //! `Busy` / `Conflict` 409（`NotOpen` 说清是哪种状态）、请求键冲突 409、`Internal` 500。
@@ -11,11 +11,14 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use komo_kernel::durable::legacy_ids;
 use komo_kernel::protocol::http::{
-    BoundaryRequest, BoundaryResponse, CreateSessionRequest, ResumeRequest, ResumeResponse,
-    SessionDetail, SessionListResponse, SessionSummary, SubmitRunRequest, SubmitRunResponse,
+    BoundaryRequest, BoundaryResponse, CreateSessionRequest, DeleteSessionRequest, PurgeBlocked,
+    PurgeSessionRequest, PurgeSessionResponse, ResumeRequest, ResumeResponse, SessionDetail,
+    SessionLifecycleResponse, SessionListResponse, SessionSummary, SubmitRunRequest,
+    SubmitRunResponse,
 };
 use komo_kernel::types::ids::SessionId;
 use komo_kernel::types::model::Effort;
+use komo_kernel::types::status::SessionState;
 use komo_runtime::durable::harness::WhenBusy;
 
 use crate::http::Api;
@@ -23,6 +26,7 @@ use crate::http::error::{ApiFailure, ApiResult};
 use crate::http::idempotency::body_hash;
 use crate::service::durable::DurableCore;
 use crate::service::durable::hooks;
+use crate::service::durable::lifecycle;
 use crate::service::durable::sessions::NewSession;
 use crate::service::durable::shell;
 use crate::service::durable::submit::{Accepted, InputRequest, ModelOverride};
@@ -35,6 +39,8 @@ pub fn routes() -> Router<Api> {
         .route("/v1/sessions/{id}/runs", post(submit))
         .route("/v1/sessions/{id}/resume", post(resume))
         .route("/v1/sessions/{id}/boundary", post(boundary))
+        .route("/v1/sessions/{id}/delete", post(delete))
+        .route("/v1/sessions/{id}/purge", post(purge))
 }
 
 /// query 里那个开关开着吗。`?all`、`?all=1`、`?all=true`、`?all=yes` 都算开（同 Legacy：
@@ -116,8 +122,7 @@ async fn detail(State(api): State<Api>, Path(id): Path<String>) -> ApiResult<Jso
     Ok(Json(SessionDetail {
         summary,
         unfinished,
-        // W4a：faulted 任务 → `Blocked`。
-        pending: Vec::new(),
+        pending: core.pending_of(&id).await?,
     }))
 }
 
@@ -219,7 +224,7 @@ async fn submit(
 }
 
 /// `POST /v1/sessions/{id}/resume`：现在到哪了。D5 里 run 的续跑由引擎自己做（启动与每拍的恢复），
-/// 这里只返回还没结束的 run（并叫醒调度），待处理的 Intervention W4a 接上。
+/// 这里只返回还没结束的 run（并叫醒调度）与待处理的 Intervention（faulted 任务）。
 async fn resume(
     State(api): State<Api>,
     Path(id): Path<String>,
@@ -230,11 +235,11 @@ async fn resume(
     let core = api.state.core()?;
     let resumed = core.unfinished_runs(&id).await?;
     core.engine.resume();
+    let pending = core.pending_of(&id).await?;
     Ok(Json(ResumeResponse {
         session: SessionId::from_raw(id),
         resumed,
-        // W4a：faulted 任务 → `Blocked`。
-        pending: Vec::new(),
+        pending,
     }))
 }
 
@@ -251,4 +256,66 @@ async fn boundary(
         session: SessionId::from_raw(id),
         seq: legacy_ids::seq(submission, 0),
     }))
+}
+
+/// `POST /v1/sessions/{id}/delete`（§8.10）：`closing` → 撤回排队输入（含内部输入）→（`now`）abort →
+/// `deleted`。已经 `deleted` / `purged` 的再删是幂等的。
+async fn delete(
+    State(api): State<Api>,
+    Path(id): Path<String>,
+    body: Option<Json<DeleteSessionRequest>>,
+) -> ApiResult<Json<SessionLifecycleResponse>> {
+    let request = body.map(|Json(request)| request).unwrap_or_default();
+    let hash = body_hash(&request);
+    if let Some(previous) = api
+        .idempotency
+        .lookup::<SessionLifecycleResponse>(request.request_key.as_ref(), &hash)?
+    {
+        return Ok(Json(previous));
+    }
+    let core = api.state.core()?;
+    let outcome = core.delete_session(&id, request.now).await?;
+    let response = SessionLifecycleResponse {
+        session: SessionId::from_raw(id),
+        state: crate::service::durable::sessions::state_of(outcome.lifecycle),
+        changed_at: crate::service::durable::sessions::time_of(outcome.changed_at),
+        cancelled: outcome.cancelled,
+    };
+    api.idempotency
+        .remember(request.request_key.as_ref(), &hash, &response);
+    Ok(Json(response))
+}
+
+/// `POST /v1/sessions/{id}/purge`（§8.10 第 3 条）：要求已 `deleted`；有没做完的工作（或记忆证据、
+/// 未送出的投递、cron 触发）就 409 并列出；否则一次提交 `PurgeConversations` + 墓碑，之后删目录。幂等。
+async fn purge(
+    State(api): State<Api>,
+    Path(id): Path<String>,
+    body: Option<Json<PurgeSessionRequest>>,
+) -> ApiResult<Json<PurgeSessionResponse>> {
+    let request = body.map(|Json(request)| request).unwrap_or_default();
+    let hash = body_hash(&request);
+    if let Some(previous) = api
+        .idempotency
+        .lookup::<PurgeSessionResponse>(request.request_key.as_ref(), &hash)?
+    {
+        return Ok(Json(previous));
+    }
+    let session = SessionId::from_raw(id.clone());
+    match lifecycle::purge(&api.state, &id).await? {
+        Ok(purged) => {
+            let response = PurgeSessionResponse {
+                session,
+                state: SessionState::Purged,
+                removed_bytes: purged.removed_bytes,
+            };
+            api.idempotency
+                .remember(request.request_key.as_ref(), &hash, &response);
+            Ok(Json(response))
+        }
+        Err(blockers) => Err(ApiFailure::purge_blocked(PurgeBlocked {
+            session,
+            blockers,
+        })),
+    }
 }

@@ -356,6 +356,16 @@ impl DurableCore {
         record: &SessionRecord,
     ) -> Result<SessionSummary, SessionError> {
         use komo_runtime::durable::harness::Harness;
+        if record.lifecycle == SessionLifecycle::Purged {
+            // 墓碑：conversation 行已经 purge 了（W4a），没有 run、没有 entry，只剩"它曾经存在"。
+            return Ok(self.build_summary(
+                record,
+                None,
+                None,
+                None,
+                komo_kernel::types::ids::Seq::ZERO,
+            ));
+        }
         let live = Harness::live(&*self.storage, record.current_branch).await?;
         let (current_run, current_state, current_wait) = match &live.run {
             Some(run) => {
@@ -379,8 +389,25 @@ impl DurableCore {
             Some(entry) => legacy_ids::seq(entry, 0),
             None => komo_kernel::types::ids::Seq::ZERO,
         };
+        Ok(self.build_summary(
+            record,
+            current_run,
+            current_state,
+            current_wait,
+            applied_seq,
+        ))
+    }
+
+    fn build_summary(
+        &self,
+        record: &SessionRecord,
+        current_run: Option<SubmissionId>,
+        current_state: Option<RunState>,
+        current_wait: Option<komo_kernel::types::status::WaitReason>,
+        applied_seq: komo_kernel::types::ids::Seq,
+    ) -> SessionSummary {
         let created = time_of(record.created_at);
-        Ok(SessionSummary {
+        SessionSummary {
             session: SessionId::from_raw(record.id.clone()),
             title: record.title.clone().unwrap_or_default(),
             state: state_of(record.lifecycle),
@@ -399,7 +426,7 @@ impl DurableCore {
             home: (record.kind == SessionKind::Task)
                 .then(|| record.parent_session.clone().map(SessionId::from_raw))
                 .flatten(),
-        })
+        }
     }
 
     /// 一个 conversation 沿 fork 祖先拼出来的可见历史里最新的那条 entry。

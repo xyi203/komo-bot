@@ -5,7 +5,10 @@
 //!
 //! - W2c：启动时对账监听（上一代遗留的进程核对 + `Harness::reconcile_monitors`），已在这里；
 //! - W2b：`feed::spawn`（提交订阅 → SSE），由主控合并时补一行；
-//! - W3b：cron tick；W3c：`MEMORY_TICK`；W4a：启动时做完停在 `closing` 的删除。
+//! - W3b：cron tick；W3c：`MEMORY_TICK`；W4a：做完停在 `closing` 的删除（`lifecycle::spawn`）。
+//!
+//! **次序**（W4a）：`feed::spawn`、`interventions::spawn_attention`、`lifecycle::boot`、`watch::reattach`
+//! 都在 `service::start` 里排在 `core.resume()` **之前**；本文件的 `spawn` 在 resume 之后。
 
 use std::sync::Arc;
 
@@ -28,11 +31,14 @@ pub fn spawn(state: &Arc<GatewayState>, shutdown: &Shutdown) {
         let state = Arc::clone(state);
         tokio::spawn(async move { reconcile_monitors(&state).await });
     }
-    // W3a：重挂看客（每个非任务会话一个，未结算的输入等结算后收尾）。
+    // W3a / W4a：看客与未结算输入的小任务已在 `core.resume()` 之前挂好（`watch::reattach`）；
+    // 这里只补"已结算、投递前崩溃"的那一窗（`watch::replay_recent`，判据的评估见它的文档）。
     {
         let state = Arc::clone(state);
-        tokio::spawn(async move { super::watch::reattach(&state).await });
+        tokio::spawn(async move { super::watch::replay_recent(&state).await });
     }
+    // W4a：把停在 `closing` 的删除做完（启动一次，之后每几秒）。
+    super::lifecycle::spawn(state, shutdown);
     // W3b：cron——启动补做上一代没做完的触发，再一分钟一扫。
     super::cron::spawn(state, shutdown);
     // W3c：记忆的后台领取（`MEMORY_TICK`）。

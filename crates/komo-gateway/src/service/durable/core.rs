@@ -29,6 +29,8 @@ pub struct DurableCore {
     closed: AtomicBool,
     /// 用户插话的旗子，按 conversation 一面（`bash` 转后台，`docs/monitor.md` §8）。
     interjections: Mutex<HashMap<ConversationId, InterjectSignal>>,
+    /// faulted 任务的索引（W4a，`interventions`）：开库时接上提交订阅。
+    pub(super) faults: Arc<super::interventions::FaultIndex>,
 }
 
 impl std::fmt::Debug for DurableCore {
@@ -67,6 +69,14 @@ impl DurableCore {
             },
         )
         .await?;
+        let faults = Arc::new(super::interventions::FaultIndex::default());
+        {
+            // 订阅在引擎调度开始之前接上：之后出现的 faulted 任务一个不漏（Drop 不退订，随线一起清）。
+            let faults = Arc::clone(&faults);
+            let _ = engine
+                .line()
+                .subscribe_commits(move |publication| faults.observe(&publication.writes));
+        }
         Ok(Arc::new(DurableCore {
             engine: Arc::new(engine),
             harness,
@@ -75,6 +85,7 @@ impl DurableCore {
             home: home.to_path_buf(),
             closed: AtomicBool::new(false),
             interjections: Mutex::new(HashMap::new()),
+            faults,
         }))
     }
 

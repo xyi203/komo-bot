@@ -1350,27 +1350,25 @@ async fn a_run_in_a_purged_session_is_never_claimed_and_the_reconcile_says_why()
 ///
 /// `closing` 只是不再收新活（没跑完的照跑），`deleted` 是逻辑删除完成，`purged` 内容已经
 /// 回收——三句话对操作者意味着三件不同的事，所以 409 的正文要说得出是哪一种。
+///
+/// Durable 版（W4a）：前一条停在 `gate` 工具上（旧版用"结果不明"的 waiting，新存储没有那种停等），这样
+/// `closing` 期间**手里还有活**；跑完之后由 reconcile / 后台补做推进到 `deleted`（判定，不是时钟）。
 #[tokio::test]
 async fn a_logically_deleted_session_refuses_new_input_and_names_the_state() {
-    use crate::service::test_support::harness::{FakeLlm, Home, call_round};
+    use crate::service::test_support::Gate;
+    use crate::service::test_support::harness::{FakeLlm, Home, call_round, text_round};
 
     let home = Home::with_config(&config_toml(""));
-    // 前一条停在一次"结果不明"上：这样 `closing` 期间**手里还有活**——§8.10 说 `closing`
-    // 仍然服务，而未完成 Run 在的时候对账不会把它推进到 `deleted`（那一步是判定，不是时钟）。
-    let unsure = crate::service::test_support::Unsure::new();
-    home.install_tools(vec![unsure.tool()]);
-    let llm = FakeLlm::new(vec![vec![call_round(
-        1,
-        "life-1",
-        "unsure",
-        serde_json::json!({}),
-    )]]);
-    let gateway = home
-        .start(Arc::clone(&llm) as Arc<dyn komo_kernel::traits::LlmClient>)
-        .await;
+    let gate = Gate::new();
+    home.install_tools(vec![gate.tool()]);
+    let llm = FakeLlm::new(vec![vec![
+        call_round(1, "life-1", "gate", serde_json::json!({})),
+        text_round(2, "手里的活做完了。"),
+    ]]);
+    let gateway = home.start_durable(llm).await;
     let session = gateway.open_session().await;
     let first = gateway.submit(&session, "life-1", "先跑一条").await.run;
-    gateway.wait_waiting(&first).await;
+    gate.wait_entered(1).await;
 
     // `closing`：不再收新活，但列表里还在（§8.10 的列表那一列）。
     let (code, body) = gateway
@@ -1406,15 +1404,33 @@ async fn a_logically_deleted_session_refuses_new_input_and_names_the_state() {
         "`closing` 要列出来并标注：{visible:?}"
     );
 
-    // `closing` 仍然服务（§8.10）：手里那条 Run 照常答复、跑完。
-    gateway.answer(first.as_str(), "satisfied").await;
+    // `closing` 仍然服务（§8.10）：手里那条 Run 照常跑完。
+    gate.release();
     assert_eq!(
         gateway.wait_terminal(&first).await.summary.state,
         RunState::Completed,
         "closing 只是不收新活，手里的活要跑完"
     );
 
-    // `deleted`：默认列表不再列，`?all=1` 才列（§8.10）。
+    // 活做完了：reconcile（或后台补做，谁先到）把 `closing` 推进到 `deleted`。
+    let (code, body) = gateway
+        .post_json("/v1/reconcile", serde_json::json!({}))
+        .await;
+    assert_eq!(code, 200, "{body}");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let (_, body) = gateway.get_json(&format!("/v1/sessions/{session}")).await;
+        if body["state"] == "deleted" {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "没有进 deleted：{body}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    // `deleted`：再删一次是幂等的；不再收新活，默认列表不再列，`?all=1` 才列（§8.10）。
     let (code, body) = gateway
         .post_json(
             &format!("/v1/sessions/{session}/delete"),
@@ -1459,21 +1475,33 @@ async fn a_logically_deleted_session_refuses_new_input_and_names_the_state() {
 }
 
 /// §8.10 第 3 条：**先算引用，再落墓碑，最后删内容**；幂等；`purged` 只剩墓碑。
+///
+/// Durable 版（W4a）：purge 只从 `deleted` 起步（没删就 409）；墓碑 + `PurgeConversations` 一次提交，之后删目录。
 #[tokio::test]
 async fn purging_a_session_removes_its_content_and_is_idempotent() {
     use crate::service::test_support::harness::{FakeLlm, Home, text_round};
 
     let home = Home::with_config(&config_toml(""));
     let llm = FakeLlm::always(vec![text_round(1, "好。")]);
-    let gateway = home
-        .start(Arc::clone(&llm) as Arc<dyn komo_kernel::traits::LlmClient>)
-        .await;
+    let gateway = home.start_durable(llm).await;
     let session = gateway.open_session().await;
     let run = gateway.submit(&session, "purge-1", "说句话").await.run;
     gateway.wait_terminal(&run).await;
+    // 会话目录里有点东西（纯文字的一轮不会自己往里写）。
+    let dir =
+        komo_store::SessionPaths::new(&gateway.state().snapshot().paths.sessions_dir, &session);
+    std::fs::create_dir_all(dir.root().join("artifacts")).unwrap();
+    std::fs::write(dir.root().join("artifacts/note.txt"), b"some evidence").unwrap();
 
-    // 未完成的 Run 挡着就先 409 并列出要先处置什么——那一条由下一个测试管；这里先把会话
-    // 逻辑删除掉（`purge` 只从 `deleted` 起步）。
+    // 没逻辑删除就 purge：409（新存储不替人做上一步）。
+    let (code, body) = gateway
+        .post_json(
+            &format!("/v1/sessions/{session}/purge"),
+            serde_json::json!({}),
+        )
+        .await;
+    assert_eq!(code, 409, "{body}");
+
     let (code, body) = gateway
         .post_json(
             &format!("/v1/sessions/{session}/delete"),
@@ -1494,6 +1522,7 @@ async fn purging_a_session_removes_its_content_and_is_idempotent() {
         body["removed_bytes"].as_u64().unwrap_or(0) > 0,
         "真的删了内容才报得出来：{body}"
     );
+    assert!(!dir.root().exists());
 
     // 幂等：再跑一次不报错，`removed_bytes` 是 0（目录已经不在）。
     let (code, body) = gateway

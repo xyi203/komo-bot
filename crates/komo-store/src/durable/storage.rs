@@ -957,6 +957,60 @@ mod tests {
         );
     }
 
+    /// purge 删掉末尾的行后重开：取号器从持久化的高水位起，不从剩余行的最大 ID 起。
+    #[tokio::test]
+    async fn purged_ids_are_never_reissued_after_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = TursoStorage::open(dir.path()).await.unwrap();
+        let conversation = ConversationId::new(first.mint_id().await.unwrap());
+        let entry = EntryId::new(first.mint_id().await.unwrap());
+        first
+            .commit(&[
+                StorageWrite::Conversation(ConversationRecord::root(conversation)),
+                StorageWrite::Entry(EntryRecord::new(entry, conversation, "message")),
+            ])
+            .await
+            .unwrap();
+        first
+            .commit(&[StorageWrite::PurgeConversations {
+                conversations: vec![conversation],
+            }])
+            .await
+            .unwrap();
+        first.close().await.unwrap();
+        drop(first);
+
+        let second = TursoStorage::open(dir.path()).await.unwrap();
+        let next = second.mint_id().await.unwrap();
+        assert!(next > entry.get(), "{next} 复用了已 purge 的 {entry:?}");
+    }
+
+    /// 旧库没有 `max_id` 这一行：开库时按表里的最大值补上，之后照常推进。
+    #[tokio::test]
+    async fn a_database_without_the_high_water_row_gets_one_on_open() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let first = TursoStorage::open(dir.path()).await.unwrap();
+            let id = first.mint_id().await.unwrap();
+            first
+                .commit(&[StorageWrite::Conversation(ConversationRecord::root(
+                    ConversationId::new(id),
+                ))])
+                .await
+                .unwrap();
+            first
+                .line()
+                .read_connection()
+                .unwrap()
+                .execute("DELETE FROM durable_meta WHERE name = 'max_id'", ())
+                .await
+                .unwrap();
+            first.close().await.unwrap();
+        }
+        let second = TursoStorage::open(dir.path()).await.unwrap();
+        assert_eq!(second.mint_id().await.unwrap(), 3);
+    }
+
     #[tokio::test]
     async fn an_engine_failure_is_a_backend_error_and_every_later_commit_repeats_it() {
         let dir = tempfile::tempdir().unwrap();

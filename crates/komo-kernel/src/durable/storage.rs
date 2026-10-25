@@ -338,8 +338,9 @@ pub enum StorageWrite {
     ///   随后被一并删掉）。
     /// - 存储不检查还有没有别的 conversation 从这里 fork（读它们会因祖先消失而报请求无效）：
     ///   谁 purge 谁保证按 Session 整组删（`komo-gateway` 的 purge 就是这样用的）。
-    /// - 取号器照旧越过已删的最大 ID（同一次打开内不复用）；Turso 重开后从剩余行的最大 ID 接着取，
-    ///   purge 恰好删掉了末尾的 ID 时它们会被重新铸出——purge 的是整个 Session，没有存活数据还指着它们。
+    /// - **ID 不复用**（设计 §6.1）：取号器越过已删的最大 ID，重开之后也是——Turso 把已分配过的
+    ///   最大 ID 作为高水位随提交落进 `durable_meta`，开库时取号器从它起（旧的 SSE 游标、
+    ///   memory 证据里的 `Seq` / `RunId` 因此不会指向新数据）。
     PurgeConversations {
         conversations: Vec<ConversationId>,
     },

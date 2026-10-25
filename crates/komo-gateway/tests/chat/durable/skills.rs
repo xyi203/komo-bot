@@ -9,9 +9,13 @@
 //!
 //! 1. 适用本平台 / 这套工具的 skill 在提示里，不适用的不在；
 //! 2. 被 `disable` 的不在（一个都不在时提示里**一个字都不多**）；
-//! 3. 配置重载之后的下一条 Run 按新快照重算；
-//! 4. 一条 Run 用的是**受理时冻结**的那份目录：续跑那一段与第一段逐字相同，注册表的变化
-//!    从下一条 Run 起生效。
+//! 3. 配置重载之后**新会话**按新快照重算；
+//! 4. 已展示的目录**钉住到下一次 head**（`/new`、压缩；W4b，同 `project` / `memory` 段）：续跑那一段与
+//!    第一段逐字相同，同一会话里之后的 Run 也不变，注册表的变化到下一次 head 才生效。
+//!
+//! 与 Legacy 不同：Legacy 的目录冻结在每条 Run 的受理快照里，"下一条 Run 起生效"；Durable 没有受理快照，
+//! 目录是系统段，钉住的粒度是 head（同一会话里的下一条 Run 也看不到新 skill，开新会话或 `/new` 才看得到）。
+//! 第 3 条因此改成开新会话再看。
 
 use std::path::Path;
 use std::sync::Arc;
@@ -124,7 +128,12 @@ async fn a_disabled_skill_leaves_no_trace_in_the_prompt() {
         .await
         .expect("新配置装得上");
 
-    let after = prompt_of(&gw, &llm, &session, "现在呢", "skills-2").await;
+    // 已展示的目录钉住：同一会话里的下一条 Run 仍是那份（改了断言：Legacy 这里就没有了）。
+    let pinned = prompt_of(&gw, &llm, &session, "现在呢", "skills-2").await;
+    assert!(pinned.contains("pr-review"), "{pinned}");
+    // 新会话按新的注册表。
+    let fresh = gw.open_session().await;
+    let after = prompt_of(&gw, &llm, &fresh, "现在呢", "skills-3").await;
     assert!(!after.contains("pr-review"), "{after}");
     assert!(
         !after.contains("Skills"),
@@ -144,7 +153,7 @@ async fn a_reload_picks_up_a_skill_written_after_startup() {
     let before = prompt_of(&gw, &llm, &session, "在吗", "skills-1").await;
     assert!(!before.contains("Skills"), "{before}");
 
-    // 人放了一个 skill 进去，然后重载：下一条 Run 受理时按新的注册表冻结目录。
+    // 人放了一个 skill 进去，然后重载：之后新开的会话按新的注册表出目录。
     write_skill(
         skills.path(),
         "pr-review",
@@ -155,13 +164,18 @@ async fn a_reload_picks_up_a_skill_written_after_startup() {
         .await
         .expect("新配置装得上");
 
-    let after = prompt_of(&gw, &llm, &session, "现在呢", "skills-2").await;
+    // 已展示的"没有"也钉住：同一会话里的下一条 Run 仍然没有（改了断言）。
+    let pinned = prompt_of(&gw, &llm, &session, "现在呢", "skills-2").await;
+    assert!(!pinned.contains("Skills"), "{pinned}");
+    // 新会话按新的注册表。
+    let fresh = gw.open_session().await;
+    let after = prompt_of(&gw, &llm, &fresh, "现在呢", "skills-3").await;
     assert!(after.contains("- pr-review：怎么审一个 PR"), "{after}");
 }
 
-/// 目录冻结在 `run.accepted` 里：Run 停在退避上时有人加了 skill 并重载，续跑那一段的系统
-/// 提示仍与第一段逐字相同——否则 provider 的前缀缓存从系统提示起整段作废，一条跑了几十轮
-/// 的 Run 一次就丢掉十几万 token 的缓存。新 skill 从下一条 Run 起出现。
+/// 目录钉在已展示的那份里：Run 停在退避上时有人加了 skill 并重载，续跑那一段的系统提示仍与第一段逐字
+/// 相同——否则 provider 的前缀缓存从系统提示起整段作废，一条跑了几十轮的 Run 一次就丢掉十几万 token 的
+/// 缓存。同一会话里之后的 Run 也一样，新 skill 到下一次 head（`/new`）才出现。
 #[tokio::test]
 async fn a_resumed_segment_keeps_the_skills_catalog_it_was_accepted_with() {
     let skills = tempfile::tempdir().expect("临时 skills 目录");
@@ -203,15 +217,25 @@ async fn a_resumed_segment_keeps_the_skills_catalog_it_was_accepted_with() {
         )
     };
     assert!(first.contains("- pr-review：怎么审一个 PR"), "{first}");
-    // 改了断言：Legacy 把目录冻结在 `run.accepted` 里，续跑那一段与第一段逐字相同。Durable 的钩子
-    // 每次请求都按**当前**注册表解析 skills 段（W1b；"已开始的请求用 checkpoint 里冻结的"是 W4b 的
-    // 事，见 `docs/storage-durable-d5.md` §4），所以退避后重发的那次请求带上了期间新增的 skill。
-    // 这里记下现状：第一段只有 pr-review，重发的那一段多了 log-diagnosis；W4b 做冻结时把这条改回
-    // `assert_eq!(resumed, first)`。
     assert!(!first.contains("log-diagnosis"), "{first}");
-    assert!(resumed.contains("- log-diagnosis：查日志"), "{resumed}");
-    assert!(resumed.contains("- pr-review：怎么审一个 PR"), "{resumed}");
+    // W4b 做了冻结：skills 段钉住到下一次 head，退避后重发的请求与第一次逐字相同（W3a 当时记下的是
+    // "重发的请求带上了期间新增的 skill"这个现状，这里改回 Legacy 的断言）。
+    assert_eq!(resumed, first);
 
+    // 同一会话里的下一条 Run 仍是钉住的那份。
     let next = prompt_of(&gw, &llm, &session, "再看看", "skills-2").await;
-    assert!(next.contains("- log-diagnosis：查日志"), "{next}");
+    assert_eq!(next, first, "同一会话里新 skill 要等下一次 head");
+
+    // `/new` 之后才出现。
+    gw.state()
+        .core()
+        .expect("Durable 模式")
+        .boundary(session.as_str(), None)
+        .await
+        .expect("/new");
+    let after_new = prompt_of(&gw, &llm, &session, "重新开始", "skills-3").await;
+    assert!(
+        after_new.contains("- log-diagnosis：查日志") && after_new.contains("- pr-review"),
+        "{after_new}"
+    );
 }

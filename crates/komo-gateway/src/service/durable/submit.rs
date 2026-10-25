@@ -251,7 +251,16 @@ impl DurableCore {
             .clone()
             .unwrap_or_else(|| InputEntry::new(DEFAULT_INPUT_KIND, None));
         entry.data = Some(with_hash(entry.data.take(), &hash));
-        let body = match request.project_update.as_deref() {
+        // 调用方没给就自己核对：规范文件在本会话中改过，新的那一版补在输入正文后面（系统段里的 `project`
+        // 钉在已展示的那份，改动要等下一次 head 才换，见 `hooks/sections.rs`）。
+        let project_update = match request.project_update.clone() {
+            Some(update) => Some(update),
+            None => match self.session(session).await {
+                Ok(record) => self.project_update_for(record.current_branch).await,
+                Err(_) => None,
+            },
+        };
+        let body = match project_update.as_deref() {
             Some(update) if !update.trim().is_empty() => {
                 format!("{}\n\n{update}", request.text)
             }
@@ -276,6 +285,51 @@ impl DurableCore {
             },
         )
         .await
+    }
+
+    /// 规范文件（`AGENTS.md` 一类）自这个 conversation 展示 `project` 段以来改过没有：改过就交回
+    /// [`project_update_block`](komo_agent::context::project_update_block)（现在的那一版），没改、
+    /// 没展示过基线、任务会话、Profile 关了规范文件都是 `None`。每条输入都核对，所以改动之后到下一次
+    /// head 之前的每条输入后面都带着它（旧 `freeze_run` 同一个口径）。
+    async fn project_update_for(&self, conversation: ConversationId) -> Option<String> {
+        use komo_agent::context::{SECTION_PROJECT, project_section, project_update_block};
+        let state = self.gateway()?;
+        let config = state.snapshot();
+        let resolved = super::hooks::resolve(&state, &*self.storage, conversation, &config)
+            .await
+            .ok()?;
+        if resolved.is_task() || !resolved.profile.project_files {
+            return None;
+        }
+        let mut entries = Vec::new();
+        let query = komo_kernel::durable::storage::EntryQuery {
+            order: Some(komo_kernel::durable::ScanOrder::Ascending),
+            ..komo_kernel::durable::storage::EntryQuery::new(conversation)
+        };
+        let mut cursor = None;
+        loop {
+            let page = self
+                .storage
+                .scan_entries(&query, 1_000, cursor.as_ref())
+                .await
+                .ok()?;
+            entries.extend(page.items);
+            match page.next {
+                Some(next) => cursor = Some(next),
+                None => break,
+            }
+        }
+        let view = komo_kernel::durable::derive_context(&entries, None);
+        let shown = komo_runtime::durable::harness::system::replay_sections(&view.messages);
+        if shown.is_empty() {
+            return None;
+        }
+        let pinned = shown
+            .iter()
+            .find(|(key, _)| key == SECTION_PROJECT)
+            .map(|(_, text)| text.clone());
+        let found = crate::service::project_files::discover(&resolved.workspace);
+        (pinned != project_section(&found)).then(|| project_update_block(&found))
     }
 
     /// 同一个请求键是不是已经受理过（`!` 命令在真跑之前先问：重发不该把命令再跑一遍）。命中且内容

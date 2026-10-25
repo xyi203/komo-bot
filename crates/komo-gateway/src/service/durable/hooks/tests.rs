@@ -499,6 +499,71 @@ async fn memory_section_is_pinned_until_the_next_head() {
     let _ = memory_address_for_tests(conversation);
 }
 
+/// skills 目录行同样钉住（W4b）：展示过之后注册表变了（多了 skill、重载），已展示的那份原样不动，
+/// 直到下一次 head；"没有"也钉住。
+#[tokio::test]
+async fn skills_section_is_pinned_until_the_next_head() {
+    let dir = tempfile::tempdir().unwrap();
+    let skills = dir.path().join("skills");
+    let write_skill = |name: &str, description: &str| {
+        let one = skills.join(name);
+        std::fs::create_dir_all(&one).unwrap();
+        std::fs::write(
+            one.join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: {description}\n---\n正文\n"),
+        )
+        .unwrap();
+    };
+    write_skill("pr-review", "审 PR");
+    let config = config_with("", NO_MEMORY)
+        + &format!("\n[paths]\nskill_dirs = [\"{}\"]\n", skills.display());
+    let world = World::new(&config, finisher()).await;
+    let state = world.gateway.state();
+    let hooks = world.hooks();
+    let conversation = world.conversation(Some(agent("assistant"))).await;
+    let ask = [Message::user("在吗", 1)];
+    let find = |sections: &[(String, String)], key: &str| {
+        sections
+            .iter()
+            .find(|(have, _)| have == key)
+            .map(|(_, text)| text.clone())
+    };
+    let shown_of = |sections: &[(String, String)]| {
+        system_message(
+            &sections
+                .iter()
+                .map(|(key, text)| (key.as_str(), text.as_str()))
+                .collect::<Vec<_>>(),
+        )
+    };
+
+    let first = texts(&hooks.setup(conversation, &ask).await.unwrap().sections);
+    assert!(find(&first, "skills").is_some_and(|text| text.contains("pr-review")));
+
+    // 注册表里多了一个 skill、重载之后：已展示的原样不动；下一次 head 才带上它。
+    write_skill("log-diagnosis", "查日志");
+    crate::reload::reload(state).await.expect("新配置装得上");
+    let context = [shown_of(&first), Message::user("在吗", 2)];
+    let pinned = texts(&hooks.setup(conversation, &context).await.unwrap().sections);
+    assert_eq!(find(&pinned, "skills"), find(&first, "skills"));
+    assert!(!find(&pinned, "skills").unwrap().contains("log-diagnosis"));
+    let after_head = texts(&hooks.setup(conversation, &ask).await.unwrap().sections);
+    assert!(
+        find(&after_head, "skills").is_some_and(|text| text.contains("log-diagnosis")),
+        "{after_head:?}"
+    );
+
+    // "没有"也钉住：展示过的基线里没有 skills 段，之后再多出 skill 也不补。
+    let bare: Vec<(String, String)> = first
+        .iter()
+        .filter(|(key, _)| key != "skills")
+        .cloned()
+        .collect();
+    let context = [shown_of(&bare), Message::user("在吗", 3)];
+    let still_bare = texts(&hooks.setup(conversation, &context).await.unwrap().sections);
+    assert_eq!(find(&still_bare, "skills"), None, "{still_bare:?}");
+}
+
 /// 同一个 profile 下，段连起来与旧 `assemble` 的系统提示逐字相同（`komo-agent` 里还有一份
 /// 纯函数的组合黄金测试）。
 #[tokio::test]

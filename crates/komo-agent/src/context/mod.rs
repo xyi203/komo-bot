@@ -190,6 +190,12 @@ pub fn task_contract_block(contract: &DelegateContract) -> String {
     prompt::task_contract_block(contract)
 }
 
+/// 这些项目规范文件渲染成的系统段正文（`project` 段）；一份都没有是 `None`。网关拿它与已展示的
+/// `project` 段比，看规范文件是不是在会话中改过（改过就补 [`project_update_block`]）。
+pub fn project_section(files: &[ProjectFile]) -> Option<String> {
+    prompt::project_block(files)
+}
+
 /// 会话里规范改过之后补在任务后面的那一块（见 [`ContextInput::project_update`]）。
 pub fn project_update_block(files: &[ProjectFile]) -> String {
     prompt::project_update_block(files)

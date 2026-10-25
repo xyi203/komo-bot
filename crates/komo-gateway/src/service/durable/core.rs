@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use komo_kernel::durable::{ConversationId, Storage, SubmissionId, SubmissionRecord};
 use komo_kernel::traits::Clock;
@@ -29,6 +29,9 @@ pub struct DurableCore {
     closed: AtomicBool,
     /// 用户插话的旗子，按 conversation 一面（`bash` 转后台，`docs/monitor.md` §8）。
     interjections: Mutex<HashMap<ConversationId, InterjectSignal>>,
+    /// `GatewayState` 的槽（`assemble::wire` 填）：提交输入时核对规范文件是不是改过要读配置与工作目录，
+    /// 这些在 `GatewayState` 上，而 `DurableCore` 先于它造出来。
+    state: OnceLock<super::assemble::StateSlot>,
 }
 
 impl std::fmt::Debug for DurableCore {
@@ -75,7 +78,20 @@ impl DurableCore {
             home: home.to_path_buf(),
             closed: AtomicBool::new(false),
             interjections: Mutex::new(HashMap::new()),
+            state: OnceLock::new(),
         }))
+    }
+
+    /// `assemble::wire` 接上 `GatewayState` 的槽（只接一次）。
+    pub(super) fn attach_state(&self, slot: &super::assemble::StateSlot) {
+        let _ = self.state.set(Arc::clone(slot));
+    }
+
+    /// 接上之后的 `GatewayState`；还没接或已经释放是 `None`。
+    pub(super) fn gateway(&self) -> Option<Arc<crate::service::state::GatewayState>> {
+        self.state
+            .get()
+            .and_then(|slot| super::hooks::state_of(slot).ok())
     }
 
     /// 开始（或继续）调度。幂等。

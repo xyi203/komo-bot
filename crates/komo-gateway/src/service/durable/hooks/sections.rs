@@ -10,12 +10,12 @@
 //!
 //! # 已展示的段钉住
 //!
-//! 已经展示过一份基线（`replay_sections(context)` 不空）时，`project` 与 `memory` **用已展示的那份**，
-//! 不再现读磁盘、不再召回——"没有"也钉住：规范文件变了或这一段对话又召回出别的记忆，都要等
-//! 下一次 head（`/new`、压缩）才换，否则每次变化都打掉整段前缀缓存。规范文件变了的事由
-//! `submit.rs` 把 `project_update_block` 补进下一条输入（W1c）；记忆条目被遗忘则立刻作废这一块
-//! （核对 `komo.memory` document 里记的 uses）。其余的段（`base` / `instructions` / `skills`）
-//! 每次按当前事实重渲，文字没变就不写。
+//! 已经展示过一份基线（`replay_sections(context)` 不空）时，`project`、`skills` 与 `memory` **用已展示的
+//! 那份**，不再现读磁盘、不再重算目录、不再召回——"没有"也钉住：规范文件变了、注册表里多了 / 少了
+//! skill、或这一段对话又召回出别的记忆，都要等下一次 head（`/new`、压缩）才换，否则每次变化都打掉
+//! 整段前缀缓存（退避重发的请求也不会带上期间新增的 skill，W4b）。规范文件变了的事由 `submit.rs` 把
+//! `project_update_block` 补进下一条输入（W1c）；记忆条目被遗忘则立刻作废这一块（核对 `komo.memory`
+//! document 里记的 uses）。其余的段（`base` / `instructions`）每次按当前事实重渲，文字没变就不写。
 //!
 //! **fork 任务**返回 `replay_sections(context)`：fork 的 conversation 一开头就带着父的 `komo.system`
 //! entry，段原样沿用——首请求与父的上一次请求逐字节同前缀。
@@ -126,7 +126,7 @@ pub(super) async fn build(
         SECTION_SKILLS,
         SECTION_MEMORY,
     ] {
-        // 钉住的两段用已展示的那份；记忆块作废了就用刚重召回的。
+        // 钉住的三段用已展示的那份；记忆块作废了就用刚重召回的。
         let keep_shown = pinned && is_pinned_key(key) && !(key == SECTION_MEMORY && memory_dead);
         let text = if keep_shown {
             shown_text(key)
@@ -141,7 +141,7 @@ pub(super) async fn build(
 }
 
 fn is_pinned_key(key: &str) -> bool {
-    key == SECTION_PROJECT || key == SECTION_MEMORY
+    key == SECTION_PROJECT || key == SECTION_SKILLS || key == SECTION_MEMORY
 }
 
 /// 召回这一段的记忆（只在没有已展示的 `memory` 段时问；召回失败不拦这一轮）。

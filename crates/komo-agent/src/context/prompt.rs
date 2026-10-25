@@ -281,7 +281,7 @@ const SELF_BLOCK: &str = "komo 自己的状态（cron、会话 / Run、记忆、
 /// 项目规范（`AGENTS.md` / `CLAUDE.md`）那一块：开头一句说清顺序与冲突怎么办，每份文件
 /// 原样包在 `<project_instructions path="…">` 里（标签照 pi，`system-prompt.ts`）。
 /// 正文全是空白的那份不出现；一份都不剩就整块不出现（不留空标题）。
-fn project_block(files: &[ProjectFile]) -> Option<String> {
+pub(crate) fn project_block(files: &[ProjectFile]) -> Option<String> {
     let rendered: Vec<String> = files
         .iter()
         .filter(|file| !file.content.trim().is_empty())

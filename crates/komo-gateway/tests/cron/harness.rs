@@ -117,7 +117,6 @@ impl CronOps for Gw {
     async fn tick(&self) -> komo_runtime::scheduler::CronTick {
         let tick = self.state().cron_scheduler().tick().await.expect("扫得动");
         self.state().watch_fired(&tick.fired).await;
-        self.state().waker().wake();
         tick
     }
 }

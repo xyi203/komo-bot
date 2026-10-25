@@ -35,7 +35,7 @@ async fn a_local_path_reads_as_plain_content_without_resource_semantics() {
         read_call(1, "pc-read", "笔记.txt"),
         text_round(2, "读完了。"),
     ]]);
-    let gw = home.start_durable(Arc::clone(&llm)).await;
+    let gw = home.start(Arc::clone(&llm)).await;
     let session = gw.open_session().await;
     let run = gw.submit(&session, "res-local", "读那份笔记").await.run;
     let detail = gw.wait_terminal(&run).await;
@@ -79,7 +79,7 @@ async fn a_skill_uri_reads_and_the_plan_names_the_logical_uri() {
         read_call(1, "pc-skill", "skill://review/SKILL.md"),
         text_round(2, "看过了。"),
     ]]);
-    let gw = home.start_durable(Arc::clone(&llm)).await;
+    let gw = home.start(Arc::clone(&llm)).await;
     let session = gw.open_session().await;
     let run = gw
         .submit(&session, "res-skill", "按审查 skill 看一遍")
@@ -113,7 +113,7 @@ async fn tool_uris_read_schema_inside_the_surface_and_are_refused_outside_it() {
         read_call(2, "pc-out", "tool://write/schema"),
         text_round(3, "看完了。"),
     ]]);
-    let gw = home.start_durable(Arc::clone(&llm)).await;
+    let gw = home.start(Arc::clone(&llm)).await;
     let session = gw.open_session().await;
     let run = gw.submit(&session, "res-tool", "看看工具说明").await.run;
     let detail = gw.wait_terminal(&run).await;
@@ -155,7 +155,7 @@ async fn historical_artifacts_stay_readable_after_a_restart() {
         read_call(1, "pc-read", "artifact://files/run-old/报告.md"),
         text_round(2, "读到了。"),
     ]]);
-    let gw = home.start_durable(Arc::clone(&llm)).await;
+    let gw = home.start(Arc::clone(&llm)).await;
     let session = gw.open_session().await;
 
     let artifacts = home.session_dir(&session).join("artifacts/run-old");
@@ -175,7 +175,7 @@ async fn historical_artifacts_stay_readable_after_a_restart() {
         read_call(1, "pc-read", "artifact://files/run-old/报告.md"),
         text_round(2, "读到了。"),
     ]]);
-    let gw_b = home.start_durable(Arc::clone(&llm_b)).await;
+    let gw_b = home.start(Arc::clone(&llm_b)).await;
     let run_b = gw_b.submit(&session, "res-art-2", "再读一遍").await.run;
     let detail = gw_b.wait_terminal(&run_b).await;
     assert_eq!(detail.summary.state, RunState::Completed, "{detail:?}");
@@ -209,7 +209,7 @@ async fn another_sessions_run_is_out_of_reach() {
         read_call(1, "pc-a", "甲会话的文件.txt"),
         text_round(2, "读完了。"),
     ]]);
-    let gw = home.start_durable(Arc::clone(&llm)).await;
+    let gw = home.start(Arc::clone(&llm)).await;
     let session_a = gw.open_session().await;
     let run_a = gw.submit(&session_a, "res-a", "读我自己的文件").await.run;
     let detail = gw.wait_terminal(&run_a).await;
@@ -217,7 +217,7 @@ async fn another_sessions_run_is_out_of_reach() {
 
     // 甲会话那条输出的真实位置：从合成事件的 `output_ref` 取（`tool-output/{conversation}/{task}/{attempt}/…`）。
     let result = gw
-        .durable_events(&session_a)
+        .events(&session_a)
         .await
         .into_iter()
         .find_map(|event| match event.payload {
@@ -240,7 +240,7 @@ async fn another_sessions_run_is_out_of_reach() {
         read_call(1, "pc-own", &uri),
         text_round(2, "读到了。"),
     ]]);
-    let gw_a = home.start_durable(Arc::clone(&llm_a)).await;
+    let gw_a = home.start(Arc::clone(&llm_a)).await;
     let run_own = gw_a
         .submit(&session_a, "res-a2", "再读一遍我自己的输出")
         .await
@@ -262,7 +262,7 @@ async fn another_sessions_run_is_out_of_reach() {
         read_call(1, "pc-b", &uri),
         text_round(2, "读不到。"),
     ]]);
-    let gw_b = home.start_durable(Arc::clone(&llm_b)).await;
+    let gw_b = home.start(Arc::clone(&llm_b)).await;
     let session_b = gw_b.open_session().await;
     assert_ne!(session_a, session_b);
     let run_b = gw_b.submit(&session_b, "res-b", "读别人的输出").await.run;

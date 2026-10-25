@@ -13,7 +13,7 @@ use crate::seeded;
 #[tokio::test]
 async fn a_rebuild_really_runs_and_its_progress_is_queryable() {
     let embeddings = ConceptEmbeddings::new();
-    let gateway = memory_gateway(&memory_config("hybrid", true))
+    let gateway = super::gateway(&memory_config("hybrid", true))
         .embeddings(Arc::clone(&embeddings) as Arc<dyn EmbeddingClient>)
         .start()
         .await;
@@ -95,7 +95,7 @@ async fn a_rebuild_really_runs_and_its_progress_is_queryable() {
 /// 没有配置向量模型时 `GET /v1/memory-index` 是一个**状态**，重建则是配置错误。
 #[tokio::test]
 async fn an_index_without_an_embedding_model_reads_as_unconfigured() {
-    let gateway = memory_gateway(&memory_config("keyword", false))
+    let gateway = super::gateway(&memory_config("keyword", false))
         .start()
         .await;
 
@@ -117,7 +117,7 @@ async fn an_index_without_an_embedding_model_reads_as_unconfigured() {
 /// §14 ⑤：**修改记忆时旧 revision 不召回**——旧向量连 join 都 join 不上。
 #[tokio::test]
 async fn editing_a_memory_retires_its_vector() {
-    let (gateway, _embeddings) = crate::with_memories(
+    let (gateway, _embeddings) = super::with_memories(
         "hybrid",
         vec![seeded(
             "m-1",
@@ -175,7 +175,7 @@ async fn editing_a_memory_retires_its_vector() {
 #[tokio::test]
 async fn a_rebuild_survives_a_restart() {
     let embeddings = ConceptEmbeddings::new();
-    let mut gateway = memory_gateway(&memory_config("hybrid", true))
+    let mut gateway = super::gateway(&memory_config("hybrid", true))
         .embeddings(Arc::clone(&embeddings) as Arc<dyn EmbeddingClient>)
         .start()
         .await;
@@ -218,12 +218,15 @@ async fn a_rebuild_survives_a_restart() {
 
     // 重启：同一个数据目录、同一个空间。
     let revived = ConceptEmbeddings::new();
-    gateway
-        .restart_with_embeddings(
-            &memory_config("hybrid", true),
-            Arc::clone(&revived) as Arc<dyn EmbeddingClient>,
-        )
-        .await;
+    let next = super::restart(
+        &mut gateway,
+        &memory_config("hybrid", true),
+        None,
+        Some(Arc::clone(&revived) as Arc<dyn EmbeddingClient>),
+    )
+    .await;
+    // 旧的那台留着直到测试结束（它的 `Drop` 会删临时数据目录）。
+    let _old = std::mem::replace(&mut gateway, next);
 
     let resumed = gateway.state().memories.build_index().await.unwrap();
     assert_eq!(
@@ -247,7 +250,7 @@ async fn a_rebuild_survives_a_restart() {
 /// 同维度但**不同代次**的向量不混用（§9.5「同维度不代表同一空间」）。
 #[tokio::test]
 async fn an_old_generation_is_never_mixed_in() {
-    let (gateway, _embeddings) = crate::with_memories(
+    let (gateway, _embeddings) = super::with_memories(
         "hybrid",
         vec![seeded(
             "m-1",

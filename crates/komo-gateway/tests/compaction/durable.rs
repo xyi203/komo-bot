@@ -7,7 +7,7 @@
 //!
 //! 与 Legacy 不同的断言与理由：
 //!
-//! - **事件**：`context.compacted` 来自合成事件流（`durable_events`，由 `komo.compaction` entry 的 `data`
+//! - **事件**：`context.compacted` 来自合成事件流（`events`，由 `komo.compaction` entry 的 `data`
 //!   投影），不再读 JSONL；`first_kept` 是切点（head）那条 entry 的 seq，同样等于那一轮 `MessageAssistant`
 //!   的 seq；
 //! - **"停在介入上、重启再答、回放逐字节不变"**：新存储没有介入状态。回放逐字节相同的论点换成"压缩之后
@@ -34,12 +34,12 @@ async fn run_short(config: &str) -> (Arc<FakeLlm>, Vec<Event>) {
     let home = Home::with_config(config);
     std::fs::create_dir_all(home.workspace()).expect("工作目录");
     let llm = FakeLlm::new(short_script());
-    let gateway = home.start_durable(Arc::clone(&llm)).await;
+    let gateway = home.start(Arc::clone(&llm)).await;
     let session = gateway.open_session().await;
     let run = gateway.submit(&session, "short-1", "跑两条命令").await.run;
     let detail = gateway.wait_terminal(&run).await;
     assert_eq!(detail.summary.state, RunState::Completed, "{detail:?}");
-    let events = gateway.durable_events(&session).await;
+    let events = gateway.events(&session).await;
     gateway.stop().await;
     (llm, events)
 }
@@ -118,7 +118,7 @@ async fn window_protection_compacts_and_the_run_goes_on_with_task_summary_tail()
         // 压完之后的主请求：收尾。
         vec![text_round(1, "都做完了。")],
     ]);
-    let gateway = home.start_durable(Arc::clone(&llm)).await;
+    let gateway = home.start(Arc::clone(&llm)).await;
     let session = gateway.open_session().await;
     let task = "把五个大文件读一遍，最后跑一条命令";
     let run = gateway.submit(&session, "window-1", task).await.run;
@@ -145,7 +145,7 @@ async fn window_protection_compacts_and_the_run_goes_on_with_task_summary_tail()
     );
     assert!(!text.contains("5-0000"), "切点之后的那一轮不收");
 
-    let events = gateway.durable_events(&session).await;
+    let events = gateway.events(&session).await;
     let recorded = compactions(&events);
     let [
         ContextCompacted::Compacted {
@@ -219,7 +219,7 @@ async fn window_protection_compacts_and_the_run_goes_on_with_task_summary_tail()
     // 重启 → 同一个会话再说一句：新一轮请求的前缀逐字节等于压缩后那次请求的消息。
     gateway.stop().await;
     let llm = FakeLlm::finisher("好。");
-    let gateway = home.start_durable(Arc::clone(&llm)).await;
+    let gateway = home.start(Arc::clone(&llm)).await;
     let run = gateway.submit(&session, "window-2", "再说一句").await.run;
     let detail = gateway.wait_terminal(&run).await;
     assert_eq!(detail.summary.state, RunState::Completed, "{detail:?}");
@@ -234,7 +234,7 @@ async fn window_protection_compacts_and_the_run_goes_on_with_task_summary_tail()
         "重启之后回放的那一段逐字节相同"
     );
     assert_eq!(
-        compactions(&gateway.durable_events(&session).await).len(),
+        compactions(&gateway.events(&session).await).len(),
         1,
         "压过之后没有再压"
     );
@@ -275,14 +275,14 @@ async fn run_into_overflow(
         vec![text_round(1, "摘要：读过 big1，内容是编号行。")],
         after_summary,
     ]);
-    let gateway = home.start_durable(Arc::clone(&llm)).await;
+    let gateway = home.start(Arc::clone(&llm)).await;
     let session = gateway.open_session().await;
     let run = gateway
         .submit(&session, "overflow-1", "把两个大文件读一遍")
         .await
         .run;
     let detail = gateway.wait_terminal(&run).await;
-    let events = gateway.durable_events(&session).await;
+    let events = gateway.events(&session).await;
     gateway.stop().await;
     (llm, detail.summary.state, events)
 }

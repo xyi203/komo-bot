@@ -1,5 +1,5 @@
-//! Telegram：真 `TelegramChannel` 对着 loopback 上的假 Bot API `serve`，真 Dispatcher
-//! 在后面（§11.1 的六步、§11.3 的命令）。
+//! Telegram（Durable 存储，D5 W3a）：与 `../telegram.rs` 同名同断言，Gateway 跑在新存储上。
+//! 与 Legacy 不同的只有读会话 / 输入的帮手（`durable_*`）与模型替身（`FakeLlm` 兼当 `ModelStream`）。
 
 use std::sync::Arc;
 
@@ -10,7 +10,9 @@ use komo_kernel::types::chat::ChannelPlatform;
 use komo_gateway::channels::ChannelSender;
 use komo_gateway::channels::telegram::TelegramChannel;
 
-use crate::harness::{FixedFactory, GatewayBuilder, TestGateway, eventually, telegram_config};
+use crate::harness::{
+    FakeLlm, FixedFactory, GatewayBuilder, TestGateway, eventually, telegram_config,
+};
 use komo_gateway::channels::telegram::fake::{Behavior, FakeBotApi, text_update};
 
 /// 一台起着的 Gateway + 它背后的假 Bot API。渠道是**真的**：`TelegramChannel::serve`
@@ -37,7 +39,11 @@ async fn wire_with(config: &str, behavior: Behavior, updates: Vec<serde_json::Va
         Arc::clone(&channel) as Arc<dyn Channel>,
         sender,
     );
-    let gateway = GatewayBuilder::new(config).factory(factory).start().await;
+    let gateway = GatewayBuilder::new(config)
+        .fake_llm(FakeLlm::finisher("好"))
+        .factory(factory)
+        .start()
+        .await;
     Wired { gateway, fake }
 }
 
@@ -70,9 +76,8 @@ async fn a_replayed_update_produces_one_run() {
         // 消息到达之后 home session 才有行；先等 Run 落账再读。
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
-            let sessions = gateway.sessions().await;
-            if let Some(record) = sessions.iter().find(|record| record.origin == "home") {
-                break record.session.clone();
+            if let Some(session) = gateway.session_of("home").await {
+                break session;
             }
             assert!(std::time::Instant::now() < deadline, "等不到 home session");
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
@@ -82,8 +87,8 @@ async fn a_replayed_update_produces_one_run() {
     // 让重投再来几轮。
     wired.polled_at_least(5).await;
 
-    let runs = wired.gateway.runs_of(&home).await;
-    assert_eq!(runs.len(), 1, "重投不该开第二个 Run：{runs:?}");
+    let inputs = wired.gateway.inputs(&home).await;
+    assert_eq!(inputs, 1, "重投不该开第二个 Run");
 }
 
 /// §11.2：群里只响应 @机器人 的消息，并剥掉提及；群不用事先登记。
@@ -98,7 +103,7 @@ async fn a_group_message_only_counts_when_it_names_the_bot() {
     // 没 @ 的那条走完了（至少轮询过几轮），不该建出任何会话。
     wired.polled_at_least(3).await;
     assert!(
-        wired.gateway.sessions().await.is_empty(),
+        wired.gateway.origins().await.is_empty(),
         "群里没 @机器人 的消息不进 Dispatcher"
     );
 
@@ -114,15 +119,7 @@ async fn a_group_message_only_counts_when_it_names_the_bot() {
         ),
     ));
 
-    let gateway_sessions = || async {
-        wired
-            .gateway
-            .sessions()
-            .await
-            .into_iter()
-            .map(|record| record.origin)
-            .collect::<Vec<_>>()
-    };
+    let gateway_sessions = || async { wired.gateway.origins().await };
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
         let origins = gateway_sessions().await;
@@ -165,12 +162,7 @@ async fn an_unregistered_group_is_answered_when_it_names_the_bot() {
     let gateway = &wired.gateway;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
-        let origins: Vec<String> = gateway
-            .sessions()
-            .await
-            .into_iter()
-            .map(|record| record.origin)
-            .collect();
+        let origins: Vec<String> = gateway.origins().await;
         if origins.iter().any(|origin| origin == "chat:telegram:333") {
             break;
         }

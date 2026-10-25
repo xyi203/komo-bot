@@ -18,9 +18,7 @@ fn daily(prompt: &str) -> serde_json::Value {
 #[tokio::test]
 async fn model_menu_and_job_selection_use_catalog_aliases() {
     let home = Home::new();
-    let gw = home
-        .start(FakeLlm::new(vec![]) as Arc<dyn komo_kernel::traits::LlmClient>)
-        .await;
+    let gw = home.start(FakeLlm::new(vec![])).await;
 
     let (status, body) = gw.get("/v1/models").await;
     assert_eq!(status, 200, "{body}");
@@ -53,9 +51,7 @@ async fn model_menu_and_job_selection_use_catalog_aliases() {
 #[tokio::test]
 async fn every_field_in_the_job_definition_round_trips() {
     let home = Home::new();
-    let gw = home
-        .start(FakeLlm::new(vec![]) as Arc<dyn komo_kernel::traits::LlmClient>)
-        .await;
+    let gw = home.start(FakeLlm::new(vec![])).await;
 
     let workdir = home.workspace();
     let job = gw
@@ -100,9 +96,7 @@ async fn every_field_in_the_job_definition_round_trips() {
 #[tokio::test]
 async fn a_model_override_is_a_whole_config_and_leaves_memory_alone() {
     let home = Home::new();
-    let gw = home
-        .start(FakeLlm::new(vec![]) as Arc<dyn komo_kernel::traits::LlmClient>)
-        .await;
+    let gw = home.start(FakeLlm::new(vec![])).await;
 
     let job = gw
         .add_job(serde_json::json!({
@@ -135,9 +129,7 @@ async fn a_model_override_is_a_whole_config_and_leaves_memory_alone() {
 #[tokio::test]
 async fn an_unsupported_effort_is_refused_before_the_request_with_its_supported_values() {
     let home = Home::new();
-    let gw = home
-        .start(FakeLlm::new(vec![]) as Arc<dyn komo_kernel::traits::LlmClient>)
-        .await;
+    let gw = home.start(FakeLlm::new(vec![])).await;
 
     let (status, body) = gw
         .post(
@@ -164,9 +156,7 @@ async fn an_unsupported_effort_is_refused_before_the_request_with_its_supported_
 #[tokio::test]
 async fn an_unknown_timezone_is_refused_with_what_to_write() {
     let home = Home::new();
-    let gw = home
-        .start(FakeLlm::new(vec![]) as Arc<dyn komo_kernel::traits::LlmClient>)
-        .await;
+    let gw = home.start(FakeLlm::new(vec![])).await;
 
     let (status, body) = gw
         .post(
@@ -187,9 +177,7 @@ async fn an_unknown_timezone_is_refused_with_what_to_write() {
 #[tokio::test]
 async fn a_six_field_expression_is_refused_rather_than_read_as_seconds() {
     let home = Home::new();
-    let gw = home
-        .start(FakeLlm::new(vec![]) as Arc<dyn komo_kernel::traits::LlmClient>)
-        .await;
+    let gw = home.start(FakeLlm::new(vec![])).await;
     let (status, body) = gw
         .post(
             "/v1/cron",
@@ -206,9 +194,7 @@ async fn a_six_field_expression_is_refused_rather_than_read_as_seconds() {
 #[tokio::test]
 async fn changing_the_definition_bumps_the_version_but_pausing_does_not() {
     let home = Home::new();
-    let gw = home
-        .start(FakeLlm::new(vec![]) as Arc<dyn komo_kernel::traits::LlmClient>)
-        .await;
+    let gw = home.start(FakeLlm::new(vec![])).await;
     let job = gw.add_job(daily("原来的话")).await;
     assert_eq!(job.version, 1);
 
@@ -274,8 +260,7 @@ async fn changing_the_definition_bumps_the_version_but_pausing_does_not() {
 async fn a_one_shot_is_done_after_it_fires_and_refuses_to_run_again() {
     let home = Home::new();
     let gw = home
-        .start(FakeLlm::always(vec![text_round(1, "做完了")])
-            as Arc<dyn komo_kernel::traits::LlmClient>)
+        .start(FakeLlm::always(vec![text_round(1, "做完了")]))
         .await;
 
     let at = time::OffsetDateTime::now_utc() + time::Duration::hours(1);
@@ -319,9 +304,7 @@ async fn a_one_shot_is_done_after_it_fires_and_refuses_to_run_again() {
 #[tokio::test]
 async fn an_at_in_the_past_is_refused_while_the_person_is_still_there() {
     let home = Home::new();
-    let gw = home
-        .start(FakeLlm::new(vec![]) as Arc<dyn komo_kernel::traits::LlmClient>)
-        .await;
+    let gw = home.start(FakeLlm::new(vec![])).await;
     let (status, body) = gw
         .post(
             "/v1/cron",
@@ -339,8 +322,7 @@ async fn an_at_in_the_past_is_refused_while_the_person_is_still_there() {
 async fn a_manual_run_writes_no_firing_and_does_not_advance_the_slot() {
     let home = Home::new();
     let gw = home
-        .start(FakeLlm::always(vec![text_round(1, "做完了")])
-            as Arc<dyn komo_kernel::traits::LlmClient>)
+        .start(FakeLlm::always(vec![text_round(1, "做完了")]))
         .await;
     let job = gw.add_job(daily("整理")).await;
     let slot = job.next_run_at.expect("有槽位");
@@ -364,12 +346,10 @@ async fn a_manual_run_writes_no_firing_and_does_not_advance_the_slot() {
     assert!(response.request_key.as_str().contains("cron-manual"));
 
     // 那个 Run 真的在账本上，来源是 Cron（§11.2 最后一条：来源仍是 Cron）。
-    let record = komo_store::repos::runs::get(&gw.state().db, &response.run)
-        .await
-        .expect("读得到")
-        .expect("有这一行");
+    // Durable：没有 `runs` 表，来源由 run 详情读出（输入 entry 是 `cron.input`）。
+    let detail = gw.run_detail(&response.run).await;
     assert!(matches!(
-        record.source,
+        detail.summary.source,
         komo_kernel::types::plan::PlanSource::Cron { .. }
     ));
 
@@ -381,8 +361,7 @@ async fn a_manual_run_writes_no_firing_and_does_not_advance_the_slot() {
 async fn removing_a_job_keeps_its_firings() {
     let home = Home::new();
     let gw = home
-        .start(FakeLlm::always(vec![text_round(1, "做完了")])
-            as Arc<dyn komo_kernel::traits::LlmClient>)
+        .start(FakeLlm::always(vec![text_round(1, "做完了")]))
         .await;
     let job = gw.add_job(daily("整理")).await;
     gw.make_due(&job.id).await;
@@ -430,9 +409,7 @@ async fn a_job_runs_on_its_own_round_budget() {
         call_round(2, "pc-2", "read", serde_json::json!({"path": path})),
         call_round(3, "pc-3", "read", serde_json::json!({"path": path})),
     ]);
-    let gw = home
-        .start(Arc::clone(&llm) as Arc<dyn komo_kernel::traits::LlmClient>)
-        .await;
+    let gw = home.start(Arc::clone(&llm)).await;
 
     let mut body = daily("读点东西");
     body["max_rounds"] = serde_json::json!(1);
@@ -441,12 +418,9 @@ async fn a_job_runs_on_its_own_round_budget() {
     let run = gw.tick().await.fired[0].run.clone();
 
     gw.wait_state(&run, |s| s.is_terminal(), "终态").await;
-    let record = komo_store::repos::runs::get(&gw.state().db, &run)
-        .await
-        .expect("读得到")
-        .expect("有这一行");
+    let detail = gw.run_detail(&run).await;
     assert_eq!(
-        record.state,
+        detail.summary.state,
         komo_kernel::types::status::RunState::Failed,
         "预算用完是一个明确的终态，不是无限循环"
     );

@@ -1,5 +1,5 @@
-//! 微信：真 `WeChatChannel` 对着 loopback 上的假 iLink `serve`，真 Dispatcher 在后面
-//! （§11.1 的去重键、§11.4 的 `Deferred` 与冲刷）。
+//! 微信（Durable 存储，D5 W3a）：与 `../wechat.rs` 同名同断言，Gateway 跑在新存储上；读会话 / 输入
+//! 用 `durable_*` 帮手。
 
 use std::sync::Arc;
 
@@ -8,7 +8,7 @@ use komo_kernel::traits::Channel;
 use komo_kernel::types::chat::{ChannelPeer, ChannelPlatform, DeliveryState, Outbound};
 
 use crate::harness::{
-    FixedFactory, GatewayBuilder, TestGateway, config_toml, eventually, wechat_block,
+    FakeLlm, FixedFactory, GatewayBuilder, TestGateway, config_toml, eventually, wechat_block,
 };
 use komo_gateway::channels::wechat::fake::{Behavior, FakeILink, text_wire};
 
@@ -29,6 +29,7 @@ async fn wire(behavior: Behavior, msgs: Vec<wechatbot::types::WireMessage>) -> W
         sender,
     );
     let gateway = GatewayBuilder::new(&config_toml(&wechat_block("\"wxid_op\"")))
+        .fake_llm(FakeLlm::finisher("好"))
         .factory(factory)
         .start()
         .await;
@@ -44,13 +45,8 @@ impl Wired {
         .await;
     }
 
-    async fn home_session(&self) -> Option<komo_kernel::types::ids::SessionId> {
-        self.gateway
-            .sessions()
-            .await
-            .into_iter()
-            .find(|record| record.origin == "home")
-            .map(|record| record.session)
+    async fn home_session(&self) -> Option<String> {
+        self.gateway.session_of("home").await
     }
 }
 
@@ -78,8 +74,8 @@ async fn a_replayed_client_id_produces_one_run() {
     // 让重投再来几轮。
     wired.polled_at_least(5).await;
 
-    let runs = wired.gateway.runs_of(&home).await;
-    assert_eq!(runs.len(), 1, "重投不该开第二个 Run：{runs:?}");
+    let inputs = wired.gateway.inputs(&home).await;
+    assert_eq!(inputs, 1, "重投不该开第二个 Run");
 }
 
 /// 验证列②：进程起来后用户还没说过话 → 主动投递 `Deferred`，行留在 pending，
@@ -174,7 +170,7 @@ async fn a_wechat_stranger_is_refused_but_can_still_ask_for_its_id() {
     assert!(hint.contains("wxid_other"), "{hint}");
     assert!(hint.contains("allow_from"), "{hint}");
     assert!(
-        wired.gateway.sessions().await.is_empty(),
+        wired.gateway.origins().await.is_empty(),
         "被拒绝的消息不建会话"
     );
     assert!(

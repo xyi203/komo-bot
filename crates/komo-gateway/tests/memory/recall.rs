@@ -3,10 +3,10 @@
 use std::sync::Arc;
 
 use komo_kernel::test_support::ScriptedLlm;
-use komo_kernel::traits::LlmClient;
 use komo_kernel::types::ids::MemoryId;
 use komo_kernel::types::memory::{MemoryState, Provenance};
 
+use super::{Scripted, a_run, restart, run_in, wait_for_terminal};
 use crate::harness::*;
 use crate::{scoped, seeded, text_round, with_memories};
 
@@ -123,7 +123,7 @@ async fn a_dead_endpoint_degrades_hybrid_and_fails_vector_only() {
 /// （§9.4）。
 #[tokio::test]
 async fn hybrid_without_an_embedding_section_is_reported_as_a_configuration_error() {
-    let gateway = memory_gateway(&memory_config("keyword", false))
+    let gateway = super::gateway(&memory_config("keyword", false))
         .start()
         .await;
     gateway
@@ -243,9 +243,9 @@ async fn a_turn_records_which_memories_reached_it() {
         1,
         "知道了，26 度。",
     )]]);
-    let gateway = memory_gateway(&memory_config("hybrid", true))
+    let gateway = super::gateway(&memory_config("hybrid", true))
         .embeddings(Arc::clone(&embeddings) as Arc<dyn komo_kernel::traits::EmbeddingClient>)
-        .llm(Arc::new(llm.clone()) as Arc<dyn komo_kernel::traits::LlmClient>)
+        .scripted(llm.clone())
         .start()
         .await;
     gateway
@@ -264,7 +264,7 @@ async fn a_turn_records_which_memories_reached_it() {
         .unwrap();
     gateway.state().memories.build_index().await.unwrap();
 
-    let (_session, _run) = crate::a_run(&gateway, "rk-1", "空调现在几度来着").await;
+    let (_session, _run) = a_run(&gateway, "rk-1", "空调现在几度来着").await;
 
     let requests = llm.requests.clone();
     eventually("这一轮开跑了", || {
@@ -273,10 +273,24 @@ async fn a_turn_records_which_memories_reached_it() {
     .await;
 
     let seen = requests.lock().expect("请求表").clone();
-    let used = &seen[0].memories;
+    // 新 harness 的请求没有 `memories` 字段：系统提示里带着正文，run 详情（读 `komo.memory`）记着
+    // 条目与版本。
+    assert!(
+        seen[0].system_prompt.contains("客厅空调设 26 度"),
+        "注入了一条：{}",
+        seen[0].system_prompt
+    );
+    gateway.wait_run(&_run).await;
+    let (status, detail) = gateway.get_json(&format!("/v1/runs/{_run}")).await;
+    assert_eq!(status, 200, "{detail}");
+    let used = detail["memories"].as_array().expect("memories");
     assert_eq!(used.len(), 1, "注入了一条：{used:?}");
-    assert_eq!(used[0].memory, MemoryId::from_raw("m-1"));
-    assert_eq!(used[0].revision, 1, "记的是**哪个版本**（§9.7）");
+    assert_eq!(used[0]["memory"], serde_json::json!("m-1"));
+    assert_eq!(
+        used[0]["revision"],
+        serde_json::json!(1),
+        "记的是**哪个版本**（§9.7）"
+    );
 
     // 使用计数记上了，但真实性一点没变（§9.2）。
     let after = gateway
@@ -307,8 +321,8 @@ async fn an_agent_only_recalls_its_own_scope_plus_the_shared_profile() {
         vec![crate::text_round(1, "知道了。")],
         vec![crate::text_round(1, "知道了。")],
     ]);
-    let gateway = memory_gateway(&scoped_memory_config())
-        .llm(Arc::new(llm.clone()) as Arc<dyn komo_kernel::traits::LlmClient>)
+    let gateway = super::gateway(&scoped_memory_config())
+        .scripted(llm.clone())
         .start()
         .await;
     for item in [
@@ -332,32 +346,32 @@ async fn an_agent_only_recalls_its_own_scope_plus_the_shared_profile() {
     }
 
     // 没有归属的入口 = 默认 Agent（`assistant`）：它没写 `memory_scope`，不按作用域过滤。
-    let assistant = gateway.state().default_main_session().await.unwrap();
-    let coder = gateway.state().main_session("coder").await.unwrap();
+    let core = komo_gateway::service::test_support::driver_stream::core(&gateway);
+    let assistant = core.main_session("assistant").await.unwrap().0.id;
+    let coder = core.main_session("coder").await.unwrap().0.id;
     assert_ne!(assistant, coder);
 
     for (session, key) in [(&assistant, "rk-assistant"), (&coder, "rk-coder")] {
-        let (status, body) = gateway
-            .post_json(
-                &format!("/v1/sessions/{session}/runs"),
-                serde_json::json!({ "request_key": key, "text": "空调现在几度来着" }),
-            )
-            .await;
-        assert_eq!(status, 200, "{body}");
-        let run: komo_kernel::types::ids::RunId =
-            serde_json::from_value(body["run"].clone()).expect("run id");
+        let session = komo_kernel::types::ids::SessionId::from_raw(session.clone());
+        let run = run_in(&gateway, &session, key, "空调现在几度来着").await;
         wait_for_terminal(&gateway, &run).await;
     }
 
     let seen = llm.requests.lock().expect("请求表").clone();
     assert_eq!(seen.len(), 2, "两段各请求了一次");
+    // 新 harness 的请求没有 `memories` 字段：按系统提示里出现的正文认。
     let ids = |index: usize| {
-        let mut ids: Vec<String> = seen[index]
-            .memories
-            .iter()
-            .map(|used| used.memory.to_string())
-            .collect();
-        ids.sort();
+        let prompt = &seen[index].system_prompt;
+        let mut ids = Vec::new();
+        for (id, text) in [
+            ("m-acme", "acme 的空调遥测在 26 度"),
+            ("m-other", "别的项目的空调日志在 26 度"),
+            ("m-personal", "客厅空调设 26 度"),
+        ] {
+            if prompt.contains(text) {
+                ids.push(id);
+            }
+        }
         ids
     };
     assert_eq!(
@@ -382,8 +396,8 @@ async fn an_agent_only_recalls_its_own_scope_plus_the_shared_profile() {
 async fn the_memory_block_survives_a_restart_within_one_segment() {
     let config = memory_config("keyword", false);
     let first = ScriptedLlm::new(vec![vec![text_round(1, "26 度。")]]);
-    let mut gateway = memory_gateway(&config)
-        .llm(Arc::new(first.clone()) as Arc<dyn LlmClient>)
+    let mut gateway = super::gateway(&config)
+        .scripted(first.clone())
         .start()
         .await;
     for (id, content) in [("m-1", "客厅空调设 26 度"), ("m-2", "卧室台灯是暖光")] {
@@ -398,7 +412,7 @@ async fn the_memory_block_survives_a_restart_within_one_segment() {
             .unwrap();
     }
 
-    let (session, run) = crate::a_run(&gateway, "rk-1", "空调设多少度来着").await;
+    let (session, run) = a_run(&gateway, "rk-1", "空调设多少度来着").await;
     wait_for_terminal(&gateway, &run).await;
     let before = first.requests.lock().expect("请求表")[0]
         .system_prompt
@@ -407,18 +421,10 @@ async fn the_memory_block_survives_a_restart_within_one_segment() {
     assert!(!before.contains("台灯"), "第一轮只召回到空调那条：{before}");
 
     let second = ScriptedLlm::new(vec![vec![text_round(1, "暖光。")]]);
-    gateway
-        .restart_with_llm(&config, Arc::new(second.clone()) as Arc<dyn LlmClient>)
-        .await;
-    let (status, body) = gateway
-        .post_json(
-            &format!("/v1/sessions/{session}/runs"),
-            serde_json::json!({"request_key": "rk-2", "text": "台灯是什么光"}),
-        )
-        .await;
-    assert_eq!(status, 200, "{body}");
-    let run: komo_kernel::types::ids::RunId =
-        serde_json::from_value(body["run"].clone()).expect("run id");
+    // 旧的那台留着直到测试结束（它的 `Drop` 会删临时数据目录）。
+    let revived = restart(&mut gateway, &config, Some(second.clone()), None).await;
+    let _old = std::mem::replace(&mut gateway, revived);
+    let run = run_in(&gateway, &session, "rk-2", "台灯是什么光").await;
     wait_for_terminal(&gateway, &run).await;
 
     let after = second.requests.lock().expect("请求表")[0]
@@ -430,8 +436,8 @@ async fn the_memory_block_survives_a_restart_within_one_segment() {
 #[tokio::test]
 async fn the_system_prompt_the_model_receives_ends_with_the_recalled_memory_block() {
     let llm = ScriptedLlm::new(vec![vec![text_round(1, "26 度。")]]);
-    let gateway = memory_gateway(&memory_config("keyword", false))
-        .llm(Arc::new(llm.clone()) as Arc<dyn LlmClient>)
+    let gateway = super::gateway(&memory_config("keyword", false))
+        .scripted(llm.clone())
         .start()
         .await;
     gateway
@@ -449,7 +455,7 @@ async fn the_system_prompt_the_model_receives_ends_with_the_recalled_memory_bloc
         .await
         .unwrap();
 
-    let (_session, run) = crate::a_run(&gateway, "rk-1", "空调设多少度来着").await;
+    let (_session, run) = a_run(&gateway, "rk-1", "空调设多少度来着").await;
     wait_for_terminal(&gateway, &run).await;
 
     let seen = llm.requests.lock().expect("请求表").clone();

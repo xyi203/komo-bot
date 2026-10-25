@@ -1,4 +1,7 @@
-//! 飞书：真 `FeishuSender` 对着 loopback 上的假开放平台，真 Dispatcher 在后面。
+//! 飞书（Durable 存储，D5 W3a）：与 `../feishu.rs` 同名同断言，Gateway 跑在新存储上。读会话 / 输入用
+//! `durable_*` 帮手；其余照旧。原文件的模块文档（入站没走 `FeishuChannel::serve` 的原因）同样适用。
+//!
+//! 真 `FeishuSender` 对着 loopback 上的假开放平台，真 Dispatcher 在后面。
 //!
 //! **入站这一半没有走 `FeishuChannel::serve`**，而是把假开放平台给出的原始事件负载喂给
 //! `feishu::inbound::parse` + `from_message`（渠道自己在
@@ -36,6 +39,7 @@ async fn wire() -> Wired {
     let fake = Arc::new(FakeOpenApi::start(Behavior::default()).await);
     let sender = Arc::new(FeishuSender::with_api(fake.api())) as Arc<dyn ChannelSender>;
     let gateway = GatewayBuilder::new(&config_toml(&feishu_block("\"ou_op\"")))
+        .fake_llm(FakeLlm::finisher("好"))
         .env("KOMO_LLM_API_KEY=test-key\nFEISHU_APP_ID=cli_test\nFEISHU_APP_SECRET=test-app-secret\n")
         .factory(FixedFactory::sender_only(sender))
         .start()
@@ -74,8 +78,8 @@ async fn a_replayed_event_produces_one_run() {
         "重推不该开第二个 Run"
     );
 
-    let runs = wired.gateway.runs_of(&session).await;
-    assert_eq!(runs.len(), 1, "账本上只有一个 Run：{runs:?}");
+    let inputs = wired.gateway.inputs(session.as_str()).await;
+    assert_eq!(inputs, 1, "账本上只有一个 Run");
 }
 
 /// 验证列②：ws 断线重连不丢事件，也不重跑 Run。
@@ -119,8 +123,8 @@ async fn a_reconnect_loses_nothing_and_reruns_nothing() {
         "断线时没送到的那条不能丢：{recovered:?}"
     );
 
-    let runs = wired.gateway.runs_of(&session).await;
-    assert_eq!(runs.len(), 2, "一共两条输入、两个 Run：{runs:?}");
+    let inputs = wired.gateway.inputs(session.as_str()).await;
+    assert_eq!(inputs, 2, "一共两条输入、两个 Run");
 }
 
 /// 飞书私聊也是一个话题一个会话：主线里每一条都开新话题、新会话，都不是 home。
@@ -139,17 +143,18 @@ async fn a_feishu_dm_opens_a_thread_session_instead_of_home() {
         panic!("第二条应该排队");
     };
     assert_ne!(a, b, "主线里的两条是两个话题");
-    let home = wired.gateway.state().default_main_session().await.unwrap();
-    assert_ne!(a, home);
-    assert_ne!(b, home);
-
-    let origins: Vec<String> = wired
+    let (home, _) = wired
         .gateway
-        .sessions()
+        .state()
+        .core()
+        .unwrap()
+        .main_session("assistant")
         .await
-        .into_iter()
-        .map(|record| record.origin)
-        .collect();
+        .unwrap();
+    assert_ne!(a.as_str(), home.id);
+    assert_ne!(b.as_str(), home.id);
+
+    let origins: Vec<String> = wired.gateway.origins().await;
     assert!(
         origins.contains(&"chat:feishu:oc_dm#om_evt-d1".to_string()),
         "{origins:?}"
@@ -199,13 +204,7 @@ async fn a_feishu_group_needs_only_the_mention() {
     let ack = wired.gateway.handle(decode(&outside, false)).await;
     assert!(matches!(ack, InboundAck::Queued { .. }), "{ack:?}");
 
-    let origins: Vec<String> = wired
-        .gateway
-        .sessions()
-        .await
-        .into_iter()
-        .map(|record| record.origin)
-        .collect();
+    let origins: Vec<String> = wired.gateway.origins().await;
     assert!(
         origins.contains(&"chat:feishu:oc_group#om_evt-g2".to_string()),
         "{origins:?}"
@@ -230,7 +229,7 @@ async fn a_feishu_stranger_leaves_no_delivery() {
     assert!(hint.contains("ou_someone"), "{hint}");
     assert!(hint.contains("feishu:oc_dm"), "{hint}");
 
-    assert!(wired.gateway.sessions().await.is_empty(), "不建会话");
+    assert!(wired.gateway.origins().await.is_empty(), "不建会话");
     assert!(
         wired.gateway.pending_deliveries().await.is_empty(),
         "不写投递"
@@ -276,12 +275,8 @@ async fn a_deleted_thread_session_is_replaced_by_a_fresh_one() {
     let (_, first) = group_mention("D1", "@_user_1 先说一句", "", "");
     let (old, _) = queued(&wired.gateway, first.clone()).await;
 
-    wired
-        .gateway
-        .state()
-        .delete_session(&old, true)
-        .await
-        .expect("操作者删会话");
+    // 生命周期（W4a）还没有 Durable 版的 delete：直接把 sessions 行标成已删除。
+    wired.gateway.soft_delete(old.as_str()).await;
 
     let (_, again) = group_mention("D2", "@_user_1 还在吗", "om_D1", "omt_d");
     assert_eq!(again.peer, first.peer, "还是同一个话题");
@@ -298,7 +293,7 @@ async fn a_group_mention_opens_a_thread_that_is_its_own_session() {
     let gate = Gate::new();
     let gateway = GatewayBuilder::new(&config_toml(&feishu_block("\"ou_op\"")))
         .env("KOMO_LLM_API_KEY=test-key\nFEISHU_APP_ID=cli_test\nFEISHU_APP_SECRET=test-app-secret\n")
-        .llm(FakeLlm::new(vec![
+        .fake_llm(FakeLlm::new(vec![
             vec![
                 call_round(1, "pc-1", "gate", serde_json::json!({})),
                 text_round(2, "甲好了。"),
@@ -361,12 +356,7 @@ async fn a_group_mention_opens_a_thread_that_is_its_own_session() {
     let (session_c, _) = queued(&gateway, third).await;
     assert_ne!(session_c, session_a, "另一个话题是另一个 Session");
 
-    let mut origins: Vec<String> = gateway
-        .sessions()
-        .await
-        .into_iter()
-        .map(|record| record.origin)
-        .collect();
+    let mut origins: Vec<String> = gateway.origins().await;
     origins.sort();
     assert_eq!(
         origins,
@@ -422,6 +412,7 @@ async fn wire_tenant(allow_tenant: bool, external_chats: &[&str]) -> Tenant {
          home_chat = \"oc_home\"\n"
     );
     let gateway = GatewayBuilder::new(&config_toml(&block))
+        .fake_llm(FakeLlm::finisher("好"))
         .env("KOMO_LLM_API_KEY=test-key\nFEISHU_APP_ID=cli_test\nFEISHU_APP_SECRET=test-app-secret\n")
         .factory(FixedFactory::sender_only(sender))
         .start()
@@ -490,13 +481,17 @@ async fn a_colleague_in_an_internal_group_is_an_operator_with_allow_tenant() {
     let InboundAck::Queued { session, .. } = ack else {
         panic!("同事应该排队：{ack:?}");
     };
-    let record = komo_store::repos::session::get(&wired.gateway.state().db, &session)
-        .await
+    let record = wired
+        .gateway
+        .state()
+        .core()
         .unwrap()
+        .session(session.as_str())
+        .await
         .expect("会话在");
-    assert_eq!(record.kind, komo_store::models::SessionKind::Normal);
-    assert_eq!(record.agent_id, "assistant");
-    assert_eq!(record.origin, "chat:feishu:oc_group#om_T1");
+    assert_eq!(record.kind, komo_kernel::durable::SessionKind::Normal);
+    assert_eq!(record.agent.as_deref(), Some("assistant"));
+    assert_eq!(record.source.as_deref(), Some("chat:feishu:oc_group#om_T1"));
 
     let status = wired
         .say("T2", "oc_group", "ou_colleague", APP_TENANT, "/status")
@@ -511,7 +506,7 @@ async fn an_external_tenant_sender_is_rejected_even_with_allow_tenant() {
         .say("T3", "oc_group", "ou_outsider", "tenant_other", "你好")
         .await;
     assert!(matches!(ack, InboundAck::Rejected { .. }), "{ack:?}");
-    assert!(wired.gateway.sessions().await.is_empty(), "不留会话");
+    assert!(wired.gateway.origins().await.is_empty(), "不留会话");
 }
 
 #[tokio::test]
@@ -522,7 +517,7 @@ async fn a_colleague_in_an_external_group_is_rejected_even_with_allow_tenant() {
         .say("T4", "oc_ext", "ou_colleague", APP_TENANT, "你好")
         .await;
     assert!(matches!(ack, InboundAck::Rejected { .. }), "{ack:?}");
-    assert!(wired.gateway.sessions().await.is_empty(), "不留会话");
+    assert!(wired.gateway.origins().await.is_empty(), "不留会话");
 }
 
 #[tokio::test]

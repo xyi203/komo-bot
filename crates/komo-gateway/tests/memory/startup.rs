@@ -7,8 +7,6 @@
 
 use std::time::Duration;
 
-use crate::harness::*;
-
 /// 一个收下连接就再也不回话的端点。探测要等满模型超时，所以"等它"与"不等它"差着一个
 /// 数量级——这正是这条测试能测出回归的地方。
 async fn a_silent_endpoint() -> u16 {
@@ -68,7 +66,7 @@ async fn a_silent_embedding_endpoint_never_holds_up_readiness() {
     // 不会把负载下一次慢装配错当成回归。
     let mut started = tokio::time::timeout(
         Duration::from_secs(60),
-        memory_gateway(&config_pointing_at(port)).start(),
+        super::gateway(&config_pointing_at(port)).start(),
     )
     .await
     .expect("就绪不该等向量探测：等满一个超时就是又回到「先探模型再起服务」");

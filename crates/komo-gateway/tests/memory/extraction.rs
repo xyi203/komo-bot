@@ -8,12 +8,13 @@
 use std::sync::Arc;
 
 use komo_kernel::test_support::ScriptedLlm;
-use komo_kernel::traits::{LlmClient, MemoryRepo};
+use komo_kernel::traits::MemoryRepo;
 use komo_kernel::types::memory::{
     Confirmation, MemoryState, MemoryWork, Provenance, RetrievalMode,
 };
 use komo_kernel::types::turn::Round;
 
+use super::{Scripted, a_run, progress, wait_for_terminal};
 use crate::harness::*;
 use crate::{seeded, text_round};
 
@@ -21,25 +22,22 @@ use crate::{seeded, text_round};
 async fn run_and_learn(scripts: Vec<Vec<Round>>, text: &str) -> (TestGateway, ScriptedLlm) {
     let embeddings = ConceptEmbeddings::new();
     let llm = ScriptedLlm::new(scripts);
-    let gateway = memory_gateway(&memory_config("hybrid", true))
+    let gateway = super::gateway(&memory_config("hybrid", true))
         .embeddings(Arc::clone(&embeddings) as Arc<dyn komo_kernel::traits::EmbeddingClient>)
-        .llm(Arc::new(llm.clone()) as Arc<dyn LlmClient>)
+        .scripted(llm.clone())
         .start()
         .await;
 
-    let (_session, run) = crate::a_run(&gateway, "rk-1", text).await;
+    let (_session, run) = a_run(&gateway, "rk-1", text).await;
 
     // 等这一轮到终态——`memory_work` 受理时就是 pending，终态之后会话才能被领取。
     wait_for_terminal(&gateway, &run).await;
 
-    let record = komo_store::repos::runs::get(&gateway.state().db, &run)
-        .await
-        .unwrap()
-        .unwrap();
+    let record = progress(&gateway, &run).await;
     assert_eq!(
-        record.memory_work,
+        record.work,
         MemoryWork::Pending,
-        "终态提交的同一刻就标上了待处理（§9.3）"
+        "已结算的输入就是待处理的工作（§9.3）；游标还没动"
     );
 
     // 后台那一拍是 30 秒一次；测试里直接消费一轮，走的是同一段代码。
@@ -91,13 +89,13 @@ async fn a_user_statement_lands_active_and_unconfirmed_with_its_evidence() {
 async fn an_observation_with_a_real_evidence_id_is_stored_with_its_provenance() {
     let embeddings = ConceptEmbeddings::new();
     let llm = ScriptedLlm::new(vec![vec![text_round(1, "记住了。")]]);
-    let gateway = memory_gateway(&memory_config("hybrid", true))
+    let gateway = super::gateway(&memory_config("hybrid", true))
         .embeddings(Arc::clone(&embeddings) as Arc<dyn komo_kernel::traits::EmbeddingClient>)
-        .llm(Arc::new(llm.clone()) as Arc<dyn LlmClient>)
+        .scripted(llm.clone())
         .start()
         .await;
 
-    let (session, run) = crate::a_run(&gateway, "rk-1", "客厅空调我一直设 26 度").await;
+    let (session, run) = a_run(&gateway, "rk-1", "客厅空调我一直设 26 度").await;
     wait_for_terminal(&gateway, &run).await;
 
     // 从真实日志里取出承载用户输入的那条事件 ID。
@@ -148,12 +146,9 @@ async fn an_observation_with_a_real_evidence_id_is_stored_with_its_provenance() 
     );
 
     // 游标推进，标记落 done——「重复处理相同来源不重复新增」的第一道闸。
-    let after = komo_store::repos::runs::get(&gateway.state().db, &run)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(after.memory_work, MemoryWork::Done);
-    assert!(after.memory_cursor.0 > 0, "游标推进了");
+    let after = progress(&gateway, &run).await;
+    assert_eq!(after.work, MemoryWork::Done);
+    assert!(after.cursor > 0, "游标推进了");
 
     // 再消费一轮：队列里没有 pending，什么都不做。
     let again = gateway.state().memories.process_pending(8).await.unwrap();
@@ -205,7 +200,7 @@ async fn the_memory_model_is_used_for_extraction_not_the_chat_model() {
 /// §14 ②：四种来源在**展示**里分得开——`GET /v1/memories` 把两个轴分开返回。
 #[tokio::test]
 async fn the_four_provenances_stay_apart_end_to_end() {
-    let (gateway, _embeddings) = crate::with_memories(
+    let (gateway, _embeddings) = super::with_memories(
         "keyword",
         vec![
             seeded(
@@ -288,7 +283,7 @@ async fn the_four_provenances_stay_apart_end_to_end() {
 /// §14 ②的后半：**候选不因反复提取而升级**。
 #[tokio::test]
 async fn a_candidate_stays_a_candidate_however_often_it_is_extracted() {
-    let (gateway, _embeddings) = crate::with_memories(
+    let (gateway, _embeddings) = super::with_memories(
         "keyword",
         vec![seeded(
             "m-1",
@@ -346,12 +341,12 @@ async fn a_failed_extraction_stays_pending_for_the_next_round() {
     let embeddings = ConceptEmbeddings::new();
     // 只给对话那一轮脚本；提取那一问会在模型这一层失败。
     let llm = ScriptedLlm::new(vec![vec![text_round(1, "好的。")]]);
-    let gateway = memory_gateway(&memory_config("hybrid", true))
+    let gateway = super::gateway(&memory_config("hybrid", true))
         .embeddings(Arc::clone(&embeddings) as Arc<dyn komo_kernel::traits::EmbeddingClient>)
-        .llm(Arc::new(llm) as Arc<dyn LlmClient>)
+        .scripted(llm)
         .start()
         .await;
-    let (_session, run) = crate::a_run(&gateway, "rk-1", "客厅空调我一直设 26 度").await;
+    let (_session, run) = a_run(&gateway, "rk-1", "客厅空调我一直设 26 度").await;
     wait_for_terminal(&gateway, &run).await;
 
     past_extract_idle().await;
@@ -359,16 +354,13 @@ async fn a_failed_extraction_stays_pending_for_the_next_round() {
     assert_eq!(report.failed, 1, "{report:?}");
     assert_eq!(report.applied, 0);
 
-    let after = komo_store::repos::runs::get(&gateway.state().db, &run)
-        .await
-        .unwrap()
-        .unwrap();
+    let after = progress(&gateway, &run).await;
     assert_eq!(
-        after.memory_work,
+        after.work,
         MemoryWork::Pending,
         "放回 pending 就是「下次重试」"
     );
-    assert_eq!(after.memory_cursor.0, 0, "失败不推进游标（§9.3）");
+    assert_eq!(after.cursor, 0, "失败不推进游标（§9.3）");
     assert!(
         gateway
             .state()
@@ -382,20 +374,63 @@ async fn a_failed_extraction_stays_pending_for_the_next_round() {
     );
 }
 
+/// 记忆模式按**提取那一刻**的配置（W4b 的决定，不冻进 `komo.agent`）：Run 受理时 Agent 是共享记忆，
+/// 提取之前操作者把它改成 `off` 并重载——这条 Run 不再提取（不调记忆模型），记成已处理。
+///
+/// 与 Legacy 不同：Legacy 把记忆模式冻在 `run.accepted` 里，改配置之后受理前的 Run 仍按旧模式提取。
+/// 提取要等会话空闲 `extract_idle` 之后才跑，这段空窗里"关掉记忆"应当立刻生效，而不是让已经说过的话
+/// 在关掉之后又被写进库。
+#[tokio::test]
+async fn extraction_follows_the_memory_mode_at_extraction_time() {
+    let llm = ScriptedLlm::new(vec![
+        vec![text_round(1, "记住了。")],
+        vec![text_round(1, r#"{"observations":[]}"#)],
+    ]);
+    let config = memory_config("keyword", false);
+    let gateway = super::gateway(&config).scripted(llm.clone()).start().await;
+    let (_session, run) = a_run(&gateway, "rk-mode", "客厅空调我一直设 26 度").await;
+    wait_for_terminal(&gateway, &run).await;
+
+    // 提取之前：Agent 关了记忆。
+    gateway.write_config(&config.replace(
+        "[agents.assistant]\n",
+        "[agents.assistant]\nmemory = \"off\"\n",
+    ));
+    gateway.reload().await;
+    past_extract_idle().await;
+    let report = gateway
+        .state()
+        .memories
+        .process_pending(komo_runtime::memory::WORK_BATCH)
+        .await
+        .expect("这一轮提取跑得动");
+    assert_eq!(report.skipped, 1, "{report:?}");
+    assert_eq!(report.applied, 0, "{report:?}");
+    assert_eq!(
+        llm.requests.lock().expect("请求表").len(),
+        1,
+        "只有对话那一问，没有提取调用"
+    );
+    assert_eq!(
+        progress(&gateway, &run).await.work,
+        MemoryWork::Done,
+        "跳过的 Run 也记成已处理"
+    );
+}
+
 // ---------------------------------------------------------------- 小工具
 
 async fn read_events(
     gateway: &TestGateway,
     session: &komo_kernel::types::ids::SessionId,
 ) -> Vec<komo_kernel::events::Event> {
-    use komo_kernel::traits::Ledger;
-    let batch = gateway
-        .state()
-        .routed
-        .read(session, komo_kernel::types::ids::Seq::ZERO, 0)
-        .await
-        .expect("读得出");
-    batch.events
+    use komo_runtime::memory::SessionEvents;
+    komo_runtime::memory::durable::DurableSessionEvents::new(std::sync::Arc::clone(
+        &komo_gateway::service::test_support::driver_stream::core(gateway).storage,
+    ))
+    .events_of(session)
+    .await
+    .expect("读得出")
 }
 
 /// 用另一段脚本消费一次记忆队列。
@@ -405,12 +440,18 @@ async fn read_events(
 /// `MemoryManager`——**读写的是同一个 state.db 与同一条队列**，跑的是同一段代码，只是
 /// 模型换了一段脚本。
 async fn learn_with(gateway: &TestGateway, llm: ScriptedLlm) {
-    use komo_runtime::memory::{DbMemoryWork, LedgerEvents, MemoryManager, MemoryParts};
+    use komo_kernel::traits::LlmClient;
+    use komo_runtime::memory::{MemoryManager, MemoryParts};
     let state = gateway.state();
     let snapshot = state.snapshot();
     let repo: Arc<dyn MemoryRepo> = Arc::clone(&state.memory);
     let catalog: Arc<dyn komo_runtime::memory::MemoryCatalog> =
         Arc::new(komo_store::TursoMemoryRepo::new(state.db.clone()));
+    let (events, work) = komo_gateway::service::durable::memory::seams(
+        &komo_gateway::service::test_support::driver_stream::core(gateway),
+        &state.config,
+        &state.clock,
+    );
     let manager = MemoryManager::new(MemoryParts {
         config: snapshot.memory.clone(),
         repo,
@@ -422,17 +463,12 @@ async fn learn_with(gateway: &TestGateway, llm: ScriptedLlm) {
             ConceptEmbeddings::new() as Arc<dyn komo_kernel::traits::EmbeddingClient>
         }),
         llm: Arc::new(llm) as Arc<dyn LlmClient>,
-        events: Arc::new(LedgerEvents(
-            Arc::clone(&state.routed) as Arc<dyn komo_kernel::traits::Ledger>
-        )),
-        work: Arc::new(DbMemoryWork::new(
-            state.db.clone(),
-            Arc::clone(&state.clock),
-        )),
+        events,
+        work,
         clock: Arc::clone(&state.clock),
         render: komo_agent::context::memory::render,
     });
-    // 直接用这一台新的消费队列——它读写的是**同一个 state.db**。
+    // 直接用这一台新的消费队列——它读写的是**同一个 durable.db 与 aux.db**。
     past_extract_idle().await;
     manager.process_pending(8).await.expect("提取跑得动");
 }

@@ -69,7 +69,7 @@ async fn a_big_tool_output_keeps_both_ends_and_the_uri_it_points_at_really_reads
         ),
         text_round(2, "读完了。"),
     ]]);
-    let gateway = home.start_durable(Arc::clone(&llm)).await;
+    let gateway = home.start(Arc::clone(&llm)).await;
     let session = gateway.open_session().await;
     let run = gateway
         .submit(&session, "obs-1", "把那份大文件读一遍")
@@ -91,7 +91,7 @@ async fn a_big_tool_output_keeps_both_ends_and_the_uri_it_points_at_really_reads
 
     // 完整输出的引用是一条**资源入口**，它指的正是这次落盘的那一份 `output.json`——拼法只有一处
     // （`output_file_path`），两边共用。
-    let events = gateway.durable_events(&session).await;
+    let events = gateway.events(&session).await;
     let result = tool_results(&events).pop().expect("有结果");
     let output = home.session_dir(&session).join(result.output_ref.path());
     let readable = std::fs::canonicalize(&output).expect("output.json 真的在");
@@ -124,7 +124,7 @@ async fn a_big_tool_output_keeps_both_ends_and_the_uri_it_points_at_really_reads
     // 首次请求刻意用 2 KiB 测截断；重新读单行 JSON 时恢复默认 50 KiB。
     // pi 的 head 视图不切开长行，因此 2 KiB 无法展示这一整行。
     std::fs::write(home.path().join("config.toml"), config_toml("")).expect("恢复默认模型输出预算");
-    let gateway = home.start_durable(Arc::clone(&llm)).await;
+    let gateway = home.start(Arc::clone(&llm)).await;
     let run = gateway
         .submit(&session, "obs-2", "把完整输出读出来")
         .await
@@ -161,7 +161,7 @@ async fn the_replayed_window_renders_the_same_bytes_as_the_live_round() {
         ),
         text_round(2, "都做完了。"),
     ]]);
-    let gateway = home.start_durable(Arc::clone(&llm)).await;
+    let gateway = home.start(Arc::clone(&llm)).await;
     let session = gateway.open_session().await;
     let run = gateway.submit(&session, "obs-3", "读一遍大文件").await.run;
     let detail = gateway.wait_terminal(&run).await;
@@ -170,7 +170,7 @@ async fn the_replayed_window_renders_the_same_bytes_as_the_live_round() {
     gateway.stop().await;
 
     let llm2 = FakeLlm::finisher("好。");
-    let gateway = home.start_durable(Arc::clone(&llm2)).await;
+    let gateway = home.start(Arc::clone(&llm2)).await;
     let run = gateway.submit(&session, "obs-3b", "再说一句").await.run;
     gateway.wait_terminal(&run).await;
     assert_eq!(
@@ -202,7 +202,7 @@ async fn a_fused_edit_runs_once_and_replays_the_same_bytes() {
         ),
         text_round(2, "改完也跑过了。"),
     ]]);
-    let gateway = home.start_durable(Arc::clone(&llm)).await;
+    let gateway = home.start(Arc::clone(&llm)).await;
     let session = gateway.open_session().await;
     let run = gateway
         .submit(&session, "obs-fused", "改版本号然后跑一下")
@@ -222,7 +222,7 @@ async fn a_fused_edit_runs_once_and_replays_the_same_bytes() {
         live.contains("version = 2"),
         "命令的输出在同一条结果里：{live}"
     );
-    let events = gateway.durable_events(&session).await;
+    let events = gateway.events(&session).await;
     let results = tool_results(&events);
     assert_eq!(results.len(), 1, "组合调用的结果是一条");
     assert!(
@@ -240,7 +240,7 @@ async fn a_fused_edit_runs_once_and_replays_the_same_bytes() {
     gateway.stop().await;
 
     let llm2 = FakeLlm::finisher("好。");
-    let gateway = home.start_durable(Arc::clone(&llm2)).await;
+    let gateway = home.start(Arc::clone(&llm2)).await;
     let run = gateway
         .submit(&session, "obs-fused-2", "再说一句")
         .await
@@ -264,7 +264,7 @@ async fn a_refused_call_renders_the_same_bytes_live_and_replayed() {
         call_round(1, "pc-nope", "nope", serde_json::json!({})),
         text_round(2, "没有这个工具，算了。"),
     ]]);
-    let gateway = home.start_durable(Arc::clone(&llm)).await;
+    let gateway = home.start(Arc::clone(&llm)).await;
     let session = gateway.open_session().await;
     let run = gateway
         .submit(&session, "obs-4", "调一个不存在的工具")
@@ -279,7 +279,7 @@ async fn a_refused_call_renders_the_same_bytes_live_and_replayed() {
     gateway.stop().await;
 
     let llm2 = FakeLlm::finisher("好。");
-    let gateway = home.start_durable(Arc::clone(&llm2)).await;
+    let gateway = home.start(Arc::clone(&llm2)).await;
     let run = gateway.submit(&session, "obs-4b", "再说一句").await.run;
     gateway.wait_terminal(&run).await;
     assert_eq!(
@@ -298,7 +298,6 @@ async fn recorded(
 ) -> (TestGateway, Arc<RecordingStream>) {
     let recording = RecordingStream::new(Arc::clone(llm) as Arc<dyn ModelStream>);
     let mut builder = GatewayBuilder::new(config)
-        .durable()
         .fake_llm(Arc::clone(llm))
         .stream(Arc::clone(&recording) as Arc<dyn ModelStream>)
         .at(home.path());
@@ -465,7 +464,7 @@ async fn the_decayed_view_is_the_same_live_and_replayed() {
     assert!(live.contains("完整输出：artifact://"), "{live}");
     assert!(live.len() + 1024 <= full.len());
 
-    let events = gateway.durable_events(&session).await;
+    let events = gateway.events(&session).await;
     let [
         ContextCompacted::Decayed {
             calls, decision, ..
@@ -541,7 +540,7 @@ async fn a_short_task_never_rewrites_a_big_result() {
             .map(|(_, text)| text.as_str());
         assert_eq!(big, Some(full.as_str()), "第 {index} 次请求不改前缀");
     }
-    assert!(decayed_decisions(&gateway.durable_events(&session).await).is_empty());
+    assert!(decayed_decisions(&gateway.events(&session).await).is_empty());
     gateway.stop().await;
 
     let llm2 = FakeLlm::finisher("好。");
@@ -562,6 +561,6 @@ async fn a_short_task_never_rewrites_a_big_result() {
         .map(|(_, text)| text.clone())
         .expect("回放里有那条 read 结果");
     assert_eq!(replayed, full, "回放仍是活着时给过的完整正文");
-    assert!(decayed_decisions(&gateway.durable_events(&session).await).is_empty());
+    assert!(decayed_decisions(&gateway.events(&session).await).is_empty());
     gateway.stop().await;
 }

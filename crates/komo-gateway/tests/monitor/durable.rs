@@ -25,7 +25,6 @@ use super::{MonitorLlm, Script, ScriptDriver, config, last_user_text};
 
 async fn start(llm: &Arc<MonitorLlm>, at: Option<&Path>) -> TestGateway {
     let mut builder = GatewayBuilder::new(&config())
-        .durable()
         .llm(Arc::clone(llm) as Arc<dyn LlmClient>)
         .stream(DriverStream::new(Arc::clone(llm) as Arc<dyn LlmClient>));
     if let Some(home) = at {
@@ -453,7 +452,6 @@ async fn a_monitor_event_interjects_into_the_still_running_host() {
         proceed: proceed.clone(),
     });
     let mut gateway = GatewayBuilder::new(&config())
-        .durable()
         .llm(Arc::clone(&llm))
         .stream(DriverStream::new(llm))
         .start()

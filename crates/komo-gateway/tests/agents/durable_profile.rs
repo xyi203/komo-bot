@@ -60,7 +60,7 @@ async fn two_agents_keep_their_sessions_prompts_and_tools_apart() {
         // coder 那一段：同一个调用，这次能写。
         vec![write_call(1, "notes.md"), text_round(2, "写好了。")],
     ]);
-    let gateway = home.start_durable(Arc::clone(&llm)).await;
+    let gateway = home.start(Arc::clone(&llm)).await;
     let core = Arc::clone(gateway.state().core().expect("Durable 模式"));
 
     // ── 1. 主会话按 Agent 分：各一份，归属写在会话上。
@@ -172,7 +172,6 @@ async fn editing_a_profile_applies_from_the_next_request_of_a_run_in_flight() {
     let recording =
         RecordingStream::new(Arc::clone(&llm) as Arc<dyn komo_runtime::llm::ModelStream>);
     let mut gateway = GatewayBuilder::new(&gated(FIRST, "gpt-test"))
-        .durable()
         .fake_llm(Arc::clone(&llm))
         .stream(Arc::clone(&recording) as Arc<dyn komo_runtime::llm::ModelStream>)
         .tool(gate.tool())
@@ -230,7 +229,6 @@ async fn project_files_are_pinned_until_the_next_head_and_updates_ride_on_the_ne
         RecordingStream::new(Arc::clone(&llm) as Arc<dyn komo_runtime::llm::ModelStream>);
     let home = Home::with_config(&gated(FIRST, "gpt-test"));
     let mut gateway = GatewayBuilder::new(&gated(FIRST, "gpt-test"))
-        .durable()
         .fake_llm(Arc::clone(&llm))
         .stream(Arc::clone(&recording) as Arc<dyn komo_runtime::llm::ModelStream>)
         .tool(gate.tool())
@@ -375,7 +373,6 @@ async fn a_restart_resumes_an_in_flight_request_on_its_frozen_model_and_prompt()
     let held = RecordingStream::new(Arc::clone(&llm) as Arc<dyn komo_runtime::llm::ModelStream>);
     held.hold_next();
     let mut first = GatewayBuilder::new(&gated(FIRST, "gpt-test"))
-        .durable()
         .fake_llm(Arc::clone(&llm))
         .stream(Arc::clone(&held) as Arc<dyn komo_runtime::llm::ModelStream>)
         .start()
@@ -399,7 +396,6 @@ async fn a_restart_resumes_an_in_flight_request_on_its_frozen_model_and_prompt()
     let recording =
         RecordingStream::new(Arc::clone(&resumed_llm) as Arc<dyn komo_runtime::llm::ModelStream>);
     let mut second = GatewayBuilder::new(&gated(SECOND, "gpt-test-2"))
-        .durable()
         .fake_llm(Arc::clone(&resumed_llm))
         .stream(Arc::clone(&recording) as Arc<dyn komo_runtime::llm::ModelStream>)
         .at(&first.home)
@@ -441,7 +437,7 @@ async fn a_session_without_an_owner_runs_as_the_default_agent() {
         vec![text_round(1, "好。")],
         vec![text_round(1, "好。")],
     ]);
-    let gateway = home.start_durable(Arc::clone(&llm)).await;
+    let gateway = home.start(Arc::clone(&llm)).await;
     let core = Arc::clone(gateway.state().core().expect("Durable 模式"));
 
     // ① `POST /v1/sessions`：归属在建的时候就写下来了。

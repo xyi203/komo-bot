@@ -4,10 +4,10 @@ use std::sync::Arc;
 
 use komo_kernel::protocol::http::RunDetail;
 use komo_kernel::test_support::ScriptedLlm;
-use komo_kernel::traits::LlmClient;
 use komo_kernel::types::ids::{MemoryId, RunId};
 use komo_kernel::types::memory::{MemoryState, Provenance, RetrievalMode};
 
+use super::{Scripted, a_run, run_in, wait_for_terminal};
 use crate::harness::*;
 use crate::{seeded, text_round};
 
@@ -26,9 +26,9 @@ async fn run_detail_lists_injected_memories_and_how_they_were_recalled() {
         vec![text_round(1, "26 度。")],
         vec![text_round(1, "还是 26 度。")],
     ]);
-    let gateway = memory_gateway(&memory_config("hybrid", true))
+    let gateway = super::gateway(&memory_config("hybrid", true))
         .embeddings(Arc::clone(&embeddings) as Arc<dyn komo_kernel::traits::EmbeddingClient>)
-        .llm(Arc::new(llm.clone()) as Arc<dyn LlmClient>)
+        .scripted(llm.clone())
         .start()
         .await;
     gateway
@@ -47,7 +47,7 @@ async fn run_detail_lists_injected_memories_and_how_they_were_recalled() {
         .unwrap();
     gateway.state().memories.build_index().await.unwrap();
 
-    let (session, first) = crate::a_run(&gateway, "ri-1", "空调几度来着").await;
+    let (session, first) = a_run(&gateway, "ri-1", "空调几度来着").await;
     wait_for_terminal(&gateway, &first).await;
     let one = detail(&gateway, &first).await;
     assert_eq!(one.memories.len(), 1, "{:?}", one.memories);
@@ -62,14 +62,7 @@ async fn run_detail_lists_injected_memories_and_how_they_were_recalled() {
     );
     assert_eq!(recall.dropped_by_budget, Some(0));
 
-    let (status, body) = gateway
-        .post_json(
-            &format!("/v1/sessions/{session}/runs"),
-            serde_json::json!({"request_key": "ri-2", "text": "空调几度来着"}),
-        )
-        .await;
-    assert_eq!(status, 200, "{body}");
-    let second: RunId = serde_json::from_value(body["run"].clone()).expect("run id");
+    let second: RunId = run_in(&gateway, &session, "ri-2", "空调几度来着").await;
     wait_for_terminal(&gateway, &second).await;
     let two = detail(&gateway, &second).await;
     assert_eq!(two.memories, one.memories, "同一段沿用同一块");

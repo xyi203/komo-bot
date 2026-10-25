@@ -3,10 +3,8 @@
 use std::sync::Arc;
 
 use komo_kernel::cron::FiringStatus;
-use komo_kernel::traits::LlmClient;
-use komo_kernel::types::status::WaitReason;
 
-use komo_gateway::service::test_support::Unsure;
+use komo_gateway::service::test_support::Gate;
 
 use crate::harness::*;
 
@@ -32,7 +30,7 @@ async fn a_restart_does_not_create_the_same_firing_twice() {
 
     // 第一台：投出这一槽。
     let gw = home
-        .start(FakeLlm::always(vec![text_round(1, "做完了")]) as Arc<dyn LlmClient>)
+        .start(FakeLlm::always(vec![text_round(1, "做完了")]))
         .await;
     let job = gw.add_job(daily()).await;
     gw.make_due(&job.id).await;
@@ -42,21 +40,15 @@ async fn a_restart_does_not_create_the_same_firing_twice() {
     assert_eq!(first.fired.len(), 1, "{first:?}");
     let run = first.fired[0].run.clone();
     gw.wait_state(&run, |s| s.is_terminal(), "终态").await;
-    gw.stop().await;
-
-    let firings_before = {
-        use komo_kernel::traits::CronRepo;
-        let db = komo_store::Db::connect(home.path().join("state.db"))
-            .await
-            .expect("打开库");
-        let repo = komo_store::TursoCronRepo::new(db);
-        repo.firings(&job.id, 10).await.expect("读得出")
-    };
+    // Durable：触发记录在 `aux.db`（Turso 对库文件持进程独占锁，停机后不能另开），所以在停机
+    // 之前读——持久化的就是这一份，重启后同一个 `aux.db` 再读到的还是它。
+    let firings_before = gw.firings(&job.id).await;
     assert_eq!(firings_before.len(), 1);
+    gw.stop().await;
 
     // ── 重启。同一个数据目录。
     let gw = home
-        .start(FakeLlm::always(vec![text_round(1, "做完了")]) as Arc<dyn LlmClient>)
+        .start(FakeLlm::always(vec![text_round(1, "做完了")]))
         .await;
 
     // 把槽位按回原处：这就是"推进已经算出来了、但落库前进程没了"。
@@ -95,23 +87,19 @@ async fn a_restart_does_not_create_the_same_firing_twice() {
 #[tokio::test]
 async fn an_overlapping_slot_is_skipped_and_leaves_a_trace() {
     let home = Home::new();
-    let unsure = Unsure::new();
-    home.install_tools(vec![unsure.tool()]);
+    let gate = Gate::new();
+    home.install_tools(vec![gate.tool()]);
 
-    // 模型每一段都调一次 `unsure`：结果不明，于是第一次触发**停在等人核对上**——
-    // §10 说的"还没结束"就是这一种。
-    let llm = FakeLlm::always(vec![unsure_round(1, "pc-1")]);
-    let gw = home.start(Arc::clone(&llm) as Arc<dyn LlmClient>).await;
+    // 模型每一段都调一次 `gate`：门不开，第一次触发就一直没结束。Legacy 版靠 `unsure` 停在
+    // 等人核对上；新语义里结果不明直接交给模型，不再有那种等待，"还没结束"就是 run 还在跑。
+    let llm = FakeLlm::always(vec![gate_round(1, "pc-1")]);
+    let gw = home.start(Arc::clone(&llm)).await;
 
     let job = gw.add_job(daily()).await;
     gw.make_due(&job.id).await;
     let first = gw.tick().await;
     assert_eq!(first.fired.len(), 1);
-    let wait = gw.wait_waiting(&first.fired[0].run).await;
-    assert!(
-        matches!(wait, WaitReason::Intervention { .. }),
-        "「还没结束」就是这条：停在等人核对上：{wait:?}"
-    );
+    gate.wait_entered(1).await;
 
     // 下一槽到了，而上一次还在等人。
     gw.make_due(&job.id).await;
@@ -134,7 +122,8 @@ async fn an_overlapping_slot_is_skipped_and_leaves_a_trace() {
     );
 
     // 动作只发生了一次：第二槽没有再起一个 Run。
-    assert_eq!(unsure.ran(), 1, "跳过的那一槽什么都没跑");
+    assert_eq!(gate.entered(), 1, "跳过的那一槽什么都没跑");
+    gate.release();
     gw.stop().await;
 }
 
@@ -142,28 +131,25 @@ async fn an_overlapping_slot_is_skipped_and_leaves_a_trace() {
 #[tokio::test]
 async fn an_allow_policy_fires_even_when_the_last_one_is_still_waiting() {
     let home = Home::new();
-    let unsure = Unsure::new();
-    home.install_tools(vec![unsure.tool()]);
-    let llm = FakeLlm::always(vec![unsure_round(1, "pc-1")]);
-    let gw = home.start(Arc::clone(&llm) as Arc<dyn LlmClient>).await;
+    let gate = Gate::new();
+    home.install_tools(vec![gate.tool()]);
+    let llm = FakeLlm::always(vec![gate_round(1, "pc-1")]);
+    let gw = home.start(Arc::clone(&llm)).await;
 
     let mut body = daily();
     body["overlap"] = serde_json::json!("allow");
     let job = gw.add_job(body).await;
 
     gw.make_due(&job.id).await;
-    let first = gw.tick().await;
-    let wait = gw.wait_waiting(&first.fired[0].run).await;
-    assert!(
-        matches!(wait, WaitReason::Intervention { .. }),
-        "停在等人核对上：{wait:?}"
-    );
+    let _first = gw.tick().await;
+    gate.wait_entered(1).await;
 
     gw.make_due(&job.id).await;
     let second = gw.tick().await;
     assert_eq!(second.fired.len(), 1, "allow 照样投：{second:?}");
     assert_eq!(gw.firings(&job.id).await.len(), 2);
 
+    gate.release();
     gw.stop().await;
 }
 
@@ -172,7 +158,7 @@ async fn an_allow_policy_fires_even_when_the_last_one_is_still_waiting() {
 async fn the_list_shows_the_last_firing_and_the_next_slot() {
     let home = Home::new();
     let gw = home
-        .start(FakeLlm::always(vec![text_round(1, "整理好了")]) as Arc<dyn LlmClient>)
+        .start(FakeLlm::always(vec![text_round(1, "整理好了")]))
         .await;
     let job = gw.add_job(daily()).await;
 
@@ -214,5 +200,79 @@ async fn the_list_shows_the_last_firing_and_the_next_slot() {
     }
     assert!(ok, "触发状态最终应当是 ok");
 
+    gw.stop().await;
+}
+
+/// Durable 独有：触发建出来的是 `kind = cron` 的会话，`komo.agent` 带着 Job 的模型 alias、effort、
+/// `maxRounds` 与工作目录，输入 entry 是 `cron.input`（`data {job, slot}`）。
+#[tokio::test]
+async fn a_firing_creates_a_cron_session_carrying_the_job_overrides() {
+    use komo_gateway::service::durable::agent_doc;
+    use komo_kernel::durable::SessionKind;
+
+    let home = Home::new();
+    let gw = home
+        .start(FakeLlm::always(vec![text_round(1, "整理好了")]))
+        .await;
+    let mut body = daily();
+    body["model"] = serde_json::json!("job");
+    body["effort"] = serde_json::json!("high");
+    body["max_rounds"] = serde_json::json!(12);
+    let job = gw.add_job(body).await;
+    gw.make_due(&job.id).await;
+    let fired = gw.tick().await.fired[0].clone();
+    gw.wait_state(&fired.run, |s| s.is_terminal(), "终态").await;
+
+    let core = gw.state().core().unwrap().clone();
+    let record = core
+        .storage
+        .session(fired.session.as_str())
+        .await
+        .unwrap()
+        .expect("会话建出来了");
+    assert_eq!(record.kind, SessionKind::Cron);
+    let doc = agent_doc::read(&*core.storage, record.root_conversation)
+        .await
+        .unwrap()
+        .expect("有 komo.agent");
+    assert_eq!(doc.model.as_deref(), Some("job"));
+    assert_eq!(doc.effort.as_deref(), Some("high"));
+    assert_eq!(doc.max_rounds, Some(12));
+    assert_eq!(
+        doc.source.as_deref(),
+        Some(format!("cron:{}", job.id).as_str())
+    );
+
+    let (code, text) = gw
+        .get(&format!("/v1/sessions/{}/tree", fired.session))
+        .await;
+    assert_eq!(code, 200, "{text}");
+    assert!(text.contains("整理今天的技术动态"), "{text}");
+    gw.stop().await;
+}
+
+/// 重启幂等：同一个预分配的 Session ID 再投一次，只取回原来的 Run，不再建会话。
+#[tokio::test]
+async fn firing_twice_with_the_same_session_returns_the_same_run() {
+    use komo_runtime::scheduler::{FireSpec, firing_key};
+
+    let home = Home::new();
+    let gw = home.start(FakeLlm::always(vec![text_round(1, "好")])).await;
+    let job = gw.add_job(daily()).await;
+    let slot = time::OffsetDateTime::now_utc();
+    let spec = FireSpec {
+        job: job.clone(),
+        session: komo_kernel::types::ids::SessionId::new_at(slot),
+        request_key: firing_key(&job.id, slot),
+        model: gw.state().snapshot().model.clone(),
+        slot: Some(slot),
+        at: slot,
+    };
+    let target = gw.state().durable_cron_target();
+    let first = target.fire(spec.clone()).await.expect("投得出");
+    assert!(!first.deduplicated);
+    let second = target.fire(spec).await.expect("补投得出");
+    assert!(second.deduplicated);
+    assert_eq!(first.run, second.run);
     gw.stop().await;
 }

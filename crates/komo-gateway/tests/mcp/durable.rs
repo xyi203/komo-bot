@@ -3,7 +3,7 @@
 //!
 //! 共同的改动：
 //!
-//! - 起 Gateway 用 `Home::start_durable`（`FakeLlm` 同时是 `ModelStream`）；
+//! - 起 Gateway 用 `Home::start`（`FakeLlm` 同时是 `ModelStream`）；
 //! - `gw.interventions().is_empty()`（证"不该停下来问人"）一句删掉：新存储没有 `waiting + intervention`
 //!   状态，Run 要么收尾要么 faulted，`wait_terminal` + `Completed` 已经说明没有停住；
 //! - "冻结能力面"改成"每阶段（每次请求）按当前目录解析"：Legacy 的 Run 受理时冻结能力面与 MCP 目录，
@@ -48,7 +48,7 @@ async fn a_read_only_mcp_tool_runs_and_sees_only_declared_env() {
         ),
         text_round(2, "好了"),
     ]]);
-    let gw = home.start_durable(Arc::clone(&llm)).await;
+    let gw = home.start(Arc::clone(&llm)).await;
     let names = mounted(&gw).await;
     assert!(
         names.iter().any(|name| name == "mcp__demo__bump"),
@@ -77,7 +77,7 @@ async fn a_side_effecting_mcp_tool_runs_directly_and_once() {
         call_round(1, "pc-1", "mcp__demo__bump", serde_json::json!({})),
         text_round(2, "加好了"),
     ]]);
-    let gw = home.start_durable(Arc::clone(&llm)).await;
+    let gw = home.start(Arc::clone(&llm)).await;
 
     let session = gw.open_session().await;
     let run = gw.submit(&session, "mcp-2", "加一").await.run;
@@ -95,7 +95,7 @@ async fn a_broken_server_does_not_take_the_others_down() {
 command = "/nonexistent/mcp-server"
 "#,
     );
-    let gw = home.start_durable(FakeLlm::finisher("好")).await;
+    let gw = home.start(FakeLlm::finisher("好")).await;
     let names = &mounted(&gw).await;
     assert!(
         names.iter().any(|name| name == "mcp__demo__echo"),
@@ -126,7 +126,7 @@ tools.mcp__demo__bump()
         call_round(1, "pc-1", "codemode", serde_json::json!({ "code": code })),
         text_round(2, "好了"),
     ]]);
-    let gw = home.start_durable(Arc::clone(&llm)).await;
+    let gw = home.start(Arc::clone(&llm)).await;
     assert!(
         gw.state()
             .tool_names()
@@ -178,7 +178,7 @@ async fn direct_and_hidden_exposure_follow_the_config() {
 tool_exposure = { "b*" = "hidden" }"#,
     );
     let llm = FakeLlm::finisher("好");
-    let gw = home.start_durable(Arc::clone(&llm)).await;
+    let gw = home.start(Arc::clone(&llm)).await;
     let names = &mounted(&gw).await;
     assert!(
         names.iter().any(|name| name == "mcp__demo__echo"),
@@ -228,7 +228,7 @@ async fn codemode_side_effecting_mcp_is_journaled_and_only_parent_enters_model_m
         ),
         text_round(2, "好了"),
     ]]);
-    let gw = home.start_durable(Arc::clone(&llm)).await;
+    let gw = home.start(Arc::clone(&llm)).await;
     assert!(
         gw.state()
             .tool_names()
@@ -245,7 +245,7 @@ async fn codemode_side_effecting_mcp_is_journaled_and_only_parent_enters_model_m
     let results = tool_results(&llm);
     assert_eq!(results.len(), 1);
     assert!(results[0].contains("bumped"));
-    let events = gw.durable_events(&session).await;
+    let events = gw.events(&session).await;
     let model_results = events
         .iter()
         .filter(|event| {
@@ -325,7 +325,7 @@ args = ["-c", "import sys; sys.stdin.read()"]
         text_round(2, "好了"),
     ]]);
     let begun = std::time::Instant::now();
-    let gw = home.start_durable(Arc::clone(&llm)).await;
+    let gw = home.start(Arc::clone(&llm)).await;
     let ready = begun.elapsed();
     assert!(
         ready < std::time::Duration::from_secs(5),
@@ -385,7 +385,7 @@ async fn a_run_right_after_start_waits_for_its_mcp_server() {
     )
     .unwrap();
     let llm = echo_twice();
-    let gw = home.start_durable(Arc::clone(&llm)).await;
+    let gw = home.start(Arc::clone(&llm)).await;
     let session = gw.open_session().await;
     let run = gw.submit(&session, "resumed", "调一下").await.run;
     let detail = gw.wait_terminal(&run).await;
@@ -418,7 +418,7 @@ async fn a_run_is_told_why_its_mcp_server_is_missing() {
     );
     std::fs::write(home.path().join("config.toml"), config).unwrap();
     let llm = echo_twice();
-    let gw = home.start_durable(Arc::clone(&llm)).await;
+    let gw = home.start(Arc::clone(&llm)).await;
     let session = gw.open_session().await;
     let run = gw.submit(&session, "resumed", "调一下").await.run;
     let detail = gw.wait_terminal(&run).await;
@@ -467,7 +467,7 @@ async fn logging_in_after_start_mounts_the_tools_on_the_next_run() {
             text_round(2, "好了"),
         ],
     ]);
-    let gw = home.start_durable(Arc::clone(&llm)).await;
+    let gw = home.start(Arc::clone(&llm)).await;
     let names = gw.state().tool_names();
     assert!(
         !names.iter().any(|name| name.starts_with("mcp__secure__")),
@@ -504,7 +504,7 @@ async fn a_rejected_token_asks_for_login_and_the_next_login_reconnects() {
         ]
     };
     let llm = FakeLlm::new(vec![whoami("pc-1"), whoami("pc-2")]);
-    let gw = home.start_durable(Arc::clone(&llm)).await;
+    let gw = home.start(Arc::clone(&llm)).await;
     assert!(
         mounted(&gw)
             .await
@@ -516,7 +516,7 @@ async fn a_rejected_token_asks_for_login_and_the_next_login_reconnects() {
     let session = gw.open_session().await;
     let run = gw.submit(&session, "expired", "调一下").await.run;
     gw.wait_terminal(&run).await;
-    let events = gw.durable_events(&session).await;
+    let events = gw.events(&session).await;
     let rejected = events
         .iter()
         .rev()
@@ -572,7 +572,7 @@ async fn a_server_added_by_reload_is_seen_by_the_next_run() {
         ),
         text_round(2, "好了"),
     ]]);
-    let gw = home.start_durable(Arc::clone(&llm)).await;
+    let gw = home.start(Arc::clone(&llm)).await;
     assert!(!has_demo(&gw.state().tool_names()));
 
     std::fs::write(
@@ -619,7 +619,7 @@ async fn a_server_added_by_reload_is_seen_by_the_next_run() {
 async fn a_server_removed_by_reload_is_gone_for_the_next_run() {
     let (home, _) = home_with_demo(r#"exposure = "direct""#);
     let llm = FakeLlm::finisher("好");
-    let gw = home.start_durable(Arc::clone(&llm)).await;
+    let gw = home.start(Arc::clone(&llm)).await;
     assert!(has_demo(&mounted(&gw).await));
 
     std::fs::write(home.path().join("config.toml"), config_toml("")).unwrap();
@@ -666,7 +666,7 @@ async fn a_running_run_is_told_the_server_was_removed() {
         ),
         text_round(3, "好"),
     ]]);
-    let gw = home.start_durable(Arc::clone(&llm)).await;
+    let gw = home.start(Arc::clone(&llm)).await;
     let session = gw.open_session().await;
     let run = gw.submit(&session, "in-flight", "调一下").await.run;
     gate.wait_entered(1).await;
@@ -694,7 +694,7 @@ async fn a_running_run_is_told_the_server_was_removed() {
 async fn an_invalid_mcp_reload_leaves_the_servers_alone() {
     let (home, _) = home_with_demo("");
     let llm = FakeLlm::finisher("好");
-    let gw = home.start_durable(Arc::clone(&llm)).await;
+    let gw = home.start(Arc::clone(&llm)).await;
     let before = mounted(&gw).await;
     assert!(has_demo(&before));
 

@@ -26,7 +26,6 @@ use super::{DetachLlm, Script, ScriptDriver, config, last_user_text};
 
 async fn start(llm: &Arc<DetachLlm>, detach_after_secs: u64, at: Option<&Path>) -> TestGateway {
     let mut builder = GatewayBuilder::new(&config(detach_after_secs))
-        .durable()
         .llm(Arc::clone(llm) as Arc<dyn LlmClient>)
         .stream(DriverStream::new(Arc::clone(llm) as Arc<dyn LlmClient>));
     if let Some(home) = at {
@@ -481,7 +480,6 @@ async fn a_detached_completion_interjects_into_the_still_running_host() {
         proceed: proceed.clone(),
     });
     let mut gateway = GatewayBuilder::new(&config(1))
-        .durable()
         .llm(Arc::clone(&llm))
         .stream(DriverStream::new(llm))
         .start()

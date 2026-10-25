@@ -3,17 +3,16 @@
 use std::sync::Arc;
 
 use komo_kernel::test_support::ScriptedLlm;
-use komo_kernel::traits::LlmClient;
-use komo_kernel::types::ids::MemoryId;
 use komo_kernel::types::memory::{MemoryState, Provenance};
 
+use super::{Scripted, a_run, run_in, wait_for_terminal};
 use crate::harness::*;
 use crate::{seeded, text_round};
 
 /// §14 ⑦：confirm / forget **带着预期 revision**，重复请求幂等。
 #[tokio::test]
 async fn confirm_and_forget_are_idempotent_over_http() {
-    let (gateway, _embeddings) = crate::with_memories(
+    let (gateway, _embeddings) = super::with_memories(
         "keyword",
         vec![seeded(
             "m-1",
@@ -113,9 +112,9 @@ async fn a_forgotten_memory_never_comes_back_into_a_turn() {
         vec![text_round(1, "26 度。")],
         vec![text_round(1, "我这边看不到了。")],
     ]);
-    let gateway = memory_gateway(&memory_config("hybrid", true))
+    let gateway = super::gateway(&memory_config("hybrid", true))
         .embeddings(Arc::clone(&embeddings) as Arc<dyn komo_kernel::traits::EmbeddingClient>)
-        .llm(Arc::new(llm.clone()) as Arc<dyn LlmClient>)
+        .scripted(llm.clone())
         .start()
         .await;
     gateway
@@ -135,17 +134,23 @@ async fn a_forgotten_memory_never_comes_back_into_a_turn() {
     gateway.state().memories.build_index().await.unwrap();
 
     // 第一轮：注入了它。
-    let (session, run) = crate::a_run(&gateway, "rk-1", "空调几度来着").await;
+    let (session, run) = a_run(&gateway, "rk-1", "空调几度来着").await;
     wait_for_terminal(&gateway, &run).await;
     {
+        // 新 harness 的请求没有 `memories` 字段：看系统提示里的记忆段与 `komo.memory` 里记的 uses。
         let seen = llm.requests.lock().expect("请求表").clone();
-        assert_eq!(
-            seen[0].memories.len(),
-            1,
-            "第一轮注入了：{:?}",
-            seen[0].memories
+        assert!(
+            seen[0].system_prompt.contains("客厅空调设 26 度"),
+            "第一轮注入了：{}",
+            seen[0].system_prompt
         );
-        assert_eq!(seen[0].memories[0].memory, MemoryId::from_raw("m-1"));
+        let detail = detail_of(&gateway, &run).await;
+        assert_eq!(
+            detail["memories"].as_array().map(Vec::len),
+            Some(1),
+            "{detail}"
+        );
+        assert_eq!(detail["memories"][0]["memory"], serde_json::json!("m-1"));
     }
 
     // 操作者遗忘它。
@@ -158,30 +163,32 @@ async fn a_forgotten_memory_never_comes_back_into_a_turn() {
     assert_eq!(status, 200, "{body}");
 
     // 第二轮：同一个会话，同一个问题。
-    let (status, body) = gateway
-        .post_json(
-            &format!("/v1/sessions/{session}/runs"),
-            serde_json::json!({"request_key": "rk-2", "text": "空调几度来着"}),
-        )
-        .await;
-    assert_eq!(status, 200, "{body}");
-    let second: komo_kernel::types::ids::RunId =
-        serde_json::from_value(body["run"].clone()).expect("run id");
+    let second = run_in(&gateway, &session, "rk-2", "空调几度来着").await;
     wait_for_terminal(&gateway, &second).await;
 
     let seen = llm.requests.lock().expect("请求表").clone();
     assert_eq!(seen.len(), 2, "跑了两轮");
+    // 钉住的那一块里有条目被遗忘：作废重召回（没有别的可召回），第二轮的系统提示里不再有它。
     assert!(
-        seen[1].memories.is_empty(),
-        "遗忘的内容不能回到上下文（§9.7）：{:?}",
-        seen[1].memories
+        !seen[1].system_prompt.contains("客厅空调设 26 度"),
+        "遗忘的内容不能回到上下文（§9.7）：{}",
+        seen[1].system_prompt
     );
+}
+
+async fn detail_of(
+    gateway: &TestGateway,
+    run: &komo_kernel::types::ids::RunId,
+) -> serde_json::Value {
+    let (status, body) = gateway.get_json(&format!("/v1/runs/{run}")).await;
+    assert_eq!(status, 200, "{body}");
+    body
 }
 
 /// 一条**不存在**的记忆：404，而不是一个空对象。
 #[tokio::test]
 async fn an_unknown_memory_is_a_not_found_not_an_empty_answer() {
-    let (gateway, _embeddings) = crate::with_memories("keyword", vec![]).await;
+    let (gateway, _embeddings) = super::with_memories("keyword", vec![]).await;
     let (status, body) = gateway.get_json("/v1/memories/nope").await;
     assert_eq!(status, 404, "{body}");
     assert_eq!(
@@ -215,7 +222,7 @@ async fn sweep_forgets_by_rule_and_restore_brings_it_back() {
         MemoryState::Active,
     );
     expired.valid_until = Some(long_ago);
-    let (gateway, _embeddings) = crate::with_memories(
+    let (gateway, _embeddings) = super::with_memories(
         "keyword",
         vec![
             aged("m-old", "卧室空调设 24 度"),

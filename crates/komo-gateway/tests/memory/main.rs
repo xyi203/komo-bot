@@ -1,5 +1,10 @@
 //! W6 端到端验收：docs/komo_bot.md §14「Memory 与模型验收覆盖」那九条，走真 Gateway
-//! （真数据目录、真 state.db、真 HTTP、真 MemoryManager），模型与向量端点是替身。
+//! （真数据目录、真 durable.db / aux.db、真 HTTP、真 MemoryManager），模型与向量端点是替身。
+//!
+//! 模型替身还是 `ScriptedLlm`：同一个实例既当聊天（经 `DriverStream` 演成 `ModelStream`）又当记忆
+//! 模型（`LlmClient`），脚本按调用先后消费；等一轮结束用 `TestGateway::wait_run`；记忆处理进度读
+//! conversation 级 document `komo.memory_cursor`（`progress`）；模型收到的"注入了哪些记忆"看系统
+//! 提示正文与 `komo.memory` document。
 //!
 //! 验收列逐句 → 测试：
 //!
@@ -24,7 +29,6 @@
 
 mod harness;
 
-mod durable;
 mod extraction;
 mod governance;
 mod index;
@@ -42,6 +46,10 @@ use komo_kernel::types::memory::{
 };
 use komo_kernel::types::turn::Round;
 use time::OffsetDateTime;
+
+use komo_gateway::service::test_support::driver_stream::{DriverStream, core};
+use komo_kernel::traits::{EmbeddingClient, LlmClient};
+use komo_runtime::memory::durable::{RunCursor, read_cursor_doc};
 
 use harness::*;
 
@@ -102,15 +110,38 @@ fn scoped_with(
     }
 }
 
-/// 起一台带记忆的 Gateway，并把几条记忆写进去、把索引建起来。
+/// 带 `[memory]` 三把钥匙的 Durable builder。
+pub fn gateway(config: &str) -> GatewayBuilder {
+    memory_gateway(config)
+}
+
+pub trait Scripted {
+    /// 一个 `ScriptedLlm` 同时当聊天模型（`ModelStream`）与记忆模型（`LlmClient`）。
+    fn scripted(self, llm: ScriptedLlm) -> Self;
+}
+
+impl Scripted for GatewayBuilder {
+    fn scripted(self, llm: ScriptedLlm) -> Self {
+        let llm = Arc::new(llm);
+        self.llm(Arc::clone(&llm) as Arc<dyn LlmClient>)
+            .stream(DriverStream::new(llm as Arc<dyn LlmClient>))
+    }
+}
+
+/// 等这条 run 的输入结算。
+pub async fn wait_for_terminal(gateway: &TestGateway, run: &RunId) {
+    gateway.wait_run(run).await;
+}
+
+/// 起一台带记忆的 Gateway，写几条记忆、建好索引（同 `crate::with_memories`）。
 pub async fn with_memories(
     mode: &str,
-    items: Vec<MemoryItem>,
+    items: Vec<komo_kernel::types::memory::MemoryItem>,
 ) -> (TestGateway, Arc<ConceptEmbeddings>) {
     let embeddings = ConceptEmbeddings::new();
-    let gateway = memory_gateway(&memory_config(mode, true))
-        .embeddings(Arc::clone(&embeddings) as Arc<dyn komo_kernel::traits::EmbeddingClient>)
-        .llm(Arc::new(ScriptedLlm::new(vec![])) as Arc<dyn komo_kernel::traits::LlmClient>)
+    let gateway = gateway(&memory_config(mode, true))
+        .embeddings(Arc::clone(&embeddings) as Arc<dyn EmbeddingClient>)
+        .scripted(ScriptedLlm::new(vec![]))
         .start()
         .await;
     for item in items {
@@ -130,14 +161,19 @@ pub async fn with_memories(
     (gateway, embeddings)
 }
 
-/// 断言用：会话与 Run 的那一对。
+/// 断言用：会话与 Run 的那一对（走 HTTP v2）。
 pub async fn a_run(gateway: &TestGateway, key: &str, text: &str) -> (SessionId, RunId) {
     let (status, body) = gateway
         .post_json("/v1/sessions", serde_json::json!({}))
         .await;
     assert_eq!(status, 200, "{body}");
     let session: SessionId = serde_json::from_value(body["session"].clone()).expect("会话 id");
+    let run = run_in(gateway, &session, key, text).await;
+    (session, run)
+}
 
+/// 往已有会话再提交一条输入。
+pub async fn run_in(gateway: &TestGateway, session: &SessionId, key: &str, text: &str) -> RunId {
     let (status, body) = gateway
         .post_json(
             &format!("/v1/sessions/{session}/runs"),
@@ -145,6 +181,45 @@ pub async fn a_run(gateway: &TestGateway, key: &str, text: &str) -> (SessionId, 
         )
         .await;
     assert_eq!(status, 200, "{body}");
-    let run: RunId = serde_json::from_value(body["run"].clone()).expect("run id");
-    (session, run)
+    serde_json::from_value(body["run"].clone()).expect("run id")
+}
+
+/// 一条 run 的记忆处理进度（没有记录 = pending、游标 0）。
+pub async fn progress(gateway: &TestGateway, run: &RunId) -> RunCursor {
+    let core = core(gateway);
+    let id = komo_kernel::durable::legacy_ids::submission_of(run).expect("十进制 RunId");
+    let submission = core
+        .storage
+        .submission(id)
+        .await
+        .expect("读得出")
+        .expect("有 submission");
+    read_cursor_doc(&*core.storage, submission.conversation)
+        .await
+        .runs
+        .get(run.as_str())
+        .copied()
+        .unwrap_or(RunCursor {
+            work: komo_kernel::types::memory::MemoryWork::Pending,
+            cursor: 0,
+        })
+}
+
+/// 停机后在**同一个数据目录**上重起一台 Durable。返回新的那台；旧的那台要留着直到测试结束
+/// （它的 `Drop` 会删临时数据目录）。
+pub async fn restart(
+    old: &mut TestGateway,
+    config: &str,
+    llm: Option<ScriptedLlm>,
+    embeddings: Option<Arc<dyn EmbeddingClient>>,
+) -> TestGateway {
+    old.stop().await;
+    let mut builder = gateway(config).at(&old.home);
+    if let Some(llm) = llm {
+        builder = builder.scripted(llm);
+    }
+    if let Some(embeddings) = embeddings {
+        builder = builder.embeddings(embeddings);
+    }
+    builder.start().await
 }

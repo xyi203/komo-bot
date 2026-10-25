@@ -1,20 +1,38 @@
-//! 跨平台：准入、热重载、投递目标、重启补发、会话归属（§11.2、§11.4、§3）。
+//! 跨平台：准入、热重载、投递目标、重启补发、会话归属（§11.2、§11.4、§3）——Durable 存储版
+//! （D5 W3a）：与 `../cross.rs` 同名同断言，Gateway 跑在新存储上。
+//!
+//! 与 Legacy 不同之处各在对应测试的注释里写了理由。W3a 没迁的四个（建立在旧的 `waiting + intervention`
+//! 之上）在 W4b 里处理，放在本文件末尾：
+//!
+//! - `an_intervention_reaches_both_the_source_and_home`、`a_waiting_run_sends_its_intervention_to_the_chat_and_home`、
+//!   `an_http_run_sends_its_intervention_to_home_only`：意图（NeedsAttention 投到来源会话 + home chat、
+//!   各一条、HTTP 来源只投 home、第二个答复得到"已经答复过了"）新存储里仍然成立，只是触发它的不再是
+//!   "结果不明"而是 **faulted 任务**。写成 Durable 版（用 `poison_agent_doc` 让下一条输入的生成任务 fault），
+//!   W4a（`interventions.rs`、NeedsAttention 投递）合并后已放开（faulted 的生成任务按输入里记的 run 对回）；
+//! - `a_round_stopped_at_its_first_call_still_finishes_the_rest`：**不迁**。它守的是"第一个调用停在介入上时，
+//!   续跑要把后面没有计划的调用也跑完，否则转写里有调用没输出、provider 400"。新存储没有"停在半轮"这个
+//!   状态：harness 在一轮的全部调用都有结果（结果不明的也是一条结果）之后才发下一次请求，runtime 的
+//!   `harness/tests/recovery.rs::aborting_a_round_answers_every_call_and_the_next_request_is_fully_paired` /
+//!   `a_faulted_tool_is_answered_by_derivation_rule_8_and_the_run_continues` 钉着。网关层换成一个仍然成立的
+//!   版本 `a_round_with_two_calls_gets_both_results_before_the_next_request`（一轮两个调用、第一个停在 gate 上、
+//!   排队的下一条输入不夹进去）。
+//!
+//! 其余没迁的无。
 
 use std::sync::Arc;
 
 use komo_gateway::channels::ChannelSender;
-use komo_gateway::service::test_support::{Gate, Unsure};
+use komo_gateway::service::test_support::Gate;
 use komo_kernel::protocol::InboundAck;
-use komo_kernel::traits::{LlmClient, Notifier};
+use komo_kernel::traits::Notifier;
 use komo_kernel::types::chat::{
     ChannelPeer, ChannelPlatform, DeliveryState, DeliveryTarget, Outbound, PeerId,
 };
-use komo_kernel::types::status::{RunState, WaitReason};
+use komo_kernel::types::status::RunState;
 
 use crate::harness::{
-    FakeLlm, FixedFactory, GatewayBuilder, Home, MemSender, TestGateway, call_round, config_toml,
-    eventually, feishu_block, inbound, multi_call_round, telegram_block, telegram_config,
-    text_round,
+    FakeLlm, FixedFactory, GatewayBuilder, MemSender, TestGateway, call_round, config_toml,
+    eventually, feishu_block, inbound, telegram_block, telegram_config, text_round,
 };
 
 fn operator_dm(text: &str, key: &str) -> komo_kernel::protocol::InboundMessage {
@@ -31,6 +49,7 @@ async fn both_channels() -> (TestGateway, Arc<MemSender>, Arc<MemSender>) {
         telegram_block("111")
     ));
     let gateway = GatewayBuilder::new(&config)
+        .fake_llm(FakeLlm::finisher("好"))
         .env("KOMO_LLM_API_KEY=test-key\nTELEGRAM_BOT_TOKEN=t\nFEISHU_APP_ID=a\nFEISHU_APP_SECRET=b\n")
         .factory(FixedFactory::sender_only(
             Arc::clone(&telegram) as Arc<dyn ChannelSender>
@@ -83,7 +102,7 @@ async fn a_stranger_is_refused_and_leaves_no_trace() {
 
     // 不留任何记录：没有会话、没有 Run、没有投递。
     assert!(
-        gateway.sessions().await.is_empty(),
+        gateway.origins().await.is_empty(),
         "被拒绝的消息不该建出会话"
     );
     assert!(
@@ -170,77 +189,6 @@ home_chat = 111
     );
 }
 
-/// 验证列：介入投到**来源会话 + home chat**；第二个答复得到「已经答复过了」。
-///
-/// 停住 Run 的是一次"结果不明"（测试工具 `unsure`，§7.5 的 `verify`）。
-#[tokio::test]
-async fn an_intervention_reaches_both_the_source_and_home() {
-    let sender = MemSender::new(ChannelPlatform::Telegram);
-    let unsure = Unsure::new();
-    let gateway = GatewayBuilder::new(&telegram_config("111"))
-        .llm(FakeLlm::new(vec![vec![
-            call_round(1, "pc-1", "unsure", serde_json::json!({})),
-            text_round(2, "好了。"),
-        ]]))
-        .tool(unsure.tool())
-        .factory(FixedFactory::sender_only(
-            Arc::clone(&sender) as Arc<dyn ChannelSender>
-        ))
-        .start()
-        .await;
-
-    // 来源会话是群 222，home chat 是 111。
-    let ack = gateway
-        .handle(inbound(
-            ChannelPlatform::Telegram,
-            "222",
-            "111",
-            "跑一下",
-            "telegram:1",
-            false,
-        ))
-        .await;
-    let InboundAck::Queued { run, .. } = ack else {
-        panic!("{ack:?}");
-    };
-    let pending = gateway.wait_intervention(&run).await;
-
-    let watching = Arc::clone(&sender);
-    eventually("两处都收到了", move || {
-        let targets = attentions(&watching);
-        targets.contains(&"222".to_string()) && targets.contains(&"111".to_string())
-    })
-    .await;
-
-    // 第一个答复。
-    let first: komo_kernel::protocol::http::InterventionAnswerResponse =
-        serde_json::from_str(&gateway.answer(&pending.handle, "satisfied").await).expect("回执");
-    assert!(!first.already_answered);
-
-    // 第二个答复得到「已经答复过了」，且不改写结论。
-    let second: komo_kernel::protocol::http::InterventionAnswerResponse =
-        serde_json::from_str(&gateway.answer(&pending.handle, "abandon").await).expect("回执");
-    assert!(
-        second.already_answered,
-        "第二个答复应当得到原结论：{second:?}"
-    );
-    assert_ne!(
-        second.run_state,
-        Some(RunState::Abandoned),
-        "结论没有被改写"
-    );
-    assert_eq!(unsure.ran(), 1);
-}
-
-fn attentions(sender: &MemSender) -> Vec<String> {
-    sender
-        .sent()
-        .iter()
-        .filter(|message| matches!(message.outbound, Outbound::NeedsAttention { .. }))
-        .map(|message| message.peer.chat_id.to_string())
-        .collect()
-}
-
 /// §11.4：一个 `home_chat` 都没配时 `deliver_home` **返回错误给调用方，不静默丢弃**。
 #[tokio::test]
 async fn no_home_chat_is_an_error_not_silence() {
@@ -251,6 +199,7 @@ enabled = true
 allow_from = [111]
 "#,
     ))
+    .fake_llm(FakeLlm::finisher("好"))
     .start()
     .await;
 
@@ -282,6 +231,7 @@ async fn a_pending_delivery_is_resent_once_after_a_restart() {
     let first = MemSender::new(ChannelPlatform::Telegram);
     first.defer(true);
     let mut gateway = GatewayBuilder::new(&telegram_config("111"))
+        .fake_llm(FakeLlm::finisher("好"))
         .factory(FixedFactory::sender_only(
             Arc::clone(&first) as Arc<dyn ChannelSender>
         ))
@@ -332,6 +282,7 @@ async fn becoming_ready_does_not_wait_for_the_delivery_backlog() {
     let first = MemSender::new(ChannelPlatform::Telegram);
     first.defer(true);
     let mut gateway = GatewayBuilder::new(&telegram_config("111"))
+        .fake_llm(FakeLlm::finisher("好"))
         .factory(FixedFactory::sender_only(
             Arc::clone(&first) as Arc<dyn ChannelSender>
         ))
@@ -405,12 +356,7 @@ async fn every_private_chat_lands_in_one_home_session() {
     };
     assert_eq!(session, home, "早上在飞书说的话，回到 Telegram 接着说");
 
-    let origins: Vec<String> = gateway
-        .sessions()
-        .await
-        .into_iter()
-        .map(|record| record.origin)
-        .collect();
+    let origins: Vec<String> = gateway.origins().await;
     assert_eq!(
         origins,
         vec!["home".to_string()],
@@ -450,12 +396,7 @@ async fn every_group_gets_its_own_session() {
     };
     assert_ne!(a, b, "两个群是两个 Session");
 
-    let mut origins: Vec<String> = gateway
-        .sessions()
-        .await
-        .into_iter()
-        .map(|record| record.origin)
-        .collect();
+    let mut origins: Vec<String> = gateway.origins().await;
     origins.sort();
     assert_eq!(
         origins,
@@ -497,12 +438,15 @@ async fn slash_new_appends_a_boundary_without_switching_sessions() {
     };
     assert!(text.contains("新的一段"), "{text}");
 
-    assert_eq!(
-        gateway.state().default_main_session().await.unwrap(),
-        session,
-        "还是同一个 home session"
-    );
-    assert_eq!(gateway.sessions().await.len(), 1);
+    let (home, _) = gateway
+        .state()
+        .core()
+        .unwrap()
+        .main_session("assistant")
+        .await
+        .unwrap();
+    assert_eq!(home.id, session.as_str(), "还是同一个 home session");
+    assert_eq!(gateway.origins().await.len(), 1);
 
     // 事件流上有那条边界。
     let (status, body) = gateway
@@ -513,18 +457,23 @@ async fn slash_new_appends_a_boundary_without_switching_sessions() {
 }
 
 /// §11.3 命令表：`/status` / `/pending` / `/cancel` 都有回执，且都只对操作者生效。
+///
+/// 改了断言：Legacy 让 run 停在一次"结果不明"（`unsure`）的介入上，`/pending` 列出它、`/status` 数出
+/// "结果不明 1"、`/cancel` 取消停着的那条。新存储里结果不明直接交给模型，intervention 清单只剩
+/// faulted 任务（W4a 接），所以这里让 run 忙在 `gate` 上：`/status` 报当前任务（执行中）与待处理 0，
+/// `/pending` 说没有，`/cancel` 停下这一轮并说出 run 与它现在的状态（已取消）。
 #[tokio::test]
 async fn the_command_table_is_operator_only() {
     let sender = MemSender::new(ChannelPlatform::Telegram);
-    let unsure = Unsure::new();
+    let gate = Gate::new();
     let gateway = GatewayBuilder::new(&telegram_config("111"))
-        .llm(FakeLlm::new(vec![vec![call_round(
+        .fake_llm(FakeLlm::new(vec![vec![call_round(
             1,
             "pc-1",
-            "unsure",
+            "gate",
             serde_json::json!({}),
         )]]))
-        .tool(unsure.tool())
+        .tool(gate.tool())
         .factory(FixedFactory::sender_only(
             Arc::clone(&sender) as Arc<dyn ChannelSender>
         ))
@@ -534,11 +483,11 @@ async fn the_command_table_is_operator_only() {
     let InboundAck::Queued { run, .. } = ack else {
         panic!("{ack:?}");
     };
-    gateway.wait_intervention(&run).await;
+    gate.wait_entered(1).await;
 
     let pending = gateway.handle(operator_dm("/pending", "telegram:1")).await;
     assert!(
-        matches!(&pending, InboundAck::Replied { text } if text.contains(run.as_str()) && text.contains("结果不明")),
+        matches!(&pending, InboundAck::Replied { text } if text.contains("现在没有待处理的 Intervention")),
         "{pending:?}"
     );
 
@@ -547,7 +496,10 @@ async fn the_command_table_is_operator_only() {
     assert!(
         matches!(
             &status,
-            InboundAck::Replied { text } if text.contains("待处理（共 1 条）：结果不明 1 · 前提没了 0")
+            InboundAck::Replied { text }
+                if text.contains(run.as_str())
+                    && text.contains("执行中")
+                    && text.contains("待处理（共 0 条）：结果不明 0 · 前提没了 0")
         ),
         "{status:?}"
     );
@@ -570,8 +522,8 @@ async fn the_command_table_is_operator_only() {
 
     let cancel = gateway.handle(operator_dm("/cancel", "telegram:3")).await;
     assert!(
-        matches!(&cancel, InboundAck::Replied { text } if text.contains("已取消")),
-        "/cancel 取消停着的那条：{cancel:?}"
+        matches!(&cancel, InboundAck::Replied { text } if text.contains(run.as_str()) && text.contains("已取消")),
+        "/cancel 取消在跑的那条：{cancel:?}"
     );
 }
 
@@ -580,6 +532,7 @@ async fn the_command_table_is_operator_only() {
 async fn an_empty_allow_list_still_receives_but_nobody_can_speak() {
     let sender = MemSender::new(ChannelPlatform::Telegram);
     let gateway = GatewayBuilder::new(&telegram_config(""))
+        .fake_llm(FakeLlm::finisher("好"))
         .factory(FixedFactory::sender_only(
             Arc::clone(&sender) as Arc<dyn ChannelSender>
         ))
@@ -600,121 +553,85 @@ async fn an_empty_allow_list_still_receives_but_nobody_can_speak() {
     assert_eq!(sender.texts(), vec!["夜里跑完了".to_string()]);
 }
 
-/// **一条真的消息**停在要人处理的介入上时，那条介入真的被投出去了。
+/// §8.4：前一个 Run 还在跑时，**同一 Session 的下一条消息不越过它**。
 ///
-/// 一条 Telegram 私聊消息进来、模型调的工具"结果不明"，然后介入通知应当自己出现在两个
-/// 会话里——§11.4 的「投递到 Run 的来源会话与 home chat」说的是这条生产路径。
-#[tokio::test]
-async fn a_waiting_run_sends_its_intervention_to_the_chat_and_home() {
-    let sender = MemSender::new(ChannelPlatform::Telegram);
-    let unsure = Unsure::new();
-    // home chat 故意与私聊不是同一个会话，这样"各一条"才说得清。
-    let gateway = GatewayBuilder::new(&config_toml(
-        r#"
-[channels.telegram]
-enabled = true
-allow_from = [111]
-home_chat = 999
-"#,
-    ))
-    .llm(FakeLlm::new(vec![vec![
-        call_round(1, "pc-1", "unsure", serde_json::json!({})),
-        text_round(2, "跑完了。"),
-    ]]))
-    .tool(unsure.tool())
-    .factory(FixedFactory::sender_only(
-        Arc::clone(&sender) as Arc<dyn ChannelSender>
-    ))
-    .start()
-    .await;
-
-    let ack = gateway.handle(operator_dm("跑一下", "telegram:1")).await;
-    assert!(matches!(ack, InboundAck::Queued { .. }), "{ack:?}");
-
-    let watching = Arc::clone(&sender);
-    eventually("两个会话都收到了介入", move || {
-        attentions(&watching).len() >= 2
-    })
-    .await;
-    // 再等一小会儿，看有没有多投。
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-
-    let mut targets = attentions(&sender);
-    targets.sort();
-    assert_eq!(
-        targets,
-        vec!["111".to_string(), "999".to_string()],
-        "来源会话与 home chat **各一条**，不多不少"
-    );
-}
-
-/// §8.4：前一个 Run 还停在等人处理时，**同一 Session 的下一条消息不越过它**。
+/// 越过去不是"顺序不好看"：停住的那半轮里那次调用还没有结果，回放窗口只能带着一个没有输出的
+/// `function_call` 发给模型，provider 直接 400（`No tool output found for tool call …`）。
 ///
-/// 越过去不是"顺序不好看"：停住的那半轮里那次调用还没有结果，回放窗口只能带着一个没有
-/// 输出的 `function_call` 发给模型，provider 直接 400（`No tool output found for tool
-/// call …`）。
+/// 改了断言：Legacy 让前一条停在介入上（`waiting + intervention`），后一条是 `waiting + dependency`
+/// 并说出在等哪一条；新存储里后一条是收件箱里排着的 follow-up（`queued`），前一条收尾的边界才把它放进
+/// 上下文——前一条这里忙在 `gate` 上。其余不变：排着的那条不走到模型，前一条跑完后它才轮到，
+/// 交给模型的每一份转写都不把用户消息夹在没有输出的调用中间，后一条的窗口里看得见前一条说了什么。
 #[tokio::test]
 async fn a_message_behind_a_waiting_run_waits_instead_of_overtaking() {
-    let home = Home::new();
-    let unsure = Unsure::new();
-    home.install_tools(vec![unsure.tool()]);
+    let gate = Gate::new();
     let llm = FakeLlm::new(vec![
-        // 第一段：调 `unsure` → 结果不明，停在介入上。
-        vec![call_round(1, "pc-1", "unsure", serde_json::json!({}))],
-        // 答复之后续跑的那一段。
-        vec![text_round(2, "跑完了。")],
+        // 第一段：调 `gate` 停在门上，门开之后收尾。
+        vec![
+            call_round(1, "pc-1", "gate", serde_json::json!({})),
+            text_round(2, "跑完了。"),
+        ],
         // 排队那条 Run 的那一段。
         vec![text_round(1, "y")],
     ]);
-    let gw = home.start(Arc::clone(&llm) as Arc<dyn LlmClient>).await;
-    let session = gw.open_session().await;
+    let gateway = GatewayBuilder::new(&telegram_config("111"))
+        .fake_llm(Arc::clone(&llm))
+        .tool(gate.tool())
+        .start()
+        .await;
+    let (_, body) = gateway.get("/v1/home-session").await;
+    let session = serde_json::from_str::<komo_kernel::protocol::http::SessionSummary>(&body)
+        .expect("home session")
+        .session;
+    let submit = |key: &'static str, text: &'static str| {
+        let session = session.clone();
+        let gateway = &gateway;
+        async move {
+            let (code, body) = gateway
+                .post(
+                    &format!("/v1/sessions/{session}/runs"),
+                    serde_json::json!({ "request_key": key, "text": text }),
+                )
+                .await;
+            assert_eq!(code, 200, "{body}");
+            serde_json::from_str::<komo_kernel::protocol::http::SubmitRunResponse>(&body)
+                .expect("回执")
+                .run
+        }
+    };
 
-    let first = gw.submit(&session, "overtake-1", "跑一下 echo").await.run;
-    let wait = gw.wait_waiting(&first).await;
-    assert!(
-        matches!(wait, WaitReason::Intervention { .. }),
-        "前一个 Run 停下的理由是等人核对：{wait:?}"
-    );
+    let first = submit("overtake-1", "跑一下 echo").await;
+    gate.wait_entered(1).await;
     let turns_before = llm.turns();
 
-    // 同一个 Session 再来一条：前一个没结束，它不许越过。§8.4 拆成两维之后，这个形态是
-    // `waiting` + `dependency`，而且**说得出在等哪一条 Run**——旧模型里的"排队中"正好是
-    // 要消掉的那句"排队二十分钟，不知道为什么"。
-    let second = gw.submit(&session, "overtake-2", "y").await.run;
-    let blocked = gw.wait_waiting(&second).await;
+    // 同一个 Session 再来一条：前一个没结束，它不许越过。
+    let second = submit("overtake-2", "y").await;
+    let queued = gateway
+        .state()
+        .core()
+        .unwrap()
+        .submission_state(komo_kernel::durable::legacy_ids::submission_of(&second).unwrap())
+        .await
+        .unwrap();
     assert_eq!(
-        blocked,
-        WaitReason::Dependency { run: first.clone() },
-        "后一条要说出在等哪一条 Run"
-    );
-    let detail = gw.run_detail(&second).await;
-    assert_eq!(
-        detail.summary.state,
-        RunState::Waiting,
-        "前一个还停在等人，后一个不许领"
-    );
-    assert_eq!(
-        detail.summary.wait,
-        Some(WaitReason::Dependency { run: first.clone() })
+        queued,
+        RunState::Queued,
+        "前一个还在跑，后一个只在收件箱里排着"
     );
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     assert_eq!(llm.turns(), turns_before, "排队的这条不该走到模型");
-    assert_eq!(gw.run_state(&second).await, RunState::Waiting);
 
-    // 答复之后前一个跑完，后一个才轮到。
-    gw.answer(first.as_str(), "satisfied").await;
-    gw.wait_terminal(&first).await;
-    gw.wait_terminal(&second).await;
+    // 前一个跑完，后一个才轮到。
+    gate.release();
+    gateway.wait_run(&first).await;
+    gateway.wait_run(&second).await;
 
     // 而且交给模型的每一份转写都过得了 provider 那一关。
     let requests = llm.requests.lock().expect("脚本模型").clone();
     assert_transcripts_close_every_call(&requests);
 
     // §8.3：后一条 Run 的窗口里要看得见前一条说了什么、最后答了什么——用户那句"接着上面
-    // 说"指的就是它，少了这两句，模型只能靠猜（真实会话里它去读了 `config.toml`）。
-    //
-    // 找的是**带 `y` 的那一份转写**，不是"最后一份"：后台的记忆整理走的是同一个模型，
-    // 最后一份是个会漂的位置。
+    // 说"指的就是它，少了这两句，模型只能靠猜。
     let turns: Vec<&str> = requests
         .iter()
         .filter_map(|request| {
@@ -733,69 +650,6 @@ async fn a_message_behind_a_waiting_run_waits_instead_of_overtaking() {
     );
     assert!(turns.contains(&"跑完了。"), "上一轮的最后回复：{turns:?}");
     assert!(turns.contains(&"y"), "这一轮的输入：{turns:?}");
-}
-
-/// §8.3 / §8.4：一轮要了两次调用、**第一个就停下**时，续跑要把后面的也跑完。
-///
-/// `tool.planned` 是执行到那个调用才写的，所以第一个停在介入上时，**第二个连计划都还
-/// 没有**。按"有计划的调用"恢复，续跑只跑完第一个，模型下一轮拿到的是"要了两次、只回了
-/// 一次输出"的转写——provider 直接 400（`No tool output found for tool call …`），这条
-/// Run 从此不可能完成。
-#[tokio::test]
-async fn a_round_stopped_at_its_first_call_still_finishes_the_rest() {
-    let home = Home::new();
-    let unsure = Unsure::new();
-    home.install_tools(vec![unsure.tool()]);
-    let llm = FakeLlm::new(vec![
-        vec![multi_call_round(
-            1,
-            &[
-                ("call_00_one", "unsure", serde_json::json!({})),
-                (
-                    "call_01_two",
-                    "bash",
-                    serde_json::json!({"command": "echo two"}),
-                ),
-            ],
-        )],
-        vec![text_round(2, "两条都跑完了。")],
-    ]);
-    let gw = home.start(Arc::clone(&llm) as Arc<dyn LlmClient>).await;
-    let session = gw.open_session().await;
-    let run = gw.submit(&session, "two-calls", "跑两条命令").await.run;
-    let wait = gw.wait_waiting(&run).await;
-    assert!(
-        matches!(wait, WaitReason::Intervention { .. }),
-        "第一次停下就是等人核对：{wait:?}"
-    );
-
-    // 核对第一个。它收尾之后，第二个必须也跑——而不是被跳过。
-    gw.answer(run.as_str(), "satisfied").await;
-    gw.wait_terminal(&run).await;
-
-    // 两次调用都有结果（结果不明的那一个另有一条核对后的收尾，按调用号数）。
-    let called: std::collections::BTreeSet<String> = home
-        .events(&session)
-        .iter()
-        .filter(|event| event.run.as_ref() == Some(&run))
-        .filter_map(|event| match &event.payload {
-            komo_kernel::events::EventPayload::ToolResult(result) => {
-                Some(result.call_id.to_string())
-            }
-            _ => None,
-        })
-        .collect();
-    assert_eq!(
-        called.len(),
-        2,
-        "一轮里的两次调用都要有结果：{:?}",
-        home.event_types(&session)
-    );
-    assert_eq!(unsure.ran(), 1, "核对过的那一个不重跑");
-
-    // 而且每一步交给模型的转写都过得了 provider 那一关。
-    let requests = llm.requests.lock().expect("脚本模型").clone();
-    assert_transcripts_close_every_call(&requests);
 }
 
 /// 转写里**调用还没有输出之前，不能出现下一条用户消息**。
@@ -844,18 +698,181 @@ fn transcript(request: &komo_kernel::types::turn::TurnRequest) -> String {
         .join("\n")
 }
 
-/// HTTP 提交的 Run 没有来源会话：介入**只投 home chat**（§11.4「来源是 Cron 或已
-/// 断开的 TUI 时只有 home chat」）。
+/// 同一会话里，前一条停在 `gate` 上（`running`、占着名额）时，`/cancel` 取消的是它，
+/// 门不必开——取消不能卡在一次还没返回的调用上。
+#[tokio::test]
+async fn cancel_stops_a_run_that_is_still_inside_a_call() {
+    let sender = MemSender::new(ChannelPlatform::Telegram);
+    let gate = Gate::new();
+    let gateway = GatewayBuilder::new(&telegram_config("111"))
+        .fake_llm(FakeLlm::new(vec![vec![
+            call_round(1, "pc-1", "gate", serde_json::json!({})),
+            text_round(2, "不该走到这里。"),
+        ]]))
+        .tool(gate.tool())
+        .factory(FixedFactory::sender_only(
+            Arc::clone(&sender) as Arc<dyn ChannelSender>
+        ))
+        .start()
+        .await;
+    let ack = gateway.handle(operator_dm("等着", "telegram:1")).await;
+    let InboundAck::Queued { run, .. } = ack else {
+        panic!("{ack:?}");
+    };
+    gate.wait_entered(1).await;
+
+    let cancel = gateway.handle(operator_dm("/cancel", "telegram:2")).await;
+    assert!(
+        matches!(&cancel, InboundAck::Replied { text } if text.contains(run.as_str())),
+        "{cancel:?}"
+    );
+    // 取消是异步的：等这条 run 的输入结算，它的状态是已取消（`aborted`），门没有开过。
+    let record = gateway.wait_run(&run).await;
+    assert_eq!(
+        komo_gateway::service::durable::runs::state_of_submission(&record),
+        RunState::Cancelled,
+        "没取消掉：{record:?}"
+    );
+}
+
+// ---------------------------------------------------------------- W4b：intervention 一组
+
+/// 让这个 Session 当前分支的下一条输入 fault：把 `komo.agent` 写成读不出来的值，钩子 `setup` 读它失败
+/// （`HookError::Failed`）→ 生成任务 faulted。（faulted 是新存储里"要人处理"的唯一来源。）
+async fn poison_agent_doc(gateway: &TestGateway, session: &str) {
+    use komo_gateway::service::durable::agent_doc::{AGENT_DOC_VERSION, address};
+    let core = Arc::clone(gateway.state().core().expect("Durable 模式"));
+    let branch = core.session(session).await.expect("会话").current_branch;
+    core.engine
+        .commit(move |tx| {
+            Box::pin(async move {
+                tx.put_document(
+                    address(branch),
+                    AGENT_DOC_VERSION,
+                    serde_json::json!("坏掉的 komo.agent"),
+                )
+                .await
+            })
+        })
+        .await
+        .expect("写坏 komo.agent");
+}
+
+fn attentions(sender: &MemSender) -> Vec<String> {
+    sender
+        .sent()
+        .iter()
+        .filter(|message| matches!(message.outbound, Outbound::NeedsAttention { .. }))
+        .map(|message| message.peer.chat_id.to_string())
+        .collect()
+}
+
+/// 验证列：介入投到**来源会话 + home chat**；第二个答复得到「已经答复过了」。
+///
+/// 改了做法：Legacy 用 `unsure` 停住 Run（`verify`，答 `satisfied`）；新存储里要人处理的只有 faulted
+/// 任务，可答的结论只有 `abandon`（决定 13）。让第二条输入的生成任务 fault，等两处收到，答两次 `abandon`。
+#[tokio::test]
+async fn an_intervention_reaches_both_the_source_and_home() {
+    let sender = MemSender::new(ChannelPlatform::Telegram);
+    let gateway = GatewayBuilder::new(&telegram_config("111"))
+        .fake_llm(FakeLlm::finisher("好"))
+        .factory(FixedFactory::sender_only(
+            Arc::clone(&sender) as Arc<dyn ChannelSender>
+        ))
+        .start()
+        .await;
+
+    // 来源会话是群 222，home chat 是 111。先说一句建出会话，再让它 fault。
+    let group =
+        |text: &str, key: &str| inbound(ChannelPlatform::Telegram, "222", "111", text, key, false);
+    let InboundAck::Queued { session, run } = gateway.handle(group("在吗", "telegram:1")).await
+    else {
+        panic!("第一句应该受理");
+    };
+    gateway.wait_run(&run).await;
+    poison_agent_doc(&gateway, session.as_str()).await;
+    let ack = gateway.handle(group("跑一下", "telegram:2")).await;
+    let InboundAck::Queued { run, .. } = ack else {
+        panic!("{ack:?}");
+    };
+    let pending = gateway.wait_intervention(&run).await;
+
+    let watching = Arc::clone(&sender);
+    eventually("两处都收到了", move || {
+        let targets = attentions(&watching);
+        targets.contains(&"222".to_string()) && targets.contains(&"111".to_string())
+    })
+    .await;
+
+    // 第一个答复。
+    let first: komo_kernel::protocol::http::InterventionAnswerResponse =
+        serde_json::from_str(&gateway.answer(&pending.handle, "abandon").await).expect("回执");
+    assert!(!first.already_answered);
+
+    // 第二个答复得到「已经答复过了」。
+    let second: komo_kernel::protocol::http::InterventionAnswerResponse =
+        serde_json::from_str(&gateway.answer(&pending.handle, "abandon").await).expect("回执");
+    assert!(
+        second.already_answered,
+        "第二个答复应当得到原结论：{second:?}"
+    );
+}
+
+/// **一条真的消息**让任务 fault 时，那条介入真的被投出去了：来源会话与 home chat **各一条**，不多不少。
+///
+/// 改了做法同上（`unsure` 换成 faulted）。home chat 故意与私聊不是同一个会话，这样"各一条"才说得清。
+#[tokio::test]
+async fn a_waiting_run_sends_its_intervention_to_the_chat_and_home() {
+    let sender = MemSender::new(ChannelPlatform::Telegram);
+    let gateway = GatewayBuilder::new(&config_toml(
+        r#"
+[channels.telegram]
+enabled = true
+allow_from = [111]
+home_chat = 999
+"#,
+    ))
+    .fake_llm(FakeLlm::finisher("好"))
+    .factory(FixedFactory::sender_only(
+        Arc::clone(&sender) as Arc<dyn ChannelSender>
+    ))
+    .start()
+    .await;
+
+    let InboundAck::Queued { session, run } =
+        gateway.handle(operator_dm("在吗", "telegram:1")).await
+    else {
+        panic!("第一句应该受理");
+    };
+    gateway.wait_run(&run).await;
+    poison_agent_doc(&gateway, session.as_str()).await;
+    let ack = gateway.handle(operator_dm("跑一下", "telegram:2")).await;
+    assert!(matches!(ack, InboundAck::Queued { .. }), "{ack:?}");
+
+    let watching = Arc::clone(&sender);
+    eventually("两个会话都收到了介入", move || {
+        attentions(&watching).len() >= 2
+    })
+    .await;
+    // 再等一小会儿，看有没有多投。
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    let mut targets = attentions(&sender);
+    targets.sort();
+    assert_eq!(
+        targets,
+        vec!["111".to_string(), "999".to_string()],
+        "来源会话与 home chat **各一条**，不多不少"
+    );
+}
+
+/// HTTP 提交的 Run 没有来源会话：介入**只投 home chat**（§11.4「来源是 Cron 或已断开的 TUI 时只有
+/// home chat」）。改了做法同上（`unsure` 换成 faulted）。
 #[tokio::test]
 async fn an_http_run_sends_its_intervention_to_home_only() {
     let sender = MemSender::new(ChannelPlatform::Telegram);
-    let unsure = Unsure::new();
     let gateway = GatewayBuilder::new(&telegram_config("111"))
-        .llm(FakeLlm::new(vec![vec![
-            call_round(1, "pc-1", "unsure", serde_json::json!({})),
-            text_round(2, "跑完了。"),
-        ]]))
-        .tool(unsure.tool())
+        .fake_llm(FakeLlm::finisher("好"))
         .factory(FixedFactory::sender_only(
             Arc::clone(&sender) as Arc<dyn ChannelSender>
         ))
@@ -866,6 +883,7 @@ async fn an_http_run_sends_its_intervention_to_home_only() {
     assert_eq!(code, 200, "{body}");
     let summary: komo_kernel::protocol::http::SessionSummary =
         serde_json::from_str(&body).expect("会话");
+    poison_agent_doc(&gateway, summary.session.as_str()).await;
     let (code, body) = gateway
         .post(
             &format!("/v1/sessions/{}/runs", summary.session),
@@ -888,42 +906,89 @@ async fn an_http_run_sends_its_intervention_to_home_only() {
     );
 }
 
-/// 同一会话里，前一条停在 `gate` 上（`running`、占着名额）时，`/cancel` 取消的是它，
-/// 门不必开——取消不能卡在一次还没返回的调用上。
+/// 一轮要了两个调用、**第一个停在 `gate` 上**时：两个调用都有结果之后才发下一次请求，排队的下一条输入
+/// 不夹在没有输出的调用中间。
+///
+/// 对应 Legacy 的 `a_round_stopped_at_its_first_call_still_finishes_the_rest`，换成新存储里仍然成立的版本：
+/// Legacy 守的是"第一个调用停在介入上、续跑要把后面连计划都没有的调用也跑完"；新存储没有停在半轮的状态，
+/// 一轮的调用都收尾（含结果不明）才发下一次请求，这里证网关层看到的就是这样——两个调用各有一条结果，
+/// 每份转写都不把用户消息夹在没有输出的调用中间。
 #[tokio::test]
-async fn cancel_stops_a_run_that_is_still_inside_a_call() {
-    let sender = MemSender::new(ChannelPlatform::Telegram);
+async fn a_round_with_two_calls_gets_both_results_before_the_next_request() {
+    use komo_gateway::service::test_support::harness::multi_call_round;
     let gate = Gate::new();
+    let llm = FakeLlm::new(vec![
+        vec![
+            multi_call_round(
+                1,
+                &[
+                    ("call_00_one", "gate", serde_json::json!({})),
+                    (
+                        "call_01_two",
+                        "bash",
+                        serde_json::json!({"command": "echo two"}),
+                    ),
+                ],
+            ),
+            text_round(2, "两条都跑完了。"),
+        ],
+        // 排队那条输入的那一段。
+        vec![text_round(1, "y")],
+    ]);
     let gateway = GatewayBuilder::new(&telegram_config("111"))
-        .llm(FakeLlm::new(vec![vec![
-            call_round(1, "pc-1", "gate", serde_json::json!({})),
-            text_round(2, "不该走到这里。"),
-        ]]))
+        .fake_llm(Arc::clone(&llm))
         .tool(gate.tool())
-        .factory(FixedFactory::sender_only(
-            Arc::clone(&sender) as Arc<dyn ChannelSender>
-        ))
         .start()
         .await;
-    let ack = gateway.handle(operator_dm("等着", "telegram:1")).await;
-    let InboundAck::Queued { session, run } = ack else {
-        panic!("{ack:?}");
-    };
-    gate.wait_entered(1).await;
-
-    let cancel = gateway.handle(operator_dm("/cancel", "telegram:2")).await;
-    assert!(
-        matches!(&cancel, InboundAck::Replied { text } if text.contains(run.as_str())),
-        "{cancel:?}"
-    );
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    loop {
-        let runs = gateway.runs_of(&session).await;
-        let state = runs.iter().find(|one| one.run == run).map(|one| one.state);
-        if state == Some(RunState::Cancelled) {
-            break;
+    let (_, body) = gateway.get("/v1/home-session").await;
+    let session = serde_json::from_str::<komo_kernel::protocol::http::SessionSummary>(&body)
+        .expect("home session")
+        .session;
+    let submit = |key: &'static str, text: &'static str| {
+        let session = session.clone();
+        let gateway = &gateway;
+        async move {
+            let (code, body) = gateway
+                .post(
+                    &format!("/v1/sessions/{session}/runs"),
+                    serde_json::json!({ "request_key": key, "text": text }),
+                )
+                .await;
+            assert_eq!(code, 200, "{body}");
+            serde_json::from_str::<komo_kernel::protocol::http::SubmitRunResponse>(&body)
+                .expect("回执")
+                .run
         }
-        assert!(std::time::Instant::now() < deadline, "没取消掉：{state:?}");
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
+    };
+
+    let first = submit("two-calls", "跑两条命令").await;
+    gate.wait_entered(1).await;
+    let second = submit("two-calls-2", "y").await;
+    gate.release();
+    gateway.wait_run(&first).await;
+    gateway.wait_run(&second).await;
+
+    // 两个调用都有结果。
+    let events = gateway.events(session.as_str()).await;
+    let called: std::collections::BTreeSet<String> = events
+        .iter()
+        .filter_map(|event| match &event.payload {
+            komo_kernel::events::EventPayload::ToolResult(result) => {
+                Some(result.call_id.to_string())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        called,
+        ["call_00_one", "call_01_two"]
+            .iter()
+            .map(ToString::to_string)
+            .collect(),
+        "一轮里的两次调用都要有结果"
+    );
+
+    // 而且每一步交给模型的转写都过得了 provider 那一关。
+    let requests = llm.requests.lock().expect("脚本模型").clone();
+    assert_transcripts_close_every_call(&requests);
 }

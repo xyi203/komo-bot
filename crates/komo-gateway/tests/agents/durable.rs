@@ -44,7 +44,6 @@ fn config() -> String {
 
 async fn start(llm: &Arc<TasksLlm>, at: Option<&Path>, tool: Option<Arc<dyn Tool>>) -> TestGateway {
     let mut builder = GatewayBuilder::new(&config())
-        .durable()
         .llm(Arc::clone(llm) as Arc<dyn LlmClient>)
         .stream(DriverStream::new(Arc::clone(llm) as Arc<dyn LlmClient>));
     if let Some(home) = at {
@@ -481,7 +480,6 @@ async fn start_chat(
     gate: Option<&Arc<Gate>>,
 ) -> TestGateway {
     let mut builder = GatewayBuilder::new(&tasks_config())
-        .durable()
         .llm(Arc::clone(llm) as Arc<dyn LlmClient>)
         .stream(DriverStream::new(Arc::clone(llm) as Arc<dyn LlmClient>))
         .factory(FixedFactory::sender_only(

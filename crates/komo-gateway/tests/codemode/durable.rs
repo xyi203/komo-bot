@@ -1,7 +1,7 @@
 //! codemode 在 Durable 存储上（`docs/storage-durable-d5.md` W4b）：与 `../main.rs` 同名同断言，Gateway
 //! 跑在新存储上，只有起 Gateway 与"停下来问人"那几处不同：
 //!
-//! - 模型替身是 `FakeLlm`（同时是 `ModelStream`），起 Gateway 用 `Home::start_durable`；
+//! - 模型替身是 `FakeLlm`（同时是 `ModelStream`），起 Gateway 用 `Home::start`；
 //! - Legacy 里 `gw.interventions().is_empty()` 证"脚本里不停下来问人"。新存储没有 `waiting + intervention`
 //!   这个状态（intervention 只列 faulted 任务，路由由 W4a 接），这一句删掉：`run_script` 已断言 Run 以
 //!   `Completed` 收尾，"停下来等人"在新存储里不存在，所以没有可断言的东西。
@@ -21,7 +21,7 @@ async fn run_script(home: &Home, code: &str) -> (Gw, Arc<FakeLlm>, String) {
         call_round(1, "pc-1", "codemode", serde_json::json!({ "code": code })),
         text_round(2, "好了"),
     ]]);
-    let gw = home.start_durable(Arc::clone(&llm)).await;
+    let gw = home.start(Arc::clone(&llm)).await;
     assert!(
         gw.state()
             .tool_names()

@@ -29,6 +29,5 @@ mod harness;
 
 mod command;
 mod definition;
-mod durable;
 mod firing;
 mod notify;

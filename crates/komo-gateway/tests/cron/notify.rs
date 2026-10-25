@@ -2,10 +2,6 @@
 
 use std::sync::Arc;
 
-use komo_kernel::traits::LlmClient;
-use komo_kernel::types::status::WaitReason;
-
-use komo_gateway::service::test_support::Unsure;
 use komo_kernel::types::chat::Outbound;
 
 use crate::harness::*;
@@ -25,7 +21,7 @@ fn daily(notify: &str) -> serde_json::Value {
 async fn always_delivers_a_good_run() {
     let home = Home::new();
     let gw = home
-        .start(FakeLlm::always(vec![text_round(1, "整理好了")]) as Arc<dyn LlmClient>)
+        .start(FakeLlm::always(vec![text_round(1, "整理好了")]))
         .await;
     let job = gw.add_job(daily("always")).await;
     gw.make_due(&job.id).await;
@@ -46,7 +42,7 @@ async fn on_error_keeps_quiet_about_a_good_run_but_never_about_a_wait() {
     let home = Home::new();
     // ── 前半：一个顺利跑完的 Job，`on_error` 下不投。
     let gw = home
-        .start(FakeLlm::always(vec![text_round(1, "整理好了")]) as Arc<dyn LlmClient>)
+        .start(FakeLlm::always(vec![text_round(1, "整理好了")]))
         .await;
     let quiet = gw.add_job(daily("on_error")).await;
     gw.make_due(&quiet.id).await;
@@ -76,58 +72,70 @@ async fn on_error_keeps_quiet_about_a_good_run_but_never_about_a_wait() {
     );
     gw.stop().await;
 
-    // ── 后半：同一份配置，一个停在等待上的 Job。**一律投**。
-    let unsure = Unsure::new();
-    home.install_tools(vec![unsure.tool()]);
-    let llm = FakeLlm::always(vec![unsure_round(1, "pc-1")]);
-    let gw = home.start(Arc::clone(&llm) as Arc<dyn LlmClient>).await;
-    let asking = gw.add_job(daily("on_error")).await;
-    gw.make_due(&asking.id).await;
+    // ── 后半：同一份配置，一个**失败**的 Job。**照投**。
+    //
+    // Legacy 版这里是"停在等人核对上的等待照样投"；新语义没有 `waiting + intervention`（结果不明
+    // 直接交给模型），`on_error` 要保住的那条底线换成它的另一半：出错一定报告。
+    let llm = FakeLlm::always(vec![Err(komo_kernel::types::turn::LlmError::Rejected {
+        status: 400,
+        message: "模型后端坏了".into(),
+    })]);
+    let gw = home.start(Arc::clone(&llm)).await;
+    let failing = gw.add_job(daily("on_error")).await;
+    gw.make_due(&failing.id).await;
     let run = gw.tick().await.fired[0].run.clone();
-    // §8.4：等待是 `waiting` 加理由两维，理由说得出是在等人核对。
-    let wait = gw.wait_waiting(&run).await;
-    assert!(
-        matches!(wait, WaitReason::Intervention { .. }),
-        "停在等人核对上：{wait:?}"
-    );
+    gw.wait_state(&run, |s| s.is_terminal(), "终态").await;
 
     let sender = Arc::clone(&gw.home);
-    eventually("等待照样投到 home chat", move || {
+    eventually("失败照样投到 home chat", move || {
         sender
             .sent()
             .iter()
-            .any(|message| matches!(message.outbound, Outbound::NeedsAttention { .. }))
+            .any(|message| matches!(message.outbound, Outbound::RunFinished { .. }))
     })
     .await;
+    assert_eq!(
+        gw.firings(&failing.id).await.first().map(|f| f.status),
+        Some(komo_kernel::cron::FiringStatus::Error)
+    );
     gw.stop().await;
 }
 
-/// `never`：结果一概不投——**但等待还是投**，否则这个 Job 会从此停在那里。
+/// `never`：结果一概不投。
+///
+/// Legacy 版叫"等待照样投"：`never` 下一次停在等人核对上的等待仍然投，否则 Job 会从此停在那里。
+/// Durable 里没有那种等待（faulted 任务的提醒是 W4a 的 intervention），这一条只能验 `never` 的前半：
+/// 失败也**不**投，但触发状态照样记成 `error`——结果去原 Session 看（§10 最后一条）。
 #[tokio::test]
-async fn never_still_lets_a_wait_through() {
+async fn never_keeps_quiet_even_about_a_failure() {
     let home = Home::new();
-    let unsure = Unsure::new();
-    home.install_tools(vec![unsure.tool()]);
-    let llm = FakeLlm::always(vec![unsure_round(1, "pc-1")]);
-    let gw = home.start(Arc::clone(&llm) as Arc<dyn LlmClient>).await;
+    let llm = FakeLlm::always(vec![Err(komo_kernel::types::turn::LlmError::Rejected {
+        status: 400,
+        message: "模型后端坏了".into(),
+    })]);
+    let gw = home.start(Arc::clone(&llm)).await;
 
     let job = gw.add_job(daily("never")).await;
     gw.make_due(&job.id).await;
     let run = gw.tick().await.fired[0].run.clone();
-    let wait = gw.wait_waiting(&run).await;
-    assert!(
-        matches!(wait, WaitReason::Intervention { .. }),
-        "停在等人核对上：{wait:?}"
-    );
+    gw.wait_state(&run, |s| s.is_terminal(), "终态").await;
 
-    let sender = Arc::clone(&gw.home);
-    eventually("never 也要投一次等待", move || {
-        sender
-            .sent()
-            .iter()
-            .any(|message| matches!(message.outbound, Outbound::NeedsAttention { .. }))
-    })
-    .await;
+    let mut settled = false;
+    for _ in 0..100 {
+        if gw.firings(&job.id).await.first().map(|f| f.status)
+            == Some(komo_kernel::cron::FiringStatus::Error)
+        {
+            settled = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(settled, "触发状态应当记成 error");
+    assert!(
+        gw.home.sent().is_empty(),
+        "never 一概不投：{:?}",
+        gw.home.sent()
+    );
     gw.stop().await;
 }
 
@@ -138,7 +146,7 @@ async fn never_still_lets_a_wait_through() {
 #[tokio::test]
 async fn a_misspelled_notify_is_refused() {
     let home = Home::new();
-    let gw = home.start(FakeLlm::new(vec![]) as Arc<dyn LlmClient>).await;
+    let gw = home.start(FakeLlm::new(vec![])).await;
     let (status, body) = gw.post("/v1/cron", daily("nerver")).await;
     assert!(status == 400 || status == 422, "{status} {body}");
     assert!(body.contains("nerver"), "说出是哪个词：{body}");

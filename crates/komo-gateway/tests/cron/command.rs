@@ -5,8 +5,6 @@
 
 use std::sync::Arc;
 
-use komo_kernel::traits::LlmClient;
-
 use crate::harness::*;
 
 fn command_job(name: &str, command: &str) -> serde_json::Value {
@@ -27,7 +25,7 @@ async fn a_command_job_never_asks_the_model_and_delivers_trimmed_stdout() {
     // 空脚本：`begin_turn` 一旦真的被调用，`FakeDriver` 会给一句收尾文本而不是报错
     // （见 `FakeLlm` 的注释），所以断言靠 `llm.turns()`，不是"没崩"。
     let llm = FakeLlm::new(vec![]);
-    let gw = home.start(Arc::clone(&llm) as Arc<dyn LlmClient>).await;
+    let gw = home.start(Arc::clone(&llm)).await;
 
     let job = gw.add_job(command_job("say-hi", "echo '  hi  '")).await;
     gw.make_due(&job.id).await;
@@ -58,7 +56,7 @@ async fn a_command_job_never_asks_the_model_and_delivers_trimmed_stdout() {
 async fn a_command_job_with_empty_stdout_settles_ok_but_delivers_nothing() {
     let home = Home::new();
     let llm = FakeLlm::new(vec![]);
-    let gw = home.start(Arc::clone(&llm) as Arc<dyn LlmClient>).await;
+    let gw = home.start(Arc::clone(&llm)).await;
 
     let job = gw.add_job(command_job("silent", "true")).await;
     let before = gw.home.texts().len();
@@ -100,7 +98,7 @@ async fn a_command_job_with_empty_stdout_settles_ok_but_delivers_nothing() {
 async fn a_non_zero_exit_delivers_an_error_summary() {
     let home = Home::new();
     let llm = FakeLlm::new(vec![]);
-    let gw = home.start(Arc::clone(&llm) as Arc<dyn LlmClient>).await;
+    let gw = home.start(Arc::clone(&llm)).await;
 
     let job = gw
         .add_job(command_job("boom", "echo went-wrong >&2; exit 3"))
@@ -135,7 +133,7 @@ async fn a_failed_firing_emits_its_span_and_counts_a_failure() {
     let capture = komo_runtime::telemetry::capture::Capture::default();
     let _guard = capture.install();
     let home = Home::new();
-    let gw = home.start(FakeLlm::new(vec![]) as Arc<dyn LlmClient>).await;
+    let gw = home.start(FakeLlm::new(vec![])).await;
 
     let job = gw.add_job(command_job("boom", "exit 3")).await;
     gw.make_due(&job.id).await;
@@ -155,8 +153,14 @@ async fn a_failed_firing_emits_its_span_and_counts_a_failure() {
     assert_eq!(failures.len(), 1);
     assert_eq!(failures[0].fields["komo.cron.job"], job.id.to_string());
     for event in capture.all_metrics() {
-        let dump = format!("{:?}", event.fields);
-        assert!(!dump.contains(run.as_str()), "指标里不该有 Run id：{dump}");
+        // Durable 的 RunId 是十进制 submission ID，很短，按子串找会误撞 Job UUID 里的数字；
+        // 改成按字段：值里不能有这个 Run，键里不能有 run / session。
+        for (key, value) in &event.fields {
+            assert!(
+                !key.contains("run") && !key.contains("session") && value != run.as_str(),
+                "指标里不该有 Run / 会话 id：{key}={value}"
+            );
+        }
     }
     gw.stop().await;
 }
@@ -166,7 +170,7 @@ async fn a_failed_firing_emits_its_span_and_counts_a_failure() {
 #[tokio::test]
 async fn prompt_and_command_are_mutually_exclusive() {
     let home = Home::new();
-    let gw = home.start(FakeLlm::new(vec![]) as Arc<dyn LlmClient>).await;
+    let gw = home.start(FakeLlm::new(vec![])).await;
 
     let (status, body) = gw
         .post(

@@ -62,7 +62,7 @@ async fn a_session_workdir_is_one_fact_for_the_interface_and_the_execution() {
         ),
         text_round(2, "读完了。"),
     ]]);
-    let gateway = home.start_durable(Arc::clone(&llm)).await;
+    let gateway = home.start(Arc::clone(&llm)).await;
 
     // 创建会话时带上 workdir：摘要立刻就该报它。
     let (code, body) = gateway

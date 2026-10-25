@@ -789,26 +789,52 @@ pub async fn admit(
             Ok(Admitted::Id(submission.id))
         }
         SubmissionDraft::Input { content, entry, .. } => {
-            let record = tx
-                .append_entry(
-                    conversation,
-                    entries::input_draft(content, entry.as_ref(), now),
-                )
-                .await?;
-            let submission = tx
-                .create_submission(
-                    conversation,
-                    request_id,
-                    SubmissionKind::Input {
-                        state: InputState::Placed { entry: record.id },
-                    },
-                )
-                .await?;
-            start_run(tx, generation, conversation, &mut live, vec![submission.id]).await?;
+            let id = place_idle_input(
+                tx,
+                generation,
+                conversation,
+                &mut live,
+                content,
+                entry.as_ref(),
+                request_id,
+                now,
+            )
+            .await?;
             live::store(tx, conversation, &live).await?;
-            Ok(Admitted::Id(submission.id))
+            Ok(Admitted::Id(id))
         }
     }
+}
+
+/// 空闲、收件箱为空的 conversation 直接放置一条输入：追加 user entry、建 `placed` 的
+/// submission、起 run。`admit` 的最后一支，也是 `orchestration` 在刚建出来的子 conversation 里
+/// 放第一条输入的路径（那里没有请求键可查、没有 head 可读，也不许有表读）。调用方随后把
+/// `live` 写回。
+#[allow(clippy::too_many_arguments)]
+pub async fn place_idle_input(
+    tx: &mut Tx,
+    generation: &dyn TaskKind,
+    conversation: ConversationId,
+    live: &mut LiveState,
+    content: &Content,
+    entry: Option<&InputEntry>,
+    request_id: Option<&str>,
+    now: i64,
+) -> Result<SubmissionId, DurableError> {
+    let record = tx
+        .append_entry(conversation, entries::input_draft(content, entry, now))
+        .await?;
+    let submission = tx
+        .create_submission(
+            conversation,
+            request_id,
+            SubmissionKind::Input {
+                state: InputState::Placed { entry: record.id },
+            },
+        )
+        .await?;
+    start_run(tx, generation, conversation, live, vec![submission.id]).await?;
+    Ok(submission.id)
 }
 
 /// 撤回一个还在排队的 submission：从收件箱移除，settle `unanswered{aborted}`。

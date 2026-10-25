@@ -10,7 +10,7 @@ use komo_kernel::durable::{
 };
 use serde_json::json;
 
-use super::super::{DurableError, EntryDraft, TaskInspectionState};
+use super::super::{ConversationOwnership, DurableError, EntryDraft, TaskInspectionState};
 use super::support::*;
 
 /// pi: "stops without outcomes and starts no fresh phase or abort invocation while closing"：关闭写不下任何
@@ -202,6 +202,52 @@ async fn table_reads_after_a_table_write_are_rejected_but_documents_stay_availab
                 assert_eq!(tx.document(&address).await?, Some((1, json!({"n": 1}))));
                 tx.put_document(address.clone(), 1, json!({"n": 2})).await?;
                 assert_eq!(tx.document(&address).await?, Some((1, json!({"n": 2}))));
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+    engine.close().await.unwrap();
+}
+
+/// 交回结果要在写过自己的 conversation 之后读**别的** conversation 的请求键与 head 标记：这次提交
+/// 没碰过它（也没碰过它的 fork 祖先）时已提交的读是精确的，放行；碰过就仍然拒绝。
+#[tokio::test(start_paused = true)]
+async fn reading_another_conversation_after_a_write_is_allowed_only_when_untouched() {
+    let env = Env::new();
+    let engine = env.open().await;
+    let other = engine
+        .commit(|tx| {
+            Box::pin(async move {
+                Ok(tx
+                    .create_conversation(ConversationOwnership::Ownerless)
+                    .await?
+                    .id)
+            })
+        })
+        .await
+        .unwrap();
+    engine
+        .commit(move |tx| {
+            Box::pin(async move {
+                tx.append_entry(ROOT_CONVERSATION_ID, EntryDraft::new("test.entry"))
+                    .await?;
+                // 别的 conversation 没被碰过：读得了请求键、head 标记。
+                assert!(tx.submission_by_request(other, "k").await?.is_none());
+                assert!(tx.latest_head_marker(other).await?.is_none());
+                assert!(tx.conversation(other).await?.is_some());
+                // 自己写过的：仍然不许读。
+                assert!(matches!(
+                    tx.submission_by_request(ROOT_CONVERSATION_ID, "k").await,
+                    Err(DurableError::ReadAfterWrite(_))
+                ));
+                // 碰过 `other` 之后它也不行了。
+                tx.append_entry(other, EntryDraft::new("test.entry"))
+                    .await?;
+                assert!(matches!(
+                    tx.latest_head_marker(other).await,
+                    Err(DurableError::ReadAfterWrite(_))
+                ));
                 Ok(())
             })
         })

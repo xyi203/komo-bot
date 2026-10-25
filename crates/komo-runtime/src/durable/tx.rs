@@ -158,12 +158,63 @@ impl Tx {
         Ok(())
     }
 
+    /// 这次提交已暂存的写入有没有碰过 `conversation`（它的记录、entry、submission 或任务）。
+    fn touches(&self, conversation: ConversationId) -> bool {
+        self.conversations
+            .iter()
+            .any(|record| record.id == conversation)
+            || self
+                .entries
+                .iter()
+                .any(|entry| entry.conversation == conversation)
+            || self
+                .submissions
+                .values()
+                .any(|record| record.conversation == conversation)
+            || self
+                .tasks
+                .values()
+                .any(|(_, record)| record.conversation == conversation)
+    }
+
+    /// 读**别的** conversation 已提交状态的门：表读不许排在表写之后，是因为读不到自己暂存的
+    /// 写；但这次提交没碰过 `conversation`，也没碰过它沿 fork 能看到的任何祖先时，已提交的读就
+    /// 是精确的——子 conversation 收尾的那笔提交往父 conversation 交回结果（`orchestration::report`）
+    /// 要这样读父的请求键与 head 标记。
+    async fn read_guard_for(
+        &self,
+        method: &'static str,
+        conversation: ConversationId,
+    ) -> Result<(), DurableError> {
+        if !self.has_table_write {
+            return Ok(());
+        }
+        let mut current = conversation;
+        loop {
+            if self.touches(current) {
+                return Err(DurableError::ReadAfterWrite(method));
+            }
+            match self.storage.conversation(current).await? {
+                Some(ConversationRecord {
+                    parent: Some(parent),
+                    ..
+                }) => current = parent.conversation,
+                _ => return Ok(()),
+            }
+        }
+    }
+
     pub async fn conversation(
         &mut self,
         id: ConversationId,
     ) -> Result<Option<ConversationRecord>, DurableError> {
-        self.read_guard("conversation")?;
+        self.read_guard_for("conversation", id).await?;
         Ok(self.storage.conversation(id).await?)
+    }
+
+    /// 本次提交已暂存、还没提交的 entry（表读之后不能再读已提交的，但自己刚追加的要能看见）。
+    pub fn staged_entry(&self, id: EntryId) -> Option<&EntryRecord> {
+        self.entries.iter().find(|entry| entry.id == id)
     }
 
     pub async fn task(&mut self, id: TaskId) -> Result<Option<TaskRecord>, DurableError> {
@@ -444,7 +495,8 @@ impl Tx {
         }) {
             return Ok(Some(record.clone()));
         }
-        self.read_guard("submission_by_request")?;
+        self.read_guard_for("submission_by_request", conversation)
+            .await?;
         Ok(self
             .storage
             .submission_by_request(conversation, request_id)
@@ -482,7 +534,8 @@ impl Tx {
         &mut self,
         conversation: ConversationId,
     ) -> Result<Option<EntryRecord>, DurableError> {
-        self.read_guard("latest_head_marker")?;
+        self.read_guard_for("latest_head_marker", conversation)
+            .await?;
         Ok(self
             .storage
             .find_latest_head_marker(conversation, None)

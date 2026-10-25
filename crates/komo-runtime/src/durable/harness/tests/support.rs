@@ -41,6 +41,7 @@ use crate::recovery::{ChildProcess, IdentityProbe, Liveness, ProcessProbe};
 use super::super::hooks::{
     AgentHooks, AgentSetup, HarnessDeps, HookError, PromptSection, RunBudget, ToolEnv, ToolSet,
 };
+use super::super::orchestration::{LaunchMode, MonitorError, MonitorLaunch, OrchestrationHooks};
 use super::super::{CompactionSettings, CompactionSetup, SummaryPrompt};
 use super::super::{Harness, LiveState};
 
@@ -271,6 +272,9 @@ pub struct Script {
     /// 主请求抢次序。
     summary_steps: Mutex<VecDeque<Step>>,
     summary_requests: Mutex<Vec<Vec<Message>>>,
+    /// 按"最后一条用户消息含这段文字"认领的步骤（后台任务的子 conversation 与父共用一个脚本，
+    /// 按到达次序出牌会互相抢）。
+    routed: Mutex<Vec<(String, Step)>>,
     requests: Mutex<Vec<Vec<Message>>>,
     times: Mutex<Vec<i64>>,
     models: Mutex<Vec<ModelConfig>>,
@@ -284,6 +288,7 @@ impl Script {
             steps: Mutex::new(VecDeque::new()),
             summary_steps: Mutex::new(VecDeque::new()),
             summary_requests: Mutex::new(Vec::new()),
+            routed: Mutex::new(Vec::new()),
             requests: Mutex::new(Vec::new()),
             times: Mutex::new(Vec::new()),
             models: Mutex::new(Vec::new()),
@@ -302,6 +307,27 @@ impl Script {
 
     pub fn calls(&self, calls: &[(&str, &str, Value)]) {
         self.push(Step::Reply(call_reply(calls)));
+    }
+
+    /// 最后一条用户消息含 `needle` 的请求用这一步（先于主队列；每步只用一次）。
+    pub fn push_for(&self, needle: &str, step: Step) {
+        self.routed.lock().unwrap().push((needle.to_owned(), step));
+    }
+
+    pub fn reply_for(&self, needle: &str, text: &str) {
+        self.push_for(needle, Step::Reply(text_reply(text)));
+    }
+
+    pub fn calls_for(&self, needle: &str, calls: &[(&str, &str, Value)]) {
+        self.push_for(needle, Step::Reply(call_reply(calls)));
+    }
+
+    /// 最后一条用户消息含 `needle` 的那些请求（按到达次序）。
+    pub fn requests_for(&self, needle: &str) -> Vec<Vec<Message>> {
+        self.requests()
+            .into_iter()
+            .filter(|messages| last_user_text(messages).contains(needle))
+            .collect()
     }
 
     /// 摘要请求的下一步（压缩任务的）。
@@ -394,14 +420,36 @@ impl ModelStream for Script {
                 .lock()
                 .unwrap()
                 .push(request.options.revised_from);
-            self.steps
-                .lock()
-                .unwrap()
-                .pop_front()
-                .expect("the script ran out of steps")
+            let last_user = last_user_text(request.messages);
+            let routed = {
+                let mut routed = self.routed.lock().unwrap();
+                routed
+                    .iter()
+                    .position(|(needle, _)| last_user.contains(needle.as_str()))
+                    .map(|index| routed.remove(index).1)
+            };
+            match routed {
+                Some(step) => step,
+                None => self
+                    .steps
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .expect("the script ran out of steps"),
+            }
         };
         self.play(step, progress).await
     }
+}
+
+/// 请求里最后一条用户消息的文字（没有就是空）。
+pub fn last_user_text(messages: &[Message]) -> String {
+    messages
+        .iter()
+        .rev()
+        .find(|message| matches!(message, Message::User(_)))
+        .map(text_of)
+        .unwrap_or_default()
 }
 
 fn usage(input: u64, output: u64) -> Value {
@@ -693,6 +741,100 @@ impl ProcessProbe for FakeProbe {
     }
 }
 
+// ------------------------------------------------------------ 编排钩子替身
+
+/// `OrchestrationHooks` 的替身（D5 由 gateway 实现的那个东西）：记下每次被问到的，答案由测试定；
+/// 监听的"进程"只是 `running` 里的一个 id。
+#[derive(Default)]
+pub struct TestOrchestration {
+    /// `check_effort` 被问到的 `(conversation, 已知的 alias, 档位)`。
+    pub effort_checks: Mutex<Vec<(ConversationId, Option<String>, String)>>,
+    /// 有值就让 `check_effort` 拒绝，文字是这个。
+    pub reject_effort: Mutex<Option<String>>,
+    /// `start_monitor` 收到的每份启动说明（模式、id、剩余时限）。
+    pub launches: Mutex<Vec<(LaunchMode, u64, i64)>>,
+    pub stops: Mutex<Vec<u64>>,
+    /// gateway 眼里"还在跑"的监听进程。
+    pub running: Mutex<std::collections::HashSet<u64>>,
+    /// 有值就让 `Fresh` / `Resume` 起不来。
+    pub fail_start: Mutex<Option<String>>,
+    /// 起进程时（进程已经算起来了）停在这里，直到放行：模拟"进程起了、结果还没提交"。
+    pub start_gate: Mutex<Option<Arc<Notify>>>,
+}
+
+impl TestOrchestration {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    pub fn launches(&self) -> Vec<(LaunchMode, u64, i64)> {
+        self.launches.lock().unwrap().clone()
+    }
+
+    pub fn stops(&self) -> Vec<u64> {
+        self.stops.lock().unwrap().clone()
+    }
+
+    /// gateway 重启了：进程都没了。
+    pub fn forget_processes(&self) {
+        self.running.lock().unwrap().clear();
+    }
+}
+
+#[async_trait]
+impl OrchestrationHooks for TestOrchestration {
+    async fn check_effort(
+        &self,
+        conversation: ConversationId,
+        model: Option<&str>,
+        effort: &komo_kernel::types::model::Effort,
+    ) -> Result<(), String> {
+        self.effort_checks.lock().unwrap().push((
+            conversation,
+            model.map(str::to_owned),
+            effort.as_str().to_owned(),
+        ));
+        match self.reject_effort.lock().unwrap().clone() {
+            Some(problem) => Err(problem),
+            None => Ok(()),
+        }
+    }
+
+    async fn start_monitor(&self, launch: &MonitorLaunch) -> Result<(), MonitorError> {
+        let id = launch.record.id;
+        self.launches
+            .lock()
+            .unwrap()
+            .push((launch.mode, id, launch.remaining_ms));
+        match launch.mode {
+            LaunchMode::Recover => {
+                if self.running.lock().unwrap().contains(&id) {
+                    Ok(())
+                } else {
+                    Err(MonitorError::Interrupted("没有这个监听在跑".into()))
+                }
+            }
+            LaunchMode::Fresh | LaunchMode::Resume => {
+                if let Some(reason) = self.fail_start.lock().unwrap().clone() {
+                    return Err(MonitorError::Failed(reason));
+                }
+                self.running.lock().unwrap().insert(id);
+                let gate = self.start_gate.lock().unwrap().clone();
+                if let Some(gate) = gate {
+                    gate.notified().await;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    async fn stop_monitor(&self, id: u64) -> Result<(), MonitorError> {
+        self.stops.lock().unwrap().push(id);
+        self.running.lock().unwrap().remove(&id);
+        Ok(())
+    }
+}
+
 // ------------------------------------------------------------ 测试钩子
 
 pub fn model_config() -> ModelConfig {
@@ -723,6 +865,11 @@ struct HookState {
     compaction_enabled: bool,
     /// 先放过这么多次 `compaction()`，再失败一次。
     compaction_failure: Option<(usize, HookError)>,
+    /// `komo.task` 里的 alias → 模型配置（gateway 的 `setup` 按名字解析的替身）。
+    aliases: std::collections::HashMap<String, ModelConfig>,
+    storage: Option<Arc<dyn Storage>>,
+    /// `setup` 被问过的 conversation 与它给的缓存键。
+    setups: Vec<(ConversationId, Option<String>)>,
 }
 
 /// 测试里的钩子：D5 由 gateway 实现的那个东西的替身。每个决定点都按当前内容重新答。
@@ -762,8 +909,28 @@ impl TestHooks {
                 compaction: None,
                 compaction_enabled: false,
                 compaction_failure: None,
+                aliases: std::collections::HashMap::new(),
+                storage: None,
+                setups: Vec::new(),
             }),
         })
+    }
+
+    /// 钩子读 `komo.task` 要的存储（引擎每次打开时换成当前的）。
+    pub fn attach(&self, storage: Arc<dyn Storage>) {
+        self.state.lock().unwrap().storage = Some(storage);
+    }
+
+    pub fn add_alias(&self, alias: &str, model: ModelConfig) {
+        self.state
+            .lock()
+            .unwrap()
+            .aliases
+            .insert(alias.to_owned(), model);
+    }
+
+    pub fn setups(&self) -> Vec<(ConversationId, Option<String>)> {
+        self.state.lock().unwrap().setups.clone()
     }
 
     pub fn set_tools(&self, tools: Vec<Arc<dyn Tool>>) {
@@ -827,22 +994,49 @@ impl TestHooks {
 impl AgentHooks for TestHooks {
     async fn setup(
         &self,
-        _conversation: ConversationId,
+        conversation: ConversationId,
         _context: &[Message],
     ) -> Result<AgentSetup, HookError> {
-        let state = self.state.lock().unwrap();
+        // 后台任务的 conversation：`komo.task` 说它用哪个模型、fork 的缓存键用父的。
+        let storage = self.state.lock().unwrap().storage.clone();
+        let doc = match storage {
+            Some(storage) => super::super::orchestration::task_doc(&*storage, conversation)
+                .await
+                .ok()
+                .flatten(),
+            None => None,
+        };
+        let mut state = self.state.lock().unwrap();
         if let Some(failure) = &state.failure {
             return Err(failure.clone());
         }
-        let Some(model) = state.model.clone() else {
+        let Some(mut model) = state.model.clone() else {
             return Err(HookError::NoModel("No model is configured".into()));
         };
+        let mut cache_key = Some("cache-1".to_owned());
+        if let Some(doc) = &doc {
+            if doc.fork {
+                cache_key = Some(format!("conversation-{}", doc.parent));
+            } else {
+                if let Some(chosen) = doc
+                    .model
+                    .as_ref()
+                    .and_then(|alias| state.aliases.get(alias))
+                {
+                    model = chosen.clone();
+                }
+                if let Some(effort) = &doc.effort {
+                    model.effort = Some(effort.clone());
+                }
+            }
+        }
+        state.setups.push((conversation, cache_key.clone()));
         Ok(AgentSetup {
             sections: state.sections.clone(),
             tools: Self::tool_set(&state),
             model,
             budget: state.budget,
-            cache_key: Some("cache-1".into()),
+            cache_key,
             max_output_tokens: None,
         })
     }
@@ -890,6 +1084,8 @@ pub struct World {
     pub harness: Harness,
     /// 工具任务 `probe` 阶段用的探测替身（默认答"已经结束"）。
     pub probe: Arc<FakeProbe>,
+    /// 编排钩子替身（后台任务、监听）。
+    pub orch: Arc<TestOrchestration>,
     pub log: Log,
     /// 内存输出存储（`World::new`）；`with_outputs` 给了别的存储时它是空的。
     pub mem: MemOutputStore,
@@ -915,8 +1111,12 @@ impl World {
         let script = Script::new(clock.clone());
         let hooks = TestHooks::new(outputs);
         let probe = FakeProbe::new(Liveness::Gone);
-        let harness =
-            Harness::new(HarnessDeps::new(hooks.clone(), script.clone()).with_probe(probe.clone()));
+        let orch = TestOrchestration::new();
+        let harness = Harness::new(
+            HarnessDeps::new(hooks.clone(), script.clone())
+                .with_probe(probe.clone())
+                .with_orchestration(orch.clone()),
+        );
         let registry = Registry::new();
         harness.install(&registry);
         let storage = RecordingStorage::new();
@@ -931,6 +1131,7 @@ impl World {
             hooks,
             harness,
             probe,
+            orch,
             log: Log::default(),
             mem,
         }
@@ -972,6 +1173,7 @@ impl World {
                 .expect("open the Turso database");
             *self.db.lock().unwrap() = Arc::new(storage);
         }
+        self.hooks.attach(self.db());
         let engine = Engine::open(
             self.db(),
             self.registry.clone(),
@@ -1013,8 +1215,67 @@ impl World {
     }
 
     pub async fn live(&self) -> LiveState {
+        self.live_of(CONV).await
+    }
+
+    pub async fn live_of(&self, conversation: ConversationId) -> LiveState {
         let db = self.db();
-        Harness::live(&*db, CONV).await.expect("live")
+        Harness::live(&*db, conversation).await.expect("live")
+    }
+
+    pub async fn inbox(&self) -> super::super::InboxState {
+        let db = self.db();
+        Harness::inbox(&*db, CONV).await.expect("inbox")
+    }
+
+    /// 已提交的存储（读辅助；Turso 世界里引擎关着时不可用）。
+    pub fn storage_handle(&self) -> Arc<dyn Storage> {
+        self.db()
+    }
+
+    /// 最近派出的那个后台任务的子 conversation（所有者是锚任务的那个）。
+    pub async fn child(&self) -> ConversationId {
+        self.children().await.pop().expect("a spawned child")
+    }
+
+    pub async fn children(&self) -> Vec<ConversationId> {
+        let page = self
+            .db()
+            .scan_conversations(&ConversationQuery::default(), 1000, None)
+            .await
+            .unwrap();
+        page.items
+            .into_iter()
+            .filter(|record| record.owner.is_some())
+            .map(|record| record.id)
+            .collect()
+    }
+
+    pub async fn entries_in(&self, conversation: ConversationId) -> Vec<EntryRecord> {
+        let mut all = Vec::new();
+        let query = EntryQuery {
+            order: Some(ScanOrder::Ascending),
+            ..EntryQuery::new(conversation)
+        };
+        let mut cursor: Option<Cursor> = None;
+        loop {
+            let page = self
+                .db()
+                .scan_entries(&query, 256, cursor.as_ref())
+                .await
+                .unwrap();
+            all.extend(page.items);
+            match page.next {
+                Some(next) => cursor = Some(next),
+                None => return all,
+            }
+        }
+    }
+
+    /// 某个 conversation 推导出的模型消息（含它沿 fork 看到的祖先部分）。
+    pub async fn messages_in(&self, conversation: ConversationId) -> Vec<Message> {
+        // `scan_entries` 本来就沿 fork 祖先拼出可见的 entry。
+        derive_context(&self.entries_in(conversation).await, None).messages
     }
 
     pub async fn entries(&self) -> Vec<EntryRecord> {

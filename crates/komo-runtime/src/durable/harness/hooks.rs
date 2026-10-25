@@ -27,6 +27,7 @@ use komo_kernel::types::tool::{ToolDefinition, ToolExposure, WorkspaceRoot};
 use serde::{Deserialize, Serialize};
 
 use super::compaction::{CompactionSetup, SummaryPrompt};
+use super::orchestration::{NoOrchestration, OrchestrationHooks};
 use crate::agent::RetryBudget;
 use crate::llm::ImageResolver;
 use crate::recovery::{IdentityProbe, ProcessProbe};
@@ -307,6 +308,8 @@ pub struct HarnessDeps {
     pub stream: Arc<dyn crate::llm::ModelStream>,
     /// 工具任务 `probe` 阶段探子进程用的（生产是带身份核对的 [`IdentityProbe`]，测试里换替身）。
     pub probe: Arc<dyn ProcessProbe>,
+    /// `task` / `monitor` 要 agent / gateway 侧才有的东西（`orchestration`）；默认什么都没装配。
+    pub orchestration: Arc<dyn OrchestrationHooks>,
     settings: arc_swap::ArcSwap<HarnessSettings>,
 }
 
@@ -316,12 +319,18 @@ impl HarnessDeps {
             hooks,
             stream,
             probe: Arc::new(IdentityProbe),
+            orchestration: Arc::new(NoOrchestration),
             settings: arc_swap::ArcSwap::from_pointee(HarnessSettings::default()),
         }
     }
 
     pub fn with_probe(mut self, probe: Arc<dyn ProcessProbe>) -> Self {
         self.probe = probe;
+        self
+    }
+
+    pub fn with_orchestration(mut self, orchestration: Arc<dyn OrchestrationHooks>) -> Self {
+        self.orchestration = orchestration;
         self
     }
 

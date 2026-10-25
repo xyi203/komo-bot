@@ -68,6 +68,7 @@ use super::entries::append_assistant;
 use super::hooks::{HarnessDeps, HookError, RetryPolicy, ToolSet};
 use super::inbox::{self, At, QueueModes};
 use super::live::{self, GenerationLive, RetryLive, ToolSlot};
+use super::orchestration::report;
 use super::outcome::{aborted, completed, failed, running, unanswered, waiting};
 use super::system::plan_system_entries;
 use super::tool::ToolTask;
@@ -220,7 +221,7 @@ impl GenerationTask {
         &self.deps
     }
 
-    fn modes(&self) -> QueueModes {
+    pub(super) fn modes(&self) -> QueueModes {
         let settings = self.deps.settings();
         QueueModes {
             steering: settings.steering_mode,
@@ -353,6 +354,7 @@ impl GenerationTask {
         };
         let max_rounds = setup.budget.max_rounds;
         let compaction_task = self.compaction.clone();
+        let this = self.clone();
         rt.commit(move |tx, task| {
             Box::pin(async move {
                 let mut live = live::load(tx, conversation).await?;
@@ -362,8 +364,10 @@ impl GenerationTask {
                     && run.rounds >= max
                 {
                     let message = format!("超过总轮数预算（{max}）");
-                    live::end_run(
+                    report::end_run(
                         tx,
+                        &this,
+                        conversation,
                         &mut live,
                         task.id(),
                         &unanswered("budget", Some(&message)),
@@ -698,12 +702,15 @@ impl GenerationTask {
         text: String,
     ) -> Result<(), TaskError> {
         let conversation = rt.conversation();
+        let this = self.clone();
         rt.commit(move |tx, task| {
             Box::pin(async move {
                 let mut live = live::load(tx, conversation).await?;
                 append_assistant(tx, conversation, message).await?;
-                live::end_run(
+                report::end_run(
                     tx,
+                    &this,
+                    conversation,
                     &mut live,
                     task.id(),
                     &unanswered("model_error", Some(&text)),
@@ -726,12 +733,21 @@ impl GenerationTask {
         detail: Option<String>,
     ) -> Result<(), TaskError> {
         let conversation = rt.conversation();
+        let this = self.clone();
         rt.commit(move |tx, task| {
             Box::pin(async move {
                 let mut live = live::load(tx, conversation).await?;
                 live::convert_partial(tx, conversation, &mut live).await?;
                 let text = detail.unwrap_or_else(|| message.clone());
-                live::end_run(tx, &mut live, task.id(), &unanswered(reason, Some(&text))).await?;
+                report::end_run(
+                    tx,
+                    &this,
+                    conversation,
+                    &mut live,
+                    task.id(),
+                    &unanswered(reason, Some(&text)),
+                )
+                .await?;
                 live::store(tx, conversation, &live).await?;
                 Ok(Some(failed(message, reason, None)))
             })
@@ -753,8 +769,10 @@ impl GenerationTask {
                 let now = tx.now();
                 let entry = append_assistant(tx, conversation, message).await?;
                 let result = inbox::apply_boundary(tx, &mut boundary, At::Final, now).await?;
-                live::end_run(
+                report::end_run(
                     tx,
+                    &this,
+                    conversation,
                     &mut live,
                     task.id(),
                     &SubmissionSettlement::Done { answer: entry.id },
@@ -799,8 +817,15 @@ impl GenerationTask {
                         && run.tokens > limit
                     {
                         let text = format!("超过 token 预算（{limit}）");
-                        live::end_run(tx, &mut live, task.id(), &unanswered("budget", Some(&text)))
-                            .await?;
+                        report::end_run(
+                            tx,
+                            &this,
+                            conversation,
+                            &mut live,
+                            task.id(),
+                            &unanswered("budget", Some(&text)),
+                        )
+                        .await?;
                         live::store(tx, conversation, &live).await?;
                         return Ok(Some(failed(text, "budget", None)));
                     }
@@ -920,7 +945,15 @@ impl GenerationTask {
                 let now = tx.now();
                 let result = inbox::apply_boundary(tx, &mut boundary, At::PostTools, now).await?;
                 if result.reset {
-                    live::end_run(tx, &mut live, task.id(), &unanswered("reset", None)).await?;
+                    report::end_run(
+                        tx,
+                        &this,
+                        conversation,
+                        &mut live,
+                        task.id(),
+                        &unanswered("reset", None),
+                    )
+                    .await?;
                     if !result.users.is_empty() {
                         inbox::start_run(tx, &this, conversation, &mut live, result.users).await?;
                     }
@@ -1195,6 +1228,7 @@ impl TaskKind for GenerationTask {
             } if !pending.is_empty() => self.pending_calls(rt, *assistant, pending).await?,
             _ => Vec::new(),
         };
+        let this = self.clone();
         rt.commit(move |tx, task| {
             Box::pin(async move {
                 let mut live = live::load(tx, conversation).await?;
@@ -1210,7 +1244,15 @@ impl TaskKind for GenerationTask {
                     )
                     .await?;
                 }
-                live::end_run(tx, &mut live, task.id(), &unanswered("aborted", None)).await?;
+                report::end_run(
+                    tx,
+                    &this,
+                    conversation,
+                    &mut live,
+                    task.id(),
+                    &unanswered("aborted", None),
+                )
+                .await?;
                 live::store(tx, conversation, &live).await?;
                 Ok(Some(aborted(None)))
             })
@@ -1223,6 +1265,7 @@ impl TaskKind for GenerationTask {
 /// 给 `HarnessHooks` 用：生成任务被调度器写成 faulted / orphaned 时的清理。
 pub(super) async fn settle_scheduler_outcome(
     tx: &mut crate::durable::tx::Tx,
+    this: &GenerationTask,
     conversation: ConversationId,
     task: TaskId,
     settlement: &SubmissionSettlement,
@@ -1232,6 +1275,6 @@ pub(super) async fn settle_scheduler_outcome(
         return Ok(());
     }
     live::convert_partial(tx, conversation, &mut live).await?;
-    live::end_run(tx, &mut live, task, settlement).await?;
+    report::end_run(tx, this, conversation, &mut live, task, settlement).await?;
     live::store(tx, conversation, &live).await
 }

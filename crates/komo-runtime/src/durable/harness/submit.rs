@@ -31,6 +31,7 @@ use super::generation::{self, GenerationTask};
 use super::hooks::HarnessDeps;
 use super::inbox::{self, Admitted, QueueModes, SubmissionDraft, WriteDraft};
 use super::live::{self, LiveState, live_address};
+use super::orchestration::monitor;
 use super::outcome::unanswered;
 use super::tool::ToolTask;
 use super::{COMPACTION_KIND, GENERATION_KIND, TOOL_KIND};
@@ -90,11 +91,14 @@ impl Harness {
         registry.install(Arc::new(self.generation.clone()));
         registry.install(Arc::new(self.tool.clone()));
         registry.install(Arc::new(self.generation.compaction().clone()));
+        registry.install(Arc::new(super::orchestration::BackgroundTask));
     }
 
     /// 给 `EngineOptions::hooks`：调度器自己写的结局（faulted / orphaned）的清理。
     pub fn hooks(&self) -> Arc<dyn TaskHooks> {
-        Arc::new(HarnessHooks)
+        Arc::new(HarnessHooks {
+            generation: self.generation.clone(),
+        })
     }
 
     fn modes(&self) -> QueueModes {
@@ -177,6 +181,94 @@ impl Harness {
                 })
             })
             .await
+    }
+
+    /// 监听结束了（脚本退出 / 超时 / 刷屏 / 事件到上限，gateway 的泵调）：登记 `ended` 与结束消息
+    /// `monitor-end:{id}` 同一次提交。只有第一个结束它的人赢：已经结束的（模型 `monitor_stop` 停掉
+    /// 的、对账判过的）返回 `false`，什么都不写、不重复交回。见 [`orchestration::monitor`]。
+    pub async fn finish_monitor(
+        &self,
+        engine: &Engine,
+        id: u64,
+        reason: &str,
+        detail: Option<&str>,
+        message: String,
+    ) -> Result<bool, DurableError> {
+        engine.resume();
+        let generation = self.generation.clone();
+        let modes = self.modes();
+        let (reason, detail) = (reason.to_owned(), detail.map(str::to_owned));
+        engine
+            .commit(move |tx| {
+                Box::pin(async move {
+                    monitor::finish_in_tx(
+                        tx,
+                        &generation,
+                        modes,
+                        id,
+                        &reason,
+                        detail.as_deref(),
+                        message,
+                    )
+                    .await
+                })
+            })
+            .await
+    }
+
+    /// 重启后对账（gateway 启动时调一次）：每条 `running` 的登记——声明了 `resume_after_restart`
+    /// 且离截止还有至少 1 分钟的，让 gateway 重挂（同一个 id）；其余登记为结束并交回"已中断"（
+    /// 重挂不上、时限已过同理）。`starting` 的归挂它的工具任务接着判，这里不碰。
+    pub async fn reconcile_monitors(
+        &self,
+        engine: &Engine,
+    ) -> Result<Vec<monitor::Reconciled>, DurableError> {
+        use monitor::{LaunchMode, MIN_RESUME, MonitorLaunch, MonitorState, Reconciled};
+        let line = engine.line();
+        let records = monitor::list(&**line.storage()).await?;
+        let now = line.now_ms();
+        let mut done = Vec::new();
+        for record in records {
+            if record.state != MonitorState::Running {
+                continue;
+            }
+            let remaining = record.deadline - now;
+            let mut why = if record.resume_after_restart {
+                "时限已经到了（Gateway 重启时已过截止或只剩不到 1 分钟），没有重挂。".to_owned()
+            } else {
+                "已中断：Gateway 重启了，脚本没有在跑，也不会自动重挂。".to_owned()
+            };
+            let mut reason = if record.resume_after_restart {
+                "timeout"
+            } else {
+                "interrupted"
+            };
+            if record.resume_after_restart && remaining >= MIN_RESUME.as_millis() as i64 {
+                let launch = MonitorLaunch {
+                    record: record.clone(),
+                    mode: LaunchMode::Resume,
+                    remaining_ms: remaining,
+                };
+                match self.deps.orchestration.start_monitor(&launch).await {
+                    Ok(()) => {
+                        done.push(Reconciled::Resumed(record.id));
+                        continue;
+                    }
+                    Err(error) => {
+                        why = format!("已中断：Gateway 重启后重挂失败：{error}");
+                        reason = "interrupted";
+                    }
+                }
+            }
+            let message = monitor::interrupted_message(&record, &why);
+            if self
+                .finish_monitor(engine, record.id, reason, Some(&why), message)
+                .await?
+            {
+                done.push(Reconciled::Ended(record.id, reason.to_owned()));
+            }
+        }
+        Ok(done)
     }
 
     /// 撤回一个还在排队的 submission。`conversation` 给了就只认那个 conversation 里的。
@@ -286,7 +378,10 @@ impl Harness {
 /// - 工具任务：槽位标记完成、没有 entry——上下文推导会补上缺的结果。
 /// - 生成任务：已提交的部分回复转成 aborted entry，run 的输入以 `faulted` / 孤儿原因收场。
 /// - 压缩任务：移除状态、记下 `komo.live.compactionFailure`。
-pub struct HarnessHooks;
+pub struct HarnessHooks {
+    /// 收尾要往外交回结果（后台任务的子 conversation，`orchestration::report`）时放置输入、起 run 用。
+    generation: GenerationTask,
+}
 
 #[async_trait]
 impl TaskHooks for HarnessHooks {
@@ -313,6 +408,7 @@ impl TaskHooks for HarnessHooks {
                 };
                 generation::settle_scheduler_outcome(
                     tx,
+                    &self.generation,
                     record.conversation,
                     record.id,
                     &settlement,

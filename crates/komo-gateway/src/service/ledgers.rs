@@ -851,6 +851,18 @@ impl ToolOutputStore for RoutedOutputs {
             .interrupted(attempt, tail_bytes)
             .await
     }
+
+    /// 新存储的工具任务恢复时问"盘上有没有完整输出"（§5）：路由到这个 Session 自己的存储。
+    /// 不转发的话会落到 trait 的默认实现（永远 `None`），"已有完整输出就复用"就不生效。
+    async fn find_published(
+        &self,
+        attempt: &AttemptRef,
+    ) -> Result<Option<PublishedOutput>, StoreError> {
+        self.store_for(&attempt.session)
+            .await?
+            .find_published(attempt)
+            .await
+    }
 }
 
 /// 一个 Session 的目录。
@@ -981,6 +993,68 @@ mod tests {
             .await
             .expect("只算路径，不碰磁盘");
         assert!(!dir.exists(), "`store_for` 把搬走的会话目录建回来了");
+    }
+
+    /// §5「盘上有完整输出就复用」：路由层得把 `find_published` 转给 Session 的存储，否则落到
+    /// trait 的默认实现（永远 `None`）。发布过的尝试，换一层新的路由（相当于重启）也找得回；没发布的
+    /// 尝试与别的 Session 的同名尝试找不到。
+    #[tokio::test]
+    async fn find_published_is_routed_to_the_sessions_own_store() {
+        use komo_kernel::types::refs::{ToolResultBody, ToolResultStatus};
+
+        let store = TempStore::open().await.unwrap();
+        let session = SessionId::from_raw("sess-1");
+        let attempt = |session: &SessionId, number: &str| AttemptRef {
+            session: session.clone(),
+            run: RunId::from_raw("7"),
+            call: ToolCallId::from_raw("9"),
+            attempt: AttemptId::from_raw(number),
+        };
+        let (first_ledgers, first_routed, _hub) = ledgers(&store).await;
+        let outputs = RoutedOutputs::new(first_ledgers, first_routed);
+        let mut writer = outputs.begin(&attempt(&session, "1")).await.unwrap();
+        writer.write_stdout(b"hello\n").await.unwrap();
+        let published = outputs
+            .publish(
+                writer,
+                ToolResultBody {
+                    status: ToolResultStatus::Completed,
+                    result: serde_json::Value::Null,
+                    error: None,
+                    exit_code: Some(0),
+                    artifacts: vec![],
+                    images: vec![],
+                    preview: Some("done".into()),
+                },
+            )
+            .await
+            .unwrap();
+
+        let (fresh_ledgers, fresh_routed, _hub) = ledgers(&store).await;
+        let fresh = RoutedOutputs::new(fresh_ledgers, fresh_routed);
+        let found = fresh
+            .find_published(&attempt(&session, "1"))
+            .await
+            .unwrap()
+            .expect("盘上有完整输出就该找得到");
+        assert_eq!(found.output, published.output);
+        assert_eq!(found.status, ToolResultStatus::Completed);
+        assert!(
+            fresh
+                .find_published(&attempt(&session, "2"))
+                .await
+                .unwrap()
+                .is_none(),
+            "没发布过的尝试没有完整输出"
+        );
+        assert!(
+            fresh
+                .find_published(&attempt(&SessionId::from_raw("sess-2"), "1"))
+                .await
+                .unwrap()
+                .is_none(),
+            "别的 Session 的同名尝试不是它"
+        );
     }
 
     #[test]

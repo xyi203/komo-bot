@@ -806,6 +806,11 @@ pub struct World {
     pub log: Log,
     /// 内存输出存储（`World::new`）；`with_outputs` 给了别的存储时它是空的。
     pub mem: MemOutputStore,
+    /// 引擎与读辅助实际用的存储。内存世界里就是 `storage`；Turso 世界（`World::turso`）里是
+    /// 每次 `open` 重新打开的 `TursoStorage`——此时 `storage`（记录提交方式的替身）不用。
+    db: Mutex<Arc<dyn Storage>>,
+    /// Turso 世界的数据目录。
+    turso_dir: Option<PathBuf>,
 }
 
 impl World {
@@ -827,8 +832,11 @@ impl World {
             Harness::new(HarnessDeps::new(hooks.clone(), script.clone()).with_probe(probe.clone()));
         let registry = Registry::new();
         harness.install(&registry);
+        let storage = RecordingStorage::new();
         Self {
-            storage: RecordingStorage::new(),
+            db: Mutex::new(storage.clone()),
+            turso_dir: None,
+            storage,
             registry,
             clock,
             reports: Log::default(),
@@ -841,6 +849,22 @@ impl World {
         }
     }
 
+    /// 跑在 Turso 文件库上的世界：`dir` 里是 `durable.db` 与工具输出（真文件存储）。每次
+    /// `open` 都重新开库，所以 `restart` 是真的"关库、再开库"。读辅助只在引擎开着的时候能用。
+    pub fn turso(dir: &std::path::Path) -> Self {
+        let outputs = Arc::new(komo_store::FileToolOutputStore::new(
+            komo_store::SessionPaths::at(dir),
+            SessionId::from_raw("s1"),
+        ));
+        let mut world = Self::with_outputs(outputs);
+        world.turso_dir = Some(dir.to_path_buf());
+        world
+    }
+
+    fn db(&self) -> Arc<dyn Storage> {
+        self.db.lock().unwrap().clone()
+    }
+
     /// 装上工具（返回同一批，方便测试读计数）。
     pub fn tools(&self, tools: Vec<Arc<TestTool>>) {
         self.hooks.set_tools(
@@ -851,15 +875,22 @@ impl World {
         );
     }
 
-    /// 打开一个引擎并开始调度；关闭时不关存储，所以能在同一个库上重开。
+    /// 打开一个引擎并开始调度；内存世界关闭时不关存储，所以能在同一个库上重开；Turso 世界
+    /// 关引擎时连库一起关，这里重新开库。
     pub async fn open(&self) -> Engine {
         let reports = self.reports.clone();
+        if let Some(dir) = &self.turso_dir {
+            let storage = komo_store::durable::TursoStorage::open(dir)
+                .await
+                .expect("open the Turso database");
+            *self.db.lock().unwrap() = Arc::new(storage);
+        }
         let engine = Engine::open(
-            self.storage.clone(),
+            self.db(),
             self.registry.clone(),
             self.clock.clone(),
             EngineOptions {
-                close_storage: false,
+                close_storage: self.turso_dir.is_some(),
                 report: Arc::new(move |text| reports.push(text)),
                 hooks: self.harness.hooks(),
             },
@@ -895,7 +926,8 @@ impl World {
     }
 
     pub async fn live(&self) -> LiveState {
-        Harness::live(&*self.storage, CONV).await.expect("live")
+        let db = self.db();
+        Harness::live(&*db, CONV).await.expect("live")
     }
 
     pub async fn entries(&self) -> Vec<EntryRecord> {
@@ -907,7 +939,7 @@ impl World {
         let mut cursor: Option<Cursor> = None;
         loop {
             let page = self
-                .storage
+                .db()
                 .scan_entries(&query, 256, cursor.as_ref())
                 .await
                 .unwrap();
@@ -932,16 +964,12 @@ impl World {
     }
 
     pub async fn submission(&self, id: SubmissionId) -> SubmissionRecord {
-        self.storage
-            .submission(id)
-            .await
-            .unwrap()
-            .expect("submission")
+        self.db().submission(id).await.unwrap().expect("submission")
     }
 
     pub async fn tasks(&self, kind: &str) -> Vec<TaskRecord> {
         let page = self
-            .storage
+            .db()
             .scan_tasks(&TaskQuery::default(), 1000, None)
             .await
             .unwrap();

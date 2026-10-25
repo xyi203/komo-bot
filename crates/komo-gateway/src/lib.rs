@@ -31,5 +31,5 @@ pub use komo_runtime::mcp_auth;
 pub use dispatcher::Dispatcher;
 pub use lock::{DiscoveryFile, GatewayDiscovery, InstanceLock};
 pub use notifier::HomeNotifier;
-pub use service::{Running, ServiceError, ServiceOptions, run, start};
+pub use service::{Running, ServiceError, ServiceOptions, StorageMode, run, start};
 pub use telemetry::TelemetryStatus;

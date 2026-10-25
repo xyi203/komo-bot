@@ -34,7 +34,10 @@ use komo_kernel::types::model::{CatalogModel, ModelCatalog, ModelConfig};
 use crate::channels::{ChannelSender, test_channel::MemChannel};
 
 #[cfg(test)]
-use super::{Running, ServiceOptions, start};
+use komo_runtime::llm::ModelStream;
+
+#[cfg(test)]
+use super::{Running, ServiceOptions, StorageMode, start};
 
 /// 一份能通过校验的最小 config.toml。
 #[cfg(test)]
@@ -158,6 +161,27 @@ impl TestGateway {
 
     /// 配置与模型后端自己给。
     pub async fn with(config: &str, llm: Option<Arc<dyn LlmClient>>) -> TestGateway {
+        TestGateway::boot(config, StorageMode::Legacy, llm, None).await
+    }
+
+    /// 跑在新存储上（`docs/storage-durable-d5.md` §1）：`llm` 同时当 `LlmClient`（辅助调用）与
+    /// `ModelStream`（harness），脚本与 `requests` / `turns()` 的观察口共用。
+    pub async fn durable(config: &str, llm: Arc<harness::FakeLlm>) -> TestGateway {
+        TestGateway::boot(
+            config,
+            StorageMode::Durable,
+            Some(Arc::clone(&llm) as Arc<dyn LlmClient>),
+            Some(llm as Arc<dyn ModelStream>),
+        )
+        .await
+    }
+
+    async fn boot(
+        config: &str,
+        storage: StorageMode,
+        llm: Option<Arc<dyn LlmClient>>,
+        stream: Option<Arc<dyn ModelStream>>,
+    ) -> TestGateway {
         install_crypto();
         let home = tempfile::tempdir().expect("临时数据目录");
         write_home(home.path(), config);
@@ -167,7 +191,9 @@ impl TestGateway {
             // 端口 0：内核挑一个空的，发现文件里写的是真实地址。
             listen: Some("127.0.0.1:0".into()),
             channels: Vec::new(),
+            storage,
             llm,
+            stream,
             embeddings: None,
             // 共享 skill 目录钉在临时数据目录上（§5.6）：测试不受这台机器上装过什么影响。
             shared_home: Some(home.path().to_path_buf()),
@@ -187,6 +213,14 @@ impl TestGateway {
             running,
             channel,
         }
+    }
+
+    /// 等这条 run 的输入 submission 结算（`done` 或 `unanswered`，最多 20 秒）。Durable 下用。
+    pub async fn wait_run(
+        &self,
+        run: &komo_kernel::types::ids::RunId,
+    ) -> komo_kernel::durable::SubmissionRecord {
+        harness::wait_run(self.state(), run).await
     }
 
     pub fn state(&self) -> &Arc<super::state::GatewayState> {

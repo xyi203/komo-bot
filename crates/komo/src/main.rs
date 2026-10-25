@@ -802,7 +802,9 @@ async fn gateway(
                 home: Some(home.to_path_buf()),
                 listen: None,
                 channels: komo_gateway::channels::factories(),
+                storage: komo_gateway::service::StorageMode::Legacy,
                 llm: None,
+                stream: None,
                 embeddings: None,
                 // 生产上用当前用户的家目录：`~/.agents/skills` 是与其他本地 agent 共享的
                 // 那一份（§5.6）。

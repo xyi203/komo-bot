@@ -83,7 +83,7 @@ depends on `agent`; `client` knows only protocol types.
   `waiting + approval` resumes as approved, retired delivery/outbox rows are
   skipped and never block a flush.
 - **The only hard limit lives in the tools:** `write`/`edit` refuse komo's own
-  state (`sessions/`, `state.db*`, `runtime/`, `.env` under the data dir).
+  state (`sessions/`, `state.db*`, `durable.db*`, `aux.db*`, `runtime/`, `.env` under the data dir).
   bash cannot be stopped; real boundaries come only from an execution
   environment (codemode's Monty engine: no network or subprocesses, files
   read-only with the same protected list denied even for reads, except

@@ -345,7 +345,11 @@ pub struct GatewayState {
     pub clock: Arc<dyn Clock>,
     pub config: Arc<ConfigHolder>,
     pub caps: EffortCapabilities,
+    /// Legacy：`state.db`；Durable：`aux.db`（同一套 toasty 模型、同一份 migration，
+    /// 只装 cron / 投递 / memory / 幂等键这类辅助表，`docs/storage-durable-d5.md` §1）。
     pub db: Db,
+    /// D5：新存储与新 harness。`None` = Legacy 模式。
+    pub durable: Option<Arc<super::durable::DurableCore>>,
     pub hub: SharedHub,
     pub ledgers: Arc<SessionLedgers>,
     pub routed: Arc<RoutedLedger>,
@@ -434,6 +438,8 @@ pub struct Assembly {
     pub config: Arc<ConfigHolder>,
     pub caps: EffortCapabilities,
     pub db: Db,
+    /// Durable 模式的核心（`None` = Legacy）。
+    pub durable: Option<Arc<super::durable::DurableCore>>,
     pub clock: Arc<dyn Clock>,
     pub instance_id: String,
     pub token: String,
@@ -462,6 +468,7 @@ impl GatewayState {
             config,
             caps,
             db,
+            durable,
             clock,
             instance_id,
             token,
@@ -647,6 +654,7 @@ impl GatewayState {
             config,
             caps,
             db,
+            durable,
             hub,
             ledgers,
             routed,
@@ -682,6 +690,13 @@ impl GatewayState {
             max_retries,
             max_rounds,
         }))
+    }
+
+    /// Durable 模式的核心；Legacy 模式下调用是装配错误（W1 起各包的入口用它拿 `DurableCore`）。
+    pub fn core(&self) -> Result<&Arc<super::durable::DurableCore>, GatewayError> {
+        self.durable.as_ref().ok_or_else(|| {
+            GatewayError::Internal("这台 Gateway 跑在 Legacy 存储上，没有 DurableCore".into())
+        })
     }
 
     /// 接上任务分发的实现（`docs/background-tasks.md`）：`GatewayTaskSpawner` 自己
@@ -1784,6 +1799,9 @@ impl GatewayState {
     }
 }
 
+/// Durable 模式下 cron / 投递 / memory 等辅助表的库文件名（在数据目录里，与 `durable.db` 并列）。
+pub const AUX_DB_FILE: &str = "aux.db";
+
 /// §8.10 第 4 条要拦的那些路径：**komo 自己的状态**。
 ///
 /// 「删除只有一条路……默认规则里工具对数据目录（`sessions/`、`state.db*`、`runtime/`、
@@ -1795,6 +1813,9 @@ pub fn protected_paths(snapshot: &ConfigSnapshot, home: &std::path::Path) -> Vec
     vec![
         snapshot.paths.sessions_dir.clone(),
         snapshot.start_only.db_path.clone(),
+        // D5：新存储的两个库（`covers` 连 `-wal` / `-log` / `-shm` 兄弟一并认）。
+        home.join(komo_store::durable::DURABLE_DB_FILE),
+        home.join(AUX_DB_FILE),
         snapshot.paths.runtime_dir.clone(),
         home.join(".env"),
     ]
@@ -1984,6 +2005,27 @@ fn build_llm(
         Err(error) => {
             tracing::warn!(%error, "模型后端造不出来：Gateway 照常启动，模型调用会报这个错");
             Arc::new(UnconfiguredLlm::new(error.to_string()))
+        }
+    }
+}
+
+/// Durable 模式的无状态模型后端（`ModelStream`），按配置路由。
+///
+/// 与 [`build_llm`] 同一个取舍：造不出来不让 Gateway 起不来，退到按需建的路由，模型调用
+/// 时把原因报出来。测试通过 `ServiceOptions::stream` 注入替身，不走这里。
+pub(crate) fn build_stream(
+    snapshot: &ConfigSnapshot,
+    config: &ConfigHolder,
+    caps: &EffortCapabilities,
+) -> Arc<dyn komo_runtime::llm::ModelStream> {
+    let factory = llm_factory(snapshot, config, caps);
+    match komo_runtime::llm::RoutingStream::from_snapshot(snapshot, factory) {
+        Ok(routing) => Arc::new(routing),
+        Err(error) => {
+            tracing::warn!(%error, "模型后端造不出来：Gateway 照常启动，模型调用会报这个错");
+            Arc::new(komo_runtime::llm::RoutingStream::lazy(llm_factory(
+                snapshot, config, caps,
+            )))
         }
     }
 }

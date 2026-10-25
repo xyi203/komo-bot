@@ -350,6 +350,10 @@ pub async fn start(options: ServiceOptions) -> Result<Running, ServiceError> {
     // 9. 后台任务：调度器、Cron、配置轮询、SIGHUP（Durable：只有配置轮询与 SIGHUP，其余各包再加）。
     if durable_mode {
         durable::background::spawn(&state, &shutdown);
+        // 提交订阅 → 旧事件词汇 → `EventHub`（SSE 与渠道看客都从这里读）。返回时订阅已生效。
+        if let Some(core) = state.durable.as_ref() {
+            durable::feed::spawn(core, &state.hub, &shutdown).await;
+        }
     } else {
         spawn_background(&state, &shutdown);
     }

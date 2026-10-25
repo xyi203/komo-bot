@@ -398,6 +398,98 @@ async fn a_background_compaction_does_not_block_the_turn_and_lands_when_idle() {
     engine.close().await.unwrap();
 }
 
+/// pi §8.7 / §6：后台摘要和任何被动的 write 一样放置——conversation 忙时排进收件箱，在下一个
+/// boundary（这里是工具轮之后的 postTools）落下，所以摘要 entry 排在那一轮的结果之后，
+/// 紧接着的下一个生成从它起算。
+#[tokio::test(start_paused = true)]
+async fn a_background_summary_that_arrives_while_busy_waits_for_the_next_boundary() {
+    let world = World::new();
+    let gate = Arc::new(Notify::new());
+    let read = Arc::new(TestTool::reader("read", &world.log).with_text(&"A".repeat(2200)));
+    let rg = Arc::new(
+        TestTool::reader("rg", &world.log)
+            .with_text(&"B".repeat(2200))
+            .with_gate(&gate),
+    );
+    world.tools(vec![read, rg]);
+    windowed(&world, 1100);
+    let mut with_background = settings(1, 100, 50);
+    with_background.background_tokens = 400;
+    world.hooks.set_compaction(true, with_background);
+    world.script.push(call(&world, "c1", "read"));
+    world.script.push(call(&world, "c2", "rg"));
+    world.script.push(say(&world, "ok"));
+    let summary_gate = Arc::new(Notify::new());
+    world.script.push_summary(Step::Gate(
+        summary_gate.clone(),
+        Box::new(Step::Reply(text_reply("LATE SUMMARY"))),
+    ));
+    let engine = world.open().await;
+    let id = world.submit(&engine, "go").await;
+    world.until_log("start rg #1").await;
+    world
+        .until(|| async { world.script.summary_requests().len() == 1 })
+        .await;
+
+    // 摘要回来的时候 run 还忙着（rg 还没跑完）：排进收件箱，还没有摘要 entry。
+    summary_gate.notify_one();
+    world
+        .until(|| async { world.live().await.compactions.is_none() })
+        .await;
+    let inbox = super::super::Harness::inbox(&*world.storage, CONV)
+        .await
+        .unwrap();
+    assert_eq!(inbox.items.len(), 1, "{inbox:?}");
+    assert!(world.entries_of(COMPACTION_ENTRY_KIND).await.is_empty());
+    let compaction = world.tasks(COMPACTION_KIND).await.pop().unwrap();
+    let queued = world
+        .storage
+        .submission_by_request(CONV, &format!("compaction:{}", compaction.id))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        queued.kind,
+        SubmissionKind::Write {
+            state: WriteState::Queued
+        }
+    );
+
+    // 工具轮结束：postTools boundary 放置它，排在 rg 的结果之后。
+    gate.notify_one();
+    world.harness.wait(&engine, id).await.unwrap();
+    let entries = world.entries().await;
+    let result = entries
+        .iter()
+        .filter(|entry| entry.kind == "komo.tool-result")
+        .nth(1)
+        .unwrap();
+    let summaries = world.entries_of(COMPACTION_ENTRY_KIND).await;
+    assert_eq!(summaries.len(), 1);
+    assert!(
+        summaries[0].id > result.id,
+        "placed at the boundary after the round"
+    );
+    let placed = world.submission(queued.id).await;
+    assert_eq!(
+        placed.kind,
+        SubmissionKind::Write {
+            state: WriteState::Done {
+                entry: summaries[0].id
+            }
+        }
+    );
+    let last = world.script.requests().pop().unwrap();
+    assert_eq!(
+        outline(&last)[..2],
+        [
+            "system".to_owned(),
+            format!("user: {}", wrap_summary("LATE SUMMARY")),
+        ]
+    );
+    engine.close().await.unwrap();
+}
+
 /// `Harness::compact`（pi `Conversation.compact()`）：手动压缩不是 background；摘要在空闲的
 /// conversation 里直接落，data 记着 `manual`。
 #[tokio::test(start_paused = true)]

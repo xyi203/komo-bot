@@ -7,6 +7,8 @@
 //! | `komo.system` | `[SystemMessage]`（`content` 恒为空，§2） | 生成的 `prepare` |
 //! | `komo.tool-result` | `[ToolResultMessage]` | 工具任务；生成对没跑过的调用 |
 //! | `komo.reset` | 无，或 `[UserMessage]`；恒带 `head: "self"` | `/new`、交接 |
+//! | `komo.compaction` | `[UserMessage]`（包好的摘要）；`head` = 第一条保留的 entry | 压缩任务（`compaction::task`） |
+//! | `komo.decay` | 无；只带 `edits`（`replace` 成 `data.decayed`） | 生成的 `prepare`（衰减） |
 //!
 //! 每条生成回复都是一条 `komo.assistant`：回答、失败的尝试（带错误文字与用量）、转成
 //! `aborted` 的部分回复。上下文推导（规则 9）把失败与中断的消息挡在之后的请求之外，所以

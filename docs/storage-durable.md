@@ -1,6 +1,6 @@
 # 存储重设计：整套采用 pi-durable 的提交模型
 
-> 状态：**实现中（2026-10-23）**。D0–D3、D4a、D4b 已完成并合入 `main`，下一步 D4c；进度与实现中的偏离见 §13。新旧代码并存，新存储还没接到 gateway。全部完成后改写 `docs/komo_bot.md` §8，本文留作推导记录。
+> 状态：**实现中（2026-10-24）**。D0–D3、D4a、D4b 已完成并合入 `main`；D4c 的**压缩**部分（`komo.compaction` 阻塞与后台、衰减写成 `edits`、上下文超长时压缩重试）在 `d4c-compaction` 分支做完，D4c 的 codemode 嵌套调用、`task` / `monitor`、子进程 probe 另有分支；下一步 D5。进度与实现中的偏离见 §13。新旧代码并存，新存储还没接到 gateway。全部完成后改写 `docs/komo_bot.md` §8，本文留作推导记录。
 >
 > 对照基线：本机 `../pi` 提交 `8efd314fa` 的 `packages/durable`（`docs/spec.md` 为规范，`README.md`）。
 > pi-durable 自称 **Experimental**，API 随版本变；pi coding-agent 在这个提交上**并不依赖它**（仍是
@@ -365,7 +365,7 @@ pi-durable 没有删除。komo 保留 `closing → deleted → purged`：
 | D3 任务调度（**已完成 2026-10-23**） | 任务状态机、step 规则、reservation / reconciliation、waiting / completing / abort 自底向上 | 移植 pi-durable 的 child-tasks / abort / restart 示例 |
 | D4a 无状态模型调用（**已完成 2026-10-23**） | 三家 provider 的 `ModelStream::stream`：每次给完整 context，返回一条 assistant 消息；路由 `RoutingStream` | 请求体与旧的有状态 driver 逐字节相同 |
 | D4b 生成与工具（**已完成 2026-10-23**） | `komo.generation` / `komo.tool`，收件箱与 boundary，`komo.live` 节流 | §5 恢复表逐行有测试；§8.6 中断正文逐字一致 |
-| D4c 压缩与其余工具 | `komo.compaction`（阻塞与后台）、衰减写成 `edits`、上下文超长时压缩重试、codemode 嵌套调用、编排工具（`task` / `monitor`）、子进程 probe 阶段 | 现有 `tests/recovery`、`tests/agents` 的对应场景改写后通过 |
+| D4c 压缩与其余工具（压缩部分**已完成 2026-10-24**，见 §13.1） | `komo.compaction`（阻塞与后台）、衰减写成 `edits`、上下文超长时压缩重试、codemode 嵌套调用、编排工具（`task` / `monitor`）、子进程 probe 阶段 | 现有 `tests/recovery`、`tests/agents` 的对应场景改写后通过 |
 | D5 gateway 与树 | 会话树映射到 fork、HTTP / SSE 改读新存储、`task` / cron / 投递 | §8.11 的端到端测试（`session_tree/tests.rs`）原样通过 |
 | D6 导出 | `komo session export SESSION_ID`：输出 pi v3 树形 JSONL（带 blob 引用）；不导入旧会话（§8） | 导出的文件能被 pi 的 session-manager 读入，分支与当前位置一致 |
 | D7 收尾 | 删旧 ledger 代码，改写 `docs/komo_bot.md` §8、AGENTS.md 结构规则、§14 验收表 | — |
@@ -522,7 +522,7 @@ finalize     → blob 收尾同步 → 提交结果 entry（projection.rs 的 fu
 
 ## 13. 实现进度与偏离（2026-10-23）
 
-### 13.1 已合入 `main` 的部分
+### 13.1 位置与测试（D4c 压缩在分支上，其余已合入 `main`）
 
 | 阶段 | 位置 | 测试 |
 |---|---|---|
@@ -531,6 +531,7 @@ finalize     → blob 收尾同步 → 提交结果 entry（projection.rs 的 fu
 | D3 | `crates/komo-kernel/src/durable/task/`（纯逻辑）、`crates/komo-runtime/src/durable/`（`line` `tx` `kind` `runtime` `scheduler` `engine`） | kernel 37 项、runtime 52 项 |
 | D4a | `crates/komo-runtime/src/llm/{model_stream,routing_stream,stream_tests}.rs`、各 provider 的 `stateless.rs` | 字节等价：9 种场景 × 3 家 |
 | D4b | `crates/komo-runtime/src/durable/harness/`（`hooks` `inbox` `live` `system` `generation` `tool` `submit` `entries`） | 约 50 项 |
+| D4c 压缩（`d4c-compaction` 分支，尚未合入 `main`） | 纯逻辑 `crates/komo-kernel/src/durable/compaction.rs`（切点、摘要输入序列化、衰减候选与 `edits`、从 entry 折在线状态）；`crates/komo-runtime/src/durable/harness/compaction/`（`setup` 钩子值 · `plan` 缓存账决策 · `task` `komo.compaction` 任务）；`generation.rs` 的 `prepare` / 超长分支；`live.rs` 的 `compactions` 与 `compactionFailure`；`Harness::compact`；`AgentHooks::compaction` | kernel 11 项、runtime 25 项（`plan` 8 项单测 + `tests/compaction.rs` 17 项集成，含 Turso `Storage` 上的超长救援与重开回放） |
 
 合入时（`durable-integration` 分支）强制重编后 `cargo test --workspace`：**2558 通过，0 失败**。
 
@@ -549,11 +550,22 @@ finalize     → blob 收尾同步 → 提交结果 entry（projection.rs 的 fu
 - **`komo.usage` 没做**（D4b）：预算用的轮数与 token 记在 `komo.live.run`。新增未答原因 `budget`。
 - **意图 checkpoint 存完整 `ExecutionPlan`**（D4b），Safe 重跑用原计划。
 - **Anthropic 衰减时的额外缓存断点**要调用方传 `revised_from`（D4a），对应旧 driver 的行为。
+- **压缩的在线状态从 entry 折，不单独存 document**（D4c）：旧实现的"请求次数、上下文增量、缓存债、冷却"是从事件日志折的，现在从 entry 折（`durable::compaction::online_state`）——请求次数与上下文大小读 assistant 消息的用量，压缩 / 衰减欠下的债记在各自 entry 的 `data.debt`，`head` 指自己的 entry（`/new`）归零。这比放 document / checkpoint 更稳：重启、fork 之后重折一遍就回来，没有第二份真相。唯一不在 entry 里的是旧的 `compaction_refused`（"刚压失败过"）：在 `komo.live.compactionFailure`，用任务 ID 当位置标记（任务 ID 与 entry ID 同一计数），之后出现一条完成的工具结果就解除。缓存是否已冷看最后一条正常结束的 assistant 消息的时间戳。
+- **后台阈值默认关、不过缓存账**（D4c）：`CompactionSettings.background_tokens`（pi 的 `backgroundTokens`）= 0 不启用；到了 `阻塞阈值 - background_tokens` 就在后台起压缩，只要求摘要比被收的那段小、压完在阻塞阈值之下，不再看旧的经济账（那本账估不出剩余请求，只剩冷缓存与窗口保护两条路，后台阈值本来就低于窗口保护线）。`[compaction]` 配置里还没有对应的键。
+- **超长恢复不看 `[compaction] enabled`**（D4c）：同旧实现，不压这条 run 就失败了；pi 要求策略开着。其余照 pi：一个生成只救一次（checkpoint 里的 `compacted`），救完又超长就 `model_error`；旧实现的"压成摘要之后至少有一次成功请求"也保留（折账读 `requests_since_last_summary`）。
+- **摘要请求**（D4c）：两条消息、没有工具——系统提示与 `<conversation>…</conversation>` + 指令（pi 的 `serializeConversation` 格式，思考块与 system 消息不进，工具结果截 2000 字符），不再是旧的单条中文渲染。默认提示是 pi 的结构化检查点格式（`SummaryPrompt::default`），gateway 经 `AgentHooks::compaction` 换成 komo-agent 的。模型、提示、`tail`、`firstKept`、时间戳钉在 checkpoint，重启后重发逐字节相同。
+- **切点用 pi 的 `selectCut`**（D4c）：以 entry 为单位，候选是以 user / assistant 消息开头的 entry，工具结果与 system entry 从不是候选，也不落在"调用与结果之间"的 user 上；旧的 `find_cut` 只认助手回复开头，两者同样保证调用不会和结果拆开。
+- **衰减 entry 的 kind 是 `komo.decay`**（D4c）：只带 `edits`（`replace`，目标 = 结果 entry，替换消息 = 原结果 + 正文换成 `data.decayed`，图片块留着）和 `data { decayed: [entry id], debt, decision }`。与 `komo.system` 同一次提交追加，所以 `cutoff` 之后的请求就带短视图；这一轮的 `revised_from`（第一条被换的结果在请求里的下标）写进 `request` 的 checkpoint，重启后重发带同一个值。`full_sends` 的"完整给过几次" = 它之后的 assistant 消息数。
+- **摘要的用量没计**（D4c）：`komo.usage` 还没做（D4b 起就没有），摘要请求的 token 不进累计用量。
+- **没有 `beforeCompact` 钩子**（D4c）：pi 的 `hooks.beforeCompact`（调用方给摘要或拒绝）没移植；手动压缩用 `Harness::compact`（conversation 所有、不是 background、`instructions` 可选）。
+- **`TaskRuntime::find_document`**（D4c，`durable/runtime.rs`）：阶段里读已提交 document 的只读方法（`prepare` 要在建任务之前读 `komo.live.compactions` 与 `compactionFailure`）。
 
 ### 13.3 已知缺口（按阶段）
 
-- **D4c**：上下文超长现在直接 `model_error` 失败，要接压缩；衰减视图已存在结果 entry 的 `data.decayed`，等压缩决策写 `edits`；codemode、`task`、`monitor` 还没有执行路径；`komo.live.tools[].pid` 没人写。
-- **D5**：gateway 实现 `AgentHooks`（`ToolExecutor::tools()` 要公开）；`RoutedOutputs` 要转发 `ToolOutputStore::find_published`，否则"盘上已有完整输出就复用"在 gateway 里不生效；`conversations.session_id` 现在总是 NULL，`/tree` 按 Session 查分支时补；`TursoStorage` 的读共用一条连接，读多了再换连接池；新存储至今只在 `MemoryStorage` 上跑过生成与工具任务，Turso 接线没测。
+- **D4c**（压缩已做完，剩下的）：codemode、`task`、`monitor` 还没有执行路径；`komo.live.tools[].pid` 没人写。
+- **压缩 · D5**：gateway 实现 `AgentHooks::compaction`（`[compaction]` 配置 → `CompactionSettings`，另加 `background_tokens` 的配置键；komo-agent 的摘要提示与摘要模型；默认实现只是"压缩关着 + pi 的提示"）；`/compact` 路由接 `Harness::compact`；`komo.live.compactions` / `compactionFailure` 还没有客户端展示；fork 不复制 document，所以 `compactionFailure`（"刚压失败过"）不随 fork 继承，其余在线状态是从 entry 折的、自然继承。
+- **压缩 · 真机**：Anthropic 的 `revised_from` 缓存断点只测到"请求里带了值"，没有对真 provider 验证过命中；摘要请求没有 `cacheRetention: none` 的对应选项（无状态调用没有这个旋钮），摘要请求会写进提示缓存。
+- **D5**：gateway 实现 `AgentHooks`（`ToolExecutor::tools()` 要公开）；`RoutedOutputs` 要转发 `ToolOutputStore::find_published`，否则"盘上已有完整输出就复用"在 gateway 里不生效；`conversations.session_id` 现在总是 NULL，`/tree` 按 Session 查分支时补；`TursoStorage` 的读共用一条连接，读多了再换连接池；新存储的生成与工具任务只在 `MemoryStorage` 上测过；压缩的超长救援（生成 → 压缩任务 → 重发）另在 Turso `Storage` 上跑过一遍并验证了重开回放，工具任务的 Turso 接线仍没测。
 - **崩溃安全**：进度提交 `synchronous=OFF` 后"进程崩溃不丢"是按机制推的，崩溃注入测试只跑在 tmpfs 上，没有真盘掉电验证。
 - **开发环境**：多个 worktree 共用一个 `target/` 时，cargo 可能复用别的 worktree 编出来的 crate；共享 target 跑测试前先 `touch crates/*/src/lib.rs`。
 

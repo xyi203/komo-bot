@@ -77,8 +77,8 @@ async fn durable_mode_serves_shared_routes_and_leaves_session_routes_to_v2() {
     assert_eq!(status, 200, "{body}");
     let (status, body) = gateway.get("/v1/sessions").await;
     assert_eq!(status, 200, "{body}");
-    let (status, _) = gateway.get("/v1/interventions").await;
-    assert_eq!(status, 404, "v2 的 interventions 路由还是空桩（W4a 填）");
+    let (status, body) = gateway.get("/v1/interventions").await;
+    assert_eq!(status, 200, "v2 的 interventions 路由（W4a）：{body}");
 }
 
 #[test]

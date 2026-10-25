@@ -90,7 +90,7 @@
 **监听默认不跨重启。** 进程只活在这一代 Gateway 里：
 
 - 停机（`DurableCore::close`，引擎关闭前）先终止所有监听的进程组（TERM → KILL），登记原样留给下一代。
-- 启动（`background::spawn`，引擎恢复 `core.resume()` 之前）：`OrchestrationHooks::boot` 先把 `runtime/monitors/children/` 里的遗留进程组（Gateway 崩了没来得及停）**核对身份后**终止——pid 会复用，按起来时刻与登记差 10 秒以内才算同一个，对不上宁可留着也不误杀；然后调一次 `Harness::reconcile_monitors`：对每条 `running` 的登记，给它的会话交回一条"已中断：Gateway 重启了，脚本没有在跑，也不会自动重挂"（输入 kind `monitor.end`，请求键 `monitor-end:{id}`，与登记改成 `ended{interrupted}` **同一次提交**，原子幂等），声明了 `resume_after_restart` 的例外，见下。`starting` 的登记归挂它的工具任务接着判，对账不碰。
+- 启动（`background::spawn`，在 `core.resume()` 之后；`starting` 的登记归挂它的工具任务，引擎恢复它们）：`OrchestrationHooks::boot` 先把 `runtime/monitors/children/` 里的遗留进程组（Gateway 崩了没来得及停）**核对身份后**终止——pid 会复用，按起来时刻与登记差 10 秒以内才算同一个，对不上宁可留着也不误杀；然后调一次 `Harness::reconcile_monitors`：对每条 `running` 的登记，给它的会话交回一条"已中断：Gateway 重启了，脚本没有在跑，也不会自动重挂"（输入 kind `monitor.end`，请求键 `monitor-end:{id}`，与登记改成 `ended{interrupted}` **同一次提交**，原子幂等），声明了 `resume_after_restart` 的例外，见下。对账不碰 `starting` 的登记。
 - 监听与任何一条 run 无关，不进工具任务的恢复表（`docs/komo_bot.md` §8.4）。
 
 **续跑的 `monitor` 调用不重新起进程。** `monitor` 是 `komo.tool` 任务，`call` 阶段在 `Tool::prepare` 之后转进编排路径：`登记 starting` 与 checkpoint `orchestrate { monitorStart }` 同一次提交 → `start_monitor`（gateway 起脚本与泵）→ 登记 `running` → 落结果 entry。这是"效果三明治"，但没有意图 → 执行那一步，也不走 §8.6 的重放判断。登记之后、结果之前崩溃，恢复从 `orchestrate { monitorStart }`：先让 gateway **认回**同一个 id 下还在跑的进程（`LaunchMode::Recover`，进程活得比引擎重启久的情形）；认不到，且登记声明了 `resume_after_restart`、剩余时限至少 1 分钟，就**重挂**（`LaunchMode::Resume`，同一个 id，时限只给剩下的）；否则登记为 `ended{interrupted}`，结果是"上一次挂的监听随重启中断了，没有自动重挂"——任意命令不自动重跑（`docs/komo_bot.md` §8.6）。

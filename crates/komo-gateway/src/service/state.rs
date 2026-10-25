@@ -850,10 +850,18 @@ impl GatewayState {
     ///
     /// 每次现造而不是存一个：Job 的模型覆盖之外，它还握着主模型的那一份快照，而模型
     /// 改完之后下一次触发就该用新的（§3 第 2 步）。
-    pub fn cron_scheduler(&self) -> komo_runtime::scheduler::CronScheduler {
+    pub fn cron_scheduler(self: &Arc<Self>) -> komo_runtime::scheduler::CronScheduler {
+        // Durable：触发交给 `DurableCronTarget`（一次提交建会话并受理）；Legacy：旧账本。
+        let target: Arc<dyn komo_runtime::scheduler::CronTarget> = if self.durable.is_some() {
+            self.durable_cron_target()
+        } else {
+            Arc::new(komo_runtime::scheduler::LedgerCronTarget::new(
+                Arc::clone(&self.routed) as Arc<dyn Ledger>,
+            ))
+        };
         komo_runtime::scheduler::CronScheduler::new(
             Arc::clone(&self.cron),
-            Arc::clone(&self.routed) as Arc<dyn Ledger>,
+            target,
             Arc::clone(&self.clock),
             Arc::new(komo_runtime::scheduler::JiffZoneResolver::new()),
             self.snapshot().model.clone(),
@@ -918,10 +926,12 @@ impl GatewayState {
         job: &komo_kernel::cron::CronJob,
         scheduled: bool,
     ) {
-        super::cron_watch::watch(
-            Arc::clone(self),
-            super::cron_watch::Watched::of(fired, job, scheduled),
-        );
+        let watched = super::cron_watch::Watched::of(fired, job, scheduled);
+        if self.durable.is_some() {
+            super::durable::cron_watch::watch(Arc::clone(self), watched);
+            return;
+        }
+        super::cron_watch::watch(Arc::clone(self), watched);
     }
 
     /// 模型 / 凭证变了：换掉实例。**正在跑的 Run 不换**——它握着自己那一个 driver。

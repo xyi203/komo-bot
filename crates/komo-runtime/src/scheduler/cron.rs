@@ -14,6 +14,7 @@
 
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use komo_kernel::cron::{CronFiring, CronJob, FiringStatus, JobStatus, OverlapPolicy, Trigger};
 use komo_kernel::traits::{Clock, CronRepo, Ledger, LedgerError, RepoError, ZoneResolver};
 use komo_kernel::types::ids::{CronJobId, RequestKey, RunId, SessionId};
@@ -31,6 +32,142 @@ pub enum CronError {
     Repo(#[from] RepoError),
     #[error(transparent)]
     Ledger(#[from] LedgerError),
+    /// 触发目标（`CronTarget`）自己报的错：Durable 侧建会话 / 受理 / 跑命令失败。
+    #[error("{0}")]
+    Target(String),
+}
+
+/// 一次触发要交给 [`CronTarget`] 的东西。Session ID 与请求键由调度器**先分配并写进触发记录**
+/// （`claim_firing`），再交给目标：目标据此做到重启幂等——同一个 Session 已经建过就不再建。
+#[derive(Debug, Clone)]
+pub struct FireSpec {
+    pub job: CronJob,
+    /// 预先分配的 Session ID。
+    pub session: SessionId,
+    /// 请求幂等键：定时触发是 `cron:{job}:{slot}`，手动 run 是 `cron-manual:{job}:{时刻}`。
+    pub request_key: RequestKey,
+    /// 这一次用的完整模型配置（§10：Job 的覆盖整份用，没有覆盖就是当前主模型快照；
+    /// Job 的 effort 已经盖在上面）。
+    pub model: ModelConfig,
+    /// 计划时间；手动 run 没有。
+    pub slot: Option<OffsetDateTime>,
+    pub at: OffsetDateTime,
+}
+
+/// 目标受理了触发之后给回的指代。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FiredRef {
+    pub run: RunId,
+    /// 同一请求键的原 Run（重发）。
+    pub deduplicated: bool,
+}
+
+/// 触发交给谁：调度器只负责「到期 → 重叠判定 → 占位 → 投出」，投到哪里由它决定。
+///
+/// Legacy 侧是 [`LedgerCronTarget`]（包住旧 `Ledger::accept_input`）；Durable 侧在 gateway
+/// （`service::durable::cron`）：一次 engine 提交建会话并受理。
+#[async_trait]
+pub trait CronTarget: Send + Sync {
+    /// 一次定时触发。
+    async fn fire(&self, spec: FireSpec) -> Result<FiredRef, CronError>;
+
+    /// 手动触发（`komo cron run`）：不写触发记录，由调用方保证（`spec.slot` 为 `None`）。
+    async fn run_now(&self, spec: FireSpec) -> Result<FiredRef, CronError> {
+        self.fire(spec).await
+    }
+
+    /// 这个 Job 上一次触发还没结束吗（重叠判定）。默认问触发表自己（Legacy：连 `runs` 表判）；
+    /// Durable 没有 `runs` 表，要按 submission 的结算状态判。
+    async fn has_unfinished(
+        &self,
+        jobs: &dyn CronRepo,
+        job: &CronJobId,
+    ) -> Result<bool, CronError> {
+        Ok(jobs.has_unfinished_firing(job).await?)
+    }
+}
+
+/// 定时触发的请求键。
+pub fn firing_key(job: &CronJobId, slot: OffsetDateTime) -> RequestKey {
+    RequestKey::new(format!(
+        "cron:{}:{}",
+        job,
+        slot.format(&Rfc3339).unwrap_or_else(|_| slot.to_string())
+    ))
+}
+
+/// 没有 Job 级覆盖时用主模型；Job 的 effort 盖在上面（§10）。
+pub fn model_for(job: &CronJob, main: &ModelConfig) -> ModelConfig {
+    let mut model = job.model.clone().unwrap_or_else(|| main.clone());
+    if let Some(effort) = &job.effort {
+        model.effort = Some(effort.clone());
+    }
+    model
+}
+
+/// Legacy 的目标：把触发作为一条 Cron 来源的输入交给旧账本。行为同改动之前的 `accept`。
+pub struct LedgerCronTarget {
+    ledger: Arc<dyn Ledger>,
+}
+
+impl LedgerCronTarget {
+    pub fn new(ledger: Arc<dyn Ledger>) -> Self {
+        LedgerCronTarget { ledger }
+    }
+}
+
+#[async_trait]
+impl CronTarget for LedgerCronTarget {
+    async fn fire(&self, spec: FireSpec) -> Result<FiredRef, CronError> {
+        let FireSpec {
+            job,
+            session,
+            request_key,
+            model,
+            at,
+            ..
+        } = spec;
+        // 命令直跑模式（§10）：`text` 只是账本上"这条 Run 是为了什么"的人读记录——
+        // CommandDriver 不读它，命令本身从这条 Run 的 Job 定义（`PlanSource::Cron` 指
+        // 着的那个 Job）里查。写清楚是为了会话记录诚实，不是为了喂给模型。
+        let text = match &job.command {
+            Some(command) => format!("[命令直跑] {command}"),
+            None => job.prompt.clone(),
+        };
+        let accepted = self
+            .ledger
+            .accept_input(AcceptInput {
+                session,
+                request_key,
+                text,
+                // 来源仍是 Cron（§8.8）：恢复后也不会因为由本机 Gateway 发起就升权。
+                source: PlanSource::Cron {
+                    job: job.id.clone(),
+                    job_version: job.version,
+                },
+                peer: None,
+                model,
+                // Job 的工作目录落到这个 Session 上——创建 Job 时就核实过它存在
+                // （§10），这里只是把它带过去。
+                workdir: job.workdir.clone(),
+                // 定时 Job 不是子代理：没有父 Run，也没有结果契约。
+                delegate: None,
+                // Cron 是**没有归属的入口**（§四）：它的身份按当前配置的默认 Agent 在装配
+                // 那一步兜底（`service::segment`）。这里不编一份——`CronScheduler` 手里只有
+                // 队列与模型，没有工具目录、没有工作目录解析、也没有配置快照。
+                snapshot: None,
+                // 命令 Run 全程零模型请求（§10）：记忆提取本身要发一次模型请求，跳过它
+                // 不是省一步，是不破"零模型请求"这条硬约束（§9.3）。
+                skip_memory: job.command.is_some(),
+                at,
+                interject: false,
+            })
+            .await?;
+        Ok(FiredRef {
+            run: accepted.run,
+            deduplicated: accepted.deduplicated,
+        })
+    }
 }
 
 /// 一次真的投出去了的触发。
@@ -64,6 +201,9 @@ pub enum SkipReason {
     /// 这一槽错过得太久了——超过这个 Job 自己的间隔（§10：停机期间错过的触发不集中
     /// 补跑）。
     TooLate,
+    /// 触发目标没能投出去（Durable：建会话 / 受理 / 跑命令失败）。这一槽记成 `error`，
+    /// 别的 Job 照跑。
+    Failed(String),
 }
 
 impl SkipReason {
@@ -75,6 +215,7 @@ impl SkipReason {
             SkipReason::AlreadyFired => "这个计划时间已经有一条触发记录了".into(),
             SkipReason::Schedule(reason) => format!("算不出槽位：{reason}"),
             SkipReason::TooLate => "错过得超过这个 Job 自己的间隔，不补跑".into(),
+            SkipReason::Failed(reason) => format!("触发没投成：{reason}"),
         }
     }
 }
@@ -88,7 +229,7 @@ pub struct CronTick {
 
 pub struct CronScheduler {
     jobs: Arc<dyn CronRepo>,
-    ledger: Arc<dyn Ledger>,
+    target: Arc<dyn CronTarget>,
     clock: Arc<dyn Clock>,
     zones: Arc<dyn ZoneResolver>,
     /// 没有 Job 级覆盖时用的模型配置快照（§10：覆盖按完整模型配置解析）。
@@ -108,14 +249,14 @@ impl std::fmt::Debug for CronScheduler {
 impl CronScheduler {
     pub fn new(
         jobs: Arc<dyn CronRepo>,
-        ledger: Arc<dyn Ledger>,
+        target: Arc<dyn CronTarget>,
         clock: Arc<dyn Clock>,
         zones: Arc<dyn ZoneResolver>,
         model: ModelConfig,
     ) -> Self {
         CronScheduler {
             jobs,
-            ledger,
+            target,
             clock,
             zones,
             model,
@@ -163,17 +304,20 @@ impl CronScheduler {
             job.id,
             now.format(&Rfc3339).unwrap_or_else(|_| now.to_string())
         ));
-        let accepted = self.accept(&job, session.clone(), key, now).await?;
+        let fired = self
+            .target
+            .run_now(self.spec(&job, session.clone(), key, None, now))
+            .await?;
         if let Some(waker) = &self.waker {
             waker.wake();
         }
         Ok(Some(Fired {
             job: job.id.clone(),
             job_version: job.version,
-            run: accepted.0,
+            run: fired.run,
             session,
             scheduled_at: now,
-            deduplicated: accepted.1,
+            deduplicated: fired.deduplicated,
         }))
     }
 
@@ -196,15 +340,27 @@ impl CronScheduler {
 
         // 「同一 Job 上一次仍未结束（含等待重试或结果核对）时，跳过本次并记录
         // 原因」。
-        if job.overlap == OverlapPolicy::Skip && self.jobs.has_unfinished_firing(&job.id).await? {
+        if job.overlap == OverlapPolicy::Skip
+            && self
+                .target
+                .has_unfinished(self.jobs.as_ref(), &job.id)
+                .await?
+        {
             tracing::info!(job = %job.id, scheduled_at = %slot, "上一次触发还没结束，跳过本次");
             return self.skip(job, slot, now, SkipReason::Overlap).await;
         }
 
+        // Session ID 先分配、随占位一起写进触发记录：目标（Durable）据它做到重启幂等，
+        // 崩在"占位之后、建会话之前 / 之后、回写 Run 之前"都能按同一个 ID 补上。
+        let session = SessionId::new_at(now);
+
         // 唯一键 `job_id + scheduled_at_utc`：已经存在就**不重复创建运行**。
         if !self
             .jobs
-            .claim_firing(CronFiring::claimed(&job, slot))
+            .claim_firing(CronFiring {
+                session: Some(session.clone()),
+                ..CronFiring::claimed(&job, slot)
+            })
             .await?
         {
             tracing::info!(job = %job.id, scheduled_at = %slot, "这个计划时间已经有触发记录了");
@@ -218,13 +374,36 @@ impl CronScheduler {
             }));
         }
 
-        let session = SessionId::new_at(now);
-        let key = RequestKey::new(format!(
-            "cron:{}:{}",
-            job.id,
-            slot.format(&Rfc3339).unwrap_or_else(|_| slot.to_string())
-        ));
-        let (run, deduplicated) = self.accept(&job, session.clone(), key, now).await?;
+        let key = firing_key(&job.id, slot);
+        let fired = match self
+            .target
+            .fire(self.spec(&job, session.clone(), key, Some(slot), now))
+            .await
+        {
+            Ok(fired) => fired,
+            // 目标自己报的错（只有 Durable 会）：这一槽记成 error、推进槽位，别让一个 Job 的
+            // 失败拖住同一拍里的别的 Job。Legacy 的账本错误照旧往上抛。
+            Err(CronError::Target(reason)) => {
+                tracing::warn!(job = %job.id, scheduled_at = %slot, %reason, "触发没投成");
+                let _ = self
+                    .jobs
+                    .update_firing(CronFiring {
+                        session: Some(session),
+                        status: FiringStatus::Error,
+                        error: Some(reason.clone()),
+                        ..CronFiring::claimed(&job, slot)
+                    })
+                    .await?;
+                self.advance(&mut job, now).await?;
+                return Ok(Outcome::Skipped(Skipped {
+                    job: job.id.clone(),
+                    scheduled_at: Some(slot),
+                    reason: SkipReason::Failed(reason),
+                }));
+            }
+            Err(other) => return Err(other),
+        };
+        let (run, deduplicated) = (fired.run, fired.deduplicated);
 
         // 触发记录补上它产生的 Session / Run——「据此可以补完尚未写入的触发输入」。
         let recorded = CronFiring {
@@ -312,58 +491,24 @@ impl CronScheduler {
             .await?)
     }
 
-    async fn accept(
+    fn spec(
         &self,
         job: &CronJob,
         session: SessionId,
         request_key: RequestKey,
+        slot: Option<OffsetDateTime>,
         now: OffsetDateTime,
-    ) -> Result<(RunId, bool), CronError> {
-        // §10：Job 可指定自己的主模型与 effort，**按完整模型配置解析**，不影响记忆整理
-        // 或向量模型。所以这里要么整份用 Job 的，要么整份用当前主模型的。
-        let mut model = job.model.clone().unwrap_or_else(|| self.model.clone());
-        if let Some(effort) = &job.effort {
-            model.effort = Some(effort.clone());
+    ) -> FireSpec {
+        FireSpec {
+            job: job.clone(),
+            session,
+            request_key,
+            // §10：Job 可指定自己的主模型与 effort，**按完整模型配置解析**，不影响记忆整理
+            // 或向量模型。所以这里要么整份用 Job 的，要么整份用当前主模型的。
+            model: model_for(job, &self.model),
+            slot,
+            at: now,
         }
-
-        // 命令直跑模式（§10）：`text` 只是账本上"这条 Run 是为了什么"的人读记录——
-        // CommandDriver 不读它，命令本身从这条 Run 的 Job 定义（`PlanSource::Cron` 指
-        // 着的那个 Job）里查。写清楚是为了会话记录诚实，不是为了喂给模型。
-        let text = match &job.command {
-            Some(command) => format!("[命令直跑] {command}"),
-            None => job.prompt.clone(),
-        };
-
-        let accepted = self
-            .ledger
-            .accept_input(AcceptInput {
-                session,
-                request_key,
-                text,
-                // 来源仍是 Cron（§8.8）：恢复后也不会因为由本机 Gateway 发起就升权。
-                source: PlanSource::Cron {
-                    job: job.id.clone(),
-                    job_version: job.version,
-                },
-                peer: None,
-                model,
-                // Job 的工作目录落到这个 Session 上——创建 Job 时就核实过它存在
-                // （§10），这里只是把它带过去。
-                workdir: job.workdir.clone(),
-                // 定时 Job 不是子代理：没有父 Run，也没有结果契约。
-                delegate: None,
-                // Cron 是**没有归属的入口**（§四）：它的身份按当前配置的默认 Agent 在装配
-                // 那一步兜底（`service::segment`）。这里不编一份——`CronScheduler` 手里只有
-                // 队列与模型，没有工具目录、没有工作目录解析、也没有配置快照。
-                snapshot: None,
-                // 命令 Run 全程零模型请求（§10）：记忆提取本身要发一次模型请求，跳过它
-                // 不是省一步，是不破"零模型请求"这条硬约束（§9.3）。
-                skip_memory: job.command.is_some(),
-                at: now,
-                interject: false,
-            })
-            .await?;
-        Ok((accepted.run, accepted.deduplicated))
     }
 
     /// 推进到下一个槽位并落库。
@@ -446,7 +591,7 @@ mod tests {
         let ledger = Arc::new(MemLedger::new(clock.clone()));
         let scheduler = CronScheduler::new(
             Arc::clone(&jobs) as Arc<dyn CronRepo>,
-            Arc::clone(&ledger) as Arc<dyn Ledger>,
+            Arc::new(LedgerCronTarget::new(Arc::clone(&ledger) as Arc<dyn Ledger>)),
             Arc::new(clock.clone()),
             Arc::new(JiffZoneResolver::new()),
             model(),

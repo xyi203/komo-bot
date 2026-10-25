@@ -43,6 +43,12 @@ pub fn unsure_round(n: u32, provider_id: &str) -> Result<Round, LlmError> {
     call_round(n, provider_id, "unsure", serde_json::json!({}))
 }
 
+/// 一次 `gate` 调用（测试工具，门不开就一直等）：Durable 里"一次触发一直没结束"靠它——
+/// 新语义没有停在等人核对上的 `waiting`（见 `durable/firing.rs`）。
+pub fn gate_round(n: u32, provider_id: &str) -> Result<Round, LlmError> {
+    call_round(n, provider_id, "gate", serde_json::json!({}))
+}
+
 /// 计数文件里有几行 = 副作用发生了几次。
 pub fn lines(path: &Path) -> usize {
     std::fs::read_to_string(path)

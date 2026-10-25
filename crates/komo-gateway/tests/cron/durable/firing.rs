@@ -1,0 +1,280 @@
+//! 触发面：唯一键、重启、重叠、留痕、清单（§10、§14 阶段 7 第一句）。
+
+use std::sync::Arc;
+
+use komo_kernel::cron::FiringStatus;
+
+use komo_gateway::service::test_support::Gate;
+
+use crate::harness::*;
+
+fn daily() -> serde_json::Value {
+    serde_json::json!({
+        "name": "morning-summary",
+        "schedule": "0 9 * * *",
+        "timezone": "Asia/Shanghai",
+        "prompt": "整理今天的技术动态",
+    })
+}
+
+/// **§14 阶段 7 第一句：重启不重复创建同次触发。**
+///
+/// 做法就是 §10 的那条唯一键 `job_id + scheduled_at_utc`。这里把它放在**真的一次
+/// 重启**上验：第一台 Gateway 投出了这一槽，停机，同一个数据目录再起一台，把槽位
+/// 按回原处（模拟"推进没落库就崩了"）再扫一轮——第二次 claim 是 `false`，触发记录
+/// 还是一条，Run 还是一个。
+#[tokio::test]
+async fn a_restart_does_not_create_the_same_firing_twice() {
+    let home = Home::new();
+    let counter = home.workspace().join("ran.log");
+
+    // 第一台：投出这一槽。
+    let gw = home
+        .start(FakeLlm::always(vec![text_round(1, "做完了")]))
+        .await;
+    let job = gw.add_job(daily()).await;
+    gw.make_due(&job.id).await;
+    let slot = gw.job(&job.id).await.next_run_at.expect("有槽位");
+
+    let first = gw.tick().await;
+    assert_eq!(first.fired.len(), 1, "{first:?}");
+    let run = first.fired[0].run.clone();
+    gw.wait_state(&run, |s| s.is_terminal(), "终态").await;
+    // Durable：触发记录在 `aux.db`（Turso 对库文件持进程独占锁，停机后不能另开），所以在停机
+    // 之前读——持久化的就是这一份，重启后同一个 `aux.db` 再读到的还是它。
+    let firings_before = gw.firings(&job.id).await;
+    assert_eq!(firings_before.len(), 1);
+    gw.stop().await;
+
+    // ── 重启。同一个数据目录。
+    let gw = home
+        .start(FakeLlm::always(vec![text_round(1, "做完了")]))
+        .await;
+
+    // 把槽位按回原处：这就是"推进已经算出来了、但落库前进程没了"。
+    {
+        let stored = gw.job(&job.id).await;
+        gw.state()
+            .cron
+            .advance(&job.id, Some(slot), stored.status, None)
+            .await
+            .expect("拨得动");
+    }
+
+    let second = gw.tick().await;
+    assert!(second.fired.is_empty(), "同一计划时间不再投：{second:?}");
+    assert_eq!(
+        second.skipped[0].reason,
+        komo_runtime::scheduler::SkipReason::AlreadyFired
+    );
+
+    let firings = gw.firings(&job.id).await;
+    assert_eq!(firings.len(), 1, "还是一条触发记录：{firings:?}");
+    assert_eq!(firings[0].run, Some(run.clone()), "还是原来那个 Run");
+
+    // 槽位照样往前推——跳过的是这一槽，不是这个 Job。
+    assert!(gw.job(&job.id).await.next_run_at.unwrap() > slot);
+
+    // 副作用文件从来没被写过两次（这里模型没调工具，所以是 0 —— 断言的是**次数**）。
+    assert_eq!(lines(&counter), 0);
+    gw.stop().await;
+}
+
+/// **上一次仍未结束时跳过本次并记录原因**（§10）。
+///
+/// "记录"落在 `cron_firings` 上，不是只落在日志里：`last_error` 那一列是当前状态，
+/// 下一次成功触发就会把它清掉，而"昨天那一槽被跳过了"是一条历史。
+#[tokio::test]
+async fn an_overlapping_slot_is_skipped_and_leaves_a_trace() {
+    let home = Home::new();
+    let gate = Gate::new();
+    home.install_tools(vec![gate.tool()]);
+
+    // 模型每一段都调一次 `gate`：门不开，第一次触发就一直没结束。Legacy 版靠 `unsure` 停在
+    // 等人核对上；新语义里结果不明直接交给模型，不再有那种等待，"还没结束"就是 run 还在跑。
+    let llm = FakeLlm::always(vec![gate_round(1, "pc-1")]);
+    let gw = home.start_durable(Arc::clone(&llm)).await;
+
+    let job = gw.add_job(daily()).await;
+    gw.make_due(&job.id).await;
+    let first = gw.tick().await;
+    assert_eq!(first.fired.len(), 1);
+    gate.wait_entered(1).await;
+
+    // 下一槽到了，而上一次还在等人。
+    gw.make_due(&job.id).await;
+    let second = gw.tick().await;
+    assert!(second.fired.is_empty(), "{second:?}");
+    assert_eq!(
+        second.skipped[0].reason,
+        komo_runtime::scheduler::SkipReason::Overlap
+    );
+
+    let firings = gw.firings(&job.id).await;
+    assert_eq!(firings.len(), 2, "跳过的那一槽也有记录：{firings:?}");
+    let skipped = firings
+        .iter()
+        .find(|f| f.status == FiringStatus::Skipped)
+        .expect("有一条 skipped");
+    assert!(
+        skipped.error.as_deref().unwrap().contains("还没结束"),
+        "说得出为什么：{skipped:?}"
+    );
+
+    // 动作只发生了一次：第二槽没有再起一个 Run。
+    assert_eq!(gate.entered(), 1, "跳过的那一槽什么都没跑");
+    gate.release();
+    gw.stop().await;
+}
+
+/// `overlap = allow`：上一次还没结束也照样再起一个。
+#[tokio::test]
+async fn an_allow_policy_fires_even_when_the_last_one_is_still_waiting() {
+    let home = Home::new();
+    let gate = Gate::new();
+    home.install_tools(vec![gate.tool()]);
+    let llm = FakeLlm::always(vec![gate_round(1, "pc-1")]);
+    let gw = home.start_durable(Arc::clone(&llm)).await;
+
+    let mut body = daily();
+    body["overlap"] = serde_json::json!("allow");
+    let job = gw.add_job(body).await;
+
+    gw.make_due(&job.id).await;
+    let _first = gw.tick().await;
+    gate.wait_entered(1).await;
+
+    gw.make_due(&job.id).await;
+    let second = gw.tick().await;
+    assert_eq!(second.fired.len(), 1, "allow 照样投：{second:?}");
+    assert_eq!(gw.firings(&job.id).await.len(), 2);
+
+    gate.release();
+    gw.stop().await;
+}
+
+/// **清单上看得见"上一次怎么样"与"下一次什么时候"**（§10：结果去原 Session 查看）。
+#[tokio::test]
+async fn the_list_shows_the_last_firing_and_the_next_slot() {
+    let home = Home::new();
+    let gw = home
+        .start(FakeLlm::always(vec![text_round(1, "整理好了")]))
+        .await;
+    let job = gw.add_job(daily()).await;
+
+    // 还没响过：有下一次，没有上一次。
+    let list = gw.cron_list().await;
+    let status = list
+        .status
+        .iter()
+        .find(|s| s.job == job.id)
+        .expect("清单里有它");
+    assert!(status.next_run_at.is_some());
+    assert!(status.last.is_none(), "还没响过");
+
+    gw.make_due(&job.id).await;
+    let tick = gw.tick().await;
+    let run = tick.fired[0].run.clone();
+    let session = tick.fired[0].session.clone();
+    gw.wait_state(&run, |s| s.is_terminal(), "终态").await;
+
+    // 「更新本次触发状态」：盯梢把它记成了 ok。
+    eventually("触发状态记成 ok", || true).await;
+    let mut ok = false;
+    for _ in 0..100 {
+        let list = gw.cron_list().await;
+        let last = list
+            .status
+            .iter()
+            .find(|s| s.job == job.id)
+            .and_then(|s| s.last.clone());
+        if last.as_ref().map(|f| f.status) == Some(FiringStatus::Ok) {
+            let last = last.unwrap();
+            // 「Cron 的结果去原 Session 查看」——会话号就在这一行上。
+            assert_eq!(last.session, Some(session.clone()));
+            assert_eq!(last.run, Some(run.clone()));
+            ok = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(ok, "触发状态最终应当是 ok");
+
+    gw.stop().await;
+}
+
+/// Durable 独有：触发建出来的是 `kind = cron` 的会话，`komo.agent` 带着 Job 的模型 alias、effort、
+/// `maxRounds` 与工作目录，输入 entry 是 `cron.input`（`data {job, slot}`）。
+#[tokio::test]
+async fn a_firing_creates_a_cron_session_carrying_the_job_overrides() {
+    use komo_gateway::service::durable::agent_doc;
+    use komo_kernel::durable::SessionKind;
+
+    let home = Home::new();
+    let gw = home
+        .start_durable(FakeLlm::always(vec![text_round(1, "整理好了")]))
+        .await;
+    let mut body = daily();
+    body["model"] = serde_json::json!("job");
+    body["effort"] = serde_json::json!("high");
+    body["max_rounds"] = serde_json::json!(12);
+    let job = gw.add_job(body).await;
+    gw.make_due(&job.id).await;
+    let fired = gw.tick().await.fired[0].clone();
+    gw.wait_state(&fired.run, |s| s.is_terminal(), "终态").await;
+
+    let core = gw.state().core().unwrap().clone();
+    let record = core
+        .storage
+        .session(fired.session.as_str())
+        .await
+        .unwrap()
+        .expect("会话建出来了");
+    assert_eq!(record.kind, SessionKind::Cron);
+    let doc = agent_doc::read(&*core.storage, record.root_conversation)
+        .await
+        .unwrap()
+        .expect("有 komo.agent");
+    assert_eq!(doc.model.as_deref(), Some("job"));
+    assert_eq!(doc.effort.as_deref(), Some("high"));
+    assert_eq!(doc.max_rounds, Some(12));
+    assert_eq!(
+        doc.source.as_deref(),
+        Some(format!("cron:{}", job.id).as_str())
+    );
+
+    let (code, text) = gw
+        .get(&format!("/v1/sessions/{}/tree", fired.session))
+        .await;
+    assert_eq!(code, 200, "{text}");
+    assert!(text.contains("整理今天的技术动态"), "{text}");
+    gw.stop().await;
+}
+
+/// 重启幂等：同一个预分配的 Session ID 再投一次，只取回原来的 Run，不再建会话。
+#[tokio::test]
+async fn firing_twice_with_the_same_session_returns_the_same_run() {
+    use komo_runtime::scheduler::{FireSpec, firing_key};
+
+    let home = Home::new();
+    let gw = home
+        .start_durable(FakeLlm::always(vec![text_round(1, "好")]))
+        .await;
+    let job = gw.add_job(daily()).await;
+    let slot = time::OffsetDateTime::now_utc();
+    let spec = FireSpec {
+        job: job.clone(),
+        session: komo_kernel::types::ids::SessionId::new_at(slot),
+        request_key: firing_key(&job.id, slot),
+        model: gw.state().snapshot().model.clone(),
+        slot: Some(slot),
+        at: slot,
+    };
+    let target = gw.state().durable_cron_target();
+    let first = target.fire(spec.clone()).await.expect("投得出");
+    assert!(!first.deduplicated);
+    let second = target.fire(spec).await.expect("补投得出");
+    assert!(second.deduplicated);
+    assert_eq!(first.run, second.run);
+    gw.stop().await;
+}

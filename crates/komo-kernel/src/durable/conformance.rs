@@ -15,7 +15,7 @@ use super::ids::{
 };
 use super::records::{
     ConversationOwner, ConversationRecord, DocumentAddress, DocumentScope, EntryRecord, InputState,
-    JoinPolicy, SessionLifecycle, SessionRecord, SubmissionKind, SubmissionRecord,
+    JoinPolicy, SessionKind, SessionLifecycle, SessionRecord, SubmissionKind, SubmissionRecord,
     SubmissionStatus, TaskOutcome, TaskOutcomeError, TaskRecord, TaskState, TaskStatus, WriteState,
 };
 use super::storage::{
@@ -50,6 +50,9 @@ pub fn cases() -> Vec<Case> {
         case!(entry_cursor_continues_below_its_last_item_after_a_newer_commit),
         case!(conversations_paginate_by_cursor_in_ascending_order),
         case!(conversations_filter_by_owner_edges),
+        case!(a_conversation_records_its_session),
+        case!(conversations_scan_by_session_and_parent),
+        case!(purge_removes_every_row_of_the_listed_conversations),
         case!(deep_fork_history_scans_through_every_ancestor_cap),
         case!(tables_scan_in_either_order_and_a_cursor_keeps_its_direction),
         case!(task_records_replace_whole_and_filter),
@@ -425,6 +428,7 @@ async fn conversations_filter_by_owner_edges(storage: &dyn Storage) {
             id,
             parent: None,
             owner: Some(ConversationOwner { conversation, task }),
+            session: None,
         })
     };
     commit(
@@ -468,6 +472,374 @@ async fn conversations_filter_by_owner_edges(storage: &dyn Storage) {
     };
     let page = storage.scan_conversations(&both, 10, None).await.unwrap();
     assert_eq!(ids(&page.items, |c| c.id.get()), [first.get()]);
+}
+
+async fn a_conversation_records_its_session(storage: &dyn Storage) {
+    let root = create_root(storage).await;
+    let in_session: ConversationId = mint(storage).await;
+    let forked: ConversationId = mint(storage).await;
+    let entry_id: EntryId = mint(storage).await;
+    commit(
+        storage,
+        vec![
+            StorageWrite::Conversation(ConversationRecord::root(in_session).in_session("s1")),
+            put(entry(entry_id, in_session)),
+        ],
+    )
+    .await;
+    // fork 的子 conversation 带自己的 session 字段（继承是调用方的事，存储原样记）。
+    commit(
+        storage,
+        vec![StorageWrite::Conversation(
+            ConversationRecord::fork(forked, in_session, entry_id).in_session("s1"),
+        )],
+    )
+    .await;
+    let read = |id| async move { storage.conversation(id).await.unwrap().unwrap() };
+    assert_eq!(read(in_session).await.session.as_deref(), Some("s1"));
+    assert_eq!(read(forked).await.session.as_deref(), Some("s1"));
+    assert_eq!(read(root).await.session, None);
+    // 其余字段不受影响，整条记录读出来与写进去的一致。
+    assert_eq!(
+        read(forked).await,
+        ConversationRecord::fork(forked, in_session, entry_id).in_session("s1")
+    );
+    // 创建后不可变：换一个 session 重写同一个 ID 被拒。
+    expect_rejected(
+        storage
+            .commit(&[StorageWrite::Conversation(
+                ConversationRecord::root(in_session).in_session("s2"),
+            )])
+            .await,
+    );
+    assert_eq!(read(in_session).await.session.as_deref(), Some("s1"));
+}
+
+async fn conversations_scan_by_session_and_parent(storage: &dyn Storage) {
+    let root = create_root(storage).await;
+    let a_root: ConversationId = mint(storage).await;
+    let a_entry: EntryId = mint(storage).await;
+    let a_fork_1: ConversationId = mint(storage).await;
+    let a_fork_2: ConversationId = mint(storage).await;
+    let b_root: ConversationId = mint(storage).await;
+    let b_fork: ConversationId = mint(storage).await;
+    commit(
+        storage,
+        vec![
+            StorageWrite::Conversation(ConversationRecord::root(a_root).in_session("a")),
+            put(entry(a_entry, a_root)),
+            StorageWrite::Conversation(ConversationRecord::root(b_root).in_session("b")),
+        ],
+    )
+    .await;
+    commit(
+        storage,
+        vec![
+            StorageWrite::Conversation(
+                ConversationRecord::fork(a_fork_1, a_root, a_entry).in_session("a"),
+            ),
+            StorageWrite::Conversation(
+                ConversationRecord::fork(a_fork_2, a_root, a_entry).in_session("a"),
+            ),
+            StorageWrite::Conversation(
+                ConversationRecord::fork(b_fork, a_root, a_entry).in_session("b"),
+            ),
+        ],
+    )
+    .await;
+    let scan = |query: ConversationQuery, limit: usize| async move {
+        let mut found = Vec::new();
+        let mut cursor = None;
+        loop {
+            let page = storage
+                .scan_conversations(&query, limit, cursor.as_ref())
+                .await
+                .unwrap();
+            found.extend(ids(&page.items, |c| c.id.get()));
+            match page.next {
+                Some(next) => cursor = Some(round_trip(&next)),
+                None => return found,
+            }
+        }
+    };
+    let by_session = |name: &str| ConversationQuery {
+        session: Some(name.to_owned()),
+        ..Default::default()
+    };
+    // 分页一次一条，过滤之后续扫不丢不重。
+    assert_eq!(
+        scan(by_session("a"), 1).await,
+        [a_root.get(), a_fork_1.get(), a_fork_2.get()]
+    );
+    assert_eq!(
+        scan(by_session("b"), 10).await,
+        [b_root.get(), b_fork.get()]
+    );
+    assert_eq!(scan(by_session("nobody"), 10).await, Vec::<u64>::new());
+
+    let by_parent = ConversationQuery {
+        parent_conversation: Some(a_root),
+        ..Default::default()
+    };
+    assert_eq!(
+        scan(by_parent.clone(), 2).await,
+        [a_fork_1.get(), a_fork_2.get(), b_fork.get()]
+    );
+    // 两个过滤同时给是交集；降序同样成立。
+    let both = ConversationQuery {
+        session: Some("a".into()),
+        parent_conversation: Some(a_root),
+        ..Default::default()
+    };
+    assert_eq!(scan(both, 10).await, [a_fork_1.get(), a_fork_2.get()]);
+    let descending = ConversationQuery {
+        order: Some(ScanOrder::Descending),
+        ..by_parent
+    };
+    assert_eq!(
+        scan(descending, 10).await,
+        [b_fork.get(), a_fork_2.get(), a_fork_1.get()]
+    );
+    // 没有任何过滤时，没有 session 的根 conversation 也在。
+    assert_eq!(scan(ConversationQuery::default(), 10).await[0], root.get());
+}
+
+async fn purge_removes_every_row_of_the_listed_conversations(storage: &dyn Storage) {
+    let root = create_root(storage).await;
+    // 两组各自一整套行：A 要被 purge，B 留着。
+    struct Rows {
+        conversation: ConversationId,
+        entry: EntryId,
+        task: TaskId,
+        submission: SubmissionId,
+        conversation_doc: DocumentId,
+        task_doc: DocumentId,
+        retired_doc: DocumentId,
+    }
+    let mut groups = Vec::new();
+    for (name, conversation) in [
+        ("a", mint::<ConversationId>(storage).await),
+        ("b", mint(storage).await),
+    ] {
+        let rows = Rows {
+            conversation,
+            entry: mint(storage).await,
+            task: mint(storage).await,
+            submission: mint(storage).await,
+            conversation_doc: mint(storage).await,
+            task_doc: mint(storage).await,
+            retired_doc: mint(storage).await,
+        };
+        let conversation_scope = DocumentScope::Conversation { conversation };
+        let task = pending_task(rows.task, conversation, "p");
+        commit(
+            storage,
+            vec![
+                StorageWrite::Conversation(ConversationRecord::root(conversation).in_session(name)),
+                put(entry(rows.entry, conversation)),
+                StorageWrite::Task(task),
+                StorageWrite::Submission(input(rows.submission, conversation, Some("req"))),
+                doc_create(
+                    rows.conversation_doc,
+                    doc_address("komo.live", conversation_scope, None),
+                    json!({"who": name}),
+                ),
+                doc_create(
+                    rows.task_doc,
+                    doc_address("komo.slot", DocumentScope::Task { task: rows.task }, None),
+                    json!({"who": name}),
+                ),
+                doc_create(
+                    rows.retired_doc,
+                    doc_address("komo.old", conversation_scope, None),
+                    json!({"who": name}),
+                ),
+            ],
+        )
+        .await;
+        commit(
+            storage,
+            vec![StorageWrite::DocumentRetire {
+                id: rows.retired_doc,
+            }],
+        )
+        .await;
+        groups.push(rows);
+    }
+    // 不属于任何 conversation 的东西不受影响：session 作用域的 document 与 Session 行。
+    let session_doc: DocumentId = mint(storage).await;
+    commit(
+        storage,
+        vec![
+            doc_create(
+                session_doc,
+                doc_address("komo.note", DocumentScope::Session, None),
+                json!({"keep": true}),
+            ),
+            StorageWrite::Session(session("a", SessionLifecycle::Deleted, 1)),
+        ],
+    )
+    .await;
+    let (a, b) = (&groups[0], &groups[1]);
+
+    let missing = ConversationId::new(424_242);
+    commit(
+        storage,
+        vec![StorageWrite::PurgeConversations {
+            conversations: vec![a.conversation, missing],
+        }],
+    )
+    .await;
+
+    // A 的每一种行都没了。
+    assert_eq!(storage.conversation(a.conversation).await.unwrap(), None);
+    assert_eq!(storage.entry(a.entry).await.unwrap(), None);
+    assert_eq!(storage.task(a.task).await.unwrap(), None);
+    assert_eq!(storage.submission(a.submission).await.unwrap(), None);
+    assert_eq!(
+        storage
+            .submission_by_request(a.conversation, "req")
+            .await
+            .unwrap(),
+        None
+    );
+    for id in [a.conversation_doc, a.task_doc, a.retired_doc] {
+        assert_eq!(storage.document(id).await.unwrap(), None);
+    }
+    let scope_of = |conversation, task| {
+        [
+            DocumentQuery {
+                scope: DocumentScope::Conversation { conversation },
+                kind: None,
+            },
+            DocumentQuery {
+                scope: DocumentScope::Task { task },
+                kind: None,
+            },
+        ]
+    };
+    for query in scope_of(a.conversation, a.task) {
+        assert!(
+            storage
+                .scan_documents(&query, 10, None)
+                .await
+                .unwrap()
+                .items
+                .is_empty()
+        );
+    }
+    let query = ConversationQuery {
+        session: Some("a".into()),
+        ..Default::default()
+    };
+    assert!(
+        storage
+            .scan_conversations(&query, 10, None)
+            .await
+            .unwrap()
+            .items
+            .is_empty()
+    );
+    assert!(
+        storage
+            .scan_tasks(
+                &TaskQuery {
+                    conversation: Some(a.conversation),
+                    ..Default::default()
+                },
+                10,
+                None
+            )
+            .await
+            .unwrap()
+            .items
+            .is_empty()
+    );
+    assert!(
+        storage
+            .scan_submissions(
+                &SubmissionQuery {
+                    conversation: Some(a.conversation),
+                    ..Default::default()
+                },
+                10,
+                None
+            )
+            .await
+            .unwrap()
+            .items
+            .is_empty()
+    );
+    expect_request(
+        storage
+            .scan_entries(&EntryQuery::new(a.conversation), 10, None)
+            .await,
+    );
+
+    // B 一行没少，别的东西也都在。
+    assert!(
+        storage
+            .conversation(b.conversation)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(storage.entry(b.entry).await.unwrap().is_some());
+    assert!(storage.task(b.task).await.unwrap().is_some());
+    assert!(storage.submission(b.submission).await.unwrap().is_some());
+    assert!(
+        storage
+            .submission_by_request(b.conversation, "req")
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        storage
+            .document(b.conversation_doc)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(storage.document(b.task_doc).await.unwrap().is_some());
+    assert_eq!(
+        eids(
+            &storage
+                .scan_entries(&EntryQuery::new(b.conversation), 10, None)
+                .await
+                .unwrap()
+                .items
+        ),
+        [b.entry.get()]
+    );
+    assert!(storage.conversation(root).await.unwrap().is_some());
+    assert!(storage.document(session_doc).await.unwrap().is_some());
+    assert!(storage.session("a").await.unwrap().is_some());
+
+    // 幂等：再删一次（连同 B 已不存在的那些）照常成功；请求键可以在别处重新用。
+    commit(
+        storage,
+        vec![StorageWrite::PurgeConversations {
+            conversations: vec![a.conversation, b.conversation],
+        }],
+    )
+    .await;
+    assert_eq!(storage.conversation(b.conversation).await.unwrap(), None);
+    assert_eq!(storage.task(b.task).await.unwrap(), None);
+    commit(
+        storage,
+        vec![StorageWrite::PurgeConversations {
+            conversations: Vec::new(),
+        }],
+    )
+    .await;
+    let next: SubmissionId = mint(storage).await;
+    assert!(next.get() > b.submission.get(), "取号器越过已删的 ID");
+    commit(
+        storage,
+        vec![StorageWrite::Submission(input(next, root, Some("req")))],
+    )
+    .await;
 }
 
 async fn deep_fork_history_scans_through_every_ancestor_cap(storage: &dyn Storage) {
@@ -1670,13 +2042,21 @@ async fn progress_commits_only_replace_document_values(storage: &dyn Storage) {
 
 fn session(id: &str, lifecycle: SessionLifecycle, branch: u64) -> SessionRecord {
     SessionRecord {
-        id: id.to_owned(),
         lifecycle,
         current_branch: ConversationId::new(branch),
-        root_conversation: ROOT,
         title: Some(format!("title of {id}")),
         source: Some("cli".into()),
         cwd: Some("/work".into()),
+        // D5 的扩展字段也要整条原样存取。
+        kind: SessionKind::Cron,
+        agent: Some("coder".into()),
+        parent_session: Some("parent".into()),
+        leaf: Some(EntryId::new(5)),
+        title_provisional: true,
+        created_at: 1_000,
+        changed_at: 2_000,
+        request_key: Some(format!("key of {id}")),
+        ..SessionRecord::new(id, ROOT)
     }
 }
 
@@ -1705,6 +2085,7 @@ async fn sessions_replace_whole_and_scan_by_lifecycle(storage: &dyn Storage) {
     // 整条替换：当前分支与生命周期都换了，旧值不残留（含 Option 字段变空）。
     let mut moved = session("s2", SessionLifecycle::Active, 7);
     moved.title = None;
+    moved.leaf = None;
     commit(storage, vec![StorageWrite::Session(moved.clone())]).await;
     assert_eq!(storage.session("s2").await.unwrap(), Some(moved));
 

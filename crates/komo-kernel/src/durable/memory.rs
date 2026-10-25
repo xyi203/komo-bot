@@ -3,14 +3,14 @@
 //! 一把 `std::sync::Mutex` 护住整个状态，所有 future 都立即就绪，不依赖 tokio。写入时先
 //! 整批校验、再整批应用，所以失败的提交什么都没改；读出的都是独立拷贝。
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Bound;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use super::fork::{ForkError, fork_chain, is_visible, visible_entries};
 use super::ids::{ConversationId, DocumentId, EntryId, Seq, SubmissionId, TaskId};
 use super::records::{
-    ConversationRecord, DocumentAddress, DocumentRecord, EntryRecord, SessionRecord,
+    ConversationRecord, DocumentAddress, DocumentRecord, DocumentScope, EntryRecord, SessionRecord,
     SubmissionRecord, TaskRecord,
 };
 use super::storage::{
@@ -164,7 +164,7 @@ impl State {
                     self.collect_document_action(write, &mut actions)?;
                     continue;
                 }
-                StorageWrite::Session(_) => continue,
+                StorageWrite::Session(_) | StorageWrite::PurgeConversations { .. } => continue,
             };
             if id > MAX_ID {
                 return Err(StorageError::rejected(format!("ID {id} is out of range")));
@@ -351,7 +351,9 @@ impl State {
                 }
                 StorageWrite::DocumentCreate(_)
                 | StorageWrite::DocumentChange { .. }
-                | StorageWrite::DocumentRetire { .. } => {}
+                | StorageWrite::DocumentRetire { .. }
+                // purge 排在其余写入之后（见下）。
+                | StorageWrite::PurgeConversations { .. } => {}
             }
         }
         for (id, action) in actions {
@@ -380,7 +382,69 @@ impl State {
                 self.documents.get_mut(&id).expect("exists").retired_at = Some(seq);
             }
         }
+        let purged: HashSet<ConversationId> = writes
+            .iter()
+            .filter_map(|write| match write {
+                StorageWrite::PurgeConversations { conversations } => Some(conversations),
+                _ => None,
+            })
+            .flatten()
+            .copied()
+            .collect();
+        if !purged.is_empty() {
+            self.purge(&purged);
+        }
         seq
+    }
+
+    /// 删掉这些 conversation 的全部行（`StorageWrite::PurgeConversations`）。
+    fn purge(&mut self, purged: &HashSet<ConversationId>) {
+        let tasks: HashSet<TaskId> = self
+            .tasks
+            .values()
+            .filter(|task| purged.contains(&task.conversation))
+            .map(|task| task.id)
+            .collect();
+        for task in &tasks {
+            self.tasks.remove(task);
+            self.tables.remove(&task.get());
+        }
+        let submissions: Vec<SubmissionRecord> = self
+            .submissions
+            .values()
+            .filter(|submission| purged.contains(&submission.conversation))
+            .cloned()
+            .collect();
+        for submission in submissions {
+            self.submissions.remove(&submission.id);
+            self.tables.remove(&submission.id.get());
+            if let Some(request) = submission.request_id {
+                self.requests.remove(&(submission.conversation, request));
+            }
+        }
+        let documents: Vec<DocumentId> = self
+            .documents
+            .values()
+            .filter(|document| match document.address.scope {
+                DocumentScope::Session => false,
+                DocumentScope::Conversation { conversation } => purged.contains(&conversation),
+                DocumentScope::Task { task } => tasks.contains(&task),
+            })
+            .map(|document| document.id)
+            .collect();
+        for document in documents {
+            self.documents.remove(&document);
+            self.tables.remove(&document.get());
+        }
+        for conversation in purged {
+            for entry in self.entries.remove(conversation).unwrap_or_default() {
+                self.entry_index.remove(&entry.id);
+                self.tables.remove(&entry.id.get());
+            }
+            if self.conversations.remove(conversation).is_some() {
+                self.tables.remove(&conversation.get());
+            }
+        }
     }
 
     fn claim(&mut self, id: u64, table: Table) {
@@ -456,6 +520,15 @@ impl Storage for MemoryStorage {
                 }) && query
                     .owner_task
                     .is_none_or(|wanted| record.owner.is_some_and(|owner| owner.task == wanted))
+                    && query
+                        .session
+                        .as_ref()
+                        .is_none_or(|wanted| record.session.as_ref() == Some(wanted))
+                    && query.parent_conversation.is_none_or(|wanted| {
+                        record
+                            .parent
+                            .is_some_and(|parent| parent.conversation == wanted)
+                    })
             },
         );
         Ok(page_of(values, limit, start.order, |record| {

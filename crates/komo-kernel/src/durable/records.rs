@@ -35,6 +35,11 @@ pub struct ConversationRecord {
     pub parent: Option<ForkPoint>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner: Option<ConversationOwner>,
+    /// 这个 conversation 属于哪个 komo Session（`SessionRecord::id`）。创建后不可变；写进
+    /// `conversations.session_id` 列，按它建了索引（`ConversationQuery::session`）。fork 出来的
+    /// 子 conversation 继承父的 session；嵌套工具与压缩用的 conversation 没有。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
 }
 
 impl ConversationRecord {
@@ -43,6 +48,7 @@ impl ConversationRecord {
             id,
             parent: None,
             owner: None,
+            session: None,
         }
     }
 
@@ -54,7 +60,13 @@ impl ConversationRecord {
                 at,
             }),
             owner: None,
+            session: None,
         }
+    }
+
+    pub fn in_session(mut self, session: impl Into<String>) -> Self {
+        self.session = Some(session.into());
+        self
     }
 }
 
@@ -503,9 +515,25 @@ pub enum SessionLifecycle {
     Purged,
 }
 
+/// komo Session 的种类（D5 契约，`docs/storage-durable-d5.md` §2）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SessionKind {
+    /// 渠道 peer 的主会话。
+    Main,
+    /// 普通会话（TUI / CLI 新建、群与话题）。
+    #[default]
+    Normal,
+    /// 后台任务的会话（`task` 工具派出的子 conversation 那一个）。
+    Task,
+    /// cron 触发建出来的会话。
+    Cron,
+}
+
 /// 对外的 komo Session：id 是 UUIDv7 字符串（不在数字命名空间里），整条替换。
 ///
-/// 一个 Session 是一组 conversation 加一个"当前分支"指针（§4.2）。
+/// 一个 Session 是一组 conversation 加一个"当前分支"指针（§4.2）。D5 起带上 gateway 要的展示与
+/// 路由信息，全部只放在 `record` JSON 里（不改 DDL）；新字段都有默认值，旧记录照样读得出。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionRecord {
@@ -516,11 +544,56 @@ pub struct SessionRecord {
     pub root_conversation: ConversationId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
-    /// 来源（channel / cli / cron……），调用方自己的约定。
+    /// 来源（channel / cli / cron……），调用方自己的约定；渠道会话如 `chat:telegram:123`。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
+    #[serde(default)]
+    pub kind: SessionKind,
+    /// 会话用的 Agent 名（`komo.agent` document 里也有，这里供列表与按 Agent 找主会话用）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    /// 派生它的会话（任务会话指向父会话）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_session: Option<String>,
+    /// 会话树里导航到的位置；没有就是当前分支的末端（导航只改它，不追加 entry）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub leaf: Option<EntryId>,
+    /// 标题还是临时的（取自第一条消息，等 `titles` 换成模型起的）。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub title_provisional: bool,
+    /// 创建与最近一次改动的时刻（毫秒）；旧记录没有，读成 0。
+    #[serde(default)]
+    pub created_at: i64,
+    #[serde(default)]
+    pub changed_at: i64,
+    /// 创建请求的幂等键（同一键同一内容是同一个会话）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_key: Option<String>,
+}
+
+impl SessionRecord {
+    /// 一个刚建的、活着的会话：当前分支就是根 conversation，其余字段取默认。
+    pub fn new(id: impl Into<String>, root_conversation: ConversationId) -> Self {
+        Self {
+            id: id.into(),
+            lifecycle: SessionLifecycle::Active,
+            current_branch: root_conversation,
+            root_conversation,
+            title: None,
+            source: None,
+            cwd: None,
+            kind: SessionKind::default(),
+            agent: None,
+            parent_session: None,
+            leaf: None,
+            title_provisional: false,
+            created_at: 0,
+            changed_at: 0,
+            request_key: None,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -592,6 +665,51 @@ mod tests {
         let text = serde_json::to_string(&task).unwrap();
         assert_eq!(serde_json::from_str::<TaskRecord>(&text).unwrap(), task);
         assert_eq!(task.state.status(), TaskStatus::Terminal);
+    }
+
+    #[test]
+    fn session_records_gain_fields_without_breaking_old_json() {
+        // D4 的记录没有 kind / leaf / 时间戳等字段：照样读得出，读成默认值。
+        let old = json!({
+            "id": "s1", "lifecycle": "active", "currentBranch": 7, "rootConversation": 2,
+            "title": "t", "source": "cli", "cwd": "/w",
+        });
+        let record: SessionRecord = serde_json::from_value(old).unwrap();
+        assert_eq!(record.kind, SessionKind::Normal);
+        assert_eq!(record.leaf, None);
+        assert_eq!((record.created_at, record.changed_at), (0, 0));
+        assert!(!record.title_provisional);
+
+        let mut full = SessionRecord::new("s2", ConversationId::new(2));
+        full.kind = SessionKind::Task;
+        full.agent = Some("coder".into());
+        full.parent_session = Some("s1".into());
+        full.leaf = Some(EntryId::new(9));
+        full.title_provisional = true;
+        full.created_at = 10;
+        full.changed_at = 20;
+        full.request_key = Some("k".into());
+        let value = serde_json::to_value(&full).unwrap();
+        assert_eq!(value["kind"], "task");
+        assert_eq!(value["parentSession"], "s1");
+        assert_eq!(value["leaf"], 9);
+        assert_eq!(
+            serde_json::from_value::<SessionRecord>(value).unwrap(),
+            full
+        );
+    }
+
+    #[test]
+    fn conversation_records_keep_their_session_and_old_json_has_none() {
+        let record = ConversationRecord::root(ConversationId::new(2)).in_session("s1");
+        let value = serde_json::to_value(&record).unwrap();
+        assert_eq!(value["session"], "s1");
+        assert_eq!(
+            serde_json::from_value::<ConversationRecord>(value).unwrap(),
+            record
+        );
+        let old: ConversationRecord = serde_json::from_value(json!({"id": 2})).unwrap();
+        assert_eq!(old.session, None);
     }
 
     #[test]

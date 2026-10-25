@@ -137,7 +137,7 @@ fn to_write(write: &StorageWrite) -> StorageResult<Write> {
                 .parent
                 .map(|parent| write_id(parent.at.get()))
                 .transpose()?,
-            session_id: None,
+            session_id: record.session.clone(),
             record: json(record)?,
         },
         StorageWrite::Entry(record) => Write::InsertEntry {
@@ -181,6 +181,12 @@ fn to_write(write: &StorageWrite) -> StorageResult<Write> {
         },
         StorageWrite::DocumentRetire { id } => Write::RetireDocument {
             id: write_id(id.get())?,
+        },
+        StorageWrite::PurgeConversations { conversations } => Write::PurgeConversations {
+            conversations: conversations
+                .iter()
+                .map(|conversation| write_id(conversation.get()))
+                .collect::<StorageResult<Vec<_>>>()?,
         },
         StorageWrite::Session(record) => Write::UpsertSession {
             id: record.id.clone(),
@@ -490,6 +496,12 @@ impl Storage for TursoStorage {
         }
         if let Some(task) = query.owner_task {
             filter.eq("owner_task", int(write_id(task.get())?));
+        }
+        if let Some(session) = &query.session {
+            filter.eq("session_id", text(session.clone()));
+        }
+        if let Some(parent) = query.parent_conversation {
+            filter.eq("parent_conversation", int(write_id(parent.get())?));
         }
         let values = self
             .scan_table("conversations", filter, start, limit)

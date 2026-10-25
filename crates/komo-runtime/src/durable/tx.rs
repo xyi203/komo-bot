@@ -13,8 +13,9 @@ use komo_kernel::durable::storage::{DocumentCreate, DocumentQuery, TaskQuery};
 use komo_kernel::durable::task::{Overlay, check_checkpoint};
 use komo_kernel::durable::{
     ConversationId, ConversationRecord, Cursor, DocumentAddress, DocumentId, DocumentRecord,
-    DocumentScope, EntryId, EntryRecord, ROOT_CONVERSATION_ID, Storage, StorageExt, StorageWrite,
-    SubmissionId, SubmissionKind, SubmissionRecord, TaskId, TaskRecord, TaskState, TaskStatus,
+    DocumentScope, EntryId, EntryRecord, ROOT_CONVERSATION_ID, SessionRecord, Storage, StorageExt,
+    StorageWrite, SubmissionId, SubmissionKind, SubmissionRecord, TaskId, TaskRecord, TaskState,
+    TaskStatus,
 };
 
 use super::error::DurableError;
@@ -109,6 +110,10 @@ pub struct Tx {
     tasks: BTreeMap<TaskId, (bool, TaskRecord)>,
     submissions: BTreeMap<SubmissionId, SubmissionRecord>,
     documents: HashMap<DocumentAddress, DocState>,
+    /// 本次提交要整条替换的 komo Session 行（按 id 去重，后写的赢）。
+    sessions: BTreeMap<String, SessionRecord>,
+    /// 本次提交要整组删掉的 conversation（`purge_conversations`）。
+    purged: Vec<ConversationId>,
     progress: bool,
 }
 
@@ -124,6 +129,8 @@ impl Tx {
             tasks: BTreeMap::new(),
             submissions: BTreeMap::new(),
             documents: HashMap::new(),
+            sessions: BTreeMap::new(),
+            purged: Vec::new(),
             progress: false,
         }
     }
@@ -285,8 +292,29 @@ impl Tx {
         Ok(record)
     }
 
+    /// 建一个不属于任何 komo Session 的 conversation（嵌套工具、测试用）。komo 的 Session 用
+    /// [`Tx::create_conversation_in`]。
     pub async fn create_conversation(
         &mut self,
+        ownership: ConversationOwnership,
+    ) -> Result<ConversationRecord, DurableError> {
+        self.create_conversation_with(None, ownership).await
+    }
+
+    /// 建一个属于 komo Session `session` 的 conversation（`conversations.session_id` 列，创建后
+    /// 不可变）。komo 的每个 Session 用它建根——不用固定占 ID 1 的 `create_root_conversation`。
+    pub async fn create_conversation_in(
+        &mut self,
+        session: &str,
+        ownership: ConversationOwnership,
+    ) -> Result<ConversationRecord, DurableError> {
+        self.create_conversation_with(Some(session.to_owned()), ownership)
+            .await
+    }
+
+    async fn create_conversation_with(
+        &mut self,
+        session: Option<String>,
         ownership: ConversationOwnership,
     ) -> Result<ConversationRecord, DurableError> {
         self.mark_table_write();
@@ -296,11 +324,13 @@ impl Tx {
             id,
             parent: None,
             owner,
+            session,
         };
         self.conversations.push(record.clone());
         Ok(record)
     }
 
+    /// fork 出子 conversation；它**继承父的 session**（同一个 komo Session 的另一个分支）。
     pub async fn fork_conversation(
         &mut self,
         parent: ConversationId,
@@ -309,12 +339,55 @@ impl Tx {
     ) -> Result<ConversationRecord, DurableError> {
         self.mark_table_write();
         let id: ConversationId = self.storage.mint().await?;
-        self.require_conversation(parent).await?;
+        let parent_record = self.conversation_record(parent).await?;
         let owner = self.conversation_owner(ownership).await?;
         let mut record = ConversationRecord::fork(id, parent, at);
         record.owner = owner;
+        record.session = parent_record.session;
         self.conversations.push(record.clone());
         Ok(record)
+    }
+
+    /// 本次提交暂存的优先，其次已提交的（conversation 创建后不可变，所以这样读总是精确的）。
+    async fn conversation_record(
+        &self,
+        id: ConversationId,
+    ) -> Result<ConversationRecord, DurableError> {
+        if let Some(record) = self.conversations.iter().find(|record| record.id == id) {
+            return Ok(record.clone());
+        }
+        self.storage
+            .conversation(id)
+            .await?
+            .ok_or_else(|| DurableError::rejected(format!("Conversation {id} does not exist")))
+    }
+
+    /// komo Session 行：整条替换。不算"表写"——它不影响 entry / task / submission 的表读。
+    pub fn put_session(&mut self, record: SessionRecord) {
+        self.sessions.insert(record.id.clone(), record);
+    }
+
+    /// 一个 komo Session 行：本次提交暂存的优先，其次已提交的。像 [`Tx::submission`] 那样不受
+    /// "表读在表写之前"的限制——Session 行只经 [`Tx::put_session`] 改，暂存的总能读到。
+    pub async fn session(&mut self, id: &str) -> Result<Option<SessionRecord>, DurableError> {
+        if let Some(record) = self.sessions.get(id) {
+            return Ok(Some(record.clone()));
+        }
+        Ok(self.storage.session(id).await?)
+    }
+
+    /// 整组删掉这些 conversation 的全部行（entry、task、submission、document 与 conversation 行
+    /// 本身；`StorageWrite::PurgeConversations`）。幂等；一批里排在其余写之后。
+    ///
+    /// 只给"整个 Session 已经没有活任务"的清理用（gateway 的 purge 先 abort 并等 idle）：存储不
+    /// 管这些 conversation 上还有没有活任务、有没有别处 fork 自它们的 conversation。
+    pub fn purge_conversations(&mut self, conversations: impl IntoIterator<Item = ConversationId>) {
+        self.mark_table_write();
+        for conversation in conversations {
+            if !self.purged.contains(&conversation) {
+                self.purged.push(conversation);
+            }
+        }
     }
 
     async fn conversation_owner(
@@ -679,6 +752,11 @@ impl Tx {
         }
         let mut writes = Vec::new();
         writes.extend(self.conversations.drain(..).map(StorageWrite::Conversation));
+        writes.extend(
+            std::mem::take(&mut self.sessions)
+                .into_values()
+                .map(StorageWrite::Session),
+        );
         writes.extend(self.entries.drain(..).map(StorageWrite::Entry));
         writes.extend(
             std::mem::take(&mut self.submissions)
@@ -720,6 +798,11 @@ impl Tx {
                     }
                 }
             }
+        }
+        if !self.purged.is_empty() {
+            writes.push(StorageWrite::PurgeConversations {
+                conversations: std::mem::take(&mut self.purged),
+            });
         }
         Ok(writes)
     }

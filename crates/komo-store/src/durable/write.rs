@@ -96,6 +96,11 @@ pub enum Write {
         root_conversation: i64,
         record: String,
     },
+    /// 删掉这些 conversation 的 entry / task / submission / document 行与 conversation 行
+    /// （`StorageWrite::PurgeConversations`）。幂等；一批里排在其余写之后。
+    PurgeConversations {
+        conversations: Vec<i64>,
+    },
 }
 
 /// 事务内应用一条写的失败。见模块文档。
@@ -124,6 +129,7 @@ impl Write {
             Write::ReplaceDocument { .. } => "ReplaceDocument",
             Write::RetireDocument { .. } => "RetireDocument",
             Write::UpsertSession { .. } => "UpsertSession",
+            Write::PurgeConversations { .. } => "PurgeConversations",
         }
     }
 
@@ -207,6 +213,8 @@ pub(crate) fn ordered(writes: &[Write]) -> Batch<'_> {
         Write::RetireDocument { id } if !created.contains(id) => 1,
         // 同批建的 document 的退役已经并进了建（`ephemeral`），这里不再有动作。
         Write::RetireDocument { .. } => 3,
+        // purge 最后：同批对这些 conversation 的写入随后被一并删掉，与调用方排的次序无关。
+        Write::PurgeConversations { .. } => 4,
         _ => 2,
     };
     let mut ordered: Vec<&Write> = writes.iter().collect();
@@ -503,6 +511,12 @@ impl Write {
                 )
                 .await
             }
+            Write::PurgeConversations { conversations } => {
+                for conversation in conversations {
+                    purge_conversation(conn, what, *conversation).await?;
+                }
+                Ok(())
+            }
             Write::UpsertSession {
                 id,
                 lifecycle,
@@ -528,4 +542,38 @@ impl Write {
             }
         }
     }
+}
+
+/// 一个 conversation 的全部行：作用域是它或它名下 task 的 document（含已退役的历史）、
+/// task、submission、entry，最后是 conversation 行。按这个次序删，document 的子查询才能还看到 task。
+async fn purge_conversation(
+    conn: &Connection,
+    what: &str,
+    conversation: i64,
+) -> Result<(), ApplyError> {
+    let id = vec![int(conversation)];
+    exec(
+        conn,
+        what,
+        "DELETE FROM documents WHERE scope_kind = 'task' AND owner_id IN (SELECT id FROM tasks WHERE conversation_id = ?1)",
+        id.clone(),
+    )
+    .await?;
+    exec(
+        conn,
+        what,
+        "DELETE FROM documents WHERE scope_kind = 'conversation' AND owner_id = ?1",
+        id.clone(),
+    )
+    .await?;
+    for table in ["tasks", "submissions", "entries"] {
+        exec(
+            conn,
+            what,
+            &format!("DELETE FROM {table} WHERE conversation_id = ?1"),
+            id.clone(),
+        )
+        .await?;
+    }
+    exec(conn, what, "DELETE FROM conversations WHERE id = ?1", id).await
 }

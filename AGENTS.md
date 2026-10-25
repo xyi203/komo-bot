@@ -43,13 +43,13 @@ The full command table is §3 of the design.
 komo-kernel    value types, `durable/` (entry · conversation · task · submission ·
                document records, context derivation, fork, Task state machine,
                compaction logic, `Storage` trait + in-memory impl + conformance,
-               `pi_tree` / `legacy_events` projections), cron math, §8.4 recovery
-               table, wire protocol, ALL traits. No tokio, no I/O.
+               `pi_tree` / `legacy_events` projections), cron math, wire protocol, ALL traits. No tokio, no I/O.
                lib.rs is module declarations only.
 komo-store     `durable/`: `Line` (the single commit line), Turso `Storage`, DDL,
                blob writes, id high-water mark — raw `turso`, no toasty.
                Plus `aux.db`: toasty models + *_TABLE_DDL · repositories (cron,
-               deliveries, memory) · tool_output. The only crate that sees
+               deliveries, memory) · tool_output · session_dir / purge (Session directory
+               paths, pre-purge reference check). The only crate that sees
                toasty/turso.
 komo-runtime   `durable/`: Task engine + harness (generation / tool / inbox /
                compaction / orchestration / codemode, the agent loop organised

@@ -1,6 +1,6 @@
 # 存储重设计：整套采用 pi-durable 的提交模型
 
-> 状态：**实现中（2026-10-25）**。D0–D3、D4a、D4b 已完成并合入 `main`；**D4c 已完成**，在集成分支 `d4c`（未合入 `main`）：工具任务 `probe` 阶段与 `komo.live.tools[].pid`、生成 / 工具任务在 Turso 上的接线测试、压缩（`komo.compaction` 阻塞与后台、衰减写成 `edits`、上下文超长时压缩重试）、codemode 嵌套调用（外层脚本任务、名下的嵌套工具任务、`komo.nested` 槽位、时钟 / 随机数 memo）、编排工具 `task` / `monitor` 的执行路径（owned、background 的子 conversation，交回结果，监听登记与对账）。**D5 已完成（2026-10-25，W0–W5，分支 `d5-w5`，生产默认已是 Durable）**：gateway 的 HTTP / SSE / 渠道 / cron / memory / 生命周期全部跑在新存储上，`TursoStorage` 读改 4 条连接的池，本机真模型冒烟通过（见 `docs/komo_bot.md` §14）。下一步 D7（删旧 ledger 与 Legacy 代码）。进度与实现中的偏离见 §13。全部完成后改写 `docs/komo_bot.md` §8，本文留作推导记录。
+> 状态：**D7（旧存储代码全部删除）已完成（2026-10-25，D7a gateway / bin、D7b runtime / store / kernel / agent，分支 `d7b`）；本文是设计与推导记录**。以下是此前的进度：D0–D3、D4a、D4b 已完成并合入 `main`；**D4c 已完成**，在集成分支 `d4c`（未合入 `main`）：工具任务 `probe` 阶段与 `komo.live.tools[].pid`、生成 / 工具任务在 Turso 上的接线测试、压缩（`komo.compaction` 阻塞与后台、衰减写成 `edits`、上下文超长时压缩重试）、codemode 嵌套调用（外层脚本任务、名下的嵌套工具任务、`komo.nested` 槽位、时钟 / 随机数 memo）、编排工具 `task` / `monitor` 的执行路径（owned、background 的子 conversation，交回结果，监听登记与对账）。**D5 已完成（2026-10-25，W0–W5，分支 `d5-w5`，生产默认已是 Durable）**：gateway 的 HTTP / SSE / 渠道 / cron / memory / 生命周期全部跑在新存储上，`TursoStorage` 读改 4 条连接的池，本机真模型冒烟通过（见 `docs/komo_bot.md` §14）。进度与实现中的偏离见 §13；`docs/komo_bot.md` §8 已按新存储改写，本文留作推导记录。
 >
 > 对照基线：本机 `../pi` 提交 `8efd314fa` 的 `packages/durable`（`docs/spec.md` 为规范，`README.md`）。
 > pi-durable 自称 **Experimental**，API 随版本变；pi coding-agent 在这个提交上**并不依赖它**（仍是
@@ -379,7 +379,7 @@ pi-durable 没有删除。komo 保留 `closing → deleted → purged`：
 | D4c 压缩与其余工具（**已完成 2026-10-25**，在集成分支 `d4c`；`monitor` 的 gateway 一半在 D5，见 §13） | `komo.compaction`（阻塞与后台）、衰减写成 `edits`、上下文超长时压缩重试、codemode 嵌套调用、编排工具（`task` / `monitor`）、子进程 probe 阶段 | 现有 `tests/recovery`、`tests/agents` 的对应场景改写后通过 |
 | D5 gateway 与树（**已完成 2026-10-25**，W0–W5，工作包与决定见 `docs/storage-durable-d5.md`） | 会话树映射到 fork、HTTP / SSE 改读新存储、`task` / cron / 投递；生产默认翻成 Durable；读连接池 | §8.11 的端到端测试（`session_tree/tests.rs`）在 Durable 下通过；本机真模型冒烟（新建 / 回复 / 分支 / 编辑历史输入 / 导出 / 重启后接着聊） |
 | D6 导出 | `komo session export SESSION_ID`：输出 pi v3 树形 JSONL（带 blob 引用）；不导入旧会话（§8） | 导出的文件能被 pi 的 session-manager 读入，分支与当前位置一致 |
-| D7 收尾 | 删旧 ledger 代码，改写 `docs/komo_bot.md` §8、AGENTS.md 结构规则、§14 验收表 | — |
+| D7 收尾 | 删旧 ledger 代码，改写 `docs/komo_bot.md` §8、AGENTS.md 结构规则、§14 验收表 | **已完成（2026-10-25）**：D7a 删 gateway / bin 的旧路径与 Legacy 测试，D7b 删 runtime（agent loop、executor 的账本分支、recovery 扫描、Scheduler）/ store（coordinator、旧 repos 与模型）/ kernel（`Ledger`、`RunQueue`、`recovery`、`session_events`）/ agent（回放与旧压缩计划） |
 
 ### D6 导出（**已完成 2026-10-25**，D5 W4c）
 
@@ -648,3 +648,4 @@ finalize     → blob 收尾同步 → 提交结果 entry（projection.rs 的 fu
 
   放得越宽补读吞吐越高，但多出来的补读是在抢 CPU（每次补读全量投影整段历史），提交延迟被拖到 2.5 倍；提交延迟更要紧，所以限 2 路、给提交的读留 2 条空闲连接。补读改成增量投影（W1a 的限制）之后再放宽。
 - **编译时间**（`cargo build --timings`，本机 6 job）：release `-p komo` 5 分 53 秒（含这次改动之前未编过的依赖）；dev 增量（改 `komo-store` 之后重编 store / runtime / gateway / komo）1 分 31 秒。冷编预算 60 秒（§13.4）仍超，原因与此前相同（Turso / toasty / reqwest 等依赖），不是 D5 引入。
+- **D7b 之后的编译时间**（同一台机器、6 job，`cargo clean` 之后）：dev `cargo build` 冷编 2 分 00 秒；release `-p komo` 冷编 5 分 03 秒（D5 末尾的 5 分 53 秒含当时未编过的依赖，口径不完全相同；旧存储的约 7 万行删掉后少了一些）；dev 增量（给 `komo-store` 加一个 `pub fn` 之后 `cargo build`）8.7 秒（D5 末尾 1 分 31 秒，那次改的是带 toasty 宏的模型，重编范围更大）。冷编预算 60 秒仍超，原因同上。

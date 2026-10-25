@@ -170,8 +170,6 @@ pub(crate) fn truncate(text: &str, limit: usize) -> String {
     format!("{}…（截断）", &text[..end])
 }
 
-/// 内层调用的输出：流照样写进子调用自己的尝试目录，同时在内存里留一份给脚本的 `text`
-
 #[cfg(test)]
 mod tests {
     use super::join_outputs;

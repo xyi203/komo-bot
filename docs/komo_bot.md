@@ -1254,18 +1254,19 @@ effort 的行为统一，取值按协议和具体模型校验：
 komo-kernel    值类型、`durable/` 模块（entry / conversation / task / submission / document 的记录类型，
                上下文推导、fork 遍历、Task 状态机的纯逻辑 `durable/task/`、压缩的纯逻辑、`Storage` trait、
                内存实现 `durable/memory.rs` 与 conformance 用例、`pi_tree` / `legacy_events` 投影）、
-               Session 生命周期、cron 到期计算、§8.4 恢复表里的判定（纯函数）、协议线格式、全部 trait（§13.5）。
+               Session 生命周期、cron 到期计算、协议线格式、全部 trait（§13.5）。
                deps: serde, serde_json, uuid, time, thiserror, async-trait, sha2, croner（`default-features = false`，
                无 chrono；它自己仍拉 derive_builder / darling / strum，接受）。不依赖 tokio，不带 tzdb。
 
 komo-store     `durable/`：`Line`（一条提交线，唯一写连接）、Turso `Storage` 实现、新库 DDL 与字节对等测试、
                `blob`（先写文件后提交引用）、`ids`（取号器与高水位）——**裸 `turso`，不经 toasty**；
-               `aux.db` 的 toasty 模型 + `*_TABLE_DDL` + 仓库（cron / 投递 / Memory）、tool_output（输出存储）。
+               `aux.db` 的 toasty 模型 + `*_TABLE_DDL` + 仓库（cron / 投递 / Memory）、tool_output（输出存储）、
+               session_dir（`SessionPaths` 与落盘小工具）、purge（回收前的引用检查与删目录）。
                唯一依赖 toasty/turso 的 crate。deps: kernel, toasty(turso only), turso, tokio(fs, sync)
 
 komo-runtime   `durable/`：Task 引擎（`engine` / `scheduler` / `runtime` / `tx` / `line`）与 harness
                （`harness/{generation,tool,inbox,live,system,compaction,orchestration,codemode,nested,…}`，
-               按 pi 的钩子组织的 agent loop，§6）、tools/{read,write,edit,rg,bash}、executor 的投影与 prepare 部分、
+               按 pi 的钩子组织的 agent loop，§6）、tools/{read,write,edit,rg,bash}、executor（工具目录 `ToolExecutor` 与结果落地的小函数、`check_contract` 复验）、
                codemode（Monty worker 与协议，`komo __codemode-worker` 的函数体也在这里）、
                memory（MemoryManager、索引、代次）、llm（无状态 `ModelStream` + `RoutingStream`）与 embedding 适配器、
                cron scheduler、config。日常改动落在这里；它从不重新展开 toasty 宏。

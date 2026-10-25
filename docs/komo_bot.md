@@ -1261,7 +1261,7 @@ komo-kernel    值类型、`durable/` 模块（entry / conversation / task / sub
 komo-store     `durable/`：`Line`（一条提交线，唯一写连接）、Turso `Storage` 实现、新库 DDL 与字节对等测试、
                `blob`（先写文件后提交引用）、`ids`（取号器与高水位）——**裸 `turso`，不经 toasty**；
                `aux.db` 的 toasty 模型 + `*_TABLE_DDL` + 仓库（cron / 投递 / Memory）、tool_output（输出存储）。
-               唯一依赖 toasty/turso 的 crate。deps: kernel, toasty(turso only), turso, tokio(fs, sync), sha2
+               唯一依赖 toasty/turso 的 crate。deps: kernel, toasty(turso only), turso, tokio(fs, sync)
 
 komo-runtime   `durable/`：Task 引擎（`engine` / `scheduler` / `runtime` / `tx` / `line`）与 harness
                （`harness/{generation,tool,inbox,live,system,compaction,orchestration,codemode,nested,…}`，

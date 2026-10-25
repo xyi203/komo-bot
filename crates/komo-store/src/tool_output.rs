@@ -23,8 +23,7 @@ use komo_kernel::types::refs::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::payloads::sync_file;
-use crate::session_log::{SessionPaths, create_dir_all_synced, sync_dir};
+use crate::session_dir::{SessionPaths, create_dir_all_synced, sync_dir, sync_file};
 
 /// `output.json` 的磁盘格式。
 ///
@@ -54,7 +53,7 @@ pub const OUTPUT_FORMAT_VERSION: u32 = 1;
 ///
 /// **按 Session 构造**：`OutputRef` 里的路径相对该 Session 目录（§8.3），而
 /// [`ToolOutputStore::open`] 的签名只有一个引用，所以"是哪个 Session"必须由存储自己
-/// 带着。Gateway 每个 Session 一个实例，和 [`crate::coordinator::Coordinator`] 同寿。
+/// 带着。Gateway 每个 Session 一个实例。
 ///
 /// 打开中的 `.partial` 句柄由**存储**持有，不由写入器持有：`publish` 收到的是
 /// `Box<dyn OutputWriter>`，从一个 trait 对象里把具体类型拿回来只能靠 downcast，而

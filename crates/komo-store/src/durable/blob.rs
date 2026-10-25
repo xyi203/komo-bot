@@ -21,7 +21,7 @@ use komo_kernel::traits::StoreError;
 use komo_kernel::types::{ContentHash, ContentRef};
 use tokio::io::AsyncWriteExt;
 
-use crate::session_log::sync_dir;
+use crate::session_dir::sync_dir;
 
 /// 已完整落盘（文件与目录项都已同步）的 blob。
 #[derive(Debug, Clone, PartialEq, Eq)]

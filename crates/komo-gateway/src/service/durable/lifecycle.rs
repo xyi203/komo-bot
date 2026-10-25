@@ -444,7 +444,7 @@ async fn finish_purged(core: &DurableCore, sessions_dir: &Path) -> Result<u32, S
         if !paths.root().exists() {
             continue;
         }
-        match komo_store::repos::reconcile::remove_session_content(&paths).await {
+        match komo_store::purge::remove_session_content(&paths).await {
             Ok(_) => done += 1,
             // 删不掉就说清楚、下一次再试（§8.8），不假装成功。
             Err(error) => {
@@ -484,7 +484,7 @@ pub async fn purge(
     let mut blockers = core.work_remaining(id).await?;
     blockers.extend(core.live_monitors(&conversations).await?);
     blockers.extend(
-        komo_store::repos::reconcile::purge_blockers(&state.db, &SessionId::from_raw(id))
+        komo_store::purge::purge_blockers(&state.db, &SessionId::from_raw(id))
             .await
             .map_err(|error| SessionError::Internal(error.to_string()))?,
     );
@@ -523,7 +523,7 @@ pub async fn purge(
 }
 
 async fn remove_content(paths: &SessionPaths) -> Result<u64, SessionError> {
-    komo_store::repos::reconcile::remove_session_content(paths)
+    komo_store::purge::remove_session_content(paths)
         .await
         .map_err(|error| SessionError::Internal(error.to_string()))
 }

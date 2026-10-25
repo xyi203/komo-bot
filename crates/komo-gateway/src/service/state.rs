@@ -568,9 +568,9 @@ impl GatewayState {
         supervisor.restart(self, platform).await;
     }
 
-    /// 把卡在 `processing` 的记忆处理放回 `pending`（§9.3）。返回放回了几行。
-    pub async fn requeue_memory_work(&self) -> Result<u64, GatewayError> {
-        Ok(komo_store::repos::runs::requeue_stuck_memory_work(&self.db).await?)
+    /// 对 `aux.db` 做一次启动期的写（见 [`komo_store::Db::first_write`]）。
+    pub async fn warm_aux_db(&self) -> Result<(), GatewayError> {
+        Ok(self.db.first_write().await?)
     }
 }
 

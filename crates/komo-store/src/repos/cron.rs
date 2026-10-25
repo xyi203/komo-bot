@@ -15,7 +15,7 @@ use time::OffsetDateTime;
 use crate::db::{
     BoxFuture, Db, decode, encode, from_ts, from_ts_opt, map_toasty, to_ts, to_ts_opt,
 };
-use crate::models::{CronFiringRow, CronJobRow, RunRow};
+use crate::models::{CronFiringRow, CronJobRow};
 
 /// Turso 上的 [`CronRepo`]。
 #[derive(Debug, Clone)]
@@ -331,43 +331,6 @@ impl CronRepo for TursoCronRepo {
                         .await
                         .map_err(map_toasty)?;
                     Ok(true)
-                }) as BoxFuture<'_, Result<bool, StoreError>>
-            })
-            .await
-            .map_err(RepoError::from)
-    }
-
-    async fn has_unfinished_firing(&self, id: &CronJobId) -> Result<bool, RepoError> {
-        let id = id.to_string();
-        self.db
-            .read(move |ex| {
-                let id = id.clone();
-                Box::pin(async move {
-                    let rows =
-                        CronFiringRow::filter(CronFiringRow::fields().job_id().eq(id.as_str()))
-                            .exec(ex)
-                            .await
-                            .map_err(map_toasty)?;
-                    for row in rows {
-                        let Some(run_id) = row.run_id else {
-                            // 触发记录已在、Run 还没建出来——这也算"上一次还没结束"。
-                            return Ok(true);
-                        };
-                        let Some(run) = RunRow::filter_by_id(&run_id)
-                            .first()
-                            .exec(ex)
-                            .await
-                            .map_err(map_toasty)?
-                        else {
-                            return Ok(true);
-                        };
-                        // 「含等待重试或结果核对」都算没结束（§10）——判据就是
-                        // §8.4 的"非终态"，与领取语句、reconcile 同一份。
-                        if crate::repos::runs::state_of(&run)?.is_unfinished() {
-                            return Ok(true);
-                        }
-                    }
-                    Ok(false)
                 }) as BoxFuture<'_, Result<bool, StoreError>>
             })
             .await
@@ -694,22 +657,6 @@ mod tests {
         }
         assert_eq!(wins, 1, "同一计划时间不重复创建运行");
         assert_eq!(repo.firings(&id, 10).await.unwrap().len(), 1);
-    }
-
-    /// 「含等待重试或结果核对」都算没结束（§10）。
-    #[tokio::test]
-    async fn a_firing_without_a_finished_run_counts_as_unfinished() {
-        let (db, _dir) = temp().await;
-        let repo = TursoCronRepo::new(db.clone());
-        repo.put(job("job-1")).await.unwrap();
-        let id = CronJobId::from_raw("job-1");
-
-        assert!(!repo.has_unfinished_firing(&id).await.unwrap());
-        repo.claim_firing(firing(&id, NOW)).await.unwrap();
-        assert!(
-            repo.has_unfinished_firing(&id).await.unwrap(),
-            "触发记录已在、Run 还没建出来，也算没结束"
-        );
     }
 
     /// 只有 active 且槽位到期的才是 due。

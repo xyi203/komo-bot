@@ -7,18 +7,15 @@
 //! 约定（写新模型前先读）：
 //!
 //! - 主键一律 `String` UUIDv7（`#[key] id: String`），不用 `#[auto]`——ID 要在写库之前
-//!   就存在（JSONL 先写、事件里带 ID、跨进程恢复按 ID 对账）。
+//!   就存在（跨库靠预分配 ID 与请求键幂等）。
 //! - 时间一律 `i64` **unix 纳秒**（[`crate::db::to_ts`] / [`crate::db::from_ts`]）。可空的
-//!   时间用哨兵 `0`（= 未设置），因为 §8.7 的领取 SQL 要对 `runs.wake_at` 直接做
-//!   `<= ?1` 比较，NULL 在那里会把整行筛掉。
+//!   时间用哨兵 `0`（= 未设置）：NULL 在 SQL 的 `<=` 比较里会把整行筛掉。
 //! - 结构化字段存 JSON 文本；**在 SQL 里被筛选或排序的维度另开一列**（`scope_kind`、
 //!   `job_version`…），不要指望从 JSON 里查。
 //! - **不加 `#[index]`**：索引由 [`crate::db::ensure_schema`] 用
 //!   `CREATE INDEX IF NOT EXISTS` 统一建，新文件和旧文件走同一条路；让 toasty 建一半、
 //!   自己建一半会分叉。
 
-pub mod checkpoint;
-pub mod control_outbox;
 pub mod cron_firing;
 pub mod cron_job;
 pub mod delivery;
@@ -27,14 +24,8 @@ pub mod memory_index_generation;
 pub mod memory_item;
 pub mod memory_terms;
 pub mod memory_vector;
-pub mod run;
-pub mod session;
-pub mod session_log_index;
-pub mod tool_attempt;
-pub mod tool_call;
+pub mod session_kind;
 
-pub use checkpoint::CheckpointRow;
-pub use control_outbox::ControlOutboxRow;
 pub use cron_firing::CronFiringRow;
 pub use cron_job::CronJobRow;
 pub use delivery::DeliveryRow;
@@ -43,11 +34,7 @@ pub use memory_index_generation::MemoryIndexGenerationRow;
 pub use memory_item::MemoryItemRow;
 pub use memory_terms::MemoryTermsRow;
 pub use memory_vector::MemoryVectorRow;
-pub use run::RunRow;
-pub use session::{SessionKind, SessionRow};
-pub use session_log_index::SessionLogIndexRow;
-pub use tool_attempt::ToolAttemptRow;
-pub use tool_call::ToolCallRow;
+pub use session_kind::SessionKind;
 
 /// 一列在 `ALTER TABLE ADD COLUMN` 里的写法，以及补完之后要跑的回填。
 ///
@@ -102,18 +89,11 @@ pub struct TableSpec {
     pub columns: &'static [ColumnSpec],
 }
 
-/// §8.2 表清单里的全部 15 张表，按建表顺序。
+/// `aux.db` 里的全部表，按建表顺序：cron、投递、记忆。
 ///
-/// `approval_requests` / `policy_grants` 随 Policy 与审批一起删了（2026-10-11）：老库里那两张表
-/// 与它们的索引留着、没人读；`ensure_schema` 不管多出来的表。
+/// 会话 / run / 工具调用 / 检查点 / 控制 outbox 那几张旧表随旧存储删除（会话与提交在
+/// `durable.db`，`komo-store::durable`）；老用户目录里的 `state.db` 不再被打开。
 pub const TABLES: &[TableSpec] = &[
-    session::SPEC,
-    run::SPEC,
-    session_log_index::SPEC,
-    tool_call::SPEC,
-    tool_attempt::SPEC,
-    checkpoint::SPEC,
-    control_outbox::SPEC,
     delivery::SPEC,
     cron_job::SPEC,
     cron_firing::SPEC,
@@ -126,19 +106,6 @@ pub const TABLES: &[TableSpec] = &[
 
 /// 索引由 store 自己建（见模块头），新文件与旧文件走同一条路。
 pub const INDEXES: &[&str] = &[
-    // 每个 Agent **至多一条活的主会话**（`docs/bot.md` §4.2：「数据库应保证每个 Agent 只有
-    // 一个有效主会话，创建过程也应具有并发唯一性」）。三条限定缺一不可：
-    // `kind = 'main'` 只约束主会话；`agent_id <> ''` 让升级前那些还没有归属的行（以及
-    // 普通会话）不进索引——一次迁移可能带出好几条 `origin = 'home'` 的老行，那时它们都还是
-    // 空串；`state NOT IN (…)` 说的是"**有效**"：墓碑不是主会话，删掉主会话之后要能再建一条。
-    r#"CREATE UNIQUE INDEX IF NOT EXISTS "sessions_main_per_agent" ON "sessions" ("agent_id") WHERE "kind" = 'main' AND "agent_id" <> '' AND "state" NOT IN ('deleted', 'purged')"#,
-    r#"CREATE INDEX IF NOT EXISTS "runs_session" ON "runs" ("session_id")"#,
-    r#"CREATE INDEX IF NOT EXISTS "runs_claimable" ON "runs" ("state", "wait_kind", "wake_at")"#,
-    r#"CREATE INDEX IF NOT EXISTS "log_index_session_seq" ON "session_log_index" ("session_id", "seq")"#,
-    r#"CREATE INDEX IF NOT EXISTS "tool_calls_run" ON "tool_calls" ("run_id")"#,
-    r#"CREATE INDEX IF NOT EXISTS "tool_attempts_call" ON "tool_attempts" ("call_id")"#,
-    r#"CREATE INDEX IF NOT EXISTS "checkpoints_session" ON "checkpoints" ("session_id", "covers_to")"#,
-    r#"CREATE INDEX IF NOT EXISTS "outbox_undelivered" ON "control_outbox" ("delivered")"#,
     r#"CREATE INDEX IF NOT EXISTS "deliveries_state" ON "deliveries" ("state")"#,
     r#"CREATE INDEX IF NOT EXISTS "cron_firings_job" ON "cron_firings" ("job_id", "scheduled_at")"#,
     r#"CREATE INDEX IF NOT EXISTS "memory_evidence_memory" ON "memory_evidence" ("memory_id")"#,
@@ -148,13 +115,6 @@ pub const INDEXES: &[&str] = &[
 /// 交给 `Db::builder().models(..)` 的模型集合。
 pub fn model_set() -> toasty::ModelSet {
     toasty::models!(
-        SessionRow,
-        RunRow,
-        SessionLogIndexRow,
-        ToolCallRow,
-        ToolAttemptRow,
-        CheckpointRow,
-        ControlOutboxRow,
         DeliveryRow,
         CronJobRow,
         CronFiringRow,

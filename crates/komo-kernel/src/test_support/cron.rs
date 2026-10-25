@@ -21,17 +21,11 @@ pub struct MemCronRepo {
 struct CronState {
     jobs: BTreeMap<CronJobId, CronJob>,
     firings: Vec<CronFiring>,
-    unfinished: Vec<CronJobId>,
 }
 
 impl MemCronRepo {
     pub fn new() -> Self {
         Self::default()
-    }
-
-    /// 标记某个 Job "上一次还没结束"，用来测重叠策略。
-    pub fn mark_unfinished(&self, job: CronJobId) {
-        self.state.lock().expect("cron").unfinished.push(job);
     }
 }
 
@@ -119,10 +113,6 @@ impl CronRepo for MemCronRepo {
         };
         *row = firing;
         Ok(true)
-    }
-
-    async fn has_unfinished_firing(&self, id: &CronJobId) -> Result<bool, RepoError> {
-        Ok(self.state.lock().expect("cron").unfinished.contains(id))
     }
 
     async fn firings(&self, id: &CronJobId, limit: u32) -> Result<Vec<CronFiring>, RepoError> {

@@ -521,9 +521,6 @@ pub trait CronRepo: Send + Sync {
     /// 行不在时答 `false`，不是错误：一次手动 run 本来就没有触发记录。
     async fn update_firing(&self, firing: CronFiring) -> Result<bool, RepoError>;
 
-    /// 这个 Job 上一次触发还没结束吗（含等待重试或结果核对）。
-    async fn has_unfinished_firing(&self, id: &CronJobId) -> Result<bool, RepoError>;
-
     async fn firings(&self, id: &CronJobId, limit: u32) -> Result<Vec<CronFiring>, RepoError>;
 }
 

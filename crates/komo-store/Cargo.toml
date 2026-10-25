@@ -16,11 +16,9 @@ toasty = { workspace = true }
 toasty-driver-turso = { workspace = true }
 turso = { workspace = true }
 tokio = { workspace = true, features = ["fs", "io-util"] }
-sha2 = { workspace = true }
 
 serde = { workspace = true }
 serde_json = { workspace = true }
-uuid = { workspace = true }
 time = { workspace = true }
 thiserror = { workspace = true }
 async-trait = { workspace = true }

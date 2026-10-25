@@ -189,14 +189,5 @@ pub fn memory_gateway(config: &str) -> GatewayBuilder {
 // ---------------------------------------------------------------- 等待
 
 pub async fn wait_for_terminal(gateway: &TestGateway, run: &komo_kernel::types::ids::RunId) {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    while std::time::Instant::now() < deadline {
-        if let Ok(Some(record)) = komo_store::repos::runs::get(&gateway.state().db, run).await
-            && record.state.is_terminal()
-        {
-            return;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    }
-    panic!("等了 10 秒 run {run} 还没到终态");
+    gateway.wait_run(run).await;
 }

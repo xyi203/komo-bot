@@ -483,10 +483,11 @@ mod tests {
         }
     }
 
-    /// 记下每次触发的目标：编号造 Run，重叠判定问触发表（`MemCronRepo::mark_unfinished`）。
+    /// 记下每次触发的目标：编号造 Run；`unfinished` 里的 Job 报"上一次还没结束"。
     #[derive(Default)]
     struct RecordingTarget {
         fired: std::sync::Mutex<Vec<FireSpec>>,
+        unfinished: std::sync::Mutex<Vec<CronJobId>>,
     }
 
     #[async_trait]
@@ -502,10 +503,10 @@ mod tests {
 
         async fn has_unfinished(
             &self,
-            jobs: &dyn CronRepo,
+            _jobs: &dyn CronRepo,
             job: &CronJobId,
         ) -> Result<bool, CronError> {
-            Ok(jobs.has_unfinished_firing(job).await?)
+            Ok(self.unfinished.lock().unwrap().contains(job))
         }
     }
 
@@ -585,7 +586,11 @@ mod tests {
             .put(job("job-1", Some(NOW - time::Duration::minutes(1))))
             .await
             .unwrap();
-        h.jobs.mark_unfinished(CronJobId::from_raw("job-1"));
+        h.target
+            .unfinished
+            .lock()
+            .unwrap()
+            .push(CronJobId::from_raw("job-1"));
 
         let tick = h.scheduler.tick().await.unwrap();
         assert!(tick.fired.is_empty());
@@ -683,7 +688,11 @@ mod tests {
         let mut job = job("job-1", Some(NOW - time::Duration::minutes(1)));
         job.overlap = OverlapPolicy::Allow;
         h.jobs.put(job).await.unwrap();
-        h.jobs.mark_unfinished(CronJobId::from_raw("job-1"));
+        h.target
+            .unfinished
+            .lock()
+            .unwrap()
+            .push(CronJobId::from_raw("job-1"));
 
         let tick = h.scheduler.tick().await.unwrap();
         assert_eq!(tick.fired.len(), 1, "{tick:?}");

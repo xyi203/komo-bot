@@ -1,19 +1,14 @@
 //! 给上层 crate 的测试用的构造器（feature `test-support`，只作为 dev-dependency 启用）。
 //!
-//! runtime / gateway 的测试要一个**真的** Turso 库和一个真的 Session 目录——内存替身
-//! （kernel 的 `MemLedger` / `MemOutputStore`）测得了 loop 与 executor 的逻辑，测不了
-//! "写入顺序"和"尾部校验"。这里给的是后者。
+//! gateway 的测试要一个**真的** Turso 库（`aux.db`）和一个真的 Session 目录。
 
-use std::sync::Arc;
-
-use komo_kernel::traits::{Clock, LedgerError, StoreError};
+use komo_kernel::traits::StoreError;
 use komo_kernel::types::ids::SessionId;
 
-use crate::coordinator::Coordinator;
 use crate::db::{Db, DbOptions};
-use crate::session_log::SessionPaths;
+use crate::session_dir::SessionPaths;
 
-/// 一个临时数据目录 + 一个打开的 state.db。
+/// 一个临时数据目录 + 一个打开的 aux.db。
 ///
 /// `TempDir` 拿在手里：它一被丢弃，目录就没了，所以别让它比 [`Db`] 先走。
 pub struct TempStore {
@@ -30,7 +25,7 @@ impl std::fmt::Debug for TempStore {
 }
 
 impl TempStore {
-    /// 建一个临时数据目录，打开 `state.db`。
+    /// 建一个临时数据目录，打开 `aux.db`。
     pub async fn open() -> Result<TempStore, StoreError> {
         TempStore::open_with(DbOptions::default()).await
     }
@@ -39,7 +34,7 @@ impl TempStore {
     pub async fn open_with(options: DbOptions) -> Result<TempStore, StoreError> {
         let root =
             tempfile::tempdir().map_err(|e| StoreError::Io(format!("建立临时目录失败：{e}")))?;
-        let db = Db::connect_with(root.path().join("state.db"), options).await?;
+        let db = Db::connect_with(root.path().join("aux.db"), options).await?;
         Ok(TempStore { root, db })
     }
 
@@ -61,27 +56,11 @@ impl TempStore {
         SessionPaths::new(self.sessions_root(), session)
     }
 
-    /// 打开一个 Session 的 [`Coordinator`]。
-    pub async fn coordinator(
-        &self,
-        session: &SessionId,
-        clock: Arc<dyn Clock>,
-    ) -> Result<Coordinator, LedgerError> {
-        Coordinator::open(
-            self.db.clone(),
-            self.sessions_root(),
-            session.clone(),
-            "test",
-            clock,
-        )
-        .await
-    }
-
     /// 关掉这个库再用同一个目录重开一个——重启语义的测试要它。
     pub async fn reopen(self) -> Result<TempStore, StoreError> {
         let TempStore { root, db } = self;
         drop(db);
-        let db = Db::connect(root.path().join("state.db")).await?;
+        let db = Db::connect(root.path().join("aux.db")).await?;
         Ok(TempStore { root, db })
     }
 }
@@ -89,49 +68,17 @@ impl TempStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use komo_kernel::test_support::TestClock;
-    use komo_kernel::traits::Ledger;
-    use komo_kernel::types::ids::{RequestKey, Seq};
-    use komo_kernel::types::turn::AcceptInput;
 
-    /// 上层 crate 拿到的就是这套：一个真的 Turso 库 + 一个真的 Session 目录，
-    /// 关掉重开之后账本还在。
+    /// 关掉重开之后同一个目录还在、库还能用。
     #[tokio::test]
     async fn a_temp_store_survives_a_reopen() {
         let store = TempStore::open().await.expect("打开临时库");
-        let session = SessionId::from_raw("00000000-0000-7000-8000-0000000000aa");
-        let clock: Arc<dyn Clock> = Arc::new(TestClock::fixed());
-
-        {
-            let coordinator = store.coordinator(&session, clock.clone()).await.unwrap();
-            coordinator
-                .accept_input(AcceptInput {
-                    session: session.clone(),
-                    request_key: RequestKey::new("api:1"),
-                    text: "你好".into(),
-                    source: komo_kernel::types::plan::PlanSource::Interactive {
-                        session: session.clone(),
-                    },
-                    peer: None,
-                    model: komo_kernel::test_support::sample_model(),
-                    workdir: None,
-                    at: clock.now(),
-                    delegate: None,
-                    snapshot: None,
-                    skip_memory: false,
-                    interject: false,
-                })
-                .await
-                .unwrap();
-        }
-
-        assert!(store.paths_for(&session).events().exists());
-
+        assert!(store.root().join("aux.db").exists());
         let store = store.reopen().await.expect("重开");
-        let coordinator = store.coordinator(&session, clock).await.unwrap();
-        let batch = coordinator.read(&session, Seq::ZERO, 0).await.unwrap();
-        assert_eq!(batch.events.len(), 2);
-        assert_eq!(batch.next, None);
+        assert_eq!(
+            store.db().table_ddl().await.unwrap().len(),
+            crate::models::TABLES.len()
+        );
     }
 
     /// `Db::open_temp` 是最小的那一个：只要一个库。
@@ -142,6 +89,6 @@ mod tests {
             db.table_ddl().await.unwrap().len(),
             crate::models::TABLES.len()
         );
-        assert!(dir.path().join("state.db").exists());
+        assert!(dir.path().join("aux.db").exists());
     }
 }

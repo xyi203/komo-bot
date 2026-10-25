@@ -1,48 +1,33 @@
-//! 持久化层：Session 目录的三个写入点与 Turso 存储（docs/komo_bot.md §8.2、§13.4）。
+//! 持久化层：新存储（`durable`）、`aux.db` 上的 cron / 投递 / 记忆仓储，以及 Session 目录的
+//! 内容（docs/komo_bot.md §8.2、§13.4）。
 //!
-//! 两个持久化边界，各自是真的落盘，但**合起来不是一个跨文件原子事务**（§8.2）：
+//! 两个库文件、一个目录，各管各的：
 //!
-//! - **Session 目录**是内容的权威。每一步先 `sync_all` 再往下走。
-//! - **state.db**（Turso，MVCC）是调度的权威。提交即 fsync。
-//!
-//! 所以写入顺序永远是 §8.5 的那条箭头：**外置正文（如有）→ JSONL 追加并同步 →
-//! 数据库事务**。[`coordinator::Coordinator`] 的每个方法内部完成这一顺序，它是
-//! `Ledger` 的生产实现，也是 Agent Loop 的唯一写入口。
-//!
-//! 模块之间的关系：
+//! - **`durable.db`**（[`durable`]）：会话、提交、收件箱、任务——串行提交线，WAL，提交即 fsync。
+//! - **`aux.db`**（[`db::Db`] + toasty，[`models`] / [`repos`]）：cron、投递记录、记忆。
+//!   跨库靠预分配 ID 与请求键幂等。
+//! - **Session 目录**（[`session_dir`] / [`tool_output`]）：工具输出与产物的内容文件。
+//!   写入顺序是 §8.5 的箭头：**外置正文 → 数据库提交**，崩溃后靠对账收尾。
 //!
 //! ```text
-//! Coordinator ─┬─ payloads::PayloadStore   外置正文（内容寻址）
-//!              ├─ session_log::SessionLog  events.jsonl（分配 seq、sync_all、尾部校验）
-//!              └─ db::Db ─ models/         Turso + toasty；repos/ 是各 trait 的实现
-//! FileToolOutputStore  tool-output/<run>/<call>/<attempt>/（独立于 Coordinator）
+//! durable::TursoStorage   durable.db：Line（串行提交线）+ blob 先落后引用
+//! db::Db ─ models/        aux.db：Turso + toasty；repos/ 是各 trait 的实现
+//! FileToolOutputStore     tool-output/<conversation>/<task>/<attempt>/
 //! ```
 
-pub mod checkpoint;
-pub mod coordinator;
 pub mod db;
 pub mod durable;
 pub mod models;
-pub mod payloads;
+pub mod purge;
 pub mod repos;
-pub mod session_log;
-pub mod session_tree;
+pub mod session_dir;
 pub mod tool_output;
 
-pub use checkpoint::{CheckpointRecord, CheckpointStore};
-pub use coordinator::Coordinator;
 pub use db::{Db, DbOptions, RetryConfig};
-pub use payloads::PayloadStore;
 pub use repos::cron::TursoCronRepo;
 pub use repos::deliveries::{DeliveryRecord, TursoDeliveryRepo};
-pub use repos::interventions::{BlockedRun, UncertainCall};
 pub use repos::memory::{TursoMemoryRepo, lexical_terms};
-pub use repos::queue::{
-    DEFAULT_LEASE_WINDOW, TursoRunQueue, expired_lease_running, reclaim_expired_lease,
-    reclaim_lease, reclaim_unowned, release_satisfied_dependencies, unowned_running,
-};
-pub use repos::recovery::{RecoveryStore, SeenRun, UnfinishedRun};
-pub use session_log::{SessionLog, SessionPaths, TailExpectation, TailRepair};
+pub use session_dir::SessionPaths;
 pub use tool_output::FileToolOutputStore;
 
 #[cfg(feature = "test-support")]

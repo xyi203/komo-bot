@@ -498,7 +498,7 @@ impl DurableCore {
                         .title
                         .as_deref()
                         .is_none_or(|title| title.trim().is_empty())
-                        && let Some(title) = komo_store::coordinator::title_for(&text)
+                        && let Some(title) = super::titles::title_for(&text)
                     {
                         record.title = Some(title);
                         record.title_provisional = true;

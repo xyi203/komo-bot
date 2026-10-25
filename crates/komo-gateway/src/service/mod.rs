@@ -278,12 +278,11 @@ pub async fn start(options: ServiceOptions) -> Result<Running, ServiceError> {
         },
     )?;
 
-    // 7. 把卡在 `processing` 的记忆处理放回 pending（aux.db 里的旧表，W3c 换成新游标的复位）。
-    //    它同时是 aux.db 的**第一次写**：只建不写的新文件，Turso 在同一进程里重开会报
+    // 7. aux.db 的**第一次写**：只建不写的新文件，Turso 在同一进程里重开会报
     //    `database is locked`（实测；写过一次就好）。生产里重启是新进程，不受影响；测试里
     //    `stop` 后同一数据目录重起要靠这一下。
-    if let Err(error) = state.requeue_memory_work().await {
-        tracing::warn!(%error, "记忆处理队列的复位没做成");
+    if let Err(error) = state.warm_aux_db().await {
+        tracing::warn!(%error, "aux.db 的首次写没做成");
     }
 
     // 8. 后台循环：feed 与看客已在 `core.resume()` 之前起好（上面），这里只起 resume 之后的。

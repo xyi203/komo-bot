@@ -70,7 +70,7 @@ async fn retitle(
     let Some(current) = record.title.clone() else {
         return Ok(());
     };
-    if komo_store::coordinator::title_for(&input).as_deref() != Some(current.as_str()) {
+    if title_for(&input).as_deref() != Some(current.as_str()) {
         return Ok(());
     }
 
@@ -144,6 +144,22 @@ async fn replace_title_if(
         .map_err(|error| error.to_string())
 }
 
+/// 会话标题取哪一段：输入的**第一行**（去掉首尾空白），最多 [`PROVISIONAL_TITLE_CHARS`] 个字符。
+///
+/// 空白输入没有标题可言（返回 `None`，于是空会话在列表里仍然是"无标题"，而不是一行空白）。
+/// 截断按**字符**切，不按字节——中文按字节切会切出半个字。
+pub(crate) fn title_for(text: &str) -> Option<String> {
+    let first = text.lines().map(str::trim).find(|line| !line.is_empty())?;
+    let mut title: String = first.chars().take(PROVISIONAL_TITLE_CHARS).collect();
+    if first.chars().count() > PROVISIONAL_TITLE_CHARS {
+        title.push('…');
+    }
+    Some(title)
+}
+
+/// 标题最多这么多个字符。够列表里认出是哪个会话，又不至于把整段话塞进一列。
+const PROVISIONAL_TITLE_CHARS: usize = 60;
+
 fn excerpt(text: &str) -> String {
     let mut out: String = text.trim().chars().take(EXCERPT_CHARS).collect();
     if text.trim().chars().count() > EXCERPT_CHARS {
@@ -184,6 +200,16 @@ fn wrapping(c: char) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_provisional_title_is_the_first_line_cut_by_characters() {
+        assert_eq!(title_for("  \n 你好\n第二行").as_deref(), Some("你好"));
+        assert_eq!(title_for("  \n "), None);
+        let long = "字".repeat(61);
+        let title = title_for(&long).unwrap();
+        assert_eq!(title.chars().count(), 61, "60 个字符加省略号");
+        assert!(title.ends_with('…'));
+    }
 
     #[test]
     fn the_title_is_stripped_of_wrapping_and_prefixes() {

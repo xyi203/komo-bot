@@ -27,7 +27,7 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::time::Duration;
 
-use komo_kernel::traits::{LedgerError, StoreError};
+use komo_kernel::traits::StoreError;
 use time::OffsetDateTime;
 use toasty::Executor;
 use toasty_driver_turso::Turso;
@@ -91,7 +91,7 @@ impl Default for DbOptions {
     }
 }
 
-/// state.db 的句柄。
+/// aux.db 的句柄。
 ///
 /// Turso 对 db 文件持**进程独占锁**，所以进程里只有一个 `Db`，而 Gateway 是唯一打开它
 /// 的进程（§8.2、§3）。克隆很便宜——内部共享同一个连接池。
@@ -103,7 +103,7 @@ pub struct Db {
 }
 
 impl Db {
-    /// 打开 `path` 上的 state.db。
+    /// 打开 `path` 上的 aux.db。
     pub async fn connect(path: impl AsRef<Path>) -> Result<Db, StoreError> {
         Db::connect_with(path, DbOptions::default()).await
     }
@@ -144,7 +144,7 @@ impl Db {
     pub async fn open_temp() -> Result<(Db, tempfile::TempDir), StoreError> {
         let dir =
             tempfile::tempdir().map_err(|e| StoreError::Io(format!("建立临时目录失败：{e}")))?;
-        let db = Db::connect(dir.path().join("state.db")).await?;
+        let db = Db::connect(dir.path().join("aux.db")).await?;
         Ok((db, dir))
     }
 
@@ -199,7 +199,7 @@ impl Db {
         Ok(db)
     }
 
-    /// state.db 的路径；内存库没有。
+    /// aux.db 的路径；内存库没有。
     pub fn path(&self) -> Option<&Path> {
         self.path.as_deref()
     }
@@ -423,6 +423,21 @@ impl Db {
                 .map_err(|error| StoreError::Other(error.to_string()))?;
         }
         Ok(())
+    }
+
+    /// 启动期对库做一次写：只建不写的新文件，Turso 在同一进程里重开会报 `database is locked`
+    /// （实测；写过一次就好）。写的是一条什么都不匹配的 `DELETE`。
+    pub async fn first_write(&self) -> Result<(), StoreError> {
+        self.with_write_retry(|ex| {
+            Box::pin(async move {
+                toasty::sql::statement("DELETE FROM deliveries WHERE id = ''")
+                    .exec(ex)
+                    .await
+                    .map_err(map_toasty)?;
+                Ok(())
+            }) as BoxFuture<'_, Result<(), StoreError>>
+        })
+        .await
     }
 
     pub async fn ensure_schema(&self) -> Result<(), StoreError> {
@@ -697,28 +712,6 @@ pub fn map_toasty(error: toasty::Error) -> StoreError {
     }
 }
 
-/// [`StoreError`] → [`LedgerError`]。
-///
-/// `StoreError` → `RepoError` 的方向**不在这里**：kernel 有
-/// `impl From<StoreError> for RepoError`，领域性变体在那儿逐个对上，仓储直接
-/// `?` 或 `.map_err(RepoError::from)` 就行。
-///
-/// 账本这边没有对应的变体：预期 revision 不符，对
-/// [`LedgerError`] 来说是"这个状态下做不了这件事"，所以并进 [`LedgerError::Conflict`]
-/// ——**并进去的是文本，不是沉默**。
-pub fn store_to_ledger(error: StoreError) -> LedgerError {
-    match error {
-        StoreError::NotFound { what } => LedgerError::NotFound { what },
-        StoreError::Contended => LedgerError::Contended,
-        StoreError::Corrupt(message) => LedgerError::Corrupt(message),
-        StoreError::VersionConflict { expected, actual } => {
-            LedgerError::Conflict(format!("版本冲突：预期 {expected}，当前 {actual}"))
-        }
-        StoreError::Io(message) => LedgerError::Persist(message),
-        StoreError::Other(message) => LedgerError::Conflict(message),
-    }
-}
-
 /// JSON 编码一个要进 TEXT 列的值。
 pub fn encode<T: serde::Serialize>(value: &T) -> Result<String, StoreError> {
     serde_json::to_string(value).map_err(|e| StoreError::Other(format!("列编码失败：{e}")))
@@ -732,12 +725,11 @@ pub fn decode<T: serde::de::DeserializeOwned>(raw: &str, what: &str) -> Result<T
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::{SessionKind, SessionRow};
-    use komo_kernel::types::ids::SessionId;
+    use crate::models::DeliveryRow;
 
     async fn temp() -> (Db, tempfile::TempDir) {
         let dir = tempfile::tempdir().expect("临时目录");
-        let db = Db::connect(dir.path().join("state.db"))
+        let db = Db::connect(dir.path().join("aux.db"))
             .await
             .expect("打开库");
         (db, dir)
@@ -804,21 +796,18 @@ mod tests {
         db.with_write_retry(move |ex| {
             let id = id.clone();
             Box::pin(async move {
-                toasty::create!(SessionRow {
+                toasty::create!(DeliveryRow {
                     id,
-                    title: String::new(),
-                    origin: "test",
-                    agent_id: String::new(),
-                    kind: "normal",
-                    workdir: None as Option<String>,
-                    current_run: None as Option<String>,
-                    jsonl_path: String::new(),
-                    applied_seq: 0_i64,
-                    applied_bytes: 0_i64,
+                    platform: "test",
+                    chat_id: "c",
+                    is_home: false,
+                    outbound: "",
+                    approval_id: None as Option<String>,
+                    state: "pending",
+                    attempts: 0_i64,
+                    last_error: None as Option<String>,
                     created_at: 0_i64,
                     updated_at: 0_i64,
-                    state: "active",
-                    state_changed_at: 0_i64,
                 })
                 .exec(ex)
                 .await
@@ -829,12 +818,12 @@ mod tests {
         .await
     }
 
-    /// 验收 ③：两个写入器对**不同** Session 并发提交不互相阻塞。
+    /// 验收 ③：两个写入器对**不同**行并发提交不互相阻塞。
     ///
     /// spike 实测 autocommit 下 200 次只成 6 次，包进事务 200/200 全成——这条测试锁住
     /// 的就是"每个写都进 `db.transaction()`"这条规则（§8.2）。
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn two_writers_on_different_sessions_never_block_each_other() {
+    async fn two_writers_on_different_rows_never_block_each_other() {
         const ROUNDS: usize = 60;
         let (db, _dir) = temp().await;
 
@@ -860,9 +849,13 @@ mod tests {
 
         let count = db
             .read(|ex| {
-                Box::pin(
-                    async move { SessionRow::all().count().exec(ex).await.map_err(map_toasty) },
-                ) as BoxFuture<'_, Result<u64, StoreError>>
+                Box::pin(async move {
+                    DeliveryRow::all()
+                        .count()
+                        .exec(ex)
+                        .await
+                        .map_err(map_toasty)
+                }) as BoxFuture<'_, Result<u64, StoreError>>
             })
             .await
             .unwrap();
@@ -888,13 +881,13 @@ mod tests {
                 for _ in 0..EACH {
                     db.with_write_retry(|ex| {
                         Box::pin(async move {
-                            let mut row = SessionRow::filter_by_id("counter")
+                            let mut row = DeliveryRow::filter_by_id("counter")
                                 .get(&mut *ex)
                                 .await
                                 .map_err(map_toasty)?;
-                            let next = row.applied_seq + 1;
+                            let next = row.attempts + 1;
                             row.update()
-                                .applied_seq(next)
+                                .attempts(next)
                                 .exec(&mut *ex)
                                 .await
                                 .map_err(map_toasty)?;
@@ -913,11 +906,11 @@ mod tests {
         let final_value = db
             .read(|ex| {
                 Box::pin(async move {
-                    SessionRow::filter_by_id("counter")
+                    DeliveryRow::filter_by_id("counter")
                         .get(ex)
                         .await
                         .map_err(map_toasty)
-                        .map(|row| row.applied_seq)
+                        .map(|row| row.attempts)
                 }) as BoxFuture<'_, Result<i64, StoreError>>
             })
             .await
@@ -933,7 +926,7 @@ mod tests {
     #[tokio::test]
     async fn reopening_an_existing_file_keeps_the_schema_and_the_rows() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("state.db");
+        let path = dir.path().join("aux.db");
 
         let db = Db::connect(&path).await.unwrap();
         insert(&db, "kept".to_string()).await.unwrap();
@@ -950,12 +943,12 @@ mod tests {
         let found = db
             .read(|ex| {
                 Box::pin(async move {
-                    SessionRow::filter_by_id("kept")
+                    DeliveryRow::filter_by_id("kept")
                         .first()
                         .exec(ex)
                         .await
                         .map_err(map_toasty)
-                }) as BoxFuture<'_, Result<Option<SessionRow>, StoreError>>
+                }) as BoxFuture<'_, Result<Option<DeliveryRow>, StoreError>>
             })
             .await
             .unwrap();
@@ -970,24 +963,24 @@ mod tests {
     #[tokio::test]
     async fn a_missing_column_is_added_on_reopen() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("state.db");
+        let path = dir.path().join("aux.db");
 
-        // 旧形状：sessions 少一列。
-        let legacy = crate::models::session::DDL.replace(r#""origin" TEXT NOT NULL, "#, "");
-        assert!(!legacy.contains("origin"), "旧形状里不该有 origin");
-        plain_build_old(&path, Some(("sessions", legacy))).await;
+        // 旧形状：deliveries 少一列。
+        let legacy = crate::models::delivery::DDL.replace(r#""thread" TEXT, "#, "");
+        assert!(!legacy.contains("thread"), "旧形状里不该有 thread");
+        plain_build_old(&path, Some(("deliveries", legacy))).await;
 
-        let before = plain_columns(&path, "sessions").await;
+        let before = plain_columns(&path, "deliveries").await;
         assert!(
-            !before.iter().any(|name| name == "origin"),
+            !before.iter().any(|name| name == "thread"),
             "旧形状没落盘，后面的断言就没有意义：{before:?}"
         );
 
         // 重开：迁移在建池之前把它补回来，而且**落盘**。
         let db = Db::connect(&path).await.unwrap();
-        let after = plain_columns(&path, "sessions").await;
+        let after = plain_columns(&path, "deliveries").await;
         assert!(
-            after.iter().any(|name| name == "origin"),
+            after.iter().any(|name| name == "thread"),
             "补回来了，而且落盘：{after:?}"
         );
 
@@ -998,7 +991,7 @@ mod tests {
     #[tokio::test]
     async fn the_superseded_by_column_is_added_to_an_existing_memory_items_table() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("state.db");
+        let path = dir.path().join("aux.db");
 
         let legacy = crate::models::memory_item::DDL.replace(r#""superseded_by" TEXT, "#, "");
         assert!(!legacy.contains("superseded_by"), "旧形状里不该有这一列");
@@ -1022,7 +1015,7 @@ mod tests {
     #[tokio::test]
     async fn the_consolidated_at_column_is_added_to_an_existing_memory_items_table() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("state.db");
+        let path = dir.path().join("aux.db");
 
         let legacy = crate::models::memory_item::DDL.replace(r#""consolidated_at" BIGINT, "#, "");
         assert!(!legacy.contains("consolidated_at"), "旧形状里不该有这一列");
@@ -1043,7 +1036,7 @@ mod tests {
     #[tokio::test]
     async fn the_adoption_columns_are_added_to_an_existing_memory_items_table() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("state.db");
+        let path = dir.path().join("aux.db");
 
         let legacy = crate::models::memory_item::DDL
             .replace(r#""adopted_count" BIGINT, "last_adopted_at" BIGINT, "#, "");
@@ -1060,55 +1053,12 @@ mod tests {
         }
     }
 
-    /// 委派那三列在**旧形状的 runs 表**上补得回来（§8.2 的加列规则，也是升级路径）。
-    ///
-    /// 同上：旧形状在普通连接上造、在另一条新连接上确认，然后才重开验迁移。
-    #[tokio::test]
-    async fn the_delegate_columns_are_added_to_an_existing_runs_table() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("state.db");
-
-        let legacy = crate::models::run::DDL
-            .replace(r#""parent_run_id" TEXT, "#, "")
-            .replace(r#""resumes_run_id" TEXT, "#, "")
-            .replace(r#""delegate" TEXT, "#, "");
-        assert!(
-            !legacy.contains("parent_run_id")
-                && !legacy.contains("resumes_run_id")
-                && !legacy.contains("delegate"),
-            "旧形状里不该有这三列"
-        );
-        plain_build_old(&path, Some(("runs", legacy))).await;
-
-        let before = plain_columns(&path, "runs").await;
-        assert!(
-            !before.iter().any(|name| name == "parent_run_id"),
-            "旧形状没落盘：{before:?}"
-        );
-
-        let db = Db::connect(&path).await.unwrap();
-        let after = plain_columns(&path, "runs").await;
-        for column in ["parent_run_id", "resumes_run_id", "delegate"] {
-            assert!(
-                after.iter().any(|name| name == column),
-                "{column} 补回来了，而且落盘：{after:?}"
-            );
-        }
-        assert!(
-            crate::repos::runs::get(&db, &komo_kernel::types::ids::RunId::from_raw("缺的"))
-                .await
-                .unwrap()
-                .is_none(),
-            "补完之后按模型读一遍不报错：SELECT 的列清单在这张表上成立"
-        );
-    }
-
     /// `cron_jobs.command`（命令直跑模式，Cron 加法字段）在**旧形状**的表上补得回来，
     /// 旧行读成 `None`（这一列本来就没有），新写的命令 Job 逐字往返。
     #[tokio::test]
     async fn the_command_column_is_added_to_an_existing_cron_jobs_table_and_round_trips() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("state.db");
+        let path = dir.path().join("aux.db");
 
         let legacy = crate::models::cron_job::DDL.replace(r#""command" TEXT, "#, "");
         assert!(!legacy.contains(r#""command""#), "旧形状里不该有 command");
@@ -1162,91 +1112,6 @@ mod tests {
         assert_eq!(read.prompt, "", "命令 Job 的 prompt 列写空串");
     }
 
-    /// 把 `sessions` 退回"还没有 Agent 归属"的旧形状：**先丢掉引用了那两列的索引，再删列**
-    /// ——老库里既没有那条索引，也没有这两列。真机上老库就是这么长出来的。
-    async fn plain_roll_back_agent_columns(path: &Path) {
-        for sql in [
-            r#"DROP INDEX IF EXISTS "sessions_main_per_agent""#,
-            r#"ALTER TABLE "sessions" DROP COLUMN "kind""#,
-            r#"ALTER TABLE "sessions" DROP COLUMN "agent_id""#,
-        ] {
-            plain_exec(path, sql).await;
-        }
-    }
-
-    /// 升级之前就存在的那两行：操作者的全局主会话（`origin = home`）与一个平台会话。
-    async fn plain_insert_legacy_sessions(path: &Path) {
-        plain_exec(
-            path,
-            r#"INSERT INTO "sessions" ("id", "title", "origin", "workdir", "current_run", "jsonl_path", "applied_seq", "applied_bytes", "created_at", "updated_at", "state", "state_changed_at") VALUES ('h', '', 'home', NULL, NULL, 'p', 0, 0, 1, 1, 'active', 1), ('a', '', 'feishu:1', NULL, NULL, 'p', 0, 0, 2, 2, 'active', 2)"#,
-        )
-        .await;
-    }
-
-    /// 老库（没有 `agent_id` / `kind`）打开：两列补得上、能起，而且**已有的行**回填了
-    /// ——`origin = 'home'` 的那条是主会话，其余是普通会话；`agent_id` 留空串
-    /// （`docs/bot.md` §4.2）。
-    ///
-    /// 旧形状照旧在普通连接上造、在另一条新连接上确认（见
-    /// `a_missing_column_is_added_on_reopen`），重开才走 [`Db::migrate_file`]。
-    #[tokio::test]
-    async fn the_agent_columns_are_added_and_backfilled_on_reopen() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("state.db");
-
-        plain_build_old(&path, None).await;
-        plain_roll_back_agent_columns(&path).await;
-        plain_insert_legacy_sessions(&path).await;
-        let before = plain_columns(&path, "sessions").await;
-        assert!(
-            !before
-                .iter()
-                .any(|name| name == "agent_id" || name == "kind"),
-            "旧形状没落盘，后面的断言就没有意义：{before:?}"
-        );
-
-        let db = Db::connect(&path).await.unwrap();
-        let after = plain_columns(&path, "sessions").await;
-        for column in ["agent_id", "kind"] {
-            assert!(
-                after.iter().any(|name| name == column),
-                "{column} 补回来了，而且落盘：{after:?}"
-            );
-        }
-
-        let home = crate::repos::session::get(&db, &SessionId::from_raw("h"))
-            .await
-            .unwrap()
-            .expect("旧行读得回来");
-        assert_eq!(
-            home.kind,
-            SessionKind::Main,
-            "origin = home 的那条按回填规则是主会话"
-        );
-        assert_eq!(home.agent_id, "", "空串 = 还没有归属，迁移不替路由认主");
-        let other = crate::repos::session::get(&db, &SessionId::from_raw("a"))
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(other.kind, SessionKind::Normal, "非 home 的是普通会话");
-        assert_eq!(other.agent_id, "");
-
-        // 补完之后两列能用：那条老的主会话可以被认领一次（认领 = `set_agent_in`），
-        // 认完就是 `main_session(assistant)`。
-        assert!(
-            crate::repos::session::set_agent(&db, &SessionId::from_raw("h"), "assistant")
-                .await
-                .unwrap(),
-            "升级前的主会话还没有归属，第一次认领要写进去"
-        );
-        let main = crate::repos::session::main_for_agent(&db, "assistant")
-            .await
-            .unwrap()
-            .expect("认领之后它就是这个 Agent 的主会话");
-        assert_eq!(main.row.id, "h");
-        assert!(main.duplicates.is_empty());
-    }
-
     /// 时间列是 unix 纳秒，`0` 是"未设置"。
     #[test]
     fn a_timestamp_round_trips_at_full_precision() {
@@ -1262,85 +1127,6 @@ mod tests {
         let retry = RetryConfig::default();
         assert!(retry.delay_for(0) < retry.delay_for(3));
         assert_eq!(retry.delay_for(30), retry.max_delay);
-    }
-
-    /// 删 Policy 与审批之前的老库（D2 / D4）：多出来的 `approval_requests` /
-    /// `policy_grants` 两张表、它们的索引与 `deliveries_approval` 都还在，`Db::connect`
-    /// 照样起得来、不碰它们；停在审批上的 Run 读回来是 `WaitReason::Approval`（旧审批
-    /// ID 缺了读成空串，不当损坏），而且不进 Intervention 清单。
-    #[tokio::test]
-    async fn an_old_file_with_the_approval_tables_still_opens_and_its_waits_decode() {
-        use komo_kernel::types::ids::RunId;
-        use komo_kernel::types::status::{RunState, WaitReason};
-
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("state.db");
-
-        plain_build_old(&path, None).await;
-        for sql in [
-            r#"CREATE TABLE "approval_requests" ("id" TEXT NOT NULL, "short_id" TEXT NOT NULL, "session_id" TEXT NOT NULL, "run_id" TEXT, "call_id" TEXT, "plan_hash" TEXT NOT NULL, "plan" TEXT NOT NULL, "reason" TEXT NOT NULL, "changes" TEXT, "evidence" TEXT, "scopes" TEXT NOT NULL, "requested_at" BIGINT NOT NULL, "valid_until" BIGINT NOT NULL, "decided" BOOLEAN NOT NULL, "decision" TEXT, PRIMARY KEY ("id"))"#,
-            r#"CREATE TABLE "policy_grants" ("id" TEXT NOT NULL, "approval_id" TEXT NOT NULL, "scope_kind" TEXT NOT NULL, "run_id" TEXT, "job_id" TEXT, "job_version" BIGINT NOT NULL, "scope" TEXT NOT NULL, "granted_at" BIGINT NOT NULL, "valid_until" BIGINT NOT NULL, "consumed" BOOLEAN NOT NULL, "reason" TEXT NOT NULL, PRIMARY KEY ("id"))"#,
-            r#"CREATE INDEX IF NOT EXISTS "approvals_pending" ON "approval_requests" ("decided", "short_id")"#,
-            r#"CREATE INDEX IF NOT EXISTS "grants_run" ON "policy_grants" ("run_id")"#,
-            r#"CREATE INDEX IF NOT EXISTS "grants_job" ON "policy_grants" ("job_id", "job_version")"#,
-            r#"CREATE INDEX IF NOT EXISTS "deliveries_approval" ON "deliveries" ("approval_id")"#,
-            r#"INSERT INTO "approval_requests" VALUES ('ap-1', 'K7QF', 's', 'run-a', 'call-1', 'ph', '{}', 'shell', NULL, NULL, '["once"]', 1, 0, 0, NULL)"#,
-            r#"INSERT INTO "policy_grants" VALUES ('g-1', 'ap-1', 'once', 'run-a', NULL, 0, '{}', 1, 0, 0, 'ok')"#,
-            r#"INSERT INTO "sessions" ("id", "title", "origin", "agent_id", "kind", "workdir", "current_run", "jsonl_path", "applied_seq", "applied_bytes", "created_at", "updated_at", "state", "state_changed_at") VALUES ('s', '', 'api', '', 'normal', NULL, NULL, 'p', 0, 0, 1, 1, 'active', 1)"#,
-        ] {
-            plain_exec(&path, sql).await;
-        }
-        let run_insert = |id: &str, wait_ref: &str| {
-            format!(
-                r#"INSERT INTO "runs" ("id", "session_id", "request_key", "input_hash", "input_event", "input_seq", "final_event", "parent_run_id", "resumes_run_id", "delegate", "status", "state", "wait_kind", "wait_ref", "wake_at", "lease_until", "source", "peer", "claimed_by", "claim_generation", "claimed_at", "next_retry_at", "retry_attempts", "rounds", "max_rounds", "valid_until", "model_snapshot", "effort", "grants", "memory_work", "memory_cursor", "last_error", "created_at", "updated_at", "ended_at") VALUES ('{id}', 's', 'k-{id}', 'h', NULL, 0, NULL, NULL, NULL, NULL, '', 'waiting', 'approval', {wait_ref}, 0, 0, '{{"kind":"interactive","session":"s"}}', NULL, NULL, 1, 0, 0, 0, 0, 0, 0, '{{"provider":"test","base_url":"memory://test","model":"m","api_key_env":"K","timeout_secs":30}}', NULL, '["g-1"]', 'pending', 0, NULL, 1, 1, 0)"#
-            )
-        };
-        plain_exec(&path, &run_insert("run-a", "'ap-1'")).await;
-        plain_exec(&path, &run_insert("run-b", "NULL")).await;
-
-        let db = Db::connect(&path).await.expect("老库照样打得开");
-        db.ensure_schema()
-            .await
-            .expect("多出来的表不挡 ensure_schema");
-
-        let a = crate::repos::runs::get(&db, &RunId::from_raw("run-a"))
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(a.state, RunState::Waiting);
-        assert_eq!(
-            a.wait,
-            Some(WaitReason::Approval {
-                approval: "ap-1".into()
-            })
-        );
-        let b = crate::repos::runs::get(&db, &RunId::from_raw("run-b"))
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            b.wait,
-            Some(WaitReason::Approval {
-                approval: String::new()
-            }),
-            "旧审批 ID 缺了不算损坏"
-        );
-
-        // 不要人：清单里没有它们；Gateway 启动时从这里点出来续跑。
-        assert!(
-            crate::repos::interventions::list(&db, &Default::default())
-                .await
-                .unwrap()
-                .is_empty()
-        );
-        let legacy = crate::repos::recovery::RecoveryStore::new(db.clone(), dir.path())
-            .legacy_approval_waits()
-            .await
-            .unwrap();
-        assert_eq!(
-            legacy.iter().map(|r| r.run.as_str()).collect::<Vec<_>>(),
-            vec!["run-a", "run-b"]
-        );
     }
 
     /// `models::INDEXES` 真的建出来了。

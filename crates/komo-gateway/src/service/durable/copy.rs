@@ -58,7 +58,7 @@ async fn copy_dir(source: &Path, target: &Path) -> Result<(), SessionError> {
     }
     let mut queue = vec![(source.to_path_buf(), target.to_path_buf())];
     while let Some((source, target)) = queue.pop() {
-        komo_store::session_log::create_dir_all_synced(&target)
+        komo_store::session_dir::create_dir_all_synced(&target)
             .await
             .map_err(|e| io_error("建 blob 目录", e))?;
         let mut items = tokio::fs::read_dir(&source)
@@ -93,7 +93,7 @@ async fn copy_dir(source: &Path, target: &Path) -> Result<(), SessionError> {
                     .map_err(|e| io_error("复制 blob", e))?;
             }
         }
-        komo_store::session_log::sync_dir(&target)
+        komo_store::session_dir::sync_dir(&target)
             .await
             .map_err(|e| io_error("同步 blob 目录", e))?;
     }
@@ -108,19 +108,19 @@ async fn copy_blobs(sessions: &Path, source: &str, target: &str) -> Result<(), S
     }
     let staging: PathBuf = sessions.join(format!(".{target}.fork"));
     let prepared: Result<(), SessionError> = async {
-        komo_store::session_log::create_dir_all_synced(&staging)
+        komo_store::session_dir::create_dir_all_synced(&staging)
             .await
             .map_err(|e| io_error("建暂存目录", e))?;
         for dir in BLOB_DIRS {
             copy_dir(&source_dir.join(dir), &staging.join(dir)).await?;
         }
-        komo_store::session_log::sync_dir(&staging)
+        komo_store::session_dir::sync_dir(&staging)
             .await
             .map_err(|e| io_error("同步暂存目录", e))?;
         tokio::fs::rename(&staging, sessions.join(target))
             .await
             .map_err(|e| io_error("改名暂存目录", e))?;
-        komo_store::session_log::sync_dir(sessions)
+        komo_store::session_dir::sync_dir(sessions)
             .await
             .map_err(|e| io_error("同步 sessions 目录", e))?;
         Ok(())

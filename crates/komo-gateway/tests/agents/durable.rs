@@ -864,3 +864,51 @@ async fn a_follow_up_absorbed_into_a_busy_task_reports_back_once() {
 
     gateway.stop().await;
 }
+
+/// 任务停在一次还没返回的调用里（`gate`）时，home 照样几秒内答完下一句——任务在自己的会话里跑，不占
+/// home 的串行位。
+///
+/// **换了场景**（对应 Legacy 的 `home_answers_while_a_task_waits_on_a_person`）：Legacy 让任务调 `unsure`
+/// 停在一条要人答的介入上（`waiting + intervention`），再证 home 不被它挡。新存储没有"等人"这个状态——
+/// 结果不明的调用直接作为结果交回模型，任务不会停下来等操作者；真正会让任务"停着不动"的只剩两种：
+/// 还在调用里（`gate`），或 faulted。faulted 任务的呈现（`NeedsAttention`、intervention 列表）是 W4a 的
+/// 事，而 home 与任务在不同 conversation、各有各的串行位这一条与任务为什么停着无关，所以用 `gate` 证
+/// 这条不变量；faulted 版的 home 不被挡由 W4a 的恢复测试带上。
+#[tokio::test]
+async fn home_answers_while_a_task_is_stuck_in_a_call() {
+    let llm = TasksLlm::new();
+    let sender = MemSender::new(ChannelPlatform::Telegram);
+    let gate = Gate::new();
+    let mut gateway = start_chat(&llm, &sender, Some(&gate)).await;
+
+    let (_, home_run) = dm(&gateway, "派等门任务", "dm-1").await;
+    gateway.wait_run(&home_run).await;
+    gate.wait_entered(1).await;
+    let task = the_task(&gateway).await;
+    let host = inputs_of(&gateway, task.conversation).await.remove(0);
+    assert_eq!(
+        run_state(&gateway, &komo_kernel::durable::legacy_ids::run_id(host.id)).await,
+        RunState::Running,
+        "任务停在 gate 里"
+    );
+
+    let (_, second) = dm(&gateway, "1+1 等于几", "dm-2").await;
+    gateway.wait_run(&second).await;
+    assert_eq!(
+        run_state(&gateway, &second).await,
+        RunState::Completed,
+        "home 答完了"
+    );
+    eventually("渠道收到了答案", || {
+        texts_to(&sender, "111").iter().any(|text| text == "2")
+    })
+    .await;
+    assert_eq!(
+        run_state(&gateway, &komo_kernel::durable::legacy_ids::run_id(host.id)).await,
+        RunState::Running,
+        "home 答完的时候任务还停在调用里"
+    );
+
+    gate.release();
+    gateway.stop().await;
+}

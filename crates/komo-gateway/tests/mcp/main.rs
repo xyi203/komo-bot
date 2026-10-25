@@ -906,3 +906,5 @@ command = "python3"
     assert!(gw.state().snapshot().mcp.contains_key("demo"));
     gw.stop().await;
 }
+
+mod durable;

@@ -31,6 +31,7 @@ pub fn wire(slot: &StateSlot, state: &Arc<GatewayState>, detach: &DetachSlot) {
     let Some(core) = state.durable.as_ref() else {
         return;
     };
+    core.attach_state(slot);
     if let Some(detacher) = core.harness.deps().orchestration.detacher() {
         detach.set(detacher);
     }

@@ -374,6 +374,50 @@ async fn a_failed_extraction_stays_pending_for_the_next_round() {
     );
 }
 
+/// 记忆模式按**提取那一刻**的配置（W4b 的决定，不冻进 `komo.agent`）：Run 受理时 Agent 是共享记忆，
+/// 提取之前操作者把它改成 `off` 并重载——这条 Run 不再提取（不调记忆模型），记成已处理。
+///
+/// 与 Legacy 不同：Legacy 把记忆模式冻在 `run.accepted` 里，改配置之后受理前的 Run 仍按旧模式提取。
+/// 提取要等会话空闲 `extract_idle` 之后才跑，这段空窗里"关掉记忆"应当立刻生效，而不是让已经说过的话
+/// 在关掉之后又被写进库。
+#[tokio::test]
+async fn extraction_follows_the_memory_mode_at_extraction_time() {
+    let llm = ScriptedLlm::new(vec![
+        vec![text_round(1, "记住了。")],
+        vec![text_round(1, r#"{"observations":[]}"#)],
+    ]);
+    let config = memory_config("keyword", false);
+    let gateway = super::gateway(&config).scripted(llm.clone()).start().await;
+    let (_session, run) = a_run(&gateway, "rk-mode", "客厅空调我一直设 26 度").await;
+    wait_for_terminal(&gateway, &run).await;
+
+    // 提取之前：Agent 关了记忆。
+    gateway.write_config(&config.replace(
+        "[agents.assistant]\n",
+        "[agents.assistant]\nmemory = \"off\"\n",
+    ));
+    gateway.reload().await;
+    past_extract_idle().await;
+    let report = gateway
+        .state()
+        .memories
+        .process_pending(komo_runtime::memory::WORK_BATCH)
+        .await
+        .expect("这一轮提取跑得动");
+    assert_eq!(report.skipped, 1, "{report:?}");
+    assert_eq!(report.applied, 0, "{report:?}");
+    assert_eq!(
+        llm.requests.lock().expect("请求表").len(),
+        1,
+        "只有对话那一问，没有提取调用"
+    );
+    assert_eq!(
+        progress(&gateway, &run).await.work,
+        MemoryWork::Done,
+        "跳过的 Run 也记成已处理"
+    );
+}
+
 // ---------------------------------------------------------------- 小工具
 
 async fn read_events(

@@ -75,7 +75,11 @@ impl Tool for WithdrawnTool {
 }
 
 /// 按当前目录与配置算这个 conversation 的能力面。
-fn surface_for(state: &GatewayState, resolved: &Resolved, catalog: &[String]) -> AgentSurface {
+pub(crate) fn surface_for(
+    state: &GatewayState,
+    resolved: &Resolved,
+    catalog: &[String],
+) -> AgentSurface {
     let surface = komo_agent::surface_of(
         &resolved.profile,
         catalog,

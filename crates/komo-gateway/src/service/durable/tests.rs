@@ -68,14 +68,17 @@ async fn durable_mode_never_opens_state_db() {
     );
 }
 
-/// 路由按存储模式挑：共用的（models）在，Legacy 独有的（sessions）在 Durable 下还是空桩。
+/// 路由按存储模式挑：共用的（models）在，会话路由是 v2 的（W2a 起有了），还没填的 Legacy 独有
+/// 路由（interventions，W4a）在 Durable 下还是空桩。
 #[tokio::test]
 async fn durable_mode_serves_shared_routes_and_leaves_session_routes_to_v2() {
     let gateway = TestGateway::durable(&config_toml(""), FakeLlm::finisher("好")).await;
     let (status, body) = gateway.get("/v1/models").await;
     assert_eq!(status, 200, "{body}");
-    let (status, _) = gateway.get("/v1/sessions").await;
-    assert_eq!(status, 404, "v2 的 sessions 路由还是空桩（W2a 填）");
+    let (status, body) = gateway.get("/v1/sessions").await;
+    assert_eq!(status, 200, "{body}");
+    let (status, _) = gateway.get("/v1/interventions").await;
+    assert_eq!(status, 404, "v2 的 interventions 路由还是空桩（W4a 填）");
 }
 
 #[test]

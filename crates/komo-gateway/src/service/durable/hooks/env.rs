@@ -40,7 +40,7 @@ impl ImageResolver for SessionImages {
     }
 }
 
-pub(super) fn build(
+pub(crate) fn build(
     state: &GatewayState,
     config: &ConfigSnapshot,
     resolved: &Resolved,

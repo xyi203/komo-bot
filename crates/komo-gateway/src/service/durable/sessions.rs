@@ -15,7 +15,7 @@ use komo_kernel::durable::{
 };
 use komo_kernel::protocol::http::SessionSummary;
 use komo_kernel::types::ids::{RunId, SessionId};
-use komo_kernel::types::status::{RetryCause, RunState, SessionState, WaitReason};
+use komo_kernel::types::status::{RunState, SessionState};
 use komo_runtime::durable::harness::{InboxItem, SubmitError};
 use komo_runtime::durable::{ConversationOwnership, DurableError, Tx};
 use time::OffsetDateTime;
@@ -360,20 +360,8 @@ impl DurableCore {
         let (current_run, current_state, current_wait) = match &live.run {
             Some(run) => {
                 let first = run.inputs.first().copied();
-                let retry = live
-                    .generation
-                    .as_ref()
-                    .and_then(|generation| generation.retry.as_ref().map(|r| (generation, r)));
-                match retry {
-                    Some((generation, retry)) => (
-                        first,
-                        Some(RunState::Waiting),
-                        Some(WaitReason::Retry {
-                            attempts: generation.attempt,
-                            not_before: time_of(retry.at),
-                            cause: RetryCause::Transport,
-                        }),
-                    ),
+                match live.generation.as_ref().and_then(super::runs::retry_wait) {
+                    Some(wait) => (first, Some(RunState::Waiting), Some(wait)),
                     None => (first, Some(RunState::Running), None),
                 }
             }

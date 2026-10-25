@@ -19,6 +19,8 @@
 //! | `submit` | 提交输入：路由到当前分支、惰性 fork、model / effort 覆盖、`/new`、`/cancel` | W1c |
 //! | `tree` | 读树（`read_tree`）、导航、label / name、context-edit、分支摘要、compact、忙时守卫 | W1c |
 //! | `copy` | `/fork`、`/clone`：复制 entry 与 blob | W1c |
+//! | `runs` | `RunSummary` / `RunDetail` / `RunState` 映射、按 RunId 取消 | W2a |
+//! | `shell` | `!` 命令直跑（不建 run），落 `shell.command` write | W2a |
 
 pub mod agent_doc;
 pub mod assemble;
@@ -27,7 +29,9 @@ pub mod copy;
 pub mod core;
 pub mod hooks;
 pub mod orchestration;
+pub mod runs;
 pub mod sessions;
+pub mod shell;
 pub mod submit;
 pub mod tree;
 
@@ -35,6 +39,8 @@ pub use self::core::DurableCore;
 pub use assemble::StateSlot;
 pub use sessions::SessionError;
 
+#[cfg(test)]
+mod run_tests;
 #[cfg(test)]
 mod session_tests;
 #[cfg(test)]

@@ -13,10 +13,11 @@
 //! 失败（调度此刻也还是暂停的，不会被问到）。
 
 mod compaction;
-mod env;
+/// `!` 命令直跑（`shell.rs`）也要同一份执行环境与能力面。
+pub(crate) mod env;
 mod sections;
 mod setup;
-mod tools;
+pub(crate) mod tools;
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};

@@ -6,6 +6,8 @@
 //! 的样子：创建时落库、界面读那一行、执行也用那一行；换一个 `Db` 句柄（不是同一份内存
 //! 缓存）之后仍然是它。
 //!
+//! 跑在 Durable 存储上：落点是 `sessions` 行（`cwd`，`komo.agent.workdir` 是同一份，钩子每轮现读）。
+//!
 //! 共用件在 `komo_gateway::service::test_support::harness`（真数据目录、真 `service::start`、
 //! 脚本化模型）。
 
@@ -14,7 +16,7 @@ use std::sync::Arc;
 use komo_gateway::service::test_support::harness::{
     FakeLlm, Home, call_round, config_toml, text_round,
 };
-use komo_kernel::traits::LlmClient;
+use komo_kernel::durable::Storage;
 use komo_kernel::types::status::RunState;
 use komo_kernel::types::turn::RoundInput;
 
@@ -60,7 +62,7 @@ async fn a_session_workdir_is_one_fact_for_the_interface_and_the_execution() {
         ),
         text_round(2, "读完了。"),
     ]]);
-    let gateway = home.start(Arc::clone(&llm) as Arc<dyn LlmClient>).await;
+    let gateway = home.start_durable(Arc::clone(&llm)).await;
 
     // 创建会话时带上 workdir：摘要立刻就该报它。
     let (code, body) = gateway
@@ -105,15 +107,16 @@ async fn a_session_workdir_is_one_fact_for_the_interface_and_the_execution() {
 
     gateway.stop().await;
 
-    // 换一个 `Db` 句柄（相当于新进程）：仍然是它，不是某一份内存缓存。
-    let db = home.open_db().await;
-    let record = komo_store::repos::session::get(&db, &session)
+    // 换一个存储句柄（相当于新进程）：仍然是它，不是某一份内存缓存。
+    let storage = home.open_durable().await;
+    let record = storage
+        .session(session.as_str())
         .await
         .expect("读得出")
         .expect("有这个会话");
     assert_eq!(
-        record.workdir.as_deref(),
+        record.cwd.as_deref(),
         Some(workdir_str.as_str()),
-        "workdir 必须落在 sessions.workdir 那一行上"
+        "workdir 必须落在 sessions 行上"
     );
 }

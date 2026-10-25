@@ -5,6 +5,7 @@
 > 2026-10-16 定并落地：`dispatch` + `follow` 合成 `task`，同步 `delegate` 删掉、子代理并进来，
 > 加 `model` / `effort` / `contract`，交回的结果在宿主还在跑时并入（§2a；`docs/komo_bot.md` §2、§4、§6）。
 > 2026-10-23 定并落地：`context: "fork"`，任务带着父会话的上下文起步、复用父的提示缓存（§2b）。
+> 新存储上的执行路径（子 conversation、同一次提交交回、fork 直接读父链）见 `docs/storage-durable.md` §4.6 与 §13；本文的语义（派出、接着做、`model` / `effort`、契约、不连带取消）不变，§3 的"终态之后、交回之前崩溃"窗口在新路径里不存在。
 
 ## 1. 问题
 

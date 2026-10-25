@@ -852,6 +852,102 @@ async fn a_status_query_reads_the_child_without_disturbing_it() {
     engine.close().await.unwrap();
 }
 
+/// 输出存储的替身：第一次发布完之后让存储开始失败——"结果落盘了，结果 entry 没提交就崩了"。
+struct CrashAfterPublish {
+    inner: komo_kernel::test_support::MemOutputStore,
+    crash: std::sync::Mutex<Option<Arc<RecordingStorage>>>,
+}
+
+#[async_trait::async_trait]
+impl komo_kernel::traits::ToolOutputStore for CrashAfterPublish {
+    async fn begin(
+        &self,
+        attempt: &komo_kernel::types::refs::AttemptRef,
+    ) -> Result<Box<dyn komo_kernel::traits::OutputWriter>, komo_kernel::traits::StoreError> {
+        self.inner.begin(attempt).await
+    }
+
+    async fn publish(
+        &self,
+        writer: Box<dyn komo_kernel::traits::OutputWriter>,
+        result: komo_kernel::types::refs::ToolResultBody,
+    ) -> Result<komo_kernel::types::refs::PublishedOutput, komo_kernel::traits::StoreError> {
+        let published = self.inner.publish(writer, result).await;
+        if let Some(storage) = self.crash.lock().unwrap().take() {
+            storage
+                .fail_commits
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        published
+    }
+
+    async fn open(
+        &self,
+        output: &komo_kernel::types::refs::OutputRef,
+    ) -> Result<komo_kernel::types::refs::VerifiedOutput, komo_kernel::traits::StoreError> {
+        self.inner.open(output).await
+    }
+
+    async fn interrupted(
+        &self,
+        attempt: &komo_kernel::types::refs::AttemptRef,
+        tail_bytes: usize,
+    ) -> Result<komo_kernel::types::refs::InterruptedOutput, komo_kernel::traits::StoreError> {
+        self.inner.interrupted(attempt, tail_bytes).await
+    }
+
+    async fn find_published(
+        &self,
+        attempt: &komo_kernel::types::refs::AttemptRef,
+    ) -> Result<Option<komo_kernel::types::refs::PublishedOutput>, komo_kernel::traits::StoreError>
+    {
+        self.inner.find_published(attempt).await
+    }
+}
+
+/// 派出提交之后、结果 entry 之前崩溃：恢复从 `orchestrate` 接着落结果，**不会再派一遍**。
+#[tokio::test(start_paused = true)]
+async fn a_crash_between_the_spawn_and_its_result_does_not_spawn_twice() {
+    let mem = komo_kernel::test_support::MemOutputStore::new();
+    let outputs = Arc::new(CrashAfterPublish {
+        inner: mem,
+        crash: std::sync::Mutex::new(None),
+    });
+    let world = World::with_outputs(outputs.clone());
+    let (_fixture, ..) = install(&world);
+    world
+        .script
+        .calls(&[("c1", "task", spawn_call("CHILD once", "一次"))]);
+    world.script.reply("dispatched");
+    world.script.reply("noted");
+    world.script.reply_for("CHILD once", "done");
+    *outputs.crash.lock().unwrap() = Some(world.storage.clone());
+    let engine = world.open().await;
+    let id = world.submit(&engine, "go").await;
+    world.until(|| async { engine.failure().is_some() }).await;
+    assert_eq!(world.children().await.len(), 1, "the spawn was committed");
+
+    let engine = world.restart(engine).await;
+    world.harness.wait(&engine, id).await.unwrap();
+    let child = world.child().await;
+    assert_eq!(world.children().await, vec![child], "still one child");
+    assert_eq!(world.tasks(ANCHOR_KIND).await.len(), 1);
+    assert_eq!(
+        result_text(&world.messages().await, "c1"),
+        format!("已派出 #{child}：一次")
+    );
+    world
+        .until(|| async {
+            outline(&world.messages().await).contains(&"assistant: noted".to_owned())
+        })
+        .await;
+    assert_eq!(
+        submissions_with(&world, CONV, "task-result:").await.len(),
+        1
+    );
+    engine.close().await.unwrap();
+}
+
 // ------------------------------------------------------------ monitor
 
 fn monitor_call(title: &str, resumable: bool, minutes: u64) -> serde_json::Value {

@@ -1,6 +1,6 @@
 # 存储重设计：整套采用 pi-durable 的提交模型
 
-> 状态：**实现中（2026-10-25）**。D0–D3、D4a、D4b 已完成并合入 `main`；D4c 的工具任务 `probe` 阶段与 `komo.live.tools[].pid`、生成 / 工具任务在 Turso 上的接线测试、**压缩**（`komo.compaction` 阻塞与后台、衰减写成 `edits`、上下文超长时压缩重试）已合入集成分支 `d4c`，codemode 嵌套调用与 `task` / `monitor` 还在做；进度与实现中的偏离见 §13。新旧代码并存，新存储还没接到 gateway。全部完成后改写 `docs/komo_bot.md` §8，本文留作推导记录。
+> 状态：**实现中（2026-10-25）**。D0–D3、D4a、D4b 已完成并合入 `main`；D4c 的工具任务 `probe` 阶段与 `komo.live.tools[].pid`、生成 / 工具任务在 Turso 上的接线测试、**压缩**（`komo.compaction` 阻塞与后台、衰减写成 `edits`、上下文超长时压缩重试）已合入集成分支 `d4c`，编排工具 `task` / `monitor` 的新 harness 执行路径（owned、background 的子 conversation，交回结果，监听登记与对账）在分支 `d4c-orchestration`（尚未并入 `d4c`）；codemode 嵌套调用还在做；进度与实现中的偏离见 §13。新旧代码并存，新存储还没接到 gateway。全部完成后改写 `docs/komo_bot.md` §8，本文留作推导记录。
 >
 > 对照基线：本机 `../pi` 提交 `8efd314fa` 的 `packages/durable`（`docs/spec.md` 为规范，`README.md`）。
 > pi-durable 自称 **Experimental**，API 随版本变；pi coding-agent 在这个提交上**并不依赖它**（仍是
@@ -260,6 +260,7 @@ komo 的：
 - 交回结果 = 子 run 收尾的提交里，往父 conversation submit 一条带 `request_id = task-result:{run}` 的输入。
   原子、幂等，不需要今天的单独派送路径。
 - fork 不换 provider session 身份（偏离 pi-durable，见 §2 末行）。
+- **实现**（2026-10-25，`harness/orchestration/`）：子 conversation 由一个 background 的**锚任务**持有（pi spec §7.3 的 persistent background subagent 那一式——工具任务是生成任务的子任务，不能自己是 background）；锚任务立刻 completed，子 conversation 有活时引擎让它停在 `completing`。交回在 `orchestration::report`，监听在 `orchestration::monitor`，边界与偏离见 §13.2。
 
 ### 4.7 codemode
 
@@ -365,7 +366,7 @@ pi-durable 没有删除。komo 保留 `closing → deleted → purged`：
 | D3 任务调度（**已完成 2026-10-23**） | 任务状态机、step 规则、reservation / reconciliation、waiting / completing / abort 自底向上 | 移植 pi-durable 的 child-tasks / abort / restart 示例 |
 | D4a 无状态模型调用（**已完成 2026-10-23**） | 三家 provider 的 `ModelStream::stream`：每次给完整 context，返回一条 assistant 消息；路由 `RoutingStream` | 请求体与旧的有状态 driver 逐字节相同 |
 | D4b 生成与工具（**已完成 2026-10-23**） | `komo.generation` / `komo.tool`，收件箱与 boundary，`komo.live` 节流 | §5 恢复表逐行有测试；§8.6 中断正文逐字一致 |
-| D4c 压缩与其余工具（压缩部分**已完成 2026-10-24**，见 §13.1） | `komo.compaction`（阻塞与后台）、衰减写成 `edits`、上下文超长时压缩重试、codemode 嵌套调用、编排工具（`task` / `monitor`）、子进程 probe 阶段 | 现有 `tests/recovery`、`tests/agents` 的对应场景改写后通过 |
+| D4c 压缩与其余工具（压缩部分**已完成 2026-10-24**，编排工具 `task` / `monitor` 的 runtime 侧**已完成 2026-10-25**，见 §13.1） | `komo.compaction`（阻塞与后台）、衰减写成 `edits`、上下文超长时压缩重试、codemode 嵌套调用、编排工具（`task` / `monitor`）、子进程 probe 阶段 | 现有 `tests/recovery`、`tests/agents` 的对应场景改写后通过 |
 | D5 gateway 与树 | 会话树映射到 fork、HTTP / SSE 改读新存储、`task` / cron / 投递 | §8.11 的端到端测试（`session_tree/tests.rs`）原样通过 |
 | D6 导出 | `komo session export SESSION_ID`：输出 pi v3 树形 JSONL（带 blob 引用）；不导入旧会话（§8） | 导出的文件能被 pi 的 session-manager 读入，分支与当前位置一致 |
 | D7 收尾 | 删旧 ledger 代码，改写 `docs/komo_bot.md` §8、AGENTS.md 结构规则、§14 验收表 | — |
@@ -535,6 +536,8 @@ finalize     → blob 收尾同步 → 提交结果 entry（projection.rs 的 fu
 | `komo init` | `komo-runtime/src/config/init.rs`；bin 的 `Command::Init` 只分发 | init 7 项、bin 1 项加一条 clap 解析断言 |
 | D4c 压缩（`d4c-compaction`） | 纯逻辑 `crates/komo-kernel/src/durable/compaction.rs`（切点、摘要输入序列化、衰减候选与 `edits`、从 entry 折在线状态）；`crates/komo-runtime/src/durable/harness/compaction/`（`setup` 钩子值 · `plan` 缓存账决策 · `task` `komo.compaction` 任务）；`generation.rs` 的 `prepare` / 超长分支；`live.rs` 的 `compactions` 与 `compactionFailure`；`Harness::compact`；`AgentHooks::compaction` | kernel 11 项、runtime 25 项（`plan` 8 项单测 + `tests/compaction.rs` 17 项集成，含 Turso `Storage` 上的超长救援与重开回放） |
 
+| D4c 编排（`d4c-orchestration`，基于 `d4c` 的 66960939） | `crates/komo-runtime/src/durable/harness/orchestration/`（`mod` 钩子 `OrchestrationHooks` · `komo.task` document · 锚任务 `komo.background` · 工具任务里的分派与 `orchestrate` 阶段 · `task` 派出 / 接着做 / 查进度 · `report` 子 run 收尾时交回 · `monitor` 登记、起停、对账）；`tool.rs` 加 `Checkpoint::Orchestrate` 与 `call` 里一个分支；`live::end_run` 返回结束的 run，`generation.rs` 的收尾出口改走 `report::end_run`；`inbox::place_idle_input`（`admit` 的最后一支拆出来）；`submit.rs` 的 `Harness::{finish_monitor, reconcile_monitors}`、`HarnessHooks` 带 `GenerationTask`；`tx.rs` 的 `read_guard_for`、`staged_entry`；`HarnessDeps::orchestration` | `harness/tests/orchestration.rs` 26 项（含 3 项 Turso：派出 / 交回 / 重开不重复交回，fork 与接着做，监听登记与对账；另有派出提交之后崩溃不重派）、`durable/tests/lifecycle.rs` 1 项（别的 conversation 在写之后的读） |
+
 合入时（`durable-integration` 分支）强制重编后 `cargo test --workspace`：**2558 通过，0 失败**。D4c 的 probe 与接线（`d4c-probe-gaps`，基于 `main` 的 52ae527c）：**2587 通过，0 失败，11 忽略**。D4c 压缩（`d4c-compaction`，同一基线）：**2594 通过，0 失败，11 忽略**。两者合入集成分支 `d4c` 后：**2623 通过，0 失败，11 忽略**。
 
 ### 13.2 实现与本文的偏离（都已接受）
@@ -567,11 +570,30 @@ finalize     → blob 收尾同步 → 提交结果 entry（projection.rs 的 fu
 - **衰减 entry 的 kind 是 `komo.decay`**（D4c）：只带 `edits`（`replace`，目标 = 结果 entry，替换消息 = 原结果 + 正文换成 `data.decayed`，图片块留着）和 `data { decayed: [entry id], debt, decision }`。与 `komo.system` 同一次提交追加，所以 `cutoff` 之后的请求就带短视图；这一轮的 `revised_from`（第一条被换的结果在请求里的下标）写进 `request` 的 checkpoint，重启后重发带同一个值。`full_sends` 的"完整给过几次" = 它之后的 assistant 消息数。
 - **摘要的用量没计**（D4c）：`komo.usage` 还没做（D4b 起就没有），摘要请求的 token 不进累计用量。
 - **没有 `beforeCompact` 钩子**（D4c）：pi 的 `hooks.beforeCompact`（调用方给摘要或拒绝）没移植；手动压缩用 `Harness::compact`（conversation 所有、不是 background、`instructions` 可选）。
+- **子 conversation 由 background 的锚任务持有**（D4c 编排）：设计 §4.6 写的是"工具任务建 owned、background 的子 conversation"，但工具任务是生成任务的子任务，spec §5.5 不许子任务是 background，所以照 spec §7.3 的 persistent background subagent 做：同一次提交建锚任务（conversation 所有、background，`komo.background`，立刻 completed）、子 conversation（所有者是锚任务；fork 时从父 fork）、`komo.task` document、第一条输入与 run。父的 idle、`abort_conversation`（非 background）、所有者级联都停在锚任务前面（所以父被取消不连带子，同旧规则）；子有活时锚任务 `completing`。
+- **派出 / 接着做 / 监听是"效果三明治"但没有意图 → 执行**（D4c 编排）：`call` 阶段在 `Tool::prepare` 之后转进 `orchestration`，效果（建会话、放输入、登记监听）在**一次提交**里完成并同时把 checkpoint 推进到新阶段 `orchestrate { step }`，之后另一次提交落结果 entry。两次之间崩溃，恢复从 `orchestrate` 接着落结果，**不会再产生一遍效果**，也不经过 §5 的重放判断（`TaskTool` / `MonitorTool` 的 `Tool::replay` 只用来让它们排成顺序组）。`Tool::execute` 对它们恒为错误，同旧实现。`monitor` 多一步：登记（`starting`）提交后才调 `start_monitor`，崩溃发生在中间时 `orchestrate { monitorStart }` 先让 gateway 认回（`LaunchMode::Recover`），认不到再看 `resume_after_restart` 与剩余时限决定重挂（`Resume`）或判中断。钩子调用都可取消（abort 标记、引擎关闭），重启后从 checkpoint 接着做。
+- **句柄是子 conversation 的数字 ID**（D4c 编排）：回执 `已派出 #12：标题`，`task_id` 解析成 conversation 后核对它的 `komo.task.parent` 就是调用方，不需要登记表；监听的句柄是挂它的工具任务的 ID。旧的四位 UUID 短号属于 gateway 的任务会话（D5 若要沿用自己映射）。
+- **fork 切在父此刻最新的 entry 上**（D4c 编排）：设计 §4.6 与任务书写的是"`fork(at = 当前调用的 assistant entry)`"，但同一轮里排在前面、已收尾的调用结果（顺序组，先于这次调用落账）会落在切口之外，在子里变成"结果缺失"，所以改切在 `rt.entries` 读到的最新一条 entry 上（派出时只有这一个工具任务在写父）。发起调用的那条消息里还没有结果的调用在**子里**补一条 `komo.tool-result`（本调用是"派出的就是你（fork）"，同一轮排在后面的是"你看不到它的结果"，文字沿用旧实现），不进父；任务前面是 `FORK_NOTICE`。
+- **交回结果在 `live::end_run` 的出口里，同一次提交**（D4c 编排）：run 的每个出口（回答、模型失败、预算、abort、调度器写的 faulted / orphaned——`HarnessHooks` 现在带着 `GenerationTask`）都经 `report::end_run`，子 conversation 有 `komo.task` 时往父 `admit` 一条 steer 输入，请求键 `task-result:{子 conversation}:{这条 run 的首个输入}`，entry kind `task.result`（`komo.` 前缀留给 harness 自己的 entry，外部 submit 的输入要过 `SubmissionDraft::check`，所以监听事件与结束消息同样用 `monitor.event` / `monitor.end`）。正文与旧实现逐字相同（"[后台任务 #句柄「标题」已完成 / 没有完成] …"），带结果契约的 run 由 runtime 用 `executor::check_contract` 复验、结论写进正文（契约存在 `komo.task.contracts`，key 是输入的 submission ID）。要在写过子 conversation 之后读父的请求键与 head 标记，`Tx` 的表读门改成按 conversation 判：这次提交没碰过它、也没碰过它沿 fork 能看到的祖先时已提交的读是精确的，放行（`read_guard_for`，用于 `conversation` / `submission_by_request` / `latest_head_marker`；碰过的仍然 `ReadAfterWrite`）——共享基础设施的一处语义放宽，有测试。
+- **`model` / `effort` 存成名字**（D4c 编排）：写进子 conversation 的 `komo.task`，不冻结成 `ModelConfig`（§6.3"names resolved at each use"）；已开始的请求阶段仍用 checkpoint 里冻结的。接着做时给了 `model` 就连同 `effort` 一起换，只给 `effort` 就沿用模型、换档位，都没给沿用；追问换模型在子下一次生成的 `prepare` 生效。`prepare` 里按配置快照的校验（alias、档位）原样沿用旧 `TaskTool`，只给 `effort` 的在派出那步问 `OrchestrationHooks::check_effort`。
+- **监听登记是 Session 级的一份 document**（D4c 编排，`komo.monitors`）：`{ items: [MonitorRecord] }`，gateway 启动时一次读完就是全部在册监听（按 conversation 建 document 的话，没法不扫全库就列出所有在跑的）。`starting` → `running` → `ended{reason, detail}`；对账只碰 `running`，`starting` 归挂它的工具任务接着判。"只有第一个结束它的人赢"：`finish_monitor` 与 `monitor_stop` 都先看登记，已结束的不再交回——比旧实现的"刚结束"内存表（64 个、重启就忘）强，这个信息现在跨重启。**边界**：进程、泵、合批、时限计时、渠道投递全是 gateway 的（`OrchestrationHooks::{start,stop}_monitor` 背后）；runtime 负责登记、工具任务的三明治与恢复、结束 / 中断消息的原子幂等交回、重启对账。详见 `orchestration/monitor.rs` 的模块文档。
 - **`TaskRuntime::find_document`**（D4c，`durable/runtime.rs`）：阶段里读已提交 document 的只读方法（`prepare` 要在建任务之前读 `komo.live.compactions` 与 `compactionFailure`）。
 
 ### 13.3 已知缺口（按阶段）
 
-- **D4c**（压缩、probe 已做完，剩下的）：codemode、`task`、`monitor` 还没有执行路径。
+- **D4c**（压缩、probe、编排已做完，剩下的）：codemode 嵌套调用还没有执行路径（另一个分支在做）。
+- **编排 · D5**（gateway 要做的，runtime 侧的契约都在 `orchestration/`）：
+  - 实现 `OrchestrationHooks`：`check_effort`（只给 `effort` 时按 Agent 默认模型 / 任务上一次的模型校验）、`contract_block`（直接调 komo-agent 的 `task_contract_block`，免得两处文字漂移；runtime 里的默认值是一份拷贝）、`start_monitor` / `stop_monitor`（起脚本、泵、合批、时限、进程组、崩溃遗留进程的核对——全在 gateway；事件经 `Harness::submit(monitor::event_draft(..))`，结束时调 `Harness::finish_monitor`，启动时调一次 `Harness::reconcile_monitors`）。
+  - `AgentHooks::setup` 读子 conversation 的 `komo.task`（`orchestration::task_doc`）：`model` / `effort` 是 alias 名字，按当前配置解析；`fork` 的任务沿用父的模型与 effort、提示缓存的路由键用 `parent`；能力面——fresh 任务没有 `task`，任务会话里没有 `monitor`（runtime 在执行时也各拦一道，但 schema 要与执行同源）。
+  - 任务会话在 `sessions` 里的行（`kind = task`、标题、`komo session list` 里的短号）：runtime 只有子 conversation，句柄是它的数字 ID；gateway 要给任务会话 UUIDv7 与四位短号的话，需要自己的映射。
+  - 把交回的输入（`task.result` entry，`data.task` 带子 conversation / 标题 / 结局）、监听事件与结束消息（`monitor.event` / `monitor.end`）渲染成"任务交回"、不能引为 `user_statement`（`docs/memory.md` §9.10）；旧实现里"投给挂它那条 Run 的来源对端"在新存储里还没有对应物（来源对端要记在哪条 entry 的 `data` 上，D5 定）。
+  - 删掉 `GatewayTaskSpawner` / `GatewayMonitors` 里属于状态的那部分（`runtime/monitors/<id>.json`）；进程身份（pid、起来的时刻）仍是 gateway 自己的。
+- **编排 · 已知缺口**：
+  - 父的 `Conversation.abort()` 会撤回收件箱里排队的 steer / followUp，**包括还没放置的 `task.result`**——任务结果因此丢失（旧实现里取消 home 的 Run 不动排队的内部输入）。需要时给交回的输入一个"撤回时保留"的标记，或改成 write 式的被动写入。
+  - 模型没有取消子任务的工具（旧实现也没有）；显式取消是 `Harness::abort_conversation(engine, 子 conversation)`，gateway 路由要接。
+  - 查进度是近似的：`accepted_at` 取当前 run 第一条用户消息的时间戳，`running` 的调用没有参数摘要与起始时刻（槽位里没有），已收尾的 run 的终态来自 `komo.task.lastRun`。
+  - 登记里的已结束监听只留最近 64 条，没有按时间清理；`komo.task` 随子 conversation 一直在。
+  - fork 的切口之后父追加的 entry 子看不到（按设计）；fork 不复制 document（D1 偏离），所以子不继承父的 `compactionFailure`。
 - **D4c 的 probe**：没有杀进程的注入口（取消只在结果里说明子进程还在）；`bash` 转后台（`detach_after`）交给 gateway 的监听接手后，那条路径不写槽位也不进 probe；只有走 `run_child_detachable` 的工具会报告子进程（codemode worker、MCP 子进程不报）。
 - **压缩 · D5**：gateway 实现 `AgentHooks::compaction`（`[compaction]` 配置 → `CompactionSettings`，另加 `background_tokens` 的配置键；komo-agent 的摘要提示与摘要模型；默认实现只是"压缩关着 + pi 的提示"）；`/compact` 路由接 `Harness::compact`；`komo.live.compactions` / `compactionFailure` 还没有客户端展示；fork 不复制 document，所以 `compactionFailure`（"刚压失败过"）不随 fork 继承，其余在线状态是从 entry 折的、自然继承。
 - **压缩 · 真机**：Anthropic 的 `revised_from` 缓存断点只测到"请求里带了值"，没有对真 provider 验证过命中；摘要请求没有 `cacheRetention: none` 的对应选项（无状态调用没有这个旋钮），摘要请求会写进提示缓存。

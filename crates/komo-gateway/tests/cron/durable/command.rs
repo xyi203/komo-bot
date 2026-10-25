@@ -153,8 +153,14 @@ async fn a_failed_firing_emits_its_span_and_counts_a_failure() {
     assert_eq!(failures.len(), 1);
     assert_eq!(failures[0].fields["komo.cron.job"], job.id.to_string());
     for event in capture.all_metrics() {
-        let dump = format!("{:?}", event.fields);
-        assert!(!dump.contains(run.as_str()), "指标里不该有 Run id：{dump}");
+        // Durable 的 RunId 是十进制 submission ID，很短，按子串找会误撞 Job UUID 里的数字；
+        // 改成按字段：值里不能有这个 Run，键里不能有 run / session。
+        for (key, value) in &event.fields {
+            assert!(
+                !key.contains("run") && !key.contains("session") && value != run.as_str(),
+                "指标里不该有 Run / 会话 id：{key}={value}"
+            );
+        }
     }
     gw.stop().await;
 }

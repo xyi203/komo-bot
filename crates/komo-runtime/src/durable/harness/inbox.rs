@@ -22,15 +22,28 @@
 //! | 输入或别的 write，忙或收件箱非空 | `queued` | 往 `komo.inbox` 加一项 |
 //! | boundary 放置 write / 用户项 | `done` / `placed` | 追加 entry，用户项加进当前或后继 run |
 //! | run 回答 | 输入 `done` | 移除 `run`，或交给后继 |
-//! | run 失败 / 它的任务 abort | 输入 `unanswered`（原因） | 移除 `run`；收件箱里有**内部输入**时同一次提交放 write 与内部输入、起后继 run，否则不动 |
-//! | `Conversation.abort()` | 排队的用户输入 `unanswered{aborted}` | 从收件箱移除；write 与内部输入留着 |
+//! | run 失败 / 它的任务 abort（含 `Harness::abort_run`） | 输入 `unanswered`（原因） | 移除 `run`；**同一次提交**按 final boundary 放全部排队项（先 write，再内部与用户输入，按 ID 序），放了输入就起后继 run |
+//! | `Conversation.abort()`（`abort_conversation`） | 排队的用户输入 `unanswered{aborted}` | 先从收件箱移除用户输入；write 与内部输入留着，随后由 run 的收尾放置 |
 //! | 撤回排队项（显式，单条） | `unanswered{aborted}` | 移除这一项（内部输入也行） |
+//!
+//! 每结算一个**输入**（上表里所有 `done` / `unanswered`，含排队中被撤回的），[`settle`] 同一次提交
+//! 追加一条只展示的 `komo.settled`（见 [`entries`]），write 不追加。
+//!
+//! **非正常收尾不挡后面的消息**（D5 决定 8，恢复旧 komo 的行为）：run 因取消、模型失败、预算、
+//! fault、orphan 收尾时，收件箱里排着的东西——用户的 steer / followUp、内部输入、write——都在收尾的
+//! 同一次提交里按 final boundary 放置，有输入放置就起后继 run；不再等"下一条用户输入"才顺带放。
+//! 队列模式照旧（`OneAtATime` 时每种取第一项，余下的留给后继 run 自己的 boundary），所以每个后继
+//! run 至少消耗一个排队的输入，链条有限、不会死循环。放置在收尾那次提交里做（boundary 的表读在
+//! 这次提交的第一次表写之前），没有"run 结束了、后继没起"的崩溃窗口。
+//!
+//! 谁来撤回排队的输入是调用方的选择：[`Harness::abort_run`](super::Harness::abort_run)（`/cancel`、
+//! Esc）只停当前这一轮、**不撤**收件箱，排着的消息接着跑；`abort_conversation`（删除会话等）先撤用户
+//! 输入再 abort，内部输入仍然保留。单条排队项用 [`withdraw`]。
 //!
 //! **内部输入**（`internal: true`）是系统往 conversation 里递的 steer / followUp：后台任务交回的
 //! 结果（`task.result`）、监听的事件与结束消息（`monitor.event` / `monitor.end`）。它们不是用户
-//! 说的话，所以用户取消（`Conversation.abort()`）不撤它们——结果丢了就没人转告用户；run 非正常
-//! 收尾（取消、模型失败、预算、fault、orphan）后也不等下一条用户输入，立刻用它们起后继 run
-//! （[`Boundary`] 的 [`At::Successor`]）。这是对 pi 的有意偏离，见 `docs/storage-durable.md` §13.2。
+//! 说的话，所以 `abort_conversation` 不撤它们——结果丢了就没人转告用户。这是对 pi 的有意偏离，
+//! 见 `docs/storage-durable.md` §13.2。
 //!
 //! boundary 的选择是按 ID 序的确定规则：`postTools` 放全部 write 与 steer，`final` 再加
 //! followUp；每种模式按设置取第一项或全部。先放 write 再放用户项，所以排在 reset 前的用户项
@@ -389,12 +402,9 @@ pub struct QueueModes {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum At {
     PostTools,
+    /// run 收尾（回答，或取消、失败、预算、fault、orphan 的非正常收尾）：全部 write，steer 与
+    /// followUp 各按设置取第一项或全部。非正常收尾不挡后面的消息，同样用它放置后继 run 的输入。
     Final,
-    /// run 非正常收尾（取消、失败、预算、fault、orphan）后的放置：全部 write，加**内部输入**
-    /// （steer 与 followUp 都算，各按设置取第一项或全部）；用户输入不放——取消时已撤，失败后
-    /// 照 pi 留在收件箱等下一条输入。调用方先确认有内部输入（[`Boundary::has_internal`]），
-    /// 没有就不该调——那时 write 也照 pi 留着。
-    Successor,
 }
 
 /// boundary 在第一次表写之前读的东西，与它见到的最新 head。
@@ -411,13 +421,6 @@ pub struct Boundary {
 pub struct BoundaryResult {
     pub users: Vec<SubmissionId>,
     pub reset: bool,
-}
-
-impl Boundary {
-    /// 收件箱里有没有内部输入：run 非正常收尾时只有它才值得起后继 run。
-    pub fn has_internal(&self) -> bool {
-        self.inbox.items.iter().any(InboxItem::is_internal)
-    }
 }
 
 /// 表读必须先于本次提交的第一次表写，所以调用方在闭包开头准备 boundary。
@@ -459,9 +462,7 @@ pub async fn apply_boundary(
     let conversation = boundary.conversation;
     let items = std::mem::take(&mut boundary.inbox.items);
     let reset = queued_reset(&items);
-    let final_boundary = at != At::PostTools || reset;
-    // 后继放置只认内部输入。
-    let internal_only = at == At::Successor;
+    let final_boundary = at == At::Final || reset;
 
     let pick = |wanted: fn(&InboxItem) -> bool, mode: QueueMode| -> Vec<usize> {
         let indexes: Vec<usize> = items
@@ -482,20 +483,12 @@ pub async fn apply_boundary(
         .map(|(index, _)| index)
         .collect();
     let mut users = pick(
-        if internal_only {
-            |item| matches!(item, InboxItem::Steer { internal: true, .. })
-        } else {
-            |item| matches!(item, InboxItem::Steer { .. })
-        },
+        |item| matches!(item, InboxItem::Steer { .. }),
         boundary.modes.steering,
     );
     if final_boundary {
         users.extend(pick(
-            if internal_only {
-                |item| matches!(item, InboxItem::FollowUp { internal: true, .. })
-            } else {
-                |item| matches!(item, InboxItem::FollowUp { .. })
-            },
+            |item| matches!(item, InboxItem::FollowUp { .. }),
             boundary.modes.follow_up,
         ));
     }
@@ -591,6 +584,9 @@ pub async fn place(tx: &mut Tx, id: SubmissionId, entry: EntryId) -> Result<(), 
 
 /// 按事务里当前的记录 settle 一个输入 / write（候选优先，退到已提交，所以第一次表写之后也
 /// 能用）。已经 settle 过的不动：它的 run 收尾时发现输入已被别的东西 settle 了也照常收尾。
+///
+/// 每结算一个**输入**，同一次提交里往它的 conversation 追加一条 [`entries::SETTLED`]；顺序上排在
+/// 这次提交里先追加的 entry（run 的回答）之后、后继放置的输入 entry 之前。
 pub async fn settle(
     tx: &mut Tx,
     id: SubmissionId,
@@ -649,8 +645,17 @@ pub async fn settle(
         // 已经 done / unanswered，或不合法的组合（排队的输入不能 done）：不动。
         _ => return Ok(()),
     };
+    // 输入结算时同一次提交里留一条只展示的 `komo.settled`（gateway 的投影锚点）；write 不留。
+    let anchor = match &next {
+        SubmissionKind::Input { state } => entries::settled_draft(id, state),
+        SubmissionKind::Write { .. } => None,
+    };
+    let conversation = record.conversation;
     record.kind = next;
     tx.put_submission(record);
+    if let Some(anchor) = anchor {
+        tx.append_entry(conversation, anchor).await?;
+    }
     Ok(())
 }
 
@@ -944,8 +949,8 @@ pub async fn withdraw(
 
 /// `Conversation.abort()` 的一半：撤回排队的**用户** steer / followUp（`unanswered{aborted}`），
 /// 排队的 write 与内部输入留着——内部输入是后台任务的结果、监听消息，丢了没人转告用户；它们在
-/// run 的 abort handler 里随后继 run 放置（[`At::Successor`]）。显式 [`withdraw`] 单条撤回对内部
-/// 输入仍然有效。
+/// run 的 abort handler 里随收尾的 final boundary 放置、起后继 run。显式 [`withdraw`] 单条撤回
+/// 对内部输入仍然有效。
 pub async fn withdraw_queued_inputs(
     tx: &mut Tx,
     conversation: ConversationId,

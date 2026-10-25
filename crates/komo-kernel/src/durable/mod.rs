@@ -10,6 +10,7 @@ pub mod conformance;
 pub mod context;
 pub mod fork;
 pub mod ids;
+pub mod legacy_ids;
 #[cfg(any(test, feature = "test-support"))]
 pub mod memory;
 pub mod message;
@@ -30,9 +31,9 @@ pub use message::{
 };
 pub use records::{
     ContextEdit, ConversationRecord, DocumentAddress, DocumentRecord, DocumentScope, EditAction,
-    EntryRecord, InputState, SessionLifecycle, SessionRecord, SubmissionKind, SubmissionRecord,
-    SubmissionSettlement, SubmissionStatus, TaskOutcome, TaskRecord, TaskState, TaskStatus,
-    WriteState,
+    EntryRecord, InputState, SessionKind, SessionLifecycle, SessionRecord, SubmissionKind,
+    SubmissionRecord, SubmissionSettlement, SubmissionStatus, TaskOutcome, TaskRecord, TaskState,
+    TaskStatus, WriteState,
 };
 pub use storage::{
     Cursor, Page, ScanOrder, SessionCursor, SessionPage, SessionQuery, Storage, StorageError,

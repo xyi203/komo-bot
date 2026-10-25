@@ -1447,8 +1447,9 @@ impl Sched {
     /// 打标记，然后等每个被标记的任务终结；`background` 时遍历穿过后台边界。
     ///
     /// 等的是**被标记的那批任务**，不是"范围空闲"：被取消的 run 的 abort handler 会在同一次提交里
-    /// 用排队的内部输入起后继 run（`harness::inbox::At::Successor`——后台任务的结果、监听消息不能因为
-    /// 用户取消而丢），那条 run 是取消之后的新工作，不属于这次取消，取消的调用方不该等它跑完。
+    /// 用排队的输入起后继 run（`harness::inbox::At::Final`——后台任务的结果、监听消息不能因为
+    /// 用户取消而丢，`Harness::abort_run` 不撤的用户输入也一样），那条 run 是取消之后的新工作，
+    /// 不属于这次取消，取消的调用方不该等它跑完。
     pub async fn abort_conversation(
         self: &Arc<Self>,
         conversation: ConversationId,

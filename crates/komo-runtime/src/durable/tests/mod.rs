@@ -9,4 +9,5 @@ mod lifecycle;
 mod ownership;
 mod phases;
 mod recovery;
+mod seams;
 mod waiting;

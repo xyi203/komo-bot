@@ -119,19 +119,39 @@ impl Harness {
     ) -> Result<SubmissionId, SubmitError> {
         draft.check().map_err(SubmitError::Invalid)?;
         engine.resume();
-        let generation = self.generation.clone();
-        let modes = self.modes();
+        let this = self.clone();
         let admitted = engine
             .commit(move |tx| {
-                Box::pin(
-                    async move { inbox::admit(tx, &generation, conversation, &draft, modes).await },
-                )
+                Box::pin(async move { this.admit_in_tx(tx, conversation, &draft).await })
             })
             .await?;
         match admitted {
             Admitted::Id(id) => Ok(id),
             Admitted::Busy => Err(SubmitError::Busy(conversation)),
         }
+    }
+
+    /// 在**调用方自己的提交**里受理一个 submission：gateway 用它在一次提交里完成"建 / fork
+    /// conversation 再受理"（新会话的第一条输入、编辑成分支、cron 触发建会话），中间不会有
+    /// "conversation 建了、输入没进"的崩溃窗口。规则同 [`Harness::submit`]：空闲且收件箱空就放置并起 run，忙或有排队项就
+    /// 排队，已知的请求键原样返回已有的那条；`Reject` 遇忙返回 [`Admitted::Busy`]、什么都不写。
+    ///
+    /// - `conversation` 可以是**这次提交才建的**（[`Tx::create_conversation_in`] /
+    ///   [`Tx::fork_conversation`]）：请求键在新 conversation 里不可能已有记录，head 标记沿 fork 点
+    ///   往父读（见 [`Tx::latest_head_marker`]），所以不会撞"表读在表写之后"。fork 出来的
+    ///   conversation 上放的 run 读到的上下文是父到 fork 点为止的历史加这条输入。
+    /// - 调用方在同一闭包里先写完别的表（建 conversation、复制 `komo.agent` document）再调它；它自己
+    ///   会写 entry、submission、任务与 `komo.live` / `komo.inbox`，之后不要再做表读。
+    /// - 提交结束时引擎要开始调度：调用方提交之后调 `engine.resume()`（`submit` 已经做了）。
+    /// - 输入的 entry kind 校验（`komo.` 前缀）在这里做，违规返回 [`DurableError::rejected`]。
+    pub async fn admit_in_tx(
+        &self,
+        tx: &mut Tx,
+        conversation: ConversationId,
+        draft: &SubmissionDraft,
+    ) -> Result<Admitted, DurableError> {
+        draft.check().map_err(DurableError::rejected)?;
+        inbox::admit(tx, &self.generation, conversation, draft, self.modes()).await
     }
 
     /// `/new`：`komo.reset` write（`head: "self"`），可带交接文字。空闲时立刻落，忙时排在
@@ -287,6 +307,54 @@ impl Harness {
             inbox::Withdrawn::Settled => WithdrawResult::Settled,
             inbox::Withdrawn::NotFound => WithdrawResult::NotFound,
         })
+    }
+
+    /// 取消**当前这一轮**（`/cancel`、Esc；D5 决定 8）：只 abort 当前 run 的生成任务（它名下的工具
+    /// 任务自底向上跟着停，每个任务在自己的 abort handler 里写 aborted 结果），**不撤回收件箱**：
+    /// run 以 `unanswered{aborted}` 收尾的同一次提交里，排队的 write、用户输入与内部输入都按 final
+    /// boundary 放置，有输入就起后继 run——前一轮怎么结束都不挡后面的消息（旧 komo 的行为）。
+    /// 排队中的单条消息要撤回用 [`Harness::withdraw`]；整个会话停下（删除）用
+    /// [`Harness::abort_conversation`]。
+    ///
+    /// 返回有没有 run 被取消（空闲、或 run 在这次调用读到它之前就结束了，返回 `false`）。等的是被
+    /// 取消的**那条 run**收尾：后继 run 是取消之后的新工作，不等它。同时在跑的压缩任务不碰（它不是
+    /// run 的一部分）。
+    ///
+    /// **竞争**：run 每一轮是一个新的生成任务（postTools boundary 交棒），所以读到 `komo.live.run`
+    /// 指着的任务之后、abort 落标记之前它可能已经交给下一个任务。这里认的是 run 的身份（首个输入），
+    /// 标记落下后重读，同一条 run 还在（换了任务）就追着再 abort，直到那条 run 不在了。run 在这次
+    /// 调用读到它之前自然收尾、后继 run 已起的，取消的是已经结束的那条，什么都不用做——调用方
+    /// （用户）看到的是新一条 run，需要的话再按一次取消。放置与取消在提交线上串行（详见
+    /// `orchestration::report::end_run_abnormal` 的竞争一节），不会放一半。
+    pub async fn abort_run(
+        &self,
+        engine: &Engine,
+        conversation: ConversationId,
+    ) -> Result<bool, DurableError> {
+        let storage = engine.line().storage().clone();
+        let mut target: Option<SubmissionId> = None;
+        let mut last: Option<TaskId> = None;
+        loop {
+            let live = Self::live(&*storage, conversation).await?;
+            let Some(run) = live.run else { break };
+            let Some(first) = run.inputs.first().copied() else {
+                break;
+            };
+            if target.is_some_and(|target| target != first) {
+                // 原来那条 run 已经收尾，现在的是它的后继（或后来的）run：不是这次取消的对象。
+                break;
+            }
+            if last == Some(run.task) {
+                // 刚 abort 并等过的任务还挂在 `run` 上：不该发生（任务终结与 run 移除同一次提交），
+                // 不在这里空转。
+                break;
+            }
+            target = Some(first);
+            last = Some(run.task);
+            engine.abort_task(run.task).await?;
+            engine.wait_for_task(run.task).await?;
+        }
+        Ok(target.is_some())
     }
 
     /// `Conversation.abort()`：撤回排队的输入（排队的 write 留着），再 abort 这个 conversation

@@ -117,6 +117,8 @@
 ### W4a 生命周期、intervention、恢复
 
 - 新建 `service/durable/lifecycle.rs`（delete：`closing` → 撤回排队输入 → 对该 Session 每个 conversation `abort_conversation` → `deleted`；purge：要求已 `deleted`，`PurgeConversations` 提交后删目录，墓碑 `purged` 幂等；启动时做完停在 `closing` 的）、`service/durable/interventions.rs`（列 faulted 任务；`abandon` 记在 Session 级 document `komo.interventions.ack`）、`http/v2/interventions.rs`（含 reconcile 路由，只查 blob 引用）。
+- **ID 不复用**（W0a 合并时发现，必须修）：Turso 重开后取号器从剩余最大 ID 起，purge 掉末尾 ID 后会重铸，违反设计 §6.1，且会让旧的 SSE 游标、memory 证据引用（`Seq` / `RunId`）指向新数据。把已分配过的最大 ID 持久化（如 `durable_meta` 的高水位，随分配同提交推进），开库时取号器从它起；加 conformance / Turso 用例`purged_ids_are_never_reissued_after_reopen`。
+- 删除会话时 `abort_conversation` 保留内部输入，abort 之后仍会起后继 run：删除流程先 `withdraw` 该 Session 所有排队的内部输入（或在 `closing` 状态下拒绝起后继 run），并加测试。
 - 新增 `tests/recovery_durable/`：`the_first_end_to_end_acceptance`、`a_chat_run_in_flight_across_a_restart_still_gets_its_reply_delivered_once`、`a_background_task_in_flight_across_a_restart_still_reports_back`、`a_killed_bash_is_handed_to_the_model_as_interrupted`、`a_missing_blob_faults_the_tool_task_and_lists_it`。`service/tests.rs` 生命周期一组迁到 Durable。旧 `tests/recovery/{rows,verdicts,reconcile}.rs` 标记只跑 Legacy、D7 删。
 
 ### W4b 剩余套件迁移
@@ -220,4 +222,5 @@
 
 | 包 | 分支 | 合入 `d4c` | 备注 |
 |---|---|---|---|
-| W0b gateway 骨架与测试脚手架 | `d5-w0b` |  | `StorageMode` / `ServiceOptions.stream`；`service/durable/{mod,core,agent_doc,assemble,background}.rs`、`http/v2/*` 桩；`FakeLlm: ModelStream`、`TestGateway::durable` / `GatewayBuilder::durable` / `wait_run`。偏离见提交说明：Durable 启动对 `aux.db` 做一次旧记忆队列复位（首次写，同进程重开不再 `database is locked`） |
+| W0a 存储接缝 | `d5-w0a` | ✓ 2026-10-25 | kernel：`SessionRecord` 扩展（`SessionKind` 与 `kind` / `agent` / `parent_session` / `leaf` / `title_provisional` / `created_at` / `changed_at` / `request_key`，全带默认值）、`ConversationRecord.session`、`ConversationQuery` 的 `session` / `parent_conversation`、`StorageWrite::PurgeConversations`、`legacy_ids`；store 写 `session_id` 列、Purge SQL；runtime `Tx::{put_session, session, create_conversation_in, fork_conversation_in, purge_conversations}`（fork 默认继承 session）、`komo.settled`（`inbox::settle`）、`Harness::admit_in_tx`、任务会话 `sessions` 行、`Harness::abort_run` 与非正常收尾放置排队输入（决定 8；队列模式照旧，`OneAtATime` 时每种取第一项、余下留给后继 run 自己的 boundary）。`komo.settled` 的 `data` 在 §2 的字段之外多一个可选 `detail`（失败详情），排队中被撤回的输入也各留一条（`unanswered` / `aborted`）。`Tx::latest_head_marker` / `submission_by_request` 认"这次提交才建的 conversation" |
+| W0b gateway 骨架与测试脚手架 | `d5-w0b` | ✓ 2026-10-25 | `StorageMode` / `ServiceOptions.stream`；`service/durable/{mod,core,agent_doc,assemble,background}.rs`、`http/v2/*` 桩；`FakeLlm: ModelStream`、`TestGateway::durable` / `GatewayBuilder::durable` / `wait_run`。偏离见提交说明：Durable 启动对 `aux.db` 做一次旧记忆队列复位（首次写，同进程重开不再 `database is locked`） |

@@ -158,6 +158,10 @@ pub fn check_limit(limit: usize) -> StorageResult<()> {
 pub struct ConversationQuery {
     pub owner_conversation: Option<ConversationId>,
     pub owner_task: Option<TaskId>,
+    /// 属于这个 komo Session 的 conversation（`ConversationRecord::session`）。
+    pub session: Option<String>,
+    /// 从这个 conversation fork 出来的子 conversation（`ConversationRecord::parent`）。
+    pub parent_conversation: Option<ConversationId>,
     pub order: Option<ScanOrder>,
 }
 
@@ -325,6 +329,20 @@ pub enum StorageWrite {
     },
     /// komo Session：整条替换（id 是字符串，不占数字命名空间）。
     Session(SessionRecord),
+    /// 删掉这些 conversation 的全部行：它们的 entry、task、submission，作用域是这些
+    /// conversation 或它们名下 task 的 document（含已退役的历史），最后是 conversation 行本身。
+    /// Session 行与别的 conversation 不动。
+    ///
+    /// - **幂等**：不存在的 conversation 跳过，所以重放一次清理不会失败。
+    /// - 一批里排在其余写入**之后**应用，与它在批里的位置无关（同批对这些 conversation 的写入
+    ///   随后被一并删掉）。
+    /// - 存储不检查还有没有别的 conversation 从这里 fork（读它们会因祖先消失而报请求无效）：
+    ///   谁 purge 谁保证按 Session 整组删（`komo-gateway` 的 purge 就是这样用的）。
+    /// - 取号器照旧越过已删的最大 ID（同一次打开内不复用）；Turso 重开后从剩余行的最大 ID 接着取，
+    ///   purge 恰好删掉了末尾的 ID 时它们会被重新铸出——purge 的是整个 Session，没有存活数据还指着它们。
+    PurgeConversations {
+        conversations: Vec<ConversationId>,
+    },
 }
 
 /// 进度提交只允许整值替换 document（§3.6）：落盘档位更低，混进别的写就等于把结构性事实

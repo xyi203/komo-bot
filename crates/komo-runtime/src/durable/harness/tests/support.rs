@@ -66,6 +66,7 @@ fn kind_of(write: &StorageWrite) -> &'static str {
         StorageWrite::DocumentChange { .. } => "document.change",
         StorageWrite::DocumentRetire { .. } => "document.retire",
         StorageWrite::Session(_) => "session",
+        StorageWrite::PurgeConversations { .. } => "purge",
     }
 }
 

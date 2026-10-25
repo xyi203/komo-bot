@@ -28,6 +28,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::agent::RetryBudget;
 use crate::llm::ImageResolver;
+use crate::recovery::{IdentityProbe, ProcessProbe};
 
 /// 钩子的失败。
 #[derive(Debug, Clone, thiserror::Error)]
@@ -265,6 +266,8 @@ pub struct HarnessSettings {
     pub output_interval: Duration,
     /// 槽位里保留的输出尾巴最多多少字节。
     pub tail_bytes: usize,
+    /// `probe` 阶段两次探测的间隔（§5：每轮探一次，`sleep(until)` 后再探）。
+    pub probe_interval: Duration,
 }
 
 impl Default for HarnessSettings {
@@ -275,15 +278,18 @@ impl Default for HarnessSettings {
             partial_interval: Duration::from_millis(250),
             output_interval: Duration::from_millis(250),
             tail_bytes: 4096,
+            probe_interval: Duration::from_secs(5),
         }
     }
 }
 
-/// 生成与工具任务共用的依赖：钩子、无状态的模型调用、设置。
+/// 生成与工具任务共用的依赖：钩子、无状态的模型调用、子进程探测、设置。
 pub struct HarnessDeps {
     pub hooks: Arc<dyn AgentHooks>,
     /// 按模型配置路由（生产是 [`RoutingStream`](crate::llm::RoutingStream)）。
     pub stream: Arc<dyn crate::llm::ModelStream>,
+    /// 工具任务 `probe` 阶段探子进程用的（生产是带身份核对的 [`IdentityProbe`]，测试里换替身）。
+    pub probe: Arc<dyn ProcessProbe>,
     settings: arc_swap::ArcSwap<HarnessSettings>,
 }
 
@@ -292,8 +298,14 @@ impl HarnessDeps {
         Self {
             hooks,
             stream,
+            probe: Arc::new(IdentityProbe),
             settings: arc_swap::ArcSwap::from_pointee(HarnessSettings::default()),
         }
+    }
+
+    pub fn with_probe(mut self, probe: Arc<dyn ProcessProbe>) -> Self {
+        self.probe = probe;
+        self
     }
 
     pub fn with_settings(self, settings: HarnessSettings) -> Self {

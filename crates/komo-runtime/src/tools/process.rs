@@ -10,7 +10,7 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
-use komo_kernel::traits::OutputWriter;
+use komo_kernel::traits::{ChildStarted, OutputWriter};
 use komo_kernel::types::ids::ExecutorId;
 use komo_kernel::types::tool::{CancelToken, InterjectSignal};
 
@@ -236,6 +236,12 @@ pub async fn run_child_detachable(
     {
         tracing::warn!(pid = pgid, %error, "子进程登记写不进去");
     }
+    // 同一个事实也告诉输出写入器：新存储的工具任务据此把身份写进槽位（§5 的 probe 阶段）。
+    sink.child_started(ChildStarted {
+        pid: pgid,
+        pgid,
+        started_at_ms: (started_at.unix_timestamp_nanos() / 1_000_000) as i64,
+    });
     // 无论怎么收尾都要销号：正常退出、超时、取消、读输出出错，都从这个函数出去。
     let forget = ForgetOnDrop {
         registration: spec.register.clone(),
@@ -569,6 +575,53 @@ mod tests {
         excerpt.push(b"a\n");
         excerpt.push(b"b\n");
         assert_eq!(excerpt.into_string(), "a\nb\n");
+    }
+
+    /// 起了进程就告诉输出写入器它的身份（新存储把它写进槽位，重启后的 `probe` 阶段靠它）。
+    #[tokio::test]
+    async fn the_sink_hears_about_the_child_that_was_started() {
+        struct Spy {
+            inner: MemOutputWriter,
+            heard: Vec<ChildStarted>,
+        }
+        #[async_trait::async_trait]
+        impl OutputWriter for Spy {
+            async fn write_stdout(
+                &mut self,
+                chunk: &[u8],
+            ) -> Result<(), komo_kernel::traits::StoreError> {
+                self.inner.write_stdout(chunk).await
+            }
+            async fn write_stderr(
+                &mut self,
+                chunk: &[u8],
+            ) -> Result<(), komo_kernel::traits::StoreError> {
+                self.inner.write_stderr(chunk).await
+            }
+            fn attempt(&self) -> &komo_kernel::types::refs::AttemptRef {
+                self.inner.attempt()
+            }
+            fn bytes_written(&self) -> u64 {
+                self.inner.bytes_written()
+            }
+            fn child_started(&mut self, child: ChildStarted) {
+                self.heard.push(child);
+            }
+        }
+        let mut spy = Spy {
+            inner: writer(),
+            heard: Vec::new(),
+        };
+        let before = time::OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000;
+        run_child(spec("true"), &mut spy, &CancelToken::new())
+            .await
+            .unwrap();
+        let [child] = spy.heard[..] else {
+            panic!("exactly one child: {:?}", spy.heard);
+        };
+        assert!(child.pid > 1);
+        assert_eq!(child.pgid, child.pid, "its own process group");
+        assert!(i128::from(child.started_at_ms) >= before - 1);
     }
 
     #[tokio::test]

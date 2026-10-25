@@ -127,7 +127,7 @@ async fn a_prepare_error_is_a_failed_result_for_the_model() {
     engine.close().await.unwrap();
 }
 
-/// 设计 §12.5 / D4b 范围："工具槽位：即意图，带重放策略、尝试序号、子进程身份（先留字段）和输出尾巴"；
+/// 设计 §12.5："工具槽位：即意图，带重放策略、尝试序号、子进程身份和输出尾巴"；
 /// pi spec §8.2 "A tool task sets its slot running in its intent commit, publishes throttled output
 /// ... and in its terminal commit sets done and entry and removes output"。输出尾巴的节流写入走
 /// `commit_progress`。
@@ -170,7 +170,7 @@ async fn the_slot_is_the_intent_and_carries_the_output_tail_while_the_call_runs(
     assert_eq!(slot.attempt, Some(1));
     assert_eq!(
         slot.pid, None,
-        "the child identity is a field D5's probe phase fills in"
+        "a tool that spawns nothing records no child"
     );
     assert_eq!(slot.output.as_deref(), Some("building...\n"));
     // 意图同时在 checkpoint 里：参数、计划、重放策略、尝试序号。

@@ -5,5 +5,6 @@ mod support;
 
 mod generation;
 mod inbox;
+mod probe;
 mod recovery;
 mod tools;

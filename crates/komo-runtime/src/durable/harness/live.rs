@@ -7,7 +7,8 @@
 //!   "generation": { "attempt": 1, "message": { …节流提交的部分回复… },
 //!                   "retry": { "at": 1761206400000, "error": "…" } },
 //!   "tools": [ { "callId": "c1", "name": "read", "taskId": 9, "status": "running",
-//!                "replay": "safe", "attempt": 1, "pid": null,
+//!                "replay": "safe", "attempt": 1, "pid": 4242, "pgid": 4242,
+//!                "startedAt": 1761206400000,
 //!                "output": "…输出尾巴…", "droppedBytes": 0 },
 //!              { "callId": "c2", "name": "bash", "status": "done", "entry": 31 } ]
 //! }
@@ -19,7 +20,7 @@
 //!   计数落在这里，生成任务交接时带着走。
 //! - `generation` 是当前这次请求的展示状态：节流提交的部分回复、重试到点。
 //! - `tools` 是当前这一轮的槽位，按调用顺序。槽位**就是意图**（§12.5）：`running` 时带着
-//!   重放策略、尝试序号、子进程身份（先留字段，D5 的 probe 阶段用）与输出尾巴；`done` 时
+//!   重放策略、尝试序号、子进程身份（pid / pgid / 起来的时刻，恢复时的 `probe` 阶段用）与输出尾巴；`done` 时
 //!   只剩结果 entry，输出尾巴随结果清掉。
 //!
 //! 进度写入（部分回复、输出尾巴）只替换这一个 document，经 `Line` 走 `commit_progress`。
@@ -104,9 +105,15 @@ pub struct ToolSlot {
     /// 当前这次尝试（从 1 数）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attempt: Option<u32>,
-    /// 子进程身份（D5 的 probe 阶段用；D4b 不写）。
+    /// 工具起的子进程（§5 的 `probe` 阶段读）：pid、进程组、起来的时刻（Unix 毫秒）。三者
+    /// 一起才够判断"还是不是那个进程"（pid 会被复用）。起了进程之后经节流进度那条路径写入，
+    /// 重跑或收尾时清掉。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pid: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pgid: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<i64>,
     /// 运行中的输出尾巴（stdout / stderr 按到达次序）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output: Option<String>,
@@ -128,14 +135,19 @@ impl ToolSlot {
             replay: None,
             attempt: None,
             pid: None,
+            pgid: None,
+            started_at: None,
             output: None,
             dropped_bytes: None,
             entry: None,
         }
     }
 
-    /// 运行中发布的东西：结果 entry 或重跑会替掉它。
+    /// 运行中发布的东西（输出尾巴、子进程身份）：结果 entry 或重跑会替掉它。
     pub fn clear_progress(&mut self) {
+        self.pid = None;
+        self.pgid = None;
+        self.started_at = None;
         self.output = None;
         self.dropped_bytes = None;
     }

@@ -27,8 +27,8 @@ use komo_kernel::types::status::{RunState, SessionState, WaitReason};
 pub use observe::{StartedCall, events_of, log_tail, output_ref_of, started_call};
 pub use orphan::SessionDirOrphanOutputs;
 pub use processes::{
-    ChildProcess, ChildRegistry, ExecutorLiveness, Liveness, LockHolderLiveness, ProcessProbe,
-    SysProcessProbe,
+    ChildProcess, ChildRegistry, ExecutorLiveness, IdentityProbe, Liveness, LockHolderLiveness,
+    ProcessProbe, SysProcessProbe,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]

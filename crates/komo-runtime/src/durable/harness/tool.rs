@@ -7,6 +7,8 @@
 //! ```json
 //! { "phase": "call" }
 //! { "phase": "execute", "arguments": {…}, "plan": {…ExecutionPlan…}, "replay": "safe", "attempt": 1 }
+//! { "phase": "probe", …同 execute…, "child": { "pid": 4242, "pgid": 4242, "startedAt": 1761206400000 },
+//!   "until": 1761206405000 }
 //! ```
 //!
 //! # effect sandwich
@@ -20,6 +22,11 @@
 //!             存下的与当前 replay 都 Safe → 新的一次尝试重跑（同一个 task、attempt + 1）
 //!             否则                       → 中断结果（uncertain）：§8.6 的正文 + .partial 末尾各 2 KiB
 //!             工具名已经没了             → 同样按中断处理（不问工具，不看重放策略）
+//! probe:    槽位里记录的子进程（`komo.live.tools[].pid`，工具起进程时经节流进度那条路径写入）
+//!           重启后还活着 → `execute` 不重判，进 `probe`：`sleep(until)` 后用 `ProcessProbe` 探一次，
+//!           还在就把 `until` 推后一个间隔再来；结束了（含 pid 被复用、起来的时刻对不上）回到
+//!           `execute` 那张表重新判。取消时 abort handler 照常写 `aborted` 结果（不终止那个进程，
+//!           结果正文里说明它可能还在）。
 //! ```
 //!
 //! 意图之前（checkpoint 还是 `call`）崩溃的确定没执行过，`call` 照常再来一遍。**大正文总是
@@ -37,6 +44,7 @@
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use komo_kernel::durable::task::{NextTaskState, RunningTask};
@@ -44,7 +52,7 @@ use komo_kernel::durable::{
     ContentBlock, ConversationId, EntryId, Message, TaskId, ToolResultMessage,
 };
 use komo_kernel::projection::{ProjectionContext, ToolResultFacts, project_views, select};
-use komo_kernel::traits::{OutputWriter, StoreError, Tool};
+use komo_kernel::traits::{ChildStarted, OutputWriter, StoreError, Tool};
 use komo_kernel::types::ids::{AttemptId, RunId, ToolCallId};
 use komo_kernel::types::plan::{ExecutionPlan, Replay};
 use komo_kernel::types::refs::{
@@ -54,6 +62,7 @@ use komo_kernel::types::status::ToolCallState;
 use komo_kernel::types::tool::{CancelToken, InterjectSignal, ResumedCall, ToolContext, ToolError};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
 use super::TOOL_KIND;
@@ -70,6 +79,7 @@ use crate::executor::{
     INTERRUPTED_TAIL_BYTES, REAP_GRACE, interrupted_message, result_body, store_images,
     timeout_error,
 };
+use crate::recovery::{ChildProcess, Liveness};
 
 /// 输入（只认 model 发起的调用；`kind` 为以后的嵌套调用留着）。
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -95,6 +105,41 @@ pub enum Checkpoint {
         /// 当前这次尝试（从 1 数）；输出落在 `tool-output/{conversation}/{task}/{attempt}/`。
         attempt: u32,
     },
+    /// 恢复时发现上一次执行起的子进程还活着：等它结束（§5 的 `probe` 阶段）。
+    Probe {
+        arguments: Value,
+        plan: Box<ExecutionPlan>,
+        replay: Replay,
+        attempt: u32,
+        child: ChildRef,
+        /// 下一次探测的时刻（`Line` 时钟，毫秒）。
+        until: i64,
+    },
+}
+
+/// 槽位里记下的子进程身份（`ToolSlot::{pid, pgid, started_at}`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChildRef {
+    pub pid: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pgid: Option<u32>,
+    /// 起来的时刻（Unix 毫秒）；判断 pid 有没有被复用靠它。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<i64>,
+}
+
+impl ChildRef {
+    fn process(&self, what: String) -> ChildProcess {
+        ChildProcess {
+            pid: self.pid,
+            pgid: self.pgid,
+            started_at: self.started_at.and_then(|ms| {
+                time::OffsetDateTime::from_unix_timestamp_nanos(i128::from(ms) * 1_000_000).ok()
+            }),
+            what,
+        }
+    }
 }
 
 fn encode(checkpoint: &Checkpoint) -> Value {
@@ -420,10 +465,12 @@ impl ToolTask {
         let settings = self.deps.settings();
 
         let tail = Arc::new(Mutex::new(Tail::new(settings.tail_bytes)));
+        let wake = Arc::new(Notify::new());
         let stop = CancellationToken::new();
         let progress = tokio::spawn(commit_output(
             rt.clone(),
             tail.clone(),
+            wake.clone(),
             stop.clone(),
             settings.output_interval,
         ));
@@ -452,6 +499,7 @@ impl ToolTask {
             let mut sink = Tee {
                 inner: writer.as_mut(),
                 tail: tail.clone(),
+                wake: wake.clone(),
             };
             let execution = async {
                 match plan.then_run {
@@ -569,6 +617,23 @@ impl ToolTask {
         stored: Replay,
         attempt: u32,
     ) -> Result<(), TaskError> {
+        self.resolve(task, rt, arguments, plan, stored, attempt, true)
+            .await
+    }
+
+    /// `execute` 与 `probe`（子进程结束之后）共用的那张表。`check_child`：还没探过子进程，
+    /// 槽位里记着一个就转进 `probe`。
+    #[allow(clippy::too_many_arguments)]
+    async fn resolve(
+        &self,
+        task: &RunningTask,
+        rt: &TaskRuntime,
+        arguments: Value,
+        plan: ExecutionPlan,
+        stored: Replay,
+        attempt: u32,
+        check_child: bool,
+    ) -> Result<(), TaskError> {
         let input = parse_input(task)?;
         let call = self.read_call(rt, &input).await?;
         let conversation = rt.conversation();
@@ -586,6 +651,20 @@ impl ToolTask {
             return self
                 .commit_result(rt, &set, &call, &published, attempt, Ending::Completed)
                 .await;
+        }
+
+        // 上一次执行起的子进程还活着吗？没探过、槽位里记着一个：进 `probe`，由它按间隔探。
+        if check_child && let Some(child) = recorded_child(rt, attempt).await? {
+            let checkpoint = Checkpoint::Probe {
+                arguments,
+                plan: Box::new(plan),
+                replay: stored,
+                attempt,
+                child,
+                until: rt.now()?,
+            };
+            rt.commit_next(running(encode(&checkpoint))).await?;
+            return Ok(());
         }
 
         // 存下的与工具现在声明的都是 Safe 才重跑；现在的 unsafe 能否决存下的 safe，反过来不行。
@@ -651,6 +730,75 @@ impl ToolTask {
         self.commit_result(rt, &set, &call, &published, attempt, ending)
             .await
     }
+
+    // ------------------------------------------------------------------ probe（恢复）
+
+    /// `probe` 阶段：睡到 `until`，探一次。还在就把 `until` 推后一个间隔；结束了回到 `execute`
+    /// 那张表。取消时 `sleep_until` 拒绝，由 abort handler 收尾。
+    #[allow(clippy::too_many_arguments)]
+    async fn probe(
+        &self,
+        task: &RunningTask,
+        rt: &TaskRuntime,
+        arguments: Value,
+        plan: ExecutionPlan,
+        replay: Replay,
+        attempt: u32,
+        child: ChildRef,
+        until: i64,
+    ) -> Result<(), TaskError> {
+        rt.sleep_until(until).await?;
+        let process = child.process(format!("tool task {}", rt.task_id()));
+        match self.deps.probe.probe(&process) {
+            Liveness::Gone => {
+                self.resolve(task, rt, arguments, plan, replay, attempt, false)
+                    .await
+            }
+            // 查不出来按"还在"处理：重复执行比多等一会儿危险（§8.7）。
+            Liveness::Alive | Liveness::Unknown => {
+                let interval = self.deps.settings().probe_interval;
+                let next = rt.now()? + interval.as_millis() as i64;
+                let checkpoint = Checkpoint::Probe {
+                    arguments,
+                    plan: Box::new(plan),
+                    replay,
+                    attempt,
+                    child,
+                    until: next,
+                };
+                rt.commit_next(running(encode(&checkpoint))).await?;
+                Ok(())
+            }
+        }
+    }
+}
+
+/// 槽位里记录的、属于这次尝试的子进程。
+async fn recorded_child(rt: &TaskRuntime, attempt: u32) -> Result<Option<ChildRef>, TaskError> {
+    let conversation = rt.conversation();
+    let found = Arc::new(Mutex::new(None));
+    let out = found.clone();
+    // 只读：不返回新状态，也不写任何东西。
+    rt.commit(move |tx, task| {
+        Box::pin(async move {
+            let live = live::load(tx, conversation).await?;
+            let child = live.slot(task.id()).and_then(|slot| {
+                if slot.attempt != Some(attempt) {
+                    return None;
+                }
+                Some(ChildRef {
+                    pid: slot.pid?,
+                    pgid: slot.pgid,
+                    started_at: slot.started_at,
+                })
+            });
+            *out.lock().unwrap_or_else(|e| e.into_inner()) = child;
+            Ok(None::<NextTaskState>)
+        })
+    })
+    .await?;
+    let child = *found.lock().unwrap_or_else(|e| e.into_inner());
+    Ok(child)
 }
 
 fn parse_input(task: &RunningTask) -> Result<Input, TaskError> {
@@ -707,6 +855,17 @@ impl TaskKind for ToolTask {
                 self.execute(task, rt, arguments, *plan, replay, attempt)
                     .await
             }
+            Checkpoint::Probe {
+                arguments,
+                plan,
+                replay,
+                attempt,
+                child,
+                until,
+            } => {
+                self.probe(task, rt, arguments, *plan, replay, attempt, child, until)
+                    .await
+            }
         }
     }
 
@@ -716,9 +875,11 @@ impl TaskKind for ToolTask {
         let input = parse_input(task)?;
         let call = self.read_call(rt, &input).await?;
         let conversation = rt.conversation();
-        let attempt = match serde_json::from_value::<Checkpoint>(task.checkpoint.clone()) {
-            Ok(Checkpoint::Execute { attempt, .. }) => Some(attempt),
-            _ => None,
+        let (attempt, probing) = match serde_json::from_value::<Checkpoint>(task.checkpoint.clone())
+        {
+            Ok(Checkpoint::Execute { attempt, .. }) => (Some(attempt), None),
+            Ok(Checkpoint::Probe { attempt, child, .. }) => (Some(attempt), Some(child)),
+            _ => (None, None),
         };
         let set = match self.tools(conversation).await {
             Ok(set) => set,
@@ -764,7 +925,17 @@ impl TaskKind for ToolTask {
             InterruptedOutput::default()
         };
         let mut body = result_body(&Err(ToolError::Cancelled));
-        let text = aborted_message(&call.name, &left);
+        let mut text = aborted_message(&call.name, &left);
+        // 在 probe 阶段被取消：重启前起的子进程我们不终止它，别让模型以为它没了。
+        if let Some(child) = probing {
+            let process = child.process(format!("tool task {}", rt.task_id()));
+            if self.deps.probe.probe(&process) != Liveness::Gone {
+                text.push_str(&format!(
+                    "\n重启前这次调用起的子进程（pid {}）取消时还在运行，komo 没有终止它。",
+                    child.pid
+                ));
+            }
+        }
         body.preview = Some(text);
         let published = self.publish(&set.env, &this, body).await?;
         self.commit_result(
@@ -786,6 +957,16 @@ struct Tail {
     buffer: VecDeque<u8>,
     cap: usize,
     dropped: u64,
+    /// 工具起的子进程（`OutputWriter::child_started`）。
+    child: Option<ChildStarted>,
+}
+
+/// 某一刻要写进槽位的进度：输出尾巴、丢掉的字节数、子进程身份。
+#[derive(Clone, PartialEq)]
+struct Snapshot {
+    text: String,
+    dropped: u64,
+    child: Option<ChildStarted>,
 }
 
 impl Tail {
@@ -794,6 +975,7 @@ impl Tail {
             buffer: VecDeque::new(),
             cap,
             dropped: 0,
+            child: None,
         }
     }
 
@@ -805,9 +987,13 @@ impl Tail {
         }
     }
 
-    fn snapshot(&self) -> (String, u64) {
+    fn snapshot(&self) -> Snapshot {
         let bytes: Vec<u8> = self.buffer.iter().copied().collect();
-        (String::from_utf8_lossy(&bytes).into_owned(), self.dropped)
+        Snapshot {
+            text: String::from_utf8_lossy(&bytes).into_owned(),
+            dropped: self.dropped,
+            child: self.child,
+        }
     }
 }
 
@@ -815,6 +1001,8 @@ impl Tail {
 struct Tee<'a> {
     inner: &'a mut dyn OutputWriter,
     tail: Arc<Mutex<Tail>>,
+    /// 起了子进程：叫醒进度提交，不等下一个节流间隔（重启前越早写进槽位越好）。
+    wake: Arc<Notify>,
 }
 
 #[async_trait]
@@ -852,29 +1040,41 @@ impl OutputWriter for Tee<'_> {
     fn bytes_written(&self) -> u64 {
         self.inner.bytes_written()
     }
+
+    fn child_started(&mut self, child: ChildStarted) {
+        self.inner.child_started(child);
+        self.tail.lock().unwrap_or_else(|e| e.into_inner()).child = Some(child);
+        self.wake.notify_one();
+    }
 }
 
-/// 节流提交输出尾巴（§3.6）：只替换 `komo.live` 里这个槽位的 `output`，经 `Line` 走
-/// `commit_progress`。槽位不在了（任务已收尾）就什么都不写。
+/// 节流提交运行中的进度（§3.6）：输出尾巴与子进程身份，只替换 `komo.live` 里这个槽位的对应
+/// 字段，经 `Line` 走 `commit_progress`。槽位不在了（任务已收尾）就什么都不写。
 async fn commit_output(
     rt: TaskRuntime,
     tail: Arc<Mutex<Tail>>,
+    wake: Arc<Notify>,
     stop: CancellationToken,
-    interval: std::time::Duration,
+    interval: Duration,
 ) {
     let conversation = rt.conversation();
-    let mut written = (String::new(), 0u64);
+    let mut written = Snapshot {
+        text: String::new(),
+        dropped: 0,
+        child: None,
+    };
     loop {
         tokio::select! {
             biased;
             _ = stop.cancelled() => return,
+            _ = wake.notified() => {}
             _ = tokio::time::sleep(interval) => {}
         }
         let snapshot = tail.lock().unwrap_or_else(|e| e.into_inner()).snapshot();
         if snapshot == written {
             continue;
         }
-        let (text, dropped) = snapshot.clone();
+        let pending = snapshot.clone();
         let committed = rt
             .commit(move |tx, task| {
                 Box::pin(async move {
@@ -883,8 +1083,13 @@ async fn commit_output(
                     let Some(slot) = live.slot_mut(task.id()) else {
                         return Ok(None);
                     };
-                    slot.output = Some(text);
-                    slot.dropped_bytes = (dropped > 0).then_some(dropped);
+                    slot.output = Some(pending.text);
+                    slot.dropped_bytes = (pending.dropped > 0).then_some(pending.dropped);
+                    if let Some(child) = pending.child {
+                        slot.pid = Some(child.pid);
+                        slot.pgid = Some(child.pgid);
+                        slot.started_at = Some(child.started_at_ms);
+                    }
                     live::store(tx, conversation, &live).await?;
                     Ok(None::<NextTaskState>)
                 })

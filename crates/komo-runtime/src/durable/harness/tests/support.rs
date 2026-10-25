@@ -19,7 +19,7 @@ use komo_kernel::durable::{
 };
 use komo_kernel::projection::{DEFAULT_MODEL_RESULT_BYTES, ProjectionContext};
 use komo_kernel::test_support::MemOutputStore;
-use komo_kernel::traits::{OutputWriter, Tool, ToolOutputStore};
+use komo_kernel::traits::{ChildStarted, OutputWriter, Tool, ToolOutputStore};
 use komo_kernel::types::ids::{OperationId, SessionId};
 use komo_kernel::types::model::ModelConfig;
 use komo_kernel::types::plan::{
@@ -36,6 +36,7 @@ use tokio::sync::Notify;
 use crate::durable::tests::support::{Log, TokioClock};
 use crate::durable::{Engine, EngineOptions, Registry};
 use crate::llm::{ModelRequest, ModelStream};
+use crate::recovery::{ChildProcess, IdentityProbe, Liveness, ProcessProbe};
 
 use super::super::hooks::{
     AgentHooks, AgentSetup, HarnessDeps, HookError, PromptSection, RunBudget, ToolEnv, ToolSet,
@@ -425,6 +426,8 @@ pub struct TestTool {
     pub fail_prepare: Option<String>,
     /// 写完输出、返回之前让存储开始失败："输出落盘了，结果没提交就崩了"。
     pub crash: Option<Arc<RecordingStorage>>,
+    /// 写完输出之后报告"起了一个子进程"（新存储的槽位据此记 pid）。
+    pub child: Option<ChildStarted>,
     pub runs: AtomicUsize,
     pub prepares: AtomicUsize,
     pub log: Log,
@@ -446,6 +449,7 @@ impl TestTool {
             hang_prepares: AtomicUsize::new(0),
             fail_prepare: None,
             crash: None,
+            child: None,
             runs: AtomicUsize::new(0),
             prepares: AtomicUsize::new(0),
             log: log.clone(),
@@ -491,6 +495,11 @@ impl TestTool {
 
     pub fn crashing(mut self, storage: &Arc<RecordingStorage>) -> Self {
         self.crash = Some(storage.clone());
+        self
+    }
+
+    pub fn with_child(mut self, child: ChildStarted) -> Self {
+        self.child = Some(child);
         self
     }
 
@@ -568,6 +577,9 @@ impl Tool for TestTool {
                     message: e.to_string(),
                 })?;
         }
+        if let Some(child) = self.child {
+            sink.child_started(child);
+        }
         if run <= self.hang_runs {
             std::future::pending::<()>().await;
         }
@@ -593,6 +605,48 @@ impl Tool for TestTool {
 
     fn replay(&self) -> Replay {
         *self.replay.lock().unwrap()
+    }
+}
+
+// ------------------------------------------------------------ 子进程探测替身
+
+/// `ProcessProbe` 的替身：答案由测试定，并记下每次被问到的子进程。`delegate` 时交给真正的
+/// [`IdentityProbe`](crate::recovery::IdentityProbe)。
+#[derive(Debug)]
+pub struct FakeProbe {
+    answer: Mutex<Option<Liveness>>,
+    asked: Mutex<Vec<ChildProcess>>,
+}
+
+impl FakeProbe {
+    pub fn new(answer: Liveness) -> Arc<Self> {
+        Arc::new(Self {
+            answer: Mutex::new(Some(answer)),
+            asked: Mutex::new(Vec::new()),
+        })
+    }
+
+    pub fn set(&self, answer: Liveness) {
+        *self.answer.lock().unwrap() = Some(answer);
+    }
+
+    /// 之后的问题交给真正的探测。
+    pub fn delegate(&self) {
+        *self.answer.lock().unwrap() = None;
+    }
+
+    pub fn asked(&self) -> Vec<ChildProcess> {
+        self.asked.lock().unwrap().clone()
+    }
+}
+
+impl ProcessProbe for FakeProbe {
+    fn probe(&self, child: &ChildProcess) -> Liveness {
+        self.asked.lock().unwrap().push(child.clone());
+        match *self.answer.lock().unwrap() {
+            Some(answer) => answer,
+            None => IdentityProbe.probe(child),
+        }
     }
 }
 
@@ -747,6 +801,8 @@ pub struct World {
     pub script: Arc<Script>,
     pub hooks: Arc<TestHooks>,
     pub harness: Harness,
+    /// 工具任务 `probe` 阶段用的探测替身（默认答"已经结束"）。
+    pub probe: Arc<FakeProbe>,
     pub log: Log,
     /// 内存输出存储（`World::new`）；`with_outputs` 给了别的存储时它是空的。
     pub mem: MemOutputStore,
@@ -766,7 +822,9 @@ impl World {
         let clock = TokioClock::new();
         let script = Script::new(clock.clone());
         let hooks = TestHooks::new(outputs);
-        let harness = Harness::new(HarnessDeps::new(hooks.clone(), script.clone()));
+        let probe = FakeProbe::new(Liveness::Gone);
+        let harness =
+            Harness::new(HarnessDeps::new(hooks.clone(), script.clone()).with_probe(probe.clone()));
         let registry = Registry::new();
         harness.install(&registry);
         Self {
@@ -777,6 +835,7 @@ impl World {
             script,
             hooks,
             harness,
+            probe,
             log: Log::default(),
             mem,
         }

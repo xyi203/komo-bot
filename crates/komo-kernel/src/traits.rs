@@ -406,6 +406,17 @@ pub trait ToolOutputStore: Send + Sync {
     }
 }
 
+/// 工具起了一个子进程：身份足够事后判断"还是不是那个进程"（pid 会被复用，所以带上起来的
+/// 时刻；`docs/storage-durable.md` §5 的 `probe` 阶段读它）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChildStarted {
+    pub pid: u32,
+    /// 进程组（取消时终止的是它）。
+    pub pgid: u32,
+    /// 起来的时刻（Unix 毫秒，真实时钟）。
+    pub started_at_ms: i64,
+}
+
 /// 一次尝试的流式写入器。
 #[async_trait]
 pub trait OutputWriter: Send + Sync {
@@ -420,6 +431,9 @@ pub trait OutputWriter: Send + Sync {
     fn attempt(&self) -> &AttemptRef;
     /// 到目前为止写了多少字节——输出长度预算按它判。
     fn bytes_written(&self) -> u64;
+    /// 工具刚起了一个子进程。默认什么都不做；新存储的工具任务借它把子进程身份写进
+    /// `komo.live.tools[].pid`，重启后据此进 `probe` 阶段。
+    fn child_started(&mut self, _child: ChildStarted) {}
 }
 
 // ---------------------------------------------------------------- 队列

@@ -230,20 +230,19 @@ async fn cloned_messages_and_artifacts_survive_source_purge_without_copying_exec
         .await
         .unwrap();
     assert!(tasks.items.is_empty());
-    // 源会话被回收（全部 conversation 与目录）。HTTP 的 delete / purge 路由是 W4a 的，这里直接做
-    // 它最终做的那两件事：提交 `PurgeConversations`、删目录。W4a 合入后换回两次 HTTP 调用。
-    let source = core.read_tree(session.as_str()).await.unwrap();
-    let conversations: Vec<_> = source.branches.iter().map(|b| b.conversation.id).collect();
-    core.engine
-        .commit(move |tx| {
-            Box::pin(async move {
-                tx.purge_conversations(conversations);
-                Ok(())
-            })
-        })
-        .await
-        .unwrap();
-    tokio::fs::remove_dir_all(&source_dir).await.unwrap();
+    // 源会话被回收（全部 conversation 与目录）：两次 HTTP 调用——逻辑删除，再 purge。
+    let (status, body) = gw
+        .post(
+            &format!("/v1/sessions/{session}/delete"),
+            json!({"now": true}),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let (status, body) = gw
+        .post(&format!("/v1/sessions/{session}/purge"), json!({}))
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert!(!source_dir.exists(), "源会话的目录被 purge 删了");
     let clone = snapshot(&gw, &response.session).await;
     assert_eq!(
         tokio::fs::read_to_string(

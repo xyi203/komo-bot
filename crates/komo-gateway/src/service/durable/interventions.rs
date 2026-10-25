@@ -161,7 +161,9 @@ impl FaultIndex {
         let mut found = Vec::new();
         let mut cursor: Option<Cursor> = None;
         loop {
-            let page = storage.scan_tasks(&query, SCAN_PAGE, cursor.as_ref()).await?;
+            let page = storage
+                .scan_tasks(&query, SCAN_PAGE, cursor.as_ref())
+                .await?;
             found.extend(
                 page.items
                     .into_iter()
@@ -328,7 +330,11 @@ impl DurableCore {
         let mut out = Vec::new();
         for faulted in self.faulted(only).await? {
             let summary = self.summary_of(&faulted, &mut runs).await;
-            if query.run.as_ref().is_some_and(|run| summary.run.as_ref() != Some(run)) {
+            if query
+                .run
+                .as_ref()
+                .is_some_and(|run| summary.run.as_ref() != Some(run))
+            {
                 continue;
             }
             out.push(summary);
@@ -337,7 +343,10 @@ impl DurableCore {
     }
 
     /// 一个 Session 的待处理清单（会话详情与 resume 的 `pending`）。
-    pub async fn pending_of(&self, session: &str) -> Result<Vec<InterventionSummary>, SessionError> {
+    pub async fn pending_of(
+        &self,
+        session: &str,
+    ) -> Result<Vec<InterventionSummary>, SessionError> {
         self.interventions(&InterventionListQuery {
             session: Some(SessionId::from_raw(session)),
             ..InterventionListQuery::default()
@@ -580,7 +589,10 @@ async fn announce(state: &Arc<GatewayState>, faulted: &Faulted) {
             .title
             .as_deref()
             .map(|name| format!("定时任务「{name}」：")),
-        SessionKind::Task => core.task_label(&faulted.session.id).await.map(|label| format!("{label}：")),
+        SessionKind::Task => core
+            .task_label(&faulted.session.id)
+            .await
+            .map(|label| format!("{label}：")),
         _ => None,
     }
     .unwrap_or_default();

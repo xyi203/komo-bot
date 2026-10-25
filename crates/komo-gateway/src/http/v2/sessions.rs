@@ -313,6 +313,9 @@ async fn purge(
                 .remember(request.request_key.as_ref(), &hash, &response);
             Ok(Json(response))
         }
-        Err(blockers) => Err(ApiFailure::purge_blocked(PurgeBlocked { session, blockers })),
+        Err(blockers) => Err(ApiFailure::purge_blocked(PurgeBlocked {
+            session,
+            blockers,
+        })),
     }
 }

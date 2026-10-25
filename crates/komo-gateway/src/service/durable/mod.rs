@@ -62,6 +62,8 @@ pub use sessions::SessionError;
 #[cfg(test)]
 mod feed_tests;
 #[cfg(test)]
+mod lifecycle_tests;
+#[cfg(test)]
 mod run_tests;
 #[cfg(test)]
 mod session_tests;

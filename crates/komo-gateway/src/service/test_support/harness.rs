@@ -1131,23 +1131,17 @@ impl TestGateway {
             .map(|record| record.id)
     }
 
-    /// Durable：把一个会话的 `sessions` 行标成已逻辑删除（`lifecycle = deleted`）。生命周期（W4a）
-    /// 合入前，测"被删的会话不再接消息"用它；W4a 之后换成 HTTP 的 delete。
+    /// Durable：把一个会话逻辑删除到 `deleted`（HTTP `POST /v1/sessions/{id}/delete {"now":true}`，
+    /// 即 W4a 的 lifecycle：`closing` → 撤回排队输入 → abort → `deleted`）。测"被删的会话不再接消息"用。
     pub async fn durable_soft_delete(&self, session: &str) {
-        use komo_kernel::durable::SessionLifecycle;
-        let core = self.state().core().expect("Durable 模式");
-        let id = session.to_owned();
-        core.engine
-            .commit(move |tx| {
-                Box::pin(async move {
-                    let mut record = tx.session(&id).await?.expect("会话在");
-                    record.lifecycle = SessionLifecycle::Deleted;
-                    tx.put_session(record);
-                    Ok(())
-                })
-            })
-            .await
-            .expect("提交得了");
+        let (code, body) = self
+            .post_json(
+                &format!("/v1/sessions/{session}/delete"),
+                serde_json::json!({ "now": true }),
+            )
+            .await;
+        assert_eq!(code, 200, "{body}");
+        assert_eq!(body["state"], "deleted", "{body}");
     }
 
     /// Durable：一个会话里受理过的输入 submission 数（排队的、并进别人 run 的都算一条）。

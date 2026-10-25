@@ -96,9 +96,7 @@ impl DurableCore {
             .commit(move |tx| {
                 Box::pin(async move {
                     let mut record = tx.session(&id).await?.ok_or_else(|| {
-                        komo_runtime::durable::DurableError::rejected(format!(
-                            "会话 {id} 不存在"
-                        ))
+                        komo_runtime::durable::DurableError::rejected(format!("会话 {id} 不存在"))
                     })?;
                     if !from.contains(&record.lifecycle) {
                         return Ok((record, false));
@@ -114,7 +112,10 @@ impl DurableCore {
 
     /// 撤回这个 Session 全部 conversation 里排队的 steer / followUp，**含内部输入**。返回撤回了几条。
     /// 排队的 write（展示用）留着：它们随 run 收尾的 boundary 落下，不起 run。
-    async fn withdraw_queued(&self, conversations: &[ConversationRecord]) -> Result<usize, SessionError> {
+    async fn withdraw_queued(
+        &self,
+        conversations: &[ConversationRecord],
+    ) -> Result<usize, SessionError> {
         let mut withdrawn = 0;
         for conversation in conversations {
             let inbox = Harness::inbox(&*self.storage, conversation.id).await?;
@@ -162,7 +163,10 @@ impl DurableCore {
             if queued > 0 {
                 blockers.push(PurgeBlocker {
                     what: "queued_input".into(),
-                    detail: format!("conversation {} 的收件箱里还排着 {queued} 条输入", conversation.id),
+                    detail: format!(
+                        "conversation {} 的收件箱里还排着 {queued} 条输入",
+                        conversation.id
+                    ),
                 });
             }
             let mut live_tasks = 0;
@@ -189,7 +193,10 @@ impl DurableCore {
             if live_tasks > 0 {
                 blockers.push(PurgeBlocker {
                     what: "task".into(),
-                    detail: format!("conversation {} 上还有 {live_tasks} 个没终结的任务", conversation.id),
+                    detail: format!(
+                        "conversation {} 上还有 {live_tasks} 个没终结的任务",
+                        conversation.id
+                    ),
                 });
             }
         }
@@ -197,7 +204,10 @@ impl DurableCore {
     }
 
     /// 这个 Session 名下还在跑的监听（purge 的阻挡项；delete 不替它们收尾——结束消息会再起 run）。
-    async fn live_monitors(&self, conversations: &[ConversationRecord]) -> Result<Vec<PurgeBlocker>, SessionError> {
+    async fn live_monitors(
+        &self,
+        conversations: &[ConversationRecord],
+    ) -> Result<Vec<PurgeBlocker>, SessionError> {
         let ids: Vec<ConversationId> = conversations.iter().map(|c| c.id).collect();
         Ok(monitor::list(&*self.storage)
             .await?
@@ -205,7 +215,10 @@ impl DurableCore {
             .filter(|record| record.is_live() && ids.contains(&record.conversation))
             .map(|record| PurgeBlocker {
                 what: "monitor".into(),
-                detail: format!("监听 #{}「{}」还在跑；先 monitor_stop 或等它结束", record.id, record.title),
+                detail: format!(
+                    "监听 #{}「{}」还在跑；先 monitor_stop 或等它结束",
+                    record.id, record.title
+                ),
             })
             .collect())
     }
@@ -234,11 +247,7 @@ impl DurableCore {
             Vec::new()
         };
         let (mut record, _) = self
-            .advance(
-                id,
-                &[SessionLifecycle::Active],
-                SessionLifecycle::Closing,
-            )
+            .advance(id, &[SessionLifecycle::Active], SessionLifecycle::Closing)
             .await?;
         let conversations = session_conversations(&*self.storage, id).await?;
         if now {
@@ -246,7 +255,9 @@ impl DurableCore {
                 self.withdraw_queued(&conversations).await?;
                 for conversation in &conversations {
                     // 穿过后台边界：后台任务（`task` 工具派出的、监听的锚点）一起停。
-                    self.engine.abort_conversation(conversation.id, true).await?;
+                    self.engine
+                        .abort_conversation(conversation.id, true)
+                        .await?;
                 }
                 if self.work_remaining(id).await?.is_empty() {
                     break;
@@ -297,7 +308,11 @@ impl DurableCore {
             self.withdraw_queued(&conversations).await?;
             if self.work_remaining(&record.id).await?.is_empty() {
                 let (_, changed) = self
-                    .advance(&record.id, &[SessionLifecycle::Closing], SessionLifecycle::Deleted)
+                    .advance(
+                        &record.id,
+                        &[SessionLifecycle::Closing],
+                        SessionLifecycle::Deleted,
+                    )
                     .await?;
                 if changed {
                     closed += 1;
@@ -396,10 +411,7 @@ async fn broken_output(paths: &SessionPaths, dir: &Path) -> Option<String> {
         match tokio::fs::metadata(&resolved).await {
             Ok(meta) if meta.len() == size => {}
             Ok(meta) => {
-                return Some(format!(
-                    "{path} 大小是 {}，引用写的是 {size}",
-                    meta.len()
-                ));
+                return Some(format!("{path} 大小是 {}，引用写的是 {size}", meta.len()));
             }
             Err(_) => return Some(format!("{path} 不在了")),
         }
@@ -435,7 +447,9 @@ async fn finish_purged(core: &DurableCore, sessions_dir: &Path) -> Result<u32, S
         match komo_store::repos::reconcile::remove_session_content(&paths).await {
             Ok(_) => done += 1,
             // 删不掉就说清楚、下一次再试（§8.8），不假装成功。
-            Err(error) => tracing::warn!(%error, session = %record.id, "墓碑已落但目录删不掉，下次再试"),
+            Err(error) => {
+                tracing::warn!(%error, session = %record.id, "墓碑已落但目录删不掉，下次再试")
+            }
         }
     }
     Ok(done)
@@ -446,7 +460,9 @@ pub async fn purge(
     state: &Arc<GatewayState>,
     id: &str,
 ) -> Result<Result<Purged, Vec<PurgeBlocker>>, SessionError> {
-    let core = state.core().map_err(|error| SessionError::Internal(error.to_string()))?;
+    let core = state
+        .core()
+        .map_err(|error| SessionError::Internal(error.to_string()))?;
     let record = core.session(id).await?;
     let sessions_dir = state.snapshot().paths.sessions_dir.clone();
     let paths = SessionPaths::new(&sessions_dir, &SessionId::from_raw(id));
@@ -522,7 +538,9 @@ pub async fn boot(state: &Arc<GatewayState>) {
 
 /// 一次 reconcile（`POST /v1/reconcile` 与启动共用）。幂等。
 pub async fn reconcile(state: &Arc<GatewayState>) -> Result<ReconcileReport, SessionError> {
-    let core = state.core().map_err(|error| SessionError::Internal(error.to_string()))?;
+    let core = state
+        .core()
+        .map_err(|error| SessionError::Internal(error.to_string()))?;
     let sessions_dir = state.snapshot().paths.sessions_dir.clone();
     let (checked, blocked) = core.check_blobs(&sessions_dir).await?;
     let closed = core.finish_closing().await?;

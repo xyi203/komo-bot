@@ -372,11 +372,14 @@ fn set_executable(path: &Path) -> Result<(), String> {
 
 /// 试跑一次。**新的那份真能在这台机器上跑起来、报的版本就是我们要的那个吗**——glibc
 /// 太旧、架构不对、包下坏了，都在这里挡下来，此时 `dest` 还是原来那一份。
+///
+/// 刚写完就执行，同进程里别的线程此刻 fork 会带走还开着的写句柄，execve 得到
+/// `ETXTBSY`——所以试跑遇到它要退避重试，而不是把它当成"新二进制坏了"。
 fn probe(staged: &Path, tag: &str) -> Result<(), String> {
-    let output = std::process::Command::new(staged)
-        .arg("--version")
-        .output()
-        .map_err(|error| format!("试跑 {} 失败：{error}", staged.display()))?;
+    let output = komo_runtime::spawn::retry_text_file_busy(|| {
+        std::process::Command::new(staged).arg("--version").output()
+    })
+    .map_err(|error| format!("试跑 {} 失败：{error}", staged.display()))?;
     let printed = String::from_utf8_lossy(&output.stdout).trim().to_string();
     if !output.status.success() {
         return Err(format!(

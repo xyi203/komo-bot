@@ -177,6 +177,14 @@ impl Projection {
         let mut sorted: Vec<&Record<'_>> = records.iter().collect();
         sorted.sort_by_key(|record| record.id());
         let mut out = Vec::new();
+        // 先登记这批里所有 submission 放置的 entry：`admit` 先铸输入 entry 的 ID、后铸 submission 的，
+        // 输入 entry 的 ID 比放置它的 submission 小，按 ID 序走到 entry 时 submission 还没处理，
+        // 不先登记就会把输入当成普通 entry（没有 `RunStarted`）。
+        for record in &sorted {
+            if let Record::Submission(submission) = record {
+                self.note_placed(submission);
+            }
+        }
         for record in sorted {
             match record {
                 Record::Submission(submission) => self.submission(submission, &mut out),
@@ -194,7 +202,8 @@ impl Projection {
 
     // ------------------------------------------------------------ submission
 
-    fn submission(&mut self, record: &SubmissionRecord, out: &mut Vec<Event>) {
+    /// 记下输入 submission 放置的 entry（输入 entry ↔ submission）。
+    fn note_placed(&mut self, record: &SubmissionRecord) {
         let SubmissionKind::Input { state } = &record.kind else {
             return;
         };
@@ -206,6 +215,13 @@ impl Projection {
         if let Some(entry) = placed {
             self.placed.insert(entry, record.id);
         }
+    }
+
+    fn submission(&mut self, record: &SubmissionRecord, out: &mut Vec<Event>) {
+        if !matches!(record.kind, SubmissionKind::Input { .. }) {
+            return;
+        }
+        self.note_placed(record);
         if !self.seen_submissions.insert(record.id) {
             return;
         }

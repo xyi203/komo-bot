@@ -41,6 +41,7 @@ use crate::recovery::{ChildProcess, IdentityProbe, Liveness, ProcessProbe};
 use super::super::hooks::{
     AgentHooks, AgentSetup, HarnessDeps, HookError, PromptSection, RunBudget, ToolEnv, ToolSet,
 };
+use super::super::{CompactionSettings, CompactionSetup, SummaryPrompt};
 use super::super::{Harness, LiveState};
 
 pub const CONV: ConversationId = ROOT_CONVERSATION_ID;
@@ -266,9 +267,14 @@ pub enum Step {
 /// 脚本化的 `ModelStream`：按次序出牌，记下每次请求收到的消息与时刻。
 pub struct Script {
     steps: Mutex<VecDeque<Step>>,
+    /// 摘要请求（压缩任务发的，第一条是有文字的 system 消息）走自己的队列，免得和并发的
+    /// 主请求抢次序。
+    summary_steps: Mutex<VecDeque<Step>>,
+    summary_requests: Mutex<Vec<Vec<Message>>>,
     requests: Mutex<Vec<Vec<Message>>>,
     times: Mutex<Vec<i64>>,
     models: Mutex<Vec<ModelConfig>>,
+    revised: Mutex<Vec<Option<usize>>>,
     clock: Arc<TokioClock>,
 }
 
@@ -276,9 +282,12 @@ impl Script {
     pub fn new(clock: Arc<TokioClock>) -> Arc<Self> {
         Arc::new(Self {
             steps: Mutex::new(VecDeque::new()),
+            summary_steps: Mutex::new(VecDeque::new()),
+            summary_requests: Mutex::new(Vec::new()),
             requests: Mutex::new(Vec::new()),
             times: Mutex::new(Vec::new()),
             models: Mutex::new(Vec::new()),
+            revised: Mutex::new(Vec::new()),
             clock,
         })
     }
@@ -295,6 +304,15 @@ impl Script {
         self.push(Step::Reply(call_reply(calls)));
     }
 
+    /// 摘要请求的下一步（压缩任务的）。
+    pub fn push_summary(&self, step: Step) {
+        self.summary_steps.lock().unwrap().push_back(step);
+    }
+
+    pub fn summary_requests(&self) -> Vec<Vec<Message>> {
+        self.summary_requests.lock().unwrap().clone()
+    }
+
     pub fn requests(&self) -> Vec<Vec<Message>> {
         self.requests.lock().unwrap().clone()
     }
@@ -305,6 +323,11 @@ impl Script {
 
     pub fn request_times(&self) -> Vec<i64> {
         self.times.lock().unwrap().clone()
+    }
+
+    /// 每次主请求带的 `revised_from`（衰减那一轮 Anthropic 缓存断点要用）。
+    pub fn revised_froms(&self) -> Vec<Option<usize>> {
+        self.revised.lock().unwrap().clone()
     }
 
     pub fn models(&self) -> Vec<ModelConfig> {
@@ -345,18 +368,38 @@ impl ModelStream for Script {
         request: &ModelRequest<'_>,
         progress: &mut (dyn for<'m> FnMut(&'m AssistantMessage) + Send),
     ) -> Result<AssistantMessage, LlmError> {
-        self.requests
-            .lock()
-            .unwrap()
-            .push(request.messages.to_vec());
-        self.times.lock().unwrap().push(self.clock.now_ms());
-        self.models.lock().unwrap().push(request.model.clone());
-        let step = self
-            .steps
-            .lock()
-            .unwrap()
-            .pop_front()
-            .expect("the script ran out of steps");
+        let summary = matches!(
+            request.messages.first(),
+            Some(Message::System(system))
+                if matches!(&system.content, komo_kernel::durable::Content::Text(text) if !text.is_empty())
+        );
+        let step = if summary {
+            self.summary_requests
+                .lock()
+                .unwrap()
+                .push(request.messages.to_vec());
+            self.summary_steps
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("the script ran out of summary steps")
+        } else {
+            self.requests
+                .lock()
+                .unwrap()
+                .push(request.messages.to_vec());
+            self.times.lock().unwrap().push(self.clock.now_ms());
+            self.models.lock().unwrap().push(request.model.clone());
+            self.revised
+                .lock()
+                .unwrap()
+                .push(request.options.revised_from);
+            self.steps
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("the script ran out of steps")
+        };
         self.play(step, progress).await
     }
 }
@@ -675,6 +718,11 @@ struct HookState {
     env: ToolEnv,
     failure: Option<HookError>,
     tools_failure: Option<HookError>,
+    /// 压缩钩子的答案（设置、摘要提示）；没设就走 trait 的默认（压缩关着）。
+    compaction: Option<CompactionSettings>,
+    compaction_enabled: bool,
+    /// 先放过这么多次 `compaction()`，再失败一次。
+    compaction_failure: Option<(usize, HookError)>,
 }
 
 /// 测试里的钩子：D5 由 gateway 实现的那个东西的替身。每个决定点都按当前内容重新答。
@@ -711,6 +759,9 @@ impl TestHooks {
                 env,
                 failure: None,
                 tools_failure: None,
+                compaction: None,
+                compaction_enabled: false,
+                compaction_failure: None,
             }),
         })
     }
@@ -734,6 +785,24 @@ impl TestHooks {
 
     pub fn set_budget(&self, budget: RunBudget) {
         self.state.lock().unwrap().budget = budget;
+    }
+
+    /// 打开在线压缩并给设置（没调就是 trait 默认：压缩关着、旋钮取默认值）。
+    pub fn set_compaction(&self, enabled: bool, settings: CompactionSettings) {
+        let mut state = self.state.lock().unwrap();
+        state.compaction_enabled = enabled;
+        state.compaction = Some(settings);
+    }
+
+    /// 工具结果的投影设置（衰减策略在里面）。
+    pub fn set_projection(&self, projection: ProjectionContext) {
+        self.state.lock().unwrap().env.projection = projection;
+    }
+
+    /// 放过 `skip` 次 `compaction()` 之后失败一次（`setup()` 不受影响）：生成的每次 `prepare`
+    /// 都问一次，所以跳过那几次就能让之后问的压缩任务 faulted。
+    pub fn fail_compaction_after(&self, skip: usize, failure: HookError) {
+        self.state.lock().unwrap().compaction_failure = Some((skip, failure));
     }
 
     pub fn set_failure(&self, failure: Option<HookError>) {
@@ -775,6 +844,24 @@ impl AgentHooks for TestHooks {
             budget: state.budget,
             cache_key: Some("cache-1".into()),
             max_output_tokens: None,
+        })
+    }
+
+    async fn compaction(&self, conversation: ConversationId) -> Result<CompactionSetup, HookError> {
+        let setup = self.setup(conversation, &[]).await?;
+        let mut state = self.state.lock().unwrap();
+        match state.compaction_failure.take() {
+            Some((0, failure)) => return Err(failure),
+            Some((skip, failure)) => state.compaction_failure = Some((skip - 1, failure)),
+            None => {}
+        }
+        Ok(CompactionSetup {
+            enabled: state.compaction_enabled,
+            settings: state.compaction.clone().unwrap_or_default(),
+            model: setup.model,
+            prompt: SummaryPrompt::default(),
+            retry: setup.budget.retry,
+            cache_key: setup.cache_key,
         })
     }
 

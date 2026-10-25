@@ -21,17 +21,19 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use komo_kernel::durable::records::TaskOutcome;
 use komo_kernel::durable::{
-    ConversationId, Message, Storage, SubmissionId, SubmissionRecord, SubmissionStatus, TaskRecord,
+    ConversationId, Message, Storage, SubmissionId, SubmissionRecord, SubmissionStatus, TaskId,
+    TaskRecord,
 };
 use tokio::sync::Notify;
 
+use super::compaction::{self, CompactionTask};
 use super::generation::{self, GenerationTask};
 use super::hooks::HarnessDeps;
 use super::inbox::{self, Admitted, QueueModes, SubmissionDraft, WriteDraft};
 use super::live::{self, LiveState, live_address};
 use super::outcome::unanswered;
 use super::tool::ToolTask;
-use super::{GENERATION_KIND, TOOL_KIND};
+use super::{COMPACTION_KIND, GENERATION_KIND, TOOL_KIND};
 use crate::durable::engine::Engine;
 use crate::durable::error::DurableError;
 use crate::durable::kind::{Registry, TaskHooks};
@@ -87,6 +89,7 @@ impl Harness {
     pub fn install(&self, registry: &Registry) {
         registry.install(Arc::new(self.generation.clone()));
         registry.install(Arc::new(self.tool.clone()));
+        registry.install(Arc::new(self.generation.compaction().clone()));
     }
 
     /// 给 `EngineOptions::hooks`：调度器自己写的结局（faulted / orphaned）的清理。
@@ -141,6 +144,39 @@ impl Harness {
             SubmissionDraft::write(WriteDraft::reset(handoff)),
         )
         .await
+    }
+
+    /// 手动压缩（`/compact`）：起一个 conversation 所有的压缩任务，不是 background，所以
+    /// `abort_conversation` 会取消它；摘要像别的被动 write 一样放置（空闲时立刻落，忙时在下一个
+    /// boundary 落，过期了 `unanswered{stale}`）。返回任务 ID，结局从任务记录读。
+    pub async fn compact(
+        &self,
+        engine: &Engine,
+        conversation: ConversationId,
+        instructions: Option<String>,
+    ) -> Result<TaskId, DurableError> {
+        engine.resume();
+        let compaction: CompactionTask = self.generation.compaction().clone();
+        engine
+            .commit(move |tx| {
+                Box::pin(async move {
+                    let mut live = live::load(tx, conversation).await?;
+                    let mut input = compaction::Input::new(compaction::Reason::Manual, None);
+                    input.instructions = instructions;
+                    let id = compaction::task::create(
+                        tx,
+                        &compaction,
+                        conversation,
+                        &mut live,
+                        &input,
+                        None,
+                    )
+                    .await?;
+                    live::store(tx, conversation, &live).await?;
+                    Ok(id)
+                })
+            })
+            .await
     }
 
     /// 撤回一个还在排队的 submission。`conversation` 给了就只认那个 conversation 里的。
@@ -249,6 +285,7 @@ impl Harness {
 ///
 /// - 工具任务：槽位标记完成、没有 entry——上下文推导会补上缺的结果。
 /// - 生成任务：已提交的部分回复转成 aborted entry，run 的输入以 `faulted` / 孤儿原因收场。
+/// - 压缩任务：移除状态、记下 `komo.live.compactionFailure`。
 pub struct HarnessHooks;
 
 #[async_trait]
@@ -279,6 +316,21 @@ impl TaskHooks for HarnessHooks {
                     record.conversation,
                     record.id,
                     &settlement,
+                )
+                .await
+            }
+            COMPACTION_KIND => {
+                let (reason, error) = match outcome {
+                    TaskOutcome::Faulted { error } => ("faulted", error.message.as_str()),
+                    TaskOutcome::Orphaned { reason } => ("orphaned", reason.as_str()),
+                    _ => return Ok(()),
+                };
+                compaction::task::settle_scheduler_outcome(
+                    tx,
+                    record.conversation,
+                    record.id,
+                    reason,
+                    error,
                 )
                 .await
             }

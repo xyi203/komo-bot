@@ -4,6 +4,7 @@
 //! 加一个内存实现与可复用的 conformance 套件。这里没有 I/O、没有 tokio；store / runtime
 //! 在后续阶段才开始用它，旧的 ledger 与 session 树照常并存。
 
+pub mod compaction;
 #[cfg(any(test, feature = "test-support"))]
 pub mod conformance;
 pub mod context;

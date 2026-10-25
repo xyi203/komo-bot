@@ -168,9 +168,55 @@ pub struct LiveState {
     pub generation: Option<GenerationLive>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tools: Option<Vec<ToolSlot>>,
+    /// 活着的压缩任务，按任务 ID 升序；没有就不写（spec §8.7）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compactions: Option<Vec<CompactionStatus>>,
+    /// 最近一次压缩失败（直到有压缩真的产出摘要才清），让客户端在任务结束之后也看得到；
+    /// 也是旧实现 `compaction_refused` 的持久形式（`compaction::refused_after`）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compaction_failure: Option<CompactionFailure>,
+}
+
+/// 一个压缩任务的展示状态：建任务的那笔提交里加，结局提交里（或调度器清理时）移除。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompactionStatus {
+    pub task: TaskId,
+    /// `manual` / `threshold` / `overflow`。
+    pub reason: String,
+    /// 有没有生成在等它：生成自己拥有的那个。
+    pub blocking: bool,
+    pub attempt: u32,
+    /// 摘要请求失败后的持久退避。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry: Option<RetryLive>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompactionFailure {
+    pub task: TaskId,
+    pub reason: String,
+    pub error: String,
 }
 
 impl LiveState {
+    pub fn compaction_status_mut(&mut self, task: TaskId) -> Option<&mut CompactionStatus> {
+        self.compactions
+            .as_mut()?
+            .iter_mut()
+            .find(|status| status.task == task)
+    }
+
+    pub fn remove_compaction(&mut self, task: TaskId) {
+        if let Some(statuses) = self.compactions.as_mut() {
+            statuses.retain(|status| status.task != task);
+            if statuses.is_empty() {
+                self.compactions = None;
+            }
+        }
+    }
+
     pub fn is_busy(&self) -> bool {
         self.run.is_some()
     }

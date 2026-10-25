@@ -28,6 +28,11 @@ pub fn spawn(state: &Arc<GatewayState>, shutdown: &Shutdown) {
         let state = Arc::clone(state);
         tokio::spawn(async move { reconcile_monitors(&state).await });
     }
+    // W3a：重挂看客（每个非任务会话一个，未结算的输入等结算后收尾）。
+    {
+        let state = Arc::clone(state);
+        tokio::spawn(async move { super::watch::reattach(&state).await });
+    }
 }
 
 /// 启动时收掉上一代留下的监听（`docs/monitor.md` §5）：先让编排钩子核对并终止遗留的进程组、

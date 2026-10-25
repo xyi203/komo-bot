@@ -727,8 +727,9 @@ async fn the_same_request_key_with_other_content_is_a_conflict() {
 
 /// `/new` 在当前会话上追加一条边界，**不切 Session**。
 ///
-/// Durable 下的 `/new` 有两个入口：这里测的是 HTTP 的 `POST /boundary`（TUI 用）；聊天渠道
-/// 的 `/new` 经 `dispatcher_v2`（W3a），到时候把下面那条 Legacy 的聊天版迁过去。
+/// Durable 下的 `/new` 有两个入口：HTTP 的 `POST /boundary`（TUI 用）与聊天渠道的 `/new`
+/// （`dispatcher_v2`，W3a 并进来：原先分开的 `_through_chat_legacy` 只测了回执与同一个 home
+/// session，这里的断言更强——边界真的落进同一个会话的历史）。
 #[tokio::test]
 async fn slash_new_appends_a_boundary_to_the_same_session() {
     use crate::service::test_support::harness::FakeLlm;
@@ -785,32 +786,27 @@ async fn slash_new_appends_a_boundary_to_the_same_session() {
             .any(|entry| matches!(entry.kind, EntryKind::Compaction { .. })),
         "{after:?}"
     );
-}
 
-/// 聊天渠道的 `/new`（Legacy 存储）：W3a 把它迁到 `dispatcher_v2` 之后并进上面那条。
-#[tokio::test]
-async fn slash_new_appends_a_boundary_to_the_same_session_through_chat_legacy() {
-    let gateway = TestGateway::start().await;
-    let first = gateway
-        .dispatcher()
-        .handle(operator_dm("在", "telegram:1"))
-        .await
-        .unwrap();
-    let InboundAck::Queued { session, .. } = first else {
-        panic!("{first:?}");
-    };
-
+    // 聊天渠道的 `/new`：回执，落在**同一个** home session（操作者私聊就是它），又多一条边界。
     let ack = gateway
         .dispatcher()
         .handle(operator_dm("/new", "telegram:2"))
         .await
         .unwrap();
-    assert!(matches!(ack, InboundAck::Replied { .. }), "{ack:?}");
-
-    // 还是同一个 home session。
-    assert_eq!(
-        gateway.state().default_main_session().await.unwrap(),
-        session
+    assert!(
+        matches!(&ack, InboundAck::Replied { text } if text.contains("新的一段")),
+        "{ack:?}"
+    );
+    let (_, body) = gateway.get("/v1/home-session").await;
+    assert_eq!(home(body), session, "聊天里的 /new 也不切 Session");
+    let (_, body) = gateway.get(&format!("/v1/sessions/{session}/tree")).await;
+    let after_chat = entries_of(body);
+    assert!(
+        after_chat.len() > after.len()
+            && after_chat[after.len()..]
+                .iter()
+                .any(|entry| matches!(entry.kind, EntryKind::Compaction { .. })),
+        "{after_chat:?}"
     );
 }
 
@@ -2590,4 +2586,282 @@ async fn an_end_to_end_turn_completes_and_reaches_the_event_stream_durable() {
         "next 是最后一帧的号"
     );
     shutdown.cancel();
+}
+
+// ---------------------------------------------------------------- 聊天渠道（Durable 存储，D5 W3a）
+//
+// 下面五个与上面 Legacy 的同名测试各是一对：同一句话、同一个意图，Gateway 跑在新存储上。读账本的
+// 地方从 `runs` 表 / JSONL 换成 sessions 行、submission 与 entry；与 Legacy 不同的断言写在各自的注释里。
+
+mod durable_chat {
+    use super::*;
+    use crate::service::test_support::harness::{
+        FakeLlm, FixedFactory, GatewayBuilder, MemSender, TestGateway as Harness, durable_inputs_of,
+    };
+
+    /// 起一台跑在新存储上的 Gateway：Telegram 渠道（操作者 111）+ 内存发送口。
+    async fn start(llm: Arc<FakeLlm>) -> (crate::service::test_support::TestGateway, Arc<FakeLlm>) {
+        let gateway = crate::service::test_support::TestGateway::durable(
+            &telegram_config("111"),
+            Arc::clone(&llm),
+        )
+        .await;
+        (gateway, llm)
+    }
+
+    /// ① 同一个 `request_key` 重发只产生一个 Run。
+    #[tokio::test]
+    async fn a_replayed_message_produces_one_run() {
+        let (gateway, _) = start(FakeLlm::finisher("好")).await;
+        let first = gateway
+            .dispatcher()
+            .handle(operator_dm("帮我看看", "telegram:42"))
+            .await
+            .expect("第一条");
+        let InboundAck::Queued { session, run } = first else {
+            panic!("第一条应该排队：{first:?}");
+        };
+
+        // 平台重投：同一个 update_id 再来一次。
+        let again = gateway
+            .dispatcher()
+            .handle(operator_dm("帮我看看", "telegram:42"))
+            .await
+            .expect("重投");
+        assert_eq!(
+            again,
+            InboundAck::Duplicate {
+                run: Some(run.clone())
+            },
+            "重投不该开第二个 Run"
+        );
+
+        // 改了断言的读法：Legacy 数 `runs` 表，新存储里一条 run 就是它的首个输入 submission。
+        assert_eq!(
+            durable_inputs_of(gateway.state(), session.as_str()).await,
+            1,
+            "账本上只有一个 Run"
+        );
+    }
+
+    /// 聊天渠道的普通消息以插话受理（§6，2026-10-23）：宿主 Run 忙着跑工具时，同一个 peer 的
+    /// 下一句话由它在下一次请求模型之前并进去，不排到整条 Run 后面。
+    ///
+    /// 改了断言：Legacy 看 `run.accepted` 上的 `interject` 标记；新存储的 RunAccepted 是合成的，
+    /// 没有那一格，插话体现为行为——宿主停在 `gate` 上时第二句话并进它（终态 `absorbed`），
+    /// 渠道收到"已并入"，回答只有宿主给的一次。
+    #[tokio::test]
+    async fn a_plain_chat_message_is_accepted_as_an_interjection() {
+        use crate::service::test_support::Gate;
+        let sender = MemSender::new(ChannelPlatform::Telegram);
+        let gate = Gate::new();
+        let gateway = GatewayBuilder::new(&telegram_config("111"))
+            .durable()
+            .fake_llm(FakeLlm::new(vec![vec![
+                call_round(1, "pc-1", "gate", serde_json::json!({})),
+                text_round(2, "好了。"),
+            ]]))
+            .tool(gate.tool())
+            .factory(FixedFactory::sender_only(
+                Arc::clone(&sender) as Arc<dyn crate::channels::ChannelSender>
+            ))
+            .start()
+            .await;
+        let ack = gateway.handle(operator_dm("稍等", "telegram:50")).await;
+        let InboundAck::Queued { run: host, .. } = ack else {
+            panic!("应该排队：{ack:?}");
+        };
+        gate.wait_entered(1).await;
+        let ack = gateway.handle(operator_dm("补一句", "telegram:51")).await;
+        let InboundAck::Queued { run: second, .. } = ack else {
+            panic!("应该排队：{ack:?}");
+        };
+
+        gate.release();
+        gateway.wait_run(&host).await;
+        gateway.wait_run(&second).await;
+        let (code, body) = gateway.get(&format!("/v1/runs/{second}")).await;
+        assert_eq!(code, 200, "{body}");
+        let detail: komo_kernel::protocol::http::RunDetail = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            detail.summary.state,
+            RunState::Absorbed,
+            "渠道的普通消息带插话：并进了宿主，没有另开一条"
+        );
+        let told = sender.sent().iter().any(|message| {
+            matches!(&message.outbound, Outbound::RunAbsorbed { run, into, .. }
+                if run == &second && into == &host)
+        });
+        assert!(told, "渠道要收到并入通知：{:?}", sender.sent());
+    }
+
+    /// 渠道带来的话题上下文：普通文本把它拼进提交的正文（引用块 + "发给你的消息："），
+    /// 命令只解析原文、不受影响（§11.3 话题上下文）。
+    ///
+    /// 改了断言的读法：正文从输入 entry（`chat.input`）读，不再从 JSONL 的 `run.accepted`；"命令没有
+    /// 起第二个 Run"数的是 submission。
+    #[tokio::test]
+    async fn thread_context_is_prepended_to_plain_text_but_never_to_commands() {
+        let (gateway, _) = start(FakeLlm::finisher("好")).await;
+
+        let mut plain = operator_dm("看看 owl 的两条 Blocking", "telegram:60");
+        plain.context = Some("张三 10:23：B1 在 Drop，B2 在 escape".into());
+        let ack = gateway.dispatcher().handle(plain).await.expect("处理了");
+        let InboundAck::Queued { session, run } = ack else {
+            panic!("应该排队：{ack:?}");
+        };
+        gateway.wait_run(&run).await;
+        let tree = gateway
+            .state()
+            .core()
+            .unwrap()
+            .read_tree(session.as_str())
+            .await
+            .expect("读得出树");
+        let text = tree
+            .branches
+            .iter()
+            .flat_map(|branch| branch.entries.iter())
+            .filter(|entry| entry.kind == "chat.input")
+            .find_map(crate::service::durable::tree::input_text)
+            .expect("这条输入放置过");
+        assert!(text.starts_with("> 【话题上下文】"), "{text}");
+        assert!(
+            text.contains("> 张三 10:23：B1 在 Drop，B2 在 escape\n"),
+            "{text}"
+        );
+        assert!(
+            text.ends_with("发给你的消息：\n看看 owl 的两条 Blocking"),
+            "{text}"
+        );
+
+        // 命令：照旧按原文解析，上下文被丢掉，不起 Run。
+        let mut status = operator_dm("/status", "telegram:61");
+        status.context = Some("张三 10:23：这段不该影响命令".into());
+        let ack = gateway.dispatcher().handle(status).await.expect("处理了");
+        assert!(matches!(ack, InboundAck::Replied { .. }), "{ack:?}");
+        assert_eq!(
+            durable_inputs_of(gateway.state(), session.as_str()).await,
+            1,
+            "命令没有起第二个 Run"
+        );
+    }
+
+    /// ② 不在 `allow_from` 的发送者被拒、`/id` 对他可用、且**会话与 deliveries 无任何记录**。
+    #[tokio::test]
+    async fn a_stranger_is_refused_and_leaves_no_trace() {
+        let (gateway, _) = start(FakeLlm::finisher("好")).await;
+        let stranger = inbound(
+            ChannelPlatform::Telegram,
+            "999",
+            "999",
+            "在吗",
+            "telegram:1",
+            true,
+        );
+
+        let ack = gateway.dispatcher().handle(stranger).await.expect("处理了");
+        let InboundAck::Rejected { hint } = ack else {
+            panic!("不在名单里的应该被拒：{ack:?}");
+        };
+        assert!(hint.contains("999"), "{hint}");
+        assert!(hint.contains("allow_from"), "{hint}");
+
+        // `/id` 对任何人可用——这是唯一不要求操作者身份的命令。
+        let id = gateway
+            .dispatcher()
+            .handle(inbound(
+                ChannelPlatform::Telegram,
+                "999",
+                "999",
+                "/id",
+                "telegram:2",
+                true,
+            ))
+            .await
+            .expect("处理了");
+        assert!(
+            matches!(&id, InboundAck::Replied { text } if text.contains("telegram:999")),
+            "{id:?}"
+        );
+
+        // 不留任何记录：没有会话、没有投递。
+        let sessions = gateway
+            .state()
+            .core()
+            .unwrap()
+            .list_sessions(true)
+            .await
+            .expect("读得到");
+        assert!(
+            sessions.is_empty(),
+            "被拒绝的消息不该建出会话：{sessions:?}"
+        );
+        let pending = gateway
+            .state()
+            .notifier
+            .log()
+            .pending(None)
+            .await
+            .expect("读得到");
+        assert!(pending.is_empty(), "也不该留下投递记录：{pending:?}");
+    }
+
+    /// ⑥ `Deferred` 的投递在下一条入站消息时先被冲刷。
+    #[tokio::test]
+    async fn a_deferred_delivery_is_flushed_before_the_next_message() {
+        let (gateway, _) = start(FakeLlm::finisher("好")).await;
+        // 微信那条路径：此刻没有回复令牌。
+        gateway.channel.defer(true);
+
+        let peer = ChannelPeer::new(ChannelPlatform::Telegram, "111");
+        let delivery = gateway
+            .state()
+            .notifier
+            .deliver(
+                &DeliveryTarget::to_peer(peer.clone()),
+                Outbound::Text {
+                    text: "要批一下".into(),
+                },
+            )
+            .await;
+        use komo_kernel::traits::Notifier;
+        let delivery = delivery.expect("登记得上");
+        assert_eq!(
+            delivery.state,
+            komo_kernel::types::chat::DeliveryState::Deferred
+        );
+        assert!(
+            gateway.channel.sent().is_empty(),
+            "推不出去就没有送出这一条"
+        );
+
+        // 用户发了消息，令牌有了。
+        gateway.channel.defer(false);
+        gateway
+            .dispatcher()
+            .handle(operator_dm("在", "telegram:9"))
+            .await
+            .expect("处理了");
+
+        let sent = gateway.channel.sent();
+        assert!(
+            sent.iter().any(
+                |message| matches!(&message.outbound, Outbound::Text { text } if text == "要批一下")
+            ),
+            "积压的那一条要先送到：{sent:?}"
+        );
+        assert!(
+            gateway
+                .state()
+                .notifier
+                .log()
+                .pending(None)
+                .await
+                .unwrap()
+                .is_empty(),
+            "冲刷之后不再 pending"
+        );
+        let _: Option<Harness> = None;
+    }
 }

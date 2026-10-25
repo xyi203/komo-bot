@@ -23,6 +23,8 @@
 //! | `shell` | `!` 命令直跑（不建 run），落 `shell.command` write | W2a |
 //! | `monitor_runner` | `MonitorRunner`：监听与转后台命令的进程、泵、合批、时限、遗留进程核对 | W2c |
 //! | `tasks` | 任务会话的展示：短号 `#<conversation>`、列表一行、标签 | W2c |
+//! | `watch` | 看客：终态回给输入的来源对端、并入通知、重启补挂 | W3a |
+//! | `titles` | 首轮跑完后起标题（读写 sessions 行） | W3a |
 //! | `feed` | 提交订阅 → SSE 帧（投影、`AssistantDelta`）与事件补读 | W2b |
 
 pub mod agent_doc;
@@ -39,7 +41,9 @@ pub mod sessions;
 pub mod shell;
 pub mod submit;
 pub mod tasks;
+pub mod titles;
 pub mod tree;
+pub mod watch;
 
 pub use self::core::DurableCore;
 pub use assemble::StateSlot;
@@ -53,3 +57,5 @@ mod run_tests;
 mod session_tests;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod watch_tests;

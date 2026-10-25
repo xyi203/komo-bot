@@ -868,6 +868,7 @@ impl GatewayBuilder {
             env: self.env,
             running: Some(running),
             factories: self.factories,
+            durable: self.storage == StorageMode::Durable,
         }
     }
 }
@@ -881,9 +882,25 @@ pub struct TestGateway {
     env: String,
     running: Option<Running>,
     factories: Vec<Arc<dyn ChannelFactory>>,
+    /// 跑在新存储上：重启要沿用同一种（模型替身是一个收尾 `好` 的 `FakeLlm`）。
+    durable: bool,
 }
 
 impl TestGateway {
+    /// 同 [`Self::start`]，跑在新存储上（`FakeLlm::finisher("好")` 当模型）。
+    pub async fn start_durable() -> (TestGateway, Arc<MemSender>) {
+        let sender = MemSender::new(ChannelPlatform::Telegram);
+        let gateway = GatewayBuilder::new(&telegram_config("111"))
+            .durable()
+            .fake_llm(FakeLlm::finisher("好"))
+            .factory(FixedFactory::sender_only(
+                Arc::clone(&sender) as Arc<dyn ChannelSender>
+            ))
+            .start()
+            .await;
+        (gateway, sender)
+    }
+
     /// 默认配置：一个 Telegram 渠道（操作者 111）+ 一个内存发送口。
     pub async fn start() -> (TestGateway, Arc<MemSender>) {
         let sender = MemSender::new(ChannelPlatform::Telegram);
@@ -956,6 +973,9 @@ impl TestGateway {
     pub async fn restart_with(&mut self, config: &str, factories: Vec<Arc<dyn ChannelFactory>>) {
         self.stop().await;
         let mut builder = GatewayBuilder::new(config).env(&self.env).at(&self.home);
+        if self.durable {
+            builder = builder.durable().fake_llm(FakeLlm::finisher("好"));
+        }
         for factory in &factories {
             builder = builder.factory(Arc::clone(factory));
         }
@@ -1076,6 +1096,63 @@ impl TestGateway {
     /// 只在 Durable 下有意义：`RunId` 是 run 首个输入 submission 的十进制 ID。
     pub async fn wait_run(&self, run: &RunId) -> komo_kernel::durable::SubmissionRecord {
         wait_run(self.state(), run).await
+    }
+
+    /// Durable：全部会话（含已删除的）的"来源"，与 Legacy 的 `sessions.origin` 同一套说法——
+    /// 主会话是 `home`，其余是 `source`（`chat:{peer}`）。任务会话与 cron 会话不算（Legacy 的
+    /// `origin` 对它们是 `task:…` / `cron:…`，聊天测试里没有它们）。
+    pub async fn durable_origins(&self) -> Vec<String> {
+        use komo_kernel::durable::SessionKind;
+        let core = self.state().core().expect("Durable 模式");
+        core.list_sessions(true)
+            .await
+            .expect("读得出")
+            .into_iter()
+            .filter_map(|record| match record.kind {
+                SessionKind::Main => Some("home".to_owned()),
+                SessionKind::Normal => Some(record.source.unwrap_or_default()),
+                SessionKind::Task | SessionKind::Cron => None,
+            })
+            .collect()
+    }
+
+    /// Durable：来源为 `origin`（`home` 或 `chat:…`）的会话 ID。
+    pub async fn durable_session_of(&self, origin: &str) -> Option<String> {
+        use komo_kernel::durable::SessionKind;
+        let core = self.state().core().expect("Durable 模式");
+        core.list_sessions(true)
+            .await
+            .expect("读得出")
+            .into_iter()
+            .find(|record| match record.kind {
+                SessionKind::Main => origin == "home",
+                _ => record.source.as_deref() == Some(origin),
+            })
+            .map(|record| record.id)
+    }
+
+    /// Durable：把一个会话的 `sessions` 行标成已逻辑删除（`lifecycle = deleted`）。生命周期（W4a）
+    /// 合入前，测"被删的会话不再接消息"用它；W4a 之后换成 HTTP 的 delete。
+    pub async fn durable_soft_delete(&self, session: &str) {
+        use komo_kernel::durable::SessionLifecycle;
+        let core = self.state().core().expect("Durable 模式");
+        let id = session.to_owned();
+        core.engine
+            .commit(move |tx| {
+                Box::pin(async move {
+                    let mut record = tx.session(&id).await?.expect("会话在");
+                    record.lifecycle = SessionLifecycle::Deleted;
+                    tx.put_session(record);
+                    Ok(())
+                })
+            })
+            .await
+            .expect("提交得了");
+    }
+
+    /// Durable：一个会话里受理过的输入 submission 数（排队的、并进别人 run 的都算一条）。
+    pub async fn durable_inputs(&self, session: &str) -> usize {
+        durable_inputs_of(self.state(), session).await
     }
 
     pub async fn runs_of(&self, session: &SessionId) -> Vec<komo_store::repos::runs::RunRecord> {
@@ -1427,6 +1504,9 @@ impl Gw {
 
     /// 这条 Run 现在**在等什么**（§8.4 的第二维）。`None` = 它没停在等待上。
     pub async fn db_wait(&self, run: &RunId) -> Option<komo_kernel::types::status::WaitReason> {
+        if self.state().durable.is_some() {
+            return self.run_detail(run).await.summary.wait;
+        }
         komo_store::repos::runs::get(&self.state().db, run)
             .await
             .expect("读得到")
@@ -1495,6 +1575,47 @@ fn submission_of(run: &RunId) -> komo_kernel::durable::SubmissionId {
         .parse()
         .unwrap_or_else(|_| panic!("{run} 不是 Durable 的 RunId（十进制 submission ID）"));
     komo_kernel::durable::SubmissionId::new(raw)
+}
+
+/// Durable：一个会话里受理过的输入 submission 数（排队的、并进别人 run 的都算一条）。
+pub async fn durable_inputs_of(state: &GatewayState, session: &str) -> usize {
+    use komo_kernel::durable::SubmissionKind;
+    use komo_kernel::durable::storage::{ConversationQuery, SubmissionQuery};
+    let core = state.core().expect("Durable 模式");
+    let conversations = core
+        .storage
+        .scan_conversations(
+            &ConversationQuery {
+                session: Some(session.to_owned()),
+                ..ConversationQuery::default()
+            },
+            10_000,
+            None,
+        )
+        .await
+        .expect("读得出")
+        .items;
+    let mut count = 0;
+    for conversation in conversations {
+        let page = core
+            .storage
+            .scan_submissions(
+                &SubmissionQuery {
+                    conversation: Some(conversation.id),
+                    ..SubmissionQuery::default()
+                },
+                10_000,
+                None,
+            )
+            .await
+            .expect("读得出");
+        count += page
+            .items
+            .iter()
+            .filter(|record| matches!(record.kind, SubmissionKind::Input { .. }))
+            .count();
+    }
+    count
 }
 
 /// 轮询 submission 状态直到结算（最多 20 秒）。`TestGateway::wait_run` 两份共用。

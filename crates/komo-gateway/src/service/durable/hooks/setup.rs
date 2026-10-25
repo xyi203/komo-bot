@@ -19,7 +19,7 @@ use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
 
-use komo_kernel::durable::{ConversationId, Storage};
+use komo_kernel::durable::{ConversationId, SessionKind, Storage};
 use komo_kernel::protocol::config::ConfigSnapshot;
 use komo_kernel::types::agent::AgentProfile;
 use komo_kernel::types::ids::SessionId;
@@ -40,6 +40,8 @@ pub(crate) struct Resolved {
     pub conversation: ConversationId,
     /// 工具输出与 blob 落在哪个 Session 目录。
     pub session: SessionId,
+    /// sessions 行的类型；conversation 没登记 Session（只在测试里直接建的 conversation）时为空。
+    pub kind: Option<SessionKind>,
     pub agent_id: String,
     pub profile: AgentProfile,
     /// 生效的 `komo.agent`：自己的，没有就是（任务会话）父的；都没有 = 默认 Agent。
@@ -64,7 +66,10 @@ impl Resolved {
 
     /// 对话会话里直接受理的输入（不是任务会话、也不是 cron）：`bash` 才转后台、禁长 sleep。
     pub fn is_conversation(&self) -> bool {
-        // W0a 合并后: 读 sessions 行的 `kind`（`main` / `normal` / `task` / `cron`），不再靠 `source`。
+        if let Some(kind) = self.kind {
+            return self.task.is_none() && matches!(kind, SessionKind::Main | SessionKind::Normal);
+        }
+        // 没登记 Session 的 conversation：按 `komo.agent.source` 认 cron。
         self.task.is_none()
             && !self
                 .doc
@@ -171,7 +176,7 @@ fn resolve_at<'a>(
         model.context_window = state.windows.effective(&model);
 
         let own_session = task.is_some();
-        let session = session_of(storage, conversation, own_session).await?;
+        let (session, kind) = session_of(storage, conversation, own_session).await?;
         let cache_key = match (&task, &parent) {
             (Some(task), Some(parent)) if task.fork => parent.session.to_string(),
             _ => session.to_string(),
@@ -197,6 +202,7 @@ fn resolve_at<'a>(
         Ok(Resolved {
             conversation,
             session,
+            kind,
             agent_id: profile.id.clone(),
             profile,
             doc,
@@ -209,16 +215,28 @@ fn resolve_at<'a>(
     })
 }
 
-/// conversation 属于哪个 Session 目录。
+/// conversation 属于哪个 Session（目录与类型）：读 `ConversationRecord.session` 与 sessions 行
+/// （分支 fork 继承父的 session；任务子 conversation 在派出的提交里有自己的 sessions 行）。
 ///
-/// W0a 合并后: 读 `ConversationRecord.session`（任务子 conversation 在派出的提交里有自己的
-/// sessions 行）。合并前的替身：对话 conversation 沿 fork 的 `parent` 走到根，用根的 ID；任务
-/// 会话就是它自己。
+/// 没登记 Session 的 conversation（只在测试里直接建）退回替身：对话沿 fork 的 `parent` 走到根，
+/// 用 `c{根 ID}`；任务会话用它自己。
 async fn session_of(
     storage: &dyn Storage,
     conversation: ConversationId,
     own_session: bool,
-) -> Result<SessionId, HookError> {
+) -> Result<(SessionId, Option<SessionKind>), HookError> {
+    let record = storage
+        .conversation(conversation)
+        .await
+        .map_err(|e| HookError::Failed(format!("读 conversation {conversation} 失败：{e}")))?;
+    if let Some(id) = record.and_then(|record| record.session) {
+        let kind = storage
+            .session(&id)
+            .await
+            .map_err(|e| HookError::Failed(format!("读 Session {id} 失败：{e}")))?
+            .map(|session| session.kind);
+        return Ok((SessionId::from_raw(id), kind));
+    }
     let mut root = conversation;
     if !own_session {
         for _ in 0..64 {
@@ -232,7 +250,7 @@ async fn session_of(
             }
         }
     }
-    Ok(SessionId::from_raw(format!("c{root}")))
+    Ok((SessionId::from_raw(format!("c{root}")), None))
 }
 
 /// 配置里的 effort 字符串：`off` = 不带 effort。

@@ -22,7 +22,10 @@ use komo_kernel::types::status::Claimed;
 use komo_kernel::types::tool::CancelToken;
 use tokio::sync::{Notify, Semaphore};
 
-pub use cron::{CronError, CronScheduler, CronTick, Fired, SkipReason, Skipped};
+pub use cron::{
+    CronError, CronScheduler, CronTarget, CronTick, FireSpec, Fired, FiredRef, LedgerCronTarget,
+    SkipReason, Skipped, firing_key, model_for,
+};
 pub use zone::JiffZoneResolver;
 
 /// 领到一个 Run 之后交给谁。

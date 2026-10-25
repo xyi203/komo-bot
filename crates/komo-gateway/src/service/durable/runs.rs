@@ -202,11 +202,15 @@ fn source_of(log: &Log, session: &str, submission: &SubmissionRecord) -> PlanSou
                 | InputState::Unanswered {
                     entry: Some(entry), ..
                 },
+        }
+        // 命令型 cron（与 `!`）是一条 `shell.command` write，不是输入。
+        | SubmissionKind::Write {
+            state: WriteState::Done { entry },
         } => log.entries.iter().find(|candidate| candidate.id == *entry),
         _ => None,
     };
     if let Some(entry) = entry
-        && entry.kind == "cron.input"
+        && matches!(entry.kind.as_str(), "cron.input" | "shell.command")
         && let Some(job) = entry
             .data
             .as_ref()

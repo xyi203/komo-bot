@@ -33,6 +33,8 @@ pub fn spawn(state: &Arc<GatewayState>, shutdown: &Shutdown) {
         let state = Arc::clone(state);
         tokio::spawn(async move { super::watch::reattach(&state).await });
     }
+    // W3b：cron——启动补做上一代没做完的触发，再一分钟一扫。
+    super::cron::spawn(state, shutdown);
 }
 
 /// 启动时收掉上一代留下的监听（`docs/monitor.md` §5）：先让编排钩子核对并终止遗留的进程组、

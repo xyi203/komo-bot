@@ -25,6 +25,8 @@
 //! | `tasks` | 任务会话的展示：短号 `#<conversation>`、列表一行、标签 | W2c |
 //! | `watch` | 看客：终态回给输入的来源对端、并入通知、重启补挂 | W3a |
 //! | `titles` | 首轮跑完后起标题（读写 sessions 行） | W3a |
+//! | `cron` | cron 的 `CronTarget`（一次提交建会话 + 受理）、重启补做、tick 的 spawn | W3b |
+//! | `cron_watch` | 按 run 终态帧（`komo.settled`）回写触发状态、按 `notify` 投递 | W3b |
 //! | `feed` | 提交订阅 → SSE 帧（投影、`AssistantDelta`）与事件补读 | W2b |
 
 pub mod agent_doc;
@@ -32,6 +34,8 @@ pub mod assemble;
 pub mod background;
 pub mod copy;
 pub mod core;
+pub mod cron;
+pub mod cron_watch;
 pub mod feed;
 pub mod hooks;
 pub mod monitor_runner;

@@ -535,7 +535,7 @@ finalize     → blob 收尾同步 → 提交结果 entry（projection.rs 的 fu
 | `komo init` | `komo-runtime/src/config/init.rs`；bin 的 `Command::Init` 只分发 | init 7 项、bin 1 项加一条 clap 解析断言 |
 | D4c 压缩（`d4c-compaction`） | 纯逻辑 `crates/komo-kernel/src/durable/compaction.rs`（切点、摘要输入序列化、衰减候选与 `edits`、从 entry 折在线状态）；`crates/komo-runtime/src/durable/harness/compaction/`（`setup` 钩子值 · `plan` 缓存账决策 · `task` `komo.compaction` 任务）；`generation.rs` 的 `prepare` / 超长分支；`live.rs` 的 `compactions` 与 `compactionFailure`；`Harness::compact`；`AgentHooks::compaction` | kernel 11 项、runtime 25 项（`plan` 8 项单测 + `tests/compaction.rs` 17 项集成，含 Turso `Storage` 上的超长救援与重开回放） |
 
-合入时（`durable-integration` 分支）强制重编后 `cargo test --workspace`：**2558 通过，0 失败**。D4c 的 probe 与接线（`d4c-probe-gaps`，基于 `main` 的 52ae527c）：**2587 通过，0 失败，11 忽略**。D4c 压缩（`d4c-compaction`，同一基线）：**2594 通过，0 失败，11 忽略**。
+合入时（`durable-integration` 分支）强制重编后 `cargo test --workspace`：**2558 通过，0 失败**。D4c 的 probe 与接线（`d4c-probe-gaps`，基于 `main` 的 52ae527c）：**2587 通过，0 失败，11 忽略**。D4c 压缩（`d4c-compaction`，同一基线）：**2594 通过，0 失败，11 忽略**。两者合入集成分支 `d4c` 后：**2623 通过，0 失败，11 忽略**。
 
 ### 13.2 实现与本文的偏离（都已接受）
 

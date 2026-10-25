@@ -381,6 +381,20 @@ pi-durable 没有删除。komo 保留 `closing → deleted → purged`：
 | D6 导出 | `komo session export SESSION_ID`：输出 pi v3 树形 JSONL（带 blob 引用）；不导入旧会话（§8） | 导出的文件能被 pi 的 session-manager 读入，分支与当前位置一致 |
 | D7 收尾 | 删旧 ledger 代码，改写 `docs/komo_bot.md` §8、AGENTS.md 结构规则、§14 验收表 | — |
 
+### D6 导出（**已完成 2026-10-25**，D5 W4c）
+
+`GET /v1/sessions/{id}/export` → `komo session export SESSION_ID [-o FILE]`（`http/v2/export.rs`）。输出 `application/x-ndjson`：
+
+- **header**：pi v3 的 `{type:"session", version:3, id, timestamp, cwd, parentSession?}`，多一个 `komoBlobRoot`（Session 目录的绝对路径；pi 忽略未知字段）。
+- **entry**：`pi_tree(..)` 的结果逐条原样（与 `/tree` 同一投影：一条 durable entry 可展开成 `"{id}"`、`"{id}:{n}"`，分支 = 同一 `parentId` 下的多个孩子，压缩 / 标签 / 分支摘要 / fork 各有对应 entry 类型）。
+- **blob 引用**：pi 格式没有外部字节的约定（图片是内联 base64），所以保持 komo 的引用：图片块 `{type:"image", mime, path, hash}`（`path` 相对 `komoBlobRoot`）、消息里的 `artifact://…` 与 `details` 里的 `tool-output/…` 路径都落在 `komoBlobRoot` 之下，不内联字节。
+- **当前位置**：pi 读文件时最后一条 entry 就是 leaf（导航不落盘）。导出把 leaf 安排在文件末尾：本来就是末条则原样；leaf 没有后代且不是 `label` / `session_info`（这两种按文件顺序后写者胜）则挪到最后；否则追加 `custom` entry `komo.leaf`（`parentId` = leaf，`data.leafId` 记真位置，`custom` 不进上下文）。"第一条之前"是一个新根的 `komo.leaf`，上下文为空。
+- 只出不进；Legacy 存储没有这个路由（404）。
+
+验证：`export_round_trips_through_session_tree_with_branches_and_leaf` 等四个用例经 HTTP 导出后用 kernel 的 `SessionTree`（与 pi 同样"文件序还原、末条为 leaf"）读回，分支数、leaf、标签、名字与 leaf 处推导出的上下文都与 `/tree` 一致；覆盖带压缩、标签、分支摘要、上下文编辑、fork 的会话。
+
+**用 pi 真读**：**跳过**。本机没有 node / npm / bun / deno（`/home/xyi203/code/pi` 无 `node_modules`、`dist`），装运行时要联网，按约定不全局安装。已对着 `packages/coding-agent/src/core/session-manager.ts`（8efd314fa）逐点核对：`loadEntriesFromFile` 只做 `JSON.parse` 逐行；`type:"session"` 为 header（`version >= 3` 不迁移）；`_buildIndex` 按文件序建 `byId`、`leafId` = 最后一条非 header entry；`buildSessionPath` 沿 `parentId` 回溯；`custom` 与未知字段不进上下文；`context_edit` / `compaction` / `branch_summary` / `label` / `session_info` 都是 pi 自己的类型。装好 node 后可用 `SessionManager.open(file)` 读一遍并核对 `getLeafId()` 与 `getEntries()`；这一步仍待做。
+
 ## 10. D0 实测（2026-10-23）
 
 本机（8 核，xfs 根分区），turso 0.7.2 release，`synchronous=FULL`，`data_sync_retry=1`，库放在真盘上（scratchpad 是

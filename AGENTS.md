@@ -29,6 +29,7 @@ komo resume SESSION_ID
 komo gateway [--foreground] | gateway status|stop|restart
 komo config check | config reload
 komo channel list|probe | channel wechat login
+komo session list|delete|purge|export SESSION_ID [-o FILE]   # export = pi v3 树形 JSONL
 komo intervention list|show|answer
 komo cron … | komo memory … | komo skills … | komo doctor
 komo update                    # swap the on-disk binary from the GitHub release (§13.6)

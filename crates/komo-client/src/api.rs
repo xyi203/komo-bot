@@ -302,6 +302,33 @@ impl KomoClient {
         self.get(&format!("/v1/sessions/{session}/tree")).await
     }
 
+    /// 导出成 pi v3 树形 JSONL（D6）：原样的文本，一行一条记录，第一行是 header。
+    pub async fn export_session(&self, session: &SessionId) -> ClientResult<String> {
+        let path = format!("/v1/sessions/{session}/export");
+        let fetch = |client: &KomoClient| {
+            let request = client.authed(client.http.get(client.url(&path)));
+            async move {
+                let response = request.send().await?;
+                let status = response.status().as_u16();
+                let body = response.text().await?;
+                if (200..300).contains(&status) {
+                    Ok(body)
+                } else {
+                    Err(ClientError::from_body(status, &body))
+                }
+            }
+        };
+        match fetch(self).await {
+            Err(error) if is_stale_connection(&error) => {
+                if !self.refresh().await {
+                    return Err(error);
+                }
+                fetch(self).await
+            }
+            other => other,
+        }
+    }
+
     pub async fn navigate_session(
         &self,
         session: &SessionId,

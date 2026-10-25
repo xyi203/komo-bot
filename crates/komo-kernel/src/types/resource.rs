@@ -256,18 +256,41 @@ fn parse_artifact(segments: Vec<&str>, raw: &str) -> Result<ResourceUri, UriErro
             path: join_path(path),
         }),
         [run, call, attempt, file] => {
-            let run = RunId::parse(run).map_err(|_| UriError::BadId {
-                part: "run",
-                value: (*run).to_string(),
-            })?;
-            let call = ToolCallId::parse(call).map_err(|_| UriError::BadId {
-                part: "call",
-                value: (*call).to_string(),
-            })?;
-            let attempt = AttemptId::parse(attempt).map_err(|_| UriError::BadId {
-                part: "attempt",
-                value: (*attempt).to_string(),
-            })?;
+            // 旧存储的三段是 UUID；新存储里是 `{conversation}/{工具任务}/{第几次尝试}`——十进制数字
+            // （`tool-output/{conversation}/{task}/{attempt}/`）。数字不含路径分隔符，拼路径安全；
+            // 其他不是 UUID 的仍然是 `BadId`。
+            let digits =
+                |raw: &str| !raw.is_empty() && raw.bytes().all(|byte| byte.is_ascii_digit());
+            let run = match RunId::parse(run) {
+                Ok(id) => id,
+                Err(_) if digits(run) => RunId::from_raw(*run),
+                Err(_) => {
+                    return Err(UriError::BadId {
+                        part: "run",
+                        value: (*run).to_string(),
+                    });
+                }
+            };
+            let call = match ToolCallId::parse(call) {
+                Ok(id) => id,
+                Err(_) if digits(call) => ToolCallId::from_raw(*call),
+                Err(_) => {
+                    return Err(UriError::BadId {
+                        part: "call",
+                        value: (*call).to_string(),
+                    });
+                }
+            };
+            let attempt = match AttemptId::parse(attempt) {
+                Ok(id) => id,
+                Err(_) if digits(attempt) => AttemptId::from_raw(*attempt),
+                Err(_) => {
+                    return Err(UriError::BadId {
+                        part: "attempt",
+                        value: (*attempt).to_string(),
+                    });
+                }
+            };
             let file =
                 OutputFile::parse(file).ok_or_else(|| UriError::UnknownPart(raw.to_string()))?;
             Ok(ResourceUri::Output {
@@ -584,6 +607,25 @@ mod tests {
         assert!(matches!(
             ResourceUri::parse("artifact://not-a-uuid/x/y/stdout"),
             Err(UriError::BadId { part: "run", .. })
+        ));
+    }
+
+    /// 新存储的工具输出入口是 `artifact://{conversation}/{工具任务}/{尝试}/result`（十进制数字，不是 UUID）：
+    /// 投影印给模型的就是它，必须解析得回来；带路径成分的数字以外的东西仍然不收。
+    #[test]
+    fn a_durable_output_entry_with_decimal_ids_parses_back() {
+        let uri = round_trip("artifact://3/9/1/result");
+        assert!(matches!(uri, ResourceUri::Output { .. }));
+        assert!(matches!(
+            ResourceUri::parse("artifact://3/..%2f9/1/result"),
+            Err(UriError::BadId { part: "call", .. })
+        ));
+        assert!(matches!(
+            ResourceUri::parse("artifact://3/9/x1/result"),
+            Err(UriError::BadId {
+                part: "attempt",
+                ..
+            })
         ));
     }
 

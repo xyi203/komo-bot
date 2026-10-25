@@ -93,6 +93,7 @@ Gateway 持有模型连接、数据库、Session JSONL 写入器、工具环境�
 | `komo memory confirm/forget`                 | 确认具体版本或停用自动记忆；不删除 Memos 原文                               |
 | `komo memory consolidate`                    | 离线整理（§9.8）：对已有记忆去重、取代、标冲突，不新增正文；`--scope` `--kind` `--instruction`，默认预演，`--apply` 才写 |
 | `komo memory index status/rebuild`           | 查看索引覆盖率或重建当前向量索引                                            |
+| `komo init`                                  | 在数据目录（`KOMO_HOME`，默认 `~/.komo`）生成带注释的最小 `config.toml`（`default_agent` 与 `[agents.assistant]` 在最前面、一个 `[model_providers.default]` 占位、一个 completion 模型、`[models] default`、`[memory.retrieval] mode = "keyword"`——没有 embedding 时默认的 hybrid 校验不过）和权限 600 的 `.env` 模板；已有 `config.toml` **拒绝覆盖**，已有 `.env` 不碰。打印下一步：填 API key、`komo config check`。不经 Gateway |
 | `komo config check`                          | 校验各模型、effort、向量参数、渠道名单及其他配置；只读，不改变运行中的 Gateway。数据目录里还留着 `policy.toml` 时报一句"已不再使用，可以删掉"（§7） |
 | `komo config reload`                         | 让 Gateway 立即重载配置（等价于文件保存后的自动重载或 `SIGHUP`）；校验失败则保留旧配置并返回错误 |
 | `komo mcp reconnect [SERVER...]`             | 让 Gateway 断开重连 MCP 服务器（不点名 = 全部），等握手完报各自状态；新连上的工具从下一条 Run 起可用，不用重启 Gateway（`docs/mcp.md` §2.5） |

@@ -626,6 +626,35 @@ pub async fn doctor(home: &Path, reconcile: bool) -> Outcome {
 
 // ---------------------------------------------------------------- 不经 Gateway
 
+/// `komo init`：在数据目录生成最小 `config.toml` 与 `.env` 模板（§3）。逻辑在
+/// `komo_runtime::config::init_home`；这里只把结果和下一步印出来。
+pub fn init(home: &Path) -> Outcome {
+    use komo_gateway::config::{InitError, init_home};
+
+    let report = init_home(home).map_err(|error| match error {
+        InitError::ConfigExists(_) => {
+            format!("{error}\n（已有配置请直接编辑它，改完用 `komo config check` 校验）")
+        }
+        other => other.to_string(),
+    })?;
+    let key = komo_gateway::config::API_KEY_VARIABLE;
+    let env_line = if report.env_created {
+        format!("已创建 {}（权限 600）", report.env.display())
+    } else {
+        format!("{} 已存在，没有改动", report.env.display())
+    };
+    let fill_key = if report.env_created {
+        format!("在 {} 里填上 {key}=你的 API key", report.env.display())
+    } else {
+        format!("确认 {} 里有 {key}=你的 API key", report.env.display())
+    };
+    Ok(format!(
+        "已生成 {}\n{env_line}\n\n下一步：\n  1. 编辑 {}：把 [model_providers.default] 的 base_url 与 [model.chat] 的 model 换成你的服务和模型\n  2. {fill_key}\n  3. 运行 `komo config check` 校验；通过后直接运行 `komo`",
+        report.config.display(),
+        report.config.display(),
+    ))
+}
+
 /// `komo channel list`：渠道清单，只读配置（§3、§11.5）。
 pub fn channel_list(home: &Path) -> Outcome {
     let loaded = load_config(&LoadOptions::at(home)).map_err(failed)?;
@@ -955,5 +984,25 @@ mod cron_render_tests {
         assert!(neither.contains("必须给一个"), "{neither}");
         let both = prompt_or_command(Some("x".into()), Some("y".into())).unwrap_err();
         assert!(both.contains("二选一"), "{both}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `komo init`：印出生成了什么与下一步；再跑一次拒绝覆盖并说明怎么办。
+    #[test]
+    fn init_reports_the_next_steps_and_refuses_a_second_run() {
+        let home = tempfile::tempdir().unwrap();
+        let out = init(home.path()).unwrap();
+        assert!(out.contains("config.toml"), "{out}");
+        assert!(out.contains("权限 600"), "{out}");
+        assert!(out.contains("KOMO_LLM_API_KEY"), "{out}");
+        assert!(out.contains("komo config check"), "{out}");
+
+        let error = init(home.path()).unwrap_err();
+        assert!(error.contains("不覆盖"), "{error}");
+        assert!(error.contains("komo config check"), "{error}");
     }
 }

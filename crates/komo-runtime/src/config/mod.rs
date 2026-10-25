@@ -17,6 +17,7 @@ mod env;
 mod error;
 mod file;
 mod holder;
+mod init;
 mod validate;
 
 use std::path::{Path, PathBuf};
@@ -30,6 +31,7 @@ pub use env::{HomeError, KOMO_HOME, KOMO_LISTEN, Secrets, user_home};
 pub use error::ConfigError;
 pub use file::{DEFAULT_LISTEN, Sources, channel_credentials};
 pub use holder::{ConfigHolder, ReloadReport};
+pub use init::{API_KEY_VARIABLE, InitError, InitReport, config_template, env_template, init_home};
 pub use validate::{has_errors, validate, validate_with};
 
 /// 从哪里加载。

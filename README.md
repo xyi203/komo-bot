@@ -27,6 +27,10 @@ cargo run -- gateway --foreground
 改完本地代码要换上正在用的 komo：`scripts/install-local.sh`（编译 release、原子替换
 `~/.local/bin/komo`、重启 Gateway；`--no-restart` 只装不重启）。
 
+装好之后先 `komo init`：在数据目录（`KOMO_HOME`，默认 `~/.komo`）生成一份带注释的最小
+`config.toml` 和权限 600 的 `.env` 模板，已有 `config.toml` 不会被覆盖。照着改 `base_url` 与
+模型名，在 `.env` 里填 API key，再 `komo config check` 校验，通过后直接 `komo`。
+
 升级用 `komo update`：它从 GitHub release 下同一套发布包，核对 sha256、解包、试跑
 `--version`，最后才把磁盘上那份换掉（详见 [`docs/komo_bot.md`](docs/komo_bot.md) §13.6）。
 

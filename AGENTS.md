@@ -23,6 +23,7 @@ cargo fmt --check
 cargo tree -d                  # duplicate versions must be attributed per channel
 cargo build --timings          # rerun at the end of every phase, record in docs
 
+komo init                      # write a minimal commented config.toml + 0600 .env (never overwrites)
 komo                           # start Gateway if needed, new session, TUI
 komo resume SESSION_ID
 komo gateway [--foreground] | gateway status|stop|restart

@@ -71,6 +71,10 @@ enum Command {
         #[command(subcommand)]
         action: MemoryCommand,
     },
+    /// 在数据目录生成一份带注释的最小 config.toml 与 .env 模板；已有 config.toml 不覆盖（§3）。
+    ///
+    /// 不经 Gateway。生成后填 `.env` 里的 API key，再 `komo config check`。
+    Init,
     /// 校验或重载配置（§3）。
     Config {
         #[command(subcommand)]
@@ -536,6 +540,8 @@ async fn dispatch(cli: Cli, home: &Path) -> Result<Option<String>, String> {
             Ok(None)
         }
         Some(Command::Gateway { foreground, action }) => gateway(home, foreground, action).await,
+        // 不经 Gateway（§3）：Gateway 起来要先有配置，这条命令就是生成那份配置。
+        Some(Command::Init) => commands::init(home).map(Some),
         Some(Command::Doctor { reconcile }) => commands::doctor(home, reconcile).await.map(Some),
         // 也不经 Gateway（§3）：它换的是磁盘上那份二进制，与在跑的那个进程无关。
         Some(Command::Update) => update::run(home).await.map(Some),
@@ -1062,6 +1068,10 @@ mod tests {
         assert!(matches!(
             Cli::parse_from(["komo", "update"]).command,
             Some(Command::Update)
+        ));
+        assert!(matches!(
+            Cli::parse_from(["komo", "init"]).command,
+            Some(Command::Init)
         ));
     }
 

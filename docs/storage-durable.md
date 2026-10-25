@@ -538,7 +538,7 @@ finalize     → blob 收尾同步 → 提交结果 entry（projection.rs 的 fu
 
 | D4c 编排（`d4c-orchestration`，基于 `d4c` 的 66960939） | `crates/komo-runtime/src/durable/harness/orchestration/`（`mod` 钩子 `OrchestrationHooks` · `komo.task` document · 锚任务 `komo.background` · 工具任务里的分派与 `orchestrate` 阶段 · `task` 派出 / 接着做 / 查进度 · `report` 子 run 收尾时交回 · `monitor` 登记、起停、对账）；`tool.rs` 加 `Checkpoint::Orchestrate` 与 `call` 里一个分支；`live::end_run` 返回结束的 run，`generation.rs` 的收尾出口改走 `report::end_run`；`inbox::place_idle_input`（`admit` 的最后一支拆出来）；`submit.rs` 的 `Harness::{finish_monitor, reconcile_monitors}`、`HarnessHooks` 带 `GenerationTask`；`tx.rs` 的 `read_guard_for`、`staged_entry`；`HarnessDeps::orchestration` | `harness/tests/orchestration.rs` 26 项（含 3 项 Turso：派出 / 交回 / 重开不重复交回，fork 与接着做，监听登记与对账；另有派出提交之后崩溃不重派）、`durable/tests/lifecycle.rs` 1 项（别的 conversation 在写之后的读） |
 
-合入时（`durable-integration` 分支）强制重编后 `cargo test --workspace`：**2558 通过，0 失败**。D4c 的 probe 与接线（`d4c-probe-gaps`，基于 `main` 的 52ae527c）：**2587 通过，0 失败，11 忽略**。D4c 压缩（`d4c-compaction`，同一基线）：**2594 通过，0 失败，11 忽略**。两者合入集成分支 `d4c` 后：**2623 通过，0 失败，11 忽略**。
+合入时（`durable-integration` 分支）强制重编后 `cargo test --workspace`：**2558 通过，0 失败**。D4c 的 probe 与接线（`d4c-probe-gaps`，基于 `main` 的 52ae527c）：**2587 通过，0 失败，11 忽略**。D4c 压缩（`d4c-compaction`，同一基线）：**2594 通过，0 失败，11 忽略**。两者合入集成分支 `d4c` 后：**2623 通过，0 失败，11 忽略**。 D4c 编排（`d4c-orchestration`，基于 `d4c`）：**2650 通过，0 失败，11 忽略**（`komo` 的 `codemode_worker` 里 `a_worker_from_another_build_is_refused_before_the_script_runs` 并行跑时出现过一次偶发失败——写临时脚本再执行的那一类竞态，与本改动无关，重跑通过）。
 
 ### 13.2 实现与本文的偏离（都已接受）
 

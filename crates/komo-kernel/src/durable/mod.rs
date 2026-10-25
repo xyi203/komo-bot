@@ -10,10 +10,12 @@ pub mod conformance;
 pub mod context;
 pub mod fork;
 pub mod ids;
+pub mod legacy_events;
 pub mod legacy_ids;
 #[cfg(any(test, feature = "test-support"))]
 pub mod memory;
 pub mod message;
+pub mod pi_tree;
 pub mod records;
 pub mod storage;
 pub mod task;

@@ -13,14 +13,25 @@
 //! | `agent_doc` | `komo.agent` document 的读写与 fork 复制 | W0b |
 //! | `assemble` | 钩子与编排的装配、与 `GatewayState` 的断环 | W0b（W1b 填） |
 //! | `background` | Durable 模式的后台循环 | W0b（W2b/W3 往里加） |
+//! | `sessions` | 建会话、列表、`SessionSummary` 映射、主会话与按来源找会话、`SessionError` | W1c |
+//! | `submit` | 提交输入：路由到当前分支、惰性 fork、model / effort 覆盖、`/new`、`/cancel` | W1c |
+//! | `tree` | 读树（`read_tree`）、导航、label / name、context-edit、分支摘要、compact、忙时守卫 | W1c |
+//! | `copy` | `/fork`、`/clone`：复制 entry 与 blob | W1c |
 
 pub mod agent_doc;
 pub mod assemble;
 pub mod background;
+pub mod copy;
 pub mod core;
+pub mod sessions;
+pub mod submit;
+pub mod tree;
 
 pub use self::core::DurableCore;
 pub use assemble::StateSlot;
+pub use sessions::SessionError;
 
+#[cfg(test)]
+mod session_tests;
 #[cfg(test)]
 mod tests;

@@ -83,11 +83,11 @@ pub enum ServiceError {
 /// 这台 Gateway 用哪套存储（`docs/storage-durable-d5.md` §1）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum StorageMode {
-    /// 旧的 `state.db` + JSONL 日志。D5 期间的生产默认，W5 翻成 `Durable`，D7 删。
-    #[default]
+    /// 旧的 `state.db` + JSONL 日志。只剩 Legacy 版测试在用（测试构造处都显式写了），D7 删。
     Legacy,
     /// 新的 `durable.db`（harness 的 entry / task / submission），cron / 投递 / memory 等辅助表在
-    /// `aux.db`。
+    /// `aux.db`。生产默认（D5 W5 起）。
+    #[default]
     Durable,
 }
 
@@ -100,7 +100,7 @@ pub struct ServiceOptions {
     pub listen: Option<String>,
     /// 渠道工厂。三个渠道各自一个 feature，接线由调用方给（`komo` 的 `main`）。
     pub channels: Vec<Arc<dyn ChannelFactory>>,
-    /// 存储模式；默认 [`StorageMode::Legacy`]。
+    /// 存储模式；默认 [`StorageMode::Durable`]。
     pub storage: StorageMode,
     /// 测试注入的模型后端。
     pub llm: Option<Arc<dyn LlmClient>>,

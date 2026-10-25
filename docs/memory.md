@@ -1,6 +1,7 @@
 # komo Memory
 
 > 状态：§9.1–§9.7 是 Memory 的**规格**，2026-10-19 从 [`komo_bot.md`](komo_bot.md) §9 原样迁来，小节号不变——代码注释与其他文档里的 §9.x 照旧指这里。§9.8–§9.10 已实现（§9.10 含 `used` 采纳）。附录 A–D 是调研、分析与评估，不是规格；与正文冲突时以正文为准，任何一条要落地，先改正文。
+> 2026-10-25 起 Memory 跑在新存储上（`docs/storage-durable.md`）：条目 / 证据 / 索引 / 采纳计数在 `aux.db`（toasty，与 `durable.db` 分库），会话内容是 `durable.db` 的 entry，证据引用仍是 `Seq` / `RunId`（新编码，`komo-kernel/src/durable/legacy_ids.rs`）；注入是系统段 `memory` + 会话级 document `komo.memory`，提取游标是 document `komo.memory_cursor`，提取读的是 entry / submission 经 `legacy_events` 投影出的事件。正文里仍写"事件""Run""`memory.injected`"的地方指这层投影的词汇，不再是 JSONL 事件。
 > 文中不带文件名的其他章节号（§3、§8.2、§8.5、§10 …）指 [`komo_bot.md`](komo_bot.md)。附录内的编号只在本附录内有效。
 
 | 节 | 内容 | 状态 |
@@ -25,9 +26,9 @@
 | 内容                               | 保存位置                                      | 使用方式                                                  |
 | ---------------------------------- | --------------------------------------------- | --------------------------------------------------------- |
 | 用户主动要求保存的笔记、想法和记录 | 现有 Memos                                    | 通过 Memos skill 的脚本（`bash` 运行）保存、搜索和读取，返回原文链接 |
-| 自动积累的偏好、项目事实和执行经验 | 本机 state.db 的 memory_items / memory_evidence | MemoryManager 提取、校验、召回、更新和遗忘；用户说"记住"时也可 `komo memory add` 当场记一条（§9.3） |
+| 自动积累的偏好、项目事实和执行经验 | 本机 `aux.db` 的 memory_items / memory_evidence | MemoryManager 提取、校验、召回、更新和遗忘；用户说"记住"时也可 `komo memory add` 当场记一条（§9.3） |
 | 本次任务的工作状态                 | Session / Run / ToolCall                      | 用于上下文与 resume，不自动等同于长期事实                 |
-| 关键词与向量索引                   | 同一个 state.db                                 | 从有效记忆重建，不能取代原文与来源                        |
+| 关键词与向量索引                   | 同一个 `aux.db`                                 | 从有效记忆重建，不能取代原文与来源                        |
 
 长期记忆和当前激活的上下文分别管理：Context Window 是模型请求的容量限制；Working Memory 是本次任务实际选入的历史、状态、相关记忆和工具结果。不能把整个记忆库塞进每轮请求。
 
@@ -67,7 +68,7 @@ MemoryManager 对 AgentRuntime 提供三个主要入口：recall、process_compl
 处理流程：
 
 ```text
-受理时登记 memory_work = pending（`skip_memory` 的 Run 直接记 done）；run.completed 在 JSONL 持久保存后 state.db 提交终态，终态写入不改这一列
+输入 submission 结算后，这条 run 就是一份待提取的工作（`skip_memory` 的、任务会话与 Cron 的不调模型）；游标在会话级 document `komo.memory_cursor`
   → 会话空闲满 `[memory].extract_idle` 后，后台一次领走该会话全部尚未处理的 Run（§9.10）
   → 提取前整批召回已有记忆一次（§9.10）
   → 记忆模型一次调用提取结构化候选并判与编号旧条目的关系，不提供执行工具
@@ -78,7 +79,7 @@ MemoryManager 对 AgentRuntime 提供三个主要入口：recall、process_compl
   → 后台生成向量，确认版本未变后入库
 ```
 
-runs 中记录 pending / processing / done / error 与处理游标。进程崩溃后可重新领取，重复处理相同来源不重复新增；索引失败独立重试，不撤销已经保存的记忆正文。
+每个 run 的处理游标（`{runs: {RunId: {work, cursor}}}`，`work` 为 pending / done / error）记在 conversation 级 document `komo.memory_cursor`，`finish` 经 engine 提交读改写，游标只进不退；领取只在进程内，进程退出即放回。进程崩溃后可重新领取，重复处理相同来源不重复新增；索引失败独立重试，不撤销已经保存的记忆正文。
 
 提取来源限定为新发生的用户陈述和可验证工具结果；已有记忆注入、助手摘要、模型生成报告和维护任务自己的输出不算新的独立证据。取消、失败或结果未知的动作不能整理成成功经验。Cron 触发的 Run 与后台任务会话（`kind = task`）不提取（§9.10）：它们的输出是任务自己的报告，不是用户说的话。系统交回会话的内容（请求键 `task-result:`、`monitor:`、`monitor-end:`、`bash-done:`）在会话窗口里标为「任务交回」，不能被引为证据。
 
@@ -128,9 +129,9 @@ runs 中记录 pending / processing / done / error 与处理游标。进程崩�
 
 **"配了 alias 但后端还没在手上"算前一种，不算配置错误。** 维度探测（§9.5）在 Gateway 就绪之后的后台跑（§3），探测落定前 hybrid 照常退化为关键词、vector-only 照常报"后端不可用"；把这一段时间报成 `VectorUnconfigured` 会把"等一个还没回来的人"说成"你把配置写错了"，也让这一轮召回整条失败而不是降级给出关键词结果。
 
-后台刚入库但尚未生成向量的记忆仍可通过关键词命中。每次模型请求前复查被选条目的有效性，**同一段对话里沿用并逐字复用**那一次的注入——注入段拼在 system 消息里，而服务端的前缀缓存按**最长公共前缀**命中：每轮重新召回、重新渲染（哪怕只是条目顺序或某条的记忆 revision 数字变了），整个请求从第一条消息起就与上一次不同，对话历史那一大段前缀的缓存全部失效，钱与延迟都付在重复的前缀上。所以召回与渲染的单位是**一段对话**（`conversation.boundary` 之间，聊天里的 `/new` 划开），不是一轮：同一段里一个字节都不改，换段或这一段第一次用时才重新召回，也不逐轮重复请求 embedding。代价写在这里：本段内新记下、或本来召回到了但这一段没选中的条目，要**下一段**才进上下文；被改写的条目在本段内仍按原样注入（正文里带 `id@revision`，读的人知道引用的是哪一版）。要立刻刷新，`/new` 开一段就行。**遗忘不在这个代价里**：沿用的每一轮都要照 §9.4 核对被选条目的有效性，被遗忘或失效的条目立刻把它那一块作废重算——"立刻停用"（§9.2）优先于前缀稳定，验收项 `a_forgotten_memory_never_comes_back_into_a_turn` 钉的就是它。
+后台刚入库但尚未生成向量的记忆仍可通过关键词命中。每次模型请求前复查被选条目的有效性，**同一段对话里沿用并逐字复用**那一次的注入——注入段拼在 system 消息里，而服务端的前缀缓存按**最长公共前缀**命中：每轮重新召回、重新渲染（哪怕只是条目顺序或某条的记忆 revision 数字变了），整个请求从第一条消息起就与上一次不同，对话历史那一大段前缀的缓存全部失效，钱与延迟都付在重复的前缀上。所以召回与渲染的单位是**一段对话**（head 标记之间：聊天里的 `/new` 写 `komo.reset`、压缩写 `komo.compaction`，都划开一段），不是一轮：同一段里一个字节都不改，换段或这一段第一次用时才重新召回，也不逐轮重复请求 embedding。代价写在这里：本段内新记下、或本来召回到了但这一段没选中的条目，要**下一段**才进上下文；被改写的条目在本段内仍按原样注入（正文里带 `id@revision`，读的人知道引用的是哪一版）。要立刻刷新，`/new` 开一段就行。**遗忘不在这个代价里**：沿用的每一轮都要照 §9.4 核对被选条目的有效性，被遗忘或失效的条目立刻把它那一块作废重算——"立刻停用"（§9.2）优先于前缀稳定，验收项 `a_forgotten_memory_never_comes_back_into_a_turn` 钉的就是它。
 
-**这一块记在 Session 日志里，跨 Gateway 重启仍逐字复用**（2026-10-14）。之前钉住的只是进程内存里的一张表，而 `checkpoints` 在生产路径上从没写过，重启之后只能按"回放面上最后一句用户输入"重新召回——查询文本不同，选中的条目就不同，整段系统提示换掉。实测（会话 01a13819-742d-702a-b0cc-5afbd1050702，magpie Responses 后端、claude-opus-5-5）：重启后第一个 Run 的 `cache_read` 从 17672 退到 6632（只剩工具表），之后两个 Run 命中的是另一份 17525 的系统提示。现在 Gateway 第一次钉住（或换段、或有条目被遗忘而重算）时追加一条 `memory.injected`（渲染好的正文 + `uses`；正文超过内联上限先外置到 `payloads/`，顺序照 §8.5；不碰 state.db）；fold 把最新一条记为这一段的注入，`conversation.boundary` 清掉它。进程里没有锘时 `prepare_segment` 按它复用——同样先核对条目还算不算数，遗忘照旧立即生效。一条召回都没有的一段也记（`text` 为空），否则重启后会把新记忆塞进段中。记不下来只留 warn：代价是重启后多召回一次。不认识这个 type 的旧二进制当未知事件保留、忽略。验收：`recall::the_memory_block_survives_a_restart_within_one_segment`（重启前后同一段的系统提示逐字相同）。
+**这一块记在会话里，跨 Gateway 重启仍逐字复用**（2026-10-14 旧路径；新存储下是系统段）。注入是一个系统段 `memory`（`komo.system` entry 里的一段，key 为 `memory`）：第一次钉住、换段或有条目被遗忘而重算时才写，之后每个请求都取已展示的那一份，直到下一个 head 标记（`/new` 的 `komo.reset`、压缩）——`memory_section_is_pinned_until_the_next_head`。同一份的 `uses`（选了哪些条目与 revision）、召回诊断和召回时刻记在 conversation 级 document `komo.memory`（`MemoryDoc { uses, recall, at }`，只留最后一份）：每个请求前据 `uses` 核对条目还算不算数，遗忘照旧立即作废重算；run 详情的 `memories` / `recall` 读它。一条召回都没有的一段也记（空段），否则重启后会把新记忆塞进段中。重启前后同一段的系统提示逐字相同。旧路径的"追加 `memory.injected` JSONL 事件、`checkpoints` 没人写"随存储重写移除。验收：`hooks` 测试 `memory_section_is_pinned_until_the_next_head`、`recall::the_memory_block_survives_a_restart_within_one_segment`。
 
 **`[memory]` 热重载**（2026-10-14）：`enabled`、`model`（连同它指向的 `model.*` / 凭证）与 `retrieval` 改了就换进 `MemoryManager`，下一次提取 / 召回用新的；此前这几项在构造时定死，重载报告却说"变了"。`memory.embedding` 不在其中——换它是换向量空间（§9.5）。
 
@@ -275,7 +276,7 @@ Memory 内容以带来源的数据进入上下文，不能成为系统指令或�
 
 **采纳（`used`，已实现）。** `usage.count` 只数曝光（注入块里有它就 +1，跨 Run 沿用也累计），不等于被用上（附录 B.3.5、B.6.2）。同一次提取调用里，提示词在「本批注入的记忆」一节列出这批 Run 注入过的条目，编号 `[m0]…`，与关系候选的 `[0]…` 分开；批里没有任何注入时不出现这一节。模型交回顶层 `"used":[{"memory":"m0","evidence":["<事件 ID>"]}]`，只在助手回复或工具调用明显依赖了它时才算（话题相关、复述都不算）。
 
-- **注入来源**：批内每个 Run 结束前最近的一条 `memory.injected`（`komo_kernel::events::injection_at`，`run inspect` 同一解法；沿用上一块的 Run 自己没有事件）。条目现在的 revision 与注入时不同则不列（正文已不是注入的那句话）。
+- **注入来源**：批内每个 Run 结束前最近的一次注入——新存储里是 conversation 级 document `komo.memory` 合成的一条 `MemoryInjected`（挂在触发召回的 run 上，`inject_memory_events`；`komo_kernel::events::injection_at` 取"结束前最近的一条"，沿用上一块的 Run 自己没有事件）。document 只留最后一份，换段重召回之后更早的 run 看不到当时那一块（最佳努力）。条目现在的 revision 与注入时不同则不列（正文已不是注入的那句话）。
 - **校验**（`Transcript::validate_used`）：evidence 必须含一个批内**助手事件**（工具调用发起在助手事件上）；只引用户行、单独的工具结果或不存在的 ID，整条丢弃并 warn。编号规则同 §9.9：越界、非整数丢弃，重复取第一条。
 - **落库**：`memory_items.adopted_count`（可空整数）与 `last_adopted_at`（可空时间），加列规则同 `superseded_by`；每批每条 +1，不改 state / confirmation / revision（`MemoryCatalog::record_adoption`）。在该批 `apply` 成功之后、游标推进之前记：提取或 apply 失败整批重试时还没记过，不会重复计数。`apply` 之后、游标写入之前进程崩溃会多记一次，接受。
 - **展示**：`komo memory show` 与 `list --full` 显示 注入 N 次 · 用上 M 次。
@@ -284,7 +285,7 @@ Memory 内容以带来源的数据进入上下文，不能成为系统指令或�
 
 **落地前的现状与数据。** 提取以 Run 为单位：Gateway 每 30 秒（`MEMORY_TICK`）领最多 8 个结束的 Run（`WORK_BATCH`），每个 Run 调一次提取，得到最多 5 条观察；每条观察不是逐字重复、又召回到相关条目时，再调一次 `classify`（§9.9）。一个 Run 最多 6 次模型调用。本机 2026-10-19：94 个会话、426 个 Run，只有一个 Run 的会话 40 个（只占 Run 的 9%），其余 54 个会话平均约 7 个 Run；v3 上线（10-16）后处理的 152 个 Run 里 102 个什么都没留下。
 
-**触发：会话空闲后整批处理。** `claim` 从按 Run 改成按会话：一个会话没有未到终态的 Run，且最后一个 Run 结束已满 `[memory].extract_idle`（初值 10 分钟），才一次领走它全部 `memory_work = pending` 的 Run。队列仍是 `runs.memory_work` 与每个 Run 自己的游标，schema 不变；失败时这一批 Run 都放回 pending，游标不推进。会话之后又被 resume，新 Run 等下一次空闲再成一批。会话没有"结束"这个事件——`resume`、`task(prompt, task_id)` 随时接着做——所以不按 Run 终态触发；一次性任务跑完就不再有动静，空闲后正好处理一次。
+**触发：会话空闲后整批处理。** 领取按会话：一个会话所有输入都已结算，且最后一个 Run 结束已满 `[memory].extract_idle`（初值 10 分钟），才一次领走它全部待提取的 Run（`DurableMemoryWork`，`komo-runtime/src/memory/durable.rs`；工作 = 输入 submission 经投影得到终态的 run，处理游标在 document `komo.memory_cursor`，领取只在进程内）；失败时这一批 Run 都放回待处理，游标不推进。领取每拍扫全部 Session（`quiet` 表让没有新结算输入的会话只扫一次 submission；待处理索引是 TODO）。会话之后又被 resume，新 Run 等下一次空闲再成一批。会话没有"结束"这个事件——`resume`、`task(prompt, task_id)` 随时接着做——所以不按 Run 终态触发；一次性任务跑完就不再有动静，空闲后正好处理一次。**记忆模式与 Agent 按提取那一刻的配置**（`MemoryWorkItem.frozen`，由领取方给；`SessionRecord.agent` 给 Agent，模式取当前 Profile）：新存储没有受理快照，也**不**把模式冻进 `komo.agent`——提取要等会话空闲之后，这段空窗里把记忆关掉应立即生效，而不是让已说过的话在关掉之后又入库。测试 `extraction_follows_the_memory_mode_at_extraction_time`。
 
 **不调模型就跳过。** 领到后先按确定性规则筛，命中的 Run 标 `done`、游标推进到末尾，日志写明原因：
 
@@ -312,7 +313,7 @@ Rust 侧不变的三道：逐字相同先合并（`find_by_content`），`Transc
 
 **窗口：用户输入一行不丢。** 现在窗口超过 `MAX_TRANSCRIPT_CHARS`（24 000 字符）时只留尾部（`extract.rs` 的 `Transcript::build`），长 Run 里用户最初的请求会被截掉——而用户陈述是 `user_statement` 唯一的来源。按本机日志估算，426 个 Run 里约 48 个超限。改成：用户输入行全部保留，从最旧的工具结果开始删。一批仍超预算时按 Run 边界切成几段，每段一次调用——"一次"是常态，不是保证。
 
-**交回的结果不是用户原话（现有缺口，一并修）。** 任务结果以请求键 `task-result:{run}` 的 `run.accepted` 交回 home（`service/tasks.rs` 的 `report_to_parent`），而 `Transcript::build` 把所有 `run.accepted` 都渲染成"用户"——模型把它标成 `user_statement` 时校验也会放行，任务 agent 写的摘要就以用户原话入库。§9.3 写明助手摘要不算独立证据。改成：这类输入渲染为"任务交回"，不能被 evidence 引用。监听事件与结束（`monitor:` / `monitor-end:`）、转后台命令的结束（`bash-done:`）同样是系统交回的内容，同一处理（2026-10-19）。
+**交回的结果不是用户原话。** 任务结果以内部输入（entry kind `task.result`，请求键 `task-result:{子 conversation}:{首个输入}`）交回 home（runtime 的 `report`，`docs/background-tasks.md` §2）；投影里它是一条 run 的输入，`Transcript::build` 若把它渲染成"用户"，模型把它标成 `user_statement` 时校验也会放行，任务 agent 写的摘要就以用户原话入库。§9.3 写明助手摘要不算独立证据。所以这类输入渲染为"任务交回"，不能被 evidence 引用；监听事件与结束（`monitor.event` / `monitor.end`，请求键 `monitor:` / `monitor-end:`）、转后台命令的结束（`bash-done:`）同样是系统交回的内容，同一处理。
 
 **逐会话记录。** 每批处理完发一个 `komo.memory.extract` span（[`observability.md`](observability.md) §3），同一份 tracing 埋点也写进文件日志：会话 id、`kind`、Run 数、窗口字符数、跳过原因、模型交回几条、落库几条。现在只有每拍的合计，分不出哪类会话总是空的；"一问一答"这类会话要不要加进跳过规则，等这份日志攒出数据再定。
 
@@ -703,7 +704,7 @@ Run 的任务附近；新对话再建立新的基线，避免每次修改整个 
 
 #### B.5.1 兼容要求
 
-- 旧 `memory.injected` 事件保留读取，旧对话继续按原方式恢复；新召回行为使用明确版本。
+- （旧存储时代的兼容要求，已不适用：新存储不读旧会话与旧 `memory.injected` 事件，见 `docs/storage-durable.md` §8。）旧的：旧 `memory.injected` 事件保留读取，旧对话继续按原方式恢复；新召回行为使用明确版本。
 - 动态附件需要新增事件或字段，记录足以逐字重建的正文与引用。新增词汇由旧 fold 按未知事件
   规则忽略；不改写历史事件，不把新协议写成旧锚使旧版本错误覆盖 system 块。
 - 附件超过内联上限时先保存正文，再追加 JSONL，最后更新需要的数据库状态，遵守 §8.5。

@@ -261,21 +261,24 @@ pub async fn store(
 
 /// 结束 `task` 负责的 run：把它的每个输入 settle，移除 `run`。**总是**一并清掉
 /// `generation` 与 `tools`——它们的展示属于正在结束的 run。
+/// 返回结束掉的 run（不是 `task` 负责的就是 `None`），收尾要往外交回结果的人要用它的输入。
 pub async fn end_run(
     tx: &mut Tx,
     live: &mut LiveState,
     task: TaskId,
     settlement: &SubmissionSettlement,
-) -> Result<(), DurableError> {
+) -> Result<Option<RunControl>, DurableError> {
+    let mut ended = None;
     if live.run.as_ref().is_some_and(|run| run.task == task) {
         let run = live.run.take().expect("刚判过它在");
-        for id in run.inputs {
-            inbox::settle(tx, id, settlement).await?;
+        for id in &run.inputs {
+            inbox::settle(tx, *id, settlement).await?;
         }
+        ended = Some(run);
     }
     live.generation = None;
     live.tools = None;
-    Ok(())
+    Ok(ended)
 }
 
 /// 把 `live.generation.message` 里已提交的部分回复转成一条 `aborted` 的 assistant entry

@@ -74,6 +74,7 @@ use super::entries::{self, TOOL_RESULT};
 use super::hooks::{HarnessDeps, HookError, ToolEnv, ToolSet};
 use super::live::{self, SlotStatus};
 use super::nested::{self, NestedMeta, NestedResult};
+use super::orchestration;
 use super::outcome::{aborted, completed, failed, running};
 use crate::durable::error::TaskError;
 use crate::durable::kind::TaskKind;
@@ -135,6 +136,16 @@ pub enum Checkpoint {
         /// 下一次探测的时刻（`Line` 时钟，毫秒）。
         until: i64,
     },
+    /// 编排调用（`task` / `monitor` / `monitor_stop`，见 [`orchestration`]）的效果已经提交，
+    /// 只差落结果（或接着起 / 停进程）。`step` 的形状归 `orchestration::Step`。
+    Orchestrate {
+        step: Value,
+    },
+}
+
+/// 编排调用提交效果时把 checkpoint 推进到 `orchestrate`。
+pub(super) fn orchestrating(step: Value) -> NextTaskState {
+    running(encode(&Checkpoint::Orchestrate { step }))
 }
 
 /// 槽位里记下的子进程身份（`ToolSlot::{pid, pgid, started_at}`）。
@@ -272,7 +283,7 @@ fn failed_body(message: String) -> ToolResultBody {
 }
 
 /// 一次尝试的身份：落盘目录是 `tool-output/{conversation}/{tool_task}/{attempt}/`。
-fn attempt_ref(
+pub(super) fn attempt_ref(
     env: &ToolEnv,
     conversation: ConversationId,
     task: TaskId,
@@ -295,6 +306,10 @@ pub struct ToolTask {
 impl ToolTask {
     pub fn new(deps: Arc<HarnessDeps>) -> Self {
         Self { deps }
+    }
+
+    pub(super) fn deps(&self) -> &Arc<HarnessDeps> {
+        &self.deps
     }
 
     async fn tools(&self, conversation: ConversationId) -> Result<ToolSet, TaskError> {
@@ -459,6 +474,11 @@ impl ToolTask {
             let message = format!("{} 不是只读工具或 MCP；脚本里不支持此操作", call.name);
             return self.settle_unrun(rt, &set, &call, message).await;
         }
+        // 编排调用没有"意图 → 执行"：效果在 `orchestration` 里一次提交完，崩溃后从 `orchestrate`
+        // 接着做（同一次提交把 checkpoint 推进过去），不经过下面的重放判断。
+        if orchestration::handles(&plan.operation) {
+            return orchestration::call(self, rt, &set, &call, input.assistant, plan).await;
+        }
         let replay = plan.recovery.replay();
         let checkpoint = Checkpoint::Execute {
             arguments: call.arguments.clone(),
@@ -513,7 +533,7 @@ impl ToolTask {
             .await
     }
 
-    async fn publish(
+    pub(super) async fn publish(
         &self,
         env: &ToolEnv,
         attempt: &AttemptRef,
@@ -659,7 +679,7 @@ impl ToolTask {
     }
 
     /// 提交结果 entry、清槽位、让任务终结。
-    async fn commit_result(
+    pub(super) async fn commit_result(
         &self,
         rt: &TaskRuntime,
         set: &ToolSet,
@@ -978,6 +998,12 @@ impl TaskKind for ToolTask {
                 self.probe(task, rt, arguments, *plan, replay, attempt, child, until)
                     .await
             }
+            Checkpoint::Orchestrate { step } => {
+                let input = parse_input(task)?;
+                let call = self.read_call(rt, &input).await?;
+                let set = self.tools(rt.conversation()).await?;
+                orchestration::resume(self, rt, &set, &call, input.assistant, step).await
+            }
         }
     }
 
@@ -1038,6 +1064,12 @@ impl TaskKind for ToolTask {
                 return Ok(());
             }
         };
+        // 编排调用的效果已经提交：结果照实写，不当成"没跑过"。
+        if let Ok(Checkpoint::Orchestrate { step }) =
+            serde_json::from_value::<Checkpoint>(task.checkpoint.clone())
+        {
+            return orchestration::aborted(self, rt, &set, &call, input.assistant, step).await;
+        }
         let this = attempt_ref(&set.env, conversation, rt.task_id(), attempt.unwrap_or(1));
         let left = if attempt.is_some() {
             set.env

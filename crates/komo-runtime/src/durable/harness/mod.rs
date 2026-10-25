@@ -26,7 +26,8 @@
 //!   [`ToolOutputStore`](komo_kernel::traits::ToolOutputStore)，模型视图由
 //!   `komo_kernel::projection` 在收尾时算一次、存进结果 entry。
 //! - 压缩与衰减（D4c）在 [`compaction`]；子进程 `probe` 阶段在 `tool.rs`（D4c）；codemode 嵌套调用：外层脚本在
-//!   `codemode.rs`，嵌套任务的数据与收尾在 `nested.rs`（D4c）；`task` / `monitor` 是 D4c 剩下的部分。
+//!   `codemode.rs`，嵌套任务的数据与收尾在 `nested.rs`（D4c）；编排工具 `task` / `monitor`（owned、background
+//!   的子 conversation，交回结果，监听登记）在 [`orchestration`]（D4c）。
 
 pub mod codemode;
 pub mod compaction;
@@ -36,6 +37,7 @@ pub mod hooks;
 pub mod inbox;
 pub mod live;
 pub mod nested;
+pub mod orchestration;
 pub mod outcome;
 pub mod submit;
 pub mod system;
@@ -53,6 +55,10 @@ pub use hooks::{
 pub use inbox::{InboxItem, InboxState, InputEntry, SubmissionDraft, WhenBusy, WriteDraft};
 pub use live::{
     GenerationLive, LiveState, RetryLive, RunControl, SlotStatus, ToolSlot, live_address,
+};
+pub use orchestration::{
+    ANCHOR_KIND, FORK_NOTICE, LaunchMode, MonitorError, MonitorLaunch, MonitorRecord, MonitorState,
+    NoOrchestration, OrchestrationHooks, TASK_RESULT_ENTRY, TaskDoc, task_doc,
 };
 pub use submit::{Harness, HarnessHooks, SubmitError, WithdrawResult};
 pub use tool::ToolTask;

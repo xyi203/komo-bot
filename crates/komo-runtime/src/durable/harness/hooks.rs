@@ -27,6 +27,7 @@ use komo_kernel::types::tool::{ToolDefinition, ToolExposure, WorkspaceRoot};
 use serde::{Deserialize, Serialize};
 
 use super::compaction::{CompactionSetup, SummaryPrompt};
+use super::orchestration::{NoOrchestration, OrchestrationHooks};
 use crate::agent::RetryBudget;
 use crate::llm::ImageResolver;
 use crate::recovery::{IdentityProbe, ProcessProbe};
@@ -310,6 +311,8 @@ pub struct HarnessDeps {
     /// codemode 的 worker 怎么起（`docs/codemode.md` §4）；`None` = 这台 Gateway 没有接 codemode，
     /// `codemode` 工具的任务以 Failed 收场。热换：Gateway 重装配时 [`Self::set_codemode`]。
     codemode: arc_swap::ArcSwapOption<crate::codemode::Worker>,
+    /// `task` / `monitor` 要 agent / gateway 侧才有的东西（`orchestration`）；默认什么都没装配。
+    pub orchestration: Arc<dyn OrchestrationHooks>,
     settings: arc_swap::ArcSwap<HarnessSettings>,
 }
 
@@ -320,6 +323,7 @@ impl HarnessDeps {
             stream,
             probe: Arc::new(IdentityProbe),
             codemode: arc_swap::ArcSwapOption::empty(),
+            orchestration: Arc::new(NoOrchestration),
             settings: arc_swap::ArcSwap::from_pointee(HarnessSettings::default()),
         }
     }
@@ -331,6 +335,11 @@ impl HarnessDeps {
 
     pub fn with_codemode(self, worker: Option<crate::codemode::Worker>) -> Self {
         self.set_codemode(worker);
+        self
+    }
+
+    pub fn with_orchestration(mut self, orchestration: Arc<dyn OrchestrationHooks>) -> Self {
+        self.orchestration = orchestration;
         self
     }
 

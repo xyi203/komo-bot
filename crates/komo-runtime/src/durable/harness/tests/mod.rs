@@ -8,6 +8,7 @@ mod codemode;
 mod compaction;
 mod generation;
 mod inbox;
+mod orchestration;
 mod probe;
 mod recovery;
 mod tools;

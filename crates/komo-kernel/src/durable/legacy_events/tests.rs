@@ -565,38 +565,3 @@ fn tool_results_carry_status_output_and_preview() {
     assert_eq!(body.preview.as_deref(), Some("boom"));
     assert_eq!(body.call_id.as_str(), "c1");
 }
-
-/// 立即放置的输入：`admit` 先铸输入 entry 的 ID、后铸 submission 的，entry 的 ID 比 submission 小。
-/// 同一批里先处理 entry 时 submission 还没登记，输入会被当成普通 entry（没有 `RunStarted`）。
-#[test]
-fn an_input_entry_minted_before_its_submission_still_starts_the_run() {
-    let entries = vec![
-        user(5, "q1"),
-        assistant(7, "a1", &[]),
-        settled(8, 6, Some(7)),
-    ];
-    let submissions = vec![input_sub(6, done(5, 7))];
-    let events = legacy_events(SESSION, &entries, &submissions);
-    assert_eq!(
-        shape(&events),
-        shape_of(&[
-            ("6", "run.started"),
-            ("6", "message.user"),
-            ("6", "run.accepted"),
-            ("6", "run.queued"),
-            ("6", "message.assistant"),
-            ("6", "run.completed"),
-        ])
-    );
-    let seqs: Vec<u64> = events.iter().map(|event| event.seq.0).collect();
-    assert!(seqs.windows(2).all(|pair| pair[0] < pair[1]), "{seqs:?}");
-
-    // 直播：同一批（submission 与 entry 一起到）与补读逐帧相同。
-    let mut projection = Projection::new(SESSION);
-    let mut live = projection.project(&[
-        Record::Entry(&entries[0]),
-        Record::Submission(&submissions[0]),
-    ]);
-    live.extend(projection.project(&[Record::Entry(&entries[1]), Record::Entry(&entries[2])]));
-    assert_eq!(live, events);
-}

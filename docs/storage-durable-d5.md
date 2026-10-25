@@ -220,3 +220,4 @@
 
 | 包 | 分支 | 合入 `d4c` | 备注 |
 |---|---|---|---|
+| W0a 存储接缝 | `d5-w0a` | | kernel：`SessionRecord` 扩展（`SessionKind` 与 `kind` / `agent` / `parent_session` / `leaf` / `title_provisional` / `created_at` / `changed_at` / `request_key`，全带默认值）、`ConversationRecord.session`、`ConversationQuery` 的 `session` / `parent_conversation`、`StorageWrite::PurgeConversations`、`legacy_ids`；store 写 `session_id` 列、Purge SQL；runtime `Tx::{put_session, session, create_conversation_in, fork_conversation_in, purge_conversations}`（fork 默认继承 session）、`komo.settled`（`inbox::settle`）、`Harness::admit_in_tx`、任务会话 `sessions` 行、`Harness::abort_run` 与非正常收尾放置排队输入（决定 8；队列模式照旧，`OneAtATime` 时每种取第一项、余下留给后继 run 自己的 boundary）。`komo.settled` 的 `data` 在 §2 的字段之外多一个可选 `detail`（失败详情），排队中被撤回的输入也各留一条（`unanswered` / `aborted`）。`Tx::latest_head_marker` / `submission_by_request` 认"这次提交才建的 conversation" |

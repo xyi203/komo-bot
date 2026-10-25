@@ -337,13 +337,37 @@ impl Tx {
         at: EntryId,
         ownership: ConversationOwnership,
     ) -> Result<ConversationRecord, DurableError> {
+        self.fork_conversation_with(parent, at, None, ownership)
+            .await
+    }
+
+    /// fork 出子 conversation，但归属另一个 komo Session `session`（而不是继承父的）：后台任务的
+    /// fork 子会话属于它自己的任务 Session（`harness::orchestration::task`）。
+    pub async fn fork_conversation_in(
+        &mut self,
+        parent: ConversationId,
+        at: EntryId,
+        session: &str,
+        ownership: ConversationOwnership,
+    ) -> Result<ConversationRecord, DurableError> {
+        self.fork_conversation_with(parent, at, Some(session.to_owned()), ownership)
+            .await
+    }
+
+    async fn fork_conversation_with(
+        &mut self,
+        parent: ConversationId,
+        at: EntryId,
+        session: Option<String>,
+        ownership: ConversationOwnership,
+    ) -> Result<ConversationRecord, DurableError> {
         self.mark_table_write();
         let id: ConversationId = self.storage.mint().await?;
         let parent_record = self.conversation_record(parent).await?;
         let owner = self.conversation_owner(ownership).await?;
         let mut record = ConversationRecord::fork(id, parent, at);
         record.owner = owner;
-        record.session = parent_record.session;
+        record.session = session.or(parent_record.session);
         self.conversations.push(record.clone());
         Ok(record)
     }
@@ -568,6 +592,11 @@ impl Tx {
         }) {
             return Ok(Some(record.clone()));
         }
+        // 这次提交才建的 conversation 里不可能已有提交过的 submission：不用读（也读不了）。
+        // gateway 在同一次提交里"建 / fork conversation + 受理"靠这一条（`Harness::admit_in_tx`）。
+        if self.is_new(conversation) {
+            return Ok(None);
+        }
         self.read_guard_for("submission_by_request", conversation)
             .await?;
         Ok(self
@@ -602,26 +631,54 @@ impl Tx {
         self.submissions.insert(record.id, record);
     }
 
+    /// 这个 conversation 是不是这次提交才建的（还没提交，存储里没有它）。
+    fn is_new(&self, conversation: ConversationId) -> bool {
+        self.conversations
+            .iter()
+            .any(|record| record.id == conversation)
+    }
+
     /// 对 conversation 可见的最新一条带 `head` 的 entry。
     ///
     /// head 标记只来自 entry，可见范围只随 conversation 的 fork 关系变。所以这次提交暂存的写入里
-    /// 既没有带 `head` 的 entry、也没有新建的 conversation 时，已提交的读依然精确，表写之后也能
-    /// 读——调度器写的 faulted / orphaned 收尾要在任务记录写下之后放置收件箱
-    /// （`harness::generation::settle_scheduler_outcome`）。否则照常守表读先于表写的规则。
+    /// 没有带 `head` 的 entry 时，已提交的读依然精确，表写之后也能读——调度器写的 faulted /
+    /// orphaned 收尾要在任务记录写下之后放置收件箱（`harness::generation::settle_scheduler_outcome`）。
+    /// 否则照常守表读先于表写的规则。
+    ///
+    /// **这次提交才建的 conversation**（`Harness::admit_in_tx` 在同一次提交里建 / fork 后受理）存储
+    /// 里没有它，沿 fork 关系往上走到第一个已提交的祖先、带着 fork 点的上限去读：新建的根没有
+    /// 标记，fork 的看得到父到 `at` 为止的那一条。新 conversation 自己暂存了带 `head` 的 entry
+    /// 时同样不许读。
     pub async fn latest_head_marker(
         &mut self,
         conversation: ConversationId,
     ) -> Result<Option<EntryRecord>, DurableError> {
-        let head_unchanged =
-            self.conversations.is_empty() && self.entries.iter().all(|entry| entry.head.is_none());
-        if !head_unchanged {
-            self.read_guard_for("latest_head_marker", conversation)
-                .await?;
+        let mut current = conversation;
+        let mut cap: Option<EntryId> = None;
+        while let Some(record) = self
+            .conversations
+            .iter()
+            .find(|record| record.id == current)
+        {
+            let own_head = self.entries.iter().any(|entry| {
+                entry.conversation == current
+                    && entry.head.is_some()
+                    && cap.is_none_or(|cap| entry.id <= cap)
+            });
+            if own_head {
+                return Err(DurableError::ReadAfterWrite("latest_head_marker"));
+            }
+            let Some(parent) = record.parent else {
+                return Ok(None);
+            };
+            cap = Some(cap.map_or(parent.at, |cap| cap.min(parent.at)));
+            current = parent.conversation;
         }
-        Ok(self
-            .storage
-            .find_latest_head_marker(conversation, None)
-            .await?)
+        // `current` 已提交：暂存的 entry 没有带 head 的，读就是精确的。
+        if self.entries.iter().any(|entry| entry.head.is_some()) {
+            self.read_guard_for("latest_head_marker", current).await?;
+        }
+        Ok(self.storage.find_latest_head_marker(current, cap).await?)
     }
 
     // ------------------------------------------------------------- document

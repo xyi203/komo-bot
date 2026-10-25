@@ -7,12 +7,13 @@ use komo_kernel::durable::{InputState, SubmissionKind, SubmissionStatus, WriteSt
 use serde_json::json;
 use tokio::sync::Notify;
 
-use super::super::inbox::{InboxItem, WriteHead};
+use super::super::inbox::{Admitted, InboxItem, WriteHead};
 use super::super::{
-    Harness, HarnessSettings, HookError, QueueMode, RunBudget, SubmissionDraft, SubmitError,
-    WithdrawResult, WriteDraft,
+    Harness, HarnessSettings, HookError, InputEntry, QueueMode, RunBudget, SubmissionDraft,
+    SubmitError, WithdrawResult, WriteDraft,
 };
 use super::support::*;
+use crate::durable::tx::ConversationOwnership;
 
 fn input_state(record: &komo_kernel::durable::SubmissionRecord) -> InputState {
     match &record.kind {
@@ -457,10 +458,13 @@ async fn withdrawing_a_queued_input_removes_its_item_and_reports_the_rest() {
     engine.close().await.unwrap();
 }
 
-/// pi harness-inbox "leaves queued items after a failed run until the next submission places them
-/// in order"；设计 §4.3 最后一条：失败的 run 只把自己的输入记 `unanswered`，收件箱不动。
+/// 设计 §4.3 最后一条（D5 决定 8 改）：失败的 run 只把自己的输入记 `unanswered`，收件箱里排着的
+/// 用户输入不再留着等下一条输入——同一次提交里放置、起后继 run，前一轮怎么结束都不挡后面的消息
+/// （旧 komo 的行为；pi 的"失败后留在收件箱"在这里有意不照搬，见 `docs/storage-durable.md` §13.2）。
+/// 对应 pi harness-inbox "leaves queued items after a failed run until the next submission places
+/// them in order" 的反面。
 #[tokio::test(start_paused = true)]
-async fn a_failed_run_leaves_the_inbox_until_the_next_submission_runs_a_boundary() {
+async fn a_failed_run_is_followed_by_the_queued_user_input() {
     let world = World::new();
     let gate = Arc::new(Notify::new());
     world.script.push(super::support::Step::Gate(
@@ -473,6 +477,10 @@ async fn a_failed_run_leaves_the_inbox_until_the_next_submission_runs_a_boundary
 
     let first = world.submit(&engine, "one").await;
     let second = world.submit(&engine, "two").await;
+    assert_eq!(
+        input_state(&world.submission(second).await),
+        InputState::Queued
+    );
     gate.notify_one();
     let failed = world.harness.wait(&engine, first).await.unwrap();
     let InputState::Unanswered { reason, detail, .. } = input_state(&failed) else {
@@ -480,17 +488,18 @@ async fn a_failed_run_leaves_the_inbox_until_the_next_submission_runs_a_boundary
     };
     assert_eq!(reason, "model_error");
     assert!(detail.unwrap().to_string().contains("400"));
-    // 失败的 run 没动收件箱：`two` 还在排队，conversation 又空闲了。
-    assert!(world.live().await.run.is_none());
-    assert_eq!(
-        input_state(&world.submission(second).await),
-        InputState::Queued
-    );
 
-    // 下一条输入排在它后面，并在同一次提交里跑一个 final boundary：`two` 先跑。
+    // 失败的 run 收尾的同一次提交把 `two` 放置了、起了后继 run：它照常跑完并回答。
+    let settled = world.harness.wait(&engine, second).await.unwrap();
+    assert!(matches!(input_state(&settled), InputState::Done { .. }));
+    assert!(world.inbox().await.items.is_empty());
+    let requests = world.script.requests();
+    assert_eq!(requests.len(), 2, "the failed run and its successor");
+    assert_eq!(outline(&requests[1]).last().unwrap(), "user: two");
+    assert!(world.live().await.run.is_none());
+
+    // 之后的输入照常：空闲、收件箱空，直接放置。
     let third = world.submit(&engine, "three").await;
-    world.harness.wait(&engine, second).await.unwrap();
-    // `two` 的 final boundary 在同一次提交里放了 `three`。
     assert!(matches!(
         input_state(&world.submission(third).await),
         InputState::Placed { .. } | InputState::Done { .. }
@@ -825,11 +834,11 @@ async fn the_successor_run_places_queued_writes_before_the_internal_input() {
     engine.close().await.unwrap();
 }
 
-/// 模型失败（`model_error`）不动收件箱——但内部输入不等下一条用户输入：同一次提交里起后继 run。
-/// 用户排队的 followUp 照 pi 不跟着放，留在收件箱里，等后继 run 的 final boundary（普通的下一个
-/// boundary）才轮到。
+/// 模型失败（`model_error`）后，用户排队的 followUp 与内部输入一起在收尾的同一次提交里放置（D5
+/// 决定 8；此前只放内部输入、用户的留着）：各按 ID 序，所以先提交的用户 followUp 排在内部的结果前，
+/// 两条都是后继 run 的起始输入，一个请求里模型同时看到。
 #[tokio::test(start_paused = true)]
-async fn a_failed_run_runs_the_queued_internal_input_before_the_user_ones() {
+async fn a_failed_run_places_the_queued_user_and_internal_inputs_together_in_id_order() {
     let world = World::new();
     let gate = Arc::new(Notify::new());
     world.script.push(super::support::Step::Gate(
@@ -841,7 +850,6 @@ async fn a_failed_run_runs_the_queued_internal_input_before_the_user_ones() {
         release.clone(),
         Box::new(super::support::Step::Reply(text_reply("relayed"))),
     ));
-    world.script.reply("then the follow-up");
     let engine = world.open().await;
 
     let first = world.submit(&engine, "one").await;
@@ -855,38 +863,25 @@ async fn a_failed_run_runs_the_queued_internal_input_before_the_user_ones() {
     let failed = world.harness.wait(&engine, first).await.unwrap();
     assert_eq!(unanswered_reason(&failed), "model_error");
 
-    // 后继 run 已经起来（卡在模型请求上）：内部输入放置了，用户的 followUp 还在收件箱里排着。
+    // 后继 run 已经起来（卡在模型请求上）：两条输入都放置了，收件箱空。
     world
         .until(|| async { world.script.request_count() == 2 })
         .await;
-    assert!(matches!(
-        input_state(&world.submission(result).await),
-        InputState::Placed { .. }
-    ));
-    assert_eq!(
-        input_state(&world.submission(user).await),
-        InputState::Queued
-    );
-    assert_eq!(
-        world
-            .inbox()
-            .await
-            .items
-            .iter()
-            .map(InboxItem::id)
-            .collect::<Vec<_>>(),
-        [user]
-    );
+    for id in [user, result] {
+        assert!(matches!(
+            input_state(&world.submission(id).await),
+            InputState::Placed { .. }
+        ));
+    }
+    assert!(world.inbox().await.items.is_empty());
     release.notify_one();
     world.harness.wait(&engine, user).await.unwrap();
+    world.harness.wait(&engine, result).await.unwrap();
 
     let requests = world.script.requests();
-    assert_eq!(outline(&requests[1]).last().unwrap(), "user: job done");
-    assert_eq!(
-        outline(&requests[2]).last().unwrap(),
-        "user: user follow",
-        "the left-over follow-up runs at the successor's final boundary"
-    );
+    assert_eq!(requests.len(), 2, "one successor run for both");
+    let tail: Vec<_> = outline(&requests[1]).into_iter().rev().take(2).collect();
+    assert_eq!(tail, ["user: job done", "user: user follow"]);
     engine.close().await.unwrap();
 }
 
@@ -1045,6 +1040,420 @@ async fn cancelling_the_successor_run_does_not_loop() {
     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
     assert_eq!(world.script.request_count(), 2, "no third run");
     assert!(world.live().await.run.is_none());
+    engine.close().await.unwrap();
+}
+
+// ------------------------------------------------------------ abort_run（决定 8）
+
+/// `abort_run`（`/cancel`、Esc）只停当前这一轮，不撤回收件箱：排队的用户 steer 与 followUp 在 run
+/// 收尾的同一次提交里放置，成了后继 run 的起始输入（没有"当前 run"可并，所以 steer 在这里不是插话），
+/// 内部输入一起；各按 ID 序，一个请求里模型同时看到。对比 `abort_conversation` 先撤用户输入。
+#[tokio::test(start_paused = true)]
+async fn abort_run_keeps_queued_user_inputs_and_runs_them_next() {
+    let (world, engine, _gate) = busy_world(|world| world.script.push(Step::Hang)).await;
+    // 队列模式取"全部"：steer 与 followUp 都不限个数（默认的 one-at-a-time 见下一个测试）。
+    world.harness.deps().set_settings(HarnessSettings {
+        steering_mode: QueueMode::All,
+        follow_up_mode: QueueMode::All,
+        ..HarnessSettings::default()
+    });
+    let first = world.submit(&engine, "go").await;
+    world.until_log("start slow #1").await;
+    let steer = world
+        .harness
+        .submit(&engine, CONV, SubmissionDraft::input("user steer").steer())
+        .await
+        .unwrap();
+    let follow = world.submit(&engine, "user follow").await;
+    let result = world
+        .harness
+        .submit(
+            &engine,
+            CONV,
+            internal_steer("task finished: 42", "task-result:t:9"),
+        )
+        .await
+        .unwrap();
+
+    assert!(world.harness.abort_run(&engine, CONV).await.unwrap());
+
+    // 被取消的那条 run 收了尾；排队的东西一条没撤，全放进了后继 run。
+    assert_eq!(unanswered_reason(&world.submission(first).await), "aborted");
+    world
+        .until(|| async { world.script.request_count() == 2 })
+        .await;
+    for id in [steer, follow, result] {
+        assert!(
+            matches!(
+                input_state(&world.submission(id).await),
+                InputState::Placed { .. }
+            ),
+            "{id}"
+        );
+    }
+    assert!(world.inbox().await.items.is_empty());
+    let live = world.live().await;
+    assert_eq!(
+        live.run.expect("the successor run").inputs,
+        [steer, follow, result],
+        "one run, inputs in ID order"
+    );
+    let requests = world.script.requests();
+    let tail: Vec<_> = outline(&requests[1]).into_iter().rev().take(3).collect();
+    assert_eq!(
+        tail,
+        [
+            "user: task finished: 42",
+            "user: user follow",
+            "user: user steer"
+        ]
+    );
+    // 后继 run 里新来的 steer 才是插话：并进它的下一个 postTools boundary，这里只看它排了队。
+    let later = world
+        .harness
+        .submit(&engine, CONV, SubmissionDraft::input("later").steer())
+        .await
+        .unwrap();
+    assert_eq!(
+        input_state(&world.submission(later).await),
+        InputState::Queued
+    );
+    // 空闲的会话上取消没有对象。
+    assert!(world.harness.abort_run(&engine, CONV).await.unwrap());
+    assert!(!world.harness.abort_run(&engine, CONV).await.unwrap());
+    engine.close().await.unwrap();
+}
+
+/// 取消的是当前这一条 run，哪怕它已经换到第二轮的生成任务：`abort_run` 认 run 的身份，不是第一个
+/// 任务。排队的 write 在同一次提交里放置；没有输入可放就不起后继 run。
+#[tokio::test(start_paused = true)]
+async fn abort_run_stops_a_run_in_a_later_round_and_places_a_queued_write_without_a_successor() {
+    let world = World::new();
+    let gate = Arc::new(Notify::new());
+    let second_gate = Arc::new(Notify::new());
+    world.tools(vec![
+        Arc::new(TestTool::writer("slow", &world.log).with_gate(&gate)),
+        Arc::new(TestTool::writer("slower", &world.log).with_gate(&second_gate)),
+    ]);
+    world.script.calls(&[("c1", "slow", json!({}))]);
+    world.script.calls(&[("c2", "slower", json!({}))]);
+    let engine = world.open().await;
+    let first = world.submit(&engine, "go").await;
+    world.until_log("start slow #1").await;
+    gate.notify_one();
+    world.until_log("start slower #1").await;
+    let reset = world.harness.reset(&engine, CONV, None).await.unwrap();
+    assert_eq!(
+        write_state(&world.submission(reset).await),
+        WriteState::Queued
+    );
+    assert_eq!(world.tasks("komo.generation").await.len(), 2);
+
+    assert!(world.harness.abort_run(&engine, CONV).await.unwrap());
+
+    assert_eq!(unanswered_reason(&world.submission(first).await), "aborted");
+    assert!(matches!(
+        write_state(&world.submission(reset).await),
+        WriteState::Done { .. }
+    ));
+    assert!(world.live().await.run.is_none());
+    assert!(world.inbox().await.items.is_empty());
+    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    assert_eq!(world.script.request_count(), 2, "no successor run");
+    engine.close().await.unwrap();
+}
+
+/// `abort_conversation` 的语义不变：先撤用户输入，再 abort；对比 `abort_run`。
+#[tokio::test(start_paused = true)]
+async fn abort_conversation_still_withdraws_the_queued_user_inputs() {
+    let (world, engine, _gate) = busy_world(|_| {}).await;
+    let first = world.submit(&engine, "go").await;
+    world.until_log("start slow #1").await;
+    let follow = world.submit(&engine, "user follow").await;
+    world
+        .harness
+        .abort_conversation(&engine, CONV)
+        .await
+        .unwrap();
+    assert_eq!(unanswered_reason(&world.submission(first).await), "aborted");
+    assert_eq!(
+        unanswered_reason(&world.submission(follow).await),
+        "aborted"
+    );
+    assert_eq!(world.script.request_count(), 1, "no successor run");
+    engine.close().await.unwrap();
+}
+
+/// 非正常收尾的后继 boundary 按队列模式放置：`OneAtATime`（默认）时每种取第一项，余下的留给后继
+/// run 自己的 boundary——每个后继 run 至少消耗一个排队的输入，链条有限。
+#[tokio::test(start_paused = true)]
+async fn the_successor_of_an_abnormal_end_follows_the_queue_modes_and_leaves_the_rest_queued() {
+    let (world, engine, gate) = busy_world(|world| {
+        world.script.push(Step::Error(rejected(400)));
+        world.script.reply("first follow answer");
+        world.script.reply("second follow answer");
+    })
+    .await;
+    // 第一个请求（带 slow 调用）之后模型失败：用 postTools 之后的那次请求失败来结束 run。
+    let first = world.submit(&engine, "go").await;
+    world.until_log("start slow #1").await;
+    let one = world.submit(&engine, "follow one").await;
+    let two = world.submit(&engine, "follow two").await;
+    gate.notify_one();
+    let failed = world.harness.wait(&engine, first).await.unwrap();
+    assert_eq!(unanswered_reason(&failed), "model_error");
+
+    // 后继 run 只带 `follow one`（followUp 模式 one-at-a-time）；`follow two` 排到它收尾时再跑。
+    world.harness.wait(&engine, one).await.unwrap();
+    world.harness.wait(&engine, two).await.unwrap();
+    let requests = world.script.requests();
+    assert_eq!(requests.len(), 4);
+    assert_eq!(outline(&requests[2]).last().unwrap(), "user: follow one");
+    assert_eq!(outline(&requests[3]).last().unwrap(), "user: follow two");
+    assert!(world.inbox().await.items.is_empty());
+    engine.close().await.unwrap();
+}
+
+// ------------------------------------------------------------ komo.settled
+
+fn settled_data(entry: &komo_kernel::durable::EntryRecord) -> serde_json::Value {
+    assert_eq!(entry.kind, "komo.settled");
+    assert!(entry.model.is_none(), "只展示，模型看不到");
+    entry.data.clone().expect("data")
+}
+
+/// D5 契约：`inbox::settle` 每结算一个输入 submission，同一次提交追加一条 `komo.settled`
+/// `{submission, status, reason?, detail?, answer?}`：回答的 `done`、吸收的 steer（与 run 同时结算，
+/// 各一条）、排队中被撤回的 `unanswered{aborted}`（没有放置过）、模型失败的 `unanswered`；write 不留。
+#[tokio::test(start_paused = true)]
+async fn every_input_settlement_leaves_one_settled_entry() {
+    let (world, engine, gate) = busy_world(|world| {
+        world.script.reply("done");
+        world.script.push(Step::Error(rejected(400)));
+    })
+    .await;
+    let first = world.submit(&engine, "go").await;
+    world.until_log("start slow #1").await;
+    let steer = world
+        .harness
+        .submit(&engine, CONV, SubmissionDraft::input("also this").steer())
+        .await
+        .unwrap();
+    let doomed = world.submit(&engine, "never mind").await;
+    world
+        .harness
+        .withdraw(&engine, doomed, Some(CONV))
+        .await
+        .unwrap();
+    gate.notify_one();
+    world.harness.wait(&engine, first).await.unwrap();
+    world.harness.wait(&engine, steer).await.unwrap();
+    // 一条 write（展示用的 label）：submission 照常 `done`，不留结算锚点。
+    let label = world
+        .harness
+        .submit(
+            &engine,
+            CONV,
+            SubmissionDraft::write(WriteDraft::display("label", json!({"label": "x"}))),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        write_state(&world.submission(label).await),
+        WriteState::Done { .. }
+    ));
+    let failing = world.submit(&engine, "break").await;
+    world.harness.wait(&engine, failing).await.unwrap();
+
+    let settled = world.entries_of("komo.settled").await;
+    let by_submission = |id: komo_kernel::durable::SubmissionId| {
+        let matching: Vec<_> = settled
+            .iter()
+            .filter(|entry| settled_data(entry)["submission"] == json!(id))
+            .collect();
+        assert_eq!(matching.len(), 1, "one anchor for {id}: {settled:?}");
+        (matching[0].id, settled_data(matching[0]))
+    };
+    assert_eq!(
+        settled.len(),
+        4,
+        "go, the steer, the withdrawn one, the failure"
+    );
+    let answer = {
+        let InputState::Done { answer, .. } = input_state(&world.submission(first).await) else {
+            panic!("done expected");
+        };
+        answer
+    };
+    let (go_at, go) = by_submission(first);
+    assert_eq!(
+        go,
+        json!({"submission": first, "status": "done", "answer": answer})
+    );
+    let (steer_at, steer_data) = by_submission(steer);
+    assert_eq!(
+        steer_data,
+        json!({"submission": steer, "status": "done", "answer": answer}),
+        "an absorbed steer settles with its run's answer"
+    );
+    assert_eq!(
+        steer_at.get().abs_diff(go_at.get()),
+        1,
+        "one run, its inputs settle side by side"
+    );
+    assert!(
+        go_at > answer && steer_at > answer,
+        "anchors follow the answer entry"
+    );
+    let (_, withdrawn) = by_submission(doomed);
+    assert_eq!(
+        withdrawn,
+        json!({"submission": doomed, "status": "unanswered", "reason": "aborted"})
+    );
+    let (_, failed) = by_submission(failing);
+    assert_eq!(failed["status"], "unanswered");
+    assert_eq!(failed["reason"], "model_error");
+    assert!(failed["detail"].to_string().contains("400"), "{failed}");
+    // write submission 不留锚点。
+    assert!(
+        settled
+            .iter()
+            .all(|entry| settled_data(entry)["submission"] != json!(label))
+    );
+    // 它们不进模型的上下文。
+    for request in world.script.requests() {
+        assert!(
+            !outline(&request)
+                .iter()
+                .any(|line| line.contains("settled")),
+            "{request:?}"
+        );
+    }
+    engine.close().await.unwrap();
+}
+
+// ------------------------------------------------------------ admit_in_tx
+
+/// gateway 在一次提交里"建 / fork conversation + 受理"：fork 出来的 conversation 上放了输入、起了
+/// run，上下文是父到 fork 点为止的历史加这条输入；同一个请求键再来原样返回；新建的根同样能用；
+/// 违规的输入 entry kind 被拒。
+#[tokio::test(start_paused = true)]
+async fn admit_in_tx_forks_and_places_in_one_commit() {
+    let world = World::new();
+    world.script.reply("first answer");
+    world.script.reply("branch answer");
+    world.script.reply("root answer");
+    let engine = world.open().await;
+    let first = world.submit(&engine, "first question").await;
+    world.harness.wait(&engine, first).await.unwrap();
+    let user_entry = world.entries_of("komo.user").await[0].id;
+
+    let harness = world.harness.clone();
+    let (branch, admitted) = engine
+        .commit(move |tx| {
+            Box::pin(async move {
+                let branch = tx
+                    .fork_conversation(CONV, user_entry, ConversationOwnership::Ownerless)
+                    .await?;
+                let draft = SubmissionDraft::input("edited question").with_request_id("edit-1");
+                let admitted = harness.admit_in_tx(tx, branch.id, &draft).await?;
+                Ok((branch.id, admitted))
+            })
+        })
+        .await
+        .unwrap();
+    engine.resume();
+    let Admitted::Id(id) = admitted else {
+        panic!("admitted: {admitted:?}");
+    };
+    // 同一次提交里：fork、输入 entry、submission（placed）、run 都在。
+    assert!(matches!(
+        input_state(&world.submission(id).await),
+        InputState::Placed { .. } | InputState::Done { .. }
+    ));
+    assert!(
+        world
+            .storage_handle()
+            .conversation(branch)
+            .await
+            .unwrap()
+            .unwrap()
+            .parent
+            .is_some()
+    );
+    let settled = world.harness.wait(&engine, id).await.unwrap();
+    assert!(matches!(input_state(&settled), InputState::Done { .. }));
+    let requests = world.script.requests();
+    assert_eq!(
+        outline(&requests[1]),
+        ["system", "user: first question", "user: edited question"]
+            .map(String::from)
+            .to_vec(),
+        "the branch sees its parent up to the fork point plus the new input"
+    );
+    // 父 conversation 不受影响。
+    assert_eq!(world.messages().await.len(), 3);
+
+    // 同一个请求键在另一次提交里原样返回已有的那条，什么都不写。
+    let harness = world.harness.clone();
+    let again = engine
+        .commit(move |tx| {
+            Box::pin(async move {
+                let draft = SubmissionDraft::input("edited question").with_request_id("edit-1");
+                harness.admit_in_tx(tx, branch, &draft).await
+            })
+        })
+        .await
+        .unwrap();
+    assert_eq!(again, Admitted::Id(id));
+
+    // 新建的根 conversation 同样：建 + 受理 + 起 run 一次提交。
+    let harness = world.harness.clone();
+    let (root, root_input) = engine
+        .commit(move |tx| {
+            Box::pin(async move {
+                let root = tx
+                    .create_conversation_in("sess-x", ConversationOwnership::Ownerless)
+                    .await?;
+                let draft = SubmissionDraft::input("hello there").with_request_id("first");
+                let Admitted::Id(id) = harness.admit_in_tx(tx, root.id, &draft).await? else {
+                    unreachable!("not rejected");
+                };
+                Ok((root.id, id))
+            })
+        })
+        .await
+        .unwrap();
+    engine.resume();
+    world.harness.wait(&engine, root_input).await.unwrap();
+    assert_eq!(
+        world
+            .storage_handle()
+            .conversation(root)
+            .await
+            .unwrap()
+            .unwrap()
+            .session
+            .as_deref(),
+        Some("sess-x")
+    );
+    assert_eq!(
+        outline(&world.script.requests()[2]),
+        ["system", "user: hello there"].map(String::from).to_vec()
+    );
+
+    // 违规的输入 entry kind（`komo.` 前缀是 Harness 自己的）在提交里被拒，整笔不生效。
+    let harness = world.harness.clone();
+    let rejected = engine
+        .commit(move |tx| {
+            Box::pin(async move {
+                let bad =
+                    SubmissionDraft::input("x").with_entry(InputEntry::new("komo.user", None));
+                harness.admit_in_tx(tx, CONV, &bad).await
+            })
+        })
+        .await;
+    assert!(rejected.is_err());
     engine.close().await.unwrap();
 }
 

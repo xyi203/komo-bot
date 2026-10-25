@@ -9,9 +9,10 @@
 //! - **父忙时**按收件箱规则排队：交回的输入是 steer，在父的 postTools boundary 并进当前 run
 //!   （旧实现的"插话并入"），父空闲就直接放置、起 run。
 //! - **内部输入**：交回的输入带 `internal` 标记，父的 `Conversation.abort()` 不撤它；父的 run
-//!   非正常收尾（取消、模型失败、预算、fault、orphan）时它也不卡在收件箱，而是同一次提交里用它
-//!   起后继 run（[`end_run_abnormal`]），父照旧跑一轮把结论转告用户——旧 komo 取消 home 的 Run
-//!   不动任务结果的行为。这是对 pi 的有意偏离（pi 的子 agent 交回是普通 followUp，会被撤）。
+//!   非正常收尾（取消、模型失败、预算、fault、orphan）时它也不卡在收件箱，而是同一次提交里随
+//!   收件箱里排着的其余输入一起放置、起后继 run（[`end_run_abnormal`]），父照旧跑一轮把结论转告
+//!   用户——旧 komo 取消 home 的 Run 不动任务结果的行为。这是对 pi 的有意偏离（pi 的子 agent
+//!   交回是普通 followUp，会被撤）。
 //!
 //! 收尾的每个出口（回答、模型失败、预算、abort、调度器写的 faulted / orphaned）都经
 //! [`end_run`] / [`end_run_abnormal`]，所以任务无论怎么结束父都会收到一条（"已完成"或"没有
@@ -103,14 +104,28 @@ fn contract_verdict(contract: &DelegateContract, text: &str) -> String {
 }
 
 /// 结束 `task` 负责的 run，run 非正常收尾（取消、模型失败、预算、fault、orphan）时用：同
-/// [`end_run`]，之后收件箱里还有内部输入就在**同一次提交**里起后继 run。
+/// [`end_run`]，之后在**同一次提交**里把收件箱里排着的东西按 final boundary 放置，放了输入就起
+/// 后继 run——"前一轮怎么结束都不挡后面的消息"（D5 决定 8，旧 komo 的行为）。
 ///
 /// - `boundary` 由调用方在闭包开头（第一次表写之前）[`inbox::prepare_boundary`] 备好——放置要读
-///   最新的 head 标记。收件箱里没有内部输入就什么都不做：write 与用户输入照 pi 留着，等下一条
-///   输入的 boundary（失败后用户输入也留着；取消时它们已被 `withdraw_queued_inputs` 撤掉）。
-/// - 放置顺序同 boundary：先排队的 write，再内部输入，各按 ID 序；用户输入不放。
-/// - **不会死循环**：内部输入一旦放置就成了后继 run 的输入，随这条 run settle，不在收件箱里了，
-///   不会被重放。后继 run 再被取消 / 再失败，收件箱里没有新的内部输入就不再起 run。
+///   最新的 head 标记。
+/// - 放置顺序同 final boundary：先排队的 write，再 steer 与 followUp（用户的与内部的一起，各按
+///   ID 序，队列模式照旧：`OneAtATime` 每种取第一项，余下的留给后继 run 自己的 boundary）。
+///   没有输入可放（只有 write 或收件箱空）就不起 run，write 照样放了。
+/// - **取消时排队的用户输入**去留不在这里决定：`Harness::abort_conversation` 先撤回它们再 abort，
+///   收件箱里就只剩内部输入；`Harness::abort_run` 不撤，它们和别的一起在这里放置。后继 run 里
+///   放进来的用户 steer 是这条 run 的**起始输入**（没有"当前 run"可并），不是插话；之后新来的
+///   steer 才在后继 run 的 postTools boundary 并入。
+/// - **取消与放置的竞争**：abort 标记、run 自己的 boundary 提交、本函数所在的收尾提交都串在同一条
+///   提交线上。run 自己的 boundary 提交（放 steer、交棒下一个生成任务、`answer` 的 final boundary）
+///   要么先于标记——那条 run 已走到下一个任务或已正常收尾，`abort_run` 重读 `komo.live` 会追着同一条
+///   run 的新任务再 abort；要么晚于标记——被 abort fence 拒掉，什么都没放到一半。放置只发生在本函数
+///   这一次提交里，所以一个排队项不会"既放了又还在收件箱"；标记之后、收尾提交之前受理的输入因为
+///   `live.run` 还在而排队，同一次提交里被放进来；收尾提交之后受理的输入看到 run 已移除，照常处理
+///   （空闲且收件箱空就直接起 run，否则排在后继 run 后面）。
+/// - **不会死循环**：放置的输入就是后继 run 的输入，随这条 run settle，不在收件箱里了，不会被
+///   重放；后继 run 再被取消 / 再失败，只会放那时收件箱里新有的东西，每个后继 run 至少消耗一个
+///   排队的输入，没有新输入就不再起 run。
 /// - 不是 `task` 负责的 run（已经结束过，重放同一笔收尾）什么都不做。
 /// - 调用方随后把 `live` 写回。
 pub(crate) async fn end_run_abnormal(
@@ -125,11 +140,11 @@ pub(crate) async fn end_run_abnormal(
     if !end_run(tx, generation, conversation, live, task, settlement).await? {
         return Ok(());
     }
-    if !boundary.has_internal() {
+    if boundary.inbox.items.is_empty() {
         return Ok(());
     }
     let now = tx.now();
-    let result = inbox::apply_boundary(tx, &mut boundary, At::Successor, now).await?;
+    let result = inbox::apply_boundary(tx, &mut boundary, At::Final, now).await?;
     if !result.users.is_empty() {
         inbox::start_run(tx, generation, conversation, live, result.users).await?;
     }

@@ -210,6 +210,119 @@ async fn a_dispatched_task_runs_in_a_child_and_its_result_reaches_the_parent() {
     engine.close().await.unwrap();
 }
 
+/// D5 契约：派出的同一次提交里给子 conversation 写一条 komo Session 行——`kind=task`、UUIDv7、
+/// `parent_session` 是父 conversation 的 Session、title 是任务标题、根与当前分支都是子 conversation；
+/// 子 conversation 属于这个新 Session（fork 出来的也是，不继承父的）。
+#[tokio::test(start_paused = true)]
+async fn a_spawned_task_has_its_own_session_row() {
+    use komo_kernel::durable::storage::ConversationQuery;
+    use komo_kernel::durable::{SessionKind, SessionRecord};
+
+    let world = World::new();
+    let (_fixture, ..) = install(&world);
+    let child_gate = Arc::new(Notify::new());
+    world.script.calls(&[
+        ("c1", "task", spawn_call("CHILD plain", "查空调")),
+        (
+            "c2",
+            "task",
+            json!({ "prompt": "CHILD forked", "title": "分支", "context": "fork" }),
+        ),
+    ]);
+    world.script.reply("dispatched");
+    world.script.push_for("CHILD", gated(&child_gate, "ok"));
+    world.script.push_for("CHILD", gated(&child_gate, "ok"));
+    let engine = world.open().await;
+    // 父是一个属于 komo Session `sess-parent` 的 conversation。
+    let parent = engine
+        .commit(|tx| {
+            Box::pin(async move {
+                let parent = tx
+                    .create_conversation_in(
+                        "sess-parent",
+                        crate::durable::tx::ConversationOwnership::Ownerless,
+                    )
+                    .await?
+                    .id;
+                tx.put_session(SessionRecord::new("sess-parent", parent));
+                Ok(parent)
+            })
+        })
+        .await
+        .unwrap();
+    let id = world
+        .harness
+        .submit(&engine, parent, SubmissionDraft::input("go"))
+        .await
+        .unwrap();
+    world.harness.wait(&engine, id).await.unwrap();
+
+    let children = world.children().await;
+    assert_eq!(
+        children.len(),
+        2,
+        "{}",
+        result_text(&world.messages_in(parent).await, "c2")
+    );
+    let storage = world.storage_handle();
+    let mut ids = Vec::new();
+    for (index, child) in children.iter().enumerate() {
+        let record = storage.conversation(*child).await.unwrap().unwrap();
+        let session_id = record
+            .session
+            .clone()
+            .expect("a task conversation has a session");
+        assert_ne!(session_id, "sess-parent", "not the parent's session");
+        assert_eq!(
+            record.parent.is_some(),
+            index == 1,
+            "the second task is the fork"
+        );
+        let session = storage
+            .session(&session_id)
+            .await
+            .unwrap()
+            .expect("its Session row");
+        assert_eq!(session.kind, SessionKind::Task);
+        assert_eq!(session.parent_session.as_deref(), Some("sess-parent"));
+        assert_eq!(session.root_conversation, *child);
+        assert_eq!(session.current_branch, *child);
+        assert_eq!(
+            session.lifecycle,
+            komo_kernel::durable::SessionLifecycle::Active
+        );
+        assert_eq!(
+            session.title.as_deref(),
+            Some(["查空调", "分支"][index]),
+            "the session is named after the task"
+        );
+        assert!(session.created_at > 0 && session.changed_at == session.created_at);
+        // UUIDv7 的字符串。
+        let uuid = uuid::Uuid::parse_str(&session_id).unwrap();
+        assert_eq!(uuid.get_version_num(), 7);
+        ids.push(session_id.clone());
+        // 按 Session 能找到它的 conversation。
+        let found = storage
+            .scan_conversations(
+                &ConversationQuery {
+                    session: Some(session_id),
+                    ..Default::default()
+                },
+                10,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(found.items.len(), 1);
+    }
+    assert_ne!(ids[0], ids[1]);
+    // 父会话的 Session 行没动。
+    let parent_session = storage.session("sess-parent").await.unwrap().unwrap();
+    assert_eq!(parent_session.kind, SessionKind::Normal);
+    child_gate.notify_waiters();
+    engine.close().await.unwrap();
+}
+
 /// 设计 §4.6 / spec §5.4：子会话是 background 的，不挡父的 idle——子还在跑，父的
 /// `wait_for_idle`（含全局）照样返回；锚任务停在 `completing`，子安静了才 terminal。
 #[tokio::test(start_paused = true)]

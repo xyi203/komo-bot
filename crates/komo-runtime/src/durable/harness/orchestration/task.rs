@@ -3,11 +3,11 @@
 use std::collections::BTreeMap;
 
 use komo_kernel::durable::{
-    Content, ContentBlock, ConversationId, EntryId, EntryRecord, Message, StopReason,
-    ToolResultMessage,
+    Content, ContentBlock, ConversationId, EntryId, EntryRecord, Message, SessionKind,
+    SessionRecord, StopReason, ToolResultMessage,
 };
 use komo_kernel::types::delegate::DelegateContract;
-use komo_kernel::types::ids::{RunId, ToolCallId};
+use komo_kernel::types::ids::{RunId, SessionId, ToolCallId};
 use komo_kernel::types::model::Effort;
 use komo_kernel::types::status::RunState;
 use komo_kernel::types::task::{RunProgress, RunningCall, TaskProgress};
@@ -188,6 +188,11 @@ async fn spawn(cx: &Cx<'_>, request: Request) -> Result<(), TaskError> {
     cx.commit_effect(move |tx, task| {
         Box::pin(async move {
             let now = tx.now();
+            // 表读先于第一次表写：父 conversation 属于哪个 komo Session（任务会话的 `parent_session`）。
+            let parent_session = tx
+                .conversation(parent)
+                .await?
+                .and_then(|record| record.session);
             let anchor = tx
                 .create_task(
                     &BackgroundTask,
@@ -201,11 +206,29 @@ async fn spawn(cx: &Cx<'_>, request: Request) -> Result<(), TaskError> {
                 )
                 .await?;
             let ownership = ConversationOwnership::Task(anchor);
+            // 任务有自己的 komo Session 行（`kind=task`）：子 conversation（fork 的也是）属于它，
+            // 不继承父的。同一次提交写下，所以不会有"有任务会话、没有 Session 行"的状态。
+            let session = SessionId::new_at(
+                OffsetDateTime::from_unix_timestamp_nanos(i128::from(now) * 1_000_000)
+                    .unwrap_or(OffsetDateTime::UNIX_EPOCH),
+            )
+            .to_string();
             let child = match &seed {
-                Some(seed) => tx.fork_conversation(parent, seed.at, ownership).await?,
-                None => tx.create_conversation(ownership).await?,
+                Some(seed) => {
+                    tx.fork_conversation_in(parent, seed.at, &session, ownership)
+                        .await?
+                }
+                None => tx.create_conversation_in(&session, ownership).await?,
             }
             .id;
+            let mut record = SessionRecord::new(session, child);
+            record.kind = SessionKind::Task;
+            record.parent_session = parent_session;
+            record.title = Some(title.clone()).filter(|title| !title.is_empty());
+            record.created_at = now;
+            record.changed_at = now;
+            record.request_key = Some(format!("task:{}", task.id()));
+            tx.put_session(record);
             if let Some(seed) = &seed {
                 for (call_id, tool, text) in &seed.synth {
                     let message = ToolResultMessage {

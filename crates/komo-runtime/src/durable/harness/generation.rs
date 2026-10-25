@@ -365,7 +365,7 @@ impl GenerationTask {
                     && run.rounds >= max
                 {
                     let message = format!("超过总轮数预算（{max}）");
-                    // 非正常收尾要放内部输入：表读（head）先于第一次表写，这里还没写过。
+                    // 非正常收尾要放排队的输入：表读（head）先于第一次表写，这里还没写过。
                     let successor = inbox::prepare_boundary(tx, conversation, modes).await?;
                     report::end_run_abnormal(
                         tx,
@@ -816,7 +816,7 @@ impl GenerationTask {
         let modes = self.modes();
         rt.commit(move |tx, task| {
             Box::pin(async move {
-                // token 预算超了要以非正常收尾放内部输入：表读先于第一次表写，所以有预算才先备好。
+                // token 预算超了要以非正常收尾放排队的输入：表读先于第一次表写，所以有预算才先备好。
                 let successor = if max_tokens.is_some() {
                     Some(inbox::prepare_boundary(tx, conversation, modes).await?)
                 } else {
@@ -1264,9 +1264,10 @@ impl TaskKind for GenerationTask {
                     )
                     .await?;
                 }
-                // 取消不撤内部输入（`withdraw_queued_inputs` 只撤用户的）：run 收尾后立刻用它们起
-                // 后继 run，把任务结果转告用户。后继 run 若再被取消，内部输入已是它的输入、随它
-                // settle，收件箱里不会再有，不会死循环。
+                // 取消不撤内部输入（`withdraw_queued_inputs` 只撤用户的），`abort_run` 连用户输入也
+                // 不撤：run 收尾后同一次提交里放置收件箱里全部排着的项、起后继 run（任务结果
+                // 转告用户，排队的消息接着跑）。后继 run 若再被取消，放进去的输入已是它的输入、
+                // 随它 settle，收件箱里不会再有，不会死循环。
                 report::end_run_abnormal(
                     tx,
                     &this,

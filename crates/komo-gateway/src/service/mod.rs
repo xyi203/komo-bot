@@ -17,7 +17,6 @@ pub mod durable;
 pub mod interventions;
 pub(crate) mod project_files;
 pub mod state;
-pub(crate) mod tool_catalog;
 pub mod units;
 pub(crate) mod windows;
 

@@ -1,17 +1,9 @@
-//! 上一个执行实例真的停了吗（§8.7）。
+//! 遗留子进程的登记与核实（§8.7）。
 //!
-//! 「异常退出可能遗留子进程，不能仅凭一个 PID 判断是否为原进程；结合平台监督信息、
-//! 启动身份和进程启动时间核对。**无法确认旧执行已结束时，阻止该任务重复启动并显示
-//! 原因。**」这个文件就是那句话的两半：
-//!
-//! - **平台监督信息**：Gateway 对数据目录持进程锁（§3）。拿到锁就说明上一个 Gateway
-//!   进程不在了——这是我们有的、最硬的那条信号，比任何 PID 探测都硬。
-//! - **遗留子进程**：锁管不到 shell 留下的进程组。谁启动它们谁在
-//!   [`ChildRegistry`] 里留一行（pid / 进程组 / 启动时刻），这里逐行核实。
-//!
-//! 记录文件不存在 = 上一代没留下任何在册子进程。这是一个明确的结论，不是一个猜测：
-//! 首版**不承诺** shell 进程跨 Gateway 重启存活（§8.7），所以"没有在册子进程
-//! + 锁已经拿到"就是"上一个执行实例已经停止"。
+//! 「异常退出可能遗留子进程，不能仅凭一个 PID 判断是否为原进程；结合启动身份和进程启动
+//! 时刻核对。」Gateway 对数据目录持进程锁（§3），拿到锁就说明上一个 Gateway 进程不在了；
+//! 锁管不到 shell 留下的进程组，所以谁启动它们谁在 [`ChildRegistry`] 里留一行（pid / 进程组 /
+//! 启动时刻），[`ProcessProbe`] 逐行核实。
 
 use std::path::{Path, PathBuf};
 
@@ -255,102 +247,9 @@ impl ChildRegistry {
     }
 }
 
-/// 上一个执行实例停了吗。
-pub trait ExecutorLiveness: Send + Sync + std::fmt::Debug {
-    /// `previous` 是账本里那个还握着领取权的执行实例（`None` = 没人握着）。
-    ///
-    /// **无法确认时答 `false`**：§8.7 要的是"阻止该任务重复启动并显示原因"。
-    fn stopped(&self, previous: Option<&ExecutorId>) -> bool;
-
-    /// 名下还有子进程活着（或核实不了）的那些**上一代**执行实例。启动回收不交还它们握着的
-    /// `running`，好让扫描判得出"上一个执行实例还没停"。
-    fn unstopped(&self) -> Vec<ExecutorId>;
-}
-
-/// 拿到了数据目录进程锁的那个实例的判断。
-#[derive(Debug)]
-pub struct LockHolderLiveness {
-    current: ExecutorId,
-    registry: ChildRegistry,
-    probe: Box<dyn ProcessProbe>,
-}
-
-impl LockHolderLiveness {
-    /// `current` 是本次启动身份。**只有真的拿到了数据目录进程锁才可以构造它**——它的
-    /// 结论建立在"没有第二个 Gateway 在跑"上。
-    pub fn holding_lock(current: ExecutorId, registry: ChildRegistry) -> Self {
-        LockHolderLiveness {
-            current,
-            registry,
-            probe: Box::new(SysProcessProbe),
-        }
-    }
-
-    pub fn with_probe(mut self, probe: Box<dyn ProcessProbe>) -> Self {
-        self.probe = probe;
-        self
-    }
-}
-
-impl ExecutorLiveness for LockHolderLiveness {
-    fn stopped(&self, previous: Option<&ExecutorId>) -> bool {
-        let Some(previous) = previous else {
-            // 没人握着领取权。
-            return true;
-        };
-        if previous == &self.current {
-            // 是我自己——这个 Run 正由本进程跑着，不是"上一个实例"。
-            return false;
-        }
-        for child in self.registry.children(previous) {
-            match self.probe.probe(&child) {
-                Liveness::Gone => {}
-                Liveness::Alive | Liveness::Unknown => {
-                    tracing::warn!(
-                        executor = %previous,
-                        pid = child.pid,
-                        what = %child.what,
-                        "上一代留下的子进程还在（或核实不了），先不重复启动"
-                    );
-                    return false;
-                }
-            }
-        }
-        true
-    }
-
-    fn unstopped(&self) -> Vec<ExecutorId> {
-        let Ok(entries) = std::fs::read_dir(self.registry.dir()) else {
-            return Vec::new();
-        };
-        let mut previous: Vec<ExecutorId> = entries
-            .filter_map(Result::ok)
-            .filter_map(|entry| {
-                let path = entry.path();
-                if path.extension()? != "json" {
-                    return None;
-                }
-                Some(ExecutorId::from_raw(path.file_stem()?.to_str()?))
-            })
-            .filter(|executor| executor != &self.current && !self.stopped(Some(executor)))
-            .collect();
-        previous.sort_by(|a, b| a.as_str().cmp(b.as_str()));
-        previous
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[derive(Debug)]
-    struct Fixed(Liveness);
-
-    impl ProcessProbe for Fixed {
-        fn probe(&self, _child: &ChildProcess) -> Liveness {
-            self.0
-        }
-    }
 
     fn child(pid: u32) -> ChildProcess {
         ChildProcess {
@@ -359,76 +258,6 @@ mod tests {
             started_at: None,
             what: "shell: cargo test".into(),
         }
-    }
-
-    fn liveness(registry: ChildRegistry, probe: Liveness) -> LockHolderLiveness {
-        LockHolderLiveness::holding_lock(ExecutorId::from_raw("exec-now"), registry)
-            .with_probe(Box::new(Fixed(probe)))
-    }
-
-    #[test]
-    fn nobody_holding_the_claim_means_nothing_to_wait_for() {
-        let dir = tempfile::tempdir().unwrap();
-        let liveness = liveness(ChildRegistry::new(dir.path()), Liveness::Alive);
-        assert!(liveness.stopped(None));
-    }
-
-    #[test]
-    fn a_previous_instance_with_no_registered_children_is_gone() {
-        let dir = tempfile::tempdir().unwrap();
-        let liveness = liveness(ChildRegistry::new(dir.path()), Liveness::Alive);
-        assert!(liveness.stopped(Some(&ExecutorId::from_raw("exec-old"))));
-    }
-
-    #[test]
-    fn a_surviving_child_blocks_a_second_start() {
-        let dir = tempfile::tempdir().unwrap();
-        let registry = ChildRegistry::new(dir.path());
-        let old = ExecutorId::from_raw("exec-old");
-        registry.record(&old, child(4242)).unwrap();
-
-        assert!(!liveness(registry.clone(), Liveness::Alive).stopped(Some(&old)));
-        assert!(
-            !liveness(registry.clone(), Liveness::Unknown).stopped(Some(&old)),
-            "核实不了就当它还在"
-        );
-        assert!(liveness(registry, Liveness::Gone).stopped(Some(&old)));
-    }
-
-    /// 启动回收不交还的名单：只列**上一代**、且名下有子进程活着或核实不了的实例。
-    #[test]
-    fn unstopped_lists_only_previous_instances_with_live_children() {
-        let dir = tempfile::tempdir().unwrap();
-        let registry = ChildRegistry::new(dir.path());
-        registry
-            .record(&ExecutorId::from_raw("exec-old"), child(4242))
-            .unwrap();
-        registry
-            .record(&ExecutorId::from_raw("exec-now"), child(4343))
-            .unwrap();
-        // 子进程都收尾了的那一代：登记文件还在，但一行都没有。
-        let done = ExecutorId::from_raw("exec-done");
-        registry.record(&done, child(1)).unwrap();
-        registry.forget(&done, 1).unwrap();
-
-        assert_eq!(
-            liveness(registry.clone(), Liveness::Alive).unstopped(),
-            vec![ExecutorId::from_raw("exec-old")],
-            "自己与子进程都收尾了的那一代都不在名单里"
-        );
-        assert_eq!(
-            liveness(registry.clone(), Liveness::Unknown).unstopped(),
-            vec![ExecutorId::from_raw("exec-old")],
-            "核实不了就当它还在"
-        );
-        assert!(liveness(registry, Liveness::Gone).unstopped().is_empty());
-    }
-
-    #[test]
-    fn no_registry_directory_means_nobody_to_keep() {
-        let dir = tempfile::tempdir().unwrap();
-        let registry = ChildRegistry::new(dir.path().join("children"));
-        assert!(liveness(registry, Liveness::Alive).unstopped().is_empty());
     }
 
     #[test]
@@ -447,13 +276,6 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![2]
         );
-    }
-
-    #[test]
-    fn a_run_this_process_is_holding_is_not_a_previous_instance() {
-        let dir = tempfile::tempdir().unwrap();
-        let liveness = liveness(ChildRegistry::new(dir.path()), Liveness::Gone);
-        assert!(!liveness.stopped(Some(&ExecutorId::from_raw("exec-now"))));
     }
 
     #[test]

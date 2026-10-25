@@ -7,7 +7,76 @@ use tracing::Instrument;
 
 use super::capture::Capture;
 use super::*;
-use crate::agent::tests_support::{FailingLlm, round, turn_request};
+
+fn round(
+    number: u32,
+    text: Option<&str>,
+    calls: Vec<komo_kernel::types::turn::ProviderToolCall>,
+) -> komo_kernel::types::turn::Round {
+    komo_kernel::types::turn::Round {
+        round: number,
+        text: text.map(str::to_string),
+        tool_calls: calls,
+        provider_blocks: None,
+        usage: Default::default(),
+        truncated: false,
+    }
+}
+
+fn turn_request(session: &SessionId, run: &RunId) -> komo_kernel::types::turn::TurnRequest {
+    komo_kernel::types::turn::TurnRequest {
+        session: session.clone(),
+        run: run.clone(),
+        model: sample_model(),
+        system_prompt: "你是 komo".into(),
+        messages: vec![],
+        tools: vec![],
+        memories: vec![],
+        covers: None,
+        cache_session: None,
+    }
+}
+
+/// 每一轮都报同一个错的 [`LlmClient`]——`ScriptedLlm` 只演得了成功的回合。
+struct FailingLlm {
+    error: LlmError,
+}
+
+impl FailingLlm {
+    fn at_round(error: LlmError) -> Self {
+        Self { error }
+    }
+}
+
+#[async_trait::async_trait]
+impl LlmClient for FailingLlm {
+    async fn begin_turn(
+        &self,
+        _req: komo_kernel::types::turn::TurnRequest,
+    ) -> Result<Box<dyn komo_kernel::traits::TurnDriver>, LlmError> {
+        Ok(Box::new(FailingDriver {
+            error: self.error.clone(),
+        }))
+    }
+}
+
+struct FailingDriver {
+    error: LlmError,
+}
+
+#[async_trait::async_trait]
+impl komo_kernel::traits::TurnDriver for FailingDriver {
+    async fn next(
+        &mut self,
+        _input: RoundInput,
+    ) -> Result<komo_kernel::types::turn::Round, LlmError> {
+        Err(self.error.clone())
+    }
+
+    fn usage(&self) -> TokenUsage {
+        Default::default()
+    }
+}
 
 fn request() -> komo_kernel::types::turn::TurnRequest {
     turn_request(&SessionId::from_raw("s"), &RunId::from_raw("r"))

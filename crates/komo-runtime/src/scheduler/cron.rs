@@ -1,8 +1,8 @@
 //! Cron 到期检查（§10）。
 //!
-//! 「Cron Scheduler 只负责产生 Run，复用 AgentLoop、工具和存储」——所以这个
-//! 文件到 `accept_input` 为止就结束了：到期 → 重叠判定 → `claim_firing` 占位 → 把触发
-//! 输入交给账本 → 推进下一个槽位。**执行是普通队列的事**，这里不碰。
+//! 「Cron Scheduler 只负责产生 Run」——所以这个文件到把触发交给 [`CronTarget`] 为止就结束了：
+//! 到期 → 重叠判定 → `claim_firing` 占位 → 交给目标 → 推进下一个槽位。**执行是 harness 的事**，
+//! 这里不碰。
 //!
 //! 三条默认行为各是下面的一段：
 //!
@@ -10,28 +10,22 @@
 //!   [`CronRepo::claim_firing`] 答，`false` 就是别人（或上一次启动）已经占过了。
 //! - 上一次仍未结束时按 [`OverlapPolicy`] 跳过并**记录原因**。
 //! - 停机期间错过的触发**不集中补跑**：推进槽位时从 `now` 往后找，中间那些槽位就此
-//!   过去——而"停机前已经持久创建、尚未完成的 Cron Run"是恢复扫描的事，不在这里。
+//!   过去——而"停机前已经持久创建、尚未完成的 Cron Run"是 harness 恢复的事，不在这里。
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use komo_kernel::cron::{CronFiring, CronJob, FiringStatus, JobStatus, OverlapPolicy, Trigger};
-use komo_kernel::traits::{Clock, CronRepo, Ledger, LedgerError, RepoError, ZoneResolver};
+use komo_kernel::traits::{Clock, CronRepo, RepoError, ZoneResolver};
 use komo_kernel::types::ids::{CronJobId, RequestKey, RunId, SessionId};
 use komo_kernel::types::model::ModelConfig;
-use komo_kernel::types::plan::PlanSource;
-use komo_kernel::types::turn::AcceptInput;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
-
-use super::Waker;
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum CronError {
     #[error(transparent)]
     Repo(#[from] RepoError),
-    #[error(transparent)]
-    Ledger(#[from] LedgerError),
     /// 触发目标（`CronTarget`）自己报的错：Durable 侧建会话 / 受理 / 跑命令失败。
     #[error("{0}")]
     Target(String),
@@ -64,8 +58,7 @@ pub struct FiredRef {
 
 /// 触发交给谁：调度器只负责「到期 → 重叠判定 → 占位 → 投出」，投到哪里由它决定。
 ///
-/// Legacy 侧是 [`LedgerCronTarget`]（包住旧 `Ledger::accept_input`）；Durable 侧在 gateway
-/// （`service::durable::cron`）：一次 engine 提交建会话并受理。
+/// 实现在 gateway（`service::durable::cron`）：一次 engine 提交建会话并受理。
 #[async_trait]
 pub trait CronTarget: Send + Sync {
     /// 一次定时触发。
@@ -76,15 +69,9 @@ pub trait CronTarget: Send + Sync {
         self.fire(spec).await
     }
 
-    /// 这个 Job 上一次触发还没结束吗（重叠判定）。默认问触发表自己（Legacy：连 `runs` 表判）；
-    /// Durable 没有 `runs` 表，要按 submission 的结算状态判。
-    async fn has_unfinished(
-        &self,
-        jobs: &dyn CronRepo,
-        job: &CronJobId,
-    ) -> Result<bool, CronError> {
-        Ok(jobs.has_unfinished_firing(job).await?)
-    }
+    /// 这个 Job 上一次触发还没结束吗（重叠判定）：按 submission 的结算状态判。
+    async fn has_unfinished(&self, jobs: &dyn CronRepo, job: &CronJobId)
+    -> Result<bool, CronError>;
 }
 
 /// 定时触发的请求键。
@@ -103,71 +90,6 @@ pub fn model_for(job: &CronJob, main: &ModelConfig) -> ModelConfig {
         model.effort = Some(effort.clone());
     }
     model
-}
-
-/// Legacy 的目标：把触发作为一条 Cron 来源的输入交给旧账本。行为同改动之前的 `accept`。
-pub struct LedgerCronTarget {
-    ledger: Arc<dyn Ledger>,
-}
-
-impl LedgerCronTarget {
-    pub fn new(ledger: Arc<dyn Ledger>) -> Self {
-        LedgerCronTarget { ledger }
-    }
-}
-
-#[async_trait]
-impl CronTarget for LedgerCronTarget {
-    async fn fire(&self, spec: FireSpec) -> Result<FiredRef, CronError> {
-        let FireSpec {
-            job,
-            session,
-            request_key,
-            model,
-            at,
-            ..
-        } = spec;
-        // 命令直跑模式（§10）：`text` 只是账本上"这条 Run 是为了什么"的人读记录——
-        // CommandDriver 不读它，命令本身从这条 Run 的 Job 定义（`PlanSource::Cron` 指
-        // 着的那个 Job）里查。写清楚是为了会话记录诚实，不是为了喂给模型。
-        let text = match &job.command {
-            Some(command) => format!("[命令直跑] {command}"),
-            None => job.prompt.clone(),
-        };
-        let accepted = self
-            .ledger
-            .accept_input(AcceptInput {
-                session,
-                request_key,
-                text,
-                // 来源仍是 Cron（§8.8）：恢复后也不会因为由本机 Gateway 发起就升权。
-                source: PlanSource::Cron {
-                    job: job.id.clone(),
-                    job_version: job.version,
-                },
-                peer: None,
-                model,
-                // Job 的工作目录落到这个 Session 上——创建 Job 时就核实过它存在
-                // （§10），这里只是把它带过去。
-                workdir: job.workdir.clone(),
-                // 定时 Job 不是子代理：没有父 Run，也没有结果契约。
-                delegate: None,
-                // Cron 是**没有归属的入口**（§四）：它的身份按当前配置的默认 Agent 在装配
-                // 那一步兜底（`service::segment`）。这里不编一份——`CronScheduler` 手里只有
-                // 队列与模型，没有工具目录、没有工作目录解析、也没有配置快照。
-                snapshot: None,
-                // 命令 Run 全程零模型请求（§10）：记忆提取本身要发一次模型请求，跳过它
-                // 不是省一步，是不破"零模型请求"这条硬约束（§9.3）。
-                skip_memory: job.command.is_some(),
-                at,
-                interject: false,
-            })
-            .await?;
-        Ok(FiredRef {
-            run: accepted.run,
-            deduplicated: accepted.deduplicated,
-        })
-    }
 }
 
 /// 一次真的投出去了的触发。
@@ -234,8 +156,6 @@ pub struct CronScheduler {
     zones: Arc<dyn ZoneResolver>,
     /// 没有 Job 级覆盖时用的模型配置快照（§10：覆盖按完整模型配置解析）。
     model: ModelConfig,
-    /// 投进队列之后叫醒调度器（§10 最后一段）。
-    waker: Option<Waker>,
 }
 
 impl std::fmt::Debug for CronScheduler {
@@ -260,13 +180,7 @@ impl CronScheduler {
             clock,
             zones,
             model,
-            waker: None,
         }
-    }
-
-    pub fn with_waker(mut self, waker: Waker) -> Self {
-        self.waker = Some(waker);
-        self
     }
 
     /// 到期的都过一遍。
@@ -279,12 +193,6 @@ impl CronScheduler {
                 Outcome::Fired(fired) => tick.fired.push(fired),
                 Outcome::Skipped(skipped) => tick.skipped.push(skipped),
             }
-        }
-
-        if !tick.fired.is_empty()
-            && let Some(waker) = &self.waker
-        {
-            waker.wake();
         }
         Ok(tick)
     }
@@ -308,9 +216,6 @@ impl CronScheduler {
             .target
             .run_now(self.spec(&job, session.clone(), key, None, now))
             .await?;
-        if let Some(waker) = &self.waker {
-            waker.wake();
-        }
         Ok(Some(Fired {
             job: job.id.clone(),
             job_version: job.version,
@@ -381,8 +286,8 @@ impl CronScheduler {
             .await
         {
             Ok(fired) => fired,
-            // 目标自己报的错（只有 Durable 会）：这一槽记成 error、推进槽位，别让一个 Job 的
-            // 失败拖住同一拍里的别的 Job。Legacy 的账本错误照旧往上抛。
+            // 目标自己报的错：这一槽记成 error、推进槽位，别让一个 Job 的
+            // 失败拖住同一拍里的别的 Job。仓库错误照旧往上抛。
             Err(CronError::Target(reason)) => {
                 tracing::warn!(job = %job.id, scheduled_at = %slot, %reason, "触发没投成");
                 let _ = self
@@ -542,7 +447,7 @@ enum Outcome {
 mod tests {
     use super::*;
     use komo_kernel::cron::{TimeZone, next_occurrence, parse_schedule};
-    use komo_kernel::test_support::{MemCronRepo, MemLedger, TestClock};
+    use komo_kernel::test_support::{MemCronRepo, TestClock};
     use komo_kernel::types::ids::CronJobId;
     use time::macros::datetime;
 
@@ -578,9 +483,35 @@ mod tests {
         }
     }
 
+    /// 记下每次触发的目标：编号造 Run，重叠判定问触发表（`MemCronRepo::mark_unfinished`）。
+    #[derive(Default)]
+    struct RecordingTarget {
+        fired: std::sync::Mutex<Vec<FireSpec>>,
+    }
+
+    #[async_trait]
+    impl CronTarget for RecordingTarget {
+        async fn fire(&self, spec: FireSpec) -> Result<FiredRef, CronError> {
+            let mut fired = self.fired.lock().unwrap();
+            fired.push(spec);
+            Ok(FiredRef {
+                run: RunId::from_raw(format!("run-{}", fired.len())),
+                deduplicated: false,
+            })
+        }
+
+        async fn has_unfinished(
+            &self,
+            jobs: &dyn CronRepo,
+            job: &CronJobId,
+        ) -> Result<bool, CronError> {
+            Ok(jobs.has_unfinished_firing(job).await?)
+        }
+    }
+
     struct Harness {
         jobs: Arc<MemCronRepo>,
-        ledger: Arc<MemLedger>,
+        target: Arc<RecordingTarget>,
         clock: TestClock,
         scheduler: CronScheduler,
     }
@@ -588,17 +519,17 @@ mod tests {
     fn harness() -> Harness {
         let jobs = Arc::new(MemCronRepo::new());
         let clock = TestClock::at(NOW);
-        let ledger = Arc::new(MemLedger::new(clock.clone()));
+        let target = Arc::new(RecordingTarget::default());
         let scheduler = CronScheduler::new(
             Arc::clone(&jobs) as Arc<dyn CronRepo>,
-            Arc::new(LedgerCronTarget::new(Arc::clone(&ledger) as Arc<dyn Ledger>)),
+            Arc::clone(&target) as Arc<dyn CronTarget>,
             Arc::new(clock.clone()),
             Arc::new(JiffZoneResolver::new()),
             model(),
         );
         Harness {
             jobs,
-            ledger,
+            target,
             clock,
             scheduler,
         }
@@ -616,9 +547,8 @@ mod tests {
         assert_eq!(tick.fired.len(), 1, "{tick:?}");
         assert!(tick.skipped.is_empty());
 
-        // 账本里真的有一条输入，来源是 Cron。
-        let events = h.ledger.events();
-        assert!(!events.is_empty());
+        // 目标真的收到了一次触发。
+        assert_eq!(h.target.fired.lock().unwrap().len(), 1);
         assert_eq!(tick.fired[0].job.as_str(), "job-1");
     }
 
@@ -729,11 +659,8 @@ mod tests {
         assert_eq!(after[0].run.as_ref(), Some(&fired.run), "回写状态不丢 Run");
     }
 
-    /// Job 的 `workdir` 跟着这一次触发交给账本（§10）。
-    ///
-    /// 它**落到哪儿**是 store 的事（`sessions.workdir` 那一列，见
-    /// `komo_store::coordinator`）；这里断言的是它真的被带上了——账本拿不到它，
-    /// 装配执行段时就只能回到 `workspaces/`，而 Job 的目录就此无声地失效。
+    /// Job 的 `workdir` 跟着这一次触发交给目标（§10）：`FireSpec.job` 带着完整的 Job 定义，
+    /// 目标据此建会话——拿不到它，Job 的目录就无声地失效。
     #[tokio::test]
     async fn a_job_workdir_travels_with_its_firing() {
         let h = harness();
@@ -742,10 +669,10 @@ mod tests {
         h.jobs.put(with_dir).await.unwrap();
 
         h.scheduler.tick().await.unwrap();
-        let inputs = h.ledger.accepted();
-        assert_eq!(inputs.len(), 1, "{inputs:?}");
+        let fired = h.target.fired.lock().unwrap();
+        assert_eq!(fired.len(), 1, "{fired:?}");
         assert_eq!(
-            inputs[0].workdir.as_deref(),
+            fired[0].job.workdir.as_deref(),
             Some(std::path::Path::new("/tmp/komo-cron-ws"))
         );
     }
@@ -1012,9 +939,8 @@ mod tests {
 
         h.scheduler.tick().await.unwrap();
 
-        // 账本里记下的是这个 Run 固定住的那份配置的模型身份——Job 的那个，不是主模型的。
-        let line = h.ledger.to_jsonl();
-        assert!(line.contains("job-model"), "{line}");
-        assert!(!line.contains("scripted"), "主模型不该混进来：{line}");
+        // 交给目标的是 Job 自己的那份配置，不是主模型的。
+        let fired = h.target.fired.lock().unwrap();
+        assert_eq!(fired[0].model.model, "job-model");
     }
 }

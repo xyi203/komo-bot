@@ -44,8 +44,8 @@ use komo_kernel::protocol::http::{
     IndexState, MemoryIndexStatus, MemorySweepRequest, MemorySweepResponse,
 };
 use komo_kernel::traits::{
-    Clock, EmbedError, EmbeddingClient, Ledger, LedgerError, LlmClient, MemoryRepo, RepoError,
-    StoreError, SystemOne,
+    Clock, EmbedError, EmbeddingClient, LedgerError, LlmClient, MemoryRepo, RepoError, StoreError,
+    SystemOne,
 };
 use komo_kernel::types::agent::MemoryMode;
 use komo_kernel::types::ids::{MemoryId, RunId, Seq, SessionId};
@@ -65,7 +65,7 @@ pub use extract::{Observation, PROMPT_VERSION, RawObservation, SaidBy};
 // 对象"，两套括号处理迟早会有一边少一个分支（`delegate` 的复验在 executor 里）。
 pub(crate) use extract::parse_json_object;
 pub use index::{IndexBuilder, IndexOutcome, MIN_ACTIVATION_COVERAGE};
-pub use work::{DbMemoryWork, MemoryBatch, MemoryWorkItem, MemoryWorkLog};
+pub use work::{MemoryBatch, MemoryWorkItem, MemoryWorkLog};
 
 /// 记忆这一层的失败。
 ///
@@ -274,47 +274,14 @@ impl MemoryCatalog for komo_store::TursoMemoryRepo {
 
 /// 一个 Session 的事件从哪里来。
 ///
-/// 它比 [`Ledger`] 窄得多，只为一件事：提取只**读**，而一个只读的依赖不该把整个账本
-/// 接口拖进测试里。生产实现是 [`LedgerEvents`]，测试给一个装好事件的表。
+/// 提取只**读**事件：生产实现是 `DurableSessionEvents`（`durable.rs`，按 conversation 读 entry
+/// 再投影成旧事件词汇），测试给一个装好事件的表。
 #[async_trait]
 pub trait SessionEvents: Send + Sync {
     async fn events_of(
         &self,
         session: &SessionId,
     ) -> Result<Vec<komo_kernel::events::Event>, MemoryError>;
-}
-
-/// 账本上的那一个：分页读到头。
-pub struct LedgerEvents(pub Arc<dyn Ledger>);
-
-impl std::fmt::Debug for LedgerEvents {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("LedgerEvents").finish_non_exhaustive()
-    }
-}
-
-#[async_trait]
-impl SessionEvents for LedgerEvents {
-    async fn events_of(
-        &self,
-        session: &SessionId,
-    ) -> Result<Vec<komo_kernel::events::Event>, MemoryError> {
-        let mut all = Vec::new();
-        let mut from = Seq::ZERO;
-        loop {
-            let batch = self.0.read(session, from, 0).await?;
-            if batch.events.is_empty() {
-                return Ok(all);
-            }
-            for event in batch.events {
-                from = from.max(event.seq);
-                all.push(event);
-            }
-            if batch.next.is_none() {
-                return Ok(all);
-            }
-        }
-    }
 }
 
 /// 一批后台处理的结果。

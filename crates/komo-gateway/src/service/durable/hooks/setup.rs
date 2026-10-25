@@ -24,7 +24,6 @@ use komo_kernel::protocol::config::ConfigSnapshot;
 use komo_kernel::types::agent::AgentProfile;
 use komo_kernel::types::ids::SessionId;
 use komo_kernel::types::model::{Effort, ModelConfig};
-use komo_runtime::agent::RetryBudget;
 use komo_runtime::durable::harness::{HookError, RetryPolicy, RunBudget, TaskDoc, task_doc};
 use komo_runtime::tools::paths;
 
@@ -193,10 +192,10 @@ fn resolve_at<'a>(
         let budget = RunBudget {
             max_rounds,
             max_tokens: None,
-            retry: RetryPolicy::from(&RetryBudget {
+            retry: RetryPolicy {
                 max_attempts: state.max_retries,
-                ..RetryBudget::default()
-            }),
+                ..RetryPolicy::default()
+            },
         };
 
         Ok(Resolved {

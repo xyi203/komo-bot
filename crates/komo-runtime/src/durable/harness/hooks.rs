@@ -28,7 +28,6 @@ use serde::{Deserialize, Serialize};
 
 use super::compaction::{CompactionSetup, SummaryPrompt};
 use super::orchestration::{NoOrchestration, OrchestrationHooks};
-use crate::agent::RetryBudget;
 use crate::llm::ImageResolver;
 use crate::recovery::{IdentityProbe, ProcessProbe};
 
@@ -59,8 +58,7 @@ impl PromptSection {
     }
 }
 
-/// 模型请求的有界退避（§8.5，同 [`RetryBudget`]，但可序列化：它随 `request` 的
-/// checkpoint 冻结）。
+/// 模型请求的有界退避（§8.5；可序列化：它随 `request` 的 checkpoint 冻结）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RetryPolicy {
@@ -72,16 +70,12 @@ pub struct RetryPolicy {
 
 impl Default for RetryPolicy {
     fn default() -> Self {
-        RetryPolicy::from(&RetryBudget::default())
-    }
-}
-
-impl From<&RetryBudget> for RetryPolicy {
-    fn from(budget: &RetryBudget) -> Self {
+        // 2s 起步、单次封顶 60s、第 10 次失败才放弃：连续退避约 5 分钟（2+4+8+16+32+60×4）。
+        // 中转站"No available accounts"这类 503 半分钟内常常还没恢复。
         Self {
-            max_attempts: budget.max_attempts,
-            base_ms: budget.base.as_millis() as u64,
-            max_wait_ms: budget.max_wait.as_millis() as u64,
+            max_attempts: 10,
+            base_ms: 2_000,
+            max_wait_ms: 60_000,
         }
     }
 }

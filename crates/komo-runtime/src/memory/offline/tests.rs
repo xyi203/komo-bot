@@ -24,8 +24,7 @@ use time::macros::datetime;
 
 use super::super::consolidate::Consolidator;
 use super::super::{
-    DbMemoryWork, MemoryCatalog, MemoryError, MemoryManager, MemoryParts, Observation,
-    SessionEvents,
+    MemoryBatch, MemoryCatalog, MemoryError, MemoryManager, MemoryParts, Observation, SessionEvents,
 };
 use super::*;
 
@@ -60,6 +59,34 @@ impl SessionEvents for NoEvents {
         _session: &SessionId,
     ) -> Result<Vec<komo_kernel::events::Event>, MemoryError> {
         Ok(vec![])
+    }
+}
+
+/// 离线整理不碰提取队列：一个永远是空的。
+#[derive(Debug)]
+struct NoWork;
+
+#[async_trait]
+impl super::super::MemoryWorkLog for NoWork {
+    async fn claim(
+        &self,
+        _idle: time::Duration,
+        _limit: usize,
+    ) -> Result<Vec<MemoryBatch>, komo_kernel::traits::StoreError> {
+        Ok(vec![])
+    }
+
+    async fn finish(
+        &self,
+        _run: &komo_kernel::types::ids::RunId,
+        _work: komo_kernel::types::memory::MemoryWork,
+        _cursor: komo_kernel::types::ids::Seq,
+    ) -> Result<(), komo_kernel::traits::StoreError> {
+        Ok(())
+    }
+
+    async fn requeue_stuck(&self) -> Result<u64, komo_kernel::traits::StoreError> {
+        Ok(0)
     }
 }
 
@@ -164,7 +191,7 @@ impl Rig {
             reranker: None,
             llm: client,
             events: Arc::new(NoEvents),
-            work: Arc::new(DbMemoryWork::new(db, Arc::new(clock.clone()))),
+            work: Arc::new(NoWork),
             clock: Arc::new(clock.clone()),
             render,
         }));

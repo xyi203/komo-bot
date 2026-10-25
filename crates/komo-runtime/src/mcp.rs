@@ -1801,12 +1801,11 @@ for line in sys.stdin:
         );
     }
 
-    /// 执行器的顶层调用：能力面里有、目录里还没有的 MCP 工具，先等服务器连上再调通；连不上的
+    /// 执行器的目录：能力面里有、目录里还没有的 MCP 工具，先等服务器连上再挂进目录；连不上的
     /// 报那台服务器为什么连不上，不是"没有名为…的工具"。
     #[tokio::test]
-    async fn a_call_to_a_tool_not_yet_mounted_waits_for_its_server() {
+    async fn a_tool_not_yet_mounted_waits_for_its_server() {
         use crate::executor::ToolExecutor;
-        use crate::executor::harness::Harness;
 
         let fixture = Fixture::new();
         let hub = Arc::new(McpHub::start_waiting(
@@ -1818,40 +1817,16 @@ for line in sys.stdin:
             fixture.dir.path(),
             Duration::from_secs(5),
         ));
-        let harness = Harness::new();
-        let executor = ToolExecutor::new(
-            vec![],
-            harness.ledger.clone(),
-            harness.outputs.clone(),
-            Arc::new(harness.clock.clone()),
-        )
-        .with_mcp(Arc::clone(&hub));
+        let executor = ToolExecutor::new(vec![]).with_mcp(Arc::clone(&hub));
         assert!(executor.tool_names().is_empty());
-        let (session, run) = harness.open_run().await;
-        let mut env = harness.env(&session, &run);
-        env.surface =
-            komo_kernel::types::surface::AgentSurface::new(["mcp__demo__echo", "mcp__broken__x"]);
 
-        let calls = harness
-            .record_round(
-                &run,
-                &[
-                    ("mcp__demo__echo", serde_json::json!({})),
-                    ("mcp__broken__x", serde_json::json!({})),
-                ],
-            )
+        let unresolved = executor
+            .await_mcp(&["mcp__demo__echo".to_string(), "mcp__broken__x".to_string()])
             .await;
-        let outcome = executor.execute_round(calls, &env).await.unwrap();
-        assert!(outcome.stop.is_none());
-        let echoed = &outcome.results[0];
-        assert!(!echoed.is_error, "{}", echoed.content);
-        assert!(echoed.content.contains("echoed"), "{}", echoed.content);
-        let broken = &outcome.results[1];
-        assert!(broken.is_error);
+        assert_eq!(unresolved.len(), 1, "{unresolved:?}");
         assert!(
-            broken.content.contains("MCP 服务器 broken 连接失败"),
-            "{}",
-            broken.content
+            unresolved["mcp__broken__x"].contains("MCP 服务器 broken 连接失败"),
+            "{unresolved:?}"
         );
         assert!(
             executor

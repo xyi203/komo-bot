@@ -14,8 +14,8 @@ use komo_kernel::traits::{
 };
 use komo_kernel::types::ids::{ExecutorId, RunId};
 use komo_kernel::types::turn::{LlmError, TurnRequest};
-use komo_runtime::agent::{Budget, RetryBudget};
 use komo_runtime::config::{ConfigHolder, EffortCapabilities};
+use komo_runtime::durable::harness::RetryPolicy;
 use komo_runtime::executor::ToolExecutor;
 use komo_runtime::memory::{MemoryManager, MemoryParts};
 use komo_store::{Db, TursoCronRepo, TursoDeliveryRepo, TursoMemoryRepo};
@@ -289,11 +289,16 @@ impl GatewayState {
             &snapshot,
             shared_home.as_deref(),
         )));
-        let executor_tools =
-            super::tool_catalog::catalog(tools, codemode, Arc::clone(&mcp), Arc::clone(&clock));
+        let executor_tools = Arc::new(
+            ToolExecutor::new(tools)
+                .with_codemode(codemode)
+                .with_mcp(Arc::clone(&mcp)),
+        );
 
-        let max_rounds = Budget::default().max_rounds;
-        let max_retries = RetryBudget::default().max_attempts;
+        // 总轮数默认不设上限：任何一个数在真活上都会撞到，撞上就是一次失败的 Run，事情往往快做完了。
+        // 停一条 Run 靠取消；单个 cron Job 想要上限就用自己的 `maxRounds`。
+        let max_rounds = None;
+        let max_retries = RetryPolicy::default().max_attempts;
 
         Ok(Arc::new(GatewayState {
             home,

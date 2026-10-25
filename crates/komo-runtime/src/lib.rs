@@ -1,6 +1,5 @@
-//! 运行时层：Agent Loop、工具、Memory 与各适配器（docs/komo_bot.md §13.4）。
+//! 运行时层：durable harness、工具、Memory 与各适配器（docs/komo_bot.md §13.4）。
 
-pub mod agent;
 pub mod codemode;
 pub mod config;
 pub mod durable;

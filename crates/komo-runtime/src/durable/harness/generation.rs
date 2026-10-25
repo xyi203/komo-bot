@@ -810,7 +810,7 @@ impl GenerationTask {
     ) -> Result<(), TaskError> {
         let conversation = rt.conversation();
         let size = group_len(tools, &calls);
-        let spent = crate::agent::spent(&usage_of(&message));
+        let spent = spent(&usage_of(&message));
         let max_tokens = request.limits.max_tokens;
         let this = self.clone();
         let modes = self.modes();
@@ -1318,4 +1318,10 @@ pub(super) async fn settle_scheduler_outcome(
     )
     .await?;
     live::store(tx, conversation, &live).await
+}
+
+/// 已知的用量之和。**未知不是零**（§8.5）：`None` 贡献 0 只是因为它压根没进预算比较。
+/// `reasoning` 已经算在 `output` 里，不再另加。
+fn spent(usage: &komo_kernel::types::model::TokenUsage) -> u64 {
+    usage.input.unwrap_or(0) + usage.output.unwrap_or(0)
 }

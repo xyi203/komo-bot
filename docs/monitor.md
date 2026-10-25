@@ -1,7 +1,7 @@
 # 监听：脚本每出一行，就交回会话一条
 
 > 状态：已落地（2026-10-14）；长 `bash` 自动转后台与对话会话禁 `sleep` 等待见 §8（2026-10-19）。与 `docs/komo_bot.md` 冲突处以本文为准。
-> 新存储上：监听的登记、工具任务的起停与恢复、结束 / 中断消息的原子交回、重启对账在 runtime（`docs/storage-durable.md` §13.2，`harness/orchestration/monitor.rs`），进程与泵留在 gateway（D5）；§5 里 `runtime/monitors/<id>.json` 属于状态的那部分由 `komo.monitors` 取代。
+> 新存储上：监听的登记、工具任务的起停与恢复、结束 / 中断消息的原子交回、重启对账在 runtime（`docs/storage-durable.md` §13.2，`harness/orchestration/monitor.rs`），进程与泵留在 gateway（D5）；§5 的登记是 `komo.monitors` document，重启对账是 `Harness::reconcile_monitors`；旧的 `runtime/monitors/<id>.json` 登记已移除。
 
 ## 1. 问题
 
@@ -30,9 +30,8 @@
 ```
 
 - **两个工具，都是编排操作**（`Operation::Monitor` / `Operation::MonitorStop`）：工具只做
-  `prepare`，起进程与交回在 Gateway 的 `service::monitors::GatewayMonitors`
-  （kernel 的 `Monitors` 接缝，装配与 `TaskSpawner` 同一个接法）。codemode 脚本里调不了。
-- **事件交回挂它的会话，投给挂它那条 Run 的来源对端**（`runs.peer`）。在 home 里挂的，
+  `prepare`；登记、工具任务的三明治与恢复在 runtime（`harness/orchestration/monitor.rs`），起进程、泵、合批与时限在 gateway 的 `GatewayMonitorRunner`（`MonitorRunner`，runtime 的 `OrchestrationHooks::{start,stop}_monitor` 背后）。codemode 脚本里调不了。
+- **事件交回挂它的会话，投给路径上最近一条带 peer 的用户输入的来源对端**（没有就只有主会话退回 home chat）。在 home 里挂的，
   事件经 home 的模型转告到聊天；在 TUI 里挂的，事件在事件流里看得到。
 - **事件与结束消息都按插话交回（2026-10-21）。** 事件、正常结束消息、重启后的"已中断"
   都走 `submit_interjecting`，与后台命令的完成通知（§8）同一套资格检查：宿主还在跑、
@@ -86,41 +85,24 @@
 
 ## 5. 重启
 
+**监听的登记是一份 Session 级 document `komo.monitors`**（`{ items: [MonitorRecord] }`，在 `durable.db` 里，与别的状态同库同提交线；gateway 启动时一次读完就是全部在册监听）。每条登记：`id`（挂它的工具任务的 ID，句柄 `#id`）、命令、挂它的 conversation、时限与截止时刻、`resume_after_restart`、状态 `starting` → `running` → `ended{reason, detail}`。结束的登记留最近 64 条（"停一个已经结束的"要答得出怎么结束的，跨重启也认）。旧的 `runtime/monitors/<id>.json` 登记文件不再有；进程身份（pid、起来的时刻）仍由 gateway 记在 `runtime/monitors/children/`，runtime 不碰子进程。
+
 **监听默认不跨重启。** 进程只活在这一代 Gateway 里：
 
-- 停机（`Running::stop`）先终止所有监听的进程组（`run_child` 的 TERM → KILL），登记
-  `runtime/monitors/<id>.json` 留着。
-- 启动（`service::start` 第 8d 步，调度器起来之前）：`runtime/monitors/children/<id>.json`
-  里的遗留进程组（Gateway 崩了没来得及停）**核对身份后**终止——pid 会复用，按
-  `ps -o etime=` 换算的起来时刻与登记差 10 秒以内才算同一个，对不上宁可留着也不误杀；
-  然后每份登记给它的会话交回一条"已中断：Gateway 重启了，脚本没有在跑，也不会自动重挂"，
-  登记删掉。声明了 `resume_after_restart` 的例外，见下。
-- 在册不进执行器的 `runtime/children/`：那里一行活着的进程会让恢复扫描把上一代的所有 Run
-  停下来（§8.7），而监听与任何一条 Run 都无关。
+- 停机（`DurableCore::close`，引擎关闭前）先终止所有监听的进程组（TERM → KILL），登记原样留给下一代。
+- 启动（`background::spawn`，引擎恢复 `core.resume()` 之前）：`OrchestrationHooks::boot` 先把 `runtime/monitors/children/` 里的遗留进程组（Gateway 崩了没来得及停）**核对身份后**终止——pid 会复用，按起来时刻与登记差 10 秒以内才算同一个，对不上宁可留着也不误杀；然后调一次 `Harness::reconcile_monitors`：对每条 `running` 的登记，给它的会话交回一条"已中断：Gateway 重启了，脚本没有在跑，也不会自动重挂"（输入 kind `monitor.end`，请求键 `monitor-end:{id}`，与登记改成 `ended{interrupted}` **同一次提交**，原子幂等），声明了 `resume_after_restart` 的例外，见下。`starting` 的登记归挂它的工具任务接着判，对账不碰。
+- 监听与任何一条 run 无关，不进工具任务的恢复表（`docs/komo_bot.md` §8.4）。
 
-**续跑的 `monitor` 调用不重新起进程。** 上一世已经 `start_call` 过、结果没落盘就崩了的那次
-调用，这一世回来收口时（`fresh = false`）只认同一个请求键 `monitor:{run}:{call}` 下还在跑
-的那个；认不到就答"上一次挂的监听随 Gateway 重启中断了，没有自动重挂"——任意命令不自动
-重跑（§8.6）。
+**续跑的 `monitor` 调用不重新起进程。** `monitor` 是 `komo.tool` 任务，`call` 阶段在 `Tool::prepare` 之后转进编排路径：`登记 starting` 与 checkpoint `orchestrate { monitorStart }` 同一次提交 → `start_monitor`（gateway 起脚本与泵）→ 登记 `running` → 落结果 entry。这是"效果三明治"，但没有意图 → 执行那一步，也不走 §8.6 的重放判断。登记之后、结果之前崩溃，恢复从 `orchestrate { monitorStart }`：先让 gateway **认回**同一个 id 下还在跑的进程（`LaunchMode::Recover`，进程活得比引擎重启久的情形）；认不到，且登记声明了 `resume_after_restart`、剩余时限至少 1 分钟，就**重挂**（`LaunchMode::Resume`，同一个 id，时限只给剩下的）；否则登记为 `ended{interrupted}`，结果是"上一次挂的监听随重启中断了，没有自动重挂"——任意命令不自动重跑（`docs/komo_bot.md` §8.6）。
 
-**可重挂的监听（2026-10-14）。** 模型挂的时候声明 `resume_after_restart = true`（工具说明：
-脚本只读、重跑一遍没有副作用——轮询状态、查进度、tail 日志），登记里就多一格 `resume`：
-挂它那次调用的请求键、挂它的 Run、工作目录、时限与截止时刻。下一代启动时（同样在调度器之前、
-收完遗留进程组之后）：
+**可重挂的监听。** 模型挂的时候声明 `resume_after_restart = true`（工具说明：脚本只读、重跑一遍没有副作用——轮询状态、查进度、tail 日志），登记里就记着它。下一代启动对账时：
 
-- 截止前至少还剩 1 分钟：**同一个 id、同一个短号、同一个请求键**重新起脚本，时限只给剩下的；
-  不额外交回消息（一条消息就是一轮模型），只在重挂后的第一条事件末尾注明"中间 Gateway 重启过，
-  断开那几秒里脚本打的行没有收到"。事件的请求键多一段这一代独有的 UUIDv7
-  （`monitor:{id}:{代}:{n}`），否则重挂后从 1 数起，撞上上一代交过的 `monitor:{id}:1` 被吞掉。
-  续跑的 `monitor` 调用按请求键认回它，答的是同一个句柄。
+- 截止前至少还剩 1 分钟：**同一个 id、同一个短号**重新起脚本，时限只给剩下的；不额外交回消息（一条消息就是一轮模型），只在重挂后的第一条事件末尾注明"中间 Gateway 重启过，断开那几秒里脚本打的行没有收到"。事件的请求键 `monitor:{id}:{后缀}` 的后缀含这一代独有的部分，否则重挂后从 1 数起会撞上上一代交过的键而被吞掉。
 - 已经过了截止（或剩不到 1 分钟）、或重挂不上（工作目录没了）：照不可重挂的那样交回结束消息。
-- 2026-10-14 之前的登记没有 `resume`，一律按不重挂收；`Operation::Monitor` 的
-  `resume_after_restart` 为 `false` 时不进 JSON，旧计划的哈希不变。
 
-为什么要它：实测（10-14 会话 `01a13911`）盯一次 stg 刷数的 40 分钟里，Gateway 因为本地重装
-komo 重启了三次，监听断了三次，每次都要模型多跑一整轮（读中断消息、查一遍现状、重新挂），
-而那个脚本只是每两分钟查一次库里的进度。为什么不默认开：任意命令不自动重跑（§8.6），
-"这个脚本重跑无害"只有写它的模型知道，与 `Tool::replay` 默认 `Unsafe` 同一个道理。
+**只有第一个结束它的人赢。** `finish_monitor`（进程结束）与 `monitor_stop` 都先看登记，已结束的不再交回——旧实现的"刚结束"内存表（64 个、重启就忘）由登记取代。
+
+为什么要它：实测（10-14 会话 `01a13911`）盯一次 stg 刷数的 40 分钟里，Gateway 因为本地重装 komo 重启了三次，监听断了三次，每次都要模型多跑一整轮（读中断消息、查一遍现状、重新挂），而那个脚本只是每两分钟查一次库里的进度。为什么不默认开：任意命令不自动重跑，"这个脚本重跑无害"只有写它的模型知道，与 `Tool::replay` 默认 `Unsafe` 同一个道理。
 
 ## 6. 没做的
 
@@ -168,8 +150,8 @@ komo 重启了三次，监听断了三次，每次都要模型多跑一整轮（
 对话会话里的 bash ── 跑过 [execution] detach_after_secs（默认 120，0 = 不转）还没完
    │ 这次调用立刻结算：「已转后台 #3f2a」+ 到现在的输出末尾（状态 completed，结果体 `detached: <id>`）
    ▼
-活子进程（管道、进程组、已收到的字节）交给 Gateway 的 `GatewayMonitors`（runtime 的 `Detacher` 槽，
-   runtime 不依赖 gateway）；同一个 id 空间，`monitor_stop #3f2a` 停得掉它
+活子进程（管道、进程组、已收到的字节）交给 Gateway 的 `GatewayMonitorRunner`（`monitor_runner/detached.rs`，经 runtime 的 `Detacher` 槽，
+   runtime 不依赖 gateway；接手后 `Harness::register_monitor` 登记进 `komo.monitors`）；同一个 id 空间，`monitor_stop #3f2a` 停得掉它
    │ 退出 / 超时 / 被停
    ▼
 内部输入 `bash-done:{call_id}`：`[后台命令 #3f2a「命令首行」结束] 退出码 N，用时 …` + 输出末尾
@@ -200,9 +182,9 @@ komo 重启了三次，监听断了三次，每次都要模型多跑一整轮（
   （`OutputFile::Background`）。转后台之前的输出在那次调用的结果里。
 - **时限。** 原 `timeout_secs`（受 `call_timeout_secs` 收紧）从调用开始算，到点在后台终止进程组，结束消息
   报「超时」。
-- **结束消息**与监听同一条投递路径（`submit_interjecting`，对端取挂它那条 Run 的 `runs.peer`）。`monitor_stop` 停掉它
+- **结束消息**与监听同一条投递路径（steer 输入，来源对端同上）。`monitor_stop` 停掉它
   时与监听不同：**会**交回一条「已被 monitor_stop 停止」（监听是模型自己停的、不再交回）。
-- **重启。** 子进程随 Gateway 停机终止，登记 `runtime/monitors/<id>.json`（带 `detached`）留着；子进程
+- **重启。** 子进程随 Gateway 停机终止，登记（`komo.monitors`）留着；子进程
   另在 `runtime/monitors/children/` 在册，崩溃遗留的进程组按监听同一套核对身份后终止。下一代启动给会话
   交回「Gateway 重启，后台命令中断，结果不明」+ `background.log` 里已有的末尾，登记删掉。不重跑。
 - **记忆。** `monitor:` / `monitor-end:` / `bash-done:` 与 `task-result:` 一样渲染为「任务交回」，不能引为

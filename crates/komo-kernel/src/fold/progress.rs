@@ -130,6 +130,11 @@ fn wait_phrase(wait: &WaitReason) -> String {
     }
 }
 
+/// 参数的一行摘要（对外给 gateway / runtime 的查进度用，口径与进度快照里的 `summary` 一致）。
+pub fn summarize_args(args: &serde_json::Value) -> String {
+    summarize(args)
+}
+
 /// 参数的一行摘要：先挑常见的"主字段"，没有就用整份参数的紧凑 JSON。
 fn summarize(args: &serde_json::Value) -> String {
     let picked = SUMMARY_KEYS

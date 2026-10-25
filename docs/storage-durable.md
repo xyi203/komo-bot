@@ -610,7 +610,7 @@ finalize     → blob 收尾同步 → 提交结果 entry（projection.rs 的 fu
   - 删掉 `GatewayTaskSpawner` / `GatewayMonitors` 里属于状态的那部分（`runtime/monitors/<id>.json`）；进程身份（pid、起来的时刻）仍是 gateway 自己的。
 - **编排 · 已知缺口**：
   - 模型没有取消子任务的工具（旧实现也没有）；显式取消是 `Harness::abort_conversation(engine, 子 conversation)`，gateway 路由要接。
-  - 查进度是近似的：`accepted_at` 取当前 run 第一条用户消息的时间戳，`running` 的调用没有参数摘要与起始时刻（槽位里没有），已收尾的 run 的终态来自 `komo.task.lastRun`。
+  - 查进度是近似的：`accepted_at` 取当前 run 第一条用户消息的时间戳，`running` 的调用没有起始时刻（槽位里没有；参数摘要 D5 W2c 起从发起它的 assistant 消息里取），已收尾的 run 的终态来自 `komo.task.lastRun`。
   - 登记里的已结束监听只留最近 64 条，没有按时间清理；`komo.task` 随子 conversation 一直在。
   - fork 的切口之后父追加的 entry 子看不到（按设计）；fork 不复制 document（D1 偏离），所以子不继承父的 `compactionFailure`。
 - **D4c 的 probe**：没有杀进程的注入口（取消只在结果里说明子进程还在）；`bash` 转后台（`detach_after`）交给 gateway 的监听接手后，那条路径不写槽位也不进 probe；只有走 `run_child_detachable` 的工具会报告子进程（codemode worker、MCP 子进程不报）。

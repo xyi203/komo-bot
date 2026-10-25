@@ -23,7 +23,7 @@ use komo_kernel::types::model::ModelConfig;
 use komo_kernel::types::plan::{PlanSource, Replay};
 use komo_kernel::types::resource::ResourceMounts;
 use komo_kernel::types::surface::AgentSurface;
-use komo_kernel::types::tool::{ToolDefinition, ToolExposure, WorkspaceRoot};
+use komo_kernel::types::tool::{InterjectSignal, ToolDefinition, ToolExposure, WorkspaceRoot};
 use serde::{Deserialize, Serialize};
 
 use super::compaction::{CompactionSetup, SummaryPrompt};
@@ -123,6 +123,9 @@ pub struct ToolEnv {
     pub projection: ProjectionContext,
     pub call_timeout: Duration,
     pub detach_after: Option<Duration>,
+    /// 用户插话的旗子（`docs/monitor.md` §8）：gateway 在用户往忙着的对话会话里插话时举起它，前台
+    /// 的长 `bash` 提前转后台。`None` = 没人会举（任务会话、cron、测试替身）；嵌套调用不用它。
+    pub interjected: Option<InterjectSignal>,
     /// 对话会话里直接受理的 Run（`bash` 拒绝 10 秒以上的 `sleep`）。
     pub conversation: bool,
     /// 这个 Session 的工具输出目录（`tool-output/{conversation}/{tool_task}/{attempt}/`）。

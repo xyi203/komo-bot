@@ -291,6 +291,16 @@ pub(crate) async fn finish_in_tx(
     Ok(true)
 }
 
+/// 登记一个**不是 `monitor` 工具挂的**监听：`bash` 转后台的命令（`docs/monitor.md` §8）进程由 gateway
+/// 接手，之后和监听同一套——`monitor_stop #id` 停得掉、重启时 [`Harness::reconcile_monitors`] 收尾、
+/// 结束时 [`finish_in_tx`] 交回一条消息。`id` 取那次 `bash` 调用的工具任务 ID（不会与别的监听撞号），
+/// 登记里 `state` 由调用方定（接手成功就是 `Running`）。同一个 `id` 重复登记整条替换。
+pub(crate) async fn register_in_tx(tx: &mut Tx, record: MonitorRecord) -> Result<(), DurableError> {
+    let mut registry = load(tx).await?;
+    registry.insert(record);
+    store(tx, &registry).await
+}
+
 /// 对账一条监听的结果。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Reconciled {

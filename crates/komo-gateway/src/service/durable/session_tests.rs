@@ -74,6 +74,7 @@ impl TestHooks {
             },
             call_timeout: std::time::Duration::from_secs(60),
             detach_after: None,
+            interjected: None,
             conversation: true,
             outputs: Arc::new(MemOutputStore::default()),
             images: None,

@@ -893,6 +893,7 @@ impl TestHooks {
             },
             call_timeout: Duration::from_secs(60),
             detach_after: None,
+            interjected: None,
             conversation: true,
             outputs,
             images: None,

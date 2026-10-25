@@ -284,7 +284,7 @@ pub async fn start(options: ServiceOptions) -> Result<Running, ServiceError> {
     if let Some(core) = &durable {
         // Durable：把 `GatewayState` 交给钩子，然后才开始调度。旧的 `task` / `monitor` 接缝
         // 不接（编排走 harness；W2c 起监听由 `MonitorRunner` 接）。
-        durable::assemble::wire(&state_slot, &state);
+        durable::assemble::wire(&state_slot, &state, &detach_slot);
         core.resume();
     } else {
         // `task` 的接缝：`GatewayTaskSpawner` 自己要一份 `Arc<GatewayState>`
@@ -660,8 +660,6 @@ async fn build_tools(
     };
 
     let snapshot = config.current();
-    // Durable 的转后台接手方要等整份状态才造得出来：槽按实例 ID 停给 `durable::assemble::wire` 取。
-    durable::assemble::park_detach_slot(instance_id, detach_slot);
     let registry = Arc::new(komo_runtime::recovery::ChildRegistry::new(
         snapshot.paths.runtime_dir.join("children"),
     ));

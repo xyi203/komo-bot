@@ -144,6 +144,8 @@ pub(super) struct Landing {
     /// 遇忙就拒（`WhenBusy::Reject`）：什么都不写。
     pub reject_when_busy: bool,
     pub model: Option<ModelOverride>,
+    /// 插话（`InputRequest::interject`）：排在忙着的会话后面时举旗。
+    pub interject: bool,
 }
 
 struct Landed {
@@ -270,6 +272,7 @@ impl DurableCore {
                 text: request.text,
                 reject_when_busy: request.when_busy == WhenBusy::Reject,
                 model: request.model,
+                interject: request.interject,
             },
         )
         .await
@@ -320,6 +323,7 @@ impl DurableCore {
             text,
             reject_when_busy,
             model,
+            interject,
         } = landing;
         let request_id = match &draft {
             SubmissionDraft::Input { request_id, .. }
@@ -462,7 +466,7 @@ impl DurableCore {
             .map(|record| record.status())
             .unwrap_or(SubmissionStatus::Queued);
         // 排在忙着的会话后面（没有自己开 run）的插话：举旗，前台的长 `bash` 提前转后台。
-        if request.interject && !landed.deduplicated && status == SubmissionStatus::Queued {
+        if interject && !landed.deduplicated && status == SubmissionStatus::Queued {
             self.interject(landed.conversation);
         }
         Ok(Accepted {

@@ -293,6 +293,7 @@ pub async fn submit_shell(
             text,
             reject_when_busy: false,
             model: None,
+            interject: false,
         },
     )
     .await

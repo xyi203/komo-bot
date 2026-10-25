@@ -77,7 +77,8 @@ impl World {
     async fn new(config: &str, llm: Arc<FakeLlm>) -> World {
         let gateway = TestGateway::durable(config, llm).await;
         let slot = assemble_slot::new_slot();
-        assemble_slot::wire(&slot, gateway.state());
+        // 这个世界只测钩子，不装转后台：给一个用不上的空槽。
+        assemble_slot::wire(&slot, gateway.state(), &Default::default());
         World { gateway, slot }
     }
 

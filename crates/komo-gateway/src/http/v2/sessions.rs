@@ -206,7 +206,8 @@ async fn submit(
     .await?;
     let mut input = InputRequest::new(request.text).request_id(request.request_key.as_str());
     if request.interject {
-        input = input.when_busy(WhenBusy::Steer);
+        // 插话：忙时并进当前 run，并举旗让前台正跑着的长 `bash` 提前转后台（W2c）。
+        input = input.when_busy(WhenBusy::Steer).interject(true);
     }
     if let Some(model) = model {
         input = input.model(model);

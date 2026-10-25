@@ -17,6 +17,7 @@ pub mod memories;
 pub mod runs;
 pub mod session_tree;
 pub mod sessions;
+pub mod v2;
 
 use std::sync::Arc;
 
@@ -58,10 +59,45 @@ impl Api {
 
 /// §13.1 的接口表，加上 W3 契约修订里的三个（`/v1/models`、`/v1/config/check`、
 /// `/v1/config/reload`），以及 `/v1/home-session`。
+///
+/// 路由按存储模式挑：Legacy 是下面的 `legacy_routes`；Durable 是 [`v2::routes`]。两种模式
+/// 共用的（memories、config、models、mcp、healthz）只有一份，直接复用旧 handler。
 pub fn router(api: Api) -> Router {
     let token = api.state.token.clone();
     let open = Router::new().route("/healthz", get(healthz));
-    let guarded = Router::new()
+    let specific = if api.state.durable.is_some() {
+        v2::routes()
+    } else {
+        legacy_routes()
+    };
+    let guarded = shared_routes()
+        .merge(specific)
+        .layer(crate::auth::bearer(token));
+
+    open.merge(guarded).with_state(api)
+}
+
+/// 两种存储模式都一样的路由。
+fn shared_routes() -> Router<Api> {
+    Router::new()
+        .route("/v1/memories", get(memories::list).post(memories::add))
+        .route("/v1/memories/{id}", get(memories::show))
+        .route("/v1/memories/{id}/confirm", post(memories::confirm))
+        .route("/v1/memories/{id}/forget", post(memories::forget))
+        .route("/v1/memories/{id}/restore", post(memories::restore))
+        .route("/v1/memory-sweep", post(memories::sweep))
+        .route("/v1/memory-consolidate", post(memories::consolidate))
+        .route("/v1/memory-index", get(memories::index))
+        .route("/v1/memory-index/rebuild", post(memories::rebuild))
+        .route("/v1/models", get(config::models))
+        .route("/v1/config/check", get(config::check))
+        .route("/v1/config/reload", post(config::reload))
+        .route("/v1/mcp/reconnect", post(mcp::reconnect))
+}
+
+/// Legacy 模式（`state.db`）独有的路由。D7 整个删。
+fn legacy_routes() -> Router<Api> {
+    Router::new()
         .route("/v1/home-session", get(home_session))
         .route("/v1/sessions", get(sessions::list).post(sessions::create))
         .route("/v1/sessions/{id}", get(sessions::detail))
@@ -91,22 +127,6 @@ pub fn router(api: Api) -> Router {
         .route("/v1/cron", get(cron::list).post(cron::create))
         .route("/v1/cron/{id}", patch(cron::update).delete(cron::remove))
         .route("/v1/cron/{id}/run", post(cron::run_now))
-        .route("/v1/memories", get(memories::list).post(memories::add))
-        .route("/v1/memories/{id}", get(memories::show))
-        .route("/v1/memories/{id}/confirm", post(memories::confirm))
-        .route("/v1/memories/{id}/forget", post(memories::forget))
-        .route("/v1/memories/{id}/restore", post(memories::restore))
-        .route("/v1/memory-sweep", post(memories::sweep))
-        .route("/v1/memory-consolidate", post(memories::consolidate))
-        .route("/v1/memory-index", get(memories::index))
-        .route("/v1/memory-index/rebuild", post(memories::rebuild))
-        .route("/v1/models", get(config::models))
-        .route("/v1/config/check", get(config::check))
-        .route("/v1/config/reload", post(config::reload))
-        .route("/v1/mcp/reconnect", post(mcp::reconnect))
-        .layer(crate::auth::bearer(token));
-
-    open.merge(guarded).with_state(api)
 }
 
 /// `POST /v1/reconcile`：**立刻跑一次对账**（§8.9）。幂等，返回这次判定了什么。

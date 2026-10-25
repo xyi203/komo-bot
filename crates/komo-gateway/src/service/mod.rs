@@ -1,7 +1,7 @@
 //! Gateway 进程本体：§8.7 的启动顺序，一步不换位。
 //!
 //! ```text
-//! 读配置 → 取得实例锁 → 打开 state.db → 绑监听 → 写发现文件
+//! 读配置 → 取得实例锁 → 打开 state.db（Durable 模式：durable.db + aux.db）→ 绑监听 → 写发现文件
 //!        → 恢复扫描（补发上一次没送到的结果）
 //!        → 起调度器 / Cron / 配置轮询 → 起渠道与 HTTP → 等停机信号
 //!        → 渠道停 → 等手上的跑完 → 删发现文件 → 放锁
@@ -11,11 +11,16 @@
 //! 打开 CLI 或发送 resume。恢复与新请求共用调度器，恢复扫描本身不等待全部旧任务完成
 //! 才提供服务。」——所以恢复扫描在监听之前跑完它那一遍**索引**工作，真正的执行交给
 //! 调度器，与新请求同一条路。
+//!
+//! **两种存储模式**（`docs/storage-durable-d5.md` §1）：[`StorageMode::Legacy`] 是上面这条
+//! 路；[`StorageMode::Durable`] 打开 `durable.db` 与 `aux.db`、**不打开 `state.db`**，跳过
+//! 旧的调度器 / 对账 / 审计补写 / 重挂看客，后台循环换成 [`durable::background`]。
 
 pub mod channels;
 pub(crate) mod compaction;
 pub(crate) mod context_sources;
 pub mod cron_watch;
+pub mod durable;
 pub mod interventions;
 pub mod ledgers;
 pub mod lifecycle;
@@ -67,12 +72,23 @@ pub enum ServiceError {
     Config(#[from] komo_runtime::config::ConfigError),
     #[error(transparent)]
     Lock(#[from] LockError),
-    #[error("打不开 state.db：{0}")]
+    #[error("打不开数据库：{0}")]
     Store(String),
     #[error("监听 {addr} 失败：{message}")]
     Listen { addr: String, message: String },
     #[error("装配失败：{0}")]
     Assemble(String),
+}
+
+/// 这台 Gateway 用哪套存储（`docs/storage-durable-d5.md` §1）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum StorageMode {
+    /// 旧的 `state.db` + JSONL 日志。D5 期间的生产默认，W5 翻成 `Durable`，D7 删。
+    #[default]
+    Legacy,
+    /// 新的 `durable.db`（harness 的 entry / task / submission），cron / 投递 / memory 等辅助表在
+    /// `aux.db`。
+    Durable,
 }
 
 /// 起一台 Gateway 要的东西。
@@ -84,8 +100,13 @@ pub struct ServiceOptions {
     pub listen: Option<String>,
     /// 渠道工厂。三个渠道各自一个 feature，接线由调用方给（`komo` 的 `main`）。
     pub channels: Vec<Arc<dyn ChannelFactory>>,
+    /// 存储模式；默认 [`StorageMode::Legacy`]。
+    pub storage: StorageMode,
     /// 测试注入的模型后端。
     pub llm: Option<Arc<dyn LlmClient>>,
+    /// 测试注入的无状态模型后端（只有 Durable 的 harness 用它）；`None` = 按配置造
+    /// [`RoutingStream`](komo_runtime::llm::RoutingStream)。
+    pub stream: Option<Arc<dyn komo_runtime::llm::ModelStream>>,
     /// 测试注入的向量后端；`None` = 按 `memory.embedding` alias 造。
     pub embeddings: Option<Arc<dyn komo_kernel::traits::EmbeddingClient>>,
     /// 共享 agent 目录（`~/.agents/skills`）按**哪个家目录**算；
@@ -104,6 +125,7 @@ impl std::fmt::Debug for ServiceOptions {
         f.debug_struct("ServiceOptions")
             .field("home", &self.home)
             .field("listen", &self.listen)
+            .field("storage", &self.storage)
             .finish_non_exhaustive()
     }
 }
@@ -136,6 +158,14 @@ impl Running {
             monitors.shutdown().await;
         }
         self.shutdown.cancel();
+        if let Some(core) = &self.state.durable {
+            // 引擎收尾：封住受理、等 invocation 走完、关库（放掉 Turso 的文件锁）。
+            match tokio::time::timeout(DRAIN, core.close()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => tracing::warn!(%error, "durable.db 没有干净地关掉"),
+                Err(_) => tracing::warn!("durable.db 收尾超时，下次启动从 checkpoint 继续"),
+            }
+        }
         let _ = tokio::time::timeout(DRAIN, self.state.scheduler.wait_for_idle()).await;
         self.discovery.remove();
         self.lock.release();
@@ -177,19 +207,50 @@ pub async fn start(options: ServiceOptions) -> Result<Running, ServiceError> {
     }
 
     // 3. 打开 state.db（Turso 对 db 文件持进程独占锁，所以这一步也再证一次只有一个）。
-    let db = Db::connect(&snapshot.start_only.db_path)
+    //    Durable 模式**不碰 state.db**：同一套 toasty 模型与 migration 开在 `aux.db` 上，装 cron /
+    //    投递 / memory / 幂等键这些辅助表（决定 4）；`durable.db` 在下面随工具一起打开。
+    let durable_mode = options.storage == StorageMode::Durable;
+    let db_path = if durable_mode {
+        home.join(state::AUX_DB_FILE)
+    } else {
+        snapshot.start_only.db_path.clone()
+    };
+    let db = Db::connect(&db_path)
         .await
-        .map_err(|error| ServiceError::Store(error.to_string()))?;
+        .map_err(|error| ServiceError::Store(format!("{}：{error}", db_path.display())))?;
 
     // 4. 装配。
     // 转后台的接手方要等整份状态才造得出来：`bash` 先拿着空槽，`wire_monitors` 再接上。
     let detach_slot = Arc::new(komo_runtime::tools::detach::DetachSlot::default());
     let (tools, codemode, mcp) = build_tools(&config, &instance_id, &detach_slot).await;
-    let state = GatewayState::assemble(Assembly {
+
+    // Durable：钩子要等 `GatewayState` 造好才找得到它，环用槽断开（`durable::assemble`）。
+    let state_slot = durable::assemble::new_slot();
+    let durable = if durable_mode {
+        let stream = options.stream.clone().unwrap_or_else(|| {
+            state::build_stream(&snapshot, &config, &EffortCapabilities::builtin())
+        });
+        let core = durable::DurableCore::open(
+            &home,
+            Arc::clone(&clock),
+            stream,
+            durable::assemble::build_hooks(&state_slot),
+            durable::assemble::build_orchestration(&state_slot),
+            codemode.clone(),
+        )
+        .await
+        .map_err(|error| ServiceError::Store(format!("durable.db：{error}")))?;
+        Some(core)
+    } else {
+        None
+    };
+
+    let state = match GatewayState::assemble(Assembly {
         home: home.clone(),
         config: Arc::clone(&config),
         caps: EffortCapabilities::builtin(),
         db: db.clone(),
+        durable: durable.clone(),
         clock: Arc::clone(&clock),
         instance_id: instance_id.clone(),
         token: token.clone(),
@@ -202,7 +263,15 @@ pub async fn start(options: ServiceOptions) -> Result<Running, ServiceError> {
         channels: options.channels,
     })
     .await
-    .map_err(|error| ServiceError::Assemble(error.to_string()))?;
+    {
+        Ok(state) => state,
+        Err(error) => {
+            if let Some(core) = &durable {
+                let _ = core.close().await;
+            }
+            return Err(ServiceError::Assemble(error.to_string()));
+        }
+    };
 
     if let Some(telemetry) = options.telemetry {
         let _ = state.telemetry.set(telemetry);
@@ -212,12 +281,19 @@ pub async fn start(options: ServiceOptions) -> Result<Running, ServiceError> {
     let _ = state
         .inbound
         .set(Arc::clone(&dispatcher) as Arc<dyn Inbound>);
-    // `task` 的接缝：`GatewayTaskSpawner` 自己要一份 `Arc<GatewayState>`
-    // （建会话、`submit`），与上面这行同一个"先有整份状态才能自己引用自己"的理由
-    // （`docs/background-tasks.md`）。
-    state.wire_task_spawner();
-    // `monitor` / `monitor_stop` 的接缝，同一个接法（`docs/monitor.md`）。
-    state.wire_monitors(&detach_slot);
+    if let Some(core) = &durable {
+        // Durable：把 `GatewayState` 交给钩子，然后才开始调度。旧的 `task` / `monitor` 接缝
+        // 不接（编排走 harness；W2c 起监听由 `MonitorRunner` 接）。
+        durable::assemble::wire(&state_slot, &state);
+        core.resume();
+    } else {
+        // `task` 的接缝：`GatewayTaskSpawner` 自己要一份 `Arc<GatewayState>`
+        // （建会话、`submit`），与上面这行同一个"先有整份状态才能自己引用自己"的理由
+        // （`docs/background-tasks.md`）。
+        state.wire_task_spawner();
+        // `monitor` / `monitor_stop` 的接缝，同一个接法（`docs/monitor.md`）。
+        state.wire_monitors(&detach_slot);
+    }
     // 窗口探测放后台，不挡 `Gateway 就绪`。
     state.spawn_window_probes();
 
@@ -256,6 +332,75 @@ pub async fn start(options: ServiceOptions) -> Result<Running, ServiceError> {
 
     let shutdown = Shutdown::new();
 
+    // 7–8. 启动对账、审计补写、记忆队列复位、重挂看客、遗留监听：Legacy 的恢复链。
+    //      Durable 一步不做——恢复由引擎开库时的 reconciliation 与 W4a 的启动补做负责。
+    if durable_mode {
+        // 把卡在 `processing` 的记忆处理放回 pending（aux.db 里的旧表，W3c 换成新游标的复位）。
+        // 它同时是 aux.db 的**第一次写**：只建不写的新文件，Turso 在同一进程里重开会报
+        // `database is locked`（实测；写过一次就好）。生产里重启是新进程，不受影响；测试里
+        // `stop` 后同一数据目录重起要靠这一下。
+        if let Err(error) = state.requeue_memory_work().await {
+            tracing::warn!(%error, "记忆处理队列的复位没做成");
+        }
+        // W4a：做完停在 `closing` 的删除；W3a：重挂看客。
+    } else {
+        legacy_recovery(&state, &home).await;
+    }
+
+    // 9. 后台任务：调度器、Cron、配置轮询、SIGHUP（Durable：只有配置轮询与 SIGHUP，其余各包再加）。
+    if durable_mode {
+        durable::background::spawn(&state, &shutdown);
+    } else {
+        spawn_background(&state, &shutdown);
+    }
+
+    // 10. 渠道与 HTTP。
+    //
+    // **补发不在就绪之前**：它是网络 I/O，一条 pending 一个平台往返，积压多少就等多久。
+    // 它曾经同步跑在 "Gateway 就绪" 之前，于是卡住的投递直接把重启拖长——10 条卡住的
+    // 投递是 3 秒，几百条能拖过客户端 60 秒的就绪超时（§11.4 的补发等得起：投递记录先
+    // 写后发，按 `DeliveryId` 幂等，晚几十毫秒没有代价）。
+    state.supervisor.start_all(&state).await;
+    let app = crate::http::router(Api::new(Arc::clone(&state)));
+    let serving = shutdown.clone();
+    tokio::spawn(async move {
+        let graceful = axum::serve(listener, app).with_graceful_shutdown(async move {
+            while !serving.is_cancelled() {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        });
+        if let Err(error) = graceful.await {
+            tracing::error!(%error, "HTTP 监听退出");
+        }
+    });
+
+    tracing::info!(%base_url, instance = %instance_id, "Gateway 就绪");
+
+    // 11. 补发积压的投递。**渠道全部登记之后**才有意义：`DeliveryLog::send_recorded`
+    //     找不到发送口就把行原样留在 pending，所以在 `start_all` 之前冲刷等于什么都没干
+    //     （W5 验收 BUG(3)）。这一步补的是"渠道都起完了"之后的那一遍，包括没有工厂、
+    //     由别处登记发送口的情形。
+    {
+        let state = Arc::clone(&state);
+        tokio::spawn(async move {
+            state.notifier.flush(None).await;
+        });
+    }
+
+    Ok(Running {
+        state,
+        dispatcher,
+        addr,
+        base_url,
+        shutdown,
+        discovery,
+        lock,
+    })
+}
+
+/// Legacy 的启动恢复链（§8.7 的第 7、8 步及 8b–8d）：对账、审计补写、记忆队列复位、重挂
+/// 看客、遗留监听收尾。Durable 模式不走这里。
+async fn legacy_recovery(state: &Arc<GatewayState>, home: &std::path::Path) {
     // 7. 启动对账（§8.7 的第 7 步就是 §8.9 的 reconcile）：**只补索引与派生状态，不调用
     //    工具、不发外部请求**（§8.5）。它同时把"输入已在 JSONL 里而索引落后"的补齐、
     //    把没主人的 `running` 判成 `queued` 或 `waiting + intervention`、把 `closing`
@@ -279,7 +424,7 @@ pub async fn start(options: ServiceOptions) -> Result<Running, ServiceError> {
             );
             // 2026-10-12 之前停在"结果不明"上等人核对的 Run：结果不明现在交给模型判断，
             // 放回队列，模型在回放里看见那条 uncertain 结果，自己核对再决定（§8.6）。
-            requeue_legacy_verify(&state, &home).await;
+            requeue_legacy_verify(state, home).await;
             // §8.7：「就绪之后」才做两件不影响调度事实的事——补发与报告。这两步在这里
             // 之外没有别的入口，而它们都是网络 / 界面的事，所以对账本身不发请求。
             for outcome in scan.to_redeliver() {
@@ -347,59 +492,13 @@ pub async fn start(options: ServiceOptions) -> Result<Running, ServiceError> {
 
     // 8c. 把跨重启还在跑的交互 Run 与后台任务 Run 重新挂上看客：看客只活在内存里，重启后没人订阅就没人能把最终回复投回聊天来源。
     // **必须在下一步调度器起来之前**：调度器一起，这些 Run 可能立刻继续往下跑。
-    run_watch::reattach_unfinished(&state).await;
+    run_watch::reattach_unfinished(state).await;
 
     // 8d. 上一代留下的监听：遗留进程组核对身份后终止，挂它的会话各收到一条"中断了"
     // （`docs/monitor.md`）。监听不跨重启，这里只收尾、不重挂。
     if let Some(monitors) = state.monitors.get() {
         monitors.recover_interrupted().await;
     }
-
-    // 9. 后台任务：调度器、Cron、配置轮询、SIGHUP。
-    spawn_background(&state, &shutdown);
-
-    // 10. 渠道与 HTTP。
-    //
-    // **补发不在就绪之前**：它是网络 I/O，一条 pending 一个平台往返，积压多少就等多久。
-    // 它曾经同步跑在 "Gateway 就绪" 之前，于是卡住的投递直接把重启拖长——10 条卡住的
-    // 投递是 3 秒，几百条能拖过客户端 60 秒的就绪超时（§11.4 的补发等得起：投递记录先
-    // 写后发，按 `DeliveryId` 幂等，晚几十毫秒没有代价）。
-    state.supervisor.start_all(&state).await;
-    let app = crate::http::router(Api::new(Arc::clone(&state)));
-    let serving = shutdown.clone();
-    tokio::spawn(async move {
-        let graceful = axum::serve(listener, app).with_graceful_shutdown(async move {
-            while !serving.is_cancelled() {
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            }
-        });
-        if let Err(error) = graceful.await {
-            tracing::error!(%error, "HTTP 监听退出");
-        }
-    });
-
-    tracing::info!(%base_url, instance = %instance_id, "Gateway 就绪");
-
-    // 11. 补发积压的投递。**渠道全部登记之后**才有意义：`DeliveryLog::send_recorded`
-    //     找不到发送口就把行原样留在 pending，所以在 `start_all` 之前冲刷等于什么都没干
-    //     （W5 验收 BUG(3)）。这一步补的是"渠道都起完了"之后的那一遍，包括没有工厂、
-    //     由别处登记发送口的情形。
-    {
-        let state = Arc::clone(&state);
-        tokio::spawn(async move {
-            state.notifier.flush(None).await;
-        });
-    }
-
-    Ok(Running {
-        state,
-        dispatcher,
-        addr,
-        base_url,
-        shutdown,
-        discovery,
-        lock,
-    })
 }
 
 fn spawn_background(state: &Arc<GatewayState>, shutdown: &Shutdown) {

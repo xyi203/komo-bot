@@ -220,3 +220,4 @@
 
 | 包 | 分支 | 合入 `d4c` | 备注 |
 |---|---|---|---|
+| W0b gateway 骨架与测试脚手架 | `d5-w0b` |  | `StorageMode` / `ServiceOptions.stream`；`service/durable/{mod,core,agent_doc,assemble,background}.rs`、`http/v2/*` 桩；`FakeLlm: ModelStream`、`TestGateway::durable` / `GatewayBuilder::durable` / `wait_run`。偏离见提交说明：Durable 启动对 `aux.db` 做一次旧记忆队列复位（首次写，同进程重开不再 `database is locked`） |

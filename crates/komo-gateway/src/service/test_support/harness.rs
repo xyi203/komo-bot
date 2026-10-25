@@ -24,6 +24,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use komo_kernel::durable::{
+    AssistantMessage, Content, ContentBlock, Message, StopReason, ToolResultMessage,
+};
 use komo_kernel::protocol::config::ConfigSnapshot;
 use komo_kernel::protocol::http::{InterventionSummary, RunDetail, SubmitRunResponse};
 use komo_kernel::protocol::{InboundAck, InboundMessage};
@@ -31,15 +34,19 @@ use komo_kernel::traits::{
     Channel, ChannelError, DeliverError, EmbeddingClient, Inbound, LlmClient, Tool, TurnDriver,
 };
 use komo_kernel::types::chat::{ChannelPeer, ChannelPlatform, Outbound};
-use komo_kernel::types::ids::{RunId, SessionId};
+use komo_kernel::types::ids::{RunId, Seq, SessionId, ToolCallId};
 use komo_kernel::types::model::TokenUsage;
 use komo_kernel::types::status::RunState;
-use komo_kernel::types::turn::{LlmError, ProviderToolCall, Round, RoundInput, TurnRequest};
+use komo_kernel::types::turn::{
+    LlmError, ProviderToolCall, ReplayMessage, Role, Round, RoundInput, ToolCallRequest,
+    ToolResultForModel, TurnRequest,
+};
 use komo_runtime::config::Secrets;
+use komo_runtime::llm::{ModelRequest, ModelStream, replay_system};
 
 use crate::channels::{BuiltChannel, ChannelFactory, ChannelRegistry, ChannelSender, SendOutcome};
 use crate::service::state::GatewayState;
-use crate::service::{Running, ServiceOptions, start};
+use crate::service::{Running, ServiceOptions, StorageMode, start};
 
 // ---------------------------------------------------------------- 配置文本
 
@@ -385,6 +392,11 @@ pub struct FakeLlm {
     /// 轮输入回去的（不是回放窗口里的消息），"父到底收没收到子代理的结果"（§4）只有这里
     /// 答得出来。
     pub inputs: Arc<Mutex<Vec<RoundInput>>>,
+    /// `ModelStream` 那一侧：每个"回合"（一条用户输入起、到下一条用户输入止）手上还剩的脚本，
+    /// 按 [`stream_key`] 记。无状态的 `stream` 没有 driver 可握，续轮只能从这里取。
+    running: Mutex<
+        std::collections::BTreeMap<String, std::collections::VecDeque<Result<Round, LlmError>>>,
+    >,
 }
 
 impl FakeLlm {
@@ -395,6 +407,7 @@ impl FakeLlm {
             turns: AtomicUsize::new(0),
             requests: Mutex::new(Vec::new()),
             inputs: Arc::new(Mutex::new(Vec::new())),
+            running: Mutex::new(std::collections::BTreeMap::new()),
         })
     }
 
@@ -447,6 +460,270 @@ impl LlmClient for FakeLlm {
     }
 }
 
+// ---------------------------------------------------------------- ModelStream
+
+/// Durable 模式的 harness 走 [`ModelStream`]：每次请求给完整消息序列、返回一条 assistant
+/// 消息，没有 driver。`FakeLlm` 用同一份脚本、同一组观察口把它演出来，所以现有测试对
+/// `requests` / `turns()` / `inputs` 的断言在 Durable 下**不用改**：
+///
+/// - 最后一条非 system 消息是**用户输入**（或没有可续的脚本）：开一段新脚本，`turns += 1`，
+///   `requests` 记一份 [`TurnRequest`] 形状的请求，`inputs` 记 `RoundInput::First`；
+/// - 最后一条是**工具结果**：取当前这段脚本的下一轮，`inputs` 记 `ToolResults`（`revised`
+///   恒为空：衰减在 Durable 下就是下一次请求里那条消息换了视图）。
+///
+/// 局限：请求里没有 session / run，`TurnRequest.session` 取缓存键（= 会话 ID，没有就空），
+/// `run` 恒为空；`memories` / `covers` / `cache_session` 恒为空。
+#[async_trait]
+impl ModelStream for FakeLlm {
+    async fn stream(
+        &self,
+        request: &ModelRequest<'_>,
+        _progress: &mut (dyn for<'m> FnMut(&'m AssistantMessage) + Send),
+    ) -> Result<AssistantMessage, LlmError> {
+        let key = stream_key(request);
+        let continuing = matches!(
+            request
+                .messages
+                .iter()
+                .rev()
+                .find(|message| !message.is_system()),
+            Some(Message::ToolResult(_))
+        ) && self.running.lock().expect("脚本模型").contains_key(&key);
+
+        let round = if continuing {
+            let results = trailing_tool_results(request.messages);
+            self.inputs
+                .lock()
+                .expect("脚本模型")
+                .push(RoundInput::ToolResults {
+                    results,
+                    revised: Vec::new(),
+                });
+            self.running
+                .lock()
+                .expect("脚本模型")
+                .get_mut(&key)
+                .and_then(std::collections::VecDeque::pop_front)
+        } else {
+            self.turns.fetch_add(1, Ordering::SeqCst);
+            self.requests
+                .lock()
+                .expect("脚本模型")
+                .push(turn_request(request));
+            self.inputs
+                .lock()
+                .expect("脚本模型")
+                .push(RoundInput::First);
+            let rounds = {
+                let mut scripts = self.scripts.lock().expect("脚本模型");
+                match scripts.pop_front() {
+                    Some(rounds) => rounds,
+                    None => self.fallback.lock().expect("脚本模型").clone(),
+                }
+            };
+            let mut rounds: std::collections::VecDeque<_> = rounds.into_iter().collect();
+            let first = rounds.pop_front();
+            self.running.lock().expect("脚本模型").insert(key, rounds);
+            first
+        };
+        // 脚本演完：给一句收尾，而不是一个错误（理由见 `FakeLlm` 的注释）。
+        let round = round.unwrap_or_else(|| text_round(99, "（脚本演完了，收尾）"))?;
+        Ok(assistant_of(request.model, &round))
+    }
+}
+
+/// 一个回合的身份：缓存键 + 最后一条用户消息的位置与正文。续轮请求与开头那一条请求同键。
+fn stream_key(request: &ModelRequest<'_>) -> String {
+    let (index, text) = request
+        .messages
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(index, message)| match message {
+            Message::User(user) => Some((index, content_text(&user.content))),
+            _ => None,
+        })
+        .unwrap_or((0, String::new()));
+    format!("{}|{index}|{text}", request.options.cache_key.unwrap_or(""))
+}
+
+fn content_text(content: &Content) -> String {
+    match content {
+        Content::Text(text) => text.clone(),
+        Content::Blocks(blocks) => blocks
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+    }
+}
+
+fn tool_result_of(result: &ToolResultMessage) -> ToolResultForModel {
+    ToolResultForModel {
+        provider_call_id: result.tool_call_id.clone(),
+        call_id: ToolCallId::from_raw(result.tool_call_id.clone()),
+        content: result
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        is_error: result.is_error,
+        images: Vec::new(),
+    }
+}
+
+/// 消息序列末尾那一串连续的工具结果（一轮的全部结果）。
+fn trailing_tool_results(messages: &[Message]) -> Vec<ToolResultForModel> {
+    let mut results: Vec<_> = messages
+        .iter()
+        .rev()
+        .take_while(|message| matches!(message, Message::ToolResult(_)))
+        .filter_map(|message| match message {
+            Message::ToolResult(result) => Some(tool_result_of(result)),
+            _ => None,
+        })
+        .collect();
+    results.reverse();
+    results
+}
+
+/// 把请求投成旧 `TurnRequest` 的形状：系统提示与工具表是 system 消息回放的结果，user /
+/// assistant 各一条，紧挨着的工具结果并成一条 `Role::Tool`。
+fn turn_request(request: &ModelRequest<'_>) -> TurnRequest {
+    let system = replay_system(request.messages);
+    let mut messages: Vec<ReplayMessage> = Vec::new();
+    let mut index = 0;
+    let body: Vec<&Message> = request
+        .messages
+        .iter()
+        .filter(|message| !message.is_system())
+        .collect();
+    while let Some(message) = body.get(index) {
+        let seq = Seq(index as u64);
+        match message {
+            Message::User(user) => messages.push(ReplayMessage {
+                role: Role::User,
+                seq,
+                text: Some(content_text(&user.content)),
+                tool_calls: Vec::new(),
+                tool_results: Vec::new(),
+                provider_blocks: None,
+            }),
+            Message::Assistant(assistant) => {
+                let text: String = assistant
+                    .content
+                    .iter()
+                    .filter_map(|block| match block {
+                        ContentBlock::Text { text, .. } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                messages.push(ReplayMessage {
+                    role: Role::Assistant,
+                    seq,
+                    text: (!text.is_empty()).then_some(text),
+                    tool_calls: assistant
+                        .content
+                        .iter()
+                        .filter_map(|block| match block {
+                            ContentBlock::ToolCall {
+                                id,
+                                name,
+                                arguments,
+                                ..
+                            } => Some(ToolCallRequest {
+                                call_id: ToolCallId::from_raw(id.clone()),
+                                provider_call_id: id.clone(),
+                                name: name.clone(),
+                                arguments: arguments.clone(),
+                                arguments_ref: None,
+                            }),
+                            _ => None,
+                        })
+                        .collect(),
+                    tool_results: Vec::new(),
+                    provider_blocks: None,
+                });
+            }
+            Message::ToolResult(_) => {
+                let mut results = Vec::new();
+                while let Some(Message::ToolResult(result)) = body.get(index) {
+                    results.push(tool_result_of(result));
+                    index += 1;
+                }
+                messages.push(ReplayMessage {
+                    role: Role::Tool,
+                    seq,
+                    text: None,
+                    tool_calls: Vec::new(),
+                    tool_results: results,
+                    provider_blocks: None,
+                });
+                continue;
+            }
+            Message::System(_) => {}
+        }
+        index += 1;
+    }
+    TurnRequest {
+        session: SessionId::from_raw(request.options.cache_key.unwrap_or("")),
+        run: RunId::from_raw(""),
+        model: request.model.clone(),
+        system_prompt: system.prompt,
+        messages,
+        tools: system.tools,
+        memories: Vec::new(),
+        covers: None,
+        cache_session: None,
+    }
+}
+
+/// 脚本里的一轮 → 一条 assistant 消息（`extra` 同真 provider：api / provider / model / usage）。
+fn assistant_of(model: &komo_kernel::types::model::ModelConfig, round: &Round) -> AssistantMessage {
+    let mut content = Vec::new();
+    if let Some(text) = round.text.as_deref().filter(|text| !text.is_empty()) {
+        content.push(ContentBlock::text(text));
+    }
+    // 被截断的一轮不含任何工具调用（`ModelStream` 的契约）。
+    if !round.truncated {
+        for call in &round.tool_calls {
+            content.push(ContentBlock::tool_call(
+                call.provider_call_id.clone(),
+                call.name.clone(),
+                call.arguments.clone(),
+            ));
+        }
+    }
+    let stop_reason = if round.truncated {
+        StopReason::Length
+    } else if !round.tool_calls.is_empty() {
+        StopReason::ToolUse
+    } else {
+        StopReason::Stop
+    };
+    let mut extra = serde_json::Map::new();
+    extra.insert("api".into(), serde_json::json!("openai-responses"));
+    extra.insert("provider".into(), serde_json::json!(model.provider));
+    extra.insert("model".into(), serde_json::json!(model.model));
+    extra.insert("usage".into(), komo_runtime::llm::usage_json(&round.usage));
+    if let Some(blocks) = &round.provider_blocks {
+        extra.insert(komo_runtime::llm::PROVIDER_BLOCKS.into(), blocks.clone());
+    }
+    AssistantMessage {
+        content,
+        stop_reason,
+        timestamp: 0,
+        extra,
+    }
+}
+
 struct FakeDriver {
     rounds: std::collections::VecDeque<Result<Round, LlmError>>,
     usage: TokenUsage,
@@ -480,6 +757,8 @@ pub struct GatewayBuilder {
     factories: Vec<Arc<dyn ChannelFactory>>,
     home: Option<PathBuf>,
     tools: Vec<Arc<dyn Tool>>,
+    storage: StorageMode,
+    stream: Option<Arc<dyn ModelStream>>,
 }
 
 impl GatewayBuilder {
@@ -492,7 +771,29 @@ impl GatewayBuilder {
             factories: Vec::new(),
             home: None,
             tools: Vec::new(),
+            storage: StorageMode::Legacy,
+            stream: None,
         }
+    }
+
+    /// 跑在新存储上（`durable.db` + `aux.db`，`docs/storage-durable-d5.md` §1）。模型要用
+    /// [`Self::fake_llm`] 给——harness 走 `ModelStream`，旧的 `LlmClient` 只剩辅助调用。
+    pub fn durable(mut self) -> Self {
+        self.storage = StorageMode::Durable;
+        self
+    }
+
+    /// 注入无状态的模型后端（只有 Durable 的 harness 用它）。
+    pub fn stream(mut self, stream: Arc<dyn ModelStream>) -> Self {
+        self.stream = Some(stream);
+        self
+    }
+
+    /// `FakeLlm` 同时是 `LlmClient` 与 `ModelStream`：两条路都装上同一个，脚本与观察口共用。
+    pub fn fake_llm(mut self, llm: Arc<FakeLlm>) -> Self {
+        self.llm = Some(Arc::clone(&llm) as Arc<dyn LlmClient>);
+        self.stream = Some(llm as Arc<dyn ModelStream>);
+        self
     }
 
     /// 多挂一个测试工具（[`super::Gate`] / [`super::Unsure`]）。
@@ -546,7 +847,9 @@ impl GatewayBuilder {
             // 端口 0：内核挑一个空的，发现文件里写的是真实地址。
             listen: Some("127.0.0.1:0".into()),
             channels: self.factories.clone(),
+            storage: self.storage,
             llm: self.llm,
+            stream: self.stream,
             embeddings: self.embeddings,
             // 共享 skill 目录也钉在这份临时数据目录上（§5.6）：否则跑测试那台机器上
             // `~/.agents/skills` 里有什么，别的测试的断言就跟着变。
@@ -766,6 +1069,12 @@ impl TestGateway {
         .await
     }
 
+    /// 等这条 run 的输入 submission 结算（`done` 或 `unanswered`，最多 20 秒），返回那条记录。
+    /// 只在 Durable 下有意义：`RunId` 是 run 首个输入 submission 的十进制 ID。
+    pub async fn wait_run(&self, run: &RunId) -> komo_kernel::durable::SubmissionRecord {
+        wait_run(self.state(), run).await
+    }
+
     pub async fn runs_of(&self, session: &SessionId) -> Vec<komo_store::repos::runs::RunRecord> {
         komo_store::repos::runs::list_for_session(&self.state().db, session)
             .await
@@ -878,7 +1187,9 @@ impl Home {
             channels: vec![FixedFactory::sender_only(
                 Arc::clone(&sender) as Arc<dyn ChannelSender>
             )],
+            storage: StorageMode::Legacy,
             llm: Some(llm),
+            stream: None,
             embeddings: None,
             // 共享 skill 目录钉在这份临时数据目录上（§5.6），与 `GatewayBuilder` 同一个口径。
             shared_home: Some(self.dir.path().to_path_buf()),
@@ -1127,6 +1438,38 @@ impl Gw {
 }
 
 // ---------------------------------------------------------------- 零碎
+
+/// `RunId`（首个输入 submission 的十进制 ID）→ submission。
+// W1a/W0a：`komo_kernel::durable::legacy_ids::submission_of` 合进来后换成它。
+fn submission_of(run: &RunId) -> komo_kernel::durable::SubmissionId {
+    let raw: u64 = run
+        .as_str()
+        .parse()
+        .unwrap_or_else(|_| panic!("{run} 不是 Durable 的 RunId（十进制 submission ID）"));
+    komo_kernel::durable::SubmissionId::new(raw)
+}
+
+/// 轮询 submission 状态直到结算（最多 20 秒）。`TestGateway::wait_run` 两份共用。
+pub async fn wait_run(state: &GatewayState, run: &RunId) -> komo_kernel::durable::SubmissionRecord {
+    use komo_kernel::durable::SubmissionStatus;
+    let core = state.core().expect("wait_run 只用在 Durable 模式下");
+    let id = submission_of(run);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        if let Some(record) = core.storage.submission(id).await.expect("读得出")
+            && matches!(
+                record.status(),
+                SubmissionStatus::Done | SubmissionStatus::Unanswered
+            )
+        {
+            return record;
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!("等了 20 秒 run {run} 的输入还没有结算");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
 
 async fn request(
     base: &str,

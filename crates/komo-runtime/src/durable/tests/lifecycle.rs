@@ -10,6 +10,7 @@ use komo_kernel::durable::{
 };
 use serde_json::json;
 
+use super::super::tx::DraftHead;
 use super::super::{ConversationOwnership, DurableError, EntryDraft, TaskInspectionState};
 use super::support::*;
 
@@ -211,7 +212,8 @@ async fn table_reads_after_a_table_write_are_rejected_but_documents_stay_availab
 }
 
 /// 交回结果要在写过自己的 conversation 之后读**别的** conversation 的请求键与 head 标记：这次提交
-/// 没碰过它（也没碰过它的 fork 祖先）时已提交的读是精确的，放行；碰过就仍然拒绝。
+/// 没碰过它（也没碰过它的 fork 祖先）时已提交的读是精确的，放行；碰过就仍然拒绝（head 标记只拒
+/// 暂存了带 `head` 的 entry 的情形）。
 #[tokio::test(start_paused = true)]
 async fn reading_another_conversation_after_a_write_is_allowed_only_when_untouched() {
     let env = Env::new();
@@ -241,9 +243,17 @@ async fn reading_another_conversation_after_a_write_is_allowed_only_when_untouch
                     tx.submission_by_request(ROOT_CONVERSATION_ID, "k").await,
                     Err(DurableError::ReadAfterWrite(_))
                 ));
-                // 碰过 `other` 之后它也不行了。
+                // head 标记只来自 entry：碰过 `other`、但暂存的 entry 都不带 `head`，已提交的读
+                // 仍然精确，放行。
                 tx.append_entry(other, EntryDraft::new("test.entry"))
                     .await?;
+                assert!(tx.latest_head_marker(other).await?.is_none());
+                // 暂存了带 `head` 的 entry 之后就读不到它了：不许读。
+                tx.append_entry(
+                    other,
+                    EntryDraft::new("test.entry").with_head(DraftHead::SelfHead),
+                )
+                .await?;
                 assert!(matches!(
                     tx.latest_head_marker(other).await,
                     Err(DurableError::ReadAfterWrite(_))

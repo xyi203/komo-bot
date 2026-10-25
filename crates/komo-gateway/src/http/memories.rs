@@ -132,8 +132,8 @@ pub async fn add(
         return Ok(Json(previous));
     }
     if let Some(session) = &request.session
-        && let Some(record) = komo_store::repos::session::get(&api.state.db, session).await?
-        && record.kind == komo_store::models::SessionKind::Task
+        && let Ok(record) = api.state.durable.session(session.as_str()).await
+        && record.kind == komo_kernel::durable::SessionKind::Task
     {
         return Err(ApiFailure::invalid(format!(
             "会话 {session} 是后台任务：任务正文不是用户原话，不能替用户记；把要记的交回主会话"

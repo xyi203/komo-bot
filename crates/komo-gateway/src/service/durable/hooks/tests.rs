@@ -75,7 +75,7 @@ struct World {
 
 impl World {
     async fn new(config: &str, llm: Arc<FakeLlm>) -> World {
-        let gateway = TestGateway::durable(config, llm).await;
+        let gateway = TestGateway::with(config, llm).await;
         let slot = assemble_slot::new_slot();
         // 这个世界只测钩子，不装转后台：给一个用不上的空槽。
         assemble_slot::wire(&slot, gateway.state(), &Default::default());
@@ -291,6 +291,36 @@ async fn setup_falls_back_to_the_default_agent_and_honours_the_agent_doc() {
         "base 段里是这个工作目录"
     );
     assert_eq!(setup.cache_key.as_deref(), Some(&*format!("c{gone}")));
+}
+
+/// 每个阶段把探到的窗口补进模型；配置里写了的不被盖掉；没探到的保持 `None`。
+/// （旧的"受理时补进快照"在新存储里就是每次 `setup` 现读 `windows`。）
+#[tokio::test]
+async fn the_probed_window_is_filled_into_the_model_only_when_config_has_none() {
+    use crate::service::windows::{WindowState, key_of};
+
+    let world = World::new(&config_with("", NO_MEMORY), finisher()).await;
+    let hooks = world.hooks();
+    let state = world.gateway.state();
+    let configured = state.snapshot().model.clone();
+    assert_eq!(configured.context_window, None);
+    let conversation = world.conversation(None).await;
+
+    // 没探到 / 探到但 provider 没说：None。
+    let setup = hooks.setup(conversation, &[]).await.unwrap();
+    assert_eq!(setup.model.context_window, None);
+    state
+        .windows
+        .finish(key_of(&configured), WindowState::Missing);
+    let setup = hooks.setup(conversation, &[]).await.unwrap();
+    assert_eq!(setup.model.context_window, None);
+
+    // 探到了：补进模型。
+    state
+        .windows
+        .finish(key_of(&configured), WindowState::Found(500_000));
+    let setup = hooks.setup(conversation, &[]).await.unwrap();
+    assert_eq!(setup.model.context_window, Some(500_000));
 }
 
 /// fork 任务返回父的段（`replay_sections`）与父的缓存键，模型沿用父此刻的。

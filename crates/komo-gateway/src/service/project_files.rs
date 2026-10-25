@@ -1,5 +1,5 @@
 //! 项目规范文件（`AGENTS.md` / `CLAUDE.md`）：从一条 Run 的工作目录往上找（`docs/agent.md`
-//! §10）。受理时找一次，正文冻结进 `payloads/`（§4.3），恢复时按引用读回、不再找。
+//! §10）。每次提交输入时对照当前分支已展示的那份找一次（`durable::submit`、`hooks::sections`）。
 //!
 //! 规则照 pi（`coding-agent/src/core/resource-loader.ts` 的 `loadProjectContextFiles`）：
 //!
@@ -15,12 +15,7 @@
 
 use std::path::Path;
 
-use komo_kernel::events::{Event, EventPayload};
-use komo_kernel::traits::{LedgerError, StoreError};
 use komo_kernel::types::agent::ProjectFile;
-use komo_kernel::types::refs::PayloadRef;
-use komo_store::PayloadStore;
-use komo_store::db::store_to_ledger;
 
 /// 每一层按这个顺序找，第一个就是这一层的。`AGENTS.override.md` 是"本地覆盖、不进仓库"
 /// 的那一份。
@@ -70,44 +65,6 @@ fn in_dir(dir: &Path) -> Option<ProjectFile> {
             }
         }
     })
-}
-
-/// 冻结：找到的那些存进 `payloads/`，返回引用。一个都没有就是 `None`（快照里不留这一格）。
-pub(crate) async fn freeze(
-    payloads: &PayloadStore,
-    files: &[ProjectFile],
-) -> Result<Option<PayloadRef>, StoreError> {
-    if files.is_empty() {
-        return Ok(None);
-    }
-    Ok(Some(payloads.put_json(&files, None).await?))
-}
-
-/// 这个会话里上一条主 Run（同一个 Agent、同一个工作目录）冻结的那一份规范：新 Run 沿用
-/// 它，系统提示才逐字不变（provider 的前缀缓存从系统提示起算）。外层 `None` = 没有这样的
-/// Run，现场找；`Some(None)` = 有，当时一个都没找到。子代理不带规范，不算。
-pub(crate) fn pinned(
-    events: &[Event],
-    agent_id: &str,
-    workspace: &Path,
-) -> Option<Option<PayloadRef>> {
-    events.iter().rev().find_map(|event| match &event.payload {
-        EventPayload::RunAccepted(body) if body.delegate.is_none() => body
-            .snapshot
-            .as_ref()
-            .filter(|snapshot| snapshot.agent_id == agent_id && snapshot.workspace == workspace)
-            .map(|snapshot| snapshot.project_files_ref.clone()),
-        _ => None,
-    })
-}
-
-/// 按引用读回冻结的那一份。读不出来或不是预期的 JSON = 会话缺内容，由调用方停下来
-/// 报告——现场再找一遍就是"恢复出来的 Run 换了一副面孔"。
-pub(crate) async fn thaw(
-    payloads: &PayloadStore,
-    reference: &PayloadRef,
-) -> Result<Vec<ProjectFile>, LedgerError> {
-    payloads.open_json(reference).await.map_err(store_to_ledger)
 }
 
 #[cfg(test)]
@@ -180,26 +137,5 @@ mod tests {
     #[test]
     fn a_relative_workspace_finds_nothing() {
         assert!(discover(Path::new("relative/dir")).is_empty());
-    }
-
-    #[tokio::test]
-    async fn freezes_into_payloads_and_thaws_back() {
-        let dir = tempfile::tempdir().unwrap();
-        let payloads = PayloadStore::new(komo_store::SessionPaths::new(
-            dir.path(),
-            &komo_kernel::types::ids::SessionId::from_raw("s-1"),
-        ));
-        assert_eq!(
-            freeze(&payloads, &[]).await.unwrap(),
-            None,
-            "没有就不留引用"
-        );
-
-        let files = vec![ProjectFile {
-            path: "/repo/AGENTS.md".into(),
-            content: "先读再改。".into(),
-        }];
-        let reference = freeze(&payloads, &files).await.unwrap().expect("有引用");
-        assert_eq!(thaw(&payloads, &reference).await.unwrap(), files);
     }
 }

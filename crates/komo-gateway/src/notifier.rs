@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use komo_kernel::protocol::config::ConfigSnapshot;
-use komo_kernel::protocol::http::{InterventionDetail, InterventionSummary};
+use komo_kernel::protocol::http::InterventionSummary;
 use komo_kernel::traits::{DeliverError, Notifier};
 use komo_kernel::types::chat::{ChannelPeer, ChannelPlatform, Delivery, DeliveryTarget, Outbound};
 use komo_runtime::config::ConfigHolder;
@@ -117,13 +117,6 @@ pub(crate) fn intervention_key(summary: &InterventionSummary) -> String {
             summary.handle,
             summary.created_at.unix_timestamp_nanos()
         ),
-    }
-}
-
-pub(crate) fn detail_key(detail: &InterventionDetail) -> Option<String> {
-    match detail {
-        InterventionDetail::Verify { summary, .. }
-        | InterventionDetail::Blocked { summary, .. } => Some(intervention_key(summary)),
     }
 }
 

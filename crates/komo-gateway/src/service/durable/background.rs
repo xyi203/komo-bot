@@ -1,7 +1,6 @@
-//! Durable 模式的后台循环（对应 Legacy 的 `service::spawn_background`）。
-//!
-//! 旧的调度器、审计补写、周期对账、旧的记忆队列与 Cron tick 在这里一概不起。配置轮询与
-//! SIGHUP 与存储无关，照旧。后续包往这里加：
+//! 后台循环（`service::start` 在 `core.resume()` 之后调 [`spawn`]）：配置轮询与 SIGHUP、
+//! 启动时对账监听、已结算输入的补投、`closing` 删除的补做、cron、记忆领取。
+//! 没有调度器、审计补写与周期对账（旧存储的东西）。各包往这里加过：
 //!
 //! - W2c：启动时对账监听（上一代遗留的进程核对 + `Harness::reconcile_monitors`），已在这里；
 //! - W2b：`feed::spawn`（提交订阅 → SSE），由主控合并时补一行；

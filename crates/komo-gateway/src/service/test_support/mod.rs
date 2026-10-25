@@ -1,4 +1,4 @@
-//! 集成测试用的一整台 Gateway：真数据目录、真 state.db、真 HTTP 监听、真 Dispatcher；
+//! 集成测试用的一整台 Gateway：真数据目录、真 durable.db / aux.db、真 HTTP 监听、真 Dispatcher；
 //! 模型与渠道是替身。
 //!
 //! 用 [`super::start`] 而不是另起一套装配——验收要证的是**这条启动路径**本身对，
@@ -38,7 +38,7 @@ use crate::channels::{ChannelSender, test_channel::MemChannel};
 use komo_runtime::llm::ModelStream;
 
 #[cfg(test)]
-use super::{Running, ServiceOptions, StorageMode, start};
+use super::{Running, ServiceOptions, start};
 
 /// 一份能通过校验的最小 config.toml。
 #[cfg(test)]
@@ -155,22 +155,21 @@ pub struct TestGateway {
 
 #[cfg(test)]
 impl TestGateway {
-    /// 默认配置：一个 Telegram 渠道，操作者 111。
+    /// 默认配置：一个 Telegram 渠道，操作者 111；不注入模型（按配置造，用不到就不会被调用）。
     pub async fn start() -> TestGateway {
-        TestGateway::with(&telegram_config("111"), None).await
+        TestGateway::boot(&telegram_config("111"), None, None).await
     }
 
-    /// 配置与模型后端自己给。
-    pub async fn with(config: &str, llm: Option<Arc<dyn LlmClient>>) -> TestGateway {
-        TestGateway::boot(config, StorageMode::Legacy, llm, None).await
+    /// 配置自己给，不注入模型。
+    pub async fn configured(config: &str) -> TestGateway {
+        TestGateway::boot(config, None, None).await
     }
 
-    /// 跑在新存储上（`docs/storage-durable-d5.md` §1）：`llm` 同时当 `LlmClient`（辅助调用）与
-    /// `ModelStream`（harness），脚本与 `requests` / `turns()` 的观察口共用。
-    pub async fn durable(config: &str, llm: Arc<harness::FakeLlm>) -> TestGateway {
+    /// 配置与模型替身自己给：`llm` 同时当 `LlmClient`（辅助调用）与 `ModelStream`（harness），
+    /// 脚本与 `requests` / `turns()` 的观察口共用。
+    pub async fn with(config: &str, llm: Arc<harness::FakeLlm>) -> TestGateway {
         TestGateway::boot(
             config,
-            StorageMode::Durable,
             Some(Arc::clone(&llm) as Arc<dyn LlmClient>),
             Some(llm as Arc<dyn ModelStream>),
         )
@@ -179,7 +178,6 @@ impl TestGateway {
 
     async fn boot(
         config: &str,
-        storage: StorageMode,
         llm: Option<Arc<dyn LlmClient>>,
         stream: Option<Arc<dyn ModelStream>>,
     ) -> TestGateway {
@@ -192,7 +190,6 @@ impl TestGateway {
             // 端口 0：内核挑一个空的，发现文件里写的是真实地址。
             listen: Some("127.0.0.1:0".into()),
             channels: Vec::new(),
-            storage,
             llm,
             stream,
             embeddings: None,
@@ -216,7 +213,7 @@ impl TestGateway {
         }
     }
 
-    /// 等这条 run 的输入 submission 结算（`done` 或 `unanswered`，最多 20 秒）。Durable 下用。
+    /// 等这条 run 的输入 submission 结算（`done` 或 `unanswered`，最多 20 秒）。
     pub async fn wait_run(
         &self,
         run: &komo_kernel::types::ids::RunId,
@@ -300,129 +297,14 @@ pub fn install_crypto() {
     });
 }
 
-// ---------------------------------------------------------------- 故障注入口
-//
-// W5「恢复故障注入验收」（§14）要的是"在 §8.5 的步骤之间停下"：一台**真** Gateway
-// 跑到某一步，账本的那一步半途而废，然后同一个数据目录重启，断言恢复扫描做了
-// §8.4 / §14 那两张表右列的事。
-//
-// 注入口做成一张按数据目录索引的表，而不是 `ServiceOptions` 上的一个字段：字段会让
-// 每一处 `ServiceOptions { .. }` 字面量在 feature 打开时编译不过（bin 的 `main` 也
-// 在内），而这里只要装配那一行读一次表。**表是空的时候什么都不发生**，生产路径上
-// 连一次哈希查找都不做（`is_empty` 就退）。
-
-/// 把装配出来的 `Arc<dyn Ledger>` 换成另一个（通常是包一层故障装饰器）。
-pub type LedgerWrap = std::sync::Arc<
-    dyn Fn(
-            std::sync::Arc<dyn komo_kernel::traits::Ledger>,
-        ) -> std::sync::Arc<dyn komo_kernel::traits::Ledger>
-        + Send
-        + Sync,
->;
-
-type WrapTable = std::sync::Mutex<Vec<(std::path::PathBuf, LedgerWrap)>>;
-
-fn wraps() -> &'static WrapTable {
-    static TABLE: std::sync::OnceLock<WrapTable> = std::sync::OnceLock::new();
-    TABLE.get_or_init(|| std::sync::Mutex::new(Vec::new()))
-}
-
-/// 下一次在 `home` 起 Gateway 时，用 `wrap` 包住账本。同一个 `home` 再装一次覆盖前一次。
-pub fn install_ledger_wrap(home: &std::path::Path, wrap: LedgerWrap) {
-    let mut table = wraps().lock().expect("故障注入表");
-    table.retain(|(path, _)| path != home);
-    table.push((home.to_path_buf(), wrap));
-}
-
-/// 撤掉 `home` 上的注入（重启一台"好的"之前调它）。
-pub fn clear_ledger_wrap(home: &std::path::Path) {
-    wraps()
-        .lock()
-        .expect("故障注入表")
-        .retain(|(p, _)| p != home);
-}
-
-/// 装配时的那一次查表。**没装过就原样返回**。
-pub(crate) fn wrap_ledger(
-    home: &std::path::Path,
-    ledger: std::sync::Arc<dyn komo_kernel::traits::Ledger>,
-) -> std::sync::Arc<dyn komo_kernel::traits::Ledger> {
-    let found = {
-        let table = wraps().lock().expect("故障注入表");
-        if table.is_empty() {
-            return ledger;
-        }
-        table
-            .iter()
-            .find(|(path, _)| path == home)
-            .map(|(_, wrap)| std::sync::Arc::clone(wrap))
-    };
-    match found {
-        Some(wrap) => wrap(ledger),
-        None => ledger,
-    }
-}
-
-// ---------------------------------------------------------------- 缓存时钟注入口
-//
-// 提示缓存冷没冷（`compaction::cache_cold`）按"现在"与上一次请求的时间差算，而
-// 缓存存活时间是五分钟：集成测试不能真等。同故障注入口一个办法——按数据目录索引的一张
-// 表，只拨**这一处判断**用的时钟（租约等别处的"现在"不动）。表是空的时候什么都
-// 不发生。
-
-type SkewTable = std::sync::Mutex<Vec<(std::path::PathBuf, std::time::Duration)>>;
-
-fn skews() -> &'static SkewTable {
-    static TABLE: std::sync::OnceLock<SkewTable> = std::sync::OnceLock::new();
-    TABLE.get_or_init(|| std::sync::Mutex::new(Vec::new()))
-}
-
-/// 下一次在 `home` 起 Gateway 时，判缓存冷没冷的"现在"往后拨 `skew`。
-pub fn install_cache_clock_skew(home: &std::path::Path, skew: std::time::Duration) {
-    let mut table = skews().lock().expect("缓存时钟注入表");
-    table.retain(|(path, _)| path != home);
-    table.push((home.to_path_buf(), skew));
-}
-
-struct SkewedClock {
-    inner: std::sync::Arc<dyn komo_kernel::traits::Clock>,
-    skew: std::time::Duration,
-}
-
-impl komo_kernel::traits::Clock for SkewedClock {
-    fn now(&self) -> time::OffsetDateTime {
-        self.inner.now() + self.skew
-    }
-}
-
-/// 装配时的那一次查表。**没装过就原样返回**。
-pub(crate) fn cache_clock(
-    home: &std::path::Path,
-    clock: std::sync::Arc<dyn komo_kernel::traits::Clock>,
-) -> std::sync::Arc<dyn komo_kernel::traits::Clock> {
-    let skew = skews()
-        .lock()
-        .expect("缓存时钟注入表")
-        .iter()
-        .find(|(path, _)| path == home)
-        .map(|(_, skew)| *skew);
-    match skew {
-        Some(skew) => std::sync::Arc::new(SkewedClock { inner: clock, skew }),
-        None => clock,
-    }
-}
-
 // ---------------------------------------------------------------- 测试工具注入口
 //
-// 审批删掉之后（§7，2026-10-11），测试再没有"默认 strict → shell 要问"这条路把一个 Run
-// 停住。停法换成两件测试专用的工具，同前两个注入口一个办法——按数据目录索引的一张表，
-// 装配时 `build_tools` 查一次，**表是空的时候什么都不挂**，生产路径上的工具目录一个不多：
+// 审批删掉之后（§7，2026-10-11），测试没有"默认 strict → shell 要问"这条路把一个 Run
+// 停住。停法是一件测试专用的工具——按数据目录索引的一张表，装配时 `build_tools` 查一次，
+// **表是空的时候什么都不挂**，生产路径上的工具目录一个不多：
 //
 // - [`Gate`]（工具名 `gate`）：进去之后**一直等**，直到测试放行——一个 Run 停在 `running`
 //   上占着名额（次序、取消、并发的测试要的就是它）。
-// - [`Unsure`]（工具名 `unsure`）：一调就答"结果不明"，正文带 `TEST_PARK` 前缀——Run 当场
-//   停在 `waiting + intervention`（升级前的 `verify` 形状）上。生产里结果不明交给模型判断
-//   （§8.6），这条停法只在 `test-support` 下有；测的是清单、投递、答复与依赖等待。
 
 type ToolTable = std::sync::Mutex<
     Vec<(
@@ -434,31 +316,6 @@ type ToolTable = std::sync::Mutex<
 fn tool_table() -> &'static ToolTable {
     static TABLE: std::sync::OnceLock<ToolTable> = std::sync::OnceLock::new();
     TABLE.get_or_init(|| std::sync::Mutex::new(Vec::new()))
-}
-
-fn legacy_table() -> &'static std::sync::Mutex<Vec<std::path::PathBuf>> {
-    static TABLE: std::sync::OnceLock<std::sync::Mutex<Vec<std::path::PathBuf>>> =
-        std::sync::OnceLock::new();
-    TABLE.get_or_init(|| std::sync::Mutex::new(Vec::new()))
-}
-
-/// 在 `home` 起 Gateway 时照生产那样，把停在结果不明上的旧 Run 放回队列交给模型。
-///
-/// 测试构建里**默认不放**：[`Unsure`] 停住的 Run 与升级前的 `verify` 是同一个形状，而
-/// "停着的 Run 扛过重启、答复之后接着跑"那一批测试要它重启后还停着。专测迁移的那条打开它。
-pub fn requeue_legacy_verify_on_start(home: &std::path::Path) {
-    let mut table = legacy_table().lock().expect("迁移开关表");
-    if !table.iter().any(|path| path == home) {
-        table.push(home.to_path_buf());
-    }
-}
-
-pub(crate) fn requeues_legacy_verify(home: &std::path::Path) -> bool {
-    legacy_table()
-        .lock()
-        .expect("迁移开关表")
-        .iter()
-        .any(|path| path == home)
 }
 
 /// 下一次在 `home` 起 Gateway 时，多挂这几个工具。同一个 `home` 再装一次覆盖前一次。
@@ -484,7 +341,7 @@ pub(crate) fn test_tools(
         .unwrap_or_default()
 }
 
-/// 两件测试工具共用的计划：一条"没有安全恢复办法"的调用——重启之后 `started` 而无结果
+/// 测试工具的计划：一条"没有安全恢复办法"的调用——重启之后 `started` 而无结果
 /// 的它只能停下来问人（§8.6），与一次真的外部写入同一个待遇。
 fn test_plan(
     name: &str,
@@ -612,113 +469,6 @@ impl komo_kernel::traits::Tool for GateTool {
             artifacts: vec![],
             images: vec![],
             preview: Some("门开了".into()),
-        })
-    }
-}
-
-/// 一调就"结果不明"的工具：Run 停在 `verify` 上等人核对（§7.5）。
-pub struct Unsure {
-    ran: std::sync::atomic::AtomicUsize,
-}
-
-impl Unsure {
-    pub fn new() -> std::sync::Arc<Unsure> {
-        std::sync::Arc::new(Unsure {
-            ran: std::sync::atomic::AtomicUsize::new(0),
-        })
-    }
-
-    pub fn tool(self: &std::sync::Arc<Self>) -> std::sync::Arc<dyn komo_kernel::traits::Tool> {
-        std::sync::Arc::new(UnsureTool(std::sync::Arc::clone(self)))
-    }
-
-    /// 真的执行了几次——"核对之后不重跑"的判据。
-    pub fn ran(&self) -> usize {
-        self.ran.load(std::sync::atomic::Ordering::SeqCst)
-    }
-}
-
-struct UnsureTool(std::sync::Arc<Unsure>);
-
-#[async_trait::async_trait]
-impl komo_kernel::traits::Tool for UnsureTool {
-    fn definition(&self) -> komo_kernel::types::tool::ToolDefinition {
-        test_definition("unsure", "测试用：一调就结果不明")
-    }
-
-    async fn prepare(
-        &self,
-        args: serde_json::Value,
-        ctx: &komo_kernel::types::tool::ToolContext,
-    ) -> Result<komo_kernel::types::plan::ExecutionPlan, komo_kernel::types::tool::ToolError> {
-        Ok(test_plan("unsure", args, ctx))
-    }
-
-    async fn execute(
-        &self,
-        _plan: komo_kernel::types::plan::ExecutionPlan,
-        _ctx: &komo_kernel::types::tool::ToolContext,
-        _sink: &mut dyn komo_kernel::traits::OutputWriter,
-    ) -> Result<komo_kernel::types::tool::ToolOutput, komo_kernel::types::tool::ToolError> {
-        self.0.ran.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        Err(komo_kernel::types::tool::ToolError::Uncertain {
-            message: format!(
-                "{}测试：远端没有回话，不知道做没做成",
-                komo_runtime::executor::TEST_PARK
-            ),
-        })
-    }
-}
-
-/// 2026-10-16 删掉之前的 `delegate`：计划照当时的 `DelegateTool::prepare` 写（`task` /
-/// `output_schema` / `schema_mode` → `Operation::Delegate`）。生产目录里已经没有它，测试装上
-/// 它在真实 Gateway 上重走旧委派调用的收尾路径（子 Run、领取豁免、父按 `run_end` 收尾，§4）。
-pub fn legacy_delegate() -> std::sync::Arc<dyn komo_kernel::traits::Tool> {
-    std::sync::Arc::new(LegacyDelegateTool)
-}
-
-struct LegacyDelegateTool;
-
-#[async_trait::async_trait]
-impl komo_kernel::traits::Tool for LegacyDelegateTool {
-    fn definition(&self) -> komo_kernel::types::tool::ToolDefinition {
-        test_definition(komo_agent::DELEGATE_TOOL, "测试用：升级前的同步委派")
-    }
-
-    async fn prepare(
-        &self,
-        args: serde_json::Value,
-        ctx: &komo_kernel::types::tool::ToolContext,
-    ) -> Result<komo_kernel::types::plan::ExecutionPlan, komo_kernel::types::tool::ToolError> {
-        use komo_kernel::types::delegate::DelegateSpec;
-        use komo_kernel::types::plan::{Operation, RecoveryMode};
-        let mut spec = DelegateSpec::new(
-            ctx.run.clone(),
-            ctx.call.clone(),
-            args["task"].as_str().unwrap_or_default(),
-        );
-        if let Some(schema) = args.get("output_schema") {
-            let mode = args
-                .get("schema_mode")
-                .and_then(|mode| serde_json::from_value(mode.clone()).ok())
-                .unwrap_or_default();
-            spec = spec.with_contract(schema.clone(), mode);
-        }
-        Ok(komo_kernel::types::plan::ExecutionPlan {
-            operation: Operation::Delegate { spec },
-            recovery: RecoveryMode::VerifyTarget,
-            ..test_plan(komo_agent::DELEGATE_TOOL, args, ctx)
-        })
-    }
-
-    async fn execute(
-        &self,
-        _plan: komo_kernel::types::plan::ExecutionPlan,
-        _ctx: &komo_kernel::types::tool::ToolContext,
-        _sink: &mut dyn komo_kernel::traits::OutputWriter,
-    ) -> Result<komo_kernel::types::tool::ToolOutput, komo_kernel::types::tool::ToolError> {
-        Err(komo_kernel::types::tool::ToolError::Failed {
-            message: "delegate 不由工具执行".into(),
         })
     }
 }

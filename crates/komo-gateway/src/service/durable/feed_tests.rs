@@ -24,7 +24,7 @@ use crate::service::test_support::harness::{FakeLlm, call_round, text_round};
 use crate::service::test_support::{TestGateway, config_toml};
 
 async fn gateway(llm: Arc<FakeLlm>) -> (TestGateway, Shutdown) {
-    let gateway = TestGateway::durable(&config_toml(""), llm).await;
+    let gateway = TestGateway::with(&config_toml(""), llm).await;
     let shutdown = Shutdown::new();
     let state = gateway.state();
     let core = state.core().expect("Durable");

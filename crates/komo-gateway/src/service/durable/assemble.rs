@@ -28,9 +28,7 @@ pub fn wire(slot: &StateSlot, state: &Arc<GatewayState>, detach: &DetachSlot) {
     if slot.set(Arc::downgrade(state)).is_err() {
         tracing::warn!("Durable 钩子已经接过一次，忽略这次重复设置");
     }
-    let Some(core) = state.durable.as_ref() else {
-        return;
-    };
+    let core = &state.durable;
     core.attach_state(slot);
     if let Some(detacher) = core.harness.deps().orchestration.detacher() {
         detach.set(detacher);

@@ -27,7 +27,6 @@ home_chat = 999
 async fn start(llm: Arc<FakeLlm>, gate: Option<&Arc<Gate>>) -> (TestGateway, Arc<MemSender>) {
     let sender = MemSender::new(ChannelPlatform::Telegram);
     let mut builder = GatewayBuilder::new(&config_toml(CONFIG))
-        .durable()
         .fake_llm(llm)
         .factory(FixedFactory::sender_only(
             Arc::clone(&sender) as Arc<dyn ChannelSender>

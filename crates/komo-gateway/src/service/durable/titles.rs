@@ -1,7 +1,5 @@
-//! 首轮跑完后给会话起个标题（Durable 版，`docs/storage-durable-d5.md` §8 的"标题"一行）。
-//!
-//! 逻辑与 Legacy 的 `service/titles.rs` 相同，只是标题读写 `sessions` 行的 `title` /
-//! `title_provisional`：
+//! 首轮跑完后给会话起个标题（`docs/storage-durable-d5.md` §8 的"标题"一行）。标题读写 `sessions`
+//! 行的 `title` / `title_provisional`：
 //!
 //! - 受理第一条输入时 `land` 把首行写成临时标题（`title_provisional = true`）；
 //! - 第一条 run 正常完成后，这里拿"用户说的 + 最终回复"问一次记忆模型（不给工具），把临时值换掉；

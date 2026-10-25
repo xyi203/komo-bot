@@ -34,7 +34,6 @@ async fn busy() -> Busy {
         vec![text_round(1, "不该有第二条 run")],
     ]);
     let gateway = GatewayBuilder::new(&telegram_config("111"))
-        .durable()
         .fake_llm(llm.clone())
         .tool(gate.tool())
         .start()
@@ -178,7 +177,6 @@ async fn a_closing_session_lets_the_run_finish_but_never_starts_a_successor() {
 #[tokio::test]
 async fn purge_requires_deleted_then_removes_rows_and_directory_and_is_idempotent() {
     let gateway = GatewayBuilder::new(&telegram_config("111"))
-        .durable()
         .fake_llm(FakeLlm::finisher("好"))
         .start()
         .await;
@@ -255,7 +253,6 @@ async fn unfinished_work_is_listed_as_blockers() {
 #[tokio::test]
 async fn a_closing_session_left_by_the_previous_generation_is_finished_on_start() {
     let mut first = GatewayBuilder::new(&telegram_config("111"))
-        .durable()
         .fake_llm(FakeLlm::finisher("好"))
         .start()
         .await;
@@ -284,7 +281,6 @@ async fn a_closing_session_left_by_the_previous_generation_is_finished_on_start(
     first.stop().await;
 
     let second = GatewayBuilder::new(&telegram_config("111"))
-        .durable()
         .fake_llm(FakeLlm::finisher("好"))
         .at(&first.home)
         .start()
@@ -301,7 +297,6 @@ async fn a_closing_session_left_by_the_previous_generation_is_finished_on_start(
 #[tokio::test]
 async fn ids_after_a_purge_and_restart_are_never_reused() {
     let mut first = GatewayBuilder::new(&telegram_config("111"))
-        .durable()
         .fake_llm(FakeLlm::finisher("好"))
         .start()
         .await;
@@ -322,7 +317,6 @@ async fn ids_after_a_purge_and_restart_are_never_reused() {
     first.stop().await;
 
     let second = GatewayBuilder::new(&telegram_config("111"))
-        .durable()
         .fake_llm(FakeLlm::finisher("好"))
         .at(&first.home)
         .start()

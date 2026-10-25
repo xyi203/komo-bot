@@ -1,9 +1,8 @@
-//! Durable 模式的 HTTP 路由（`docs/storage-durable-d5.md` §1、§4）。
+//! HTTP 路由（会话、run、树、事件、cron、intervention、导出）：路径与请求 / 响应体是冻结的协议
+//! （`komo_kernel::protocol::http`），handler 读写 `durable.db`（`docs/storage-durable-d5.md` §1、§4）。
+//! memories、config、models、mcp、healthz 在上一层（`http/*.rs`）。
 //!
-//! 协议冻结：路径与请求 / 响应体和 Legacy 一致，只是 handler 换成读写新存储。没改的路由
-//! （memories、config、models、mcp、healthz）由 `http::router` 直接复用旧 handler，不在这里。
-//!
-//! 每个子模块一组路由、一个 `routes()`；W0b 只留空桩，各包往自己的文件里填：
+//! 每个子模块一组路由、一个 `routes()`：
 //!
 //! | 文件 | 路由 | 包 |
 //! |---|---|---|
@@ -23,11 +22,14 @@ pub mod runs;
 pub mod sessions;
 pub mod tree;
 
+#[cfg(test)]
+mod tree_tests;
+
 use axum::Router;
 
 use super::Api;
 
-/// Durable 模式独有的那部分路由（认证 layer 由 `http::router` 统一加）。
+/// 这一组路由（认证 layer 由 `http::router` 统一加）。
 pub fn routes() -> Router<Api> {
     Router::new()
         .merge(sessions::routes())

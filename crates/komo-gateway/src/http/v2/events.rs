@@ -1,14 +1,14 @@
-//! Durable 模式的 `GET /v1/sessions/{id}/events`（D5 W2b，`docs/storage-durable-d5.md` §5）。
+//! `GET /v1/sessions/{id}/events`（D5 W2b，`docs/storage-durable-d5.md` §5）。
 //!
-//! 路径、`Accept` 分派、游标写法（`?from=` 与 `Last-Event-ID`，头优先）与 Legacy 一致，协议不变：
+//! 路径、`Accept` 分派、游标写法（`?from=` 与 `Last-Event-ID`，头优先）沿用冻结的协议：
 //!
 //! - 非 `text/event-stream`：一页 JSON（[`EventPage`]），`seq > from` 的前 `limit` 条；
 //! - `text/event-stream`：**先订阅 hub 再补读**，补读之后接直播。补读来自存储（投影与 feed 同一个
 //!   纯函数，见 [`feed::backfill`]），直播来自 [`feed`] 推进 hub 的帧。两段重叠的部分靠 seq 去重
 //!   （只对原始事件，见 [`already_sent`]），所以不重不漏。
 //!
-//! 与 Legacy 的差别：直播连接落后（hub 的广播缓冲溢出）时，Legacy 悄悄丢帧、靠客户端重连补读；
-//! 这里在连接上**当场补读**落下的那一段原始事件再接着直播（部分回复与状态帧丢了只是晚一点知道）。
+//! 直播连接落后（hub 的广播缓冲溢出）时，在连接上**当场补读**落下的那一段原始事件再接着直播
+//! （部分回复与状态帧丢了只是晚一点知道）。
 
 use std::collections::VecDeque;
 use std::convert::Infallible;

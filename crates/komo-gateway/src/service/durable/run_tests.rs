@@ -41,7 +41,6 @@ async fn gated() -> (TestGateway, Arc<Gated>, SessionId) {
         gate: Semaphore::new(0),
     });
     let gateway = GatewayBuilder::new(&config_toml(""))
-        .durable()
         .fake_llm(llm)
         .stream(gated.clone())
         .start()
@@ -134,7 +133,6 @@ async fn cancelling_stops_the_running_run_and_withdraws_a_queued_one() {
 #[tokio::test]
 async fn an_unknown_or_legacy_run_id_is_not_found() {
     let gateway = GatewayBuilder::new(&config_toml(""))
-        .durable()
         .fake_llm(FakeLlm::finisher("好"))
         .start()
         .await;
@@ -152,7 +150,6 @@ async fn an_unknown_or_legacy_run_id_is_not_found() {
 async fn a_replayed_bang_command_runs_once_and_other_content_conflicts() {
     let llm = FakeLlm::finisher("好");
     let gateway = GatewayBuilder::new(&telegram_config("111"))
-        .durable()
         .fake_llm(llm.clone())
         .start()
         .await;

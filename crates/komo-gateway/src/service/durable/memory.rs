@@ -16,7 +16,7 @@ use super::DurableCore;
 use crate::service::state::GatewayState;
 use komo_kernel::traits::Shutdown;
 
-/// 后台那一拍的间隔（与 Legacy 的 `MEMORY_TICK` 相同）。
+/// 后台那一拍的间隔。
 const MEMORY_TICK: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// `MemoryManager` 在 Durable 下要的两个接缝。`config` 供提取时按会话的 Agent 取记忆模式。

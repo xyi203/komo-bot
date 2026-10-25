@@ -34,6 +34,7 @@ use komo_kernel::protocol::http::{
     CompactionSummary, RunDetail, RunSummary, TokenTotals, ToolCallSummary,
 };
 use komo_kernel::types::ids::{CronJobId, RunId, SessionId};
+use komo_kernel::types::memory::RecallDiagnostics;
 use komo_kernel::types::plan::PlanSource;
 use komo_kernel::types::status::{RetryCause, RunState, WaitReason};
 use komo_runtime::durable::harness::{GenerationLive, Harness, WithdrawResult};
@@ -499,7 +500,7 @@ impl DurableCore {
             Some(doc) => {
                 let mut events = folded.events.clone();
                 komo_runtime::memory::durable::inject_memory_events(&mut events, &doc);
-                crate::http::runs::injection_of(&events, run)
+                injection_of(&events, run)
             }
             None => (Vec::new(), None),
         };
@@ -627,4 +628,35 @@ impl DurableCore {
         }
         self.submission_state(submission.id).await
     }
+}
+
+/// 这条 Run 的系统提示里带的记忆（§9.7）。
+///
+/// 同一段对话里注入段只在换块时才记一条 `memory.injected`，后面的 Run 沿用它而不再记；
+/// 所以取**这条 Run 结束前最近的一条**：是自己记的就带上召回诊断，是更早的 Run 记的就
+/// 标"沿用"。
+fn injection_of(
+    events: &[Event],
+    run: &RunId,
+) -> (
+    Vec<komo_kernel::types::turn::MemoryUse>,
+    Option<RecallDiagnostics>,
+) {
+    let Some(last) = of_run(events, run).map(|event| event.seq).max() else {
+        return (Vec::new(), None);
+    };
+    let Some((event, body)) = komo_kernel::events::injection_at(events, last) else {
+        return (Vec::new(), None);
+    };
+    let recall = if event.run.as_ref() == Some(run) {
+        body.recall.clone()
+    } else if body.uses.is_empty() {
+        None
+    } else {
+        Some(RecallDiagnostics {
+            reused_pin: true,
+            ..RecallDiagnostics::default()
+        })
+    };
+    (body.uses.clone(), recall)
 }

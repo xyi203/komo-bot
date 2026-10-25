@@ -5,24 +5,17 @@
 //! 没有来源会话，所以这里做同一件事、投到 **home chat**（§11.4：「来源是 Cron 或已
 //! 断开的 TUI 时只有 home chat」）。
 //!
-//! 三条语句在这里落地，各只有一处实现：
+//! 两条语句在这里落地，各只有一处实现：
 //!
-//! - **「不能因无人值守就没人知道它在等」**（§10）：停在需要人处理的等待上
-//!   （`verify` / `blocked`）一出现就投到 home chat。没有这一步，一个 Cron Run 会停在
-//!   等待上而**没有人知道它在等**——§11.4 的"投递到 Run 的来源会话与 home chat"在
-//!   Cron 这一侧就是这一句。
 //! - **`notify`**（§10）：`always` / `on_error` / `never` 过滤**结果**的投递。
-//!   `waiting` 不受它约束——那是任务在**问**，不是在报告，一条没人看见的提问等于这个
-//!   Job 从此停在那里。
-//! - **「更新本次触发状态」**：终态 → `ok` / `error`，停在等待上 → `waiting`。手动
-//!   run 没有触发记录，`settle` 答 `false`，这是对的（§10：手动 run 不冒充定时触发）。
+//! - **「更新本次触发状态」**：终态 → `ok` / `error`。手动 run 没有触发记录，`settle`
+//!   什么都不写（§10：手动 run 不冒充定时触发）。
 //!
-//! **订阅那一层在 [`super::run_watch`]**：交互 Run 与 Cron 触发的分别只有"谁是来源
-//! 会话"，两条循环会各投一遍同一条介入。这里剩下的是 Cron 自己的那两件事——回写触发
-//! 状态与按 `notify` 过滤结果。
+//! **订阅那一层在 [`super::durable::cron_watch`]**：等 submission 结算再读终态帧。这里是
+//! Cron 自己的那两件事——回写触发状态与按 `notify` 过滤结果。
 //!
-//! 它**不是**恢复机制：进程活着的时候订阅事件流，重启后靠 `deliveries` 表里那一行
-//! pending 补发（§11.4），不靠这里再看一遍。
+//! 它**不是**恢复机制：重启后靠 `deliveries` 表里那一行 pending 补发（§11.4）与
+//! `durable::cron::recover` 重挂看客，不靠这里再看一遍。
 
 use std::sync::Arc;
 
@@ -45,10 +38,8 @@ pub struct Watched {
     pub notify: NotifyPolicy,
     /// 手动 run 没有触发记录，不回写状态（§10）。
     pub scheduled: bool,
-    /// 这个 Job 是不是命令直跑模式（§10）：是的话，终态的 ok / error 与投递正文不看
-    /// `run.completed.final_message`（那是 `CommandDriver` 收尾用的投影正文，不是干净
-    /// 的 stdout），改由 [`super::run_watch::command_outcome`] 现读那次 `bash` 调用的
-    /// 落盘结果。
+    /// 这个 Job 是不是命令直跑模式（§10）：是的话，终态的 ok / error 与投递正文不看模型
+    /// 回复，改读 `shell.command` 落下的那次 `bash` 结果（`durable::cron_watch`）。
     pub is_command: bool,
 }
 
@@ -65,17 +56,6 @@ impl Watched {
             is_command: job.command.is_some(),
         }
     }
-}
-
-/// 盯一次触发：交给统一的看客（[`super::run_watch`]），来源是 Cron。
-pub fn watch(state: Arc<GatewayState>, watched: Watched) {
-    let (session, run) = (watched.session.clone(), watched.run.clone());
-    super::run_watch::watch(
-        state,
-        session,
-        run,
-        super::run_watch::Watcher::Cron(Box::new(watched)),
-    );
 }
 
 /// 更新本次触发状态（§10）。

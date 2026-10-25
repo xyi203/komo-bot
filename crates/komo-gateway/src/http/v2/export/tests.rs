@@ -10,7 +10,7 @@ use serde_json::json;
 
 async fn setup() -> (TestGateway, SessionId) {
     // 手动压缩只收 `keep_recent_tokens` 之外的旧内容：几十字的测试历史要压得动，调到最小。
-    let gw = TestGateway::durable(
+    let gw = TestGateway::with(
         &config_toml("[compaction]\nkeep_recent_tokens = 1\n"),
         FakeLlm::finisher("model answer"),
     )

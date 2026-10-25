@@ -290,7 +290,6 @@ pub async fn run_now(
         .map_err(|error| ApiFailure::invalid(error.to_string()))?
         .ok_or_else(|| ApiFailure::not_found(format!("定时任务 {id}")))?;
     api.state.watch_cron_run(&fired, &job, false);
-    api.state.waker().wake();
 
     let response = ManualCronRunResponse {
         job: fired.job,
@@ -343,13 +342,11 @@ fn resolve_model(
     }
     model.effort = effort.cloned().or(model.effort);
     check_effort(api, &model)?;
-    // Durable：`komo.agent.model` 只认目录里的 alias，整份配置对不上任何 alias 就当场拒绝，
+    // `komo.agent.model` 只认目录里的 alias，整份配置对不上任何 alias 就当场拒绝，
     // 不留到凌晨触发时才失败。
-    if api.state.durable.is_some()
-        && crate::service::durable::cron::alias_of(&api.state.snapshot(), &model).is_none()
-    {
+    if crate::service::durable::cron::alias_of(&api.state.snapshot(), &model).is_none() {
         return Err(ApiFailure::invalid(format!(
-            "模型覆盖（{}）不在 model_catalog 里：Durable 存储下只能用目录里的模型 alias",
+            "模型覆盖（{}）不在 model_catalog 里：只能用目录里的模型 alias",
             model.model
         )));
     }

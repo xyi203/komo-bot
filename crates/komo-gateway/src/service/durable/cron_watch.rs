@@ -4,14 +4,14 @@
 //! [`crate::service::cron_watch`]：`notify` 的 `always` / `on_error` / `never` 过滤**结果**；
 //! 手动 run 没有触发记录，不回写。
 //!
-//! 与 Legacy 看客的区别：
+//! 要点：
 //!
 //! - 不订阅 hub，而是 `wait_submission` + 读终态帧——重启后 [`super::cron::recover`] 对仍是 `queued`
 //!   的触发记录重挂，不会错过终态帧；
 //! - 新语义没有"停在等人核对上"的 `waiting`（工具结果不明直接交给模型），所以没有 `Waiting`
 //!   状态与"等待照投"那一支；faulted 任务的提醒是 W4a 的事；
 //! - 命令型 Job（决定 9）不是 harness run：RunId 是 `shell.command` write 的 submission，输出从那条 entry 的
-//!   `data.output` 引用读回 `BashResult`（与 Legacy 同样不信模型视图那份投影正文）。
+//!   `data.output` 引用读回 `BashResult`（不信模型视图那份投影正文）。
 
 use std::sync::Arc;
 

@@ -9,34 +9,16 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use komo_kernel::protocol::config::ConfigSnapshot;
-use komo_kernel::protocol::http::{InterventionListQuery, SubmitRunResponse};
 use komo_kernel::traits::{
-    Clock, CronRepo, EmbeddingClient, GatewayError, Ledger, LlmClient, MemoryRepo, RepoError,
-    RunQueue, StoreError, ToolOutputStore,
+    Clock, CronRepo, EmbeddingClient, GatewayError, LlmClient, MemoryRepo, RepoError,
 };
-use komo_kernel::types::agent::{AgentProfile, RunSnapshot};
-use komo_kernel::types::chat::ChannelPeer;
-use komo_kernel::types::delegate::DelegateContract;
-use komo_kernel::types::ids::{ExecutorId, RequestKey, RunId, SessionId};
-use komo_kernel::types::model::ModelConfig;
-use komo_kernel::types::plan::PlanSource;
-use komo_kernel::types::status::{RunEnd, RunState, SessionState};
-use komo_kernel::types::surface::AgentSurface;
-use komo_kernel::types::turn::{AcceptInput, LlmError, TurnRequest};
-use komo_runtime::agent::handler::{AgentRunHandler, SegmentSource};
-use komo_runtime::agent::{AgentLoop, Budget, ResumedRound, RetryBudget, Segment};
+use komo_kernel::types::ids::{ExecutorId, RunId};
+use komo_kernel::types::turn::{LlmError, TurnRequest};
+use komo_runtime::agent::{Budget, RetryBudget};
 use komo_runtime::config::{ConfigHolder, EffortCapabilities};
-use komo_runtime::executor::{CallEnv, ToolExecutor};
-use komo_runtime::memory::{
-    DbMemoryWork, LedgerEvents, MemoryManager, MemoryParts, MemoryWorkLog, SessionEvents,
-};
-use komo_runtime::recovery::{RecoveryIndex, RecoveryScan, UnfinishedRun};
-use komo_runtime::scheduler::{HandlerError, Scheduler, SchedulerConfig, Waker};
-use komo_runtime::tools::paths;
-use komo_store::{
-    Db, PayloadStore, RecoveryStore, TursoCronRepo, TursoDeliveryRepo, TursoMemoryRepo,
-    TursoRunQueue,
-};
+use komo_runtime::executor::ToolExecutor;
+use komo_runtime::memory::{MemoryManager, MemoryParts};
+use komo_store::{Db, TursoCronRepo, TursoDeliveryRepo, TursoMemoryRepo};
 use time::OffsetDateTime;
 
 use crate::channels::ChannelFactory;
@@ -44,20 +26,6 @@ use crate::channels::ChannelRegistry;
 use crate::deliveries::DeliveryLog;
 use crate::notifier::HomeNotifier;
 use crate::sse::{EventHub, SharedHub};
-
-use super::ledgers::{RoutedLedger, RoutedOutputs, SessionLedgers};
-use super::segment::GatewaySegments;
-
-/// 判提示缓存冷没冷用的时钟：生产就是 `clock` 本身，测试可以按数据目录拨快。
-#[cfg(any(test, feature = "test-support"))]
-fn cache_clock(home: &std::path::Path, clock: Arc<dyn Clock>) -> Arc<dyn Clock> {
-    super::test_support::cache_clock(home, clock)
-}
-
-#[cfg(not(any(test, feature = "test-support")))]
-fn cache_clock(_home: &std::path::Path, clock: Arc<dyn Clock>) -> Arc<dyn Clock> {
-    clock
-}
 
 /// 系统时钟。**进程里唯一读墙上时间的地方**（其余一切经 `Clock`）。
 #[derive(Debug, Clone, Copy, Default)]
@@ -140,201 +108,6 @@ impl LlmClient for UnconfiguredLlm {
     }
 }
 
-/// store 的 `RecoveryStore` 包成 runtime 的 [`RecoveryIndex`]。
-///
-/// 两件事由这一层补上：
-///
-/// - **会话那一维**（`RecoveryIndex::session_state`，§8.9）：`RecoveryInput` 要答"这条 Run
-///   所属的会话还在不在服务范围里"，store 的 `unfinished_runs` 只带 Run 自己的列，所以
-///   这里把它接上。行不在 = `None`，runtime 当"不服务"处置。
-/// - **正在本进程手里跑的那些不进这一趟**：一次周期对账不该去判一条活着的 Run。判据是
-///   [`InFlight`]——handler 开跑时落一行、返回时摘掉，它盖住的是"已经停在等待上、领取权
-///   已交还，handler 却还没返回"那一段。领取已提交而 handler 还没开跑的那一段不在
-///   `InFlight` 里，由扫描自己按 `claimed_by == 本实例` 跳过（`RecoveryScan::scan`）；
-///   两道之外剩下的竞争由写回时的条件更新挡住（`RecoveryStore::requeue_if_unchanged`）。
-#[derive(Debug)]
-pub struct RecoveryIndexOf {
-    store: RecoveryStore,
-    in_flight: Arc<InFlight>,
-}
-
-impl RecoveryIndexOf {
-    pub fn new(store: RecoveryStore, in_flight: Arc<InFlight>) -> Self {
-        RecoveryIndexOf { store, in_flight }
-    }
-}
-
-#[async_trait]
-impl RecoveryIndex for RecoveryIndexOf {
-    async fn unfinished_runs(&self) -> Result<Vec<UnfinishedRun>, StoreError> {
-        Ok(self
-            .store
-            .unfinished_runs()
-            .await?
-            .into_iter()
-            .filter(|run| !self.in_flight.holds(&run.run))
-            .map(|run| UnfinishedRun {
-                run: run.run,
-                session: run.session,
-                state: run.state,
-                wait: run.wait,
-                claimed_by: run.claimed_by,
-                generation: run.generation,
-                result_delivered: run.result_delivered,
-            })
-            .collect())
-    }
-
-    async fn session_state(&self, session: &SessionId) -> Result<Option<SessionState>, StoreError> {
-        komo_store::repos::session::state(self.store.db(), session).await
-    }
-
-    async fn session_content(&self, session: &SessionId) -> Result<bool, StoreError> {
-        // 权威在 store（`content_available`），这里只把 root 接上——root 从配置快照的
-        // paths 出来，`RecoveryStore` 建的时候已经拿在手里了。**它只观察，不建目录**
-        // （§8.9：观察不改写）。
-        Ok(
-            komo_store::repos::reconcile::content_available(self.store.sessions_root(), session)
-                .await,
-        )
-    }
-
-    async fn reclaim_running(
-        &self,
-        executor: &ExecutorId,
-        keep: &[ExecutorId],
-    ) -> Result<u64, StoreError> {
-        self.store.reclaim_running(executor, keep).await
-    }
-
-    async fn backfill(&self, run: &RunId) -> Result<(), StoreError> {
-        self.store.backfill(run).await
-    }
-
-    async fn requeue(&self, seen: &UnfinishedRun) -> Result<bool, StoreError> {
-        self.store
-            .requeue_if_unchanged(&seen.run, &seen_row(seen))
-            .await
-    }
-
-    async fn mark_needs_attention(
-        &self,
-        seen: &UnfinishedRun,
-        reason: &str,
-    ) -> Result<bool, StoreError> {
-        self.store
-            .mark_needs_attention_if_unchanged(&seen.run, reason, &seen_row(seen))
-            .await
-    }
-
-    async fn hold_for_previous_executor(
-        &self,
-        seen: &UnfinishedRun,
-        reason: &str,
-    ) -> Result<bool, StoreError> {
-        self.store
-            .hold_for_previous_executor_if_unchanged(&seen.run, reason, &seen_row(seen))
-            .await
-    }
-}
-
-fn seen_row(run: &UnfinishedRun) -> komo_store::SeenRun {
-    komo_store::SeenRun {
-        state: run.state,
-        wait: run.wait.clone(),
-        claimed_by: run.claimed_by.clone(),
-        generation: run.generation,
-    }
-}
-
-/// 本进程**此刻**正在跑的 Run（§8.9 的存活判定）。
-///
-/// §8.7 的租约只用来**发现**"没人管了"；对账见到租约过期时还要过一道"持有者确已不在，
-/// 或自己内存里已不再持有它"才回收。少这一道，一次二十分钟的调用会在主人还活着的时候被
-/// 当成孤儿——那不是恢复，是真的重复副作用（§8.6）。这个表就是"自己内存里还持有着"的
-/// 那一半：调度器每领一条就在这里落一行，handler 返回时摘掉。
-#[derive(Debug, Default)]
-pub struct InFlight {
-    runs: Mutex<std::collections::BTreeSet<RunId>>,
-}
-
-impl InFlight {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// 落一行并返回一个**掉了就摘掉**的守卫（handler 返回、panic 展开、任务被取消都会
-    /// 走到 `Drop`）。
-    pub fn enter(self: &Arc<Self>, run: &RunId) -> InFlightGuard {
-        self.runs.lock().expect("在跑表").insert(run.clone());
-        InFlightGuard {
-            in_flight: Arc::clone(self),
-            run: run.clone(),
-        }
-    }
-
-    /// 这条 Run 现在还在本进程手里吗。
-    pub fn holds(&self, run: &RunId) -> bool {
-        self.runs.lock().expect("在跑表").contains(run)
-    }
-
-    /// 现在在手里的全部。
-    pub fn snapshot(&self) -> std::collections::BTreeSet<RunId> {
-        self.runs.lock().expect("在跑表").clone()
-    }
-}
-
-/// [`InFlight::enter`] 的守卫。
-pub struct InFlightGuard {
-    in_flight: Arc<InFlight>,
-    run: RunId,
-}
-
-impl std::fmt::Debug for InFlightGuard {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("InFlightGuard")
-            .field("run", &self.run)
-            .finish()
-    }
-}
-
-impl Drop for InFlightGuard {
-    fn drop(&mut self) {
-        self.in_flight
-            .runs
-            .lock()
-            .expect("在跑表")
-            .remove(&self.run);
-    }
-}
-
-/// 包在 [`AgentRunHandler`] 外面，只为记 [`InFlight`]。
-///
-/// 它不改任何行为：转发一个调用，前后各动一下那张表。调度器看到的是同一条
-/// [`RunHandler`](komo_runtime::scheduler::RunHandler)。
-#[derive(Debug)]
-pub struct TrackingHandler {
-    inner: Arc<AgentRunHandler>,
-    in_flight: Arc<InFlight>,
-}
-
-impl TrackingHandler {
-    pub fn new(inner: Arc<AgentRunHandler>, in_flight: Arc<InFlight>) -> Self {
-        TrackingHandler { inner, in_flight }
-    }
-}
-
-#[async_trait]
-impl komo_runtime::scheduler::RunHandler for TrackingHandler {
-    async fn run(
-        &self,
-        claimed: komo_kernel::types::status::Claimed,
-    ) -> Result<(), komo_runtime::scheduler::HandlerError> {
-        let _guard = self.in_flight.enter(&claimed.run);
-        self.inner.run(claimed).await
-    }
-}
-
 /// 一次装配出来的 Gateway。
 pub struct GatewayState {
     pub home: PathBuf,
@@ -347,27 +120,16 @@ pub struct GatewayState {
     pub clock: Arc<dyn Clock>,
     pub config: Arc<ConfigHolder>,
     pub caps: EffortCapabilities,
-    /// Legacy：`state.db`；Durable：`aux.db`（同一套 toasty 模型、同一份 migration，
-    /// 只装 cron / 投递 / memory / 幂等键这类辅助表，`docs/storage-durable-d5.md` §1）。
+    /// `aux.db`（toasty 模型，只装 cron / 投递 / memory / 幂等键这类辅助表，
+    /// `docs/storage-durable-d5.md` §1）。
     pub db: Db,
-    /// D5：新存储与新 harness。`None` = Legacy 模式。
-    pub durable: Option<Arc<super::durable::DurableCore>>,
+    /// 新存储与 harness（`durable.db`）。
+    pub durable: Arc<super::durable::DurableCore>,
     pub hub: SharedHub,
-    pub ledgers: Arc<SessionLedgers>,
-    pub routed: Arc<RoutedLedger>,
-    /// 审计补写的叫醒铃。有审计事件刚排进 `control_outbox` 时按一下，周期（`AUDIT_TICK`）
-    /// 只是兜底（§8.5 的补写顺序不变）。
-    pub audit_wake: Arc<tokio::sync::Notify>,
-    /// 一次 Run 的三个写入者共用的那个账本句柄（测试的故障注入口包的就是它）。审计补写
-    /// 也走它——补写是账本写入的一种，没有理由绕过同一条缝。
-    pub turn_ledger: Arc<dyn Ledger>,
-    pub outputs: Arc<dyn ToolOutputStore>,
-    pub queue: Arc<TursoRunQueue>,
     pub cron: Arc<dyn CronRepo>,
     pub memory: Arc<dyn MemoryRepo>,
     /// §9 的那一层：召回与注入、自动积累、向量索引与代次。
     pub memories: Arc<MemoryManager>,
-    pub recovery_store: RecoveryStore,
     pub deliveries: Arc<TursoDeliveryRepo>,
     pub notifier: Arc<HomeNotifier>,
     pub channels: Arc<ChannelRegistry>,
@@ -380,14 +142,6 @@ pub struct GatewayState {
     pub auto_title: bool,
     /// 上一条投到 home chat 的重载错误。同一条错误不重复投；装上之后清掉并说一声。
     pub reload_notice: Mutex<Option<String>>,
-    pub scheduler: Arc<Scheduler>,
-    /// 跑 Run 的那个 handler。调度器握着一份（`Arc<dyn RunHandler>`），这里再留一份具名
-    /// 的：§7.5 的 `verify` 答复要直接调 [`AgentRunHandler::settle_by_operator`]，而那条
-    /// 路不经过调度器。
-    pub handler: Arc<AgentRunHandler>,
-    /// 本进程此刻还在手里的 Run（§8.9 的存活判定）。
-    pub in_flight: Arc<InFlight>,
-    pub segments: Arc<GatewaySegments>,
     /// MCP 服务器的连接（`docs/mcp.md` §2.2）：受理 Run 前问它一次，登录后才连上的服务器的
     /// 工具从这里挂进执行器。
     pub mcp: Arc<komo_runtime::mcp::McpHub>,
@@ -395,9 +149,6 @@ pub struct GatewayState {
     /// `follow` 的接缝（`TaskSpawner`）要一份 `Arc<GatewayState>`，而执行器是在这份状态
     /// 存在**之前**造出来的，只能在这里回头接上（`docs/background-tasks.md`）。
     pub tool_executor: Arc<ToolExecutor>,
-    /// 监听（`docs/monitor.md`）。与任务分发同一个接法：要一份 `Arc<GatewayState>`，
-    /// 只能在这份状态造好之后接上（[`Self::wire_monitors`]）。停机与启动收尾要拿到它。
-    pub monitors: std::sync::OnceLock<Arc<super::monitors::GatewayMonitors>>,
     /// §5.6 那份**活的** skill 注册表。与 [`GatewayState::segments`] 共用一个 `Arc`。
     ///
     /// 存的是注册表而不是渲染好的那一段文本：文本按用途现渲染（系统提示一处、`skill://`
@@ -418,7 +169,6 @@ pub struct GatewayState {
     /// 投递表按**句柄**记（Run ID，§7.5 那张表）：两类共用一条到达率，"投过一次就不再投"
     /// 这条判据也只能有一个。
     pub watching: Mutex<std::collections::BTreeSet<RunId>>,
-    pub interventions_delivered: Mutex<std::collections::BTreeSet<String>>,
     /// 模型请求的有界退避预算上限（§8.5）。
     pub max_retries: u32,
     /// 一段最多跑几轮模型（§6）；`None` = 不设。
@@ -440,8 +190,8 @@ pub struct Assembly {
     pub config: Arc<ConfigHolder>,
     pub caps: EffortCapabilities,
     pub db: Db,
-    /// Durable 模式的核心（`None` = Legacy）。
-    pub durable: Option<Arc<super::durable::DurableCore>>,
+    /// 新存储的核心。
+    pub durable: Arc<super::durable::DurableCore>,
     pub clock: Arc<dyn Clock>,
     pub instance_id: String,
     pub token: String,
@@ -486,33 +236,7 @@ impl GatewayState {
         let snapshot = config.current();
         let executor = ExecutorId::from_raw(instance_id.clone());
         let hub: SharedHub = Arc::new(EventHub::new());
-        let sessions_root = snapshot.paths.sessions_dir.clone();
 
-        let ledgers = Arc::new(SessionLedgers::new(
-            db.clone(),
-            sessions_root.clone(),
-            Arc::clone(&clock),
-            Arc::clone(&hub),
-            executor.clone(),
-        ));
-        let audit_wake = Arc::new(tokio::sync::Notify::new());
-        let routed = Arc::new(RoutedLedger::new(
-            Arc::clone(&ledgers),
-            db.clone(),
-            Arc::clone(&clock),
-        ));
-        let outputs: Arc<dyn ToolOutputStore> = Arc::new(RoutedOutputs::new(
-            Arc::clone(&ledgers),
-            Arc::clone(&routed),
-        ));
-
-        // 租约窗口用 store 的默认值（2 分钟）：**gateway 不另发明一个配置项**。窗口越长
-        // "handler 死了"被发现得越晚，越短长调用续租得越勤——那是 store 那一侧的取舍，
-        // 这里只是把它交给队列（§8.7）。
-        let queue = Arc::new(TursoRunQueue::with_lease(
-            db.clone(),
-            komo_store::repos::queue::DEFAULT_LEASE_WINDOW,
-        ));
         let cron: Arc<dyn CronRepo> = Arc::new(TursoCronRepo::new(db.clone()));
         let memory: Arc<dyn MemoryRepo> = Arc::new(TursoMemoryRepo::new(db.clone()));
         let deliveries = Arc::new(TursoDeliveryRepo::new(db.clone()));
@@ -533,15 +257,8 @@ impl GatewayState {
         // 判断后端（§9.4 的可选一步）：**造它不碰网络**，所以直接装，不用像向量维度那样
         // 后台探测。配置热重载会换掉它（`GatewayState::refresh_reranker`）。
         let reranker = build_reranker(&snapshot, &config);
-        // Durable：事件与工作队列走新存储（W3c）；Legacy：账本与 state.db 的队列。
-        let (events, work): (Arc<dyn SessionEvents>, Arc<dyn MemoryWorkLog>) =
-            match durable.as_ref() {
-                Some(core) => super::durable::memory::seams(core, &config, &clock),
-                None => (
-                    Arc::new(LedgerEvents(Arc::clone(&routed) as Arc<dyn Ledger>)),
-                    Arc::new(DbMemoryWork::new(db.clone(), Arc::clone(&clock))),
-                ),
-            };
+        // 事件与工作队列走新存储（W3c）。
+        let (events, work) = super::durable::memory::seams(&durable, &config, &clock);
         let memories = Arc::new(MemoryManager::new(MemoryParts {
             config: snapshot.memory.clone(),
             repo: Arc::clone(&memory),
@@ -566,93 +283,17 @@ impl GatewayState {
             None => build_llm(&snapshot, &config, &caps),
         }));
 
-        // 一次 Run 的三个账本写入者（执行器、AgentLoop、handler）共用这一个句柄。
-        // W5 的故障注入口就在这里：没装过注入时它**就是** `routed` 本身（§14）。
-        #[cfg(any(test, feature = "test-support"))]
-        let turn_ledger =
-            super::test_support::wrap_ledger(&home, Arc::clone(&routed) as Arc<dyn Ledger>);
-        #[cfg(not(any(test, feature = "test-support")))]
-        let turn_ledger = Arc::clone(&routed) as Arc<dyn Ledger>;
-
         // §5.6 的目录行：注册表**启动时按快照造一份**，那一块文本按用途现渲染（系统提示
         // 一处、`skill://` 的挂载点一处）——两处同源，不会有"提示里有、读不到"这种事。
         let skills = Arc::new(std::sync::RwLock::new(skills_registry(
             &snapshot,
             shared_home.as_deref(),
         )));
-        let executor_tools = Arc::new(
-            ToolExecutor::new(
-                tools,
-                Arc::clone(&turn_ledger),
-                Arc::clone(&outputs),
-                Arc::clone(&clock),
-            )
-            .with_codemode(codemode)
-            .with_mcp(Arc::clone(&mcp)),
-        );
-
-        let agent = Arc::new(AgentLoop::new(
-            Arc::clone(&llm) as Arc<dyn LlmClient>,
-            Arc::clone(&turn_ledger),
-            Arc::clone(&executor_tools),
-            Arc::clone(&clock),
-        ));
+        let executor_tools =
+            super::tool_catalog::catalog(tools, codemode, Arc::clone(&mcp), Arc::clone(&clock));
 
         let max_rounds = Budget::default().max_rounds;
         let max_retries = RetryBudget::default().max_attempts;
-
-        let segments = Arc::new(
-            GatewaySegments::new(
-                Arc::clone(&routed),
-                db.clone(),
-                RecoveryStore::new(db.clone(), sessions_root.clone()),
-                snapshot.paths.workspaces_dir.clone(),
-                max_rounds,
-                max_retries,
-            )
-            // §8.3：这个 Session 自己的输出与产物是一段只读根，模型才读得到"完整输出在哪"。
-            .with_session_files(sessions_root.clone())
-            // 回放那一侧的投影：同一份输出存储；预算按当前快照现读（§3）。
-            .with_projection(Arc::clone(&outputs))
-            .with_config(Arc::clone(&config))
-            .with_clock(cache_clock(&home, Arc::clone(&clock)))
-            // Cron Run 用它那个 Job 的执行预算（§10）。
-            .with_cron(Arc::clone(&cron))
-            // 每一段装配时按当前用户输入召回一次，并把用到的条目记进
-            // `TurnRequest::memories`（§9.7 的审计证据）。
-            .with_memories(
-                Arc::clone(&memories),
-                komo_store::CheckpointStore::new(db.clone()),
-            )
-            // §5.6 的目录行：与 state 共用一个 `Arc`，重载时就地换内容。
-            .with_skills(Arc::clone(&skills))
-            // 交给模型的 Schema 由执行器按这一次的能力面渲染（§4 末）：`definitions_for`
-            // 与执行器查找工具用的是同一份实现与同一份目录。
-            .with_executor(Arc::clone(&executor_tools)),
-        );
-
-        let handler = Arc::new(AgentRunHandler::new(
-            agent,
-            Arc::clone(&executor_tools),
-            Arc::clone(&turn_ledger),
-            Arc::clone(&segments) as Arc<dyn SegmentSource>,
-            Arc::clone(&queue) as Arc<dyn RunQueue>,
-            executor.clone(),
-        ));
-
-        // §8.9 的存活判定：调度器领走时落一行，handler 返回时摘掉。
-        let in_flight = Arc::new(InFlight::new());
-        let scheduler = Arc::new(Scheduler::new(
-            Arc::clone(&queue) as Arc<dyn RunQueue>,
-            Arc::new(TrackingHandler::new(
-                Arc::clone(&handler),
-                Arc::clone(&in_flight),
-            )) as Arc<dyn komo_runtime::scheduler::RunHandler>,
-            executor.clone(),
-            SchedulerConfig::default(),
-        ));
-
-        let recovery_store = RecoveryStore::new(db.clone(), sessions_root);
 
         Ok(Arc::new(GatewayState {
             home,
@@ -667,16 +308,9 @@ impl GatewayState {
             db,
             durable,
             hub,
-            ledgers,
-            routed,
-            audit_wake,
-            turn_ledger,
-            outputs,
-            queue,
             cron,
             memory,
             memories,
-            recovery_store,
             deliveries,
             reload_notice: Mutex::new(None),
             notifier,
@@ -685,59 +319,22 @@ impl GatewayState {
             windows: super::windows::WindowCache::default(),
             probe_windows,
             auto_title,
-            scheduler,
-            handler,
-            in_flight,
-            segments,
             supervisor: Arc::new(super::channels::ChannelSupervisor::new(factories)),
             inbound: std::sync::OnceLock::new(),
             telemetry: std::sync::OnceLock::new(),
             watching: Mutex::new(std::collections::BTreeSet::new()),
-            interventions_delivered: Mutex::new(std::collections::BTreeSet::new()),
             mcp,
             tool_executor: executor_tools,
-            monitors: std::sync::OnceLock::new(),
             skills,
             max_retries,
             max_rounds,
         }))
     }
 
-    /// Durable 模式的核心；Legacy 模式下调用是装配错误（W1 起各包的入口用它拿 `DurableCore`）。
+    /// 新存储的核心（`durable.db` 上的 harness）。历史上这里可能失败（旧存储模式没有它），
+    /// 现在恒为 `Ok`；保留 `Result` 是为了不改全部调用点的 `?`。
     pub fn core(&self) -> Result<&Arc<super::durable::DurableCore>, GatewayError> {
-        self.durable.as_ref().ok_or_else(|| {
-            GatewayError::Internal("这台 Gateway 跑在 Legacy 存储上，没有 DurableCore".into())
-        })
-    }
-
-    /// 接上任务分发的实现（`docs/background-tasks.md`）：`GatewayTaskSpawner` 自己
-    /// 要一份 `Arc<GatewayState>`（建会话、`submit`），只能在这份状态造出来**之后**才能
-    /// 接上——与 `Dispatcher` / [`Self::inbound`] 同一个"先有整份状态才能自己引用自己"
-    /// 的接法。`service::start` 在 [`Self::assemble`] 返回之后、渠道与 HTTP 起来之前调它。
-    pub fn wire_task_spawner(self: &Arc<Self>) {
-        let spawner = super::tasks::GatewayTaskSpawner::new(Arc::clone(self))
-            as Arc<dyn komo_kernel::traits::TaskSpawner>;
-        self.tool_executor.set_spawner(spawner);
-    }
-
-    /// 接上监听的实现（`docs/monitor.md`），与 [`Self::wire_task_spawner`] 同一个接法。
-    /// 脚本按 `bash` 的规矩起：数据目录只读挂载的名单与 `bash` 工具同一份。
-    pub fn wire_monitors(self: &Arc<Self>, detach: &komo_runtime::tools::detach::DetachSlot) {
-        let snapshot = self.snapshot();
-        let shell =
-            komo_runtime::tools::BashTool::new().protecting(protected_paths(&snapshot, &self.home));
-        let monitors = super::monitors::GatewayMonitors::new(
-            Arc::clone(self),
-            shell,
-            &snapshot.paths.runtime_dir,
-        );
-        if self.monitors.set(Arc::clone(&monitors)).is_err() {
-            tracing::warn!("监听已经接过一次，忽略这次重复设置");
-            return;
-        }
-        detach.set(Arc::clone(&monitors) as Arc<dyn komo_runtime::tools::detach::Detacher>);
-        self.tool_executor
-            .set_monitors(monitors as Arc<dyn komo_kernel::traits::Monitors>);
+        Ok(&self.durable)
     }
 
     pub fn snapshot(&self) -> Arc<ConfigSnapshot> {
@@ -862,14 +459,8 @@ impl GatewayState {
     /// 每次现造而不是存一个：Job 的模型覆盖之外，它还握着主模型的那一份快照，而模型
     /// 改完之后下一次触发就该用新的（§3 第 2 步）。
     pub fn cron_scheduler(self: &Arc<Self>) -> komo_runtime::scheduler::CronScheduler {
-        // Durable：触发交给 `DurableCronTarget`（一次提交建会话并受理）；Legacy：旧账本。
-        let target: Arc<dyn komo_runtime::scheduler::CronTarget> = if self.durable.is_some() {
-            self.durable_cron_target()
-        } else {
-            Arc::new(komo_runtime::scheduler::LedgerCronTarget::new(
-                Arc::clone(&self.routed) as Arc<dyn Ledger>,
-            ))
-        };
+        // 触发交给 `DurableCronTarget`（一次提交建会话并受理）。
+        let target = self.durable_cron_target();
         komo_runtime::scheduler::CronScheduler::new(
             Arc::clone(&self.cron),
             target,
@@ -877,7 +468,6 @@ impl GatewayState {
             Arc::new(komo_runtime::scheduler::JiffZoneResolver::new()),
             self.snapshot().model.clone(),
         )
-        .with_waker(self.waker())
     }
 
     /// 这一轮扫描投出去的每一次触发都找个人盯着（§10 的最后两步）。
@@ -905,30 +495,6 @@ impl GatewayState {
         self.watching.lock().expect("看客表").remove(run);
     }
 
-    /// 这个句柄的 Intervention 还没被投出去过。答 `false` = 投过了（同一条只问一次人）。
-    pub fn start_delivering_intervention(&self, handle: &str) -> bool {
-        self.interventions_delivered
-            .lock()
-            .expect("投递表")
-            .insert(handle.to_string())
-    }
-
-    /// 盯一个交互 Run：终态回到来源会话，需要处理投来源会话 + home chat
-    /// （§11.4）。`peer` 为 `None` 就是 TUI / HTTP——那时只有 home chat。
-    pub fn watch_interactive_run(
-        self: &Arc<Self>,
-        session: &SessionId,
-        run: &RunId,
-        peer: Option<ChannelPeer>,
-    ) {
-        super::run_watch::watch(
-            Arc::clone(self),
-            session.clone(),
-            run.clone(),
-            super::run_watch::Watcher::Interactive { peer },
-        );
-    }
-
     /// 盯一次触发。`scheduled = false` 是手动 run：它**没有触发记录**（§10：不冒充
     /// 定时触发），所以只投递，不回写状态。
     pub fn watch_cron_run(
@@ -938,11 +504,7 @@ impl GatewayState {
         scheduled: bool,
     ) {
         let watched = super::cron_watch::Watched::of(fired, job, scheduled);
-        if self.durable.is_some() {
-            super::durable::cron_watch::watch(Arc::clone(self), watched);
-            return;
-        }
-        super::cron_watch::watch(Arc::clone(self), watched);
+        super::durable::cron_watch::watch(Arc::clone(self), watched);
     }
 
     /// 模型 / 凭证变了：换掉实例。**正在跑的 Run 不换**——它握着自己那一个 driver。
@@ -1001,822 +563,9 @@ impl GatewayState {
         supervisor.restart(self, platform).await;
     }
 
-    pub fn waker(&self) -> Waker {
-        self.scheduler.waker()
-    }
-
-    /// 上一代执行实例停没停（§8.7）：按 `runtime/children` 里的子进程登记判。
-    pub fn liveness(&self) -> komo_runtime::recovery::LockHolderLiveness {
-        komo_runtime::recovery::LockHolderLiveness::holding_lock(
-            self.executor.clone(),
-            komo_runtime::recovery::ChildRegistry::new(
-                self.snapshot().paths.runtime_dir.join("children"),
-            ),
-        )
-    }
-
-    /// 恢复扫描（§8.7）。观察与决策在 runtime，索引在 store，这一层只把它俩接上。
-    pub fn recovery(&self) -> RecoveryScan {
-        RecoveryScan::new(
-            Arc::clone(&self.routed) as Arc<dyn Ledger>,
-            Arc::new(RecoveryIndexOf::new(
-                self.recovery_store.clone(),
-                Arc::clone(&self.in_flight),
-            )),
-            Arc::clone(&self.outputs),
-            self.executor.clone(),
-            Arc::new(self.liveness()),
-        )
-        // 「output.json 已完成但 JSONL 结果事件尚未写入 → 校验身份、计划及完成状态后补记
-        // 结果；**不能只凭文件存在判断**」（§14 故障注入表）。没有这一口时恢复只能把
-        // `started` 而无结果的调用交给工具核对，那条路对一次已经跑完的 `bash` 答不出
-        // "它到底发生了没有"。
-        .with_orphan_outputs(Arc::new(
-            komo_runtime::recovery::SessionDirOrphanOutputs::new(
-                self.snapshot().paths.sessions_dir.clone(),
-            ),
-        ))
-    }
-
-    /// 一个 Agent 的**主会话**（§11.2 的 home session，按 Agent 各一份）。
-    ///
-    /// 「操作者的私聊——飞书 DM、Telegram DM、WeChat、TUI——全部落到同一个 home
-    /// session」这条规则在多 Agent 下变成**每个 Agent 一份主会话**（§4.2）：归属记在
-    /// `sessions.agent_id` + `sessions.kind = 'main'` 上，唯一性由 store 的部分唯一索引
-    /// （`sessions_main_per_agent`）保证——不是"各建一个再挑最早的"。
-    ///
-    /// 归属**在创建时定下来**，此后不随消息路由变化（§4.2）：换助手是路由到另一个会话，
-    /// 不是给已有会话换人格、换能力，同时留着原来的全部上下文。
-    pub async fn main_session(&self, agent_id: &str) -> Result<SessionId, GatewayError> {
-        if let Some(main) = komo_store::repos::session::main_for_agent(&self.db, agent_id).await? {
-            // 同一个 Agent 有多条主会话只可能是**升级过来的旧库**在说话（索引补列之后才
-            // 存在）。store 取最早的那条，这里把其余的**报出来**：两个入口各建过一个主会话
-            // 是操作者该知道的事。
-            if !main.duplicates.is_empty() {
-                tracing::warn!(
-                    agent = %agent_id,
-                    main = %main.row.id,
-                    duplicates = %main
-                        .duplicates
-                        .iter()
-                        .map(|id| id.to_string())
-                        .collect::<Vec<_>>()
-                        .join("、"),
-                    "这个 Agent 有多条主会话，取最早的那一条"
-                );
-            }
-            return Ok(SessionId::from_raw(main.row.id));
-        }
-
-        // 候选：**升级之前**那个全局主会话（`origin = 'home'`、还没有归属）。它按 §八
-        // 「已有 Session 归入默认 Agent」读作默认 Agent 的那一份——所以**只有默认 Agent
-        // 认它**：别的 Agent 认了它，一次升级之后操作者原来那段对话就会凭空换一个助手。
-        // 没有候选（或者不归我）就现铸一个。
-        let candidate = match self.unowned_main().await? {
-            Some(session) if agent_id == self.snapshot().agent.default_agent => session,
-            _ => SessionId::new_at(self.clock.now()),
-        };
-        let row = komo_store::repos::session::ensure_main(
-            &self.db,
-            &candidate,
-            agent_id,
-            HOME_ORIGIN,
-            &session_log_path(&candidate),
-        )
-        .await?;
-        let session = SessionId::from_raw(row.id);
-        // **建行与建目录是两件事**：上面那一句只写库（`kind` / `agent_id` / `jsonl_path`），
-        // 会话目录与 `events.jsonl` 由 Coordinator 的 `open` 落下来。它认到行已经在就原样
-        // 返回，一行归属都不动。
-        self.ledgers.open(&session, HOME_ORIGIN).await?;
-        Ok(session)
-    }
-
-    /// **没有归属的入口**（TUI / CLI / `/v1/home-session`，以及没有绑定 Agent 的私聊）
-    /// 落在哪个会话。
-    ///
-    /// §四：「`default_agent` 指名"没有归属的入口（TUI、CLI、Cron）走谁"」。这些入口答不出
-    /// "找谁"，所以它们走同一个名字，而不是各自挑一个。
-    pub async fn default_main_session(&self) -> Result<SessionId, GatewayError> {
-        self.main_session(&self.snapshot().agent.default_agent)
-            .await
-    }
-
-    /// 升级之前那个**还没有归属**的全局主会话：`origin = 'home'` + `agent_id` 为空。
-    ///
-    /// 补 `kind` 那一列时按 `origin = 'home'` 回填成主会话（store 的 `BACKFILL_KIND`），
-    /// 而 `agent_id` **故意留空**——"迁移不替路由认主"。认主是这里的事：默认 Agent 认它
-    /// （[`Self::main_session`] 的候选分支）。
-    async fn unowned_main(&self) -> Result<Option<SessionId>, GatewayError> {
-        let mut found: Vec<SessionId> = komo_store::repos::session::list(&self.db, true)
-            .await?
-            .into_iter()
-            .filter(|record| record.agent_id.is_empty() && record.origin == HOME_ORIGIN)
-            .map(|record| record.session)
-            .collect();
-        found.sort();
-        Ok(found.into_iter().next())
-    }
-
-    /// 这个会话归哪个 Agent（§4.2 的执行身份那一半）。
-    ///
-    /// 归属写在 `sessions.agent_id` 上、建会话时定下来，**不随消息路由变化**。空串 =
-    /// 还没有归属（升级前建的行）：按 `default_agent` 用它，**不改写这一行**——归属只写
-    /// 一次，写的人是建会话的那一步（`main_session` / `set_agent`）。
-    pub async fn agent_of_session(&self, session: &SessionId) -> Result<String, GatewayError> {
-        let agent_id = komo_store::repos::session::get(&self.db, session)
-            .await?
-            .map(|record| record.agent_id)
-            .unwrap_or_default();
-        Ok(self.owner_or_default(agent_id))
-    }
-
-    /// 一条记载下来的归属，或者默认 Agent（空串 = 还没有归属）。
-    ///
-    /// 规则本身在 kernel（`AgentConfig::owner_or_default`）：没有冻结快照时的兜底身份
-    /// （`context_sources::ambient_identity`）走的是同一条，这里只是按当前快照现读一次。
-    fn owner_or_default(&self, agent_id: String) -> String {
-        let config = self.snapshot();
-        config.agent.owner_or_default(&agent_id).to_string()
-    }
-
-    /// 把一个**刚建出来、还没有归属**的会话记在默认 Agent 名下。
-    ///
-    /// 「一个 Session 的 `agent_id` 创建后不随消息路由变化」（§4.2）：不写这一笔，一处
-    /// 会话就成了"当前谁是默认 Agent 就归谁"——操作者换一次 `default_agent`，那些群聊会
-    /// 悄悄换一个人格继续说话。写了就只写一次（store 的 `set_agent` 是条件更新），之后
-    /// 谁也改不动它。
-    ///
-    /// 写不进去**不让这次路由失败**：它最坏是回到"按当前默认 Agent 用它"，而拿不到会话是
-    /// 拿不到任务。
-    pub async fn own_session(&self, session: &SessionId) -> Result<(), GatewayError> {
-        let agent_id = self.snapshot().agent.default_agent.clone();
-        match komo_store::repos::session::set_agent(&self.db, session, &agent_id).await {
-            Ok(_) => Ok(()),
-            Err(error) => {
-                tracing::warn!(%error, session = %session, agent = %agent_id, "归属没记到会话上");
-                Ok(())
-            }
-        }
-    }
-
-    /// **受理这一刻的身份与能力**（§4.3）。
-    ///
-    /// 算出来的 [`RunSnapshot`] 随 `run.accepted` 落账，此后就是这一条 Run 的唯一身份
-    /// 依据：恢复时按它装配，**不拿当前配置去覆盖它**。
-    ///
-    /// 落在快照里的每一样都在这一步定死，理由是它们**都可能在中途被改**：Profile 的指令、
-    /// 工具表、工作目录、模型 alias。介入可能一小时之后才答复，而那时这些文件与配置都可能
-    /// 已经变过——恢复出来的 Run 不能因此换一副面孔。
-    async fn freeze_run(
-        &self,
-        config: &ConfigSnapshot,
-        agent_id: &str,
-        session: &SessionId,
-        record: Option<&komo_store::repos::session::SessionRecord>,
-        model: Option<ModelConfig>,
-    ) -> Result<RunSnapshot, GatewayError> {
-        let profile = match config.agent.get(agent_id) {
-            Some(profile) => profile,
-            None => {
-                // 配置里已经没有这个 Agent 了（`[agents]` 被改过）。**一条配置改动不该让
-                // 输入失败**：退回默认 Agent 并把"是谁不见了"说清楚（§八：旧归属归入
-                // 默认 Agent）。
-                let fallback = config.agent.default_profile();
-                tracing::warn!(
-                    agent = %agent_id,
-                    fallback = %fallback.id,
-                    session = %session,
-                    "这个会话绑的 Agent 已经不在配置里，按默认 Agent 受理"
-                );
-                fallback
-            }
-        };
-
-        // 能力面：Profile 在**这份工具目录**里挑出来的那一份（§4 末）。名字写了、目录里
-        // 没有的名字**不算数**，而且必须报出来——静默采纳一份写错的配置，等于让操作者
-        // 以为某个工具给了而其实没给。
-        //
-        // 目录先补一次：刚登录的 MCP 服务器这时连上，它的工具进这条 Run 的能力面。
-        self.refresh_mcp().await;
-        let mut surface = komo_agent::surface_of(
-            profile,
-            &self.tool_names(),
-            &super::agent_config_file(&self.config),
-        );
-        // 任务会话里没有 `task`：深度只有一层，结果只交回一层（`docs/background-tasks.md`）。
-        // `GatewayTaskSpawner::parent_of` 还留着第二道。
-        if record.is_some_and(|record| record.kind == komo_store::models::SessionKind::Task) {
-            surface = AgentSurface::new(
-                surface
-                    .names()
-                    .iter()
-                    .filter(|name| name.as_str() != komo_agent::TASK_TOOL)
-                    .cloned(),
-            );
-        }
-
-        // 工作目录：**会话自己的 `workdir` 优先**，其次 Profile 的 `workspace`，最后
-        // `[paths] workspaces_dir`。
-        //
-        // 为什么会话优先：`workdir` 是操作者对**这一段对话**的显式选择（`POST /v1/sessions`
-        // 写下的那一行，界面读的也是它，见 §八 那次收口），而 Profile 的 `workspace` 是
-        // "没写的时候用哪个"——一个默认值不该盖掉一个显式选择。反过来（Profile 优先）
-        // 会让界面显示的那个目录与执行实际用的那个目录重新裂成两份事实，正是 §八 已经
-        // 修掉的那件事。
-        //
-        // 冻结的是**解析完的真实路径**：符号链接在这一刻解掉，Profile / 会话之后改过
-        // 也不影响这一条 Run（`tools::paths::resolve` 与根用的是同一个口径）。
-        let workspace = record
-            .and_then(|record| record.workdir.clone())
-            .map(PathBuf::from)
-            .or_else(|| profile.workspace.clone())
-            .unwrap_or_else(|| config.paths.workspaces_dir.clone());
-        let workspace = paths::real_root(&workspace);
-
-        // 模型：这次请求里显式给的最优先（那是操作者**这一次**的选择），其次 Profile 的
-        // alias（进 `model_catalog` 解析），最后主模型。
-        let mut model = model.unwrap_or_else(|| self.agent_model(config, profile));
-        // 配置没写窗口时用探到的；探测还没回来就是 None，快照冻结后照此回放。
-        model.context_window = self.windows.effective(&model);
-
-        // 身份指令正文**进 `PayloadStore`**，快照里只留引用（§4.3）：存的是内容，不是
-        // 文件路径——等待期间配置文件可能已经被改过，恢复出来的 Run 不能换一副面孔。
-        // `PayloadStore` 是内容寻址的，同一段正文重复受理只写一次。
-        let payloads = PayloadStore::new(self.ledgers.paths_for(session));
-        let instructions_ref = match &profile.instructions {
-            Some(text) => Some(payloads.put(text.as_bytes()).await?),
-            None => None,
-        };
-        // 项目规范文件（`AGENTS.md` 等）同一个理由：从**解析过的**工作目录往上找，正文进
-        // `PayloadStore`。Run 停着的时候文件被改了，恢复出来的那一段仍是受理时那一版。
-        // 同一会话里系统提示沿用上一条主 Run 那一份；现场找到的不一样，就另存一份，回放
-        // 时补在这条 Run 的任务后面——改动从这一条起生效，前缀缓存不作废。
-        let (project_files_ref, project_files_update_ref) = if !profile.project_files {
-            (None, None)
-        } else {
-            let found = super::project_files::discover(&workspace);
-            let current = super::project_files::freeze(&payloads, &found).await?;
-            let events = super::compaction::read_events(self.routed.as_ref(), session).await?;
-            match super::project_files::pinned(&events, &profile.id, &workspace) {
-                Some(pinned) if pinned != current => {
-                    (pinned, Some(payloads.put_json(&found, None).await?))
-                }
-                Some(pinned) => (pinned, None),
-                None => (current, None),
-            }
-        };
-        // skills 目录同一个理由，冻结的是**渲染好的正文**：续跑那一段的系统提示要与受理时
-        // 逐字相同（provider 的前缀缓存从系统提示起算），注册表之后被重载、`SKILL.md` 被改，
-        // 从下一条 Run 起生效。门控按这条 Run 的能力面。
-        let skills = skills_block(&self.skills.read().expect("skills 注册表"), surface.names());
-        let skills_ref = match skills {
-            Some(block) => Some(payloads.put(block.as_bytes()).await?),
-            None => None,
-        };
-
-        Ok(RunSnapshot {
-            agent_id: profile.id.clone(),
-            profile_revision: profile.revision(),
-            model,
-            workspace,
-            surface,
-            instructions_ref,
-            project_files_ref,
-            project_files_update_ref,
-            skills_ref,
-            memory_scope: profile.memory_scope.clone(),
-            memory_mode: profile.memory,
-            projection: Some(config.execution.projection()),
-            direct_command: None,
-            contract: None,
-            fork: None,
-        })
-    }
-
-    /// fork 任务会话里之后受理的 Run（追问）沿用 fork 那条 Run 的身份（`docs/background-tasks.md`
-    /// §2b）：它的每一段都以父会话冻结的前缀开头，能力面、工作目录、投影换了，前缀后面接的
-    /// 就不是同一副面孔。模型照这次解析的（追问可以换模型，只是缓存不中）。
-    async fn inherit_fork(
-        &self,
-        session: &SessionId,
-        record: Option<&komo_store::repos::session::SessionRecord>,
-        frozen: RunSnapshot,
-    ) -> Result<RunSnapshot, GatewayError> {
-        if !record.is_some_and(|record| record.kind == komo_store::models::SessionKind::Task) {
-            return Ok(frozen);
-        }
-        let events = super::compaction::read_events(self.routed.as_ref(), session).await?;
-        let base = events.iter().find_map(|event| match &event.payload {
-            komo_kernel::events::EventPayload::RunAccepted(body) => body
-                .snapshot
-                .as_deref()
-                .filter(|snapshot| snapshot.fork.is_some())
-                .cloned(),
-            _ => None,
-        });
-        Ok(match base {
-            Some(base) => RunSnapshot {
-                model: frozen.model,
-                fork: None,
-                ..base
-            },
-            None => frozen,
-        })
-    }
-
-    /// 这个 Agent 现在的默认模型（当前配置）：`task` 只给了 effort 时，按它校验档位。
-    pub(crate) fn default_model_of(&self, agent_id: &str) -> ModelConfig {
-        let config = self.snapshot();
-        let profile = config.agent.profile_of(agent_id);
-        self.agent_model(&config, profile)
-    }
-
-    /// Profile 指的那个模型 alias，解析不出来就用主模型。
-    ///
-    /// **不因为一个写错的 alias 让输入失败**：那会把一次配置笔误变成一条丢掉的输入。
-    /// 解析不出来时说清楚是哪个 alias，然后按主模型跑。
-    fn agent_model(&self, config: &ConfigSnapshot, profile: &AgentProfile) -> ModelConfig {
-        let Some(alias) = profile.model.as_deref() else {
-            return config.model.clone();
-        };
-        match config.model_catalog.completion(alias) {
-            Some(model) => model.clone(),
-            None => {
-                tracing::warn!(
-                    file = %super::agent_config_file(&self.config).display(),
-                    agent = %profile.id,
-                    alias,
-                    "`[agents]` 指的模型 alias 不在 model_catalog 里，这一次用主模型"
-                );
-                config.model.clone()
-            }
-        }
-    }
-
-    /// 提交一条输入：**HTTP 与聊天渠道共用的那一段**（§13.1）。
-    ///
-    /// **不接受新输入**（§8.10）：`state != active` 的会话在这里就挡下——`closing` 只是
-    /// 不再收新活，`deleted` / `purged` 连内容都不该再长出来。挡在这里而不是挡在 HTTP 层，
-    /// 是因为聊天渠道走的是同一条路（§13.1 最后一段）。
-    pub async fn submit(
-        self: &Arc<Self>,
-        session: &SessionId,
-        request_key: RequestKey,
-        text: String,
-        peer: Option<ChannelPeer>,
-        model: Option<ModelConfig>,
-    ) -> Result<SubmitRunResponse, GatewayError> {
-        self.accept(
-            session,
-            request_key,
-            text,
-            peer,
-            model,
-            None,
-            None,
-            false,
-            None,
-        )
-        .await
-    }
-
-    /// 同 [`Self::submit`]，再带上 `task` 的结果契约（冻结进这条 Run 的快照，§4），以及
-    /// 要不要插话（`interject`）。**带契约的输入不该插话**：并入沿用宿主的快照，新契约会
-    /// 丢，所以调用方带 `contract` 时传 `false`。
-    pub async fn submit_task(
-        self: &Arc<Self>,
-        session: &SessionId,
-        request_key: RequestKey,
-        text: String,
-        peer: Option<ChannelPeer>,
-        model: Option<ModelConfig>,
-        contract: Option<DelegateContract>,
-        interject: bool,
-    ) -> Result<SubmitRunResponse, GatewayError> {
-        self.accept(
-            session,
-            request_key,
-            text,
-            peer,
-            model,
-            None,
-            contract,
-            interject,
-            None,
-        )
-        .await
-    }
-
-    /// fork 任务的第一条输入（`docs/background-tasks.md` §2b）：身份不现场冻结，用派它的
-    /// Run 那一份（[`super::tasks`] 已经按 fork 改好）。不插话——任务会话刚建，没有宿主。
-    pub async fn submit_fork(
-        self: &Arc<Self>,
-        session: &SessionId,
-        request_key: RequestKey,
-        text: String,
-        peer: Option<ChannelPeer>,
-        snapshot: RunSnapshot,
-        contract: Option<DelegateContract>,
-    ) -> Result<SubmitRunResponse, GatewayError> {
-        self.accept(
-            session,
-            request_key,
-            text,
-            peer,
-            Some(snapshot.model.clone()),
-            None,
-            contract,
-            false,
-            Some(snapshot),
-        )
-        .await
-    }
-
-    /// 同 [`Self::submit`]，但这句话要求**插话**（§6）：会话里有 Run 正在跑时，由它在下一次
-    /// 请求模型之前并进去，而不是排到它后面。HTTP 调它（TUI 的 Enter，
-    /// `SubmitRunRequest::interject`，没有对端）；`task` 交回的结果也走它，带着任务 Run 的
-    /// 来源对端——对端与宿主不同就不并（§6）。聊天渠道的普通消息同样走它（2026-10-23）。
-    pub async fn submit_interjecting(
-        self: &Arc<Self>,
-        session: &SessionId,
-        request_key: RequestKey,
-        text: String,
-        peer: Option<ChannelPeer>,
-        model: Option<ModelConfig>,
-    ) -> Result<SubmitRunResponse, GatewayError> {
-        self.accept(
-            session,
-            request_key,
-            text,
-            peer,
-            model,
-            None,
-            None,
-            true,
-            None,
-        )
-        .await
-    }
-
-    /// TUI 的 `!`：受理一条**不经模型**直接跑的 shell 命令。
-    ///
-    /// 走的是同一条受理路：会话状态检查、冻结身份、次序规则、看客都一样。区别只在快照里
-    /// 多一格 `direct_command`——装配那一段按它换上 `CommandDriver`（与命令 Job 同一个
-    /// 驱动），于是命令照样经 `bash` 工具与执行器，调用与结果记进会话，下一轮模型看得见。
-    /// 不做记忆提取：没有对话，提取本身还要发一次模型请求。
-    ///
-    /// 只有 HTTP 调它（`SubmitRunRequest::shell`）；聊天渠道不接这条路。
-    pub async fn submit_shell(
-        self: &Arc<Self>,
-        session: &SessionId,
-        request_key: RequestKey,
-        command: String,
-    ) -> Result<SubmitRunResponse, GatewayError> {
-        let command = command.trim().to_string();
-        if command.is_empty() {
-            return Err(GatewayError::InvalidRequest(
-                "`!` 后面要跟一条命令，例如 `!ls -la`".into(),
-            ));
-        }
-        let text = format!("!{command}");
-        self.accept(
-            session,
-            request_key,
-            text,
-            None,
-            None,
-            Some(command),
-            None,
-            false,
-            None,
-        )
-        .await
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    async fn accept(
-        self: &Arc<Self>,
-        session: &SessionId,
-        request_key: RequestKey,
-        text: String,
-        peer: Option<ChannelPeer>,
-        model: Option<ModelConfig>,
-        direct_command: Option<String>,
-        contract: Option<DelegateContract>,
-        interject: bool,
-        prebuilt: Option<RunSnapshot>,
-    ) -> Result<SubmitRunResponse, GatewayError> {
-        if let Some(state) = self.input_refusal(session).await? {
-            return Err(GatewayError::InvalidRequest(format!(
-                "这个会话是 {}，不接受新输入（§8.10）",
-                state.as_str()
-            )));
-        }
-        // **受理这一刻冻结身份与能力**（§4.3）：哪个 Agent（这个会话的归属）、哪一版
-        // Profile、哪个模型、哪个工作目录、这次允许调用的工具、身份指令与项目规范的正文、
-        // 记忆作用域。
-        // 它随 `run.accepted` 落账，恢复时按它装配——等待期间 Profile 被改过也换不掉
-        // 这一条 Run 的面孔。
-        let config = self.snapshot();
-        let model = match model {
-            Some(model) => Some(model),
-            None => {
-                let tree = self.ledgers.tree(session).await?;
-                let projected = tree.project().map_err(GatewayError::InvalidRequest)?;
-                match projected.model {
-                    Some((provider, model_id)) if !model_id.is_empty() => {
-                        let mut selected=config.model_catalog.completions().filter_map(|(_,entry)|entry.completion()).find(|model|model.model==model_id&&(provider.is_empty()||model.provider==provider)).cloned().ok_or_else(||GatewayError::InvalidRequest(format!("当前分支的模型 {provider}/{model_id} 不在配置中，请先用 /model 选择可用模型")))?;
-                        let has_effort = tree
-                            .path(tree.leaf_id())
-                            .map_err(GatewayError::InvalidRequest)?
-                            .iter()
-                            .any(|entry| {
-                                matches!(
-                                    entry.kind,
-                                    komo_kernel::session::EntryKind::ThinkingLevelChange { .. }
-                                )
-                            });
-                        if has_effort {
-                            selected.effort = if projected.thinking_level == "off" {
-                                None
-                            } else {
-                                Some(komo_kernel::types::model::Effort::new(
-                                    &projected.thinking_level,
-                                ))
-                            };
-                        }
-                        Some(selected)
-                    }
-                    _ => None,
-                }
-            }
-        };
-        let record = komo_store::repos::session::get(&self.db, session).await?;
-        let agent_id = self.owner_or_default(
-            record
-                .as_ref()
-                .map(|record| record.agent_id.clone())
-                .unwrap_or_default(),
-        );
-        let mut frozen = match prebuilt {
-            Some(snapshot) => snapshot,
-            None => {
-                let frozen = self
-                    .freeze_run(&config, &agent_id, session, record.as_ref(), model)
-                    .await?;
-                self.inherit_fork(session, record.as_ref(), frozen).await?
-            }
-        };
-        // 这条 Run 的窗口若还没探到（或上次失败），顺手补一次后台探测，不等它。
-        self.spawn_window_probes();
-        let skip_memory = direct_command.is_some();
-        if direct_command.is_some() && !frozen.surface.allows("bash") {
-            return Err(GatewayError::InvalidRequest(format!(
-                "这个会话的 Agent（{}）没有 bash 工具，`!` 用不了",
-                frozen.agent_id
-            )));
-        }
-        frozen.direct_command = direct_command;
-        frozen.contract = contract;
-        let accepted = self
-            .routed
-            .accept_input(AcceptInput {
-                session: session.clone(),
-                request_key,
-                text,
-                source: PlanSource::Interactive {
-                    session: session.clone(),
-                },
-                peer: peer.clone(),
-                // 「新 Run 在 `accept_input` 时抓一份模型 / effort 快照」（§3 第 2 步）。
-                // 这一份就是快照里那一个——同一个值写两处（`runs.model_snapshot` 与
-                // `run.accepted` 的 `snapshot.model`），它们的缘分是同一个受理时刻，
-                // 不是两次各自解析。
-                model: frozen.model.clone(),
-                workdir: None,
-                // 交互输入不是委派：子 Run 只由 executor 在委托那一步受理（§4）。
-                delegate: None,
-                snapshot: Some(Box::new(frozen)),
-                // 交互输入是真的对话，记忆提取照常（§9.3）；跳过只留给命令 Job（§10）
-                // 与 `!` 直接执行的命令。
-                skip_memory,
-                interject,
-                at: self.clock.now(),
-            })
-            .await?;
-        // **同一 Session 后面的 Run 不越过前面的**（§8.4）：前一条没进终态时，这一条是
-        // `waiting + dependency` 而不是 `queued`——它写得出在等谁，而不是一句"排队中"。
-        //
-        // 那是**受理那一笔事务**写的（store 的 `accept_input`：写 `queued` 之前先看同会话
-        // 有没有更早的非终态 Run）。放在这里有一条谁也躲不开的窗口：受理与 suspend 之间调度
-        // 器就能把它领走，而那一步是"越过前面那条"——正是次序规则要防的事。一处事实一个
-        // 写者，所以这里只**如实地把它读回来**。
-        self.waker().wake();
-        // 有人看着它：终态回到来源会话，停下来要人处理时把那条介入投出去（§11.4）。
-        // 重发命中原 Run 时不再起第二个看客——登记表也会挡住，这里先省一次 spawn。
-        if !accepted.deduplicated {
-            self.watch_interactive_run(&accepted.session, &accepted.run, peer);
-        }
-        // 如实报它现在的状态：受理可能把它写成 `queued`，也可能写成
-        // `waiting + dependency`（前面还有一条没跑完，§8.4）。
-        let state = komo_store::repos::runs::get(&self.db, &accepted.run)
-            .await?
-            .map(|record| record.state)
-            .unwrap_or(RunState::Queued);
-        Ok(SubmitRunResponse {
-            run: accepted.run,
-            session: accepted.session,
-            seq: accepted.seq,
-            state,
-            deduplicated: accepted.deduplicated,
-        })
-    }
-
-    /// 前一条 Run 进终态了：把它后面等着的那些放回队列（§8.4）。
-    ///
-    /// 对账每一拍也会做（§8.9），但"下一条要白等一分钟"是操作者看得见的延迟——终态的
-    /// 那一刻这里顺手放一次，代价是一条条件 UPDATE（判据与写入在同一句里，所以不会出现
-    /// "判完了、写之前前置又被改回去"的窗口）。
-    pub async fn release_dependents(&self) {
-        match komo_store::repos::queue::release_satisfied_dependencies(&self.db, self.clock.now())
-            .await
-        {
-            Ok(0) => {}
-            Ok(released) => {
-                tracing::info!(released, "放行了等到依赖的 Run");
-                self.waker().wake();
-            }
-            // 放过它：这一拍的对账会补上（§8.9 的第三步）。
-            Err(error) => tracing::warn!(%error, "放行依赖没做成，等下一拍对账"),
-        }
-    }
-
-    /// 把 `control_outbox` 里还没补写的审计事件追加到各自 Session 的 JSONL。
-    ///
-    /// 「重启后重发同一个 outbox 事件先按 `event_id` 去重，已写入就复用原事件位置」
-    /// （§8.5）——幂等在 `Coordinator::append_audit` 里，这里只负责把它们递过去。返回
-    /// 这次补写了几条。
-    ///
-    /// 所属会话已经 `purged` 的行**不补写，直接标成已交付**（`seq` 记 0：不在任何 JSONL 里）。
-    /// 审计副本要落的那份 JSONL 按设计已经删了（§8.10 第 3 条），`sessions.state` 才是权威；
-    /// 硬去写只会每拍报一次"已提交范围缺失"、永远留在 outbox 里。实测（2026-10-15）：
-    /// `purge` 排完 `session.deleted` / `session.purged` 就删目录，补写器跑在删之后的那 7 个
-    /// 会话留下 17 行，每分钟各报一次 WARN 报了三周；攒到 [`AUDIT_DRAIN_LIMIT`] 行还会把
-    /// 后面所有新的审计事件挡在外面——§8.10 说的"不能让一条旧行卡死补发循环"。
-    pub async fn drain_audit(&self) -> usize {
-        let pending = match komo_store::repos::outbox::pending(&self.db, AUDIT_DRAIN_LIMIT).await {
-            Ok(pending) => pending,
-            Err(error) => {
-                tracing::warn!(%error, "读不出待补写的审计事件");
-                return 0;
-            }
-        };
-        let mut written = 0;
-        let mut discarded = 0;
-        for audit in pending {
-            if self.session_purged(&audit.session).await {
-                match self.discard_audit(&audit.event_id).await {
-                    Ok(()) => discarded += 1,
-                    Err(error) => tracing::warn!(
-                        %error,
-                        event = %audit.event_id,
-                        "会话已 purged，审计事件丢弃不了，留在 outbox"
-                    ),
-                }
-                continue;
-            }
-            match self
-                .turn_ledger
-                .append_audit(
-                    &audit.session,
-                    &audit.event_id,
-                    audit.payload,
-                    audit.occurred_at,
-                )
-                .await
-            {
-                // `append_audit` 在同一个提交里标记 outbox 已交付，这里不必再写一次。
-                Ok(_) => written += 1,
-                Err(error) => {
-                    tracing::warn!(%error, event = %audit.event_id, "审计事件补写不进去，留在 outbox");
-                }
-            }
-        }
-        if written > 0 {
-            tracing::info!(written, "补写了审计事件");
-        }
-        if discarded > 0 {
-            tracing::info!(discarded, "所属会话已 purged，审计事件不再补写，标成已交付");
-        }
-        written
-    }
-
-    /// 这个会话是不是已经 `purged`。读不出来按"不是"走：照常补写，失败了下一拍再看。
-    async fn session_purged(&self, session: &SessionId) -> bool {
-        matches!(
-            komo_store::repos::session::state(&self.db, session).await,
-            Ok(Some(SessionState::Purged))
-        )
-    }
-
-    /// 不补写，只把这一行标成已交付。
-    async fn discard_audit(
-        &self,
-        event_id: &komo_kernel::types::ids::EventId,
-    ) -> Result<(), StoreError> {
-        let event_id = event_id.clone();
-        self.db
-            .with_write_retry(move |ex| {
-                let event_id = event_id.clone();
-                Box::pin(async move {
-                    komo_store::repos::outbox::mark_delivered_in(ex, &event_id).await
-                }) as komo_store::db::BoxFuture<'_, Result<(), StoreError>>
-            })
-            .await
-    }
-
     /// 把卡在 `processing` 的记忆处理放回 `pending`（§9.3）。返回放回了几行。
     pub async fn requeue_memory_work(&self) -> Result<u64, GatewayError> {
         Ok(komo_store::repos::runs::requeue_stuck_memory_work(&self.db).await?)
-    }
-
-    /// 把**没人看着**的待处理 Intervention 补投到 home chat（§11.4 / §10 的兜底）。
-    ///
-    /// 三类共用这一条（"需要人判断"不该因为种类不同而有不同的到达率，§11.4）：屏幕上有人
-    /// 时那条只弹在他面前（[`super::run_watch`] 的投递规则），可他要是关掉界面走人了，这一
-    /// 条就成了"停在那里没人知道"——§10 明说不能这样。周期（`AUDIT_TICK`，与审计补写同一
-    /// 拍）扫一遍清单：**没有任何 SSE 订阅者的 Session** 上还挂着的，投 home chat，投过一次
-    /// 就不再投（[`GatewayState::start_delivering_intervention`]，按句柄记）。
-    ///
-    /// 已经在 chat 里投过的那条不会被重复投：那个名额在投出去时就被占了。
-    pub async fn sweep_unseen_interventions(&self) {
-        let pending = match self.interventions(&InterventionListQuery::default()).await {
-            Ok(pending) => pending,
-            Err(error) => {
-                tracing::warn!(%error, "读不出待处理清单，这一拍的兜底没做成");
-                return;
-            }
-        };
-        for summary in pending {
-            if self.hub.viewers(&summary.session) > 0 {
-                continue;
-            }
-            let key = crate::notifier::intervention_key(&summary);
-            if !self.start_delivering_intervention(&key) {
-                continue;
-            }
-            tracing::info!(
-                handle = %summary.handle,
-                kind = summary.kind.as_str(),
-                session = %summary.session,
-                "这一条没人看着，投到 home chat"
-            );
-            // 两类都是一条"哪里不清楚"的投递（§11.4：共用这条到达率）。
-            let Some(run) = summary.run.clone() else {
-                continue;
-            };
-            let failure = self
-                .notifier
-                .deliver_home_once(
-                    komo_kernel::types::chat::Outbound::NeedsAttention {
-                        session: summary.session.clone(),
-                        run,
-                        reason: summary.question.clone(),
-                    },
-                    &key,
-                )
-                .await
-                .err()
-                .map(|error| error.to_string());
-            if let Some(error) = failure {
-                tracing::warn!(%error, handle = %summary.handle, "这条投不出去：没人能回答它");
-            }
-        }
-    }
-
-    /// 把一个等着的 Run 放回队列并叫醒调度器（答复之后、`resume` 之后都走它）。
-    pub async fn wake_run(&self, run: &RunId) -> Result<(), GatewayError> {
-        self.recovery_store.requeue(run).await?;
-        self.waker().wake();
-        Ok(())
-    }
-
-    /// 取消一个 Run。
-    ///
-    /// 已终态的返回原状态而不是报错——重复取消是幂等的，而"取消一个已经完成的任务"不是
-    /// 一个错误，是一句"它已经完成了"。
-    pub async fn cancel_run(self: &Arc<Self>, run: &RunId) -> Result<RunState, GatewayError> {
-        let record = komo_store::repos::runs::get(&self.db, run)
-            .await?
-            .ok_or_else(|| GatewayError::NotFound {
-                what: format!("run {run}"),
-            })?;
-        if record.state.is_terminal() {
-            return Ok(record.state);
-        }
-        self.finish_run(&record.session, run, RunEnd::Cancelled { by: None })
-            .await
     }
 }
 
@@ -1855,27 +604,6 @@ pub fn codemode_unreadable_paths(
         .filter(|path| *path != snapshot.paths.sessions_dir)
         .collect()
 }
-
-/// `sessions.origin` 里**主会话**的那个值。
-///
-/// 它是"这条会话从哪个入口来"，不是身份：身份是 `agent_id`（§4.2）。一个 Agent 的主会话
-/// 与别的 Agent 的主会话在这一列上**长得一样**，区别在归属那一列。
-///
-/// 光秃秃的 `"home"` 也是**这次改造之前**那个全局主会话的取值——升级之后它仍然能被认成
-/// 默认 Agent 的主会话（见 `GatewayState::main_session` 的候选分支），**旧行不重写**。
-pub const HOME_ORIGIN: &str = "home";
-
-/// 会话日志在库里记的那条**相对路径**（`sessions/<id>/events.jsonl`）。
-///
-/// 建一行会话时要带上它，而 `main_session` 是 Gateway 唯一自己建行的地方。这一串是
-/// **store 的约定**（`Coordinator::open` 与 `queue` / `interventions` 里写的是同一条）；
-/// 收在这一个函数里，是为了让"改口径"只有一处要跟。
-fn session_log_path(session: &SessionId) -> String {
-    format!("sessions/{session}/events.jsonl")
-}
-
-/// 一次补写最多处理多少条审计事件。
-const AUDIT_DRAIN_LIMIT: usize = 128;
 
 /// 模型后端与窗口探测共用的工厂：凭证、effort 能力表、ChatGPT 凭证路径只在这一处接。
 fn llm_factory(
@@ -2054,84 +782,4 @@ pub(crate) fn build_stream(
 /// `RepoError` / `StoreError` 到 Gateway 错误。
 pub fn repo_error(error: RepoError) -> GatewayError {
     GatewayError::Repo(error)
-}
-
-#[allow(dead_code)]
-fn assert_segment_types(_: &ResumedRound, _: &Segment, _: &CallEnv, _: HandlerError) {}
-
-#[cfg(test)]
-mod tests {
-    use komo_kernel::types::agent::AgentProfile;
-    use komo_kernel::types::ids::SessionId;
-    use komo_store::models::SessionKind;
-
-    use crate::service::test_support::TestGateway;
-
-    async fn freeze_as(
-        state: &std::sync::Arc<crate::service::GatewayState>,
-        config: &komo_kernel::protocol::config::ConfigSnapshot,
-        agent: &str,
-    ) -> Result<komo_kernel::types::agent::RunSnapshot, komo_kernel::traits::GatewayError> {
-        let session = SessionId::new_at(state.clock.now());
-        let origin = format!("test:{session}");
-        komo_store::repos::session::ensure_owned(
-            &state.db,
-            &session,
-            &origin,
-            &format!("sessions/{session}/events.jsonl"),
-            agent,
-            SessionKind::Normal,
-        )
-        .await
-        .expect("会话行");
-        state
-            .ledgers
-            .open(&session, &origin)
-            .await
-            .expect("会话目录");
-        let record = komo_store::repos::session::get(&state.db, &session)
-            .await
-            .expect("读得出");
-        state
-            .freeze_run(config, agent, &session, record.as_ref(), None)
-            .await
-    }
-
-    /// 项目文件看 Profile 的 `project_files`：关掉就读不到，开着就读得到。
-    #[tokio::test]
-    async fn project_files_follow_the_profile() {
-        let gateway = TestGateway::start().await;
-        let state = gateway.state();
-        let mut config = (*state.snapshot()).clone();
-        let mut closed = AgentProfile::new("closed");
-        closed.project_files = false;
-        config.agent.agents.insert("closed".into(), closed);
-        config
-            .agent
-            .agents
-            .insert("open".into(), AgentProfile::new("open"));
-        std::fs::write(
-            config.paths.workspaces_dir.join("AGENTS.md"),
-            "项目规范暗号：蓝鲸",
-        )
-        .expect("写项目规范");
-
-        let closed = freeze_as(&state, &config, "closed").await.expect("冻结");
-        assert_eq!(closed.project_files_ref, None);
-        let open = freeze_as(&state, &config, "open").await.expect("冻结");
-        assert!(open.project_files_ref.is_some());
-    }
-
-    /// 会话绑的 Profile 不在配置里：退回默认 Agent。
-    #[tokio::test]
-    async fn a_session_without_its_profile_falls_back_to_the_default_agent() {
-        let gateway = TestGateway::start().await;
-        let state = gateway.state();
-        let config = (*state.snapshot()).clone();
-
-        let fallback = freeze_as(&state, &config, "ghost")
-            .await
-            .expect("退回默认 Agent");
-        assert_eq!(fallback.agent_id, config.agent.default_agent);
-    }
 }

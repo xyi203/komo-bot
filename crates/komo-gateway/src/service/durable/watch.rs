@@ -1,6 +1,6 @@
-//! Run 跑起来之后谁在看：`run_watch` 的 Durable 版（`docs/storage-durable-d5.md` §4 W3a / §8）。
+//! Run 跑起来之后谁在看（`docs/storage-durable-d5.md` §4 W3a / §8）。
 //!
-//! Legacy 一个 Run 一个看客、订阅那个 Session 的事件流。这里**一个 Session 一个看客**
+//! **一个 Session 一个看客**
 //! （[`ensure`]）：它订阅 `EventHub` 里这个 Session 的投影帧（W2b 的 feed 推进来的），对每条 run 的
 //! 终态帧做一次收尾——run 是谁的由**这条 run 首个输入**说了算：
 //!

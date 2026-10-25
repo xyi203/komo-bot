@@ -1,8 +1,12 @@
-use super::*;
 use crate::service::test_support::harness::FakeLlm;
 use crate::service::test_support::{TestGateway, config_toml};
 use komo_kernel::durable::{ContentBlock, Message, StopReason};
+use komo_kernel::protocol::http::*;
+use komo_kernel::session::{EntryKind, SessionTree};
+use komo_kernel::types::ids::{RunId, SessionId};
+use komo_kernel::types::turn::TurnRequest;
 use komo_runtime::durable::EntryDraft;
+use serde_json::{Value, json};
 
 // 这些测试跑在 Durable 存储上（`docs/storage-durable-d5.md` §7，决定 1）：HTTP 调用与行为断言
 // 照旧，只改帮手——`seed` 经提交线写真 entry 并返回铸出来的 entry ID（pi 里就是它的十进制），
@@ -12,7 +16,7 @@ async fn setup() -> (TestGateway, std::sync::Arc<FakeLlm>, SessionId) {
     let llm = FakeLlm::finisher("model answer");
     // Durable 的手动压缩只收"超出 `keep_recent_tokens` 之外"的旧内容，整段比它短就什么都不收
     // （旧实现总是把整段摘掉）：这些几十字的测试历史要压得动，把它调到最小。
-    let gw = TestGateway::durable(
+    let gw = TestGateway::with(
         &config_toml("[compaction]\nkeep_recent_tokens = 1\n"),
         llm.clone(),
     )
@@ -358,7 +362,6 @@ impl Home {
             home: Some(self.dir.path().to_path_buf()),
             listen: Some("127.0.0.1:0".into()),
             channels: Vec::new(),
-            storage: crate::service::StorageMode::Durable,
             llm: Some(llm.clone() as std::sync::Arc<dyn LlmClient>),
             stream: Some(llm as std::sync::Arc<dyn ModelStream>),
             embeddings: None,

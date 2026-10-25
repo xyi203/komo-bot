@@ -1,12 +1,10 @@
-//! 四个集成测试目标共用的那一台 Gateway。
+//! 集成测试目标共用的那一台 Gateway。
 //!
-//! `tests/{chat,cron,memory,recovery}` 原先各抄了一份「真数据目录、真 `service::start`、
-//! 内存发送口、脚本化模型」。四份的差别只在各自特有的那几个助手上——recovery 的故障账
-//! 本、cron 的触发记录断言、memory 的假向量后端。共用件搬到这里，各目标的 `harness.rs`
-//! 只留自己那几个。
+//! 「真数据目录、真 `service::start`、内存发送口、脚本化模型」搬到这里，各目标的 `harness.rs`
+//! 只留自己特有的那几个助手——cron 的触发记录断言、memory 的假向量后端。
 //!
-//! **真的东西一个没少**：真 config.toml、真 state.db、真 TcpListener、真调度器、真
-//! Dispatcher、真 `HomeNotifier`。替身只有两个——模型与渠道，因为这两样一个要钱、一个
+//! **真的东西一个没少**：真 config.toml、真 durable.db / aux.db、真 TcpListener、真 harness
+//! 引擎、真 Dispatcher、真 `HomeNotifier`。替身只有两个——模型与渠道，因为这两样一个要钱、一个
 //! 要网。
 //!
 //! 两套门面，因为两种测试问的是两个问题：
@@ -46,7 +44,7 @@ use komo_runtime::llm::{ModelRequest, ModelStream, replay_system};
 
 use crate::channels::{BuiltChannel, ChannelFactory, ChannelRegistry, ChannelSender, SendOutcome};
 use crate::service::state::GatewayState;
-use crate::service::{Running, ServiceOptions, StorageMode, start};
+use crate::service::{Running, ServiceOptions, start};
 
 // ---------------------------------------------------------------- 配置文本
 
@@ -765,7 +763,6 @@ pub struct GatewayBuilder {
     factories: Vec<Arc<dyn ChannelFactory>>,
     home: Option<PathBuf>,
     tools: Vec<Arc<dyn Tool>>,
-    storage: StorageMode,
     stream: Option<Arc<dyn ModelStream>>,
 }
 
@@ -779,19 +776,11 @@ impl GatewayBuilder {
             factories: Vec::new(),
             home: None,
             tools: Vec::new(),
-            storage: StorageMode::Legacy,
             stream: None,
         }
     }
 
-    /// 跑在新存储上（`durable.db` + `aux.db`，`docs/storage-durable-d5.md` §1）。模型要用
-    /// [`Self::fake_llm`] 给——harness 走 `ModelStream`，旧的 `LlmClient` 只剩辅助调用。
-    pub fn durable(mut self) -> Self {
-        self.storage = StorageMode::Durable;
-        self
-    }
-
-    /// 注入无状态的模型后端（只有 Durable 的 harness 用它）。
+    /// 注入无状态的模型后端（harness 的主模型）。
     pub fn stream(mut self, stream: Arc<dyn ModelStream>) -> Self {
         self.stream = Some(stream);
         self
@@ -804,7 +793,7 @@ impl GatewayBuilder {
         self
     }
 
-    /// 多挂一个测试工具（[`super::Gate`] / [`super::Unsure`]）。
+    /// 多挂一个测试工具（[`super::Gate`]）。
     pub fn tool(mut self, tool: Arc<dyn Tool>) -> Self {
         self.tools.push(tool);
         self
@@ -855,7 +844,6 @@ impl GatewayBuilder {
             // 端口 0：内核挑一个空的，发现文件里写的是真实地址。
             listen: Some("127.0.0.1:0".into()),
             channels: self.factories.clone(),
-            storage: self.storage,
             llm: self.llm,
             stream: self.stream,
             embeddings: self.embeddings,
@@ -873,7 +861,6 @@ impl GatewayBuilder {
             env: self.env,
             running: Some(running),
             factories: self.factories,
-            durable: self.storage == StorageMode::Durable,
         }
     }
 }
@@ -887,29 +874,14 @@ pub struct TestGateway {
     env: String,
     running: Option<Running>,
     factories: Vec<Arc<dyn ChannelFactory>>,
-    /// 跑在新存储上：重启要沿用同一种（模型替身是一个收尾 `好` 的 `FakeLlm`）。
-    durable: bool,
 }
 
 impl TestGateway {
-    /// 同 [`Self::start`]，跑在新存储上（`FakeLlm::finisher("好")` 当模型）。
-    pub async fn start_durable() -> (TestGateway, Arc<MemSender>) {
-        let sender = MemSender::new(ChannelPlatform::Telegram);
-        let gateway = GatewayBuilder::new(&telegram_config("111"))
-            .durable()
-            .fake_llm(FakeLlm::finisher("好"))
-            .factory(FixedFactory::sender_only(
-                Arc::clone(&sender) as Arc<dyn ChannelSender>
-            ))
-            .start()
-            .await;
-        (gateway, sender)
-    }
-
-    /// 默认配置：一个 Telegram 渠道（操作者 111）+ 一个内存发送口。
+    /// 默认配置：一个 Telegram 渠道（操作者 111）+ 一个内存发送口，`FakeLlm::finisher("好")` 当模型。
     pub async fn start() -> (TestGateway, Arc<MemSender>) {
         let sender = MemSender::new(ChannelPlatform::Telegram);
         let gateway = GatewayBuilder::new(&telegram_config("111"))
+            .fake_llm(FakeLlm::finisher("好"))
             .factory(FixedFactory::sender_only(
                 Arc::clone(&sender) as Arc<dyn ChannelSender>
             ))
@@ -930,9 +902,9 @@ impl TestGateway {
         &self.running().dispatcher
     }
 
-    /// Durable：这个 Session 的全部合成事件（见 [`Gw::durable_events`]）。
-    pub async fn durable_events(&self, session: &str) -> Vec<komo_kernel::events::Event> {
-        durable_events_of(self.state(), &SessionId::from_raw(session)).await
+    /// 这个 Session 的全部合成事件（见 [`Gw::events`]）。
+    pub async fn events(&self, session: &str) -> Vec<komo_kernel::events::Event> {
+        events_of(self.state(), &SessionId::from_raw(session)).await
     }
 
     pub fn channels(&self) -> &Arc<ChannelRegistry> {
@@ -982,10 +954,10 @@ impl TestGateway {
     /// 停机再按**同一个数据目录**起一台（"重启后 pending 补发"的测试用）。
     pub async fn restart_with(&mut self, config: &str, factories: Vec<Arc<dyn ChannelFactory>>) {
         self.stop().await;
-        let mut builder = GatewayBuilder::new(config).env(&self.env).at(&self.home);
-        if self.durable {
-            builder = builder.durable().fake_llm(FakeLlm::finisher("好"));
-        }
+        let mut builder = GatewayBuilder::new(config)
+            .env(&self.env)
+            .at(&self.home)
+            .fake_llm(FakeLlm::finisher("好"));
         for factory in &factories {
             builder = builder.factory(Arc::clone(factory));
         }
@@ -994,34 +966,6 @@ impl TestGateway {
         } = builder.start().await;
         self.running = running;
         self.factories = factories;
-    }
-
-    /// 停机再起来，换一个向量后端（`tests/memory` 的"重启之后"）。
-    pub async fn restart_with_embeddings(
-        &mut self,
-        config: &str,
-        embeddings: Arc<dyn EmbeddingClient>,
-    ) {
-        self.stop().await;
-        let TestGateway { running, .. } = GatewayBuilder::new(config)
-            .env(&self.env)
-            .at(&self.home)
-            .embeddings(embeddings)
-            .start()
-            .await;
-        self.running = running;
-    }
-
-    /// 停机再起来，换一个模型替身（同一个数据目录）。
-    pub async fn restart_with_llm(&mut self, config: &str, llm: Arc<dyn LlmClient>) {
-        self.stop().await;
-        let TestGateway { running, .. } = GatewayBuilder::new(config)
-            .env(&self.env)
-            .at(&self.home)
-            .llm(llm)
-            .start()
-            .await;
-        self.running = running;
     }
 
     pub async fn get(&self, path: &str) -> (u16, String) {
@@ -1062,14 +1006,6 @@ impl TestGateway {
             .expect("读得出")
     }
 
-    /// 全部会话，**含已逻辑删除的**（`all = true`）：测试要看得到 `closing` / `deleted`
-    /// 那两格（§8.10）。`purged` 两种都不列——它只剩墓碑行，只有显式查看单个会话才可见。
-    pub async fn sessions(&self) -> Vec<komo_store::repos::session::SessionRecord> {
-        komo_store::repos::session::list(&self.state().db, true)
-            .await
-            .expect("读得出")
-    }
-
     /// 待处理清单（两类一起，§7.5）。
     pub async fn interventions(&self) -> Vec<InterventionSummary> {
         let (code, body) = self.get_json("/v1/interventions").await;
@@ -1103,17 +1039,16 @@ impl TestGateway {
     }
 
     /// 等这条 run 的输入 submission 结算（`done` 或 `unanswered`，最多 20 秒），返回那条记录。
-    /// 只在 Durable 下有意义：`RunId` 是 run 首个输入 submission 的十进制 ID。
+    /// `RunId` 是 run 首个输入 submission 的十进制 ID。
     pub async fn wait_run(&self, run: &RunId) -> komo_kernel::durable::SubmissionRecord {
         wait_run(self.state(), run).await
     }
 
-    /// Durable：全部会话（含已删除的）的"来源"，与 Legacy 的 `sessions.origin` 同一套说法——
-    /// 主会话是 `home`，其余是 `source`（`chat:{peer}`）。任务会话与 cron 会话不算（Legacy 的
-    /// `origin` 对它们是 `task:…` / `cron:…`，聊天测试里没有它们）。
-    pub async fn durable_origins(&self) -> Vec<String> {
+    /// 全部会话（含已删除的）的"来源"：主会话是 `home`，其余是 `source`（`chat:{peer}`）。
+    /// 任务会话与 cron 会话不算（聊天测试里没有它们）。
+    pub async fn origins(&self) -> Vec<String> {
         use komo_kernel::durable::SessionKind;
-        let core = self.state().core().expect("Durable 模式");
+        let core = self.state().core().expect("durable");
         core.list_sessions(true)
             .await
             .expect("读得出")
@@ -1126,10 +1061,10 @@ impl TestGateway {
             .collect()
     }
 
-    /// Durable：来源为 `origin`（`home` 或 `chat:…`）的会话 ID。
-    pub async fn durable_session_of(&self, origin: &str) -> Option<String> {
+    /// 来源为 `origin`（`home` 或 `chat:…`）的会话 ID。
+    pub async fn session_of(&self, origin: &str) -> Option<String> {
         use komo_kernel::durable::SessionKind;
-        let core = self.state().core().expect("Durable 模式");
+        let core = self.state().core().expect("durable");
         core.list_sessions(true)
             .await
             .expect("读得出")
@@ -1141,9 +1076,9 @@ impl TestGateway {
             .map(|record| record.id)
     }
 
-    /// Durable：把一个会话逻辑删除到 `deleted`（HTTP `POST /v1/sessions/{id}/delete {"now":true}`，
+    /// 把一个会话逻辑删除到 `deleted`（HTTP `POST /v1/sessions/{id}/delete {"now":true}`，
     /// 即 W4a 的 lifecycle：`closing` → 撤回排队输入 → abort → `deleted`）。测"被删的会话不再接消息"用。
-    pub async fn durable_soft_delete(&self, session: &str) {
+    pub async fn soft_delete(&self, session: &str) {
         let (code, body) = self
             .post_json(
                 &format!("/v1/sessions/{session}/delete"),
@@ -1154,8 +1089,8 @@ impl TestGateway {
         assert_eq!(body["state"], "deleted", "{body}");
     }
 
-    /// Durable：一个 Session 的全部合成事件（`Gw` 与 `TestGateway` 共用）。
-    pub async fn durable_events_of(
+    /// 一个 Session 的全部合成事件（`Gw` 与 `TestGateway` 共用）。
+    pub async fn events_of(
         state: &GatewayState,
         session: &SessionId,
     ) -> Vec<komo_kernel::events::Event> {
@@ -1165,22 +1100,13 @@ impl TestGateway {
             .expect("读得出事件")
     }
 
-    /// Durable：一个会话里受理过的输入 submission 数（排队的、并进别人 run 的都算一条）。
-    pub async fn durable_inputs(&self, session: &str) -> usize {
-        durable_inputs_of(self.state(), session).await
-    }
-
-    pub async fn runs_of(&self, session: &SessionId) -> Vec<komo_store::repos::runs::RunRecord> {
-        komo_store::repos::runs::list_for_session(&self.state().db, session)
-            .await
-            .expect("读得出")
+    /// 一个会话里受理过的输入 submission 数（排队的、并进别人 run 的都算一条）。
+    pub async fn inputs(&self, session: &str) -> usize {
+        inputs_of(self.state(), session).await
     }
 }
 
 // ---------------------------------------------------------------- 一个数据目录
-
-/// 等一条**补写**的审计事件落盘的期限（见 [`Home::wait_event`]）。
-pub const EVENT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// 一个真实的数据目录，可以反复起落。
 pub struct Home {
@@ -1205,8 +1131,7 @@ impl Home {
         Home { dir }
     }
 
-    /// 之后每次在这个数据目录起 Gateway 都多挂这几个测试工具（[`super::Gate`] /
-    /// [`super::Unsure`]）。
+    /// 之后每次在这个数据目录起 Gateway 都多挂这几个测试工具（[`super::Gate`]）。
     pub fn install_tools(&self, tools: Vec<Arc<dyn Tool>>) {
         super::install_test_tools(self.dir.path(), tools);
     }
@@ -1227,97 +1152,21 @@ impl Home {
         self.sessions_dir().join(session.as_str())
     }
 
-    pub fn events_path(&self, session: &SessionId) -> PathBuf {
-        self.session_dir(session).join("events.jsonl")
-    }
-
-    /// 等到某一类事件**真的落进**会话账本，返回它。
-    ///
-    /// 补写是异步的一步（§8.5 的反向顺序：权威先落 state.db，JSONL 那一条随后补），所以
-    /// "它会不会到"只能给一个期限来问，不能靠"此刻还没有"来断言。期限取
-    /// [`EVENT_DEADLINE`]：比一次补写该花的时间宽出几个数量级，又远低于任何周期拍子
-    /// （`AUDIT_TICK` 是 60s），周期兜底接不住就算失败。
-    pub async fn wait_event(
-        &self,
-        session: &SessionId,
-        wanted: &str,
-        timeout: std::time::Duration,
-    ) -> komo_kernel::events::Event {
-        let deadline = std::time::Instant::now() + timeout;
-        loop {
-            if let Some(event) = self
-                .events(session)
-                .into_iter()
-                .find(|event| event.type_name() == wanted)
-            {
-                return event;
-            }
-            if std::time::Instant::now() >= deadline {
-                panic!(
-                    "等了 {:?} 也没有 {}：{:?}",
-                    timeout,
-                    wanted,
-                    self.event_types(session)
-                );
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
-    }
-
-    pub fn quarantine_path(&self, session: &SessionId) -> PathBuf {
-        self.session_dir(session).join("events.jsonl.quarantine")
-    }
-
-    /// 起一台 Gateway。**同一个数据目录**，所以再调一次就是"重启"。
-    pub async fn start(&self, llm: Arc<dyn LlmClient>) -> Gw {
+    /// 起一台 Gateway。**同一个数据目录**，再调一次就是"重启"。`llm` 同时当辅助调用的
+    /// `LlmClient` 与 harness 的 `ModelStream`。
+    pub async fn start(&self, llm: Arc<FakeLlm>) -> Gw {
         let sender = MemSender::new(ChannelPlatform::Telegram);
         self.start_with(llm, sender).await
     }
 
-    /// 同上，但发送口自己给（要断言投递内容时用）。
-    pub async fn start_with(&self, llm: Arc<dyn LlmClient>, sender: Arc<MemSender>) -> Gw {
-        let running = start(ServiceOptions {
-            home: Some(self.dir.path().to_path_buf()),
-            listen: Some("127.0.0.1:0".into()),
-            channels: vec![FixedFactory::sender_only(
-                Arc::clone(&sender) as Arc<dyn ChannelSender>
-            )],
-            storage: StorageMode::Legacy,
-            llm: Some(llm),
-            stream: None,
-            embeddings: None,
-            // 共享 skill 目录钉在这份临时数据目录上（§5.6），与 `GatewayBuilder` 同一个口径。
-            shared_home: Some(self.dir.path().to_path_buf()),
-            telemetry: None,
-        })
-        .await
-        .expect("Gateway 起得来");
-        let base = running.base_url.clone();
-        let token = running.state.token.clone();
-        Gw {
-            running,
-            base,
-            token,
-            home: sender,
-        }
-    }
-
-    /// 起一台跑在新存储上的 Gateway（`docs/storage-durable-d5.md` §1）。**同一个数据目录**，
-    /// 再调一次就是"重启"。`llm` 同时当辅助调用的 `LlmClient` 与 harness 的 `ModelStream`。
-    pub async fn start_durable(&self, llm: Arc<FakeLlm>) -> Gw {
-        let sender = MemSender::new(ChannelPlatform::Telegram);
-        self.start_durable_with(llm, sender).await
-    }
-
     /// 同上，但发送口自己给。
-    pub async fn start_durable_with(&self, llm: Arc<FakeLlm>, sender: Arc<MemSender>) -> Gw {
+    pub async fn start_with(&self, llm: Arc<FakeLlm>, sender: Arc<MemSender>) -> Gw {
         let running = start(ServiceOptions {
             home: Some(self.dir.path().to_path_buf()),
             listen: Some("127.0.0.1:0".into()),
             channels: vec![FixedFactory::sender_only(
                 Arc::clone(&sender) as Arc<dyn ChannelSender>
             )],
-            storage: StorageMode::Durable,
             llm: Some(Arc::clone(&llm) as Arc<dyn LlmClient>),
             stream: Some(llm as Arc<dyn ModelStream>),
             embeddings: None,
@@ -1341,29 +1190,6 @@ impl Home {
         komo_store::durable::TursoStorage::open(self.dir.path())
             .await
             .expect("打开 durable.db")
-    }
-
-    /// 停机之后单独打开 state.db（Turso 对 db 文件持进程独占锁，所以**必须先 stop**）。
-    pub async fn open_db(&self) -> komo_store::Db {
-        komo_store::Db::connect(self.dir.path().join("state.db"))
-            .await
-            .expect("打开 state.db")
-    }
-
-    /// 这个 Session 的全部事件，按 seq。
-    pub fn events(&self, session: &SessionId) -> Vec<komo_kernel::events::Event> {
-        let text = std::fs::read_to_string(self.events_path(session)).unwrap_or_default();
-        text.lines()
-            .filter(|line| !line.trim().is_empty())
-            .filter_map(|line| komo_kernel::events::Event::from_line(line).ok())
-            .collect()
-    }
-
-    pub fn event_types(&self, session: &SessionId) -> Vec<String> {
-        self.events(session)
-            .iter()
-            .map(|event| event.type_name().to_string())
-            .collect()
     }
 }
 
@@ -1391,16 +1217,6 @@ impl Gw {
 
     pub fn base_url(&self) -> &str {
         &self.base
-    }
-
-    pub fn executor_id(&self) -> String {
-        self.running.state.instance_id.clone()
-    }
-
-    /// 这台 Gateway 的地址与令牌——`tests/recovery` 拿它建一个真的 `KomoClient`
-    /// （client 是 gateway 的 dev-dependency，不能从 lib 里用）。
-    pub fn address(&self) -> (String, String) {
-        (self.base.clone(), self.token.clone())
     }
 
     pub async fn get(&self, path: &str) -> (u16, String) {
@@ -1472,10 +1288,9 @@ impl Gw {
         self.try_run_detail(run).await.expect("读得到运行详情")
     }
 
-    /// Durable：这个 Session 的全部事件，按 seq（与 `GET /v1/sessions/{id}/events` 的补读同一个投影；
-    /// 旧 `Home::events` 读的 `events.jsonl` 在新存储里没有）。
-    pub async fn durable_events(&self, session: &SessionId) -> Vec<komo_kernel::events::Event> {
-        durable_events_of(self.state(), session).await
+    /// 这个 Session 的全部事件，按 seq（与 `GET /v1/sessions/{id}/events` 的补读同一个投影）。
+    pub async fn events(&self, session: &SessionId) -> Vec<komo_kernel::events::Event> {
+        events_of(self.state(), session).await
     }
 
     /// 同上，但读不出来时把**原话**带回来——一个中间损坏的会话该报损坏，不该是
@@ -1488,17 +1303,10 @@ impl Gw {
         serde_json::from_str(&body).map_err(|error| error.to_string())
     }
 
-    /// 直接问账本这个 Run 现在什么状态（HTTP 那条路读的是同一行）。Durable 下没有 run 表：
-    /// 状态由 submission / entry 拼（`GET /v1/runs/{id}` 读的就是那份），所以读详情。
+    /// 这个 Run 现在什么状态：由 submission / entry 拼（`GET /v1/runs/{id}` 读的就是那份），
+    /// 所以读详情。
     pub async fn db_state(&self, run: &RunId) -> RunState {
-        if self.state().durable.is_some() {
-            return self.run_detail(run).await.summary.state;
-        }
-        komo_store::repos::runs::get(&self.state().db, run)
-            .await
-            .expect("读得到")
-            .expect("有这个 Run")
-            .state
+        self.run_detail(run).await.summary.state
     }
 
     pub async fn wait_db_state<F: Fn(RunState) -> bool>(
@@ -1525,14 +1333,7 @@ impl Gw {
 
     /// 这条 Run 现在**在等什么**（§8.4 的第二维）。`None` = 它没停在等待上。
     pub async fn db_wait(&self, run: &RunId) -> Option<komo_kernel::types::status::WaitReason> {
-        if self.state().durable.is_some() {
-            return self.run_detail(run).await.summary.wait;
-        }
-        komo_store::repos::runs::get(&self.state().db, run)
-            .await
-            .expect("读得到")
-            .expect("有这个 Run")
-            .wait
+        self.run_detail(run).await.summary.wait
     }
 
     /// 等它停在 `waiting` 上并说得出在等什么，返回那个理由。
@@ -1598,8 +1399,8 @@ fn submission_of(run: &RunId) -> komo_kernel::durable::SubmissionId {
     komo_kernel::durable::SubmissionId::new(raw)
 }
 
-/// Durable：一个 Session 的全部合成事件（`Gw` 与 `TestGateway` 共用）。
-pub async fn durable_events_of(
+/// 一个 Session 的全部合成事件（`Gw` 与 `TestGateway` 共用）。
+pub async fn events_of(
     state: &GatewayState,
     session: &SessionId,
 ) -> Vec<komo_kernel::events::Event> {
@@ -1609,8 +1410,8 @@ pub async fn durable_events_of(
         .expect("读得出事件")
 }
 
-/// Durable：一个会话里受理过的输入 submission 数（排队的、并进别人 run 的都算一条）。
-pub async fn durable_inputs_of(state: &GatewayState, session: &str) -> usize {
+/// 一个会话里受理过的输入 submission 数（排队的、并进别人 run 的都算一条）。
+pub async fn inputs_of(state: &GatewayState, session: &str) -> usize {
     use komo_kernel::durable::SubmissionKind;
     use komo_kernel::durable::storage::{ConversationQuery, SubmissionQuery};
     let core = state.core().expect("Durable 模式");

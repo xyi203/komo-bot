@@ -27,6 +27,7 @@ use komo_agent::context::{
     SECTION_PROJECT, SECTION_SKILLS, system_sections,
 };
 use komo_kernel::durable::{Content, ContentBlock, ConversationId, Message};
+use komo_kernel::types::agent::MemoryMode;
 use komo_kernel::types::memory::MemoryScope;
 use komo_runtime::durable::harness::system::replay_sections;
 use komo_runtime::durable::harness::{HookError, PromptSection, ToolSet};
@@ -175,11 +176,41 @@ async fn recall(
 }
 
 fn recall_scopes(resolved: &Resolved) -> Option<Vec<MemoryScope>> {
-    crate::service::context_sources::recall_scopes(
+    scopes_for(
         resolved.profile.memory,
         &resolved.agent_id,
         resolved.profile.memory_scope.as_ref(),
     )
+}
+
+/// 这一次召回放行哪些作用域（§9.2）；`None` = 这一段不召回。
+///
+/// `memory = "off"` 不召回；`"private"` 只放行这个 Agent 自己的 `agent:<id>`——**不带
+/// Personal**，那是操作者的个人记忆，私有记忆的 Profile 不该碰；`"shared"` 看 Profile
+/// 的 `memory_scope`：没写 = **不按作用域过滤**（`RecallQuery::scopes` 空就是"全部"），
+/// 写了就只召回那一个，外加 [`MemoryScope::Personal`]——用户资料是**显式共享**的那一份，
+/// 每个 Agent 都该看得见。
+fn scopes_for(
+    mode: MemoryMode,
+    agent_id: &str,
+    scope: Option<&MemoryScope>,
+) -> Option<Vec<MemoryScope>> {
+    match mode {
+        MemoryMode::Off => None,
+        MemoryMode::Private => Some(vec![MemoryScope::Agent {
+            agent_id: agent_id.to_string(),
+        }]),
+        MemoryMode::Shared => {
+            let Some(scope) = scope else {
+                return Some(Vec::new());
+            };
+            let mut scopes = vec![scope.clone()];
+            if *scope != MemoryScope::Personal {
+                scopes.push(MemoryScope::Personal);
+            }
+            Some(scopes)
+        }
+    }
 }
 
 async fn write_memory_doc(
@@ -241,4 +272,37 @@ fn latest_user_text(context: &[Message]) -> Option<String> {
         }),
         _ => None,
     })
+}
+
+#[cfg(test)]
+mod scope_tests {
+    use super::*;
+
+    fn agent(id: &str) -> MemoryScope {
+        MemoryScope::Agent {
+            agent_id: id.into(),
+        }
+    }
+
+    #[test]
+    fn recall_scopes_follow_the_memory_mode() {
+        assert_eq!(scopes_for(MemoryMode::Off, "helper", None), None);
+        // 私有：只有它自己的作用域，Profile 的 `memory_scope` 不参与、Personal 不带。
+        assert_eq!(
+            scopes_for(MemoryMode::Private, "helper", Some(&MemoryScope::Personal)),
+            Some(vec![agent("helper")])
+        );
+        // 共享：没写 scope = 不按作用域过滤。
+        assert_eq!(
+            scopes_for(MemoryMode::Shared, "assistant", None),
+            Some(vec![])
+        );
+        let project = MemoryScope::Project {
+            project_id: "komo".into(),
+        };
+        assert_eq!(
+            scopes_for(MemoryMode::Shared, "assistant", Some(&project)),
+            Some(vec![project, MemoryScope::Personal])
+        );
+    }
 }

@@ -3,37 +3,53 @@
 //! ```text
 //! 1. request_key 去重（平台重投）
 //! 2. 解析 Principal（config.toml 的 allow_from，每条消息现读）
-//! 3. 解析 Conversation → SessionId
+//! 3. 解析 Conversation → Session
 //! 4. 冲刷该会话 pending 的投递（§11.4）
 //! 5. 命令？→ 直接处理并 ack
-//! 6. 普通文本 → Ledger::accept_input → 排队
+//! 6. 普通文本 → `DurableCore::submit_input` → 排队 / 并进宿主 run
 //! ```
 //!
 //! **去重键只管平台重投，不管用户连点**（§11.1）：两条真实消息带着两个不同的
 //! `event_id` / `update_id`，是两条合法输入；挡住第二次执行的是答复本身的幂等
 //! （已经答过的介入返回原结论）。两层分开，不要用组合键去兼职。
 //!
-// TODO(decide: 普通文本的去重是**持久**的——`Ledger::accept_input` 按请求键返回原 Run
-// （§8.5）。命令没有对应的持久表：`deliveries` 记的是出站，`runs` 记的是输入，而一条
-// `/answer` 两者都不是。这里先用一个进程内的有界表挡住平台重投，重启后那个窗口里的
-// 重投会再执行一次——**而它的效果是幂等的**（已答过的返回原结论、`/new` 追加一条边界、
-// `/pending` 只读），所以这不是一个会产生第二次副作用的缺口。要做成持久的，需要一张
-// `inbox` 表或给 `deliveries` 加一个入站方向——那是编排者的决定，见报告。)
+//! 落存储的几步（`docs/storage-durable-d5.md` §4 W3a / §8）：
+//!
+//! - **会话**：操作者的私聊（没有话题）落到默认 Agent 的主会话（`kind = main`）；群、话题、带话题的
+//!   私聊按 `source = chat:{peer}` 各一个普通会话（被删或正在关闭的不再接消息，下一条另开新的）。
+//! - **普通文本**：`request_id` = 平台消息键（持久去重：重投返回原 run），输入 entry 是 `chat.input`，
+//!   `data {peer, principal}`；宿主 run 是**同一个 peer** 起的、还在忙时 `WhenBusy::Steer`（并进去），
+//!   别的 peer 的话排在后面（§6：对端与宿主不同就不并）。
+//! - **命令**：`/new` = `boundary`；`/cancel` = 只停当前这一轮（决定 8：`abort_run`，不撤回收件箱；
+//!   只有排队的那一条才 `withdraw`）；`/status` 带当前 run 与这个会话派出的后台任务
+//!   （`TaskLine::render`）；`/pending` 与 `/answer` 读的是 faulted 任务（W4a，只答 `abandon`）。
+//!
+//! 谁在看这条 run：渠道回复由 [`watch`] 的看客投回，这里只在**提交之前**保证这个会话有看客。
+//!
+// TODO(decide: 命令的去重是进程内的有界表：命令没有对应的持久表（`deliveries` 记的是出站，
+// submission 记的是输入，而一条 `/answer` 两者都不是），重启后那个窗口里的重投会再执行一次——
+// **而它的效果是幂等的**（已答过的返回原结论、`/new` 追加一条边界、`/pending` 只读），所以这不是
+// 一个会产生第二次副作用的缺口。普通文本的去重是持久的（请求键）。)
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use komo_kernel::durable::{SessionKind, SessionRecord, legacy_ids};
 use komo_kernel::protocol::http::{
     InterventionKind, InterventionListQuery, InterventionSummary, InterventionVerdict,
 };
 use komo_kernel::protocol::{ChatCommand, InboundAck, InboundMessage};
 use komo_kernel::traits::{GatewayError, Inbound};
 use komo_kernel::types::chat::{ChannelPeer, ChannelPlatform, PeerId, Principal};
-use komo_kernel::types::ids::{RequestKey, RunId, SessionId};
+use komo_kernel::types::ids::{RequestKey, SessionId};
 use komo_kernel::types::status::{RunState, WaitReason};
+use komo_runtime::durable::harness::{Harness, InputEntry, WhenBusy};
+use serde_json::json;
 
-use crate::service::state::{GatewayState, HOME_ORIGIN};
+use crate::service::durable::watch::{self, CHAT_INPUT, Source};
+use crate::service::durable::{DurableCore, SessionError};
+use crate::service::state::GatewayState;
 
 /// 进程内记住的去重键上限。
 const SEEN_LIMIT: usize = 4_096;
@@ -41,6 +57,22 @@ const SEEN_LIMIT: usize = 4_096;
 /// 群聊会话在 `sessions.origin` 里的样子。
 pub(crate) fn chat_origin(peer: &ChannelPeer) -> String {
     format!("chat:{peer}")
+}
+
+/// `SessionError` → 渠道看得懂的错误。
+fn gateway_error(error: SessionError) -> GatewayError {
+    match error {
+        SessionError::NotFound(what) => GatewayError::NotFound { what },
+        // 「已逻辑删除的会话拒绝新输入」（§8.10）：聊天这一侧也要说清楚是哪种状态、该怎么做。
+        SessionError::NotOpen(_) => GatewayError::InvalidRequest(format!(
+            "{error}。要接着聊就在 TUI 里新建一个会话（`/new` 只是划一段边界）。"
+        )),
+        SessionError::Invalid(message)
+        | SessionError::Busy(message)
+        | SessionError::Conflict(message) => GatewayError::InvalidRequest(message),
+        SessionError::RequestKeyConflict(_) => GatewayError::InvalidRequest(error.to_string()),
+        SessionError::Internal(message) => GatewayError::Internal(message),
+    }
 }
 
 pub struct Dispatcher {
@@ -112,90 +144,6 @@ impl Dispatcher {
         }
     }
 
-    /// 第 3 步：哪一个会话。
-    ///
-    /// 操作者的**私聊**（Telegram DM、WeChat、TUI）落到**默认 Agent 的主会话**
-    /// ——它们没有"找谁"这一维，所以走 §四 说的 `default_agent`。带话题的私聊（飞书）
-    /// 与群一样一个话题一个会话；群聊按 `{platform}:{chat_id}`（有话题再加 `#{thread}`）
-    /// 各自一个；机器人所在的群里，操作者 @ 它就响应（@ 的过滤在渠道里，§11.2）。
-    async fn conversation(&self, msg: &InboundMessage) -> Result<SessionId, GatewayError> {
-        if msg.is_private {
-            if msg.peer.thread.is_some() {
-                return self.session_for_peer(&msg.peer).await;
-            }
-            return self.state.default_main_session().await;
-        }
-        self.session_for_peer(&msg.peer).await
-    }
-
-    /// 一个群聊对应的那个 Session。
-    ///
-    /// 会话 ID 仍然是 UUID（kernel 的 ID 都是），"哪个群"记在 `sessions.origin` 上——
-    /// 把 `{platform}:{chat_id}` 直接当 ID 会让每个消费者再去拆一次字符串。
-    /// 只认还收输入的会话：被删（或正在关闭）的那个不再接消息，下一条另开新的——
-    /// `origin` 上没有唯一约束，同一个 origin 本来就可以有墓碑与活的并存。
-    pub async fn session_for_peer(&self, peer: &ChannelPeer) -> Result<SessionId, GatewayError> {
-        let origin = chat_origin(peer);
-        let existing = komo_store::repos::session::list(&self.state.db, false)
-            .await?
-            .into_iter()
-            .filter(|record| record.origin == origin && record.state.accepts_input())
-            .map(|record| record.session)
-            .min();
-        if let Some(session) = existing {
-            return Ok(session);
-        }
-        let session = SessionId::new_at(self.state.clock.now());
-        self.state.ledgers.open(&session, &origin).await?;
-        self.state.own_session(&session).await?;
-        Ok(session)
-    }
-
-    /// 第 5 步。
-    async fn command(
-        &self,
-        command: ChatCommand,
-        msg: &InboundMessage,
-        principal: &Principal,
-        session: &SessionId,
-    ) -> Result<InboundAck, GatewayError> {
-        // `/id` 是**唯一不要求操作者身份**的命令，它在 handle 里就答过了。
-        if !principal.is_operator() {
-            return Ok(reject(msg));
-        }
-        match command {
-            ChatCommand::Id => Ok(InboundAck::Replied {
-                text: id_reply(msg),
-            }),
-            ChatCommand::Pending => {
-                let pending = self.pending().await?;
-                Ok(InboundAck::Replied {
-                    text: render_pending(&pending),
-                })
-            }
-            ChatCommand::New => {
-                let seq = self.state.routed_boundary(session).await?;
-                Ok(InboundAck::Replied {
-                    text: format!("好，从这里开始新的一段（seq {seq}）。"),
-                })
-            }
-            ChatCommand::Status => {
-                let text = self.status_text(session).await?;
-                Ok(InboundAck::Replied { text })
-            }
-            ChatCommand::Cancel => {
-                let Some(run) = self.current_run(session).await? else {
-                    return Ok(InboundAck::Replied {
-                        text: "这个会话没有在跑的任务。".into(),
-                    });
-                };
-                let state = self.state.cancel_run(&run).await?;
-                Ok(InboundAck::Replied {
-                    text: format!("{run} 现在是 {}。", state_text(state)),
-                })
-            }
-        }
-    }
     /// 待处理的 Intervention，两类一起（§7.5）。
     pub(crate) async fn pending(&self) -> Result<Vec<InterventionSummary>, GatewayError> {
         self.state
@@ -213,118 +161,183 @@ impl Dispatcher {
         verdict: InterventionVerdict,
         by: PeerId,
     ) -> Result<InboundAck, GatewayError> {
-        // 先看这一条的结论拼对了没有：`InterventionVerdict::parse` 认几个手滑得不算离谱
-        // 的拼法，认不出来的到不了这里。
-        // Durable（W4a）：只有 faulted 任务（`Blocked`），只答 `abandon`；别的结论列出能答的。
-        if self.state.durable.is_some() {
-            return match self
-                .state
-                .answer_intervention(handle, verdict, Some(by))
-                .await
-            {
-                Ok(response) => Ok(InboundAck::Replied {
-                    text: response.note,
-                }),
-                Err(GatewayError::InvalidRequest(message)) => Ok(InboundAck::Replied {
-                    text: format!("`{handle}`：{message}。"),
-                }),
-                Err(GatewayError::NotFound { .. }) => Ok(InboundAck::Replied {
-                    text: format!("没有待处理的 `{handle}`（`/pending` 看现在有哪些）。"),
-                }),
-                Err(error) => Err(error),
-            };
-        }
-        let detail = self.state.intervention(handle).await?;
-        if let Some(detail) = detail {
-            let kind = match &detail {
-                komo_kernel::protocol::http::InterventionDetail::Verify { .. } => {
-                    InterventionKind::Verify
-                }
-                komo_kernel::protocol::http::InterventionDetail::Blocked { .. } => {
-                    InterventionKind::Blocked
-                }
-            };
-            if !verdict.allowed_for(kind) {
-                return Ok(InboundAck::Replied {
-                    text: format!(
-                        "`{}` 答不了 `{}`——这一条是 {}，能答的是：{}。",
-                        handle,
-                        verdict.as_str(),
-                        kind.as_str(),
-                        kind.verdicts()
-                            .iter()
-                            .map(|one| one.as_str())
-                            .collect::<Vec<_>>()
-                            .join(" / ")
-                    ),
-                });
-            }
-        }
-        let response = self
+        // 只有 faulted 任务（`Blocked`），只答 `abandon`；别的结论列出能答的。
+        match self
             .state
             .answer_intervention(handle, verdict, Some(by))
-            .await?;
-        Ok(InboundAck::Replied {
-            text: response.note,
-        })
+            .await
+        {
+            Ok(response) => Ok(InboundAck::Replied {
+                text: response.note,
+            }),
+            Err(GatewayError::InvalidRequest(message)) => Ok(InboundAck::Replied {
+                text: format!("`{handle}`：{message}。"),
+            }),
+            Err(GatewayError::NotFound { .. }) => Ok(InboundAck::Replied {
+                text: format!("没有待处理的 `{handle}`（`/pending` 看现在有哪些）。"),
+            }),
+            Err(error) => Err(error),
+        }
     }
 
-    async fn current_run(&self, session: &SessionId) -> Result<Option<RunId>, GatewayError> {
-        let mut runs = komo_store::repos::runs::list_for_session(&self.state.db, session).await?;
-        runs.retain(|run| run.state.is_unfinished());
-        Ok(runs.into_iter().next_back().map(|run| run.run))
+    /// 第 3 步：哪一个会话。
+    async fn session(
+        &self,
+        core: &DurableCore,
+        msg: &InboundMessage,
+    ) -> Result<SessionRecord, GatewayError> {
+        let agent = self.state().snapshot().agent.default_agent.clone();
+        let private_main = msg.is_private && msg.peer.thread.is_none();
+        let (record, _) = if private_main {
+            core.main_session(&agent).await
+        } else {
+            core.session_for_source(&chat_origin(&msg.peer), &agent)
+                .await
+        }
+        .map_err(gateway_error)?;
+        Ok(record)
     }
 
-    /// `/status`：当前 Run 的状态、在等什么，以及**两类合计**的待处理数（§7.5）。
-    async fn status_text(&self, session: &SessionId) -> Result<String, GatewayError> {
-        let runs = komo_store::repos::runs::list_for_session(&self.state.db, session).await?;
+    /// 宿主 run 是不是这个 peer 起的（或者它的结果本来就要回给这个 peer）。会话空闲时无所谓，答 `true`。
+    async fn host_is_peer(
+        &self,
+        core: &DurableCore,
+        record: &SessionRecord,
+        peer: &ChannelPeer,
+    ) -> bool {
+        let Ok(live) = Harness::live(&*core.storage, record.current_branch).await else {
+            return false;
+        };
+        let Some(first) = live
+            .run
+            .as_ref()
+            .and_then(|run| run.inputs.first().copied())
+        else {
+            return true;
+        };
+        match watch::source_of(core, first).await {
+            (Source::Peer(host), _) => &host == peer,
+            (Source::Internal, Some(entry)) => {
+                watch::peer_on_path(core, &record.id, entry).await.as_ref() == Some(peer)
+            }
+            _ => false,
+        }
+    }
+
+    async fn command(
+        &self,
+        command: ChatCommand,
+        msg: &InboundMessage,
+        principal: &Principal,
+        core: &DurableCore,
+        record: &SessionRecord,
+    ) -> Result<InboundAck, GatewayError> {
+        if !principal.is_operator() {
+            return Ok(reject(msg));
+        }
+        match command {
+            ChatCommand::Id => Ok(InboundAck::Replied {
+                text: id_reply(msg),
+            }),
+            ChatCommand::Pending => {
+                let pending = self.pending().await?;
+                Ok(InboundAck::Replied {
+                    text: render_pending(&pending),
+                })
+            }
+            ChatCommand::New => {
+                let submission = core
+                    .boundary(&record.id, None)
+                    .await
+                    .map_err(gateway_error)?;
+                let seq = legacy_ids::seq(submission, 0);
+                Ok(InboundAck::Replied {
+                    text: format!("好，从这里开始新的一段（seq {seq}）。"),
+                })
+            }
+            ChatCommand::Status => Ok(InboundAck::Replied {
+                text: self.status_text(core, record).await?,
+            }),
+            ChatCommand::Cancel => {
+                let summary = core.session_summary(record).await.map_err(gateway_error)?;
+                let Some(run) = summary.current_run else {
+                    return Ok(InboundAck::Replied {
+                        text: "这个会话没有在跑的任务。".into(),
+                    });
+                };
+                // 排队的那一条 withdraw，在跑的那一条只停这一轮（决定 8）。
+                let mut state = core.cancel_run_id(&run).await.map_err(gateway_error)?;
+                if !state.is_terminal() {
+                    // 取消是异步的：等它落下来（有限时），好把真实状态告诉操作者。
+                    if let Some(first) = legacy_ids::submission_of(&run) {
+                        let _ = tokio::time::timeout(
+                            std::time::Duration::from_secs(2),
+                            core.wait_submission(first),
+                        )
+                        .await;
+                        state = core.submission_state(first).await.unwrap_or(state);
+                    }
+                }
+                let text = if state == RunState::Cancelled || state.is_terminal() {
+                    format!("{run} 现在是 {}。", state_text(state))
+                } else {
+                    format!("{run} 已发出取消，这一轮停下后即为已取消。")
+                };
+                Ok(InboundAck::Replied { text })
+            }
+        }
+    }
+
+    /// `/status`：当前 run、待处理数（两类合计）、这个会话派出的后台任务。
+    async fn status_text(
+        &self,
+        core: &DurableCore,
+        record: &SessionRecord,
+    ) -> Result<String, GatewayError> {
+        let summary = core.session_summary(record).await.map_err(gateway_error)?;
         let pending = self.pending().await?;
         let by_kind =
             |kind: InterventionKind| pending.iter().filter(|one| one.kind == kind).count();
-        let current = runs.iter().rev().find(|run| run.state.is_unfinished());
-        let head = match current {
-            Some(run) => format!(
-                "当前任务 {}：{}",
-                run.run,
-                state_line(run.state, run.wait.as_ref())
+        let head = match (&summary.current_run, summary.current_state) {
+            (Some(run), Some(state)) => format!(
+                "当前任务 {run}：{}",
+                state_line(state, summary.current_wait.as_ref())
             ),
-            None => "没有在跑的任务。".to_string(),
+            _ => "没有在跑的任务。".to_string(),
         };
-        Ok(format!(
+        let mut text = format!(
             "{head}\n待处理（共 {} 条）：结果不明 {} · 前提没了 {}",
             pending.len(),
             by_kind(InterventionKind::Verify),
             by_kind(InterventionKind::Blocked),
-        ))
-    }
-}
-
-impl GatewayState {
-    /// `/new`：当前 Session 追加 `conversation.boundary`，**不切 Session**（§11.3）。
-    pub async fn routed_boundary(
-        &self,
-        session: &SessionId,
-    ) -> Result<komo_kernel::types::ids::Seq, GatewayError> {
-        use komo_kernel::traits::Ledger;
-        Ok(self.routed.boundary(session).await?)
+        );
+        if record.kind != SessionKind::Task {
+            let tasks = core
+                .task_sessions(Some(&record.id))
+                .await
+                .map_err(gateway_error)?;
+            if !tasks.is_empty() {
+                text.push_str("\n后台任务：");
+                for line in tasks {
+                    text.push_str("\n  ");
+                    text.push_str(&line.render());
+                }
+            }
+        }
+        Ok(text)
     }
 }
 
 #[async_trait]
 impl Inbound for Dispatcher {
     async fn handle(&self, msg: InboundMessage) -> Result<InboundAck, GatewayError> {
-        // Durable 存储走 `dispatcher_v2`（D5）。
-        if self.state.durable.is_some() {
-            return self.handle_v2(msg).await;
-        }
-        // ① 去重：平台重投命中同一个键。
+        // ① 去重：平台重投命中同一个键（命令用；普通文本的去重是持久的，在请求键上）。
         if let Some(ack) = self.recall(&msg.request_key) {
             return Ok(ack);
         }
-
         let command = parse_command(&msg.text);
 
-        // `/id` 对**任何人**可用，也是唯一不要求操作者身份的命令（§11.2）。
+        // `/id` 对**任何人**可用。
         if matches!(command, Some(ChatCommand::Id)) {
             let ack = InboundAck::Replied {
                 text: id_reply(&msg),
@@ -333,86 +346,81 @@ impl Inbound for Dispatcher {
             return Ok(ack);
         }
 
-        // ② Principal。不在名单里 → 拒绝，**不留任何记录**（不进 Run、不写投递、也不
-        // 记进去重表——重投再被拒一次，代价只是一条固定提示）。
+        // ② Principal。不在名单里 → 拒绝，不留任何记录。
         let principal = self.principal(&msg);
         if !principal.is_operator() {
             return Ok(reject(&msg));
         }
 
         // ③ 哪一个会话。
-        let session = self.conversation(&msg).await?;
+        let core = self.state().core()?.clone();
+        let record = self.session(&core, &msg).await?;
+        let session = record.id.clone();
 
-        // ④ 冲刷这个会话还没送到的投递（§11.1 第 4 步）——**先补上积压的，再处理新的**。
-        self.state.notifier.flush(Some(&msg.peer)).await;
+        // ④ 冲刷这个会话还没送到的投递——先补上积压的，再处理新的。
+        self.state().notifier.flush(Some(&msg.peer)).await;
 
         // ⑤ 命令。
-        //
-        // `/answer <句柄> <结论>` 不在 kernel 的 `ChatCommand` 里（那是三个渠道共用的解析
-        // 结果，而"答复介入"这条路只有网关看得到清单）：它在这里当场认，走的是与 HTTP
-        // 同一个入口（§7.5：四个界面语义相同）。
         if let Some((handle, verdict)) = parse_answer(&msg.text) {
-            // 答复介入只给操作者：上面的拒绝已经挡过一次，这里不靠那一处。
-            if !principal.is_operator() {
-                return Ok(reject(&msg));
-            }
             let ack = self
                 .answer(&handle, verdict, principal.id().clone())
                 .await?;
             self.remember(&msg.request_key, &ack);
             return Ok(ack);
         }
-        // 写歪了的 `/answer`（少了结论、或者结论拼错），**列出来**：一句"我不知道"比
-        // 悄悄把它当普通消息发出去好得多——那条消息会真的跑一轮模型。
         if let Some(help) = parse_answer_help(&msg.text) {
             let ack = InboundAck::Replied { text: help };
             self.remember(&msg.request_key, &ack);
             return Ok(ack);
         }
-        // 已经删掉的审批命令（`/approve` / `/reject`，§7）：说一句它们没了、现在有哪些
-        // 命令，而不是把它当普通消息发给模型去跑一轮。
         if let Some(help) = retired_command_help(&msg.text) {
             let ack = InboundAck::Replied { text: help };
             self.remember(&msg.request_key, &ack);
             return Ok(ack);
         }
         if let Some(command) = command {
-            let ack = self.command(command, &msg, &principal, &session).await?;
+            let ack = self
+                .command(command, &msg, &principal, &core, &record)
+                .await?;
             self.remember(&msg.request_key, &ack);
             return Ok(ack);
         }
 
-        // ⑥ 普通文本。**插话**（§6）：宿主 Run 忙着跑工具时，这句话由它在下一次请求模型
-        // 之前并进去，不排到整条 Run 后面（实测排过 18–22 分钟，2026-10-23）。
-        let submitted = self
-            .state
-            .submit_interjecting(
+        // ⑥ 普通文本。**先挂看客再提交**：订阅之后才发生的终态帧才收得到。
+        watch::ensure(self.state(), &session);
+        let when_busy = if self.host_is_peer(&core, &record, &msg.peer).await {
+            WhenBusy::Steer
+        } else {
+            WhenBusy::FollowUp
+        };
+        let entry = InputEntry::new(
+            CHAT_INPUT,
+            Some(json!({
+                "peer": msg.peer.to_string(),
+                "principal": {
+                    "platform": principal.platform().as_str(),
+                    "id": principal.id().as_str(),
+                },
+            })),
+        );
+        let accepted = core
+            .submit_input(
                 &session,
-                msg.request_key.clone(),
-                with_context(&msg),
-                Some(msg.peer.clone()),
-                None,
+                crate::service::durable::submit::InputRequest::new(with_context(&msg))
+                    .request_id(msg.request_key.as_str())
+                    .entry(entry)
+                    .when_busy(when_busy),
             )
             .await
-            .map_err(|error| match error {
-                // 「已逻辑删除的会话拒绝新输入」（§8.10）：聊天这一侧也要说清楚是哪种
-                // 状态、以及该怎么做——HTTP 那侧是 409 加同一句话。
-                GatewayError::InvalidRequest(message) => GatewayError::InvalidRequest(format!(
-                    "{message}。要接着聊就在 TUI 里新建一个会话（`/new` 只是划一段边界）。"
-                )),
-                other => other,
-            })?;
-        // 谁在看这个 Run：`GatewayState::submit` 已经按来源会话起了一个看客
-        // （§11.4：终态回到来源会话，需要处理投来源会话 + home chat），所以这里不再
-        // 另起一个——两个看客会把同一条介入投两遍。
-        let ack = if submitted.deduplicated {
+            .map_err(gateway_error)?;
+        let ack = if accepted.deduplicated {
             InboundAck::Duplicate {
-                run: Some(submitted.run.clone()),
+                run: Some(accepted.run.clone()),
             }
         } else {
             InboundAck::Queued {
-                session,
-                run: submitted.run.clone(),
+                session: SessionId::from_raw(session),
+                run: accepted.run.clone(),
             }
         };
         self.remember(&msg.request_key, &ack);
@@ -662,10 +670,6 @@ pub fn inbound(
         request_key: RequestKey::new(request_key),
     }
 }
-
-/// 主会话在 `sessions.origin` 里的前缀，给别处对照用（见
-/// [`main_origin`](crate::service::state::main_origin)）。
-pub const HOME: &str = HOME_ORIGIN;
 
 #[cfg(test)]
 mod tests {

@@ -9,30 +9,21 @@
 pub mod config;
 pub mod cron;
 pub mod error;
-pub mod events;
 pub mod idempotency;
-pub mod interventions;
 pub mod mcp;
 pub mod memories;
-pub mod runs;
-pub mod session_tree;
-pub mod sessions;
 pub mod v2;
 
 use std::sync::Arc;
 
 use axum::Json;
-use axum::routing::{get, patch, post};
+use axum::routing::{get, post};
 use axum::{Router, extract::State};
-use komo_kernel::events::Event;
 use komo_kernel::protocol::PROTOCOL_VERSION;
-use komo_kernel::protocol::http::{HealthResponse, ReconcileResponse, SessionSummary};
-use komo_kernel::types::ids::SessionId;
-use time::OffsetDateTime;
+use komo_kernel::protocol::http::{HealthResponse, SessionSummary};
 
 use crate::service::state::GatewayState;
 
-use error::{ApiFailure, ApiResult};
 use idempotency::Idempotency;
 
 /// 路由共享的东西。
@@ -60,24 +51,19 @@ impl Api {
 /// §13.1 的接口表，加上 W3 契约修订里的三个（`/v1/models`、`/v1/config/check`、
 /// `/v1/config/reload`），以及 `/v1/home-session`。
 ///
-/// 路由按存储模式挑：Legacy 是下面的 `legacy_routes`；Durable 是 [`v2::routes`]。两种模式
-/// 共用的（memories、config、models、mcp、healthz）只有一份，直接复用旧 handler。
+/// 会话、run、树、事件、cron、intervention、导出在 [`v2::routes`]（路径与协议类型不变，handler
+/// 读写 `durable.db`）；memories、config、models、mcp、healthz 在这里。
 pub fn router(api: Api) -> Router {
     let token = api.state.token.clone();
     let open = Router::new().route("/healthz", get(healthz));
-    let specific = if api.state.durable.is_some() {
-        v2::routes()
-    } else {
-        legacy_routes()
-    };
     let guarded = shared_routes()
-        .merge(specific)
+        .merge(v2::routes())
         .layer(crate::auth::bearer(token));
 
     open.merge(guarded).with_state(api)
 }
 
-/// 两种存储模式都一样的路由。
+/// memories、config、models、mcp 这几组路由（handler 在本目录，不碰存储模型）。
 fn shared_routes() -> Router<Api> {
     Router::new()
         .route("/v1/memories", get(memories::list).post(memories::add))
@@ -93,52 +79,6 @@ fn shared_routes() -> Router<Api> {
         .route("/v1/config/check", get(config::check))
         .route("/v1/config/reload", post(config::reload))
         .route("/v1/mcp/reconnect", post(mcp::reconnect))
-}
-
-/// Legacy 模式（`state.db`）独有的路由。D7 整个删。
-fn legacy_routes() -> Router<Api> {
-    Router::new()
-        .route("/v1/home-session", get(home_session))
-        .route("/v1/sessions", get(sessions::list).post(sessions::create))
-        .route("/v1/sessions/{id}", get(sessions::detail))
-        .route("/v1/sessions/{id}/tree", get(session_tree::tree))
-        .route("/v1/sessions/{id}/navigate", post(session_tree::navigate))
-        .route("/v1/sessions/{id}/fork", post(session_tree::fork))
-        .route("/v1/sessions/{id}/context-edit", post(session_tree::edit))
-        .route("/v1/sessions/{id}/label", post(session_tree::label))
-        .route("/v1/sessions/{id}/name", post(session_tree::name))
-        .route("/v1/sessions/{id}/compact", post(session_tree::compact))
-        .route("/v1/sessions/{id}/events", get(events::stream))
-        .route("/v1/sessions/{id}/runs", post(sessions::submit))
-        .route("/v1/sessions/{id}/resume", post(sessions::resume))
-        .route("/v1/sessions/{id}/boundary", post(sessions::boundary))
-        .route("/v1/sessions/{id}/delete", post(sessions::delete))
-        .route("/v1/sessions/{id}/purge", post(sessions::purge))
-        .route("/v1/reconcile", post(reconcile))
-        .route("/v1/runs/{id}", get(runs::detail))
-        .route("/v1/runs/{id}/cancel", post(runs::cancel))
-        // §7.5：清单、详情、答复。一次答一条——批量答复随审批一起删了（§7）。
-        .route("/v1/interventions", get(interventions::list))
-        .route("/v1/interventions/{handle}", get(interventions::show))
-        .route(
-            "/v1/interventions/{handle}/answer",
-            post(interventions::answer),
-        )
-        .route("/v1/cron", get(cron::list).post(cron::create))
-        .route("/v1/cron/{id}", patch(cron::update).delete(cron::remove))
-        .route("/v1/cron/{id}/run", post(cron::run_now))
-}
-
-/// `POST /v1/reconcile`：**立刻跑一次对账**（§8.9）。幂等，返回这次判定了什么。
-///
-/// 三个触发点之一（另外两个是 Gateway 启动与 `AUDIT_TICK` 那一拍）：`komo doctor
-/// --reconcile` 打它。它是"数据库是权威，其余一切都是派生"（§8.9）唯一的手动入口——
-/// 一条 handler 任务自己 panic 掉的 `running`、一个被手工 `rm -rf` 掉的会话目录，都由
-/// 它当场判成 `queued` 或 `waiting + intervention`，而不是留在日志里。
-///
-/// 返回的是这一趟的**汇总**：看了多少、判了什么。逐条的明细在日志里（一行一条恢复决定）。
-async fn reconcile(State(api): State<Api>) -> ApiResult<Json<ReconcileResponse>> {
-    Ok(Json(api.state.reconcile_response().await?))
 }
 
 /// `GET /healthz`：最小健康检查与**实例标识**。
@@ -160,48 +100,10 @@ async fn healthz(State(api): State<Api>) -> Json<HealthResponse> {
     })
 }
 
-/// `GET /v1/home-session`：操作者那一个常驻会话（§11.2）。
-///
-// TODO(decide: §13.1 的接口表里没有它。`komo home` 需要一个"哪个会话是 home"的答案，
-// 而 `SessionSummary` 上没有 `origin`，按列表也筛不出来。这里加一个只读端点，类型仍是
-// 现成的 `SessionSummary`——kernel 一个字没改。见报告。)
-async fn home_session(State(api): State<Api>) -> ApiResult<Json<SessionSummary>> {
-    let session = api.state.default_main_session().await?;
-    let summary = sessions::summary_of(&api, &session).await?;
-    Ok(Json(summary))
-}
-
-/// 读完一个 Session 的日志，外置正文读回来。
-pub async fn events_of(api: &Api, session: &SessionId) -> Result<Vec<Event>, ApiFailure> {
-    let mut all = api.state.routed.read_all(session).await?;
-    let payloads = komo_store::PayloadStore::new(api.state.ledgers.paths_for(session));
-    for event in &mut all {
-        payloads.hydrate_event(event).await?;
-    }
-    Ok(all)
-}
-
-/// 从 UUIDv7 里取出它的生成时刻。
-///
-/// 「UUIDv7 的前 48 位就是这个时间戳」（kernel 的 `ids` 模块）——所以 `created_at` 不需要
-/// 一个额外的列，ID 自己就带着它。取不出来（测试里的 `from_raw`）就退回给定的兜底值。
-pub fn created_at(id: &str, fallback: OffsetDateTime) -> OffsetDateTime {
-    let Ok(uuid) = uuid::Uuid::parse_str(id) else {
-        return fallback;
-    };
-    let Some(timestamp) = uuid.get_timestamp() else {
-        return fallback;
-    };
-    let (seconds, nanos) = timestamp.to_unix();
-    OffsetDateTime::from_unix_timestamp(seconds as i64)
-        .map(|at| at + time::Duration::nanoseconds(nanos as i64))
-        .unwrap_or(fallback)
-}
-
 /// `GET /v1/home-session`，从进程外面问（`komo home` 用它）。
 ///
-/// `komo-client` 的 `KomoClient` 是按 §13.1 的接口表写的，这个端点不在那张表里
-/// （见上面的 TODO），所以这里给一个最小的调用，而不是去改 client。
+/// `komo-client` 的 `KomoClient` 是按 §13.1 的接口表写的，这个端点不在那张表里（`v2::sessions::home`），
+/// 所以这里给一个最小的调用，而不是去改 client。
 pub async fn fetch_home_session(
     base_url: &str,
     token: Option<&str>,
@@ -220,26 +122,4 @@ pub async fn fetch_home_session(
         return Err(format!("{status}：{body}"));
     }
     serde_json::from_str(&body).map_err(|error| format!("{error}（{body}）"))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_uuid_v7_carries_its_own_creation_time() {
-        let at = time::macros::datetime!(2026-09-16 08:00:00 UTC);
-        let id = komo_kernel::types::ids::SessionId::new_at(at);
-        let read = created_at(id.as_str(), OffsetDateTime::UNIX_EPOCH);
-        assert!(
-            (read - at).abs() < time::Duration::seconds(1),
-            "{read} vs {at}"
-        );
-    }
-
-    #[test]
-    fn a_non_uuid_id_falls_back() {
-        let fallback = time::macros::datetime!(2026-09-16 08:00:00 UTC);
-        assert_eq!(created_at("sess-1", fallback), fallback);
-    }
 }

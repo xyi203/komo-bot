@@ -27,32 +27,27 @@ fn files_starting_with(home: &Path, prefix: &str) -> Vec<String> {
 async fn opens_and_closes_durable_db_beside_aux_db() {
     let config = telegram_config("111");
     let mut first = GatewayBuilder::new(&config)
-        .durable()
         .fake_llm(FakeLlm::finisher("好"))
         .start()
         .await;
     assert!(first.home.join("durable.db").exists(), "durable.db 打开了");
     assert!(first.home.join("aux.db").exists(), "aux.db 打开了");
-    assert!(first.state().durable.is_some());
     let (status, body) = first.get("/healthz").await;
     assert_eq!(status, 200, "{body}");
 
     // 关掉之后同一个数据目录能再起来：Turso 对库文件持进程独占锁，没关干净这里就起不来。
     first.stop().await;
     let mut second = GatewayBuilder::new(&config)
-        .durable()
         .fake_llm(FakeLlm::finisher("好"))
         .at(&first.home)
         .start()
         .await;
-    assert!(second.state().durable.is_some());
     second.stop().await;
 }
 
 #[tokio::test]
 async fn durable_mode_never_opens_state_db() {
     let mut gateway = GatewayBuilder::new(&telegram_config("111"))
-        .durable()
         .fake_llm(FakeLlm::finisher("好"))
         .start()
         .await;
@@ -72,7 +67,7 @@ async fn durable_mode_never_opens_state_db() {
 /// 路由（interventions，W4a）在 Durable 下还是空桩。
 #[tokio::test]
 async fn durable_mode_serves_shared_routes_and_leaves_session_routes_to_v2() {
-    let gateway = TestGateway::durable(&config_toml(""), FakeLlm::finisher("好")).await;
+    let gateway = TestGateway::with(&config_toml(""), FakeLlm::finisher("好")).await;
     let (status, body) = gateway.get("/v1/models").await;
     assert_eq!(status, 200, "{body}");
     let (status, body) = gateway.get("/v1/sessions").await;

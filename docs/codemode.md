@@ -5,6 +5,10 @@
 > 允许只读工具及有副作用 MCP；文件**只读**，写文件走 write / edit / bash。恢复借鉴 pi-durable 的子调用
 > 稳定 key、已存/当前 replay 双 Safe 与结果交付 journal；脚本的时钟与随机数经宿主、进 journal，
 > 恢复时整段重跑、已记录的原样回放、越过记录之后照常执行（§7）。设计权威为 `docs/komo_bot.md`。
+>
+> 新存储（`docs/storage-durable.md`）下，§3、§5、§7 的 journal 换成外层任务名下的嵌套工具任务、
+> `komo.nested` 槽位与时钟 / 熵的 memo：见那份文档 §4.7 与 §13；规则（双 Safe、unsafe 不重做、分歧即
+> uncertain）不变。
 
 ## 1. 要解决什么
 

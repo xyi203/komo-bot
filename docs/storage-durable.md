@@ -1,6 +1,6 @@
 # 存储重设计：整套采用 pi-durable 的提交模型
 
-> 状态：**实现中（2026-10-25）**。D0–D3、D4a、D4b 已完成并合入 `main`；D4c 已做完工具任务的 `probe` 阶段与 `komo.live.tools[].pid`，以及生成 / 工具任务在 Turso 上的接线测试（分支 `d4c-probe-gaps`），其余 D4c（压缩、codemode、`task`、`monitor`）还在做；进度与实现中的偏离见 §13。新旧代码并存，新存储还没接到 gateway。全部完成后改写 `docs/komo_bot.md` §8，本文留作推导记录。
+> 状态：**实现中（2026-10-25）**。D0–D3、D4a、D4b 已完成并合入 `main`；D4c 已做完工具任务的 `probe` 阶段与 `komo.live.tools[].pid`，以及生成 / 工具任务在 Turso 上的接线测试（分支 `d4c-probe-gaps`）；codemode 嵌套调用（外层脚本任务、名下的嵌套工具任务、`komo.nested` 槽位、时钟 / 随机数 memo）已做完（分支 `d4c-codemode`）；其余 D4c（压缩、`task`、`monitor`）还在做；进度与实现中的偏离见 §13。新旧代码并存，新存储还没接到 gateway。全部完成后改写 `docs/komo_bot.md` §8，本文留作推导记录。
 >
 > 对照基线：本机 `../pi` 提交 `8efd314fa` 的 `packages/durable`（`docs/spec.md` 为规范，`README.md`）。
 > pi-durable 自称 **Experimental**，API 随版本变；pi coding-agent 在这个提交上**并不依赖它**（仍是
@@ -268,6 +268,15 @@ codemode 外层是一个 `komo.tool` 任务；脚本里每个子调用是一个 
 （`docs/codemode.md` §7）。时钟与随机数的宿主应答作为 memo 记在外层任务上（spec §5.2 的 memo：先写者赢）。
 Monty worker 进程、只读挂载、受保护路径都不变。
 
+实现（`harness/codemode.rs` 外层、`harness/nested.rs` 数据与嵌套这一侧的收尾、`harness/tool.rs` 里的 `kind: "nested"` 分支）：
+
+- 外层 `komo.tool` 任务执行 `Operation::Codemode` 时（`CodemodeTool::replay` 是 Safe，恢复走 §5 的表重跑整段脚本），先写 memo `codemode.start`（指纹：脚本哈希、引擎 / worker 协议 / 前置代码版本、能力表、cwd；对不上就是回放分歧），再起 worker。
+- 脚本里第 `n` 个调用 = 一个输入 `{kind: "nested", parent, key: "c<n>", callId: "<外层 callId>/c<n>", name, arguments}` 的 `komo.tool` 任务，`Ownership::Task(外层)`，与 `komo.nested` 里 key 为 `c<n>` 的成员（`{taskId, name, arguments, result?}`，task 级 document，随外层退役）**在同一次提交里建出**；外层 `wait_for_task` 它，终结的那笔提交（`commit_nested`）把交给脚本的结果写进成员的 `result`。
+- 嵌套任务走和顶层调用同一条 `call → execute → 结果`：能力面（`ToolSet::get`）、`NOT_IN_SCRIPTS`、`Tool::prepare`、只放行 `ReadFile` / `McpCall` 且没有 `then_run`，意图 checkpoint、§5 的重放表都一样；不同的只有没有 `komo.live` 槽位（意图就是 checkpoint）、不发布输出尾巴、`detach_after` 取消、结果不进 transcript。被拒的是已落盘的失败结果（脚本里的 `ToolError`，可接住）。
+- 重启后外层重跑：第 `n` 个调用在 `komo.nested` 里找 `c<n>`，工具名与参数都对得上就等它的任务（不另建），对不上是分歧；任务停在 `execute` 的由引擎照 §5 恢复——Safe 新尝试重跑，Unsafe 写 `uncertain` 结果；脚本拿到 `uncertain` 就锁住宿主、之后任何调用不再执行，整段结果 uncertain 交给模型。记录用完之后的新调用才建新任务。
+- 时钟与熵：宿主答复先攒在内存，**下一个新子调用建任务之前**（以及交结果之前）落成 memo `codemode.nondet.<n>`（一批一个，先写者赢），重启后按序原样还回去，请求对不上就是分歧；上限 10 000 次，与旧路径一致。
+- 脚本结束（任何原因）之前，外层先 `abort_owned` 名下还活着的嵌套任务并等它们落结果；被取消时由引擎自底向上 abort，各嵌套任务的 abort handler 写 `aborted`（脚本一侧视为结果不明）。worker 起不来 / 被杀 / 超时的处理同旧路径（`Worker::run` 没变）。
+
 ## 5. 恢复
 
 §8.4 的整张表缩成 pi-durable 的开库对账（spec §5.1）加工具任务的 `execute` 阶段：
@@ -531,10 +540,11 @@ finalize     → blob 收尾同步 → 提交结果 entry（projection.rs 的 fu
 | D3 | `crates/komo-kernel/src/durable/task/`（纯逻辑）、`crates/komo-runtime/src/durable/`（`line` `tx` `kind` `runtime` `scheduler` `engine`） | kernel 37 项、runtime 52 项 |
 | D4a | `crates/komo-runtime/src/llm/{model_stream,routing_stream,stream_tests}.rs`、各 provider 的 `stateless.rs` | 字节等价：9 种场景 × 3 家 |
 | D4b | `crates/komo-runtime/src/durable/harness/`（`hooks` `inbox` `live` `system` `generation` `tool` `submit` `entries`） | 约 50 项 |
+| D4c（codemode 嵌套调用，`d4c-codemode`） | `harness/codemode.rs`（外层脚本、memo、重放）、`harness/nested.rs`（`komo.nested` 成员、`commit_nested`）、`harness/tool.rs`（`Input::Nested`、无槽位的执行与收尾）、`harness/hooks.rs`（`HarnessDeps::codemode`）；`komo-store` `tool_output.rs`（流按完整身份存）；`executor/codemode.rs` 只放宽了可见性 | `harness/tests/codemode.rs` 14 项（含 Turso 上的重启回放）、`nested.rs` 单元 2 项、`komo-store` 1 项、`crates/komo/tests/codemode_nested.rs` 2 项（真 `komo __codemode-worker` 子进程） |
 | D4c（probe 与接线，`d4c-probe-gaps`） | `harness/tool.rs`（`Checkpoint::Probe`、`ChildRef`、`resolve`）、`harness/live.rs`（槽位 `pid` / `pgid` / `startedAt`）、`harness/hooks.rs`（`HarnessDeps::probe`、`probe_interval`）、`recovery/processes.rs`（`IdentityProbe`）、kernel `OutputWriter::child_started`、`tools/process.rs`（起进程后报告）；gateway `RoutedOutputs::find_published`；`ToolExecutor::tools()` 公开 | `harness/tests/probe.rs` 10 项（含真进程的身份核对）、`harness/tests/turso.rs` 6 项（Turso 文件库上的生成 / 工具任务 / 重启）、`IdentityProbe` 3 项、`child_started` 1 项、`RoutedOutputs` 1 项 |
 | `komo init` | `komo-runtime/src/config/init.rs`；bin 的 `Command::Init` 只分发 | init 7 项、bin 1 项加一条 clap 解析断言 |
 
-合入时（`durable-integration` 分支）强制重编后 `cargo test --workspace`：**2558 通过，0 失败**。D4c 的 probe 与接线（`d4c-probe-gaps`，基于 `main` 的 52ae527c）：**2587 通过，0 失败，11 忽略**。
+合入时（`durable-integration` 分支）强制重编后 `cargo test --workspace`：**2558 通过，0 失败**。D4c 的 probe 与接线（`d4c-probe-gaps`，基于 `main` 的 52ae527c）：**2587 通过，0 失败，11 忽略**。 D4c 的 codemode 嵌套调用（`d4c-codemode`，基于 `d4c` 的 24677f60）：**2606 通过，0 失败，11 忽略**。
 
 ### 13.2 实现与本文的偏离（都已接受）
 
@@ -557,11 +567,20 @@ finalize     → blob 收尾同步 → 提交结果 entry（projection.rs 的 fu
 - **取消 probe 中的任务不终止那个子进程**（D4c）：abort handler 照常写 `aborted` 结果（带 `.partial` 末尾），再探一次，进程还在就在正文里写明"重启前这次调用起的子进程（pid N）取消时还在运行，komo 没有终止它"。旧 `monitors.rs` 会按身份核对后 `kill_process_group`；工具任务这边没有杀进程的注入口，暂不做。
 - **新增 `IdentityProbe`，不改 `SysProcessProbe`**（D4c）：登记行带 `started_at` 时核对起来的时刻（Linux 读 `/proc/<pid>/stat` 第 22 字段 + `btime` + `CLK_TCK`，其他平台 `ps -o stat=,etime=`，容差 10 s），对不上就是 pid 被复用 → `Gone`；僵尸进程也是 `Gone`；读不出来 `Unknown`。旧路径（`LockHolderLiveness`、gateway 锁）仍用只看 pid 在不在的 `SysProcessProbe`，行为不变。
 - **工具任务读自己的槽位用一次"不改状态的提交"**（D4c，`recorded_child`）：`TaskRuntime` 没有读 document 的入口，没有为此扩引擎。
+- **嵌套调用没有 `komo.live` 槽位，也不发布运行中的输出**（D4c codemode）：pi 的 `nestedTools` 在 live 里展示进度；这里嵌套任务的意图就是它的 checkpoint，结果只在外层名下的 `komo.nested` 成员里，运行中的输出尾巴、子进程身份都不记（脚本里放行的只有读文件与 MCP，不起 `run_child_detachable` 的子进程，所以也用不上 `probe`）。UI 要展示脚本里正在跑什么，之后读 `komo.nested` 的成员与嵌套任务记录。
+- **没有 `finished` 记录**（D4c codemode）：旧 journal 在脚本跑完后先外置整段结果再记 `finished`，好让"结果还没发布就崩"时不再起 worker。新路径外层结果一发布就按 §5 表第一行复用；发布之前崩了就整段重放——已交付的嵌套结果从 `komo.nested` 回放、不重做，所以代价只是再起一次 worker。
+- **时钟 / 熵与指纹是外层任务的 memo，不是 document**（D4c codemode）：memo 随任务记录整条重写，单批读数不小（`random` 起状态 2496 字节、十六进制 5 KB）。上限仍是 10 000 次读数，最坏的紧循环会让任务记录变到几百 KB；之后如果成问题再把批次搬进名下的 document（spec §5.2 说 memo 应当很小，大的进度放 document）。
+- **嵌套结果整值存在 `komo.nested` 成员里**（D4c codemode，同 spec §7.3）：脚本拿到的正文（`read` 的整份文件、`rg` 的整份 stdout）不设上限，由外层终结时随 document 一起退役。旧路径把它外置到 `tool-output/` 再引用；文件仍在每个嵌套任务自己的输出目录里。
+- **脚本拿到的"完整正文"只在刚执行完时精确**（D4c codemode）：`rg` 一类的 `preview` 比 stdout 短，所以"盘上有完整 `output.json`、结果没提交就崩"这一行对嵌套任务多一个条件（`nested::reusable`）——预览就是全部 stdout（或结果自带 `text`）才复用，否则落到下一行：Safe 新尝试重跑，Unsafe 中断。
+- **子调用的图片随嵌套结果存引用，回放时也附上**（D4c codemode）：补上旧路径"journal 不存图片字节、回放的子调用不再附图"的缺口——嵌套任务的输出目录里有图，外层收尾时按引用读回、写进外层自己的输出目录。
+- **`FileToolOutputStore` 的打开流改按完整身份存**（D4c codemode，`komo-store`）：原来只按 attempt ID 存，而新存储的工具任务按任务目录分、尝试号都从 1 数——嵌套任务与它的外层（以及一轮里并行的两个只读调用）同时开着流时会互相顶掉对方，发布时报"没有在本存储上开过流"。旧 executor 的 attempt ID 是唯一的，不受影响。
+- **`HarnessDeps` 多了 `codemode: Option<Worker>`**（D4c codemode）：Gateway 装配时给；`None` 时 `codemode` 工具的任务以失败结果收场（旧路径是同一句话）。`ToolExecutor::codemode_fingerprint` 与摘要 / 失败首部的几个函数放宽成 `pub(crate)` 共用，旧路径行为不变。
 - **测试里的 Turso 世界**（D4c）：`World::turso(dir)` 用真时钟与真文件输出存储；`restart` 是关引擎（连库一起关）、`TursoStorage::open` 重新开库、重建引擎。引擎关着时读辅助不可用。
 
 ### 13.3 已知缺口（按阶段）
 
-- **D4c**：上下文超长现在直接 `model_error` 失败，要接压缩；衰减视图已存在结果 entry 的 `data.decayed`，等压缩决策写 `edits`；codemode、`task`、`monitor` 还没有执行路径。
+- **D4c**：上下文超长现在直接 `model_error` 失败，要接压缩；衰减视图已存在结果 entry 的 `data.decayed`，等压缩决策写 `edits`；`task`、`monitor` 还没有执行路径。
+- **D4c 的 codemode**：旧 `ToolExecutor` 在脚本调到 MCP 工具之前会等它的服务器连上（`await_mcp`）、热重载撤掉的工具会说明原因（`withdrawn_reason`），新路径只认钩子 `AgentHooks::tools` 交回的工具表，这两件事要在 D5 的钩子里做；外层被 abort 时结果只写"被取消"，不像旧 `codemode_check_interrupted` 那样把"哪个子调用结果不明"写进正文（嵌套任务各自的 `aborted` 结果在 `komo.nested` 里，外层一终结就退役）；真 worker 在重启时是被 `kill_on_drop` 杀掉的，没有测"worker 被外部 SIGKILL 但 Gateway 还活着"这一条（`Worker::run` 本身没变，旧测试覆盖）；脚本在外层 `execute` 里按 key 回放的 `komo.nested` 成员最多 256 个，一次读完（每次重启一笔提交）。
 - **D4c 的 probe**：没有杀进程的注入口（取消只在结果里说明子进程还在）；`bash` 转后台（`detach_after`）交给 gateway 的监听接手后，那条路径不写槽位也不进 probe；只有走 `run_child_detachable` 的工具会报告子进程（codemode worker、MCP 子进程不报）。
 - **D5**：gateway 实现 `AgentHooks`（`ToolExecutor::tools()` 与 `RoutedOutputs::find_published` 已就绪）；`conversations.session_id` 现在总是 NULL，`/tree` 按 Session 查分支时补；`TursoStorage` 的读共用一条连接，读多了再换连接池。
 - **崩溃安全**：进度提交 `synchronous=OFF` 后"进程崩溃不丢"是按机制推的，崩溃注入测试只跑在 tmpfs 上，没有真盘掉电验证。Turso 接线测试里的"重启"是关库再开库（干净关闭），不是杀进程。

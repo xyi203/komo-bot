@@ -110,6 +110,19 @@ enum Input {
     },
 }
 
+impl Input {
+    /// 模型发的调用所在的 assistant entry。编排（`task` / `monitor`）只认这一种：脚本里不放行
+    /// 编排（见 `call` 里的嵌套检查），所以嵌套调用走到这里就是输入坏了。
+    fn assistant(&self) -> Result<EntryId, TaskError> {
+        match self {
+            Input::Model { assistant, .. } => Ok(*assistant),
+            Input::Nested { .. } => Err(TaskError::new(
+                "orchestration needs a model tool call, not a nested one",
+            )),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(
     tag = "phase",
@@ -477,7 +490,7 @@ impl ToolTask {
         // 编排调用没有"意图 → 执行"：效果在 `orchestration` 里一次提交完，崩溃后从 `orchestrate`
         // 接着做（同一次提交把 checkpoint 推进过去），不经过下面的重放判断。
         if orchestration::handles(&plan.operation) {
-            return orchestration::call(self, rt, &set, &call, input.assistant, plan).await;
+            return orchestration::call(self, rt, &set, &call, input.assistant()?, plan).await;
         }
         let replay = plan.recovery.replay();
         let checkpoint = Checkpoint::Execute {
@@ -1002,7 +1015,7 @@ impl TaskKind for ToolTask {
                 let input = parse_input(task)?;
                 let call = self.read_call(rt, &input).await?;
                 let set = self.tools(rt.conversation()).await?;
-                orchestration::resume(self, rt, &set, &call, input.assistant, step).await
+                orchestration::resume(self, rt, &set, &call, input.assistant()?, step).await
             }
         }
     }
@@ -1068,7 +1081,7 @@ impl TaskKind for ToolTask {
         if let Ok(Checkpoint::Orchestrate { step }) =
             serde_json::from_value::<Checkpoint>(task.checkpoint.clone())
         {
-            return orchestration::aborted(self, rt, &set, &call, input.assistant, step).await;
+            return orchestration::aborted(self, rt, &set, &call, input.assistant()?, step).await;
         }
         let this = attempt_ref(&set.env, conversation, rt.task_id(), attempt.unwrap_or(1));
         let left = if attempt.is_some() {

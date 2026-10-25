@@ -813,7 +813,7 @@ async fn gateway(
                 home: Some(home.to_path_buf()),
                 listen: None,
                 channels: komo_gateway::channels::factories(),
-                storage: komo_gateway::service::StorageMode::Legacy,
+                storage: komo_gateway::service::StorageMode::Durable,
                 llm: None,
                 stream: None,
                 embeddings: None,

@@ -1547,6 +1547,7 @@ pub trait Clock: Send + Sync {
 | 8. 模型配置与 Memory | 独立记忆 / 向量模型、effort 校验、自动提取、混合召回（`memory_terms` + 向量）与遗忘 | 不串用模型配置；推断不自行确认；过期或遗忘内容不召回；重建可恢复 |
 | 9. 场景与双平台验收 | 真实代码仓库、测试 HA 设备、Memos 主动记录；编译预算复测 | 两平台独立运行；记录从 Memos 找回；代码交付含验证证据；冷编与增量编译在预算内，或有记录在案的偏差原因 |
 | 10. 生命周期与对账 | Session 的 `closing → deleted → purged`（§8.10）、Intervention 统一清单与四种结论（§7.5）、reconcile 的三条判定与领取守卫（§8.9） | **逻辑删除可靠**：`delete` 之后新输入被拒、未完成 Run 各写一条明确取消、内容一个字节没动；`purge` 在引用未处置时 409 并列出要先处理什么；`purged` 之后没有任何路径再创建那个目录。**清单堵死漏网**：`intervention list` 为空而会话被挡住这种组合构造不出来——"挡队"与"进清单"同源，且每一条 `waiting + intervention` 都在清单里（旧的 `waiting + approval` 不进清单，启动时按 §7.4 续跑）。**orphan 自动 reconcile**：目录被手工删掉而状态不是 `purged` → 对账报出来且 Run 不被领走（不出现"按空上下文执行一轮"）；handler 任务 panic 留下的 `running`（租约过期 + 存活判定）被回收；无法确认旧执行结束的那条停成清单里的一条 |
+| D5 新存储接入 gateway（**2026-10-25**，`docs/storage-durable-d5.md`） | 生产默认 Durable（`durable.db` + `aux.db`，不再开 `state.db`）；读连接池 | **本机真模型冒烟通过**（release 二进制、临时数据目录、监听 17788、magpie）：新建会话得到真实回复；`/tree` 见分支；编辑历史输入成分支；`komo session export` 11 行 pi v3；停 Gateway 再起后会话 / 树 / 当前位置都在、能接着对话；`doctor`、`config check`、命令型 cron、`session delete` / `purge` 正常；`cargo test --workspace --no-fail-fast` 全绿（2982 通过 / 0 失败 / 11 ignored） |
 
 存储的基本约束（§8.5 的写入顺序、§7.2 的硬限制）从第二阶段开始贯穿全部工具，不能在所有功能完成后才补。
 

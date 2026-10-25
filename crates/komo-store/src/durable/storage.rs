@@ -39,7 +39,7 @@ use komo_kernel::durable::storage::{
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use tokio::sync::Mutex;
+use tokio::sync::Semaphore;
 use turso::{Connection, Value};
 
 use super::line::{Line, LineError};
@@ -48,7 +48,33 @@ use super::write::{CommitKind, Write};
 /// Turso 上的 `Storage`。
 pub struct TursoStorage {
     line: Line,
-    reader: Mutex<Option<Connection>>,
+    readers: ReadPool,
+}
+
+/// 读连接的条数上限。WAL 下读不挡写、写不挡读，所以读可以并发；小池就够——提交线上每次提交
+/// 要读好几次，补读 / HTTP 查询再多也只占这几条，不会把提交的读挤到队尾（D5 W5，原先只有一条）。
+const READ_CONNECTIONS: usize = 4;
+
+/// 读连接池：信号量限并发，空闲连接放在栈里，用完放回；栈空了现开一条（连接在一次查询中途被
+/// 取消丢掉时就是这样补上的）。关闭后信号量关闭、空闲连接清空，在途查询的连接用完直接丢。
+struct ReadPool {
+    permits: Semaphore,
+    free: std::sync::Mutex<Vec<Connection>>,
+}
+
+impl ReadPool {
+    fn new(first: Connection) -> ReadPool {
+        ReadPool {
+            permits: Semaphore::new(READ_CONNECTIONS),
+            free: std::sync::Mutex::new(vec![first]),
+        }
+    }
+
+    fn free(&self) -> std::sync::MutexGuard<'_, Vec<Connection>> {
+        self.free
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
 }
 
 fn line_error(error: LineError) -> StorageError {
@@ -289,7 +315,7 @@ impl TursoStorage {
         let reader = line.read_connection().map_err(line_error)?;
         Ok(TursoStorage {
             line,
-            reader: Mutex::new(Some(reader)),
+            readers: ReadPool::new(reader),
         })
     }
 
@@ -299,8 +325,29 @@ impl TursoStorage {
     }
 
     async fn query(&self, sql: &str, params: Vec<Value>) -> StorageResult<Vec<Vec<Value>>> {
-        let guard = self.reader.lock().await;
-        let conn = guard.as_ref().ok_or(StorageError::Closed)?;
+        let _permit = self
+            .readers
+            .permits
+            .acquire()
+            .await
+            .map_err(|_| StorageError::Closed)?;
+        let pooled = self.readers.free().pop();
+        let conn = match pooled {
+            Some(conn) => conn,
+            None => self.line.read_connection().map_err(line_error)?,
+        };
+        let result = Self::run(&conn, sql, params).await;
+        if !self.readers.permits.is_closed() {
+            self.readers.free().push(conn);
+        }
+        result
+    }
+
+    async fn run(
+        conn: &Connection,
+        sql: &str,
+        params: Vec<Value>,
+    ) -> StorageResult<Vec<Vec<Value>>> {
         let mut cursor = conn.query(sql, params).await.map_err(|e| backend(sql, e))?;
         let mut out = Vec::new();
         while let Some(row) = cursor.next().await.map_err(|e| backend(sql, e))? {
@@ -340,7 +387,7 @@ impl TursoStorage {
     }
 
     async fn check_open(&self) -> StorageResult<()> {
-        if self.reader.lock().await.is_none() {
+        if self.readers.permits.is_closed() {
             return Err(StorageError::Closed);
         }
         Ok(())
@@ -889,7 +936,8 @@ impl Storage for TursoStorage {
     }
 
     async fn close(&self) -> StorageResult<()> {
-        self.reader.lock().await.take();
+        self.readers.permits.close();
+        self.readers.free().clear();
         self.line.close().await;
         Ok(())
     }
@@ -986,6 +1034,42 @@ mod tests {
     }
 
     /// 旧库没有 `max_id` 这一行：开库时按表里的最大值补上，之后照常推进。
+    /// 读连接池：并发读不互相阻塞也不出错；关闭后读是 `Closed`；同一目录紧接着重开不报
+    /// `database is locked`（连一次都没写过的新文件也一样，W0b 记过的 Turso 问题）。
+    #[tokio::test]
+    async fn the_read_pool_serves_concurrent_reads_and_reopens_cleanly() {
+        let dir = tempfile::tempdir().unwrap();
+        for round in 0..3 {
+            let storage = Arc::new(TursoStorage::open(dir.path()).await.unwrap());
+            let mut joins = Vec::new();
+            for _ in 0..(READ_CONNECTIONS * 3) {
+                let storage = storage.clone();
+                joins.push(tokio::spawn(async move {
+                    for _ in 0..20 {
+                        storage.conversation(ConversationId::new(1)).await.unwrap();
+                    }
+                }));
+            }
+            for join in joins {
+                join.await.unwrap();
+            }
+            if round == 1 {
+                let id = storage.mint_id().await.unwrap();
+                storage
+                    .commit(&[StorageWrite::Conversation(ConversationRecord::root(
+                        ConversationId::new(id),
+                    ))])
+                    .await
+                    .unwrap();
+            }
+            storage.close().await.unwrap();
+            assert!(matches!(
+                storage.conversation(ConversationId::new(1)).await,
+                Err(StorageError::Closed)
+            ));
+        }
+    }
+
     #[tokio::test]
     async fn a_database_without_the_high_water_row_gets_one_on_open() {
         let dir = tempfile::tempdir().unwrap();

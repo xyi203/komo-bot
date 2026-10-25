@@ -1,6 +1,6 @@
 # 存储重设计：整套采用 pi-durable 的提交模型
 
-> 状态：**实现中（2026-10-25）**。D0–D3、D4a、D4b 已完成并合入 `main`；**D4c 已完成**，在集成分支 `d4c`（未合入 `main`）：工具任务 `probe` 阶段与 `komo.live.tools[].pid`、生成 / 工具任务在 Turso 上的接线测试、压缩（`komo.compaction` 阻塞与后台、衰减写成 `edits`、上下文超长时压缩重试）、codemode 嵌套调用（外层脚本任务、名下的嵌套工具任务、`komo.nested` 槽位、时钟 / 随机数 memo）、编排工具 `task` / `monitor` 的执行路径（owned、background 的子 conversation，交回结果，监听登记与对账）。下一步 D5。进度与实现中的偏离见 §13。新旧代码并存，新存储还没接到 gateway。全部完成后改写 `docs/komo_bot.md` §8，本文留作推导记录。
+> 状态：**实现中（2026-10-25）**。D0–D3、D4a、D4b 已完成并合入 `main`；**D4c 已完成**，在集成分支 `d4c`（未合入 `main`）：工具任务 `probe` 阶段与 `komo.live.tools[].pid`、生成 / 工具任务在 Turso 上的接线测试、压缩（`komo.compaction` 阻塞与后台、衰减写成 `edits`、上下文超长时压缩重试）、codemode 嵌套调用（外层脚本任务、名下的嵌套工具任务、`komo.nested` 槽位、时钟 / 随机数 memo）、编排工具 `task` / `monitor` 的执行路径（owned、background 的子 conversation，交回结果，监听登记与对账）。**D5 已完成（2026-10-25，W0–W5，分支 `d5-w5`，生产默认已是 Durable）**：gateway 的 HTTP / SSE / 渠道 / cron / memory / 生命周期全部跑在新存储上，`TursoStorage` 读改 4 条连接的池，本机真模型冒烟通过（见 `docs/komo_bot.md` §14）。下一步 D7（删旧 ledger 与 Legacy 代码）。进度与实现中的偏离见 §13。全部完成后改写 `docs/komo_bot.md` §8，本文留作推导记录。
 >
 > 对照基线：本机 `../pi` 提交 `8efd314fa` 的 `packages/durable`（`docs/spec.md` 为规范，`README.md`）。
 > pi-durable 自称 **Experimental**，API 随版本变；pi coding-agent 在这个提交上**并不依赖它**（仍是
@@ -377,7 +377,7 @@ pi-durable 没有删除。komo 保留 `closing → deleted → purged`：
 | D4a 无状态模型调用（**已完成 2026-10-23**） | 三家 provider 的 `ModelStream::stream`：每次给完整 context，返回一条 assistant 消息；路由 `RoutingStream` | 请求体与旧的有状态 driver 逐字节相同 |
 | D4b 生成与工具（**已完成 2026-10-23**） | `komo.generation` / `komo.tool`，收件箱与 boundary，`komo.live` 节流 | §5 恢复表逐行有测试；§8.6 中断正文逐字一致 |
 | D4c 压缩与其余工具（**已完成 2026-10-25**，在集成分支 `d4c`；`monitor` 的 gateway 一半在 D5，见 §13） | `komo.compaction`（阻塞与后台）、衰减写成 `edits`、上下文超长时压缩重试、codemode 嵌套调用、编排工具（`task` / `monitor`）、子进程 probe 阶段 | 现有 `tests/recovery`、`tests/agents` 的对应场景改写后通过 |
-| D5 gateway 与树 | 会话树映射到 fork、HTTP / SSE 改读新存储、`task` / cron / 投递 | §8.11 的端到端测试（`session_tree/tests.rs`）原样通过 |
+| D5 gateway 与树（**已完成 2026-10-25**，W0–W5，工作包与决定见 `docs/storage-durable-d5.md`） | 会话树映射到 fork、HTTP / SSE 改读新存储、`task` / cron / 投递；生产默认翻成 Durable；读连接池 | §8.11 的端到端测试（`session_tree/tests.rs`）在 Durable 下通过；本机真模型冒烟（新建 / 回复 / 分支 / 编辑历史输入 / 导出 / 重启后接着聊） |
 | D6 导出 | `komo session export SESSION_ID`：输出 pi v3 树形 JSONL（带 blob 引用）；不导入旧会话（§8） | 导出的文件能被 pi 的 session-manager 读入，分支与当前位置一致 |
 | D7 收尾 | 删旧 ledger 代码，改写 `docs/komo_bot.md` §8、AGENTS.md 结构规则、§14 验收表 | — |
 
@@ -630,7 +630,21 @@ finalize     → blob 收尾同步 → 提交结果 entry（projection.rs 的 fu
 - **D4c 的 probe**：没有杀进程的注入口（取消只在结果里说明子进程还在）；`bash` 转后台（`detach_after`）交给 gateway 的监听接手后，那条路径不写槽位也不进 probe；只有走 `run_child_detachable` 的工具会报告子进程（codemode worker、MCP 子进程不报）。
 - **压缩 · D5**：gateway 实现 `AgentHooks::compaction`（`[compaction]` 配置 → `CompactionSettings`，另加 `background_tokens` 的配置键；komo-agent 的摘要提示与摘要模型；默认实现只是"压缩关着 + pi 的提示"）；`/compact` 路由接 `Harness::compact`；`komo.live.compactions` / `compactionFailure` 还没有客户端展示；fork 不复制 document，所以 `compactionFailure`（"刚压失败过"）不随 fork 继承，其余在线状态是从 entry 折的、自然继承。
 - **压缩 · 真机**：Anthropic 的 `revised_from` 缓存断点只测到"请求里带了值"，没有对真 provider 验证过命中；摘要请求没有 `cacheRetention: none` 的对应选项（无状态调用没有这个旋钮），摘要请求会写进提示缓存。
-- **D5**：gateway 实现 `AgentHooks`（`ToolExecutor::tools()` 与 `RoutedOutputs::find_published` 已就绪）；`conversations.session_id` 现在总是 NULL，`/tree` 按 Session 查分支时补；`TursoStorage` 的读共用一条连接，读多了再换连接池。
+- **D5**：gateway 实现 `AgentHooks`（`ToolExecutor::tools()` 与 `RoutedOutputs::find_published` 已就绪）；`conversations.session_id` 现在总是 NULL，`/tree` 按 Session 查分支时补；（D5 W5 已做）`TursoStorage` 的读原先共用一条连接，W5 换成 4 条连接的池（`ReadPool`：信号量限并发、空闲连接放栈里、取消时丢掉在途的那条再现开）；提交线的单写连接与 `synchronous` 切换不变。
 - **崩溃安全**：进度提交 `synchronous=OFF` 后"进程崩溃不丢"是按机制推的，崩溃注入测试只跑在 tmpfs 上，没有真盘掉电验证。Turso 接线测试里的"重启"是关库再开库（干净关闭），不是杀进程。
 - **开发环境**：多个 worktree 共用一个 `target/` 时，cargo 可能复用别的 worktree 编出来的 crate；`scripts/install-local.sh` 现在在上一次不是本检出编的时候先 `touch` `crates/*/src/lib.rs`，但手动 `cargo test` 共用 target 前仍要自己 `touch crates/*/src/lib.rs`。
 
+### 13.x D5 完成记录（W5，2026-10-25）
+
+- **生产默认**：`StorageMode::default()` 与 `crates/komo` 的 `ServiceOptions` 都是 `Durable`；测试构造处（`TestGateway::with` / `GatewayBuilder` / `service/tests.rs`）都显式写存储模式，不受影响。Legacy 版测试留到 D7 与旧代码一起删。
+- **读连接池**（`komo-store/src/durable/storage.rs`）：`READ_CONNECTIONS = 4`。测试 `the_read_pool_serves_concurrent_reads_and_reopens_cleanly`：并发读、关闭后读是 `Closed`、同一目录连开三次（含一次从没写过的新文件）都不报 `database is locked`。W2b 的补读闸门 `READ_PERMITS` 保留为 2：每次提交耗时（debug，`concurrent_backfills_do_not_stall_commits`，40 次提交）——
+
+  | 配置 | 无读 | 20 路并发补读 | 补读次数 |
+  |---|---|---|---|
+  | 单连接 + 限 2 路（W2b） | 2.8 ms | 10.2–11.5 ms | 68–77 |
+  | **4 连接池 + 限 2 路（采用）** | 2.7–2.8 ms | **3.1–3.3 ms** | 58 |
+  | 池 + 限 4 路 | 2.7–2.9 ms | 6.2–7.6 ms | 144–153 |
+  | 池 + 不限 | 2.6–2.9 ms | 7.2–7.4 ms | 161–163 |
+
+  放得越宽补读吞吐越高，但多出来的补读是在抢 CPU（每次补读全量投影整段历史），提交延迟被拖到 2.5 倍；提交延迟更要紧，所以限 2 路、给提交的读留 2 条空闲连接。补读改成增量投影（W1a 的限制）之后再放宽。
+- **编译时间**（`cargo build --timings`，本机 6 job）：release `-p komo` 5 分 53 秒（含这次改动之前未编过的依赖）；dev 增量（改 `komo-store` 之后重编 store / runtime / gateway / komo）1 分 31 秒。冷编预算 60 秒（§13.4）仍超，原因与此前相同（Turso / toasty / reqwest 等依赖），不是 D5 引入。

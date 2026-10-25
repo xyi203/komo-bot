@@ -19,6 +19,7 @@ use komo_kernel::types::turn::LlmError;
 use serde_json::{Value, json};
 use tokio::sync::Notify;
 
+use super::super::hooks::HookError;
 use super::super::{COMPACTION_KIND, CompactionSettings, GENERATION_KIND, SummaryPrompt};
 use super::support::*;
 
@@ -527,6 +528,13 @@ async fn decay_is_one_edits_entry_and_the_short_view_is_identical_after_a_restar
         .unwrap();
     assert_eq!(results, [decayed.clone(), text_of_entry(second_result)]);
     assert_ne!(results[0], full);
+    // Anthropic 的缓存断点要补在第一条被换的结果之前：请求里它的下标（system、user、调用、结果）。
+    assert_eq!(
+        world.script.revised_froms(),
+        [None, None, Some(3)],
+        "{:?}",
+        outline(&requests[2])
+    );
 
     // 重启、再来一条输入：同一段前缀逐字节相同，也没有第二次衰减。
     let engine = world.restart(engine).await;
@@ -605,10 +613,7 @@ async fn an_overflow_is_compacted_once_and_the_request_is_resent() {
         4,
         "the overflowing request, then the resend"
     );
-    assert_eq!(
-        json_of(&requests[3][..2]).contains("OVERFLOW SUMMARY"),
-        true
-    );
+    assert!(json_of(&requests[3][..2]).contains("OVERFLOW SUMMARY"));
     assert_eq!(
         outline(&requests[3]),
         [
@@ -756,4 +761,176 @@ async fn a_restart_during_summarization_resumes_from_the_checkpoint() {
         "the turn went on with the summary"
     );
     engine.close().await.unwrap();
+}
+
+// ------------------------------------------------------------------ 取消与失败的清理
+
+/// 阻塞压缩在飞时取消 conversation：压缩随生成一起 abort（先于生成自己的 abort handler），
+/// 不写 entry，状态移除，输入 `unanswered{aborted}`。
+#[tokio::test(start_paused = true)]
+async fn aborting_during_a_blocking_compaction_aborts_both_without_a_summary() {
+    let world = World::new();
+    readers(&world, 2000);
+    windowed(&world, 1100);
+    world.hooks.set_compaction(true, settings(1, 100, 50));
+    world.script.push(call(&world, "c1", "read"));
+    world.script.push(call(&world, "c2", "rg"));
+    world.script.push_summary(Step::Hang);
+    let engine = world.open().await;
+    let id = world.submit(&engine, "go").await;
+    world
+        .until(|| async { world.script.summary_requests().len() == 1 })
+        .await;
+    world
+        .harness
+        .abort_conversation(&engine, CONV)
+        .await
+        .unwrap();
+    let settled = world.harness.wait(&engine, id).await.unwrap();
+    assert_eq!(unanswered(&settled).0, "aborted");
+    let compaction = world.tasks(COMPACTION_KIND).await.pop().unwrap();
+    assert!(matches!(outcome(&compaction), TaskOutcome::Aborted { .. }));
+    assert!(world.entries_of(COMPACTION_ENTRY_KIND).await.is_empty());
+    let live = world.live().await;
+    assert!(live.compactions.is_none() && live.run.is_none());
+    assert!(
+        live.compaction_failure.is_none(),
+        "an abort is not a failure"
+    );
+    engine.close().await.unwrap();
+}
+
+/// 压缩任务自己出错（钩子失败 → faulted）：调度器写的结局由清理移除状态、记下失败；等它的
+/// 生成读到 faulted，以 `model_error` 收场。
+#[tokio::test(start_paused = true)]
+async fn a_faulted_compaction_is_cleaned_up_and_fails_the_waiting_run() {
+    let world = World::new();
+    readers(&world, 2000);
+    windowed(&world, 1100);
+    world.hooks.set_compaction(true, settings(1, 100, 50));
+    world.script.push(call(&world, "c1", "read"));
+    world.script.push(call(&world, "c2", "rg"));
+    // 生成的三次 `prepare` 各问一次（放过），第四次问的是压缩任务的 `select`：让它失败。
+    world
+        .hooks
+        .fail_compaction_after(3, HookError::Failed("hook exploded".into()));
+    let engine = world.open().await;
+    let id = world.submit(&engine, "go").await;
+    let settled = world.harness.wait(&engine, id).await.unwrap();
+    let (reason, detail) = unanswered(&settled);
+    assert_eq!(reason, "model_error");
+    assert!(detail.contains("hook exploded"), "{detail}");
+    let compaction = world.tasks(COMPACTION_KIND).await.pop().unwrap();
+    assert!(matches!(outcome(&compaction), TaskOutcome::Faulted { .. }));
+    let live = world.live().await;
+    assert!(live.compactions.is_none());
+    assert_eq!(live.compaction_failure.unwrap().reason, "threshold");
+    engine.close().await.unwrap();
+}
+
+// ------------------------------------------------------------------ Turso
+
+/// 同一个超长救援场景跑在 komo-store 的 Turso `Storage` 上（真文件、真 fsync）：提交落了盘，
+/// 关库重开之后推导出的上下文与关库之前逐字节相同——摘要 entry 的 `head`、系统基线都在里面。
+#[tokio::test]
+async fn overflow_recovery_runs_on_the_turso_storage_and_replays_after_a_reopen() {
+    use komo_kernel::durable::storage::EntryQuery;
+    use komo_kernel::durable::{ScanOrder, Storage, derive_context};
+
+    use crate::durable::{Engine, EngineOptions};
+
+    let dir = tempfile::tempdir().unwrap();
+    let world = World::new();
+    readers(&world, 2000);
+    world.hooks.set_compaction(false, settings(1, 100, 50));
+    world.script.push(call(&world, "c1", "read"));
+    world.script.push(call(&world, "c2", "rg"));
+    world.script.push(too_long());
+    world.script.push(say(&world, "finished"));
+    world
+        .script
+        .push_summary(Step::Reply(text_reply("TURSO SUMMARY")));
+
+    let open = |storage: Arc<dyn Storage>| {
+        let registry = world.registry.clone();
+        let clock = world.clock.clone();
+        let hooks = world.harness.hooks();
+        async move {
+            let engine = Engine::open(
+                storage,
+                registry,
+                clock,
+                EngineOptions {
+                    close_storage: true,
+                    hooks,
+                    ..EngineOptions::default()
+                },
+            )
+            .await
+            .unwrap();
+            engine
+                .commit(|tx| {
+                    Box::pin(async move {
+                        if tx.conversation(CONV).await?.is_none() {
+                            tx.create_root_conversation().await?;
+                        }
+                        Ok(())
+                    })
+                })
+                .await
+                .unwrap();
+            engine.resume();
+            engine
+        }
+    };
+    let entries_of = |storage: Arc<dyn Storage>| async move {
+        let page = storage
+            .scan_entries(
+                &EntryQuery {
+                    order: Some(ScanOrder::Ascending),
+                    ..EntryQuery::new(CONV)
+                },
+                1000,
+                None,
+            )
+            .await
+            .unwrap();
+        page.items
+    };
+
+    let storage: Arc<dyn Storage> = Arc::new(
+        komo_store::durable::TursoStorage::open(dir.path())
+            .await
+            .unwrap(),
+    );
+    let engine = open(storage.clone()).await;
+    let id = world.submit(&engine, "go").await;
+    let settled = world.harness.wait(&engine, id).await.unwrap();
+    assert!(matches!(input_state(&settled), InputState::Done { .. }));
+    let before = derive_context(&entries_of(storage.clone()).await, None).messages;
+    assert_eq!(world.script.summary_requests().len(), 1);
+    engine.close().await.unwrap();
+
+    let reopened: Arc<dyn Storage> = Arc::new(
+        komo_store::durable::TursoStorage::open(dir.path())
+            .await
+            .unwrap(),
+    );
+    let entries = entries_of(reopened.clone()).await;
+    let summaries: Vec<_> = entries
+        .iter()
+        .filter(|entry| entry.kind == COMPACTION_ENTRY_KIND)
+        .collect();
+    assert_eq!(summaries.len(), 1);
+    assert_eq!(data_of(summaries[0])["decision"]["context_overflow"], true);
+    assert_eq!(
+        json_of(&derive_context(&entries, None).messages),
+        json_of(&before)
+    );
+    assert_eq!(
+        text_of(&before[1]),
+        wrap_summary("TURSO SUMMARY"),
+        "the summary leads the context after the baseline system message"
+    );
+    reopened.close().await.unwrap();
 }

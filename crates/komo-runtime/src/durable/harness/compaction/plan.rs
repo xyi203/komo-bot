@@ -229,3 +229,287 @@ pub fn plan_overflow(
     .forced_by_overflow();
     decision.compact.then_some((decision, cut))
 }
+
+#[cfg(test)]
+mod tests {
+    use komo_kernel::compaction::CompactionEconomics;
+    use komo_kernel::durable::{ContentBlock, ConversationId, EntryId, StopReason, derive_context};
+    use serde_json::json;
+
+    use super::*;
+
+    const CONV: ConversationId = ConversationId::new(1);
+
+    fn settings(background: u64) -> CompactionSettings {
+        CompactionSettings {
+            economics: CompactionEconomics {
+                window_reserve_tokens: 100,
+                ..CompactionEconomics::default()
+            },
+            cache_write_read_ratio: Some(12.5),
+            keep_recent_tokens: 1,
+            memo_tokens: 50,
+            max_context_tokens: 10_000_000,
+            background_tokens: background,
+        }
+    }
+
+    fn setup(enabled: bool, background: u64) -> CompactionSetup {
+        CompactionSetup {
+            enabled,
+            settings: settings(background),
+            model: model(1100),
+            prompt: Default::default(),
+            retry: Default::default(),
+            cache_key: None,
+        }
+    }
+
+    fn model(window: u64) -> ModelConfig {
+        ModelConfig {
+            provider: "responses".into(),
+            base_url: "http://localhost".into(),
+            model: "m".into(),
+            api_key_env: "KEY".into(),
+            auth: None,
+            effort: None,
+            efforts: None,
+            timeout_secs: 5,
+            context_window: Some(window),
+        }
+    }
+
+    fn entry(n: u64, kind: &str, message: Message) -> EntryRecord {
+        EntryRecord::new(EntryId::new(n), CONV, kind).with_model(vec![message])
+    }
+
+    /// 用户 · 调用 c1 · 结果 c1（`bytes` 字节，带 decayed）· 调用 c2 · 结果 c2 · 回答。
+    fn history(bytes: usize) -> Vec<EntryRecord> {
+        let call = |id: &str| {
+            Message::assistant(
+                vec![ContentBlock::tool_call(id, "read", json!({}))],
+                StopReason::ToolUse,
+                1,
+            )
+        };
+        let result = |n: u64, id: &str| {
+            entry(
+                n,
+                "komo.tool-result",
+                Message::tool_result(id, "read", "x".repeat(bytes), 1),
+            )
+            .with_data(json!({ "decayed": "short" }))
+        };
+        vec![
+            entry(1, "komo.user", Message::user("go", 1)),
+            entry(2, "komo.assistant", call("c1")),
+            result(3, "c1"),
+            entry(4, "komo.assistant", call("c2")),
+            result(5, "c2"),
+            entry(
+                6,
+                "komo.assistant",
+                Message::assistant(vec![ContentBlock::text("ok")], StopReason::Stop, 1),
+            ),
+        ]
+    }
+
+    const POLICY: DecayPolicy = DecayPolicy {
+        threshold_bytes: 100,
+        full_sends: 1,
+        head_bytes: 10,
+        tail_bytes: 10,
+    };
+
+    fn run(
+        entries: &[EntryRecord],
+        online: &OnlineState,
+        setup: &CompactionSetup,
+        decay: Option<DecayPolicy>,
+        cold: bool,
+        running: bool,
+    ) -> Plan {
+        let view = derive_context(entries, None);
+        let model = setup.model.clone();
+        plan(PlanInput {
+            entries,
+            view: &view,
+            planned: &[],
+            online,
+            setup,
+            model: &model,
+            decay,
+            cache_cold: cold,
+            compaction_running: running,
+        })
+    }
+
+    fn no_decay(setup: &CompactionSetup, entries: &[EntryRecord], online: &OnlineState) -> Plan {
+        run(entries, online, setup, None, false, false)
+    }
+
+    #[test]
+    fn nothing_happens_below_the_window_and_with_a_warm_cache() {
+        let entries = history(400);
+        let online = OnlineState::default();
+        assert!(matches!(
+            run(
+                &entries,
+                &online,
+                &setup(true, 0),
+                Some(POLICY),
+                false,
+                false
+            ),
+            Plan::Nothing
+        ));
+    }
+
+    #[test]
+    fn a_cold_cache_decays_what_is_eligible_without_pressure() {
+        let entries = history(400);
+        let online = OnlineState::default();
+        let plan = run(
+            &entries,
+            &online,
+            &setup(true, 0),
+            Some(POLICY),
+            true,
+            false,
+        );
+        let Plan::Decay {
+            candidates,
+            decision,
+        } = plan
+        else {
+            panic!("decay expected, got {plan:?}");
+        };
+        assert_eq!(candidates.len(), 2, "both results were sent at least once");
+        assert_eq!(
+            decision.reason,
+            komo_kernel::compaction::CompactionReason::CacheCold
+        );
+        assert_eq!(decision.debt().debt_tokens, 0.0);
+        // 没有衰减策略就没有什么可换的：冷了也什么都不做。
+        assert!(matches!(
+            run(&entries, &online, &setup(true, 0), None, true, false),
+            Plan::Nothing
+        ));
+    }
+
+    #[test]
+    fn pressure_prefers_decay_over_compaction_and_compaction_needs_enabled() {
+        let entries = history(2000);
+        let online = OnlineState::default();
+        assert!(matches!(
+            run(
+                &entries,
+                &online,
+                &setup(true, 0),
+                Some(POLICY),
+                false,
+                false
+            ),
+            Plan::Decay { .. }
+        ));
+        assert!(matches!(
+            no_decay(&setup(true, 0), &entries, &online),
+            Plan::Compact { .. }
+        ));
+        assert!(matches!(
+            no_decay(&setup(false, 0), &entries, &online),
+            Plan::Nothing
+        ));
+    }
+
+    #[test]
+    fn a_rewrite_right_after_a_rewrite_waits_for_a_real_request() {
+        let entries = history(2000);
+        let mut online = OnlineState::default();
+        online.record_compaction(Default::default());
+        assert!(matches!(
+            no_decay(&setup(true, 0), &entries, &online),
+            Plan::Nothing
+        ));
+        online.record_provider_request(Some(10));
+        assert!(matches!(
+            no_decay(&setup(true, 0), &entries, &online),
+            Plan::Compact { .. }
+        ));
+    }
+
+    #[test]
+    fn a_refused_summary_is_not_asked_for_again_under_window_pressure() {
+        let entries = history(2000);
+        let mut online = OnlineState::default();
+        online.record_skipped(true);
+        assert!(matches!(
+            no_decay(&setup(true, 0), &entries, &online),
+            Plan::Nothing
+        ));
+        online.record_tool_work();
+        assert!(matches!(
+            no_decay(&setup(true, 0), &entries, &online),
+            Plan::Compact { .. }
+        ));
+    }
+
+    /// 阻塞阈值 1000：压完还剩的比阈值多就是白压，先不压。
+    #[test]
+    fn compaction_that_would_still_leave_the_context_over_the_threshold_is_not_started() {
+        let mut entries = history(2000);
+        // 切点之后留下一条巨大的输入：压掉前面也降不到阈值以下。
+        entries.push(entry(7, "komo.user", Message::user("y".repeat(8000), 1)));
+        let online = OnlineState::default();
+        assert!(matches!(
+            no_decay(&setup(true, 0), &entries, &online),
+            Plan::Nothing
+        ));
+    }
+
+    #[test]
+    fn the_background_threshold_starts_a_background_compaction_below_the_blocking_one() {
+        // 约 800 token：在 1000 之下、600 之上。
+        let entries = history(1500);
+        let online = OnlineState::default();
+        assert!(matches!(
+            no_decay(&setup(true, 400), &entries, &online),
+            Plan::Background { .. }
+        ));
+        // 默认（0）不启用；已有压缩在跑不再起；压缩关着不起。
+        assert!(matches!(
+            no_decay(&setup(true, 0), &entries, &online),
+            Plan::Nothing
+        ));
+        assert!(matches!(
+            run(&entries, &online, &setup(true, 400), None, false, true),
+            Plan::Nothing
+        ));
+        assert!(matches!(
+            no_decay(&setup(false, 400), &entries, &online),
+            Plan::Nothing
+        ));
+    }
+
+    #[test]
+    fn overflow_recovery_is_forced_once_per_summary_and_needs_something_to_cut() {
+        let entries = history(2000);
+        let view = derive_context(&entries, None);
+        let settings = settings(0);
+        let model = model(1_000_000);
+        let online = OnlineState::default();
+        let (decision, cut) =
+            plan_overflow(&view, &online, &settings, &model, false).expect("forced");
+        assert!(decision.compact && decision.context_overflow);
+        assert_eq!(cut.first_kept, EntryId::new(6));
+        // 刚压成摘要、之后一次成功的请求都还没有：再压只会转圈。
+        let mut after_summary = OnlineState::default();
+        after_summary.record_compaction(Default::default());
+        assert!(plan_overflow(&view, &after_summary, &settings, &model, false).is_none());
+        after_summary.record_provider_request(Some(1));
+        assert!(plan_overflow(&view, &after_summary, &settings, &model, false).is_some());
+        // 一条输入：没有可收的。
+        let lone = derive_context(&entries[..1], None);
+        assert!(plan_overflow(&lone, &online, &settings, &model, false).is_none());
+    }
+}

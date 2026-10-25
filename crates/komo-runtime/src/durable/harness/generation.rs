@@ -89,6 +89,8 @@ pub struct Limits {
     pub max_tokens: Option<u64>,
 }
 
+// 每次只造一个、立刻编码进任务记录，装箱省不了什么。
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(
     tag = "phase",

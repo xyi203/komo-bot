@@ -273,6 +273,7 @@ pub struct Script {
     requests: Mutex<Vec<Vec<Message>>>,
     times: Mutex<Vec<i64>>,
     models: Mutex<Vec<ModelConfig>>,
+    revised: Mutex<Vec<Option<usize>>>,
     clock: Arc<TokioClock>,
 }
 
@@ -285,6 +286,7 @@ impl Script {
             requests: Mutex::new(Vec::new()),
             times: Mutex::new(Vec::new()),
             models: Mutex::new(Vec::new()),
+            revised: Mutex::new(Vec::new()),
             clock,
         })
     }
@@ -320,6 +322,11 @@ impl Script {
 
     pub fn request_times(&self) -> Vec<i64> {
         self.times.lock().unwrap().clone()
+    }
+
+    /// 每次主请求带的 `revised_from`（衰减那一轮 Anthropic 缓存断点要用）。
+    pub fn revised_froms(&self) -> Vec<Option<usize>> {
+        self.revised.lock().unwrap().clone()
     }
 
     pub fn models(&self) -> Vec<ModelConfig> {
@@ -382,6 +389,10 @@ impl ModelStream for Script {
                 .push(request.messages.to_vec());
             self.times.lock().unwrap().push(self.clock.now_ms());
             self.models.lock().unwrap().push(request.model.clone());
+            self.revised
+                .lock()
+                .unwrap()
+                .push(request.options.revised_from);
             self.steps
                 .lock()
                 .unwrap()
@@ -656,6 +667,8 @@ struct HookState {
     /// 压缩钩子的答案（设置、摘要提示）；没设就走 trait 的默认（压缩关着）。
     compaction: Option<CompactionSettings>,
     compaction_enabled: bool,
+    /// 先放过这么多次 `compaction()`，再失败一次。
+    compaction_failure: Option<(usize, HookError)>,
 }
 
 /// 测试里的钩子：D5 由 gateway 实现的那个东西的替身。每个决定点都按当前内容重新答。
@@ -694,6 +707,7 @@ impl TestHooks {
                 tools_failure: None,
                 compaction: None,
                 compaction_enabled: false,
+                compaction_failure: None,
             }),
         })
     }
@@ -729,6 +743,12 @@ impl TestHooks {
     /// 工具结果的投影设置（衰减策略在里面）。
     pub fn set_projection(&self, projection: ProjectionContext) {
         self.state.lock().unwrap().env.projection = projection;
+    }
+
+    /// 放过 `skip` 次 `compaction()` 之后失败一次（`setup()` 不受影响）：生成的每次 `prepare`
+    /// 都问一次，所以跳过那几次就能让之后问的压缩任务 faulted。
+    pub fn fail_compaction_after(&self, skip: usize, failure: HookError) {
+        self.state.lock().unwrap().compaction_failure = Some((skip, failure));
     }
 
     pub fn set_failure(&self, failure: Option<HookError>) {
@@ -775,7 +795,12 @@ impl AgentHooks for TestHooks {
 
     async fn compaction(&self, conversation: ConversationId) -> Result<CompactionSetup, HookError> {
         let setup = self.setup(conversation, &[]).await?;
-        let state = self.state.lock().unwrap();
+        let mut state = self.state.lock().unwrap();
+        match state.compaction_failure.take() {
+            Some((0, failure)) => return Err(failure),
+            Some((skip, failure)) => state.compaction_failure = Some((skip - 1, failure)),
+            None => {}
+        }
         Ok(CompactionSetup {
             enabled: state.compaction_enabled,
             settings: state.compaction.clone().unwrap_or_default(),

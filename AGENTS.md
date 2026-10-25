@@ -40,21 +40,29 @@ The full command table is §3 of the design.
 ## Crate layout (§13.4)
 
 ```text
-komo-kernel    value types, state machines, events + fold, cron math,
-               §8.4 recovery decision table, wire protocol, ALL traits.
-               No tokio, no I/O. lib.rs is module declarations only.
-komo-store     session_log (JSONL) · payloads · tool_output · Turso Db + toasty
-               models + *_TABLE_DDL · repositories · Coordinator (impl Ledger).
-               The only crate that sees toasty/turso.
-komo-runtime   agent loop · executor · tools/{read,write,edit,rg,bash} ·
-               codemode (Monty worker) · memory · llm · embedding ·
-               scheduler · recovery · config.
+komo-kernel    value types, `durable/` (entry · conversation · task · submission ·
+               document records, context derivation, fork, Task state machine,
+               compaction logic, `Storage` trait + in-memory impl + conformance,
+               `pi_tree` / `legacy_events` projections), cron math, §8.4 recovery
+               table, wire protocol, ALL traits. No tokio, no I/O.
+               lib.rs is module declarations only.
+komo-store     `durable/`: `Line` (the single commit line), Turso `Storage`, DDL,
+               blob writes, id high-water mark — raw `turso`, no toasty.
+               Plus `aux.db`: toasty models + *_TABLE_DDL · repositories (cron,
+               deliveries, memory) · tool_output. The only crate that sees
+               toasty/turso.
+komo-runtime   `durable/`: Task engine + harness (generation / tool / inbox /
+               compaction / orchestration / codemode, the agent loop organised
+               by pi's hooks) · tools/{read,write,edit,rg,bash} ·
+               codemode (Monty worker) · memory · llm (stateless `ModelStream`) ·
+               embedding · cron scheduler · config.
 komo-agent     AgentProfile → 能力面选择 · skills 发现与目录 · 编排操作名 ·
-               上下文装配（context：ContextInput → AgentContext，系统提示、回放、记忆段）。
+               系统段装配（context：system_sections、task_contract_block、project_update_block，压缩摘要提示）。
                只依赖 kernel，不执行；runtime 不依赖它，Gateway 组装两边。
-               值类型（AgentProfile/AgentSurface/RunSnapshot）留在 kernel。
-komo-gateway   axum routes · SSE · auth · lock/discovery · launchd/systemd ·
-               Dispatcher · channels/{feishu,telegram,wechat} (feature-gated) ·
+               值类型（AgentProfile/AgentSurface）留在 kernel。
+komo-gateway   axum routes (`http/v2`) · `service/durable` (DurableCore: hooks,
+               sessions/tree, feed, lifecycle) · SSE · auth · lock/discovery ·
+               launchd/systemd · Dispatcher · channels/{feishu,telegram,wechat} (feature-gated) ·
                Notifier · deliveries · intervention rendering · config reload.
 komo-client    HTTP + SSE client · discovery · ratatui TUI · command output.
                Depends on kernel only.
@@ -71,39 +79,54 @@ depends on `agent`; `client` knows only protocol types.
 
 - **Gateway is the only process that opens state.** CLI and TUI go over
   HTTP/SSE; there is no direct-db path (§3).
-- **Content authority is the Session directory, scheduling authority
-  is state.db** (§8.2). Write order per §8.5: external body → JSONL
-  append + `sync_all` → db transaction. Never the other way round.
-- **Nothing rewrites a JSONL line.** Cancellation, interjection, compaction are
-  appended events; `fold` decides what they mean. Unknown event types keep
-  their seq and mean nothing (§8.3).
+- **`durable.db` is the single authority** (§8.2): conversation content
+  (entries), Run/call state (tasks, submissions), mutable state (documents),
+  lifecycle — one commit line, one transaction per commit, nothing observable
+  before it commits. Big bodies (tool output, images, artifacts) live in the
+  Session directory as *side-effect products*: write the file and sync it
+  first, then commit the entry that references it. There is no second
+  authority and no events.jsonl (that is only the export format).
+- **Entries are immutable.** Cancellation, interjection, compaction, decay are
+  appended entries; rewriting is a write entry's `edits` (replace/omit a
+  target's model view) or `head` (where context starts), never an update
+  (§8.1, §8.3).
 - **There is no Policy and no approval** (§7, removed 2026-10-11). What the
   model asks, komo executes once the tool's own `prepare` and the capability
-  surface accept it; `Tool::execute` takes the `ExecutionPlan`. Old approval
-  traces must still decode (§7.4): `approval.*` events mean nothing, a Run left
-  `waiting + approval` resumes as approved, retired delivery/outbox rows are
-  skipped and never block a flush.
+  surface accept it; `Tool::execute` takes the `ExecutionPlan`. Nothing
+  migrates from the old store (§8): old `sessions/*/events.jsonl` and
+  `state.db*` stay on disk, unread.
 - **The only hard limit lives in the tools:** `write`/`edit` refuse komo's own
-  state (`sessions/`, `state.db*`, `durable.db*`, `aux.db*`, `runtime/`, `.env` under the data dir).
+  state (`sessions/`, `durable.db*`, `aux.db*`, `runtime/`, `.env` under the data dir; the
+  list also keeps the old `state.db*`).
   bash cannot be stopped; real boundaries come only from an execution
   environment (codemode's Monty engine: no network or subprocesses, files
   read-only with the same protected list denied even for reads, except
   `sessions/`, which `read` and bash can read anyway; it runs in a
   `komo __codemode-worker` child the host can kill).
-- **Recovery decides "did it happen" before "retry"** (§8.4 table, §8.6).
-  `started` alone proves nothing. A started call without a result reruns only
-  when both the plan's stored replay policy and the tool's current
-  `Tool::replay` are `Safe` (pi-durable's rule; default `Unsafe`); otherwise it
-  settles as `uncertain` with the partial output it left on disk and goes to
-  the model — the executor never silently re-runs it.
-- **Tool result 的模型视图只有一处投影**（`komo-kernel/src/projection.rs`）。输入只有落盘的
-  事实（完整 JSONL 事件 + `output.json` / stdout / stderr 引用；旧行的 `text_ref` 与 ≤1 KiB
-  `preview` 只作兼容读取），所以"刚跑完"与"重启后回放"必须逐字节相同。full 视图默认最多
-  50 KiB 或 2000 行（二者先到）：`bash` 留尾（旧记录里叫 `shell`，两个名字都认），其他工具留头；超限时必须给出可
-  `read` 的完整 `artifact://` 引用。`[execution] model_result_bytes` 可收紧字节预算；当前
-  Session 的 `tool-output/` 与 `artifacts/` 是只读根。大结果给哪个视图由 `projection.rs` 的
-  `select` 按 `context.compacted` 的 `decayed` 记下的集合选；decay 只改模型视图，不改完整
-  记录，换不换仍由缓存账决定（`compaction::decide`），前缀默认只追加。
+- **Side effects are an effect sandwich** (§8.5): commit the intent (the
+  `komo.live` slot + the `execute` checkpoint carrying the full
+  `ExecutionPlan`), do the effect, finish the blob (sync → rename → sync dir),
+  then commit the result entry. No intent, no effect; no blob before its
+  reference. Effects that are not tools (task spawn, monitor registration, cron
+  firing) do the same: effect and checkpoint advance in one commit, the result
+  in the next.
+- **Recovery follows the §5 table of `docs/storage-durable.md` (§8.4, §8.6):**
+  `running` tasks go back to `pending` and resume at their checkpoint phase;
+  a tool task at `execute` first reuses a complete, hash-checked `output.json`,
+  then reruns only when both the stored replay policy and the tool's current
+  `Tool::replay` are `Safe` (default `Unsafe`), otherwise it settles as
+  `uncertain` with the `.partial` tail and goes to the model — the engine never
+  silently re-runs it. A recorded live child process is `probe`d every beat
+  (`Unknown` counts as alive) before that decision. Startup reconcile only
+  checks that referenced blobs are readable; one that is not faults that task.
+- **Tool result 的模型视图只有一处投影**（`komo-kernel/src/projection.rs`），**收尾时算一次、
+  存进结果 entry 的 `model`**，所以"刚跑完"与"重启后回放"逐字节相同（存下的就是那份）。
+  输入只有落盘的事实（完整 `output.json` / stdout / stderr blob）。full 视图默认最多
+  50 KiB 或 2000 行（二者先到）：`bash` 留尾（旧名 `shell` 也认），其他工具留头；超限时必须给出可
+  `read` 的完整 `artifact://<conversation>/<task>/<attempt>/result` 引用。`[execution] model_result_bytes`
+  只影响之后落的结果；当前 Session 的 `tool-output/` 与 `artifacts/` 是只读根。衰减写成一条
+  `komo.decay` entry，只带 `edits`（`replace` 成 `data.decayed` 的短视图），回放按 edits 选视图；
+  decay 只改模型视图，不改完整 blob，换不换由缓存账决定（`compaction::decide`），前缀默认只追加。
 - **Channel identity lives in config, not the db** (§11.2): `allow_from` /
   `home_chat` / `groups` in `config.toml`, credentials in `.env`. No pairing
   table, no `/sethome`.
@@ -113,21 +136,24 @@ depends on `agent`; `client` knows only protocol types.
   `crates/komo/src/update.rs` — change one, change all three. The tag must
   equal `[workspace.package].version`, or `komo update` refuses the package.
 - **Config hot-reloads** (§3): one `Arc<ConfigSnapshot>` swapped atomically;
-  readers read the current snapshot per use, running Runs keep the snapshot
-  they started with. An invalid file is never installed. A short list of keys
+  readers read the current snapshot per use (every phase resolves Agent/model by
+  name; an already-started `request` keeps the model/effort frozen in its checkpoint). An invalid file is never installed. A short list of keys
   is start-only and is *reported* as such, never ignored.
-- **Schema changes are additive.** `*_TABLE_DDL` beside each toasty model,
-  byte-parity test against what toasty generates; a file DB is migrated *before*
-  the pool is built (`Db::connect` → `migrate_file`, a plain non-MVCC connection
-  — DDL on an MVCC connection returns `Ok` and persists nothing), and
-  `ensure_schema` then only guards (errors if a file DB still misses a column)
-  and repairs memory DBs; retired columns keep being written empty (§8.2).
-- **Turso MVCC**: string UUIDv7 keys, never AUTOINCREMENT; single writes in
-  `with_write_retry`, multi-write in a transaction inside it.
+- **Two databases, two regimes.** `durable.db` (new file, Turso **WAL**, single
+  write line): bare `turso` SQL only in `komo-store/src/durable/{schema,write,line,storage}.rs`,
+  `PRAGMA synchronous=FULL` per structural commit and `OFF` for explicit progress commits,
+  `data_sync_retry=1`, ids are global monotonic numbers minted on the line with a
+  persisted high-water mark (never reused; not AUTOINCREMENT), closures never `await`
+  models/subprocesses/files/users, a storage error fails the whole line. Schema is a
+  `*_TABLE_DDL` constant per table with a byte-parity test; additive after the first
+  version. `aux.db` (cron, deliveries, memory) is still toasty + Turso MVCC: DDL
+  before the pool on a plain connection (MVCC DDL persists nothing), writes in a
+  transaction inside `with_write_retry`, string UUIDv7 keys, retired columns keep
+  being written empty.
 
 ## Coding style
 
-- `dyn` at seams (`Arc<dyn Ledger>`, `Vec<Box<dyn Tool>>`), no generic
+- `dyn` at seams (`Arc<dyn Storage>`, `Arc<dyn ModelStream>`, `Vec<Box<dyn Tool>>`), no generic
   executors. `async_trait` for async traits.
 - Derive macros: `serde`, `thiserror::Error`, `toasty::Model` (store only),
   `clap::Parser` (bin only). No `strum`, `derive_more`, `bon`.
@@ -148,6 +174,10 @@ commands run, terminal output when CLI behavior changes.
 
 - Design: `docs/komo_bot.md` (§14 has the acceptance table and the
   "pending verification" list — write verified facts back there).
+- Storage and agent loop (the pi-durable commit model): `docs/storage-durable.md`
+  (derivation, deviations, progress) and `docs/storage-durable-d5.md` (gateway wiring);
+  `docs/session-tree.md` (forks), `docs/background-tasks.md`, `docs/monitor.md`,
+  `docs/codemode.md` describe the pieces on top of it.
 - Memory: `docs/memory.md` — §9 spec, planned memory designs, and memory
   research/analysis appendices. Memory changes update this file, not a new one.
 - Observability: `docs/observability.md` — OpenTelemetry traces/metrics, logs,

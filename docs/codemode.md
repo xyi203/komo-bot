@@ -2,13 +2,14 @@
 
 > 状态：已实现 Monty 引擎与持久化子调用（2026-10-15 起引擎由"CPython + 操作系统沙箱"换成 pydantic
 > Monty；此前的实现见 git 历史）。脚本在 komo 自己起的 worker 子进程里跑，工具调用由宿主执行；
-> 允许只读工具及有副作用 MCP；文件**只读**，写文件走 write / edit / bash。恢复借鉴 pi-durable 的子调用
-> 稳定 key、已存/当前 replay 双 Safe 与结果交付 journal；脚本的时钟与随机数经宿主、进 journal，
-> 恢复时整段重跑、已记录的原样回放、越过记录之后照常执行（§7）。设计权威为 `docs/komo_bot.md`。
+> 允许只读工具及有副作用 MCP；文件**只读**，写文件走 write / edit / bash。
 >
-> 新存储（`docs/storage-durable.md`）下，§3、§5、§7 的 journal 换成外层任务名下的嵌套工具任务、
-> `komo.nested` 槽位与时钟 / 熵的 memo：见那份文档 §4.7 与 §13；规则（双 Safe、unsafe 不重做、分歧即
-> uncertain）不变。
+> **2026-10-25 起跑在新存储上**（`docs/storage-durable.md` §4.7、§13.2）：外层是一个 `komo.tool` 任务，
+> 脚本里每个子调用是它名下一个 `kind: "nested"` 的工具子任务，交付结果记在 task 级 document `komo.nested`
+> 的槽位里，时钟 / 随机数的宿主应答与脚本指纹是外层任务的 **memo**；恢复时整段重跑、已记录的原样回放、
+> 越过记录之后照常执行（§7）。旧的 `codemode.journal`（`intent` / `started` / `delivered` / `finished` / `nondet`
+> 事件）已在 v0.8 存储重写中移除。双 Safe、unsafe 不重做、分歧即 uncertain 的规则不变。设计权威为
+> `docs/komo_bot.md`。
 
 ## 1. 要解决什么
 
@@ -62,11 +63,11 @@ Monty 是 Rust 写的 Python 子集解释器，语言本身没有文件、网络
                            输出（text() 与 print）落进这次调用的 stdout，回到模型
 ```
 
-- **外层是一次普通调用**：`tool.planned` / `tool.started` / `tool.result` 照常落账，输出照常
-  投影（§8.3）。
-- **内层调用单独持久化**：`codemode.journal` 按父 Run / Call 隔离；完整参数、计划和交付结果
-  外置到同一 Session 的 `tool-output/`。这些事件不生成顶层 `tool.result`，kernel fold 不把它们
-  加入模型消息；父结果仍经唯一的 `projection.rs` 投影。父 `result.calls` 只保留有上限的摘要。
+- **外层是一次普通调用**：一个 `komo.tool` 任务，意图 checkpoint 与结果 entry 照常（`docs/komo_bot.md` §8.5），输出照常投影（§8.3）。
+- **内层调用是外层名下的嵌套工具任务**：输入 `{kind: "nested", parent, key: "c<n>", callId: "<外层 callId>/c<n>", name, arguments}`，
+  `Ownership::Task(外层)`，与 task 级 document `komo.nested` 里 key 为 `c<n>` 的槽位（`{taskId, name, arguments, result?}`）
+  **在同一次提交里建出**；嵌套任务终结的那笔提交把交给脚本的结果写进槽位的 `result`。结果不进 transcript，
+  外层终结时槽位随它退役；父结果的 `result.calls` 只保留有上限的摘要。嵌套任务自己的输出照常落在它的尝试目录。
 - codemode 可能包含远端写操作，整体是调度屏障，不与同一轮其他只读调用并行。
 
 ## 4. worker 与限制
@@ -84,10 +85,10 @@ Monty 是 Rust 写的 Python 子集解释器，语言本身没有文件、网络
     装配时交给 `Worker::protecting`，随请求发进 worker）。符号链接指到状态里也认得出（比对的是真实路径）；硬链接认不出。
   - 写类一律拒：`write_text` / `write_bytes` / append / `mkdir` / `unlink` / `rmdir` / `rename` / `open` 的
     `w` `a` `x` 模式，`PermissionError`，消息指路"用 write / edit 工具"。挂载本身也是只读的，是第二道。
-  - 读到的是读的那一刻的磁盘，**不进 journal**；恢复时重读，内容变了会在后面的调用参数上露出（§7）。
+  - 读到的是读的那一刻的磁盘，**不记账**；恢复时重读，内容变了会在后面的调用参数上露出（§7）。
   - 挂载（cap-std）不跟绝对路径的符号链接，所以交给它的是已经解掉链接的真实路径；`is_symlink` 看链接本身，不改写。
 - 环境变量：`os.getenv` 回默认值、`os.environ` 为空。
-- 时钟与随机数：`time.*`、`datetime.now()`、`date.today()`、`os.urandom`、`random` 的起始状态都经宿主回答并进 journal
+- 时钟与随机数：`time.*`、`datetime.now()`、`date.today()`、`os.urandom`、`random` 的起始状态都经宿主回答并记进外层任务的 memo
   （Monty 的 `DateTimeSource::CallHost` / `RandomStart::CallHost`，见 §7）。`time.sleep` 在 worker 里睡
   （Monty 每次最多 10 s），总时间受墙钟限制，到点整个 worker 被杀。
 - worker 进程环境变量全清，不给 `LANG` 也不给任何凭证；stdin / stdout 只走协议，脚本的 `print`
@@ -121,7 +122,7 @@ worker → 宿主   {"call": name, "args": {…}}（等答复）、{"os": {"op":
 | 墙钟：`[execution] call_timeout_secs`（含等工具返回的时间） | 宿主 | SIGKILL，`脚本超时（Ns），已终止` |
 | 内存：1 GiB 常驻内存 | 宿主每 100 ms 读 worker 的 RSS（macOS `proc_pid_rusage`、Linux `/proc/<pid>/statm`），超了 SIGKILL；Monty 另有同值的 `max_memory` 软限，预检单次大分配 | `脚本内存超限（…），已终止` / 脚本里 `MemoryError` |
 | 取消 | 宿主：丢掉执行 future，`kill_on_drop` SIGKILL worker | 没有跨线程中断入口，只能杀进程；在途子调用沿用 §7 的恢复规则 |
-| 子调用次数：256 | worker 数，journal 再核一遍 | 脚本里 `ToolError`；journal 侧越界是宿主终止条件 |
+| 子调用次数：256 | worker 数，宿主再核一遍 | 脚本里 `ToolError`；宿主侧越界是宿主终止条件 |
 | 输出：`print` 与 `text()` 各 1 MiB | worker | 脚本里抛错 |
 | 递归深度 | Monty 默认 1000 | `RecursionError` |
 
@@ -144,14 +145,15 @@ Monty 的 `max_turn_duration` 不含等宿主答复的时间，所以墙钟由�
    MCP 写也可能已经做了（2026-10-13/14 十二次）。`getattr` 之类的绕法认不出，照样在这一步与第 2 步拒。
 2. `tool.prepare(args)` 验证参数和约束。允许 `ReadFile`（read、rg）与 `McpCall`（含写操作）；
    本地 write / edit / bash、编排、`then_run` 仍在脚本外执行。
-3. 完整参数、准备计划与 `plan.recovery.replay().and(tool.replay())` 先发布外置正文，再同步追加
-   `intent` 记录。`started` 记录提交成功之后才允许执行工具。
-4. 流式 stdout / stderr 保存在子调用自己的尝试目录；工具返回后发布完整原始输出，再发布
-   脚本将接收的精确 dict 或错误。`delivered` 记录引用这些已发布内容，提交后才回送 Python。
+3. 嵌套任务走和顶层调用同一条 `call → execute → 结果`：能力面（`ToolSet::get`）、`NOT_IN_SCRIPTS`、`Tool::prepare`、
+   只放行 `ReadFile` / `McpCall` 且没有 `then_run`，意图 checkpoint（完整 `ExecutionPlan` 与 `plan.recovery.replay().and(tool.replay())`）
+   提交成功之后才允许执行工具。
+4. 流式 stdout / stderr 保存在嵌套任务自己的尝试目录（`tool-output/{conversation}/{嵌套任务}/{attempt}/`）；工具返回后发布完整原始输出，
+   再在一次提交里终结嵌套任务并把脚本将接收的精确 dict 或错误写进 `komo.nested` 的槽位（`commit_nested`），之后才回送 Python。
+   和顶层调用不同的只有：没有 `komo.live` 槽位（意图就是 checkpoint）、不发布运行中的输出尾巴、`detach_after` 取消、结果不进 transcript。
+   被拒的是已落盘的失败结果（脚本里的 `ToolError`，可接住）。
 
-顺序复用现有 `ToolOutputStore::publish` 与 `Ledger::append_audit`：外部正文同步/原子发布 →
-JSONL append + sync → 日志索引数据库事务。这里没有子调用调度行，也没有 control_outbox 决策；
-`append_audit` 仅复用 Coordinator 的串行追加、幂等 event_id 和索引提交机制。Gateway 是唯一开 state 的进程。
+外部正文先同步 / 原子发布、再提交引用它的记录（effect sandwich），与顶层调用相同；没有子调用调度行，也没有另一套日志。Gateway 是唯一开 state 的进程。
 
 返回给脚本的 dict 保持原有接口：
 
@@ -160,11 +162,11 @@ JSONL append + sync → 日志索引数据库事务。这里没有子调用调�
 ```
 
 普通执行/参数/不支持操作的错误可被 `try/except ToolError` 捕获；这些结果也持久化。
-**uncertain、journal 读写/校验失败、恢复分歧是宿主终止条件**：宿主锁住错误，后续任何子调用都不执行，
+**uncertain、`komo.nested` 读写/校验失败、恢复分歧是宿主终止条件**：宿主锁住错误，后续任何子调用都不执行，
 父结果记为 uncertain 并返回模型。脚本捕获异常或伪造 done 不能解除该状态；模型据此核对外部状态。
 stdout/stderr 底层写失败由宿主独立锁存；即使工具将其转成普通 Failed 或吞掉错误，仍禁止后续调用，
-保留 started 未交付的中断证据。取消/超时收尾会重新读取并校验已交付 Reply 及 execution 引用；
-已交付 uncertain 优先于普通 Cancelled/Failed，用户取消仍停止 Run。
+保留未交付的中断证据。取消/超时收尾时外层先 `abort_owned` 名下还活着的嵌套任务并等它们落结果（各嵌套任务的 abort handler 写 `aborted`，脚本一侧视为结果不明）；
+已交付 uncertain 优先于普通 Cancelled/Failed，用户取消仍停止 Run。外层被 abort 时结果只写"被取消"，嵌套任务各自的 `aborted` 结果在 `komo.nested` 里、外层一终结就退役。
 
 例如，有副作用 MCP 可以和只读查询放进同一段脚本：
 
@@ -227,7 +229,7 @@ object has no attribute 'x'`，不是原来的 `ToolError`（那条错误会列�
 
 发现函数照 pi 的 `searchTools` / `describeTool` / `describeNamespace`：宿主把这次能调的工具说明、
 schema 与所属服务器（含 instructions）随第一行交进 worker（`catalog`），查找与排序用前置代码里的
-BM25 在 Monty 里做完（原来 `driver.py` 的那份，逻辑未动），不经宿主、不进 journal，也不进指纹（调用本身
+BM25 在 Monty 里做完（原来 `driver.py` 的那份，逻辑未动），不经宿主、不记账，也不进指纹（调用本身
 已按工具名与参数核对）。分词与停用词同 pi；pi 只认 a-z0-9，这里另把中日韩字切成单字与相邻两字，中文说明
 才搜得到。名字一律是脚本里的写法（`-` 换成 `_`）。
 
@@ -244,78 +246,48 @@ BM25 在 Monty 里做完（原来 `driver.py` 的那份，逻辑未动），不�
 `result.calls` 新增 `id`、可选 `status` 与可选 `output`（已发布子输出入口）；`ok` 仍只表示宿主正常
 返回，失败计数同时检查 `ok` 与工具自身的 `status=failed`。工具没有返回 ToolOutput 时不编造 status，
 首部显示“未返回工具结果”；prepare 阶段被拒且未执行时也不会给出虚假的子执行输出入口。
-引用来自 journal 中的原尝试，恢复时不替换成当前父 attempt。旧 `finished` 输出逐字复用，
-不会补新字段或重新生成提示；新结构不改写历史 output.json。
+引用来自嵌套任务的原尝试，恢复时不替换成当前父 attempt；结构变化不改写历史 output.json。
 
-## 7. 计划、journal 与恢复
+## 7. 计划、嵌套任务与恢复
 
-父计划是 `Operation::Codemode { code }`。`replay = Safe` / `SafeReread` 表示可以重新进入宿主的
-journal 协议，**不表示整段工具操作可以重做**；`is_read_only()` 为 false，父调用是调度屏障。
+父计划是 `Operation::Codemode { code }`。`CodemodeTool::replay` 是 Safe（`SafeReread`），表示恢复时可以按 `docs/komo_bot.md` §8.6 的表**重跑整段脚本**（嵌套任务与 memo 把已发生的事原样接回），**不表示整段工具操作可以重做**；`is_read_only()` 为 false，父调用是调度屏障。
 
-首次启动先提交 `start`（指纹：指纹版本、代码哈希、前置代码哈希、Monty 版本、worker 协议版本、工具表、cwd）。子调用按宿主收到的
-顺序编号 `c1..c256`，逻辑身份为父 Run / Call + 子序号；存储路径使用父 Call 与阶段/序号的 SHA-256
-组成安全的 `cm-…` Call ID。它不依赖新的父 attempt，重启仍能认回同一子调用；每次实际执行的输出
-使用父 attempt + 子身份派生的独立 Attempt ID，旧引用不会被覆盖；这也避免底层输出存储按
-Attempt ID 索引时误取父调用正在写的流。脚本不能自选 key，也不能绕过宿主的 256 次限制。
+外层 `komo.tool` 任务执行 `Operation::Codemode` 时，先写 memo `codemode.start`（指纹：指纹版本、脚本哈希、Monty 版本、worker 协议版本、前置代码哈希、能力表、cwd；对不上就是回放分歧），再起 worker。子调用按宿主收到的顺序编号 `c1..c256`：第 `n` 个调用 = 一个 `kind: "nested"` 的工具任务（`callId` 为 `<外层 callId>/c<n>`，输入里带工具名与完整参数）加 `komo.nested` 里 key 为 `c<n>` 的槽位。脚本不能自选 key，也不能绕过宿主的 256 次限制；嵌套任务的输出在它自己的尝试目录，重启后同一个子调用仍认得回同一个任务。
 
-| 恢复时已记录的阶段 | 处理 |
+重启后外层任务从 checkpoint 回来，**起新 worker 从头重跑脚本**：第 `n` 个调用在 `komo.nested` 里找 `c<n>`，工具名与完整参数都对得上就等它的任务（不另建），对不上是分歧。任务停在哪由引擎按 §8.4 的表恢复：
+
+| 嵌套任务重启时停在 | 处理 |
 |---|---|
-| `intent`，无 `started` | 确定未执行；当前能力面与 prepare 再核对后，用已存计划执行 |
-| `started`，无 `delivered` | 已存与当前 `Tool::replay` 都为 Safe 才用原计划重跑；否则 uncertain，绝不重做 |
-| `delivered` | 校验引用和完整工具输出，返回已存精确结果；包括 unsafe 成功、普通失败及 uncertain |
-| `finished` | 直接返回已提交的整段输出，不启动 Python |
+| `call`（意图未提交） | 确定未执行；当前能力面与 prepare 再核对后，用重新准备的计划执行 |
+| `execute`，没有完整输出 | 已存与当前 `Tool::replay` 都为 Safe 才用原计划新尝试重跑；否则 uncertain 结果，绝不重做 |
+| `execute`，盘上有完整 `output.json` | 复用原输出——嵌套任务多一个条件（`nested::reusable`）：预览就是全部 stdout（或结果自带 `text`）才复用，否则落到上一行 |
+| 已终结，槽位里有 `result` | 校验引用与完整工具输出，返回已存精确结果；包括 unsafe 成功、普通失败及 uncertain |
 
-脚本每次完成后先外置整段 `ToolOutput` 并提交 `finished`，再交给父 executor 发布和 `finish_call`。
-父结果发布前后中断时可以复用这个完整结果；父子工具结果不混进顶层 LLM 消息。
+脚本拿到 `uncertain` 就锁住宿主、之后任何调用不再执行，整段结果 uncertain 交给模型。记录用完之后脚本发出的**新**子调用才建新任务，走正常流程。没有单独的 `finished` 记录：外层结果一发布就按 §8.4 表第一行复用；发布之前崩了就整段重放——已交付的嵌套结果从 `komo.nested` 回放、不重做，代价只是再起一次 worker。
 
-恢复逐次核对工具名、完整 JSON 参数与顺序；结束时检查已记录的调用与读数是否都被消费。代码、前置代码、Monty
-版本、worker 协议、能力表、cwd 改变，参数或顺序改变，提前结束，或者引用损坏，均明确返回 uncertain。普通脚本异常
-仍是 Failed；`started` 保存子尝试身份，恢复 unsafe 或时限/取消中断时读取该尝试留下的部分输出，
-将有上限的 stdout/stderr 尾部及目录存入父 uncertain 正文，仍由父结果统一投影。
-时限/取消打断正在执行的子调用时，持久化的父结果保留 uncertain（用户取消仍停止 Run）。
-升级前没有 durable `start` 的中断父调用也返回 uncertain，不能按旧的“整段只读”假设重跑。
-2026-10-15 换引擎时同理：旧 `start` 指纹里是 `driver` / `env`（CPython 时代）；同一天时钟与熵进 journal
-（worker 协议 1 → 2、指纹加前置代码哈希），此前 Monty 第一版（时钟与熵不进 journal）的在途调用同样对不上。
-这些调用恢复时按分歧返回 uncertain，由模型核对外部状态（有测试守着）。
+恢复逐次核对工具名、完整 JSON 参数与顺序；结束时检查已记录的调用与读数是否都被消费。代码、前置代码、Monty 版本、worker 协议、能力表、cwd 改变，参数或顺序改变，提前结束，或者引用损坏，均明确返回 uncertain。普通脚本异常仍是 Failed；恢复 unsafe 或时限 / 取消中断时读取该尝试留下的部分输出，将有上限的 stdout / stderr 尾部及目录存入父 uncertain 正文，仍由父结果统一投影。时限 / 取消打断正在执行的子调用时，持久化的父结果保留 uncertain（用户取消仍停止 Run）。
 
 ### 脚本的恢复边界：整段重跑，记录的原样回放，越过记录之后照常执行
 
-恢复时起一个新 worker **从头重跑脚本**。宿主一边回放 journal，一边把脚本当作和第一次同一段确定性程序：
+恢复时起一个新 worker **从头重跑脚本**。宿主一边回放 `komo.nested` 与 memo，一边把脚本当作和第一次同一段确定性程序：
 
-- 已记录的子调用按序回放：每次调用核对工具名与完整参数，一致就把已交付的结果原样还给脚本（unsafe 成功、
-  普通失败、uncertain 都一样），**不重新执行**；对不上就是分歧，整段 uncertain。
+- 已记录的子调用按序回放：每次调用核对工具名与完整参数，一致就把已交付的结果原样还给脚本（unsafe 成功、普通失败、uncertain 都一样），**不重新执行**；对不上就是分歧，整段 uncertain。
 - 已记录的时钟与随机数读数（见下）按序原样还回去。
-- 记录用完之后，脚本发出的**新**子调用走正常流程：prepare → intent → started → 执行 → delivered。
-  `started` 而没 `delivered` 的 unsafe 调用仍然 uncertain、绝不重做（上表，双 Safe 准则不变）。
+- 记录用完之后，脚本发出的**新**子调用走正常流程：建任务 → 意图 checkpoint → 执行 → 结果。停在 `execute` 的 unsafe 调用仍然 uncertain、绝不重做（上表，双 Safe 准则不变）。
 
 **为什么重跑得出同样的东西**（这是 pi-durable 在 JS VM 里做的事，这里靠 Monty 的性质加宿主记账）：
 
-- Monty 没有哈希随机化，`set` / `dict` 的迭代序是确定的（插入序）；`hash()` 也是确定的。同一段代码、同一批
-  输入，纯计算每次一样。
-- 不确定的来源只有三类，全走宿主：**工具调用**（journal 的 `delivered`）、**时钟与熵**（下）、**文件读取**。
-  前两类记账、回放；文件读取**不记**，恢复时重读——文件内容变了，脚本可能走到不同的分支，但它要影响外部
-  世界只能经下一次工具调用，而那次调用的完整参数会和记录比对，对不上就 uncertain，**在执行任何新调用之前**。
-  所以分歧总是在副作用发生之前被发现，不会在记录之外悄悄多做一件事。内容变了、但没改变后面任何调用的参数，
-  那就无关紧要，脚本照常完成。
+- Monty 没有哈希随机化，`set` / `dict` 的迭代序是确定的（插入序）；`hash()` 也是确定的。同一段代码、同一批输入，纯计算每次一样。
+- 不确定的来源只有三类，全走宿主：**工具调用**（`komo.nested` 的交付结果）、**时钟与熵**（下）、**文件读取**。前两类记账、回放；文件读取**不记**，恢复时重读——文件内容变了，脚本可能走到不同的分支，但它要影响外部世界只能经下一次工具调用，而那次调用的完整参数会和记录比对，对不上就 uncertain，**在执行任何新调用之前**。所以分歧总是在副作用发生之前被发现，不会在记录之外悄悄多做一件事。内容变了、但没改变后面任何调用的参数，那就无关紧要，脚本照常完成。
 - `time.sleep`、`print` / `text()` 输出不产生外部效果（输出只在脚本结束时一并交出）。
 
-**时钟与熵**：worker 把 Monty 的 `DateTimeSource` 与 `RandomStart` 设成 `CallHost`。`time.time()` 一族、
-`datetime.now()`、`date.today()`（读 Unix 秒）与 `os.urandom(n)`、`random` 给自己起初始状态要的 2496 字节
-都暂停到宿主：宿主回答真实值，并按序记进 journal（`nondet` 记录：`[{request, value}]`，正文外置到
-`tool-output/`，fold 不看，与其他 `codemode.journal` 事件一样）。恢复时已记录的读数按序原样还回去，请求
-的种类（clock / urandom 及字节数）与记录对不上同样是分歧，记录没读完脚本就结束也是。`time.monotonic()` /
-`perf_counter()` 也是读这个时钟（答的是挂钟秒数）；`process_time()` 恒为 0。
+**时钟与熵**：worker 把 Monty 的 `DateTimeSource` 与 `RandomStart` 设成 `CallHost`。`time.time()` 一族、`datetime.now()`、`date.today()`（读 Unix 秒）与 `os.urandom(n)`、`random` 给自己起初始状态要的 2496 字节都暂停到宿主：宿主回答真实值，并作为 memo `codemode.nondet.<n>`（一批一个，**先写者赢**，记在外层任务上）按序记下来。恢复时已记录的读数按序原样还回去，请求的种类（clock / urandom 及字节数）与记录对不上同样是分歧，记录没读完脚本就结束也是。`time.monotonic()` / `perf_counter()` 也是读这个时钟（答的是挂钟秒数）；`process_time()` 恒为 0。
 
-**journal 的增长**：读数不是一次一条记录。宿主把读到的读数攒在内存里，**在下一次新子调用写 `intent` 之前**
-（以及写 `finished` 之前）一并落成一条 `nondet` 记录——因为只有子调用的参数和最终输出能把这些值带到脚本
-之外，所以先落账再提交 `intent` 就够了；之间崩了，没落账的读数没有被任何已提交的外部效果用过，恢复时重新读
-就是。结果：一个读时钟的紧循环（几万次）也只多一条记录，记录数 ≤ 子调用数 + 1（≤ 257），不随读取次数涨。
-单条记录的体积和单次脚本里读数的个数成正比，所以单段脚本合计最多读 10 000 次（含恢复时已记录的），再读
-就在脚本里抛错（`一段脚本最多读 10000 次时钟 / 随机数`）；单次 `os.urandom` 最多 64 KiB。
+**memo 的增长**：读数不是一次一条。宿主把读到的读数攒在内存里，**在下一个新子调用建任务之前**（以及交结果之前）落成一个 memo——因为只有子调用的参数和最终输出能把这些值带到脚本之外，所以先落账再建任务就够了；之间崩了，没落账的读数没有被任何已提交的外部效果用过，恢复时重新读就是。结果：一个读时钟的紧循环（几万次）也只多一个 memo，数量 ≤ 子调用数 + 1，不随读取次数涨。单次脚本合计最多读 10 000 次（含恢复时已记录的），再读就在脚本里抛错（`一段脚本最多读 10000 次时钟 / 随机数`）；单次 `os.urandom` 最多 64 KiB。已知代价：memo 随任务记录整条重写，最坏的紧循环会让任务记录变到几百 KB（spec 说 memo 应当很小；成问题再把批次搬进名下的 document）。
 
-工具成功但 `delivered` 尚未提交时，不能猜测未引用的 output.json 代表可交付成功；unsafe 返回
-uncertain，Safe 才能按双 Safe 准则重做。`start` 已提交但第一个 intent 未提交时，恢复照常从头跑（没有任何子调用做过）。已提交 successful write 子结果始终复用，
-永不执行第二次。
+工具成功但结果尚未写进 `komo.nested` 时，不能猜测未引用的 output.json 代表可交付成功（`nested::reusable` 的条件）；unsafe 返回 uncertain，Safe 才能按双 Safe 准则重做。`codemode.start` 已写但第一个子调用还没建任务时，恢复照常从头跑（没有任何子调用做过）。已交付的 successful write 子结果始终复用，永不执行第二次。
+
+子调用的图片随嵌套结果存引用（`{mime, path, hash}`），外层收尾时按引用读回、写进外层自己的输出目录；回放的子调用同样带图。嵌套结果整值存在 `komo.nested` 槽位里（脚本拿到的"完整正文"，如 `read` 的整份文件，不设上限），外层终结时随 document 一起退役；脚本在外层 `execute` 里最多回放 256 个槽位，一次读完。
 
 ## 8. 限制
 
@@ -338,12 +310,16 @@ uncertain，Safe 才能按双 Safe 准则重做。`start` 已提交但第一个 
 | `komo-runtime` `limits.rs` | `resident_bytes`：worker 的常驻内存读数 |
 | `komo-runtime` `tools/protect.rs` | `Protected`：komo 自己的状态名单，`write` / `edit` / `bash` 与 codemode worker 共用 |
 | `komo-runtime` `tools/codemode.rs` | `CodemodeTool`：定义 + `prepare`；`execute` 不该被走到（与 `task` 同一模式） |
-| `komo-runtime` `executor/codemode.rs` | 起 worker、能力与 prepare 检查、子输出发布、宿主 fatal 锁、`start` 指纹 |
-| `komo-runtime` `executor/codemode_journal.rs` | journal 阶段、稳定身份、分页读取与回放校验 |
+| `komo-runtime` `executor/codemode.rs` | `ToolExecutor::codemode_fingerprint` 与摘要 / 失败首部等共用函数（执行本身在 `durable/harness/codemode.rs`） |
+| `komo-runtime` `durable/harness/codemode.rs` | 外层脚本任务：`codemode.start` memo、worker 对话、时钟 / 熵 memo、按 key 回放 `komo.nested`、`abort_owned` 收尾 |
+| `komo-runtime` `durable/harness/nested.rs` | `komo.nested` 槽位与 `commit_nested`（嵌套任务终结 + 交付结果同一次提交）、`nested::reusable` |
+| `komo-runtime` `durable/harness/tool.rs` | `kind: "nested"` 分支：同一条 `call → execute → 结果`，无 `komo.live` 槽位 |
 | `komo-gateway` `service/mod.rs` | 启动时解析 `current_exe()`，注册工具并把 `Worker` 交给执行器 |
 | `komo` `src/main.rs` | 隐藏子命令 `__codemode-worker`，只分发到 `codemode::worker::run` |
 
 ## 10. 验收
+
+> 下面「持久化与恢复单测」「真 Gateway + stdio MCP」两条是旧 journal 时代的清单；新存储下对应的是 runtime `harness/tests/codemode.rs`（14 项，含 Turso 文件库上的重启回放）、`nested.rs` 单元测试、`crates/komo/tests/codemode_nested.rs`（真 `komo __codemode-worker` 子进程）与 gateway 的 `tests/codemode/durable.rs`。语言与文件边界、worker、发现函数几条不变。
 
 - 语言与文件边界（进程内 worker，`codemode/tests.rs`）：`import subprocess` / `socket` 失败、读不到环境变量；
   文件可读（`open` / `Path.read_text` / `iterdir` / `exists` / `stat` / 相对路径 / 绝对符号链接）；

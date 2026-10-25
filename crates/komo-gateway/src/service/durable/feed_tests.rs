@@ -146,8 +146,7 @@ async fn live_frames_equal_backfill_frames() {
     let seqs: Vec<u64> = live.iter().map(|event| event.seq.0).collect();
     assert!(seqs.windows(2).all(|pair| pair[0] < pair[1]), "{seqs:?}");
 
-    // 状态帧照旧派生。输入 entry 的 ID 比放置它的 submission 小（`admit` 先铸 entry），帧按记录 ID
-    // 排序，所以 `running` 排在 `accepted` / `queued` 之前（见 §10 W2b 的备注）。
+    // 状态帧照旧派生：accepted → queued → running → completed。
     let states: Vec<RunState> = frames
         .iter()
         .filter_map(|frame| match &frame.event {
@@ -158,9 +157,9 @@ async fn live_frames_equal_backfill_frames() {
     assert_eq!(
         &states[..4],
         [
-            RunState::Running,
             RunState::Accepted,
             RunState::Queued,
+            RunState::Running,
             RunState::Completed
         ],
         "{states:?}"

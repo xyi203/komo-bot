@@ -3,7 +3,7 @@
 //! 就是漂掉的那一条。
 //!
 //! 这里只管**正文本身**；`instructions`（最前）与 `memory`（最后）两段由
-//! [`super::assemble`] 拼在外面（§10：分隔符与顺序都照抄改造之前那一份）。
+//! [`sections`] 一并按段交回，[`super::system_sections`] 是对外入口。
 
 use std::path::Path;
 
@@ -65,30 +65,6 @@ const READ_TOOL: &str = "read";
 const CODEMODE_TOOL: &str = "codemode";
 const EDIT_TOOL: &str = "edit";
 
-/// 装配系统提示正文：身份 / 工作目录 / 行为约束，主 Agent 再加「komo 自己的状态怎么查」、
-/// 项目规范与 §5.6 的 skills 目录，子代理再加任务与结果契约。
-pub(crate) fn build(
-    workspace: &Path,
-    tools: &[String],
-    mcp_servers: &[ToolNamespace],
-    invocation: &InvocationContext,
-    project_files: &[ProjectFile],
-    skills: Option<&str>,
-) -> String {
-    let mut rules = rules(tools);
-    if let Some(block) = servers_block(mcp_servers) {
-        rules.push_str("\n\n");
-        rules.push_str(&block);
-    }
-    match invocation {
-        InvocationContext::Main => {
-            let has_shell = tools.iter().any(|tool| tool == BASH_TOOL);
-            main_prompt(workspace, &rules, project_files, skills, has_shell)
-        }
-        InvocationContext::Delegated(spec) => subagent_prompt(workspace, &rules, spec),
-    }
-}
-
 /// 系统段的 key（新存储的 `komo.system` entry 按名字补丁，`docs/storage-durable-d5.md` §6）。
 pub const SECTION_INSTRUCTIONS: &str = "instructions";
 pub const SECTION_BASE: &str = "base";
@@ -96,10 +72,9 @@ pub const SECTION_PROJECT: &str = "project";
 pub const SECTION_SKILLS: &str = "skills";
 pub const SECTION_MEMORY: &str = "memory";
 
-/// 同 [`build`]，但按段交回 `(key, 正文)`：`instructions`（最前，已 trim）→ `base`（身份 / 工作目录 /
+/// 按段交回 `(key, 正文)`：`instructions`（最前，已 trim）→ `base`（身份 / 工作目录 /
 /// RULES / komo 自查；子代理是它那份提示）→ `project`（项目规范）→ `skills` → `memory`（最后）。
-/// 空的段不出现。**用 `\n\n` 连起来就是 [`super::assemble`] 的系统提示，逐字相同**
-/// （`golden_system_sections_match_legacy_prompt` 锁着）。
+/// 空的段不出现。**用 `\n\n` 连起来就是完整的系统提示**
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn sections(
     instructions: Option<&str>,
@@ -217,29 +192,8 @@ fn truncate(text: &str, max: usize) -> String {
     format!("{}…", head.trim_end())
 }
 
-/// 主 Agent 的系统提示：身份 / 工作目录 / 行为约束 / komo 自查 / 项目规范 / §5.6 的
-/// skills 目录。
-fn main_prompt(
-    workspace: &Path,
-    rules: &str,
-    project_files: &[ProjectFile],
-    skills: Option<&str>,
-    has_shell: bool,
-) -> String {
-    let mut prompt = main_base(workspace, rules, has_shell);
-    if let Some(block) = project_block(project_files) {
-        prompt.push_str("\n\n");
-        prompt.push_str(&block);
-    }
-    if let Some(block) = skills {
-        prompt.push_str("\n\n");
-        prompt.push_str(block);
-    }
-    prompt
-}
-
 /// 主 Agent 提示里不随项目规范与 skills 变的那一段：身份 / 工作目录 / 行为约束，能跑命令时
-/// 再加「komo 自查」。[`main_prompt`] 与 [`sections`] 共用，两条路的正文因此不会漂。
+/// 再加「komo 自查」。[`sections`] 用它。
 fn main_base(workspace: &Path, rules: &str, has_shell: bool) -> String {
     let mut prompt = format!(
         "你是 komo，跑在用户自己机器上的助手。\n\

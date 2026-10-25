@@ -8,7 +8,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use komo_kernel::protocol::config::KeyPath;
 use komo_kernel::protocol::http::{ApiError, ErrorBody, ErrorCode};
-use komo_kernel::traits::{GatewayError, LedgerError, RepoError, StoreError};
+use komo_kernel::traits::{GatewayError, RepoError, StoreError};
 
 /// 一次失败的响应。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -129,20 +129,6 @@ impl IntoResponse for ApiFailure {
     }
 }
 
-impl From<LedgerError> for ApiFailure {
-    fn from(error: LedgerError) -> Self {
-        let code = match &error {
-            // 同一请求键对应不同内容——**这是它对应的那个明确失败**（§8.5）。
-            LedgerError::RequestKeyConflict { .. } => ErrorCode::RequestKeyConflict,
-            LedgerError::NotFound { .. } => ErrorCode::NotFound,
-            LedgerError::Conflict(_) | LedgerError::StaleGeneration { .. } => ErrorCode::Conflict,
-            LedgerError::Corrupt(_) => ErrorCode::Corrupt,
-            LedgerError::Persist(_) | LedgerError::Contended => ErrorCode::Internal,
-        };
-        ApiFailure::new(code, error.to_string())
-    }
-}
-
 impl From<StoreError> for ApiFailure {
     fn from(error: StoreError) -> Self {
         let code = match &error {
@@ -174,7 +160,6 @@ impl From<GatewayError> for ApiFailure {
             }
             GatewayError::NotFound { what } => ApiFailure::not_found(what),
             GatewayError::InvalidRequest(message) => ApiFailure::invalid(message),
-            GatewayError::Ledger(error) => error.into(),
             GatewayError::Store(error) => error.into(),
             GatewayError::Repo(error) => error.into(),
             GatewayError::Internal(message) => ApiFailure::new(ErrorCode::Internal, message),
@@ -210,16 +195,6 @@ pub type ApiResult<T> = Result<T, ApiFailure>;
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn a_request_key_conflict_is_a_409_with_its_own_code() {
-        let failure: ApiFailure = LedgerError::RequestKeyConflict {
-            key: "telegram:42".into(),
-        }
-        .into();
-        assert_eq!(failure.status, StatusCode::CONFLICT);
-        assert_eq!(failure.code(), ErrorCode::RequestKeyConflict);
-    }
 
     #[test]
     fn a_missing_thing_is_a_404() {

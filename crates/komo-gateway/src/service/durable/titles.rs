@@ -117,8 +117,7 @@ async fn retitle(
     replace_title_if(core, session, &current, &title).await
 }
 
-/// 标题还是 `expected`（且仍是临时值）才换：与 Legacy 的 `session::replace_title_if` 同一个条件，
-/// 在一次提交里读改写。
+/// 标题还是 `expected`（且仍是临时值）才换：在一次提交里读改写。
 async fn replace_title_if(
     core: &super::DurableCore,
     session: &str,

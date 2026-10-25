@@ -356,57 +356,6 @@ impl WaitReason {
     }
 }
 
-/// `Ledger::complete` 的参数：Run 怎么结束的。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum RunEnd {
-    /// 正常结束，带最终回复正文（大正文由调用方先外置）。
-    Completed {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        final_message: Option<String>,
-        /// 这个 Run 一共跑了几轮模型。`run inspect` 与预算核对读它——`RunCompleted.rounds`
-        /// 原先恒为 0，因为账本接口上根本没地方把这个数交进来。
-        #[serde(default)]
-        rounds: u32,
-    },
-    Failed {
-        reason: String,
-    },
-    /// 用户明确取消。
-    Cancelled {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        by: Option<String>,
-    },
-    /// 操作者在 Intervention 清单上放弃（§7.5）：**不是**用户取消，而是"这件事不再
-    /// 推进了"——比如一条停在结果不明上的 Run，操作者查过之后决定不追究。分开记，
-    /// 事后统计"多少人放弃了什么"才有意义。
-    Abandoned {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        by: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        reason: Option<String>,
-    },
-}
-
-impl RunEnd {
-    pub fn state(&self) -> RunState {
-        match self {
-            RunEnd::Completed { .. } => RunState::Completed,
-            RunEnd::Failed { .. } => RunState::Failed,
-            RunEnd::Cancelled { .. } => RunState::Cancelled,
-            RunEnd::Abandoned { .. } => RunState::Abandoned,
-        }
-    }
-}
-
-/// 调度器领取到的一个 Run（§8.7：条件更新 + 递增代次）。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Claimed {
-    pub run: RunId,
-    /// 领取代次。JSONL 追加与状态提交都校验它；旧代次不能继续提交新状态。
-    pub generation: u64,
-}
-
 /// Run 的最终事件引用，用于"结果已保存但客户端没收到"的补读（§8.4）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FinalEventRef {
@@ -528,26 +477,9 @@ mod tests {
         assert!(!ToolCallState::Planned.needs_verification());
     }
 
-    /// 放弃与取消分得开，而且四个终态各自说得出自己叫什么。
+    /// 状态词的往返：认不出的状态词不许默认成"能跑"。
     #[test]
-    fn giving_up_is_not_the_same_as_being_cancelled() {
-        let abandon = RunEnd::Abandoned {
-            by: Some("operator".into()),
-            reason: Some("查过了，不再追究".into()),
-        };
-        assert_eq!(abandon.state(), RunState::Abandoned);
-        assert_ne!(RunEnd::Cancelled { by: None }.state(), abandon.state());
-
-        let old = r#"{"kind":"completed","final_message":"好了"}"#;
-        assert_eq!(
-            serde_json::from_str::<RunEnd>(old).unwrap(),
-            RunEnd::Completed {
-                final_message: Some("好了".into()),
-                rounds: 0
-            },
-            "老行没有 rounds，读为默认"
-        );
-
+    fn run_state_words_round_trip() {
         // 认不出的状态词不许默认成"能跑"。
         assert_eq!(RunState::parse("needs_attention"), None);
         assert_eq!(RunState::parse(" waiting "), Some(RunState::Waiting));

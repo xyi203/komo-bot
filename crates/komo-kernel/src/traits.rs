@@ -4,9 +4,8 @@
 //! 后端），或**要做编译防火墙**（上层依赖 trait 就够，不需要看到 toasty / reqwest /
 //! axum 类型）。其余组件是具体类型，直接构造、直接测；不为"以后可能换"预留 trait。
 //!
-//! 不是 trait 的东西，记在这里免得有人再造一个：`AgentLoop`、`ToolExecutor`、
-//! `Scheduler`、`Recovery`、`MemoryManager`、`SkillRegistry`、`Coordinator`、
-//! `Dispatcher` —— 各只有一个实现，依赖下面这些 trait 就可测。**也没有 `Policy`**：
+//! 不是 trait 的东西，记在这里免得有人再造一个：`ToolExecutor`、`MemoryManager`、
+//! `SkillRegistry`、`Dispatcher`、`CronScheduler` —— 各只有一个实现，依赖下面这些 trait 就可测。**也没有 `Policy`**：
 //! 2026-10-11 起 komo 不再在执行前做判决（§7）——模型要的就执行，唯一的硬限制是
 //! `write` / `edit` 在 `prepare` 里拒绝写 komo 自己的状态，那是工具的事，不是一个接缝。
 //!
@@ -19,9 +18,7 @@ use time::OffsetDateTime;
 use crate::cron::{CronFiring, CronJob, JobStatus, ZoneError, ZoneResolution};
 use crate::protocol::{InboundAck, InboundMessage};
 use crate::types::chat::{Delivery, DeliveryTarget, Outbound};
-use crate::types::ids::{
-    AttemptId, CronJobId, EventId, ExecutorId, MemoryId, RunId, Seq, SessionId, ToolCallId,
-};
+use crate::types::ids::{CronJobId, MemoryId};
 use crate::types::memory::{MemoryItem, RecallQuery, RecallResult};
 use crate::types::model::{EmbeddingSpace, InputKind, TokenUsage, Vector};
 use crate::types::plan::{ExecutionPlan, Replay};
@@ -29,41 +26,13 @@ use crate::types::refs::{
     AttemptRef, ImageRef, InterruptedOutput, OutputRef, PublishedOutput, ToolResultBody,
     VerifiedOutput,
 };
-use crate::types::status::{Claimed, RunEnd, WaitReason};
 use crate::types::systemone::{SystemOneError, SystemOneRequest, SystemOneResponse};
 use crate::types::tool::{
     CancelToken, ToolContext, ToolDefinition, ToolError, ToolExposure, ToolNamespace, ToolOutput,
 };
-use crate::types::turn::{
-    AcceptInput, Accepted, AssistantRound, EventBatch, LlmError, Round, RoundInput, TurnRequest,
-};
+use crate::types::turn::{LlmError, Round, RoundInput, TurnRequest};
 
 // ---------------------------------------------------------------- 错误
-
-/// 账本写入失败。
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-pub enum LedgerError {
-    /// 同一请求键对应不同内容（§8.5）。
-    #[error("请求键 {key} 已经绑定了另一份输入")]
-    RequestKeyConflict { key: String },
-    /// 领取代次不对：旧执行者不能继续提交新状态（§8.7）。
-    #[error("领取代次过期：持有 {held}，当前 {current}")]
-    StaleGeneration { held: u64, current: u64 },
-    #[error("找不到 {what}")]
-    NotFound { what: String },
-    /// 这个状态下做不了这件事。
-    #[error("状态冲突：{0}")]
-    Conflict(String),
-    /// 文件同步失败——**不能执行后续副作用或向客户端确认持久完成**（§8.3）。
-    #[error("持久化失败：{0}")]
-    Persist(String),
-    /// MVCC 冲突重试超限（§8.2）。
-    #[error("写入争用，重试超限")]
-    Contended,
-    /// JSONL 中间损坏、已提交范围缺失或哈希不匹配。
-    #[error("记录损坏：{0}")]
-    Corrupt(String),
-}
 
 /// 存储层失败。
 ///
@@ -172,8 +141,6 @@ pub enum GatewayError {
     #[error("请求不合法：{0}")]
     InvalidRequest(String),
     #[error(transparent)]
-    Ledger(#[from] LedgerError),
-    #[error(transparent)]
     Store(#[from] StoreError),
     #[error(transparent)]
     Repo(#[from] RepoError),
@@ -192,171 +159,6 @@ pub struct ChannelError {
 /// 停机信号。kernel 不依赖 tokio，所以它就是一个可查询的标志；渠道把它和自己的
 /// select 包在一起。
 pub type Shutdown = CancelToken;
-
-// ---------------------------------------------------------------- Ledger
-
-/// **Agent Loop 的唯一写入口。**每个 Session 一个实例，串行。
-///
-/// 每个方法对应 §8.5 的一段箭头，方法内部完成"外置正文（如有）→ JSONL 追加并同步
-/// → 数据库事务"的顺序。让 loop 和 executor 的测试不碰文件与 Turso——生产实现是
-/// store 的 `Coordinator`，测试实现是 `test_support::MemLedger`。
-#[async_trait]
-pub trait Ledger: Send + Sync {
-    /// 预留 Run（ingesting）→ `run.accepted` → queued。同一 `request_key` 返回原 Run，
-    /// 哈希不同则拒绝。
-    async fn accept_input(&self, input: AcceptInput) -> Result<Accepted, LedgerError>;
-
-    /// 完整 assistant 回复 + 本轮全部调用计划，一个逻辑事件；返回 Runtime 分配的
-    /// `ToolCallId`。
-    async fn record_round(
-        &self,
-        run: &RunId,
-        round: AssistantRound,
-    ) -> Result<Vec<ToolCallId>, LedgerError>;
-
-    /// `run.started`：某个执行实例领取了这个 Run，带上它的领取代次。
-    ///
-    /// （事件词汇里本来就有 `run.started`——`RunQueue::claim` 拿到 `Claimed` 之后总得有
-    /// 人把它写下来，而 trait 上原先没有一个方法写得出它。`fold` 认它：状态变
-    /// `Running`，`generation` 记在 `RunView` 上。）
-    async fn start_run(
-        &self,
-        run: &RunId,
-        executor: &ExecutorId,
-        generation: u64,
-    ) -> Result<(), LedgerError>;
-
-    /// `tool.planned`：准备好的执行计划落盘。返回承载它的事件 ID，`tool.started` 的
-    /// `plan_ref` 指向它。
-    ///
-    /// （§13.5 的签名表没有列它——那张表把计划的持久化并在 `record_round` 里说。但
-    /// §8.4 第 6 行要求"调用 planned，确定尚未执行"是一个**可分辨的状态**，而计划要到
-    /// 执行前才由 `prepare` 产生，所以它必须是自己的一步。）
-    async fn plan_call(
-        &self,
-        call: &ToolCallId,
-        plan: &ExecutionPlan,
-    ) -> Result<EventId, LedgerError>;
-
-    /// `tool.started` + 执行尝试，同一事务；**返回后才允许产生真实副作用**。
-    async fn start_call(
-        &self,
-        call: &ToolCallId,
-        plan: &ExecutionPlan,
-    ) -> Result<AttemptId, LedgerError>;
-
-    /// 输出已由 [`ToolOutputStore`] 发布；这里只写 `tool.result` 元信息与引用。
-    async fn finish_call(
-        &self,
-        attempt: &AttemptId,
-        published: PublishedOutput,
-    ) -> Result<(), LedgerError>;
-
-    /// 给一次**没有执行过**的调用写下结论（没有 `tool.started`，也没有计划）：工具名
-    /// 不认识、参数准备不出来、`prepare` 拒绝（例如写 komo 自己的状态）、子代理不能再
-    /// 委派——它们都有明确结论，只是没有产生过尝试。
-    ///
-    /// 写下来不是记账洁癖：`tool.result` 缺席的那次调用在账本上**永远悬着**，于是任何从
-    /// 账本重建的转写都带着一个没有输出的 `function_call`——provider 直接 400
-    /// （`No tool output found for tool call …`），一次参数写错的调用会把整个会话后面的
-    /// 每一段都毒住。所以"交给模型的每一条结论都必须先在账本上"是一条不变量。
-    ///
-    /// 它建的是一条 `tool.started` 缺席的尝试行（`tool_attempts.started_event` 本来就
-    /// 可空）：`result_event` 一填，这次调用就有了终态。
-    async fn fail_call(
-        &self,
-        call: &ToolCallId,
-        attempt: &AttemptId,
-        published: PublishedOutput,
-    ) -> Result<(), LedgerError>;
-
-    /// 停在某个外部条件上（§8.4）：状态变 `Waiting`，理由进 `WaitReason`，释放执行名额。
-    async fn suspend(&self, run: &RunId, wait: WaitReason) -> Result<(), LedgerError>;
-
-    /// Run 的终态。
-    ///
-    /// **调用它之前，这一轮的最终回复必须已经作为 `message.assistant` 落过盘**：会话
-    /// 消息面只认 `message.assistant`，`run.completed` 里的 `final_message` 是给"结果
-    /// 已保存但客户端没收到"补读用的副本，不是消息面上的一个节点。runtime 的顺序因此
-    /// 是 `record_round` → `complete`，倒过来会让这一轮的回答从历史里消失，而账本看上去
-    /// 一切正常。
-    async fn complete(&self, run: &RunId, end: RunEnd) -> Result<(), LedgerError>;
-
-    /// 按 seq 范围读**一页**事件；引用正文按需加载并校验哈希。
-    ///
-    /// **读不得创建或修改内容**（§8.9：观察不改写）。实现不许在 `read` 里建目录、建
-    /// 文件、补行或改写任何字节——一个还没写过日志的会话读回来就是空的一页。理由不止
-    /// "干净"：§8.10 判一条未完成的 Run 能不能领，靠的是"内容到底在不在"，而一个会
-    /// 顺手把内容造出来的 `read` 会让那个判断永远答"在"。
-    ///
-    /// `limit` 不是可选的：§14 的待验证项里「Turso 长读事务与并发写提交的快照语义」还
-    /// 没核实，而它的对策已经定了——读路径改成短事务分页。接口先把这件事定死，实现换
-    /// 起来就不用动调用方。0 表示"由实现决定一页多大"。
-    async fn read(
-        &self,
-        session: &SessionId,
-        from: Seq,
-        limit: u32,
-    ) -> Result<EventBatch, LedgerError>;
-
-    /// `/new`：追加一个 `conversation.boundary`，**不切 Session**（§13.1）。
-    async fn boundary(&self, session: &SessionId) -> Result<Seq, LedgerError>;
-
-    /// `context.compacted`：在线压缩的结论（§8.3）。内联的摘要超过上限
-    /// 先外置到 `payloads/`（与 `record_round` 的正文同一条路），再追加并同步。它不碰
-    /// state.db 的任何表——摘要只是模型视图，调度不看它。
-    async fn record_compaction(
-        &self,
-        run: &RunId,
-        compaction: crate::events::ContextCompacted,
-    ) -> Result<Seq, LedgerError>;
-
-    /// `memory.injected`：这一段对话钉住的记忆注入段（§9.4）。正文超过内联上限先外置到
-    /// `payloads/`，再追加并同步；与 `record_compaction` 一样不碰 state.db——它只是模型
-    /// 视图，调度不看它。
-    async fn record_injection(
-        &self,
-        run: &RunId,
-        injection: crate::events::MemoryInjected,
-    ) -> Result<Seq, LedgerError>;
-
-    /// 控制审计补写：把 `control_outbox` 里的一条审计事件追加到 JSONL（§8.5 的反向
-    /// 顺序）。按 `event_id` 幂等；已写入就复用原事件位置。它只写审计副本，不改变任何
-    /// 调度状态。
-    ///
-    /// 审批删掉之后已经没有新事件走这条路；它留着，是为了老库 `control_outbox` 里还没
-    /// 补写的旧 `approval.*` 行能照原样补进 JSONL（读回来是 Unknown，什么都不表示，D3）。
-    async fn append_audit(
-        &self,
-        session: &SessionId,
-        event_id: &EventId,
-        payload: crate::events::EventPayload,
-        occurred_at: OffsetDateTime,
-    ) -> Result<Seq, LedgerError>;
-
-    /// 一条 Run 的终态（没有就是 `None`）。
-    ///
-    /// **委派的核对走它**（§8.6 的"可以核对目标状态"）：一条 delegate 调用的结果不在
-    /// 别的什么地方，就在它派出去的那条子 Run 的终态里——那也是我们自己的账本，所以
-    /// "结果不明"在这里根本不该发生。父 Run 续跑时用它把那次调用收尾。
-    ///
-    /// 它是**只读**的，且只回答"这条 Run 结束了没有、怎么结束的"，不返回消息历史：
-    /// 复验用的是父侧自己那份契约，子 Run 的完整过程由 `read` 去取。
-    async fn run_end(&self, run: &RunId) -> Result<Option<RunEnd>, LedgerError>;
-
-    /// 插话（§6）：把同 Session 里排在 `host` 后面、要求插话的输入并进 `host`，返回并进来
-    /// 的那些 Run（按受理顺序）。runtime 在一轮的调用全部收尾、下一次请求模型之前问它；
-    /// 并进来了就按日志重新装配，那几句话出现在这一刻的位置上。
-    ///
-    /// 只并能并的：`host` 是一条正在跑的主 Run（不是子 Run），输入是顶层的、要求插话的、
-    /// 还没被领走的，且受理时冻结的模型与 `host` 相同——换了模型的那句话按它自己的快照
-    /// 另跑一条。每并一条：`run.absorbed` 追加并同步 → 那条 Run 的行提交成 `absorbed`。
-    ///
-    /// 默认一条都不并：没有这个概念的账本（测试替身）照旧排队。
-    async fn absorb_interjections(&self, _host: &RunId) -> Result<Vec<RunId>, LedgerError> {
-        Ok(Vec::new())
-    }
-}
 
 // ---------------------------------------------------------------- 输出存储
 
@@ -434,47 +236,6 @@ pub trait OutputWriter: Send + Sync {
     /// 工具刚起了一个子进程。默认什么都不做；新存储的工具任务借它把子进程身份写进
     /// `komo.live.tools[].pid`，重启后据此进 `probe` 阶段。
     fn child_started(&mut self, _child: ChildStarted) {}
-}
-
-// ---------------------------------------------------------------- 队列
-
-/// 调度器、恢复扫描、Cron、手动 resume 共用的**领取入口**。并发领取测试需要替身。
-#[async_trait]
-pub trait RunQueue: Send + Sync {
-    /// 领取**下一个**可执行的 Run。条件更新 + 递增代次；返回 `None` 表示没有可领取的。
-    /// 调度器用它。
-    async fn claim(&self, executor: &ExecutorId) -> Result<Option<Claimed>, StoreError>;
-
-    /// 领取**指定**的那一个 Run。手动 `resume` 与启动扫描要的是这个——它们手里已经有
-    /// 一个 Run 号，"下一个到期的"回答的是另一个问题。
-    ///
-    /// 同样是条件更新 + 递增代次，所以两个执行者同时来只有一个拿得到；返回 `None` 表示
-    /// 这个 Run 此刻不可领取（已终态、已被别人拿走、或者根本不在队列里）。
-    async fn claim_run(
-        &self,
-        run: &RunId,
-        executor: &ExecutorId,
-    ) -> Result<Option<Claimed>, StoreError>;
-
-    /// 交还名额：Run 让出执行（等重试 / 等干预）或执行者退出时调用。代次不对就什么
-    /// 都不做。
-    async fn release(&self, claimed: &Claimed) -> Result<(), StoreError>;
-
-    /// **续租**：还在跑就别说它没人管（§8.7）。
-    ///
-    /// handler 每 `TTL/3` 调一次。租约只用来**发现**"没人管了"——对账见到过期还要过
-    /// 一道"持有者确已不在"才回收（§8.9）：少那一道，一次二十分钟的调用会在主人还活着
-    /// 的时候被第二个执行者抢走，那不是恢复，是重复副作用（§8.6）。
-    ///
-    /// 复用一个代次围栏：`false` = 这个 Run 的领取权已经不是自己的了，调用方应当
-    /// **停止这个任务的一切写入**（与状态提交拿到 `StaleGeneration` 同一个信号，所以它
-    /// 返回布尔而不是错误）。
-    async fn renew(
-        &self,
-        claimed: &Claimed,
-        executor: &ExecutorId,
-        until: time::OffsetDateTime,
-    ) -> Result<bool, StoreError>;
 }
 
 // ---------------------------------------------------------------- Cron
@@ -858,10 +619,8 @@ mod tests {
     #[test]
     fn every_seam_trait_is_object_safe() {
         fn assert_object_safe<T: ?Sized>() {}
-        assert_object_safe::<dyn Ledger>();
         assert_object_safe::<dyn ToolOutputStore>();
         assert_object_safe::<dyn OutputWriter>();
-        assert_object_safe::<dyn RunQueue>();
         assert_object_safe::<dyn CronRepo>();
         assert_object_safe::<dyn MemoryRepo>();
         assert_object_safe::<dyn LlmClient>();

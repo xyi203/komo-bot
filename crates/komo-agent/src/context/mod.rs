@@ -1,65 +1,43 @@
-//! Agent Context Boundary（`docs/agent.md` §5）：`ContextInput` → `AgentContext`。
+//! 系统段装配（`docs/agent.md` §5）：`ContextInput` → 按段的系统提示。
 //!
-//! 这是这一次重构最核心的边界——"对于这个 Agent、这个 Run、这个时刻，模型应该看到什么"
-//! 的答案只有一处，就是 [`assemble`]。它是纯函数：**相同 `ContextInput` 产出相同
-//! `AgentContext`**，没有 I/O、没有失败路径。Gateway / Runtime 负责把需要 I/O 才能获得
-//! 的事实凑齐（`context_sources.rs`），传进来的必须已经是**读到的正文**，不是"去哪读"的
-//! 指针——`MemoryManager`、`Store`、`PayloadStore`、`ToolOutputStore`、`Coordinator` 都不
-//! 允许出现在这个模块里。
+//! "对于这个 Agent、这个时刻，系统提示里有什么"的答案只有一处，就是 [`system_sections`]。它是
+//! 纯函数：**相同 `ContextInput` 产出相同的段**，没有 I/O、没有失败路径。Gateway 负责把需要
+//! I/O 才能获得的事实凑齐，传进来的必须已经是**读到的正文**，不是"去哪读"的指针。
+//! 回放消息不在这里：新存储的上下文由 kernel 的 `durable` 从 entry 推出来。
 
 pub mod compaction;
-pub mod history;
 pub mod memory;
 mod prompt;
-pub mod tree;
 
-use std::collections::BTreeSet;
 use std::path::PathBuf;
-use std::sync::Arc;
 
-use komo_kernel::projection::ProjectionContext;
 use komo_kernel::types::agent::ProjectFile;
 use komo_kernel::types::delegate::{DelegateContract, DelegateSpec};
-use komo_kernel::types::ids::ToolCallId;
 use komo_kernel::types::tool::ToolNamespace;
-use komo_kernel::types::turn::{ForkPrefix, ReplayMessage, Role};
 
 pub use prompt::{
     SECTION_BASE, SECTION_INSTRUCTIONS, SECTION_MEMORY, SECTION_PROJECT, SECTION_SKILLS,
 };
 
-pub use history::{
-    COMPACTION_PREFIX, DecayCandidate, Entry, EntryKind, ReplayScope, ResolvedMessage,
-    StoredOutput, entries, latest_user_text,
-};
-
 /// 一次装配所需的**全部事实**（`docs/agent.md` §5）。
 ///
-/// 身份里的模型、能力面、记忆作用域不进来：它们决定的是 `TurnRequest.model`、tool
-/// definitions 和召回范围，都在 I/O 阶段用掉了，assembler 用不到。
-pub struct ContextInput<'s> {
+/// 身份里的模型、能力面、记忆作用域不进来：它们决定的是请求的 model、tool definitions 和召回
+/// 范围，都在 I/O 阶段用掉了，装配用不到。
+pub struct ContextInput {
     /// 身份指令正文（已从冻结快照指向的 payload 读回）。
     pub instructions: Option<String>,
     /// 项目规范文件（`AGENTS.md` 等，已从冻结快照指向的 payload 读回），外层在前。
     /// 只渲染进主 Agent 的提示；空 = 没有（或者是子代理，调用方不给）。
     pub project_files: Vec<ProjectFile>,
-    /// 会话里规范改过之后、这条 Run 受理时的那一版：系统提示仍是会话里沿用的那份（前缀
-    /// 缓存不作废），这一版补在这条 Run 的任务后面。`None` = 没变。
-    pub project_update: Option<Vec<ProjectFile>>,
-    /// `task` 给这条 Run 的结果契约（冻结在它的快照里）：与 `project_update` 一样补在这条
-    /// Run 的任务后面，系统提示不变。`None` = 没有契约。
-    pub contract: Option<DelegateContract>,
     /// 解析过的真实工作目录。
     pub workspace: PathBuf,
     /// 这一段真正挂上的工具名，按 Schema 的顺序。RULES 按它挑规则（挂了 `rg` 才说"用
-    /// rg"），skills 门控也按它，所以 tool definitions 必须在 [`assemble`] 之前算好。
+    /// rg"），skills 门控也按它。
     /// 名字本身不进提示：API 的 tool schema 里已经有一份。
     pub tools: Vec<String>,
     /// 只在 codemode 里调的那些工具所属的组（MCP 服务器，`docs/mcp.md` §3）：工具没进 schema，
     /// 模型从系统提示的这一段知道它们在。空 = 不出这一段。
     pub mcp_servers: Vec<ToolNamespace>,
-    /// 已解析正文的回放条目。借用 `Surface`，不复制消息。
-    pub history: Vec<ResolvedMessage<'s>>,
     /// 这一段钉住的记忆注入段；`None` = 不注入（子代理、记忆关闭、没召回到）。
     /// 正文由 [`memory::render`] 渲染、由 `MemoryManager` 按段钉住，这里只决定它放在哪。
     pub memory: Option<String>,
@@ -69,14 +47,6 @@ pub struct ContextInput<'s> {
     /// [`SkillCatalog::prompt_block`]: crate::skills::SkillCatalog::prompt_block
     pub skills: Option<String>,
     pub invocation: InvocationContext,
-    /// 工具结果的投影设置（这条 Run 冻结的那一份）。
-    /// 与 `CallEnv` 用同一个值，否则"刚跑完"和"回放"渲染出来不一样。
-    pub projection: ProjectionContext,
-    /// 这条 Run 已经决定换成短视图的结果（`RunView.decayed`）：回放只按它选视图。
-    pub decayed: BTreeSet<ToolCallId>,
-    /// fork 任务会话冻结的前缀（`docs/background-tasks.md` §2b）。有它时系统提示就是它那份，
-    /// 回放以它的消息开头——上面那些拼系统提示的事实只用来挑 RULES 之外的东西（这时用不到）。
-    pub fork: Option<Arc<ForkPrefix>>,
 }
 
 /// 这一段是主 Agent 的对话，还是一次委派（`docs/agent.md` §11）。
@@ -89,89 +59,12 @@ pub enum InvocationContext {
     Delegated(DelegateSpec),
 }
 
-/// 装配出来的东西：模型看到的系统提示与回放消息。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AgentContext {
-    pub system_prompt: String,
-    pub messages: Vec<ReplayMessage>,
-    /// Legacy replay starts compaction at the current Run. Canonical tree replay
-    /// uses zero: the entire selected branch can be compacted across Runs.
-    pub run_from: usize,
-    /// 当前 Run 里有资格换成短视图、还没换的工具结果：改写决策（[`compaction::plan`]）
-    /// 据此算账；决定换了才记 `decayed`，回放才给短视图。
-    pub decay_candidates: Vec<DecayCandidate>,
-}
-
-/// 唯一的 Context Assembly 入口（`docs/agent.md` §5）。
-///
-/// 顺序（§10）：Instructions（最前）→ Identity / Task / 工作目录 / RULES → komo 自查
-/// （仅主 Agent 且挂了 `bash`）→ 项目规范（仅主 Agent）→ Skills（仅主 Agent）→ Result
-/// Contract（仅子代理）→ Memory（最后，`\n\n` + 正文）。`task` 的结果契约不进系统提示，
-/// 补在这条 Run 的任务后面。
-pub fn assemble(input: ContextInput<'_>) -> AgentContext {
-    let fork = input.fork.clone();
-    let mut context = assemble_own(input);
-    if let Some(fork) = fork {
-        // 父会话的系统提示与消息原样在前：首请求与父的上一次请求逐字节同前缀，提示缓存命中。
-        // 前缀在这条 Run 之前，压缩只在 `run_from` 之后切，碰不到它。
-        context.system_prompt = fork.system_prompt.clone();
-        let mut messages = fork.messages.clone();
-        context.run_from += messages.len();
-        messages.append(&mut context.messages);
-        context.messages = messages;
-    }
-    context
-}
-
-fn assemble_own(input: ContextInput<'_>) -> AgentContext {
-    let mut prompt = prompt::build(
-        &input.workspace,
-        &input.tools,
-        &input.mcp_servers,
-        &input.invocation,
-        &input.project_files,
-        input.skills.as_deref(),
-    );
-    prompt = with_instructions(input.instructions.as_deref(), prompt);
-    if let Some(memory) = &input.memory {
-        prompt.push_str("\n\n");
-        prompt.push_str(memory);
-    }
-    let (mut messages, run_from, decay_candidates) =
-        history::replay_messages(input.history, &input.projection, &input.decayed);
-    if let Some(files) = &input.project_update
-        && let Some(task) = messages
-            .get_mut(run_from)
-            .filter(|message| message.role == Role::User)
-    {
-        let text = task.text.get_or_insert_with(String::new);
-        text.push_str("\n\n");
-        text.push_str(&prompt::project_update_block(files));
-    }
-    if let Some(contract) = &input.contract
-        && let Some(task) = messages
-            .get_mut(run_from)
-            .filter(|message| message.role == Role::User)
-    {
-        let text = task.text.get_or_insert_with(String::new);
-        text.push_str("\n\n");
-        text.push_str(&prompt::task_contract_block(contract));
-    }
-    AgentContext {
-        system_prompt: prompt,
-        messages,
-        run_from,
-        decay_candidates,
-    }
-}
-
-/// 同 [`assemble`] 的系统提示，但按段交回 `(key, 正文)`（新存储的 `komo.system` entry 按段名
-/// 补丁，`docs/storage-durable-d5.md` §6）：`instructions` / `base` / `project` / `skills` /
-/// `memory`，空的段不出现，key 常量见 [`SECTION_INSTRUCTIONS`] 等。用 `"\n\n"` 连起来与
-/// `assemble(input).system_prompt` 逐字相同。只看 `input` 里拼系统提示的那几样事实（身份、
-/// 项目规范、工作目录、工具名、服务器、记忆、skills、调用方式）；fork 的前缀与回放不管，那是
-/// 调用方的事。
-pub fn system_sections(input: &ContextInput<'_>) -> Vec<(String, String)> {
+/// 系统提示按段交回 `(key, 正文)`（新存储的 `komo.system` entry 按段名补丁，
+/// `docs/storage-durable-d5.md` §6）：`instructions` / `base` / `project` / `skills` /
+/// `memory`，空的段不出现，key 常量见 [`SECTION_INSTRUCTIONS`] 等；用 `"\n\n"` 连起来就是
+/// 完整的系统提示（身份指令在最前，记忆在最后）。只看 `input` 里拼系统提示的那几样事实（身份、
+/// 项目规范、工作目录、工具名、服务器、记忆、skills、调用方式）。
+pub fn system_sections(input: &ContextInput) -> Vec<(String, String)> {
     prompt::sections(
         input.instructions.as_deref(),
         &input.workspace,
@@ -196,42 +89,10 @@ pub fn project_section(files: &[ProjectFile]) -> Option<String> {
     prompt::project_block(files)
 }
 
-/// 会话里规范改过之后补在任务后面的那一块（见 [`ContextInput::project_update`]）。
+/// 会话里规范改过之后补在任务后面的那一块。
 pub fn project_update_block(files: &[ProjectFile]) -> String {
     prompt::project_update_block(files)
 }
 
-/// 把身份指令放在系统提示**最前面**，基座提示排在它后面。
-fn with_instructions(instructions: Option<&str>, prompt: String) -> String {
-    match instructions.map(str::trim).filter(|text| !text.is_empty()) {
-        Some(text) => format!("{text}\n\n{prompt}"),
-        None => prompt,
-    }
-}
-
 #[cfg(test)]
 mod tests;
-
-/// Apply this Run's per-task additions after canonical tree assembly.
-pub fn append_task_context(
-    context: &mut AgentContext,
-    task_seq: komo_kernel::types::ids::Seq,
-    project_update: Option<&[ProjectFile]>,
-    contract: Option<&DelegateContract>,
-) {
-    if let Some(task) = context
-        .messages
-        .iter_mut()
-        .find(|message| message.seq == task_seq && message.role == Role::User)
-    {
-        let text = task.text.get_or_insert_with(String::new);
-        if let Some(files) = project_update {
-            text.push_str("\n\n");
-            text.push_str(&prompt::project_update_block(files));
-        }
-        if let Some(contract) = contract {
-            text.push_str("\n\n");
-            text.push_str(&prompt::task_contract_block(contract));
-        }
-    }
-}

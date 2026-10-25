@@ -154,7 +154,7 @@ enum Outcome {
 }
 
 impl Outcome {
-    /// 投出去的正文（与 Legacy 同一套话）。
+    /// 投出去的正文。
     fn text(&self) -> String {
         match self {
             Outcome::Completed(text) => text.clone(),

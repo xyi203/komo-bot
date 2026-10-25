@@ -8,7 +8,6 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use komo_agent::context::{ContextInput, InvocationContext, assemble};
 use komo_kernel::durable::{
     Content, ConversationId, EntryId, Message, Sections, SystemMessage, TaskId,
 };
@@ -594,10 +593,10 @@ async fn skills_section_is_pinned_until_the_next_head() {
     assert_eq!(find(&still_bare, "skills"), None, "{still_bare:?}");
 }
 
-/// 同一个 profile 下，段连起来与旧 `assemble` 的系统提示逐字相同（`komo-agent` 里还有一份
-/// 纯函数的组合黄金测试）。
+/// 同一个 profile 下，段按 instructions → base → project → skills 的顺序连成系统提示（`komo-agent`
+/// 里有纯函数的组合测试）。
 #[tokio::test]
-async fn golden_system_sections_match_legacy_prompt() {
+async fn the_system_sections_follow_the_prompt_order() {
     let dir = tempfile::tempdir().unwrap();
     let workdir = komo_runtime::tools::paths::real_root(dir.path());
     std::fs::write(workdir.join("AGENTS.md"), "项目规范\n").unwrap();
@@ -619,43 +618,18 @@ async fn golden_system_sections_match_legacy_prompt() {
         dir.path().join("skills").display()
     );
     let world = World::new(&config, finisher()).await;
-    let state = world.gateway.state();
     let conversation = world.conversation(Some(agent("assistant"))).await;
     let setup = world.hooks().setup(conversation, &[]).await.unwrap();
 
-    // 旧路径的装配：同一份事实，经 `assemble`。
-    let snapshot = state.snapshot();
-    let profile = snapshot.agent.get("assistant").unwrap();
-    let surface = setup.tools.surface().clone();
-    let executor = &state.tool_executor;
-    let legacy = assemble(ContextInput {
-        instructions: profile.instructions.clone(),
-        project_files: crate::service::project_files::discover(&workdir),
-        project_update: None,
-        contract: None,
-        workspace: workdir.clone(),
-        tools: executor
-            .definitions_for(&surface)
-            .into_iter()
-            .map(|tool| tool.name)
-            .collect(),
-        mcp_servers: executor.namespaces_for(&surface),
-        history: Vec::new(),
-        memory: None,
-        skills: crate::service::state::skills_block(&state.skills.read().unwrap(), surface.names()),
-        invocation: InvocationContext::Main,
-        projection: snapshot.execution.projection(),
-        decayed: Default::default(),
-        fork: None,
-    })
-    .system_prompt;
     let joined = setup
         .sections
         .iter()
         .map(|section| section.text.as_str())
         .collect::<Vec<_>>()
         .join("\n\n");
-    assert_eq!(joined, legacy);
+    assert!(joined.starts_with("你是 coder。\n\n你是 komo"), "{joined}");
+    assert!(joined.contains("项目规范"), "{joined}");
+    assert!(joined.contains("演示技能"), "{joined}");
     let keys: Vec<&str> = setup.sections.iter().map(|s| s.key.as_str()).collect();
     assert_eq!(keys, ["instructions", "base", "project", "skills"]);
     assert!(joined.contains("演示技能"), "skills 目录行在里面");

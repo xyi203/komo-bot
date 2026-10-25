@@ -2,8 +2,7 @@
 //!
 //! 新存储的系统提示是 `komo.system` entry 回放出来的**补丁**（`harness/system.rs`）：钩子每轮
 //! 把"期望的段"交回去，runtime 与已展示的比，没变就什么都不写（前缀字节不动、提示缓存照样
-//! 命中）。段的文字全部来自 `komo_agent::context::system_sections`（与旧 `assemble` 逐字相同，
-//! `golden_system_sections_match_legacy_prompt` 锁着）；key 与次序：
+//! 命中）。段的文字全部来自 `komo_agent::context::system_sections`；key 与次序：
 //!
 //! `instructions`（Profile 的身份指令）→ `base`（身份 / 工作目录 / RULES / komo 自查 / MCP 服务器）
 //! → `project`（`AGENTS.md` 等）→ `skills`（目录行）→ `memory`（召回的记忆，最后）。
@@ -83,7 +82,6 @@ pub(super) async fn build(
         memory
     };
 
-    let config = state.snapshot();
     let surface = tools.surface();
     let executor = &state.tool_executor;
     let tool_names: Vec<String> = tools
@@ -98,18 +96,12 @@ pub(super) async fn build(
     let input = ContextInput {
         instructions: resolved.profile.instructions.clone(),
         project_files,
-        project_update: None,
-        contract: None,
         workspace: resolved.workspace.clone(),
         tools: tool_names,
         mcp_servers: executor.namespaces_for(surface),
-        history: Vec::new(),
         memory,
         skills,
         invocation: InvocationContext::Main,
-        projection: config.execution.projection(),
-        decayed: Default::default(),
-        fork: None,
     };
     let fresh = system_sections(&input);
     let fresh_text = |key: &str| {

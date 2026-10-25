@@ -198,7 +198,7 @@ pub struct ForkOrigin {
     pub parent_run: crate::types::ids::RunId,
     /// 派它的那次 `task` 调用。
     pub call: crate::types::ids::ToolCallId,
-    /// 冻结的前缀（[`crate::types::turn::ForkPrefix`] 的 JSON），存在**任务会话自己的**
+    /// 冻结的前缀（系统提示 + 消息序列的 JSON），存在**任务会话自己的**
     /// `payloads/` 里：父会话删掉之后它照样读得到。
     pub prefix: PayloadRef,
 }

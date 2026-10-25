@@ -8,7 +8,6 @@
 //!
 //! 断言的是**模型收到了什么**（`FakeLlm` 记下的请求与轮输入）和日志里的 `context.compacted`。
 
-use komo_agent::context::compaction::price;
 use komo_gateway::service::test_support::harness::{call_round, text_round};
 use komo_kernel::events::{ContextCompacted, Event, EventPayload};
 use komo_kernel::types::turn::{RoundInput, TurnRequest};
@@ -85,15 +84,44 @@ fn short_script()
     ]]
 }
 
-/// 一次请求的估价：与 Gateway 判断时同一把尺子。
+/// 一次请求的估价：与 Gateway 判断时同一把尺子（字节 / 4）——系统提示、工具表、每条消息。
 fn priced(request: &TurnRequest) -> u64 {
-    let context = komo_agent::context::AgentContext {
-        system_prompt: request.system_prompt.clone(),
-        messages: request.messages.clone(),
-        run_from: 0,
-        decay_candidates: Vec::new(),
-    };
-    price(&context, &request.tools).write_tokens
+    use komo_kernel::compaction::{IMAGE_TOKENS, estimate_tokens};
+    let tools: u64 = request
+        .tools
+        .iter()
+        .map(|tool| {
+            estimate_tokens(&tool.name)
+                + estimate_tokens(&tool.description)
+                + estimate_tokens(&tool.parameters.to_string())
+        })
+        .sum();
+    let messages: u64 = request
+        .messages
+        .iter()
+        .map(|message| {
+            let body = match &message.provider_blocks {
+                Some(blocks) => estimate_tokens(&blocks.to_string()),
+                None => {
+                    message.text.as_deref().map_or(0, estimate_tokens)
+                        + message
+                            .tool_calls
+                            .iter()
+                            .map(|call| {
+                                estimate_tokens(&call.name)
+                                    + estimate_tokens(&call.arguments.to_string())
+                            })
+                            .sum::<u64>()
+                }
+            };
+            body + message
+                .tool_results
+                .iter()
+                .map(|r| estimate_tokens(&r.content) + IMAGE_TOKENS * r.images.len() as u64)
+                .sum::<u64>()
+        })
+        .sum();
+    estimate_tokens(&request.system_prompt) + tools + messages
 }
 
 mod durable;

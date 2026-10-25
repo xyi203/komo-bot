@@ -1,7 +1,7 @@
 //! 跨 crate 的测试替身（feature `test-support`，只作为 dev-dependency 启用，§13.4）。
 //!
 //! 这些替身要**够真**：store / runtime / gateway 的测试直接拿它们当依赖，所以
-//! [`MemLedger`] 真的按 seq 追加事件、真的能 fold，[`MemCronRepo`] 真的按
+//! [`MemCronRepo`] 真的按
 //! `job_id + scheduled_at` 去重。一个只会返回 `Ok(())` 的替身测不出任何东西。
 
 use std::sync::{Arc, Mutex};
@@ -14,22 +14,18 @@ use crate::types::plan::{ExecutionPlan, RecoveryMode};
 
 mod config;
 mod cron;
-mod ledger;
 mod memory;
 mod model;
 mod output;
-mod queue;
 #[cfg(test)]
 mod tests;
 mod zones;
 
 pub use config::snapshot_fixture;
 pub use cron::MemCronRepo;
-pub use ledger::MemLedger;
 pub use memory::MemMemoryRepo;
 pub use model::{FixedEmbeddingClient, ScriptedLlm, ScriptedTurnDriver};
 pub use output::{MemOutputStore, MemOutputWriter};
-pub use queue::MemRunQueue;
 pub use zones::ScriptedZoneResolver;
 
 /// 一条"压了"的 `context.compacted`：摘要内联，决策按一组压得过来的数算出来。

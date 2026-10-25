@@ -44,8 +44,7 @@ use komo_kernel::protocol::http::{
     IndexState, MemoryIndexStatus, MemorySweepRequest, MemorySweepResponse,
 };
 use komo_kernel::traits::{
-    Clock, EmbedError, EmbeddingClient, LedgerError, LlmClient, MemoryRepo, RepoError, StoreError,
-    SystemOne,
+    Clock, EmbedError, EmbeddingClient, LlmClient, MemoryRepo, RepoError, StoreError, SystemOne,
 };
 use komo_kernel::types::agent::MemoryMode;
 use komo_kernel::types::ids::{MemoryId, RunId, Seq, SessionId};
@@ -103,12 +102,6 @@ impl MemoryError {
     /// `pending`。
     pub fn is_permanent(&self) -> bool {
         matches!(self, MemoryError::Ledger(_))
-    }
-}
-
-impl From<LedgerError> for MemoryError {
-    fn from(error: LedgerError) -> Self {
-        MemoryError::Ledger(error.to_string())
     }
 }
 

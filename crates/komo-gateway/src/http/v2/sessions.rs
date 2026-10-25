@@ -43,7 +43,7 @@ pub fn routes() -> Router<Api> {
         .route("/v1/sessions/{id}/purge", post(purge))
 }
 
-/// query 里那个开关开着吗。`?all`、`?all=1`、`?all=true`、`?all=yes` 都算开（同 Legacy：
+/// query 里那个开关开着吗。`?all`、`?all=1`、`?all=true`、`?all=yes` 都算开（
 /// §13.1 写的是 `?all=1`，而 `serde_urlencoded` 的 bool 只认 `true` / `false`）。
 fn flag(query: &str, name: &str) -> bool {
     query.split('&').any(|pair| {
@@ -72,7 +72,7 @@ async fn list(
 }
 
 /// `POST /v1/sessions`：建会话（sessions 行 + 根 conversation + `komo.agent`，一次提交），落在默认
-/// Agent 名下。请求键幂等沿用进程内的那份（同 Legacy）。
+/// Agent 名下。请求键幂等沿用进程内的那份。
 async fn create(
     State(api): State<Api>,
     Json(request): Json<CreateSessionRequest>,

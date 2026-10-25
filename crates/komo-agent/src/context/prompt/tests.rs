@@ -8,6 +8,31 @@ use komo_kernel::types::ids::{RunId, ToolCallId};
 use super::*;
 use crate::skills::{OfferContext, SkillRegistry};
 
+/// 不带 instructions / memory 的整段系统提示：各段用 `"\n\n"` 连起来。
+fn build(
+    workspace: &Path,
+    tools: &[String],
+    mcp_servers: &[ToolNamespace],
+    invocation: &InvocationContext,
+    project_files: &[ProjectFile],
+    skills: Option<&str>,
+) -> String {
+    sections(
+        None,
+        workspace,
+        tools,
+        mcp_servers,
+        invocation,
+        project_files,
+        skills,
+        None,
+    )
+    .into_iter()
+    .map(|(_, text)| text)
+    .collect::<Vec<_>>()
+    .join("\n\n")
+}
+
 /// 工具名不在正文里再列一遍：API 的 tool schema 里已经有一份（学 pi）。
 #[test]
 fn the_system_prompt_names_the_workspace_and_leaves_tools_to_the_schema() {

@@ -1,13 +1,9 @@
-//! 一轮模型往返与一次输入接收所需的值类型（§6、§8.5、§13.5）。
+//! 一轮模型往返所需的值类型（§6、§8.5、§13.5）。
 
 use serde::{Deserialize, Serialize};
-use time::OffsetDateTime;
 
-use super::chat::ChannelPeer;
-use super::digest::ContentHash;
-use super::ids::{EventId, MemoryId, RequestKey, RunId, Seq, SessionId, ToolCallId};
+use super::ids::{MemoryId, RunId, Seq, SessionId, ToolCallId};
 use super::model::{ModelConfig, TokenUsage};
-use super::plan::{ExecutionPlan, PlanSource};
 use super::refs::PayloadRef;
 use super::tool::{ToolDefinition, ToolImage};
 
@@ -46,25 +42,6 @@ pub struct ToolCallRequest {
     pub arguments: serde_json::Value,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub arguments_ref: Option<PayloadRef>,
-}
-
-/// 一次完整的模型回复 + 该轮全部调用计划。**这是一个逻辑事件**：正文小则内联，大则
-/// 引用已经完整持久化的 payload，避免只恢复出半轮调用（§8.3）。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AssistantRound {
-    /// 第几轮。
-    pub round: u32,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub text: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub text_ref: Option<PayloadRef>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub tool_calls: Vec<ToolCallRequest>,
-    /// provider 回放所需的原始块（reasoning、签名等），原样保存。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub provider_blocks: Option<serde_json::Value>,
-    #[serde(default)]
-    pub usage: TokenUsage,
 }
 
 /// 一次模型往返的返回。
@@ -149,14 +126,6 @@ pub struct TurnRequest {
     pub cache_session: Option<SessionId>,
 }
 
-/// fork 任务冻结的前缀（`docs/background-tasks.md` §2b）：派它的那一刻，父会话下一次请求
-/// 的系统提示与消息序列，切口处没有结果的调用已经补上结果。fork 会话每一段都以它开头。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ForkPrefix {
-    pub system_prompt: String,
-    pub messages: Vec<ReplayMessage>,
-}
-
 /// 交给模型回放的一条消息。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReplayMessage {
@@ -205,153 +174,9 @@ pub enum LlmError {
     Unknown(String),
 }
 
-/// `Ledger::accept_input` 的输入（§8.5 第一段箭头）。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AcceptInput {
-    pub session: SessionId,
-    /// 幂等键。同一键重发返回原 Run，内容哈希不同则拒绝（§8.5）。
-    pub request_key: RequestKey,
-    pub text: String,
-    pub source: PlanSource,
-    /// 来源会话；Cron 与本机 CLI 可能没有。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub peer: Option<ChannelPeer>,
-    /// 本次 Run 固定的模型配置快照。
-    pub model: ModelConfig,
-    /// 这个 Session 的工作目录。Cron Job 的 `workdir`（§10）从这里落到 Session 行上——
-    /// 它在**创建 Job 时**就已经核实过存在，这里只是把它带到会话上。
-    ///
-    /// `None` = 不改（已经在的会话保留它自己的），不是"清空"。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub workdir: Option<std::path::PathBuf>,
-    /// 这是一次**委派**：子 Run 的身份、结果契约与轮次预算（§4）。
-    ///
-    /// 它在受理那一刻就落进 `run.accepted`，因此**活得过重启**：恢复后的子代理自己读得
-    /// 到"结果要长什么样"，父 Run 续跑时也不必去问运行时。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub delegate: Option<crate::types::delegate::DelegateSpec>,
-    /// **受理这一刻冻结下来的身份与能力**（§4.3）：哪个 Agent、哪一版 Profile、哪个模型、
-    /// 哪个工作目录、这次允许调用的工具、指向身份指令正文的引用、记忆作用域。
-    ///
-    /// 由受理方算好交下来，随 `run.accepted` 一起落账——**恢复时按它装配**：一条 Run 可能停
-    /// 一小时才续跑，而那时 Profile、工作目录与磁盘上的文件都可能已经改过，恢复出来的 Run
-    /// 不能因此换一副面孔。
-    ///
-    /// `None` = 这一条没有归属（旧行、Cron、子 Run 由父侧继承）：装配时按**当前**配置的
-    /// 默认 Agent 兜底（§八「已有 Session 归入默认 Agent；旧日志不重写」）。
-    /// 装箱的理由与 [`crate::events::RunAccepted::snapshot`] 同：它带着整份
-    /// [`crate::types::model::ModelConfig`]，而这个结构在受理路径上是按值搬的。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub snapshot: Option<Box<crate::types::agent::RunSnapshot>>,
-    /// 这条 Run 不必整理记忆：命令 Job 触发的 Run 没有对话可提取，记忆提取本身要发一次
-    /// 模型请求，而命令 Run 全程零模型请求（§9.3、§10）。落账时直接记
-    /// `MemoryWork::Done`，不进后台处理队列。
-    #[serde(default)]
-    pub skip_memory: bool,
-    /// 发送方要求插话（§6）：同 Session 有 Run 正在跑时，由它在下一次请求模型之前把这句话
-    /// 并进去，而不是排到它后面。只有 TUI 发（`SubmitRunRequest::interject`）。
-    #[serde(default)]
-    pub interject: bool,
-    #[serde(with = "time::serde::rfc3339")]
-    pub at: OffsetDateTime,
-}
-
-impl AcceptInput {
-    /// 输入内容哈希。同一请求键重发、内容不同则拒绝——比的是它。
-    pub fn input_hash(&self) -> ContentHash {
-        ContentHash::of_str(&self.text)
-    }
-}
-
-/// `Ledger::accept_input` 的返回。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Accepted {
-    pub run: RunId,
-    pub session: SessionId,
-    pub event: EventId,
-    pub seq: Seq,
-    /// 这次是不是命中了同一请求键的原 Run（重发）。
-    #[serde(default)]
-    pub deduplicated: bool,
-}
-
-/// `Ledger::read` 的返回：**一页**事件。
-///
-/// `next` 是 `Option` 而不是"一个总是有值的游标"：`None` 就是"读完了"。用一个总有值的
-/// 游标表达结尾，调用方只能靠"这一页是不是空的"去猜，而一页空可能只是这一次没读到
-/// ——那两件事必须分得开，SSE 的补读循环才不会空转。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct EventBatch {
-    pub session: SessionId,
-    pub events: Vec<crate::events::Event>,
-    /// 后面还有：下一页从这个 seq **之后**读起。`None` = 读到头了。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub next: Option<Seq>,
-}
-
-impl EventBatch {
-    /// 后面还有没有。
-    pub fn has_more(&self) -> bool {
-        self.next.is_some()
-    }
-}
-
-/// 一次工具调用的计划在账本里的样子——`record_round` 之后、`start_call` 之前。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PlannedCall {
-    pub call_id: ToolCallId,
-    pub plan: ExecutionPlan,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use time::macros::datetime;
-
-    #[test]
-    fn an_assistant_round_written_before_usage_existed_reads_with_defaults() {
-        let old = r#"{"round":3,"tool_calls":[]}"#;
-        let round: AssistantRound = serde_json::from_str(old).unwrap();
-        assert_eq!(round.round, 3);
-        assert!(round.usage.is_unknown());
-        assert!(round.text.is_none());
-        assert!(round.provider_blocks.is_none());
-    }
-
-    #[test]
-    fn the_input_hash_is_over_the_text() {
-        let mut input = AcceptInput {
-            session: SessionId::from_raw("s"),
-            request_key: RequestKey::new("telegram:1"),
-            text: "你好".into(),
-            source: PlanSource::Interactive {
-                session: SessionId::from_raw("s"),
-            },
-            peer: None,
-            model: ModelConfig {
-                provider: "openai_compatible".into(),
-                base_url: "https://x/v1".into(),
-                model: "m".into(),
-                api_key_env: "K".into(),
-                auth: None,
-                effort: None,
-                efforts: None,
-                timeout_secs: 120,
-                context_window: None,
-            },
-            workdir: None,
-            delegate: None,
-            snapshot: None,
-            skip_memory: false,
-            at: datetime!(2026-09-15 08:00:00 UTC),
-            interject: false,
-        };
-        let first = input.input_hash();
-        input.at = datetime!(2026-09-16 08:00:00 UTC);
-        assert_eq!(first, input.input_hash(), "只看正文，不看时间");
-        input.text = "你好吗".into();
-        assert_ne!(first, input.input_hash());
-    }
 
     #[test]
     fn a_round_input_round_trips_by_kind() {

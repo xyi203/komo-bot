@@ -210,6 +210,77 @@ async fn a_dispatched_task_runs_in_a_child_and_its_result_reaches_the_parent() {
     engine.close().await.unwrap();
 }
 
+/// 父所在的 Session 已经在删（`closing`）时，子任务跑完不再往父交回：交回是内部输入，会在父里起
+/// 后继 run，删除流程撤过一遍之后晚到的结果不能再让已删的会话动起来。
+#[tokio::test(start_paused = true)]
+async fn a_task_finishing_after_its_parent_session_started_closing_reports_nothing() {
+    use komo_kernel::durable::{SessionLifecycle, SessionRecord};
+
+    let world = World::new();
+    let (_fixture, ..) = install(&world);
+    let child_gate = Arc::new(Notify::new());
+    world
+        .script
+        .calls(&[("c1", "task", spawn_call("CHILD check the AC", "查空调"))]);
+    world.script.reply("dispatched");
+    world
+        .script
+        .push_for("CHILD", gated(&child_gate, "AC is on"));
+    let engine = world.open().await;
+    let parent = engine
+        .commit(|tx| {
+            Box::pin(async move {
+                let parent = tx
+                    .create_conversation_in(
+                        "sess-closing",
+                        crate::durable::tx::ConversationOwnership::Ownerless,
+                    )
+                    .await?
+                    .id;
+                tx.put_session(SessionRecord::new("sess-closing", parent));
+                Ok(parent)
+            })
+        })
+        .await
+        .unwrap();
+    let id = world
+        .harness
+        .submit(&engine, parent, SubmissionDraft::input("go"))
+        .await
+        .unwrap();
+    world.harness.wait(&engine, id).await.unwrap();
+    let child = world.child().await;
+
+    // 删除流程开始：父的 Session 进 `closing`。
+    engine
+        .commit(|tx| {
+            Box::pin(async move {
+                let mut session = tx.session("sess-closing").await?.expect("session row");
+                session.lifecycle = SessionLifecycle::Closing;
+                tx.put_session(session);
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+    child_gate.notify_one();
+    world
+        .until(|| async { world.live_of(child).await.run.is_none() })
+        .await;
+
+    assert!(world.entries_of(TASK_RESULT_ENTRY).await.is_empty());
+    assert!(
+        submissions_with(&world, parent, "task-result:")
+            .await
+            .is_empty()
+    );
+    assert!(
+        world.live_of(parent).await.run.is_none(),
+        "the closing parent was not woken up"
+    );
+    engine.close().await.unwrap();
+}
+
 /// D5 契约：派出的同一次提交里给子 conversation 写一条 komo Session 行——`kind=task`、UUIDv7、
 /// `parent_session` 是父 conversation 的 Session、title 是任务标题、根与当前分支都是子 conversation；
 /// 子 conversation 属于这个新 Session（fork 出来的也是，不继承父的）。

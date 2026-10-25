@@ -19,7 +19,7 @@
 //! 完成"）。
 
 use komo_kernel::durable::{
-    Content, ConversationId, EntryRecord, Message, SubmissionSettlement, TaskId,
+    Content, ConversationId, EntryRecord, Message, SessionLifecycle, SubmissionSettlement, TaskId,
 };
 use komo_kernel::types::delegate::DelegateContract;
 use serde_json::{Value, json};
@@ -218,7 +218,17 @@ async fn report(
 
     // 父不在了就没有可交回的对象；不能因此让这次收尾失败（失败路径会再走一遍这里）。
     let parent = doc.parent;
-    if tx.conversation(parent).await?.is_none() {
+    let Some(parent_record) = tx.conversation(parent).await? else {
+        return Ok(());
+    };
+    // 父所在的 Session 已经在删（`closing` / `deleted` / `purged`）：不再交回——交回的输入是内部
+    // 输入，会在父里起后继 run，删除流程撤过一遍之后晚到的结果不能再让已删的会话动起来。
+    if let Some(session) = parent_record.session.as_deref()
+        && tx
+            .session(session)
+            .await?
+            .is_some_and(|record| record.lifecycle != SessionLifecycle::Active)
+    {
         return Ok(());
     }
     let headline = match outcome {

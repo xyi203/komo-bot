@@ -30,6 +30,9 @@ pub struct MemoryWorkItem {
     pub source: PlanSource,
     /// 已经处理到哪条 seq。
     pub cursor: Seq,
+    /// 记忆模式与 Agent：新存储没有受理事件的快照，由领取方按配置给；`None` = 从事件里读
+    /// `run.accepted` 冻结的那一份（旧路径）。
+    pub frozen: Option<(komo_kernel::types::agent::MemoryMode, String)>,
 }
 
 /// 一个会话这一批全部待处理的 Run（按受理顺序）：一次提取调用的单位。
@@ -100,6 +103,7 @@ impl MemoryWorkLog for DbMemoryWork {
                         status: record.state,
                         source: record.source,
                         cursor: record.memory_cursor,
+                        frozen: None,
                     })
                     .collect(),
             })

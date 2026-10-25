@@ -24,6 +24,7 @@
 //! | `monitor_runner` | `MonitorRunner`：监听与转后台命令的进程、泵、合批、时限、遗留进程核对 | W2c |
 //! | `tasks` | 任务会话的展示：短号 `#<conversation>`、列表一行、标签 | W2c |
 //! | `feed` | 提交订阅 → SSE 帧（投影、`AssistantDelta`）与事件补读 | W2b |
+//! | `memory` | 记忆的装配（`DurableSessionEvents` / `DurableMemoryWork`）与 `MEMORY_TICK` | W3c |
 
 pub mod agent_doc;
 pub mod assemble;
@@ -32,6 +33,7 @@ pub mod copy;
 pub mod core;
 pub mod feed;
 pub mod hooks;
+pub mod memory;
 pub mod monitor_runner;
 pub mod orchestration;
 pub mod runs;

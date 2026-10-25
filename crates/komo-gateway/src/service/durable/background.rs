@@ -28,6 +28,8 @@ pub fn spawn(state: &Arc<GatewayState>, shutdown: &Shutdown) {
         let state = Arc::clone(state);
         tokio::spawn(async move { reconcile_monitors(&state).await });
     }
+    // W3c：记忆的后台领取（`MEMORY_TICK`）。
+    super::memory::spawn_tick(state, shutdown);
 }
 
 /// 启动时收掉上一代留下的监听（`docs/monitor.md` §5）：先让编排钩子核对并终止遗留的进程组、

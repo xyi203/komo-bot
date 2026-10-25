@@ -173,7 +173,7 @@ fn compactions_of(events: &[Event], run: &RunId) -> Vec<CompactionSummary> {
 /// 同一段对话里注入段只在换块时才记一条 `memory.injected`，后面的 Run 沿用它而不再记；
 /// 所以取**这条 Run 结束前最近的一条**：是自己记的就带上召回诊断，是更早的 Run 记的就
 /// 标"沿用"。
-fn injection_of(
+pub(crate) fn injection_of(
     events: &[Event],
     run: &RunId,
 ) -> (

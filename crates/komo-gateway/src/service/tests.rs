@@ -2348,3 +2348,183 @@ fn codemode_scripts_may_read_session_logs_but_not_the_rest_of_komo_state() {
     assert!(unreadable.contains(&home.join(".env")));
     assert!(protected_paths(&snapshot, home).contains(&snapshot.paths.sessions_dir));
 }
+
+// ---------------------------------------------------------------- W2b：Durable 版
+
+/// 起一台 Durable Gateway 并接上 SSE feed（`start()` 里的接线由主控合并时补；`spawn` 幂等）。
+async fn durable_gateway_with_feed(
+    llm: Arc<crate::service::test_support::harness::FakeLlm>,
+) -> (TestGateway, komo_kernel::traits::Shutdown) {
+    let gateway = TestGateway::durable(&telegram_config("111"), llm).await;
+    let shutdown = komo_kernel::traits::Shutdown::new();
+    let state = gateway.state();
+    let _ =
+        crate::service::durable::feed::spawn(state.core().unwrap(), &state.hub, &shutdown).await;
+    (gateway, shutdown)
+}
+
+/// ⑧ Durable 版：SSE 从 `Last-Event-ID` 续读，且先历史后直播。
+///
+/// 会话与输入直接走 `DurableCore`（HTTP 的会话路由是 W2a 的）；事件路由是 W2b 的，照旧走 HTTP。
+#[tokio::test]
+async fn sse_replays_history_from_a_cursor_then_goes_live_durable() {
+    use crate::service::durable::sessions::NewSession;
+    use crate::service::durable::submit::InputRequest;
+    use crate::service::test_support::harness::{FakeLlm, text_round};
+    use futures_util::StreamExt;
+
+    let (gateway, shutdown) =
+        durable_gateway_with_feed(FakeLlm::new(vec![vec![text_round(1, "收到")]])).await;
+    let core = gateway.state().core().unwrap();
+    let session = core
+        .create_session(NewSession::new("assistant"))
+        .await
+        .unwrap()
+        .id;
+    let accepted = core
+        .submit_input(&session, InputRequest::new("第一条").request_id("k-1"))
+        .await
+        .unwrap();
+    gateway.wait_run(&accepted.run).await;
+
+    // 游标 = 这条 run 的 `run.accepted` 那一帧的号：之后从 `run.queued` 起补读，游标那条不再给。
+    let (status, body) = gateway
+        .get(&format!("/v1/sessions/{session}/events?from=0"))
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let page: komo_kernel::protocol::http::EventPage = serde_json::from_str(&body).unwrap();
+    let cursor = page
+        .events
+        .iter()
+        .find(|event| {
+            matches!(
+                event.payload,
+                komo_kernel::events::EventPayload::RunAccepted(_)
+            )
+        })
+        .expect("有 run.accepted")
+        .seq;
+
+    let stream = reqwest::Client::new()
+        .get(format!(
+            "{}/v1/sessions/{session}/events",
+            gateway.base_url()
+        ))
+        .bearer_auth(gateway.token())
+        .header("accept", "text/event-stream")
+        .header("last-event-id", cursor.0.to_string())
+        .send()
+        .await
+        .expect("连得上");
+    assert_eq!(stream.status(), 200);
+
+    let mut body = stream.bytes_stream();
+    let mut seen = String::new();
+    while let Ok(Some(chunk)) =
+        tokio::time::timeout(std::time::Duration::from_secs(5), body.next()).await
+    {
+        seen.push_str(&String::from_utf8_lossy(&chunk.expect("一块")));
+        if seen.contains("run.completed") {
+            break;
+        }
+    }
+    assert!(seen.contains("run.queued"), "游标之后才补读：{seen}");
+    assert!(
+        !seen.contains(&format!("id: {}\n", cursor.0)),
+        "游标那一条不再给一遍：{seen}"
+    );
+
+    // 直播：现在写一条新的，同一条连接上就能收到。
+    core.boundary(&session, None).await.expect("写得下");
+    let mut live = String::new();
+    while let Ok(Some(chunk)) =
+        tokio::time::timeout(std::time::Duration::from_secs(5), body.next()).await
+    {
+        live.push_str(&String::from_utf8_lossy(&chunk.expect("一块")));
+        if live.contains("conversation.boundary") {
+            break;
+        }
+    }
+    assert!(
+        live.contains("conversation.boundary"),
+        "补读之后接直播：{live}"
+    );
+    let (_, body) = gateway
+        .get(&format!("/v1/sessions/{session}/events?from={}", cursor.0))
+        .await;
+    let page: komo_kernel::protocol::http::EventPage = serde_json::from_str(&body).unwrap();
+    let boundary = page
+        .events
+        .iter()
+        .find(|event| {
+            matches!(
+                event.payload,
+                komo_kernel::events::EventPayload::ConversationBoundary(_)
+            )
+        })
+        .expect("补读也有这条 boundary");
+    assert!(
+        live.contains(&format!("id: {}\n", boundary.seq.0)),
+        "直播的帧号与补读的一致：{live}"
+    );
+    shutdown.cancel();
+}
+
+/// ⑨ Durable 版：提交输入 → Run 完成 → 事件流上有最终消息。
+#[tokio::test]
+async fn an_end_to_end_turn_completes_and_reaches_the_event_stream_durable() {
+    use crate::service::durable::sessions::NewSession;
+    use crate::service::durable::submit::InputRequest;
+    use crate::service::test_support::harness::{FakeLlm, text_round};
+
+    let (gateway, shutdown) = durable_gateway_with_feed(FakeLlm::new(vec![vec![text_round(
+        1,
+        "好了，两加二等于四。",
+    )]]))
+    .await;
+    let core = gateway.state().core().unwrap();
+    let session = core
+        .create_session(NewSession::new("assistant"))
+        .await
+        .unwrap()
+        .id;
+    let accepted = core
+        .submit_input(
+            &session,
+            InputRequest::new("二加二等于几").request_id("cli-1"),
+        )
+        .await
+        .unwrap();
+    let settled = gateway.wait_run(&accepted.run).await;
+    assert_eq!(
+        settled.status(),
+        komo_kernel::durable::SubmissionStatus::Done
+    );
+
+    // 事件流上有那条 assistant 消息与最终消息（补读，不依赖有没有人在线）。
+    let (status, body) = gateway
+        .get(&format!("/v1/sessions/{session}/events?from=0"))
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert!(body.contains("message.assistant"), "{body}");
+    assert!(body.contains("两加二等于四"), "{body}");
+    let page: komo_kernel::protocol::http::EventPage = serde_json::from_str(&body).unwrap();
+    let completed = page
+        .events
+        .iter()
+        .find_map(|event| match &event.payload {
+            komo_kernel::events::EventPayload::RunCompleted(done) => Some(done.clone()),
+            _ => None,
+        })
+        .expect("有 run.completed");
+    assert_eq!(
+        completed.final_message.as_deref(),
+        Some("好了，两加二等于四。")
+    );
+    assert_eq!(
+        page.events.last().map(|event| event.seq),
+        Some(page.next),
+        "next 是最后一帧的号"
+    );
+    shutdown.cancel();
+}

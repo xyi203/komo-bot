@@ -19,12 +19,14 @@
 //! | `submit` | 提交输入：路由到当前分支、惰性 fork、model / effort 覆盖、`/new`、`/cancel` | W1c |
 //! | `tree` | 读树（`read_tree`）、导航、label / name、context-edit、分支摘要、compact、忙时守卫 | W1c |
 //! | `copy` | `/fork`、`/clone`：复制 entry 与 blob | W1c |
+//! | `feed` | 提交订阅 → SSE 帧（投影、`AssistantDelta`）与事件补读 | W2b |
 
 pub mod agent_doc;
 pub mod assemble;
 pub mod background;
 pub mod copy;
 pub mod core;
+pub mod feed;
 pub mod hooks;
 pub mod orchestration;
 pub mod sessions;
@@ -35,6 +37,8 @@ pub use self::core::DurableCore;
 pub use assemble::StateSlot;
 pub use sessions::SessionError;
 
+#[cfg(test)]
+mod feed_tests;
 #[cfg(test)]
 mod session_tests;
 #[cfg(test)]

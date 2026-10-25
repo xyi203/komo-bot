@@ -211,6 +211,14 @@ pub fn cursor_from(last_event_id: Option<&str>, from: Seq) -> Seq {
         .unwrap_or(from)
 }
 
+/// 直播里的这一帧是不是补读已经给过的（`last` 是已经交给客户端的最大 seq）。
+///
+/// 只有原始 [`SseEvent::Event`] 按号去重：补读只发这一种，而派生帧（`run_status` /
+/// `assistant_delta`）与源事件同号、一帧都没被补读过，按号丢会让它们永远到不了客户端。
+pub fn already_sent(frame: &SseFrame, last: Seq) -> bool {
+    frame.id <= last && matches!(frame.event, SseEvent::Event(_))
+}
+
 /// 共享的 [`EventHub`]。
 pub type SharedHub = Arc<EventHub>;
 
@@ -341,6 +349,26 @@ mod tests {
                 .unwrap_or_else(|error| panic!("客户端解不开这一帧：{error}\n{text}"));
             assert_eq!(&parsed, frame);
         }
+    }
+
+    #[test]
+    fn only_raw_events_are_deduped_against_the_backfill() {
+        let event = SseFrame {
+            id: Seq(7),
+            session: SessionId::from_raw("sess-1"),
+            event: SseEvent::Event(Box::new(completed(7))),
+        };
+        let status = SseFrame {
+            id: Seq(7),
+            session: SessionId::from_raw("sess-1"),
+            event: SseEvent::RunStatus {
+                run: RunId::from_raw("run-1"),
+                state: RunState::Completed,
+            },
+        };
+        assert!(already_sent(&event, Seq(7)));
+        assert!(!already_sent(&event, Seq(6)));
+        assert!(!already_sent(&status, Seq(7)), "派生帧不按号去重");
     }
 
     #[test]

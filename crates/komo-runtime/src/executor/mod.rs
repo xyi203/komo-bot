@@ -427,13 +427,18 @@ impl ToolExecutor {
         removed
     }
 
-    /// 这个名字被撤过：交回撤的原因。
-    fn withdrawn_reason(&self, name: &str) -> Option<String> {
+    /// 这个名字被撤过：交回撤的原因。新存储的钩子（gateway，D5）用它给撤掉的工具放桩。
+    pub fn withdrawn_reason(&self, name: &str) -> Option<String> {
         self.withdrawn
             .read()
             .expect("撤掉的工具")
             .get(name)
             .cloned()
+    }
+
+    /// 此刻撤着的名字 → 原因（新存储的钩子按它把撤掉的名字留在能力面里，再调时报原因）。
+    pub fn withdrawn(&self) -> BTreeMap<String, String> {
+        self.withdrawn.read().expect("撤掉的工具").clone()
     }
 
     /// 交给模型的工具 Schema：**按能力面的顺序**、只列能力面里真的装着的那些。

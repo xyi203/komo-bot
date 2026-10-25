@@ -555,6 +555,10 @@ pub struct CompactionConfig {
     /// 摘要本身的 token 估计。
     #[serde(default = "default_memo_token_estimate")]
     pub memo_token_estimate: u64,
+    /// 后台压缩阈值（新存储 harness，pi-durable §8.7 的 `backgroundTokens`）：上下文到
+    /// `阻塞阈值 - background_tokens` 就在后台起一个压缩，不挡当前轮。0 = 不启用。
+    #[serde(default)]
+    pub background_tokens: u64,
 }
 
 impl CompactionConfig {
@@ -624,6 +628,7 @@ impl Default for CompactionConfig {
             subsequent_margin: default_subsequent_margin(),
             cooldown_requests: default_cooldown_requests(),
             memo_token_estimate: default_memo_token_estimate(),
+            background_tokens: 0,
         }
     }
 }

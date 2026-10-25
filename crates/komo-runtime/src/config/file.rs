@@ -222,6 +222,7 @@ pub(super) struct CompactionSection {
     pub subsequent_margin: Option<f64>,
     pub cooldown_requests: Option<u64>,
     pub memo_token_estimate: Option<u64>,
+    pub background_tokens: Option<u64>,
 }
 
 impl CompactionSection {
@@ -243,6 +244,7 @@ impl CompactionSection {
             subsequent_margin: self.subsequent_margin.unwrap_or(base.subsequent_margin),
             cooldown_requests: self.cooldown_requests.unwrap_or(base.cooldown_requests),
             memo_token_estimate: self.memo_token_estimate.unwrap_or(base.memo_token_estimate),
+            background_tokens: self.background_tokens.unwrap_or(base.background_tokens),
         }
     }
 }

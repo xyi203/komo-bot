@@ -89,6 +89,63 @@ pub(crate) fn build(
     }
 }
 
+/// 系统段的 key（新存储的 `komo.system` entry 按名字补丁，`docs/storage-durable-d5.md` §6）。
+pub const SECTION_INSTRUCTIONS: &str = "instructions";
+pub const SECTION_BASE: &str = "base";
+pub const SECTION_PROJECT: &str = "project";
+pub const SECTION_SKILLS: &str = "skills";
+pub const SECTION_MEMORY: &str = "memory";
+
+/// 同 [`build`]，但按段交回 `(key, 正文)`：`instructions`（最前，已 trim）→ `base`（身份 / 工作目录 /
+/// RULES / komo 自查；子代理是它那份提示）→ `project`（项目规范）→ `skills` → `memory`（最后）。
+/// 空的段不出现。**用 `\n\n` 连起来就是 [`super::assemble`] 的系统提示，逐字相同**
+/// （`golden_system_sections_match_legacy_prompt` 锁着）。
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn sections(
+    instructions: Option<&str>,
+    workspace: &Path,
+    tools: &[String],
+    mcp_servers: &[ToolNamespace],
+    invocation: &InvocationContext,
+    project_files: &[ProjectFile],
+    skills: Option<&str>,
+    memory: Option<&str>,
+) -> Vec<(String, String)> {
+    let mut rules = rules(tools);
+    if let Some(block) = servers_block(mcp_servers) {
+        rules.push_str("\n\n");
+        rules.push_str(&block);
+    }
+    let mut out: Vec<(String, String)> = Vec::new();
+    let mut push = |key: &str, text: String| {
+        if !text.is_empty() {
+            out.push((key.to_owned(), text));
+        }
+    };
+    if let Some(text) = instructions.map(str::trim) {
+        push(SECTION_INSTRUCTIONS, text.to_owned());
+    }
+    match invocation {
+        InvocationContext::Main => {
+            let has_shell = tools.iter().any(|tool| tool == BASH_TOOL);
+            push(SECTION_BASE, main_base(workspace, &rules, has_shell));
+            if let Some(block) = project_block(project_files) {
+                push(SECTION_PROJECT, block);
+            }
+            if let Some(block) = skills {
+                push(SECTION_SKILLS, block.to_owned());
+            }
+        }
+        InvocationContext::Delegated(spec) => {
+            push(SECTION_BASE, subagent_prompt(workspace, &rules, spec));
+        }
+    }
+    if let Some(memory) = memory {
+        push(SECTION_MEMORY, memory.to_owned());
+    }
+    out
+}
+
 /// 服务器段里一台服务器的说明最多这么多字（pi 的 `MAX_SERVER_DESCRIPTION_CHARS`）。
 const MAX_SERVER_DESCRIPTION_CHARS: usize = 250;
 
@@ -169,6 +226,21 @@ fn main_prompt(
     skills: Option<&str>,
     has_shell: bool,
 ) -> String {
+    let mut prompt = main_base(workspace, rules, has_shell);
+    if let Some(block) = project_block(project_files) {
+        prompt.push_str("\n\n");
+        prompt.push_str(&block);
+    }
+    if let Some(block) = skills {
+        prompt.push_str("\n\n");
+        prompt.push_str(block);
+    }
+    prompt
+}
+
+/// 主 Agent 提示里不随项目规范与 skills 变的那一段：身份 / 工作目录 / 行为约束，能跑命令时
+/// 再加「komo 自查」。[`main_prompt`] 与 [`sections`] 共用，两条路的正文因此不会漂。
+fn main_base(workspace: &Path, rules: &str, has_shell: bool) -> String {
     let mut prompt = format!(
         "你是 komo，跑在用户自己机器上的助手。\n\
          工作目录：{}\n\
@@ -178,14 +250,6 @@ fn main_prompt(
     if has_shell {
         prompt.push_str("\n\n");
         prompt.push_str(SELF_BLOCK);
-    }
-    if let Some(block) = project_block(project_files) {
-        prompt.push_str("\n\n");
-        prompt.push_str(&block);
-    }
-    if let Some(block) = skills {
-        prompt.push_str("\n\n");
-        prompt.push_str(block);
     }
     prompt
 }

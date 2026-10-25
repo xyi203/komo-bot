@@ -12,12 +12,16 @@
 //! | `core` | [`DurableCore`]：`Engine` + `Harness` + `Storage` | W0b |
 //! | `agent_doc` | `komo.agent` document 的读写与 fork 复制 | W0b |
 //! | `assemble` | 钩子与编排的装配、与 `GatewayState` 的断环 | W0b（W1b 填） |
+//! | `hooks` | `AgentHooks`：setup / 工具表 / 系统段 / 压缩（按当前配置现解析） | W1b |
+//! | `orchestration` | `OrchestrationHooks`：`check_effort`、契约段、监听委托 `MonitorRunner` | W1b |
 //! | `background` | Durable 模式的后台循环 | W0b（W2b/W3 往里加） |
 
 pub mod agent_doc;
 pub mod assemble;
 pub mod background;
 pub mod core;
+pub mod hooks;
+pub mod orchestration;
 
 pub use self::core::DurableCore;
 pub use assemble::StateSlot;

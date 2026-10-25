@@ -206,3 +206,107 @@ fn a_task_contract_trails_the_task_not_the_system_prompt() {
             .as_deref()
     );
 }
+
+/// 新存储按段补丁系统提示（`system_sections`）：把段用 `"\n\n"` 连起来必须与旧 `assemble` 的
+/// 系统提示逐字相同——各种事实组合（有无指令 / bash / 项目规范 / skills / MCP 服务器 / 记忆、
+/// 主 Agent 与子代理）都过一遍。
+#[test]
+fn golden_system_sections_match_legacy_prompt() {
+    use komo_kernel::types::delegate::DelegateSpec;
+    use komo_kernel::types::ids::{RunId, ToolCallId};
+
+    let project = [
+        ProjectFile {
+            path: "/w/AGENTS.md".into(),
+            content: "外层规范\n".into(),
+        },
+        ProjectFile {
+            path: "/w/repo/CLAUDE.md".into(),
+            content: "仓库规范".into(),
+        },
+        ProjectFile {
+            path: "/w/repo/EMPTY.md".into(),
+            content: "  \n".into(),
+        },
+    ];
+    let servers = [ToolNamespace {
+        name: "mcp__fs".into(),
+        server: "fs".into(),
+        description: Some("文件服务".into()),
+        instructions: None,
+    }];
+    let delegate = InvocationContext::Delegated(DelegateSpec::new(
+        RunId::from_raw("parent"),
+        ToolCallId::from_raw("call"),
+        "查一下 X",
+    ));
+    let tool_sets: [Vec<String>; 3] = [
+        vec![],
+        vec!["read".into()],
+        vec![
+            "read".into(),
+            "rg".into(),
+            "bash".into(),
+            "edit".into(),
+            "codemode".into(),
+        ],
+    ];
+    let mut checked = 0;
+    for tools in &tool_sets {
+        for instructions in [None, Some("  你是 coder。\n"), Some("   ")] {
+            for memory in [None, Some("[已知记忆]\n- 用户喜欢中文")] {
+                for skills in [None, Some("可用技能：\n- a")] {
+                    for (files, servers) in [(&[][..], &[][..]), (&project[..], &servers[..])] {
+                        for invocation in [InvocationContext::Main, delegate.clone()] {
+                            let input = ContextInput {
+                                project_files: files.to_vec(),
+                                tools: tools.clone(),
+                                mcp_servers: servers.to_vec(),
+                                skills: skills.map(str::to_string),
+                                invocation: invocation.clone(),
+                                ..input(instructions, memory)
+                            };
+                            let sections = system_sections(&input);
+                            let joined = sections
+                                .iter()
+                                .map(|(_, text)| text.as_str())
+                                .collect::<Vec<_>>()
+                                .join("\n\n");
+                            assert_eq!(
+                                joined,
+                                assemble(input).system_prompt,
+                                "tools={tools:?} instructions={instructions:?} memory={memory:?}"
+                            );
+                            checked += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!(checked, 3 * 3 * 2 * 2 * 2 * 2);
+}
+
+#[test]
+fn system_sections_are_keyed_in_prompt_order_and_skip_the_empty_ones() {
+    let sections = system_sections(&ContextInput {
+        project_files: vec![ProjectFile {
+            path: "/w/AGENTS.md".into(),
+            content: "规范".into(),
+        }],
+        skills: Some("技能".into()),
+        tools: vec!["bash".into()],
+        ..input(Some("你是 coder。"), Some("记忆"))
+    });
+    let keys: Vec<&str> = sections.iter().map(|(key, _)| key.as_str()).collect();
+    assert_eq!(
+        keys,
+        ["instructions", "base", "project", "skills", "memory"]
+    );
+    assert_eq!(sections[0].1, "你是 coder。");
+    assert!(sections[1].1.starts_with("你是 komo"));
+
+    let bare = system_sections(&input(None, None));
+    let keys: Vec<&str> = bare.iter().map(|(key, _)| key.as_str()).collect();
+    assert_eq!(keys, ["base"]);
+}

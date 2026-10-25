@@ -480,6 +480,7 @@ fn compaction_is_off_by_default_and_its_keys_map_onto_the_economics() {
     assert_eq!(compaction.keep_recent_tokens, 20_000);
     assert_eq!(compaction.memo_token_estimate, 1_000);
     assert_eq!(compaction.max_context_tokens, 150_000);
+    assert_eq!(compaction.background_tokens, 0, "后台压缩默认不启用");
     assert_eq!(
         compaction.economics(),
         komo_kernel::compaction::CompactionEconomics::default()
@@ -489,7 +490,7 @@ fn compaction_is_off_by_default_and_its_keys_map_onto_the_economics() {
     text.push_str(
         "\n[compaction]\nenabled = true\nwindow_reserve_tokens = 8000\n\
          first_compaction_scale = 3.0\nsubsequent_margin = 2.0\ncooldown_requests = 4\n\
-         max_context_tokens = 200000\n",
+         max_context_tokens = 200000\nbackground_tokens = 30000\n",
     );
     write(&fixture.sources().config, &text);
     let loaded = load_config(&fixture.options()).unwrap();
@@ -500,7 +501,20 @@ fn compaction_is_off_by_default_and_its_keys_map_onto_the_economics() {
     assert_eq!(economics.subsequent_compaction_margin, 2.0);
     assert_eq!(economics.minimum_requests_since_compaction, 4);
     assert_eq!(loaded.snapshot.compaction.max_context_tokens, 200_000);
+    assert_eq!(loaded.snapshot.compaction.background_tokens, 30_000);
     assert_eq!(loaded.snapshot.compaction.window(Some(1_000_000)), 208_000);
+}
+
+#[test]
+fn a_background_threshold_at_or_above_the_blocking_one_refuses_the_load() {
+    let fixture = Fixture::valid();
+    let mut text = Fixture::config_text("chat-a", "medium");
+    text.push_str("\n[compaction]\nmax_context_tokens = 100000\nbackground_tokens = 100000\n");
+    write(&fixture.sources().config, &text);
+
+    let error = load_config(&fixture.options()).unwrap_err();
+    let keys: Vec<&str> = error.issues().iter().map(|i| i.key.as_str()).collect();
+    assert_eq!(keys, vec!["compaction.background_tokens"]);
 }
 
 #[test]

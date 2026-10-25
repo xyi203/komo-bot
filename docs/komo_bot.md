@@ -1488,6 +1488,9 @@ subsequent_margin = 1.5
 cooldown_requests = 2
 # 摘要本身的 token 估计。省略 = 1000。
 memo_token_estimate = 1000
+# 后台压缩（新存储 harness）：上下文到 阻塞阈值 − 这么多 token 就在后台起一个压缩，不挡当前轮。
+# 省略 / 0 = 不启用；要小于 max_context_tokens。
+background_tokens = 0
 ```
 
 `memory.model` 省略时使用默认 completion alias 的完整配置，包括 effort；它不继承某个 Session 或 Cron 的临时覆盖。显式引用时必须指向 completion，`memory.embedding` 必须指向 embedding。若明确选择 keyword 模式，可以不配置 embedding。`GET /v1/models` 只列 completion alias；选择 alias 会携带完整端点、协议和凭证引用，而不是只替换上游 model id。

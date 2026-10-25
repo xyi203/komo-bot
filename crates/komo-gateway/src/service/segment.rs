@@ -1013,7 +1013,7 @@ async fn call_request(
 ///
 /// 根与目标必须在同一套坐标系里：这里用 `real_root` 解掉符号链接，工具解析目标时走的也
 /// 是它（macOS 上 `/var` → `/private/var`，字面前缀匹配会全落空）。
-fn run_roots(
+pub(crate) fn run_roots(
     sessions_dir: Option<&std::path::Path>,
     session: &SessionId,
     cwd: PathBuf,

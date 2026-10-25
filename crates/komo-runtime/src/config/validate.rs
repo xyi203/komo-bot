@@ -485,6 +485,14 @@ fn check_compaction(snapshot: &ConfigSnapshot, issues: &mut Vec<ConfigIssue>) {
             "max_context_tokens 要大于 keep_recent_tokens（否则压完还在上限上，一轮一次摘要）",
         ));
     }
+    if compaction.background_tokens > 0
+        && compaction.background_tokens >= compaction.max_context_tokens
+    {
+        issues.push(error(
+            "compaction.background_tokens",
+            "background_tokens 要小于 max_context_tokens（后台阈值 = 阻塞阈值 − 它，否则一开始就在后台压）",
+        ));
+    }
 }
 
 /// `[mcp.servers.<name>]`（`docs/mcp.md`）：名字要进工具名（`mcp__<name>__<tool>`），只能是

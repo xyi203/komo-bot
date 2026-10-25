@@ -21,6 +21,8 @@
 //! | `copy` | `/fork`、`/clone`：复制 entry 与 blob | W1c |
 //! | `runs` | `RunSummary` / `RunDetail` / `RunState` 映射、按 RunId 取消 | W2a |
 //! | `shell` | `!` 命令直跑（不建 run），落 `shell.command` write | W2a |
+//! | `monitor_runner` | `MonitorRunner`：监听与转后台命令的进程、泵、合批、时限、遗留进程核对 | W2c |
+//! | `tasks` | 任务会话的展示：短号 `#<conversation>`、列表一行、标签 | W2c |
 
 pub mod agent_doc;
 pub mod assemble;
@@ -28,11 +30,13 @@ pub mod background;
 pub mod copy;
 pub mod core;
 pub mod hooks;
+pub mod monitor_runner;
 pub mod orchestration;
 pub mod runs;
 pub mod sessions;
 pub mod shell;
 pub mod submit;
+pub mod tasks;
 pub mod tree;
 
 pub use self::core::DurableCore;

@@ -660,6 +660,8 @@ async fn build_tools(
     };
 
     let snapshot = config.current();
+    // Durable 的转后台接手方要等整份状态才造得出来：槽按实例 ID 停给 `durable::assemble::wire` 取。
+    durable::assemble::park_detach_slot(instance_id, detach_slot);
     let registry = Arc::new(komo_runtime::recovery::ChildRegistry::new(
         snapshot.paths.runtime_dir.join("children"),
     ));

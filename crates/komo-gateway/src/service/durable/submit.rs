@@ -70,6 +70,10 @@ pub struct InputRequest {
     /// 规范文件（AGENTS.md 一类）变了时的 `project_update_block`：补在输入正文**后面**，
     /// 展示的是同一条 entry。
     pub project_update: Option<String>,
+    /// 用户在 TUI 里插话（`interject: true`）：输入排在忙着的会话后面时，前台正跑着的长 `bash`
+    /// 提前转后台，别让这句话等它跑完（`docs/monitor.md` §8）。只有 HTTP 的插话带它——渠道里的
+    /// steer、监听事件与任务交回不带。
+    pub interject: bool,
 }
 
 impl InputRequest {
@@ -81,6 +85,7 @@ impl InputRequest {
             when_busy: WhenBusy::FollowUp,
             model: None,
             project_update: None,
+            interject: false,
         }
     }
 
@@ -106,6 +111,11 @@ impl InputRequest {
 
     pub fn project_update(mut self, block: impl Into<String>) -> Self {
         self.project_update = Some(block.into());
+        self
+    }
+
+    pub fn interject(mut self, interject: bool) -> Self {
+        self.interject = interject;
         self
     }
 }
@@ -451,6 +461,10 @@ impl DurableCore {
             .await?
             .map(|record| record.status())
             .unwrap_or(SubmissionStatus::Queued);
+        // 排在忙着的会话后面（没有自己开 run）的插话：举旗，前台的长 `bash` 提前转后台。
+        if request.interject && !landed.deduplicated && status == SubmissionStatus::Queued {
+            self.interject(landed.conversation);
+        }
         Ok(Accepted {
             session: session.to_owned(),
             conversation: landed.conversation,

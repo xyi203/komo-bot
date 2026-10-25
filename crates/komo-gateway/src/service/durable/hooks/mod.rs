@@ -99,6 +99,8 @@ impl AgentHooks for GatewayHooks {
         let config = state.snapshot();
         let core = state.core().map_err(|e| HookError::Failed(e.to_string()))?;
         let resolved = resolve(&state, &*core.storage, conversation, &config).await?;
+        // 新的一段（一次模型请求）从没有插话开始：并进去的插话到这里已经落了地。
+        core.lower_interjection(conversation);
         // 刚登录的 MCP 服务器这时连上，它的工具进这一轮的能力面（旧 `freeze_run` 同一步）。
         state.refresh_mcp().await;
         let tools = self.resolve_tools(&state, &resolved).await?;

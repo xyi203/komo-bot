@@ -4,7 +4,9 @@
 //!   按它的档位校验（`EffortCapabilities`）。
 //! - `contract_block`：直接调 `komo_agent` 的 `task_contract_block`，免得两处文字漂移。
 //! - `start_monitor` / `stop_monitor`：委托给 [`MonitorRunner`]（进程、泵、合批、时限、进程组、
-//!   遗留进程核对都是它的事，W2c 实现）。没装配时干净地失败，并说明是没装配。
+//!   遗留进程核对都是它的事，`monitor_runner.rs` 实现）。没装配时干净地失败，并说明是没装配。
+//! - `boot` / `shutdown` / `detacher`：同样委托给它——启动时核对上一代遗留的进程、停机时终止进程组、
+//!   `bash` 转后台的接手方。
 
 use std::sync::Arc;
 
@@ -13,6 +15,7 @@ use komo_kernel::durable::ConversationId;
 use komo_kernel::types::delegate::DelegateContract;
 use komo_kernel::types::model::Effort;
 use komo_runtime::durable::harness::{MonitorError, MonitorLaunch, OrchestrationHooks};
+use komo_runtime::tools::detach::Detacher;
 
 use super::assemble::StateSlot;
 use super::hooks::{self, state_of};
@@ -28,6 +31,17 @@ pub trait MonitorRunner: Send + Sync {
 
     /// 终止监听的进程组。幂等：已经没有的也算成功。
     async fn stop(&self, id: u64) -> Result<(), MonitorError>;
+
+    /// 启动时、对账（`Harness::reconcile_monitors`）之前调一次：核对并终止上一代遗留的进程组。
+    async fn boot(&self) {}
+
+    /// 停机时、引擎关闭之前调一次：终止全部进程组，登记原样留给下一代。
+    async fn shutdown(&self) {}
+
+    /// `bash` 转后台的接手方（`docs/monitor.md` §8）。
+    fn detacher(&self) -> Option<Arc<dyn Detacher>> {
+        None
+    }
 }
 
 pub struct GatewayOrchestration {
@@ -36,7 +50,7 @@ pub struct GatewayOrchestration {
 }
 
 impl GatewayOrchestration {
-    /// `monitors = None`：这台 Gateway 还没有装配监听（W2c 装配 `MonitorRunner`）。
+    /// `monitors = None`：这台 Gateway 没有装配监听。
     pub fn new(slot: StateSlot, monitors: Option<Arc<dyn MonitorRunner>>) -> Arc<Self> {
         Arc::new(GatewayOrchestration { slot, monitors })
     }
@@ -95,6 +109,22 @@ impl OrchestrationHooks for GatewayOrchestration {
         match &self.monitors {
             Some(runner) => runner.stop(id).await,
             None => Err(Self::unassembled()),
+        }
+    }
+
+    fn detacher(&self) -> Option<Arc<dyn Detacher>> {
+        self.monitors.as_ref().and_then(|runner| runner.detacher())
+    }
+
+    async fn boot(&self) {
+        if let Some(runner) = &self.monitors {
+            runner.boot().await;
+        }
+    }
+
+    async fn shutdown(&self) {
+        if let Some(runner) = &self.monitors {
+            runner.shutdown().await;
         }
     }
 }

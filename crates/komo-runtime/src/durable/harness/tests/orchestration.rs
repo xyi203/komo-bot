@@ -1357,6 +1357,78 @@ async fn a_finished_monitor_hands_back_exactly_one_end_message() {
     engine.close().await.unwrap();
 }
 
+/// gateway 接手的、不是 `monitor` 挂的进程（`bash` 转后台，`docs/monitor.md` §8）：`register_monitor`
+/// 登记之后，`monitor_stop` 停得掉它，结束消息与登记同一次提交，重启对账把没结束的判为中断。
+#[tokio::test(start_paused = true)]
+async fn a_registered_foreign_process_is_stoppable_finishable_and_reconciled() {
+    let world = World::new();
+    let (_fixture, ..) = install(&world);
+    let engine = world.open().await;
+    let record = |id: u64, title: &str| monitor::MonitorRecord {
+        id,
+        conversation: CONV,
+        title: title.into(),
+        command: "sleep 600".into(),
+        cwd: ".".into(),
+        timeout_minutes: 0,
+        resume_after_restart: false,
+        started_at: 0,
+        deadline: 0,
+        state: MonitorState::Running,
+    };
+    for (id, title) in [(9001, "转后台甲"), (9002, "转后台乙")] {
+        world
+            .harness
+            .register_monitor(&engine, record(id, title))
+            .await
+            .unwrap();
+    }
+    assert_eq!(monitors(&world).await.len(), 2);
+
+    // `monitor_stop` 认得它们，也真的把进程交给了 gateway 去停。
+    world
+        .script
+        .calls(&[("s1", "monitor_stop", json!({ "monitor_id": "9001" }))]);
+    world.script.reply("stopped");
+    let stop = world.submit(&engine, "stop it").await;
+    world.harness.wait(&engine, stop).await.unwrap();
+    assert_eq!(
+        result_text(&world.messages().await, "s1"),
+        "已停止监听 #9001：转后台甲"
+    );
+    assert_eq!(world.orch.stops(), vec![9001]);
+
+    // 另一条自己结束：结束消息交回一次，再结束是空操作。
+    let message = "[后台命令 #9002「转后台乙」结束] 退出码 0".to_owned();
+    world.script.reply("saw the end");
+    assert!(
+        world
+            .harness
+            .finish_monitor(&engine, 9002, "exit", Some("退出码 0"), message.clone())
+            .await
+            .unwrap()
+    );
+    assert!(
+        !world
+            .harness
+            .finish_monitor(&engine, 9002, "exit", None, message)
+            .await
+            .unwrap()
+    );
+
+    // 没结束的重启之后判为中断，不重挂。
+    world
+        .harness
+        .register_monitor(&engine, record(9003, "转后台丙"))
+        .await
+        .unwrap();
+    world.script.reply("saw the interruption");
+    let engine = world.restart(engine).await;
+    let done = world.harness.reconcile_monitors(&engine).await.unwrap();
+    assert_eq!(done, vec![Reconciled::Ended(9003, "interrupted".into())]);
+    engine.close().await.unwrap();
+}
+
 /// 重启后对账（`docs/monitor.md` §5）：声明了 `resume_after_restart` 且还有 ≥1 分钟的重挂（同一个
 /// id、时限接着算），没声明的交回"已中断"，临近截止的交回"时限已经到了"；再对一次不会重复。
 #[tokio::test(start_paused = true)]

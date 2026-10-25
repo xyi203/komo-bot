@@ -413,7 +413,12 @@ impl ToolTask {
             call_timeout: env.call_timeout,
             // 脚本等着嵌套调用的结果往下走：转后台只对模型直接发的调用有意义。
             detach_after: if nested { None } else { env.detach_after },
-            interjected: InterjectSignal::new(),
+            // 嵌套调用等着脚本往下走，不看插话；顶层调用用 gateway 给的那面旗。
+            interjected: if nested {
+                InterjectSignal::new()
+            } else {
+                env.interjected.clone().unwrap_or_default()
+            },
             conversation: env.conversation,
         }
     }

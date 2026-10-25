@@ -28,6 +28,8 @@ use komo_kernel::types::model::TokenUsage;
 use komo_kernel::types::status::{RunState, WaitReason};
 use komo_kernel::types::turn::{LlmError, Round, RoundInput, TurnRequest};
 
+mod durable;
+
 // ---------------------------------------------------------------- 配置
 
 /// 两个 Agent：`assistant` 只能读，`coder` 能写，而且各有各的工作目录。

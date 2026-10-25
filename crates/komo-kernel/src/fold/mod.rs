@@ -21,7 +21,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
-pub use progress::progress_of;
+pub use progress::{progress_of, summarize_args};
 pub use views::{
     CompactionView, FoldViolation, RunView, SurfaceMessage, SurfaceToolResult, ToolCallView,
     UnknownEvent,

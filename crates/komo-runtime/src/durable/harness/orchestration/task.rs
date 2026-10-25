@@ -567,7 +567,7 @@ async fn progress(
             call: ToolCallId::from_raw(slot.call_id.clone()),
             attempt: None,
             tool: slot.name.clone(),
-            summary: String::new(),
+            summary: call_summary(&entries, &slot.call_id),
             started_at: None,
             output_tail: slot.output.as_deref().and_then(|text| tail_lines(text, 8)),
         })
@@ -589,6 +589,26 @@ async fn progress(
             waiting_on,
         }),
     })
+}
+
+/// 一个还没出结果的调用的参数摘要：从发起它的 assistant 消息里找（槽位里没有参数）。
+fn call_summary(entries: &[EntryRecord], call_id: &str) -> String {
+    entries
+        .iter()
+        .rev()
+        .flat_map(|entry| entry.model.iter().flatten())
+        .filter_map(|message| match message {
+            Message::Assistant(message) => Some(message),
+            _ => None,
+        })
+        .flat_map(|message| message.content.iter())
+        .find_map(|block| match block {
+            ContentBlock::ToolCall { id, arguments, .. } if id == call_id => {
+                Some(komo_kernel::fold::summarize_args(arguments))
+            }
+            _ => None,
+        })
+        .unwrap_or_default()
 }
 
 pub(super) async fn status(cx: &Cx<'_>, raw: &str) -> Result<(), TaskError> {

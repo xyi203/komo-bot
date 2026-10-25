@@ -236,6 +236,19 @@ impl Harness {
             .await
     }
 
+    /// 登记一个不是 `monitor` 工具挂的监听（`bash` 转后台的命令，`docs/monitor.md` §8）：gateway 接手
+    /// 进程之后调。之后它和监听同一套：`monitor_stop #id`、[`Harness::finish_monitor`]、重启对账都认它。
+    /// 见 [`monitor::register_in_tx`]。
+    pub async fn register_monitor(
+        &self,
+        engine: &Engine,
+        record: monitor::MonitorRecord,
+    ) -> Result<(), DurableError> {
+        engine
+            .commit(move |tx| Box::pin(async move { monitor::register_in_tx(tx, record).await }))
+            .await
+    }
+
     /// 重启后对账（gateway 启动时调一次）：每条 `running` 的登记——声明了 `resume_after_restart`
     /// 且离截止还有至少 1 分钟的，让 gateway 重挂（同一个 id）；其余登记为结束并交回"已中断"（
     /// 重挂不上、时限已过同理）。`starting` 的归挂它的工具任务接着判，这里不碰。

@@ -28,7 +28,7 @@
 //! `dispatch` / `follow` 调用同样按落账的计划收尾，工具已经不在目录里。
 
 pub mod cancel;
-mod codemode;
+pub(crate) mod codemode;
 mod codemode_journal;
 #[cfg(test)]
 pub mod harness;

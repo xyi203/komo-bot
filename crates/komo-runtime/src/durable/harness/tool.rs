@@ -2,7 +2,10 @@
 //! `harness/tool.ts`）：一个模型调用。
 //!
 //! 输入 `{ "kind": "model", "assistant": 13, "callId": "call_3" }`——调用本身从 assistant entry
-//! 读，任务记录保持很小。checkpoint：
+//! 读，任务记录保持很小。codemode 脚本里的子调用是 `{ "kind": "nested", "parent": 9, "key": "c1",
+//! "callId": "call_3/c1", "name": "read", "arguments": {…} }`，由外层 codemode 的工具任务拥有，
+//! 走同一条路径，只是没有槽位、结果写进外层名下的 `komo.nested` document 而不是 transcript
+//! （`nested.rs`；脚本这一侧在 `codemode.rs`）。checkpoint：
 //!
 //! ```json
 //! { "phase": "call" }
@@ -54,7 +57,7 @@ use komo_kernel::durable::{
 use komo_kernel::projection::{ProjectionContext, ToolResultFacts, project_views, select};
 use komo_kernel::traits::{ChildStarted, OutputWriter, StoreError, Tool};
 use komo_kernel::types::ids::{AttemptId, RunId, ToolCallId};
-use komo_kernel::types::plan::{ExecutionPlan, Replay};
+use komo_kernel::types::plan::{ExecutionPlan, Operation, Replay};
 use komo_kernel::types::refs::{
     AttemptRef, InterruptedOutput, PublishedOutput, ToolResultBody, ToolResultStatus,
 };
@@ -66,9 +69,11 @@ use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
 use super::TOOL_KIND;
+use super::codemode as script;
 use super::entries::{self, TOOL_RESULT};
 use super::hooks::{HarnessDeps, HookError, ToolEnv, ToolSet};
 use super::live::{self, SlotStatus};
+use super::nested::{self, NestedMeta, NestedResult};
 use super::outcome::{aborted, completed, failed, running};
 use crate::durable::error::TaskError;
 use crate::durable::kind::TaskKind;
@@ -80,13 +85,28 @@ use crate::executor::{
     timeout_error,
 };
 use crate::recovery::{ChildProcess, Liveness};
+use crate::tools::codemode::NOT_IN_SCRIPTS;
 
-/// 输入（只认 model 发起的调用；`kind` 为以后的嵌套调用留着）。
+/// 输入：模型发起的调用，或 codemode 脚本里的嵌套调用。
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct Input {
-    assistant: EntryId,
-    call_id: String,
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+enum Input {
+    Model {
+        assistant: EntryId,
+        call_id: String,
+    },
+    /// 嵌套调用自带工具名与参数（没有 assistant entry 可读）；`call_id` 是 `<外层 callId>/<key>`。
+    Nested {
+        parent: TaskId,
+        key: String,
+        call_id: String,
+        name: String,
+        arguments: Value,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -146,17 +166,19 @@ fn encode(checkpoint: &Checkpoint) -> Value {
     serde_json::to_value(checkpoint).expect("Checkpoint 可序列化")
 }
 
-/// 模型这次要的调用。
+/// 这次要的调用（模型发的，或脚本里的嵌套调用）。
 #[derive(Debug, Clone)]
-struct Call {
-    id: String,
-    name: String,
-    arguments: Value,
+pub(super) struct Call {
+    pub(super) id: String,
+    pub(super) name: String,
+    pub(super) arguments: Value,
+    /// 嵌套调用：指回外层任务。
+    pub(super) nested: Option<NestedMeta>,
 }
 
 /// 一次结果怎么收尾任务。
 #[derive(Debug, Clone)]
-enum Ending {
+pub(super) enum Ending {
     /// 工具跑完了（含 `isError`：失败的结果照样让任务 completed）。
     Completed,
     /// 执行被打断或抛错：任务 `failed`，记录取消意图（spec §8.4）。
@@ -267,7 +289,7 @@ fn attempt_ref(
 /// 工具任务。克隆便宜。
 #[derive(Clone)]
 pub struct ToolTask {
-    deps: Arc<HarnessDeps>,
+    pub(super) deps: Arc<HarnessDeps>,
 }
 
 impl ToolTask {
@@ -287,10 +309,30 @@ impl ToolTask {
 
     /// 调用本身：从 assistant entry 读。
     async fn read_call(&self, rt: &TaskRuntime, input: &Input) -> Result<Call, TaskError> {
+        let (assistant, call_id) = match input {
+            Input::Model { assistant, call_id } => (*assistant, call_id),
+            Input::Nested {
+                parent,
+                key,
+                call_id,
+                name,
+                arguments,
+            } => {
+                return Ok(Call {
+                    id: call_id.clone(),
+                    name: name.clone(),
+                    arguments: arguments.clone(),
+                    nested: Some(NestedMeta {
+                        parent: *parent,
+                        key: key.clone(),
+                    }),
+                });
+            }
+        };
         let entry = rt
-            .entry(input.assistant)
+            .entry(assistant)
             .await?
-            .ok_or_else(|| TaskError::new(format!("entry {} does not exist", input.assistant)))?;
+            .ok_or_else(|| TaskError::new(format!("entry {assistant} does not exist")))?;
         entry
             .model
             .iter()
@@ -303,24 +345,21 @@ impl ToolTask {
                             name,
                             arguments,
                             ..
-                        } if *id == input.call_id => Some(Call {
+                        } if id == call_id => Some(Call {
                             id: id.clone(),
                             name: name.clone(),
                             arguments: arguments.clone(),
+                            nested: None,
                         }),
                         _ => None,
                     })
                 }
                 _ => None,
             })
-            .ok_or_else(|| {
-                TaskError::new(format!(
-                    "entry {} has no tool call {}",
-                    input.assistant, input.call_id
-                ))
-            })
+            .ok_or_else(|| TaskError::new(format!("entry {assistant} has no tool call {call_id}")))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn context(
         &self,
         env: &ToolEnv,
@@ -329,6 +368,7 @@ impl ToolTask {
         attempt: u32,
         resumed: Option<ResumedCall>,
         cancel: CancelToken,
+        nested: bool,
     ) -> ToolContext {
         let attempt_ref = attempt_ref(env, conversation, task, attempt);
         ToolContext {
@@ -343,7 +383,8 @@ impl ToolTask {
             resumed,
             cancel,
             call_timeout: env.call_timeout,
-            detach_after: env.detach_after,
+            // 脚本等着嵌套调用的结果往下走：转后台只对模型直接发的调用有意义。
+            detach_after: if nested { None } else { env.detach_after },
             interjected: InterjectSignal::new(),
             conversation: env.conversation,
         }
@@ -359,7 +400,9 @@ impl ToolTask {
         // 能力边界先于"有没有这个工具"（§4 末）：不在能力面里就等于不认识这个名字。
         let Some(tool) = set.get(&call.name).cloned() else {
             let names = set.surface().names();
-            let message = if names.is_empty() {
+            let message = if call.nested.is_some() {
+                format!("脚本里不能调 {}", call.name)
+            } else if names.is_empty() {
                 format!("这次运行没有可用的工具，{} 调不了", call.name)
             } else {
                 format!(
@@ -370,8 +413,21 @@ impl ToolTask {
             };
             return self.settle_unrun(rt, &set, &call, message).await;
         };
+        // 脚本里调不了的（`bash` / `write` / `codemode` 这些）：和能力面外的一样当作不认识。
+        if call.nested.is_some() && NOT_IN_SCRIPTS.contains(&call.name.as_str()) {
+            let message = format!("脚本里不能调 {}", call.name);
+            return self.settle_unrun(rt, &set, &call, message).await;
+        }
         let cancel = CancelToken::new();
-        let ctx = self.context(&set.env, conversation, rt.task_id(), 1, None, cancel);
+        let ctx = self.context(
+            &set.env,
+            conversation,
+            rt.task_id(),
+            1,
+            None,
+            cancel,
+            call.nested.is_some(),
+        );
         // `prepare` 不产生副作用，但可能慢（MCP）：取消赢了就停，意图还没提交，重来一遍无妨。
         let cancelled = rt.cancelled();
         let prepared = tokio::select! {
@@ -392,6 +448,17 @@ impl ToolTask {
             );
             return self.settle_unrun(rt, &set, &call, message).await;
         }
+        // 脚本里放行的是读文件与 MCP（含有副作用的 MCP），不是本地写入、命令或编排。
+        if call.nested.is_some()
+            && (plan.then_run.is_some()
+                || !matches!(
+                    plan.operation,
+                    Operation::ReadFile | Operation::McpCall { .. }
+                ))
+        {
+            let message = format!("{} 不是只读工具或 MCP；脚本里不支持此操作", call.name);
+            return self.settle_unrun(rt, &set, &call, message).await;
+        }
         let replay = plan.recovery.replay();
         let checkpoint = Checkpoint::Execute {
             arguments: call.arguments.clone(),
@@ -400,16 +467,20 @@ impl ToolTask {
             attempt: 1,
         };
         // 意图：槽位 running + checkpoint execute，同一次提交。提交返回之后才允许有副作用。
+        // 嵌套调用没有槽位：意图就是 checkpoint，进度在外层名下的 document 里。
+        let slotted = call.nested.is_none();
         rt.commit(move |tx, task| {
             Box::pin(async move {
-                let mut live = live::load(tx, conversation).await?;
-                if let Some(slot) = live.slot_mut(task.id()) {
-                    slot.status = SlotStatus::Running;
-                    slot.replay = Some(replay);
-                    slot.attempt = Some(1);
-                    slot.clear_progress();
+                if slotted {
+                    let mut live = live::load(tx, conversation).await?;
+                    if let Some(slot) = live.slot_mut(task.id()) {
+                        slot.status = SlotStatus::Running;
+                        slot.replay = Some(replay);
+                        slot.attempt = Some(1);
+                        slot.clear_progress();
+                    }
+                    live::store(tx, conversation, &live).await?;
                 }
-                live::store(tx, conversation, &live).await?;
                 Ok(Some(running(encode(&checkpoint))))
             })
         })
@@ -430,6 +501,14 @@ impl ToolTask {
         let published = self
             .publish(&set.env, &attempt, failed_body(message))
             .await?;
+        if let Some(nested) = &call.nested {
+            // 没执行过：给脚本的只是那句话，没有"原始输出"可指（摘要里不编造执行入口）。
+            let mut result = NestedResult::from_published(&published, &attempt, false);
+            result.output = None;
+            return self
+                .commit_nested(rt, nested, result, Ending::Completed)
+                .await;
+        }
         self.commit_result(rt, set, call, &published, 1, Ending::Completed)
             .await
     }
@@ -467,13 +546,18 @@ impl ToolTask {
         let tail = Arc::new(Mutex::new(Tail::new(settings.tail_bytes)));
         let wake = Arc::new(Notify::new());
         let stop = CancellationToken::new();
-        let progress = tokio::spawn(commit_output(
-            rt.clone(),
-            tail.clone(),
-            wake.clone(),
-            stop.clone(),
-            settings.output_interval,
-        ));
+        // 嵌套调用没有槽位，不发布进度；脚本要的是完整 stdout，另存一份在内存里（同旧路径）。
+        let nested = call.nested.is_some();
+        let captured: Option<Arc<Mutex<Vec<u8>>>> = nested.then(Arc::default);
+        let progress = (!nested).then(|| {
+            tokio::spawn(commit_output(
+                rt.clone(),
+                tail.clone(),
+                wake.clone(),
+                stop.clone(),
+                settings.output_interval,
+            ))
+        });
         // kernel 的取消旗只有一个 flag：把引擎的取消信号接到它上面。
         let cancel = CancelToken::new();
         let bridge = {
@@ -492,6 +576,7 @@ impl ToolTask {
             attempt,
             resumed,
             cancel.clone(),
+            nested,
         );
 
         let started = std::time::Instant::now();
@@ -500,8 +585,13 @@ impl ToolTask {
                 inner: writer.as_mut(),
                 tail: tail.clone(),
                 wake: wake.clone(),
+                captured: captured.clone(),
             };
             let execution = async {
+                // codemode：脚本在 worker 里跑，里面的每个调用是名下的嵌套任务（`codemode.rs`）。
+                if let Operation::Codemode { code } = &plan.operation {
+                    return script::execute(self, rt, set, call, code, &ctx, &mut sink).await;
+                }
                 match plan.then_run {
                     // 组合调用：改动 → 核对 → 命令，一条结果（`tools::fusion`）。
                     Some(_) => match set.get("bash") {
@@ -530,7 +620,9 @@ impl ToolTask {
         };
         let elapsed_ms = started.elapsed().as_millis() as u64;
         stop.cancel();
-        let _ = progress.await;
+        if let Some(progress) = progress {
+            let _ = progress.await;
+        }
         let _ = bridge.await;
 
         // 取消赢了（abort 标记或关闭）：不发布、不写结果。`.partial` 留在盘上，abort handler
@@ -553,6 +645,15 @@ impl ToolTask {
             .await
             .map_err(store_error)?;
         published.elapsed_ms = elapsed_ms;
+        if let Some(nested) = &call.nested {
+            let bytes = captured
+                .map(|bytes| bytes.lock().unwrap_or_else(|e| e.into_inner()).clone())
+                .unwrap_or_default();
+            let result = NestedResult::from_outcome(&outcome, &bytes, &published, &attempt_ref);
+            return self
+                .commit_nested(rt, nested, result, Ending::Completed)
+                .await;
+        }
         self.commit_result(rt, set, call, &published, attempt, Ending::Completed)
             .await
     }
@@ -567,6 +668,13 @@ impl ToolTask {
         attempt: u32,
         ending: Ending,
     ) -> Result<(), TaskError> {
+        // 嵌套调用：结果写进外层名下的 document，不进 transcript。
+        if let Some(nested) = &call.nested {
+            let this = attempt_ref(&set.env, rt.conversation(), rt.task_id(), attempt);
+            let aborted = matches!(ending, Ending::Aborted);
+            let result = NestedResult::from_published(published, &this, aborted);
+            return self.commit_nested(rt, nested, result, ending).await;
+        }
         let rendered = render(&call.name, published, attempt, &set.env.projection)?;
         let (call_id, name) = (call.id.clone(), call.name.clone());
         let conversation = rt.conversation();
@@ -647,6 +755,7 @@ impl ToolTask {
             .find_published(&this)
             .await
             .map_err(store_error)?
+            && (call.nested.is_none() || nested::reusable(&published))
         {
             return self
                 .commit_result(rt, &set, &call, &published, attempt, Ending::Completed)
@@ -679,15 +788,18 @@ impl ToolTask {
                 replay: stored,
                 attempt: next,
             };
+            let slotted = call.nested.is_none();
             rt.commit(move |tx, task| {
                 Box::pin(async move {
-                    let mut live = live::load(tx, conversation).await?;
-                    if let Some(slot) = live.slot_mut(task.id()) {
-                        // 重跑从头报：清掉被打断的那次发布的东西。
-                        slot.attempt = Some(next);
-                        slot.clear_progress();
+                    if slotted {
+                        let mut live = live::load(tx, conversation).await?;
+                        if let Some(slot) = live.slot_mut(task.id()) {
+                            // 重跑从头报：清掉被打断的那次发布的东西。
+                            slot.attempt = Some(next);
+                            slot.clear_progress();
+                        }
+                        live::store(tx, conversation, &live).await?;
                     }
-                    live::store(tx, conversation, &live).await?;
                     Ok(Some(running(encode(&checkpoint))))
                 })
             })
@@ -885,6 +997,18 @@ impl TaskKind for ToolTask {
             Ok(set) => set,
             Err(error) => {
                 // 拿不到输出存储：没法落盘，但调用不能悬着。
+                if let Some(nested) = &call.nested {
+                    let result = NestedResult {
+                        value: None,
+                        error: Some(format!("工具 {} 被取消（{error}）", call.name)),
+                        uncertain: true,
+                        images: vec![],
+                        output: None,
+                    };
+                    return self
+                        .commit_nested(rt, nested, result, Ending::Aborted)
+                        .await;
+                }
                 let name = call.name.clone();
                 let call_id = call.id.clone();
                 let text = format!("工具 {name} 被取消（{error}）");
@@ -1003,12 +1127,20 @@ struct Tee<'a> {
     tail: Arc<Mutex<Tail>>,
     /// 起了子进程：叫醒进度提交，不等下一个节流间隔（重启前越早写进槽位越好）。
     wake: Arc<Notify>,
+    /// 嵌套调用：stdout 的全部字节（脚本拿到的是完整正文）。
+    captured: Option<Arc<Mutex<Vec<u8>>>>,
 }
 
 #[async_trait]
 impl OutputWriter for Tee<'_> {
     async fn write_stdout(&mut self, chunk: &[u8]) -> Result<(), StoreError> {
         self.inner.write_stdout(chunk).await?;
+        if let Some(captured) = &self.captured {
+            captured
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .extend_from_slice(chunk);
+        }
         self.tail
             .lock()
             .unwrap_or_else(|e| e.into_inner())

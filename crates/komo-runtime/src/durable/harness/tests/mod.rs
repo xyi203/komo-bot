@@ -4,6 +4,7 @@
 
 mod support;
 
+mod codemode;
 mod generation;
 mod inbox;
 mod probe;

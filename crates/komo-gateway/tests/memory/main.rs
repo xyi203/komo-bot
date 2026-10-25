@@ -24,6 +24,7 @@
 
 mod harness;
 
+mod durable;
 mod extraction;
 mod governance;
 mod index;

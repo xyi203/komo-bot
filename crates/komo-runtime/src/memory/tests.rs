@@ -530,6 +530,7 @@ fn work_item(status: RunState, source: PlanSource) -> MemoryWorkItem {
         status,
         source,
         cursor: Seq::ZERO,
+        frozen: None,
     }
 }
 
@@ -1500,6 +1501,7 @@ async fn a_failed_extraction_leaves_the_cursor_where_it_was() {
         .script(vec![round("我觉得没什么好记的。")])
         .work(vec![MemoryWorkItem {
             cursor: Seq(3),
+            frozen: None,
             ..work_item(RunState::Completed, interactive())
         }])
         .build()
@@ -1530,6 +1532,7 @@ async fn an_unreadable_session_abandons_the_run_instead_of_retrying_forever() {
     let harness = HarnessBuilder::new()
         .work(vec![MemoryWorkItem {
             cursor: Seq(2),
+            frozen: None,
             ..work_item(RunState::Completed, interactive())
         }])
         .build()
@@ -1556,6 +1559,7 @@ fn run_item(run: &str, cursor: u64) -> MemoryWorkItem {
     MemoryWorkItem {
         run: RunId::from_raw(run),
         cursor: Seq(cursor),
+        frozen: None,
         ..work_item(RunState::Completed, interactive())
     }
 }

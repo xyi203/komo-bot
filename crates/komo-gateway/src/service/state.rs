@@ -27,7 +27,9 @@ use komo_runtime::agent::handler::{AgentRunHandler, SegmentSource};
 use komo_runtime::agent::{AgentLoop, Budget, ResumedRound, RetryBudget, Segment};
 use komo_runtime::config::{ConfigHolder, EffortCapabilities};
 use komo_runtime::executor::{CallEnv, ToolExecutor};
-use komo_runtime::memory::{DbMemoryWork, LedgerEvents, MemoryManager, MemoryParts};
+use komo_runtime::memory::{
+    DbMemoryWork, LedgerEvents, MemoryManager, MemoryParts, MemoryWorkLog, SessionEvents,
+};
 use komo_runtime::recovery::{RecoveryIndex, RecoveryScan, UnfinishedRun};
 use komo_runtime::scheduler::{HandlerError, Scheduler, SchedulerConfig, Waker};
 use komo_runtime::tools::paths;
@@ -531,6 +533,15 @@ impl GatewayState {
         // 判断后端（§9.4 的可选一步）：**造它不碰网络**，所以直接装，不用像向量维度那样
         // 后台探测。配置热重载会换掉它（`GatewayState::refresh_reranker`）。
         let reranker = build_reranker(&snapshot, &config);
+        // Durable：事件与工作队列走新存储（W3c）；Legacy：账本与 state.db 的队列。
+        let (events, work): (Arc<dyn SessionEvents>, Arc<dyn MemoryWorkLog>) =
+            match durable.as_ref() {
+                Some(core) => super::durable::memory::seams(core, &config, &clock),
+                None => (
+                    Arc::new(LedgerEvents(Arc::clone(&routed) as Arc<dyn Ledger>)),
+                    Arc::new(DbMemoryWork::new(db.clone(), Arc::clone(&clock))),
+                ),
+            };
         let memories = Arc::new(MemoryManager::new(MemoryParts {
             config: snapshot.memory.clone(),
             repo: Arc::clone(&memory),
@@ -538,8 +549,8 @@ impl GatewayState {
             embeddings: injected_embeddings.clone(),
             reranker,
             llm: Arc::clone(&llm_for_memory(&snapshot, &config, &caps, llm.as_ref())),
-            events: Arc::new(LedgerEvents(Arc::clone(&routed) as Arc<dyn Ledger>)),
-            work: Arc::new(DbMemoryWork::new(db.clone(), Arc::clone(&clock))),
+            events,
+            work,
             clock: Arc::clone(&clock),
             render: komo_agent::context::memory::render,
         }));

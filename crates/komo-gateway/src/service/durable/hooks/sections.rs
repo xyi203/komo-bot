@@ -26,36 +26,17 @@ use komo_agent::context::{
     ContextInput, InvocationContext, SECTION_BASE, SECTION_INSTRUCTIONS, SECTION_MEMORY,
     SECTION_PROJECT, SECTION_SKILLS, system_sections,
 };
-use komo_kernel::durable::{
-    Content, ContentBlock, ConversationId, DocumentAddress, DocumentScope, Message,
-};
+use komo_kernel::durable::{Content, ContentBlock, ConversationId, Message};
 use komo_kernel::types::memory::MemoryScope;
-use komo_kernel::types::turn::MemoryUse;
 use komo_runtime::durable::harness::system::replay_sections;
 use komo_runtime::durable::harness::{HookError, PromptSection, ToolSet};
-use serde::{Deserialize, Serialize};
 
 use super::setup::Resolved;
 use crate::service::durable::DurableCore;
 use crate::service::state::GatewayState;
 
-/// 这一块记忆注入的 uses（conversation 级 document，W3c 读它记使用与核对遗忘）。
-pub const MEMORY_DOC_KIND: &str = "komo.memory";
-pub const MEMORY_DOC_VERSION: u32 = 1;
-
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct MemoryDoc {
-    pub uses: Vec<MemoryUse>,
-}
-
-pub fn memory_address(conversation: ConversationId) -> DocumentAddress {
-    DocumentAddress {
-        kind: MEMORY_DOC_KIND.to_owned(),
-        scope: DocumentScope::Conversation { conversation },
-        key: None,
-    }
-}
+// `komo.memory` document 的定义在 runtime（提取与 run 详情也读它；W3c 加了 `recall` / `at` 两格）。
+pub use komo_runtime::memory::durable::{MEMORY_DOC_VERSION, MemoryDoc, memory_address};
 
 pub(super) async fn build(
     state: &Arc<GatewayState>,
@@ -184,6 +165,8 @@ async fn recall(
     let conversation = resolved.conversation;
     let doc = MemoryDoc {
         uses: injection.uses.clone(),
+        recall: injection.diagnostics.clone(),
+        at: (state.clock.now().unix_timestamp_nanos() / 1_000_000) as i64,
     };
     if let Err(error) = write_memory_doc(core, conversation, &doc).await {
         tracing::warn!(%error, %conversation, "这一块记忆注入的 uses 没记进 komo.memory");

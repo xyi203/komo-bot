@@ -25,6 +25,7 @@
 
 mod add;
 mod consolidate;
+pub mod durable;
 mod extract;
 mod index;
 mod offline;
@@ -1174,7 +1175,10 @@ impl MemoryManager {
         // 自己那一档的限制下被提取，不存在"取一档最严的套在全批上"的失配。
         let mut groups: BTreeMap<Option<MemoryScope>, Vec<extract::RunWindow>> = BTreeMap::new();
         for item in items {
-            let (mode, agent_id) = frozen_memory(&events, &item.run);
+            let (mode, agent_id) = item
+                .frozen
+                .clone()
+                .unwrap_or_else(|| frozen_memory(&events, &item.run));
             let reason = if batch.kind == SessionKind::Task {
                 Some("后台任务会话")
             } else if mode == MemoryMode::Off {

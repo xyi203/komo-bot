@@ -14,7 +14,7 @@
 //!   "最后一条消息的时刻"，不是 `komo.settled` 落下的那一刻。
 //! - **`!` 命令**（`shell.command` write）也有 RunId（write submission 的 ID），详情由它的 entry 拼
 //!   （见 [`super::shell`]）。
-//! - `memories` / `recall`：W3c 接上（现在恒为空）。
+//! - `memories` / `recall`：读 `komo.memory` document（W3c）。
 //!
 //! 复制出来的会话里 `komo.settled` 的 `data.submission` 指向没复制的 submission：投影会为它出终态帧，
 //! 这里**只认有 submission 记录的 run**（列表与详情都按 submission 找），所以那些不算 run。
@@ -488,12 +488,26 @@ impl DurableCore {
                 .try_into()
                 .unwrap_or(u64::MAX)
         });
+        // 注入的记忆记在 conversation 级 `komo.memory` document 里：合成一条 `MemoryInjected`
+        // 挂到触发召回的 run 上，之后的 run 沿用并标出来（同旧 `memory.injected` 的口径）。
+        let (memories, recall) = match komo_runtime::memory::durable::read_memory_doc(
+            &*self.storage,
+            submission.conversation,
+        )
+        .await
+        {
+            Some(doc) => {
+                let mut events = folded.events.clone();
+                komo_runtime::memory::durable::inject_memory_events(&mut events, &doc);
+                crate::http::runs::injection_of(&events, run)
+            }
+            None => (Vec::new(), None),
+        };
         Ok(RunDetail {
             calls,
             final_message: view.final_message.clone(),
-            // W3c：memory 注入记在 `komo.memory` document 里，到那时再接。
-            memories: Vec::new(),
-            recall: None,
+            memories,
+            recall,
             model: model_of(&folded.events, run, &log),
             duration_ms,
             failure: view.reason.clone(),

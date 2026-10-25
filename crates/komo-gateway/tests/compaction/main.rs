@@ -411,3 +411,5 @@ async fn an_overflow_right_after_the_overflow_compaction_fails_the_run() {
         compactions(&events)
     );
 }
+
+mod durable;

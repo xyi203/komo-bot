@@ -104,6 +104,119 @@ impl ModelStream for DriverStream {
     }
 }
 
+// ---------------------------------------------------------------- 逐次请求的记录
+
+/// 一次模型请求的样子（`RecordingStream` 记的）。
+#[derive(Debug, Clone)]
+pub struct SeenRequest {
+    pub model: String,
+    pub effort: Option<String>,
+    /// 回放出来的系统提示（各段拼起来）。
+    pub system_prompt: String,
+    pub tools: Vec<String>,
+    /// 最后一条非 system 消息是工具结果（续轮）。
+    pub continuing: bool,
+    /// 请求里全部工具结果消息：`(tool_call_id, 正文)`，按出现顺序（看哪一个换成了短视图）。
+    pub tool_results: Vec<(String, String)>,
+}
+
+/// 包一层 [`ModelStream`]，记下**每一次**请求（含续轮）。`FakeLlm` 的 `requests` 只记"新一轮"的第一
+/// 次请求，续轮看不到系统提示与模型；要看"在飞的 run 后面那次请求带的是哪一版"就用它。
+///
+/// `hold_next` 让**下一次**请求记完之后停住，直到 `release`——"请求已发出、配置在这时被改"的窗口。
+pub struct RecordingStream {
+    inner: Arc<dyn ModelStream>,
+    seen: Mutex<Vec<SeenRequest>>,
+    hold: Mutex<bool>,
+    released: tokio::sync::Notify,
+}
+
+impl RecordingStream {
+    pub fn new(inner: Arc<dyn ModelStream>) -> Arc<Self> {
+        Arc::new(RecordingStream {
+            inner,
+            seen: Mutex::new(Vec::new()),
+            hold: Mutex::new(false),
+            released: tokio::sync::Notify::new(),
+        })
+    }
+
+    pub fn seen(&self) -> Vec<SeenRequest> {
+        self.seen.lock().expect("请求记录").clone()
+    }
+
+    /// 下一次请求记完就停住。
+    pub fn hold_next(&self) {
+        *self.hold.lock().expect("hold") = true;
+    }
+
+    pub fn release(&self) {
+        self.released.notify_one();
+    }
+
+    /// 等记到至少 `n` 次请求（最多 20 秒）。
+    pub async fn wait_seen(&self, n: usize) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while self.seen.lock().expect("请求记录").len() < n {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "等了 20 秒也没有第 {n} 次请求"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+}
+
+#[async_trait]
+impl ModelStream for RecordingStream {
+    async fn stream(
+        &self,
+        request: &ModelRequest<'_>,
+        progress: &mut (dyn for<'m> FnMut(&'m AssistantMessage) + Send),
+    ) -> Result<AssistantMessage, LlmError> {
+        let system = komo_runtime::llm::replay_system(request.messages);
+        let continuing = matches!(
+            request
+                .messages
+                .iter()
+                .rev()
+                .find(|message| !message.is_system()),
+            Some(Message::ToolResult(_))
+        );
+        self.seen.lock().expect("请求记录").push(SeenRequest {
+            model: request.model.model.clone(),
+            effort: request.model.effort.as_ref().map(ToString::to_string),
+            system_prompt: system.prompt.clone(),
+            tools: system.tools.iter().map(|tool| tool.name.clone()).collect(),
+            continuing,
+            tool_results: request
+                .messages
+                .iter()
+                .filter_map(|message| match message {
+                    Message::ToolResult(result) => Some((
+                        result.tool_call_id.clone(),
+                        result
+                            .content
+                            .iter()
+                            .filter_map(|block| match block {
+                                ContentBlock::Text { text, .. } => Some(text.as_str()),
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n"),
+                    )),
+                    _ => None,
+                })
+                .collect(),
+        });
+        let hold = std::mem::take(&mut *self.hold.lock().expect("hold"));
+        if hold {
+            self.released.notified().await;
+        }
+        self.inner.stream(request, progress).await
+    }
+}
+
 // ---------------------------------------------------------------- 迁到 Durable 的测试用的助手
 
 pub fn core(gateway: &TestGateway) -> Arc<DurableCore> {

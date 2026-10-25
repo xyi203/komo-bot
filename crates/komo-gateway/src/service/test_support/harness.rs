@@ -719,10 +719,15 @@ pub(super) fn assistant_of(
     if let Some(blocks) = &round.provider_blocks {
         extra.insert(komo_runtime::llm::PROVIDER_BLOCKS.into(), blocks.clone());
     }
+    // 回复的时间戳取现在：缓存冷不冷看的是上一条回复离现在多久（0 = 1970 年，等于"缓存早就冷了"，
+    // 压缩 / 衰减会因此误判成 `cache_cold`）。
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_millis() as i64);
     AssistantMessage {
         content,
         stop_reason,
-        timestamp: 0,
+        timestamp,
         extra,
     }
 }
@@ -923,6 +928,11 @@ impl TestGateway {
 
     pub fn dispatcher(&self) -> &Arc<crate::Dispatcher> {
         &self.running().dispatcher
+    }
+
+    /// Durable：这个 Session 的全部合成事件（见 [`Gw::durable_events`]）。
+    pub async fn durable_events(&self, session: &str) -> Vec<komo_kernel::events::Event> {
+        durable_events_of(self.state(), &SessionId::from_raw(session)).await
     }
 
     pub fn channels(&self) -> &Arc<ChannelRegistry> {
@@ -1148,6 +1158,17 @@ impl TestGateway {
             })
             .await
             .expect("提交得了");
+    }
+
+    /// Durable：一个 Session 的全部合成事件（`Gw` 与 `TestGateway` 共用）。
+    pub async fn durable_events_of(
+        state: &GatewayState,
+        session: &SessionId,
+    ) -> Vec<komo_kernel::events::Event> {
+        let core = state.core().expect("Durable 模式");
+        crate::service::durable::feed::backfill(&*core.storage, session.as_str(), Seq(0))
+            .await
+            .expect("读得出事件")
     }
 
     /// Durable：一个会话里受理过的输入 submission 数（排队的、并进别人 run 的都算一条）。
@@ -1457,6 +1478,12 @@ impl Gw {
         self.try_run_detail(run).await.expect("读得到运行详情")
     }
 
+    /// Durable：这个 Session 的全部事件，按 seq（与 `GET /v1/sessions/{id}/events` 的补读同一个投影；
+    /// 旧 `Home::events` 读的 `events.jsonl` 在新存储里没有）。
+    pub async fn durable_events(&self, session: &SessionId) -> Vec<komo_kernel::events::Event> {
+        durable_events_of(self.state(), session).await
+    }
+
     /// 同上，但读不出来时把**原话**带回来——一个中间损坏的会话该报损坏，不该是
     /// 一个 `None`（§8.5）。
     pub async fn try_run_detail(&self, run: &RunId) -> Result<RunDetail, String> {
@@ -1575,6 +1602,17 @@ fn submission_of(run: &RunId) -> komo_kernel::durable::SubmissionId {
         .parse()
         .unwrap_or_else(|_| panic!("{run} 不是 Durable 的 RunId（十进制 submission ID）"));
     komo_kernel::durable::SubmissionId::new(raw)
+}
+
+/// Durable：一个 Session 的全部合成事件（`Gw` 与 `TestGateway` 共用）。
+pub async fn durable_events_of(
+    state: &GatewayState,
+    session: &SessionId,
+) -> Vec<komo_kernel::events::Event> {
+    let core = state.core().expect("Durable 模式");
+    crate::service::durable::feed::backfill(&*core.storage, session.as_str(), Seq(0))
+        .await
+        .expect("读得出事件")
 }
 
 /// Durable：一个会话里受理过的输入 submission 数（排队的、并进别人 run 的都算一条）。

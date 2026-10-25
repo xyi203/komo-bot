@@ -1,13 +1,23 @@
 //! 跨平台：准入、热重载、投递目标、重启补发、会话归属（§11.2、§11.4、§3）——Durable 存储版
 //! （D5 W3a）：与 `../cross.rs` 同名同断言，Gateway 跑在新存储上。
 //!
-//! 与 Legacy 不同之处各在对应测试的注释里写了理由。没有迁过来的四个（都建立在旧的 `waiting +
-//! intervention` 之上，新存储里 intervention 只有 faulted 任务一种，投递与清单由 W4a 接）：
-//! `an_intervention_reaches_both_the_source_and_home`、
-//! `a_waiting_run_sends_its_intervention_to_the_chat_and_home`、
-//! `an_http_run_sends_its_intervention_to_home_only`、
-//! `a_round_stopped_at_its_first_call_still_finishes_the_rest`（"停在结果不明上的半轮续跑"：结果不明
-//! 现在直接交给模型，由 runtime 的 durable 测试覆盖）。
+//! 与 Legacy 不同之处各在对应测试的注释里写了理由。W3a 没迁的四个（建立在旧的 `waiting + intervention`
+//! 之上）在 W4b 里处理，放在本文件末尾：
+//!
+//! - `an_intervention_reaches_both_the_source_and_home`、`a_waiting_run_sends_its_intervention_to_the_chat_and_home`、
+//!   `an_http_run_sends_its_intervention_to_home_only`：意图（NeedsAttention 投到来源会话 + home chat、
+//!   各一条、HTTP 来源只投 home、第二个答复得到"已经答复过了"）新存储里仍然成立，只是触发它的不再是
+//!   "结果不明"而是 **faulted 任务**。写成 Durable 版（用 `poison_agent_doc` 让下一条输入的生成任务 fault），
+//!   先 `#[ignore = "W4a: faulted NeedsAttention"]`，W4a（`interventions.rs`、NeedsAttention 投递）合并后放开；
+//! - `a_round_stopped_at_its_first_call_still_finishes_the_rest`：**不迁**。它守的是"第一个调用停在介入上时，
+//!   续跑要把后面没有计划的调用也跑完，否则转写里有调用没输出、provider 400"。新存储没有"停在半轮"这个
+//!   状态：harness 在一轮的全部调用都有结果（结果不明的也是一条结果）之后才发下一次请求，runtime 的
+//!   `harness/tests/recovery.rs::aborting_a_round_answers_every_call_and_the_next_request_is_fully_paired` /
+//!   `a_faulted_tool_is_answered_by_derivation_rule_8_and_the_run_continues` 钉着。网关层换成一个仍然成立的
+//!   版本 `a_round_with_two_calls_gets_both_results_before_the_next_request`（一轮两个调用、第一个停在 gate 上、
+//!   排队的下一条输入不夹进去）。
+//!
+//! 其余没迁的无。
 
 use std::sync::Arc;
 
@@ -731,4 +741,269 @@ async fn cancel_stops_a_run_that_is_still_inside_a_call() {
         RunState::Cancelled,
         "没取消掉：{record:?}"
     );
+}
+
+// ---------------------------------------------------------------- W4b：intervention 一组
+
+/// 让这个 Session 当前分支的下一条输入 fault：把 `komo.agent` 写成读不出来的值，钩子 `setup` 读它失败
+/// （`HookError::Failed`）→ 生成任务 faulted。（faulted 是新存储里"要人处理"的唯一来源。）
+async fn poison_agent_doc(gateway: &TestGateway, session: &str) {
+    use komo_gateway::service::durable::agent_doc::{AGENT_DOC_VERSION, address};
+    let core = Arc::clone(gateway.state().core().expect("Durable 模式"));
+    let branch = core.session(session).await.expect("会话").current_branch;
+    core.engine
+        .commit(move |tx| {
+            Box::pin(async move {
+                tx.put_document(
+                    address(branch),
+                    AGENT_DOC_VERSION,
+                    serde_json::json!("坏掉的 komo.agent"),
+                )
+                .await
+            })
+        })
+        .await
+        .expect("写坏 komo.agent");
+}
+
+fn attentions(sender: &MemSender) -> Vec<String> {
+    sender
+        .sent()
+        .iter()
+        .filter(|message| matches!(message.outbound, Outbound::NeedsAttention { .. }))
+        .map(|message| message.peer.chat_id.to_string())
+        .collect()
+}
+
+/// 验证列：介入投到**来源会话 + home chat**；第二个答复得到「已经答复过了」。
+///
+/// 改了做法：Legacy 用 `unsure` 停住 Run（`verify`，答 `satisfied`）；新存储里要人处理的只有 faulted
+/// 任务，可答的结论只有 `abandon`（决定 13）。让第二条输入的生成任务 fault，等两处收到，答两次 `abandon`。
+#[tokio::test]
+#[ignore = "W4a: faulted NeedsAttention"]
+async fn an_intervention_reaches_both_the_source_and_home() {
+    let sender = MemSender::new(ChannelPlatform::Telegram);
+    let gateway = GatewayBuilder::new(&telegram_config("111"))
+        .durable()
+        .fake_llm(FakeLlm::finisher("好"))
+        .factory(FixedFactory::sender_only(
+            Arc::clone(&sender) as Arc<dyn ChannelSender>
+        ))
+        .start()
+        .await;
+
+    // 来源会话是群 222，home chat 是 111。先说一句建出会话，再让它 fault。
+    let group =
+        |text: &str, key: &str| inbound(ChannelPlatform::Telegram, "222", "111", text, key, false);
+    let InboundAck::Queued { session, run } = gateway.handle(group("在吗", "telegram:1")).await
+    else {
+        panic!("第一句应该受理");
+    };
+    gateway.wait_run(&run).await;
+    poison_agent_doc(&gateway, session.as_str()).await;
+    let ack = gateway.handle(group("跑一下", "telegram:2")).await;
+    let InboundAck::Queued { run, .. } = ack else {
+        panic!("{ack:?}");
+    };
+    let pending = gateway.wait_intervention(&run).await;
+
+    let watching = Arc::clone(&sender);
+    eventually("两处都收到了", move || {
+        let targets = attentions(&watching);
+        targets.contains(&"222".to_string()) && targets.contains(&"111".to_string())
+    })
+    .await;
+
+    // 第一个答复。
+    let first: komo_kernel::protocol::http::InterventionAnswerResponse =
+        serde_json::from_str(&gateway.answer(&pending.handle, "abandon").await).expect("回执");
+    assert!(!first.already_answered);
+
+    // 第二个答复得到「已经答复过了」。
+    let second: komo_kernel::protocol::http::InterventionAnswerResponse =
+        serde_json::from_str(&gateway.answer(&pending.handle, "abandon").await).expect("回执");
+    assert!(
+        second.already_answered,
+        "第二个答复应当得到原结论：{second:?}"
+    );
+}
+
+/// **一条真的消息**让任务 fault 时，那条介入真的被投出去了：来源会话与 home chat **各一条**，不多不少。
+///
+/// 改了做法同上（`unsure` 换成 faulted）。home chat 故意与私聊不是同一个会话，这样"各一条"才说得清。
+#[tokio::test]
+#[ignore = "W4a: faulted NeedsAttention"]
+async fn a_waiting_run_sends_its_intervention_to_the_chat_and_home() {
+    let sender = MemSender::new(ChannelPlatform::Telegram);
+    let gateway = GatewayBuilder::new(&config_toml(
+        r#"
+[channels.telegram]
+enabled = true
+allow_from = [111]
+home_chat = 999
+"#,
+    ))
+    .durable()
+    .fake_llm(FakeLlm::finisher("好"))
+    .factory(FixedFactory::sender_only(
+        Arc::clone(&sender) as Arc<dyn ChannelSender>
+    ))
+    .start()
+    .await;
+
+    let InboundAck::Queued { session, run } =
+        gateway.handle(operator_dm("在吗", "telegram:1")).await
+    else {
+        panic!("第一句应该受理");
+    };
+    gateway.wait_run(&run).await;
+    poison_agent_doc(&gateway, session.as_str()).await;
+    let ack = gateway.handle(operator_dm("跑一下", "telegram:2")).await;
+    assert!(matches!(ack, InboundAck::Queued { .. }), "{ack:?}");
+
+    let watching = Arc::clone(&sender);
+    eventually("两个会话都收到了介入", move || {
+        attentions(&watching).len() >= 2
+    })
+    .await;
+    // 再等一小会儿，看有没有多投。
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    let mut targets = attentions(&sender);
+    targets.sort();
+    assert_eq!(
+        targets,
+        vec!["111".to_string(), "999".to_string()],
+        "来源会话与 home chat **各一条**，不多不少"
+    );
+}
+
+/// HTTP 提交的 Run 没有来源会话：介入**只投 home chat**（§11.4「来源是 Cron 或已断开的 TUI 时只有
+/// home chat」）。改了做法同上（`unsure` 换成 faulted）。
+#[tokio::test]
+#[ignore = "W4a: faulted NeedsAttention"]
+async fn an_http_run_sends_its_intervention_to_home_only() {
+    let sender = MemSender::new(ChannelPlatform::Telegram);
+    let gateway = GatewayBuilder::new(&telegram_config("111"))
+        .durable()
+        .fake_llm(FakeLlm::finisher("好"))
+        .factory(FixedFactory::sender_only(
+            Arc::clone(&sender) as Arc<dyn ChannelSender>
+        ))
+        .start()
+        .await;
+
+    let (code, body) = gateway.post("/v1/sessions", serde_json::json!({})).await;
+    assert_eq!(code, 200, "{body}");
+    let summary: komo_kernel::protocol::http::SessionSummary =
+        serde_json::from_str(&body).expect("会话");
+    poison_agent_doc(&gateway, summary.session.as_str()).await;
+    let (code, body) = gateway
+        .post(
+            &format!("/v1/sessions/{}/runs", summary.session),
+            serde_json::json!({ "request_key": "http-1", "text": "跑一下" }),
+        )
+        .await;
+    assert_eq!(code, 200, "{body}");
+
+    let watching = Arc::clone(&sender);
+    eventually("home chat 收到了介入", move || {
+        !attentions(&watching).is_empty()
+    })
+    .await;
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    assert_eq!(
+        attentions(&sender),
+        vec!["111".to_string()],
+        "没有来源会话，就**只有** home chat 这一条"
+    );
+}
+
+/// 一轮要了两个调用、**第一个停在 `gate` 上**时：两个调用都有结果之后才发下一次请求，排队的下一条输入
+/// 不夹在没有输出的调用中间。
+///
+/// 对应 Legacy 的 `a_round_stopped_at_its_first_call_still_finishes_the_rest`，换成新存储里仍然成立的版本：
+/// Legacy 守的是"第一个调用停在介入上、续跑要把后面连计划都没有的调用也跑完"；新存储没有停在半轮的状态，
+/// 一轮的调用都收尾（含结果不明）才发下一次请求，这里证网关层看到的就是这样——两个调用各有一条结果，
+/// 每份转写都不把用户消息夹在没有输出的调用中间。
+#[tokio::test]
+async fn a_round_with_two_calls_gets_both_results_before_the_next_request() {
+    use komo_gateway::service::test_support::harness::multi_call_round;
+    let gate = Gate::new();
+    let llm = FakeLlm::new(vec![
+        vec![
+            multi_call_round(
+                1,
+                &[
+                    ("call_00_one", "gate", serde_json::json!({})),
+                    (
+                        "call_01_two",
+                        "bash",
+                        serde_json::json!({"command": "echo two"}),
+                    ),
+                ],
+            ),
+            text_round(2, "两条都跑完了。"),
+        ],
+        // 排队那条输入的那一段。
+        vec![text_round(1, "y")],
+    ]);
+    let gateway = GatewayBuilder::new(&telegram_config("111"))
+        .durable()
+        .fake_llm(Arc::clone(&llm))
+        .tool(gate.tool())
+        .start()
+        .await;
+    let (_, body) = gateway.get("/v1/home-session").await;
+    let session = serde_json::from_str::<komo_kernel::protocol::http::SessionSummary>(&body)
+        .expect("home session")
+        .session;
+    let submit = |key: &'static str, text: &'static str| {
+        let session = session.clone();
+        let gateway = &gateway;
+        async move {
+            let (code, body) = gateway
+                .post(
+                    &format!("/v1/sessions/{session}/runs"),
+                    serde_json::json!({ "request_key": key, "text": text }),
+                )
+                .await;
+            assert_eq!(code, 200, "{body}");
+            serde_json::from_str::<komo_kernel::protocol::http::SubmitRunResponse>(&body)
+                .expect("回执")
+                .run
+        }
+    };
+
+    let first = submit("two-calls", "跑两条命令").await;
+    gate.wait_entered(1).await;
+    let second = submit("two-calls-2", "y").await;
+    gate.release();
+    gateway.wait_run(&first).await;
+    gateway.wait_run(&second).await;
+
+    // 两个调用都有结果。
+    let events = gateway.durable_events(session.as_str()).await;
+    let called: std::collections::BTreeSet<String> = events
+        .iter()
+        .filter_map(|event| match &event.payload {
+            komo_kernel::events::EventPayload::ToolResult(result) => {
+                Some(result.call_id.to_string())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        called,
+        ["call_00_one", "call_01_two"]
+            .iter()
+            .map(ToString::to_string)
+            .collect(),
+        "一轮里的两次调用都要有结果"
+    );
+
+    // 而且每一步交给模型的转写都过得了 provider 那一关。
+    let requests = llm.requests.lock().expect("脚本模型").clone();
+    assert_transcripts_close_every_call(&requests);
 }

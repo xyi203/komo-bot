@@ -133,3 +133,5 @@ async fn a_runaway_script_is_killed_at_the_call_timeout() {
     let (_, _, result) = run_script(&home, "while True:\n    pass\n").await;
     assert!(result.contains("脚本超时"), "{result}");
 }
+
+mod durable;

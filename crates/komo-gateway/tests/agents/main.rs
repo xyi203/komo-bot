@@ -29,6 +29,7 @@ use komo_kernel::types::status::{RunState, WaitReason};
 use komo_kernel::types::turn::{LlmError, Round, RoundInput, TurnRequest};
 
 mod durable;
+mod durable_profile;
 
 // ---------------------------------------------------------------- 配置
 

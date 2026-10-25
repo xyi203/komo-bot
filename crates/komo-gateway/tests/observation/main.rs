@@ -797,3 +797,5 @@ async fn a_compacted_run_replays_the_same_summary_and_tail_across_restarts() {
         "重启之后回放的那一段逐字节相同"
     );
 }
+
+mod durable;

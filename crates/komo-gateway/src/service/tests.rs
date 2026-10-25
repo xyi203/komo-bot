@@ -1655,6 +1655,12 @@ async fn purging_a_session_with_unfinished_work_is_a_409_that_lists_the_blockers
 //
 // 同步委派 2026-10-16 删掉，生产目录里没有 `delegate`。这一组装上测试用的旧工具
 // （`legacy_delegate`），验的是升级前的委派调用照删之前的路径收尾。
+//
+// **只跑 Legacy（D7 删）**（D5 W4b）：这一组（`a_delegated_task_…`、`a_child_gets_only_its_task_…`、
+// `cancelling_the_parent_cancels_its_child_run`）验的是旧 `runs` 表里"子 Run + `DelegateSpec`"的收尾，
+// Durable 里没有这个概念——后台任务是 `task` 工具派出的子 conversation，由 runtime 的
+// `harness/tests/orchestration.rs` 与 `tests/agents/durable.rs` 覆盖。W5 翻默认时它们连同 Legacy 路径
+// 一起删，不迁。
 
 use crate::service::test_support::harness::{FakeLlm, call_round, text_round};
 use crate::service::test_support::legacy_delegate;
@@ -2107,6 +2113,50 @@ async fn the_catalog_has_task_and_none_of_the_retired_names() {
         assert!(!names.iter().any(|name| name == retired), "{names:?}");
     }
     gateway.stop().await;
+}
+
+/// 同名测试的 Durable 版（D5 W4b）：被删掉的东西（`delegate` / `dispatch` / `follow` 工具、审批式的 `y`）
+/// 在新存储启动路径下也没有踪影。
+///
+/// - `the_catalog_has_task_and_none_of_the_retired_names`：读的是 `tool_names()`（`ToolExecutor` 目录），
+///   这与存储无关，但要证的是 Durable 启动路径装配出的目录也一样——任务会话里再去掉 `task` / `monitor`
+///   是钩子的事（`hooks/tests.rs`）；
+/// - `a_bare_yes_with_nothing_pending_is_just_a_message`：`y` / `n` 走普通消息那条路；同一组里的
+///   `a_bare_yes_is_just_a_message_even_when_something_is_pending` **不迁**——它要一条停在 `waiting +
+///   intervention` 上的 Run，新存储没有这个状态（intervention 只有 faulted 任务，`y` 不替人答任何东西
+///   这一点由 intervention 只认 `abandon` 保证，W4a 的测试带上）。
+mod durable_retired {
+    use super::*;
+    use crate::service::test_support::harness::FakeLlm;
+
+    #[tokio::test]
+    async fn the_catalog_has_task_and_none_of_the_retired_names() {
+        let gateway =
+            TestGateway::durable(&telegram_config("111"), FakeLlm::finisher("好。")).await;
+        let names = gateway.state().tool_names();
+        assert!(
+            names.iter().any(|name| name == komo_agent::TASK_TOOL),
+            "{names:?}"
+        );
+        for retired in ["delegate", "dispatch", "follow"] {
+            assert!(!names.iter().any(|name| name == retired), "{names:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_bare_yes_with_nothing_pending_is_just_a_message() {
+        let gateway =
+            TestGateway::durable(&telegram_config("111"), FakeLlm::finisher("好。")).await;
+        let ack = gateway
+            .dispatcher()
+            .handle(operator_dm("n", "telegram:901"))
+            .await
+            .expect("收下");
+        assert!(
+            matches!(ack, InboundAck::Queued { .. }),
+            "`n` 是回话，不该被读成拒绝：{ack:?}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------- TUI 的 `!`

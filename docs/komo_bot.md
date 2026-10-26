@@ -421,7 +421,7 @@ project_files = false              # 省略 = true
 
 新存储没有"受理时冻结一份 `RunSnapshot`"。每个决定点按**当前配置**重新解析（pi-durable 的 "names resolved at each use"）：`komo.agent` document 与 `komo.task`（任务会话）只存 Agent / 模型 / effort 的**名字**，生成任务的 `prepare` 每次问 `AgentHooks::setup` 解析 Agent、指令、能力面、投影预算、模型，工具任务的 `call` 问 `AgentHooks::tools`。**已经开始的 `request` 阶段**用 checkpoint 里冻结的模型、effort、预算与 `cutoff`（重启 / 重发逐字节相同）；退避重发走 `prepare` 会重新解析，所以配置变化从下一次尝试起生效，`[execution] model_result_bytes` 与 `decay_*` 的变化只影响之后落的结果（旧结果按当时存下的视图）。
 
-**会跨请求钉住的是提示前缀里的几段**：系统段（`instructions` / `base` / `project` / `skills` / `memory`，`komo.system` entry 里按 key 一段一段存）里的 `project`、`skills`、`memory` 三段，一旦展示过就**钉住到下一个 head 标记**（`/new`、压缩）才重算——不然一个 skill 的增删、规范文件的改动、记忆条目的变化会让前缀缓存从系统提示起整段作废；规范文件变了，由 `submit` 把 `project_update_block` 补在下一条输入正文后面。fork 任务的系统段取父那份（`replay_sections`），模型与 effort 沿用父。`SKILL.md` 的增删改、`disable` 名单、配置重载都从下一个 head 起生效。
+**会跨请求钉住的是提示前缀里的几段**：系统段（`instructions` / `base` / `project` / `skills` / `memory`，`komo.system` entry 里按 key 一段一段存）里的 `project`、`skills`、`memory` 三段，一旦展示过就**钉住到下一个 head 标记**（`/new`、压缩）才重算——不然一个 skill 的增删、规范文件的改动、记忆条目的变化会让前缀缓存从系统提示起整段作废；规范文件变了，由 `submit` 把 `project_update_block` 补在下一条输入正文后面——比的是模型最近看到的那一版（这个 head 之后补过的最近一块，没补过才比钉住的 `project` 段），同一版只补一次；补的那段只给模型，输入 entry 的 `data.projectUpdateAt` 记下原话长度，消息面与记忆抽取只读原话，TUI 只提一行。fork 任务的系统段取父那份（`replay_sections`），模型与 effort 沿用父。`SKILL.md` 的增删改、`disable` 名单、配置重载都从下一个 head 起生效。
 
 等待期间改 Profile，在飞的请求不受影响，下一次解析用新的一版。（§7 那条硬限制由工具在 `prepare` 里判，本来就不进任何冻结。）
 

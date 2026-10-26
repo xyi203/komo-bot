@@ -211,17 +211,20 @@ async fn editing_a_profile_applies_from_the_next_request_of_a_run_in_flight() {
 
 /// 工作目录里的 `AGENTS.md` 进主 Agent 的提示；Run 在飞时它被改了，续跑那一次请求与同一会话的下一条 Run
 /// 的系统提示都**沿用已展示的那一版**（`project` 段钉住到下一次 head，前缀缓存不作废），新的那一版补在
-/// 下一条输入的后面；`/new` 之后系统提示才换成新版，也不再补。
+/// 下一条输入的后面——同一版只补一次，又改了才再补；`/new` 之后系统提示才换成新版，也不再补。
 #[tokio::test]
 async fn project_files_are_pinned_until_the_next_head_and_updates_ride_on_the_next_input() {
     const OLD: &str = "仓库规范第一版：先读再改。";
     const NEW: &str = "仓库规范第二版：改完跑测试。";
+    const NEWER: &str = "仓库规范第三版：提交前跑 fmt。";
     let gate = Gate::new();
     let llm = FakeLlm::new(vec![
         vec![
             call_round(1, "pc-gate", "gate", serde_json::json!({})),
             text_round(2, "跑完了。"),
         ],
+        vec![text_round(1, "好。")],
+        vec![text_round(1, "好。")],
         vec![text_round(1, "好。")],
         vec![text_round(1, "好。")],
     ]);
@@ -292,6 +295,22 @@ async fn project_files_are_pinned_until_the_next_head_and_updates_ride_on_the_ne
         .collect();
     assert_eq!(marks, [None, Some("再说一句".len() as u64)]);
 
+    // 同一版已经补过：下一条不再补。
+    let third = submit(&gateway, &session, "project-2b", "第三句").await;
+    gateway.wait_run(&third.run).await;
+    // 又改了：再补一次，补的是最新那一版。
+    std::fs::write(&agents_md, NEWER).expect("再改 AGENTS.md");
+    let fourth = submit(&gateway, &session, "project-2c", "第四句").await;
+    gateway.wait_run(&fourth.run).await;
+    let inputs = user_inputs(&gateway, &session).await;
+    assert_eq!(inputs.len(), 4, "{inputs:?}");
+    assert_eq!(inputs[2], "第三句", "同一版不补第二次");
+    assert!(
+        inputs[3].starts_with("第四句") && inputs[3].contains(NEWER) && !inputs[3].contains(NEW),
+        "又改了才再补，补最新的：{}",
+        inputs[3]
+    );
+
     // `/new`：下一次 head 才换系统提示，也不再补更新块。
     core(&gateway).boundary(&session, None).await.expect("/new");
     let after = submit(&gateway, &session, "project-3", "重新开始").await;
@@ -299,7 +318,7 @@ async fn project_files_are_pinned_until_the_next_head_and_updates_ride_on_the_ne
     let seen = recording.seen();
     let latest = seen.last().expect("有请求");
     assert!(
-        latest.system_prompt.contains(NEW) && !latest.system_prompt.contains(OLD),
+        latest.system_prompt.contains(NEWER) && !latest.system_prompt.contains(OLD),
         "head 之后换成新版：{}",
         latest.system_prompt
     );

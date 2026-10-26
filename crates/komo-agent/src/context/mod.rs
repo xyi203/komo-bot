@@ -16,7 +16,8 @@ use komo_kernel::types::delegate::{DelegateContract, DelegateSpec};
 use komo_kernel::types::tool::ToolNamespace;
 
 pub use prompt::{
-    SECTION_BASE, SECTION_INSTRUCTIONS, SECTION_MEMORY, SECTION_PROJECT, SECTION_SKILLS,
+    PROJECT_UPDATE_HEAD, SECTION_BASE, SECTION_INSTRUCTIONS, SECTION_MEMORY, SECTION_PROJECT,
+    SECTION_SKILLS,
 };
 
 /// 一次装配所需的**全部事实**（`docs/agent.md` §5）。

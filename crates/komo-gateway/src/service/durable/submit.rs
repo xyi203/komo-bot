@@ -294,10 +294,13 @@ impl DurableCore {
 
     /// 规范文件（`AGENTS.md` 一类）自这个 conversation 展示 `project` 段以来改过没有：改过就交回
     /// [`project_update_block`](komo_agent::context::project_update_block)（现在的那一版），没改、
-    /// 没展示过基线、任务会话、Profile 关了规范文件都是 `None`。每条输入都核对，所以改动之后到下一次
-    /// head 之前的每条输入后面都带着它（旧 `freeze_run` 同一个口径）。
+    /// 没展示过基线、任务会话、Profile 关了规范文件都是 `None`。比的是模型**最近看到的**那一版：
+    /// 这个 head 之后补过就比最近补的那块，没补过才比系统提示里钉住的——同一版只补一次，又改了
+    /// （包括改回系统提示里那一版）才再补。
     async fn project_update_for(&self, conversation: ConversationId) -> Option<String> {
-        use komo_agent::context::{SECTION_PROJECT, project_section, project_update_block};
+        use komo_agent::context::{
+            PROJECT_UPDATE_HEAD, SECTION_PROJECT, project_section, project_update_block,
+        };
         let state = self.gateway()?;
         let config = state.snapshot();
         let resolved = super::hooks::resolve(&state, &*self.storage, conversation, &config)
@@ -316,7 +319,22 @@ impl DurableCore {
             .find(|(key, _)| key == SECTION_PROJECT)
             .map(|(_, text)| text.clone());
         let found = crate::service::project_files::discover(&resolved.workspace);
-        (pinned != project_section(&found)).then(|| project_update_block(&found))
+        let current = project_update_block(&found);
+        let attached = view
+            .messages
+            .iter()
+            .rev()
+            .find_map(|message| match message {
+                Message::User(user) => match &user.content {
+                    Content::Text(text) if text.contains(PROJECT_UPDATE_HEAD) => Some(text),
+                    _ => None,
+                },
+                _ => None,
+            });
+        match attached {
+            Some(text) => (!text.ends_with(&current)).then_some(current),
+            None => (pinned != project_section(&found)).then_some(current),
+        }
     }
 
     /// 同一个请求键是不是已经受理过（`!` 命令在真跑之前先问：重发不该把命令再跑一遍）。命中且内容

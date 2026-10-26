@@ -29,15 +29,17 @@ pub const DEFAULT_BYTE_LIMIT: u64 = 64 * 1024;
 /// 不指定行数时最多给多少行。
 pub const DEFAULT_LINE_LIMIT: u64 = 2000;
 
-/// 模型给的参数。
+/// 模型给的参数。也认 pi 的 `offset` / `limit`（同样 1 起、同样是行数）；其他不认识的字段直接拒，
+/// 免得写错的参数被悄悄丢掉、从第 1 行读起。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReadArgs {
     pub path: String,
     /// 从第几行开始（1 起）。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, alias = "offset", skip_serializing_if = "Option::is_none")]
     pub start_line: Option<u64>,
     /// 最多读几行。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, alias = "limit", skip_serializing_if = "Option::is_none")]
     pub line_count: Option<u64>,
 }
 
@@ -775,6 +777,49 @@ mod tests {
                 .map(|r| (r.from_line, r.to_line))
                 .collect::<Vec<_>>(),
             vec![(1, 2), (5, 10)]
+        );
+    }
+
+    #[tokio::test]
+    async fn pi_offset_and_limit_mean_start_line_and_line_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let body: String = (1..=10).map(|n| format!("line {n}\n")).collect();
+        std::fs::write(dir.path().join("big.txt"), &body).unwrap();
+        let ctx = context(dir.path());
+
+        let tool = ReadTool::new();
+        let plan = tool
+            .prepare(
+                serde_json::json!({ "path": "big.txt", "offset": 3, "limit": 2 }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        // 计划里存的是规范名：同一次读不因写法不同而换哈希。
+        assert_eq!(
+            plan.args,
+            serde_json::json!({ "path": "big.txt", "start_line": 3, "line_count": 2 })
+        );
+        let result = read_result(&tool.execute(plan, &ctx, &mut writer(&ctx)).await.unwrap());
+        assert_eq!(result.text, "line 3\nline 4\n");
+    }
+
+    #[tokio::test]
+    async fn an_unknown_argument_is_refused_instead_of_silently_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = context(dir.path());
+        let error = ReadTool::new()
+            .prepare(serde_json::json!({ "path": "a.txt", "from_line": 3 }), &ctx)
+            .await
+            .unwrap_err();
+        let message = error.to_string();
+        assert!(
+            matches!(error, ToolError::InvalidArguments { .. }) && message.contains("from_line"),
+            "{message}"
+        );
+        assert!(
+            message.contains("start_line"),
+            "names the right field: {message}"
         );
     }
 

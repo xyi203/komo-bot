@@ -205,6 +205,7 @@ pub(crate) mod test_support {
         ToolContext {
             session: SessionId::from_raw("sess-1"),
             run: RunId::from_raw("run-1"),
+            input_run: Some(RunId::from_raw("run-1")),
             call: ToolCallId::from_raw("call-1"),
             attempt: AttemptId::from_raw("attempt-1"),
             source: PlanSource::Interactive {

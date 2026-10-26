@@ -610,7 +610,7 @@ finalize     → blob 收尾同步 → 提交结果 entry（projection.rs 的 fu
 - **取消 probe 中的任务不终止那个子进程**（D4c）：abort handler 照常写 `aborted` 结果（带 `.partial` 末尾），再探一次，进程还在就在正文里写明"重启前这次调用起的子进程（pid N）取消时还在运行，komo 没有终止它"。旧 `monitors.rs` 会按身份核对后 `kill_process_group`；工具任务这边没有杀进程的注入口，暂不做。
 - **新增 `IdentityProbe`，不改 `SysProcessProbe`**（D4c）：登记行带 `started_at` 时核对起来的时刻（Linux 读 `/proc/<pid>/stat` 第 22 字段 + `btime` + `CLK_TCK`，其他平台 `ps -o stat=,etime=`，容差 10 s），对不上就是 pid 被复用 → `Gone`；僵尸进程也是 `Gone`；读不出来 `Unknown`。旧路径（`LockHolderLiveness`、gateway 锁）仍用只看 pid 在不在的 `SysProcessProbe`，行为不变。
 - **工具任务读自己的槽位用一次"不改状态的提交"**（D4c，`recorded_child`）：`TaskRuntime` 没有读 document 的入口，没有为此扩引擎。
-- **嵌套 live 槽位的偏离已补齐**（2026-10-26，`docs/codemode-bash.md`）：D4c 原来不记嵌套调用的进度与子进程身份；现在脚本可调 bash，`komo.live.nestedTools` 按 pi 的结构补上归属与槽位，意图、进度、重跑、收尾都与顶层共用路径。恢复共用 komo 的 probe；外层收尾（含 fault / orphan）清理名下槽位。SSE / TUI 的工具尾巴与子调用展示仍在后续范围。
+- **嵌套 live 槽位的偏离已补齐**（2026-10-26，`docs/codemode-bash.md`）：D4c 原来不记嵌套调用的进度与子进程身份；现在脚本可调 bash，`komo.live.nestedTools` 按 pi 的结构补上归属与槽位，意图、进度、重跑、收尾都与顶层共用路径。恢复共用 komo 的 probe；外层收尾（含 fault / orphan）清理名下槽位。子调用的 SSE / TUI 展示已补（同日，`docs/codemode-bash.md` §8：结果事件带 `result.calls`，在跑的走只在 SSE 上的 `NestedCalls` 快照）；工具输出尾巴接 SSE 仍在后续范围。
 - **没有 `finished` 记录**（D4c codemode）：旧 journal 在脚本跑完后先外置整段结果再记 `finished`，好让"结果还没发布就崩"时不再起 worker。新路径外层结果一发布就按 §5 表第一行复用；发布之前崩了就整段重放——已交付的嵌套结果从 `komo.nested` 回放、不重做，所以代价只是再起一次 worker。
 - **时钟 / 熵与指纹是外层任务的 memo，不是 document**（D4c codemode）：memo 随任务记录整条重写，单批读数不小（`random` 起状态 2496 字节、十六进制 5 KB）。上限仍是 10 000 次读数，最坏的紧循环会让任务记录变到几百 KB；之后如果成问题再把批次搬进名下的 document（spec §5.2 说 memo 应当很小，大的进度放 document）。
 - **嵌套结果整值存在 `komo.nested` 成员里**（D4c codemode，同 spec §7.3）：`read` 的整份文件、`rg` 的整份 stdout 保持原接口；2026-10-26 起 bash 的 `text` 只存 kernel 的有限 full 视图，不额外缓存完整 stdout。原始输出照常在嵌套任务自己的输出目录，超限视图附可 `read` 的 artifact 引用。document 随外层终结退役。
@@ -706,7 +706,7 @@ SSE / run 投影缓存、流式快照及 P3 项仍按优化清单后续执行。
 
 bash 的 `text` 使用 kernel full 投影，不额外缓存整份 stdout；原始流留在 blob，截断时给 artifact 入口。
 脚本非零退出是 failed 字典；宿主 Timeout / Cancelled 的 uncertain 状态一起落盘，重建时不变。
-`LIVE_VERSION` 保持 1，新字段可选，旧 document 解码通过。转后台、write / edit、SSE / TUI 子调用展示继续按原范围。
+`LIVE_VERSION` 保持 1，新字段可选，旧 document 解码通过。转后台、write / edit 继续按原范围；SSE / TUI 子调用展示已在 `docs/codemode-bash.md` §8 补上。
 
 **验收**：新增 12 条测试；`cargo test --workspace --no-fail-fast` **2305 通过、0 失败、12 忽略**。
 约 300 KB stdout 在 blob 中保持完整，`komo.nested` 的编码小于 60 KiB；真实 worker 调 bash 的退出码 7 正常返回，

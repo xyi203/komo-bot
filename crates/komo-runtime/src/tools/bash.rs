@@ -521,7 +521,12 @@ impl Tool for BashTool {
 fn environment(ctx: &ToolContext) -> BTreeMap<String, String> {
     let mut env = base_environment();
     env.insert("KOMO_SESSION".into(), ctx.session.to_string());
-    env.insert("KOMO_RUN".into(), ctx.run.to_string());
+    // `!` 没有输入 Run，沿用产物身份以保持 Gateway 子进程识别及拒绝无证据记忆的行为。
+    // Agent 工具上下文必须提供 input_run；harness 缺少输入时在执行前报错。
+    env.insert(
+        "KOMO_RUN".into(),
+        ctx.input_run.as_ref().unwrap_or(&ctx.run).to_string(),
+    );
     env
 }
 

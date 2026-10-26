@@ -8,7 +8,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::events::Event;
-use crate::types::ids::{RunId, Seq, SessionId};
+use crate::protocol::nested::NestedCallView;
+use crate::types::ids::{RunId, Seq, SessionId, ToolCallId};
 use crate::types::status::RunState;
 
 /// 一帧 SSE。`id` 就是 Session 内的 seq——游标和序号是同一个数，不再发明第二套。
@@ -44,6 +45,16 @@ pub enum SseEvent {
     },
     /// Run 的状态变了。派生自事件，给不想自己 fold 的客户端。
     RunStatus { run: RunId, state: RunState },
+    /// 一次还在跑的 codemode 调用里子调用的当前全貌（`call` 是外层调用）。
+    ///
+    /// 与 `AssistantDelta` 一样**只在 SSE 上**：来自 `komo.live.nestedTools` 与 `komo.nested`，
+    /// 外层 `tool.result` 到了以后由它 `body.result.calls`（[`crate::protocol::nested`]）取代。
+    /// 每帧是整份快照，不是增量：丢一帧、重连后再来一帧都只是晚一点看到。
+    NestedCalls {
+        run: RunId,
+        call: ToolCallId,
+        calls: Vec<NestedCallView>,
+    },
     /// 心跳。只为让代理不掐连接，不带任何状态。
     Heartbeat,
 }
@@ -102,6 +113,32 @@ mod tests {
             event.payload.is_unknown(),
             "增量不是一个日志事件，账本里没有它的位置"
         );
+    }
+
+    #[test]
+    fn nested_calls_are_an_sse_only_snapshot_of_one_outer_call() {
+        use crate::types::status::ToolCallState;
+        let frame = SseFrame {
+            id: Seq(7),
+            session: SessionId::from_raw("sess-1"),
+            event: SseEvent::NestedCalls {
+                run: RunId::from_raw("run-1"),
+                call: ToolCallId::from_raw("m1"),
+                calls: vec![NestedCallView {
+                    id: "c1".into(),
+                    tool: "read".into(),
+                    args: serde_json::json!({ "path": "a" }),
+                    state: ToolCallState::Started,
+                    elapsed_ms: None,
+                    error: None,
+                    output: None,
+                }],
+            },
+        };
+        let text = serde_json::to_string(&frame).unwrap();
+        assert!(text.contains(r#""event":"nested_calls""#), "{text}");
+        assert!(!text.contains("elapsed_ms"), "{text}");
+        assert_eq!(serde_json::from_str::<SseFrame>(&text).unwrap(), frame);
     }
 
     #[test]

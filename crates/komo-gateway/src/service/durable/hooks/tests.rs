@@ -701,6 +701,7 @@ fn tool_context(set: &komo_runtime::durable::harness::ToolSet) -> ToolContext {
     ToolContext {
         session: set.env.session.clone(),
         run: RunId::from_raw("r"),
+        input_run: Some(RunId::from_raw("r")),
         call: ToolCallId::from_raw("c"),
         attempt: AttemptId::from_raw("1"),
         source: set.env.source.clone(),

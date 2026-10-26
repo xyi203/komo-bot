@@ -457,6 +457,56 @@ async fn a_sub_call_to_a_tool_the_surface_no_longer_allows_is_refused_and_the_sc
     engine.close().await.unwrap();
 }
 
+/// TUI 画子调用靠外层 `output.json` 里的 `result.calls`（`docs/codemode-bash.md` §3.5）：每个子调用带
+/// 收窄过的参数、成败与原因，界面用 `calls_of` 读成和直播帧同一种视图。模型看到的仍只有脚本输出。
+#[tokio::test]
+async fn the_outer_result_lists_each_sub_call_with_bounded_args_and_its_failure() {
+    use komo_kernel::protocol::nested::calls_of;
+    use komo_kernel::traits::ToolOutputStore;
+    use komo_kernel::types::refs::OutputRef;
+    use komo_kernel::types::status::ToolCallState;
+    let world = World::new();
+    let read = Arc::new(TestTool::reader("read", &world.log));
+    let rg = Arc::new(TestTool::reader("rg", &world.log).failing_prepare("bad pattern"));
+    setup(&world, vec![read, rg]);
+    script_round(
+        &world,
+        "tools.read(path='a' * 300)\ntry:\n    tools.rg(pattern='x')\nexcept ToolError:\n    pass\ntext('done')",
+    );
+    let engine = world.open().await;
+    let id = world.submit(&engine, "go").await;
+    world.harness.wait(&engine, id).await.unwrap();
+
+    let (status, view) = only_result(&world).await;
+    assert_eq!(status, "completed");
+    assert!(
+        !view.contains("bad pattern"),
+        "sub-call errors stay out of the model view: {view}"
+    );
+    let entries = world.entries_of("komo.tool-result").await;
+    let output: OutputRef =
+        serde_json::from_value(entries[0].data.as_ref().unwrap()["output"].clone()).unwrap();
+    let body = world.mem.open(&output).await.unwrap().body;
+    let calls = calls_of(&body.result).expect("result.calls");
+    assert_eq!(calls.len(), 2, "{:?}", body.result);
+    assert_eq!(calls[0].tool, "read");
+    assert_eq!(calls[0].state, ToolCallState::Completed);
+    let path = calls[0].args["path"].as_str().unwrap();
+    assert!(path.chars().count() < 300, "arguments are bounded: {path}");
+    assert_eq!(calls[1].tool, "rg");
+    assert_eq!(calls[1].args, json!({ "pattern": "x" }));
+    assert_eq!(calls[1].state, ToolCallState::Failed);
+    assert!(
+        calls[1]
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("bad pattern")),
+        "{:?}",
+        calls[1]
+    );
+    engine.close().await.unwrap();
+}
+
 /// 照 pi：计划是 WriteFile 的工具（write / edit）在脚本里照常执行；只认 prepare 交出的计划，名字绕不过去——
 /// 计划是读写文件、bash、MCP 之外的操作（这里是 MemoryChange）在 prepare 之后被拒、不执行。
 #[tokio::test]

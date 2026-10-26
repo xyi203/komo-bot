@@ -91,6 +91,10 @@ MemoryManager 对 AgentRuntime 提供三个主要入口：recall、process_compl
 - **Agent 在 Run 里替用户记**：bash 子进程带着 `KOMO_SESSION` / `KOMO_RUN`，CLI 自动带上。证据是这个 Run 里用户说的话——它受理的那句、并进它的插话（`run.absorbed`）与 `message.user`；任务 / 监听 / 后台命令交回、Cron 提示词、子 Run 的委派正文都不算。一句都没有就拒绝。记成 active + user_statement + unconfirmed，与提取到一句明确的用户原话同级（§9.2），立即进召回，等操作者 confirm。后台任务会话（`kind = task`）里的调用被拒：任务正文是主 Agent 写的，不是用户原话。
 - **操作者在终端自己记**：不带会话，记成 active + user_statement + user_confirmed，没有事件证据。
 
+**Durable Run 身份修复与验收（2026-10-26）。** `ToolContext.run` 原来复用了 conversation id 作为产物命名空间，bash 又把它写进 `KOMO_RUN`；记忆按首个输入 submission id 查事件，所以报「Run 里找不到用户说的话」。现在新增 `ToolContext.input_run`，Agent 工具从持久的 `komo.live.run.inputs` 首项取得真实 Run id，bash 用它设置 `KOMO_RUN`；插话只追加输入，恢复与 codemode 子调用沿用同一宿主身份。缺少 Run 或首个输入时在执行前报错。产物目录与 artifact 引用继续使用 conversation id。操作者的 `!` 命令没有输入 Run，保留原有环境身份行为（包括 Gateway 子进程识别），不借此升级为终端已确认记忆。
+
+回归 `bash_input_run_finds_user_evidence_without_changing_output_paths`：同一 conversation 的三个 Run 分别走真实 bash、codemode 内部 bash、write 的 `then_run`，读取实际进程环境组成 `MemoryAddRequest`，经 `DurableSessionEvents` 查询原话、真实记忆库写入成功且均为未确认；错误的 conversation id 仍被拒绝，全部工具产物仍按 conversation 路径发布。`a_tool_after_a_steer_keeps_the_hosts_input_run` 验证并入插话后仍取宿主首个输入；恢复用例 `safe_and_safe_reruns_the_call_as_a_new_attempt` 同时断言重启前后输入 Run 相同、原产物目录不变。`cargo test --workspace`：2320 通过、0 失败、12 忽略（日志 `/tmp/komo-memory-run-workspace-test.log`）；`cargo fmt --check`、`cargo check --workspace` 通过。增量 `cargo build --timings`：33.20 秒，报告 `target/cargo-timings/cargo-timing-20261026T065248553Z-cad003b0e67e15b9.html`。尚未安装二进制或重启当前 Gateway，没有改写真实记忆。
+
 两者走同一道闸：正文不空、不超过 300 字、不像凭证。库里已有逐字相同的一条时不新建：补证据，候选抬成 active + user_statement，操作者调用时顺带确认；遗忘过的报错并指向 `restore`（§9.6），不悄悄复活。手动条目的 `extraction` 记为 `komo memory add` / `memory-add/v1`，记下后像 `restore` 一样提交一次索引补齐（§9.5）。主 Agent 的系统提示里有一句：用户要记住什么就当场 add，告诉用户可以 confirm，别替用户 confirm。
 
 **和后台提取去重。** 这段对话稍后照常提取，最容易把同一句话换个说法再提一遍。提取前按会话找出当前版本证据引了本窗口用户输入的手动条目，补进候选编号表并标「本段已手动记下」，提示词第 12 条让模型别再交回同一件事（`memory-extract/v7`）。模型没听话时还有一道兜底：一条新观察与某条手动条目同作用域、同种类，且它引的每条证据都在那**唯一一条**里，就并进那条，不新增。代价：用户一句话里说了两件同种类的事、只手动记了一件时，另一件可能被并掉；不同种类的照常记下。

@@ -2,6 +2,7 @@
 
 use komo_kernel::events::{Event, EventPayload};
 use komo_kernel::protocol::http::InterventionSummary;
+use komo_kernel::protocol::nested::calls_of;
 use komo_kernel::protocol::sse::{SseEvent, SseFrame};
 use komo_kernel::types::ids::RunId;
 use komo_kernel::types::refs::ToolResultStatus;
@@ -355,6 +356,16 @@ impl App {
                 }
                 Vec::new()
             }
+            // codemode 子调用的当前全貌（只在 SSE 上）。跑完了以 `tool.result` 带来的那份为准：
+            // 晚到的快照不把定下来的行倒回去。
+            SseEvent::NestedCalls { call, calls, .. } => {
+                if let Some(line) = self.tools.get_mut(&call)
+                    && matches!(line.state, ToolCallState::Planned | ToolCallState::Started)
+                {
+                    line.nested = calls;
+                }
+                Vec::new()
+            }
             SseEvent::Heartbeat => Vec::new(),
         }
     }
@@ -542,6 +553,10 @@ impl App {
                         .get("detached")
                         .is_some_and(|handle| !handle.is_null())
                 });
+                // codemode：完整的子调用清单（补读与直播同一份）。没带就留着直播时的最后一份。
+                if let Some(calls) = body.body.as_ref().and_then(|full| calls_of(&full.result)) {
+                    line.nested = calls;
+                }
             }
             _ => {}
         }

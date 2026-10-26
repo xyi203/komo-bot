@@ -264,6 +264,9 @@ pub struct ToolLine {
     /// 跑过阈值、转到后台的 `bash`（结果里带 `detached`）。事件上它是 completed——这次
     /// 调用确实收了尾——但命令还在跑，成败要等交回来的那条消息，所以不画成功。
     pub detached: bool,
+    /// codemode 脚本里的子调用（`docs/codemode-bash.md` §3.5）：跑的时候来自 `nested_calls` 帧，
+    /// 跑完了来自 `tool.result` 的 `body.result.calls`。别的工具是空的。
+    pub nested: Vec<komo_kernel::protocol::nested::NestedCallView>,
 }
 
 impl ToolLine {
@@ -754,6 +757,7 @@ fn blank_tool(call: ToolCallId, run: Option<RunId>, seq: Seq) -> ToolLine {
         elapsed_ms: 0,
         seq,
         detached: false,
+        nested: Vec::new(),
     }
 }
 

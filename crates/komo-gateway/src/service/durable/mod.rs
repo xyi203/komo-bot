@@ -43,6 +43,7 @@ pub mod interventions;
 pub mod lifecycle;
 pub mod memory;
 pub mod monitor_runner;
+pub mod nested_view;
 pub mod orchestration;
 pub mod runs;
 pub mod sessions;

@@ -2,7 +2,8 @@
 //!
 //! 协议冻结，客户端读的还是旧事件。这里把 `Line` 上每次已提交的批次（[`Publication`]）投影成旧事件词汇，
 //! 经 [`EventHub::publish_event`] 推给订阅这个 Session 的 SSE 连接；`komo.live` 里节流提交的部分回复
-//! 产出只在 SSE 上的 `AssistantDelta`。
+//! 产出只在 SSE 上的 `AssistantDelta`，其中的 `nestedTools` 产出同样只在 SSE 上的 `NestedCalls`
+//! （[`nested_view`]）。codemode 的结果 entry 先读出外层 `output.json` 再投影，补读与直播都这样。
 //!
 //! # 结构
 //!
@@ -33,10 +34,11 @@
 //! 并发补读的开销由 `concurrent_backfills_do_not_stall_commits` 量。
 
 use std::collections::{BTreeMap, HashMap};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::time::Duration;
 
-use komo_kernel::durable::legacy_events::{Projection, Record, legacy_events};
+use komo_kernel::durable::legacy_events::{Projection, Record, legacy_events_with};
 use komo_kernel::durable::legacy_ids::{record_of, run_id};
 use komo_kernel::durable::storage::SubmissionQuery;
 use komo_kernel::durable::{
@@ -54,6 +56,7 @@ use serde_json::Value;
 use tokio::sync::mpsc;
 
 use super::DurableCore;
+use super::nested_view::{self, LiveNested};
 use super::sessions::SessionError;
 use super::tree::load_tree;
 use crate::sse::SharedHub;
@@ -127,8 +130,20 @@ pub async fn backfill(
     session: &str,
     after: Seq,
 ) -> Result<Vec<Event>, SessionError> {
+    backfill_with(storage, None, session, after).await
+}
+
+/// 同 [`backfill`]，给了 Session 目录的根就把 codemode 的外层结果读进来（子调用清单），与直播一致。
+pub async fn backfill_with(
+    storage: &dyn Storage,
+    sessions_dir: Option<&Path>,
+    session: &str,
+    after: Seq,
+) -> Result<Vec<Event>, SessionError> {
     let records = read_session_records(storage, session).await?;
-    let mut events = legacy_events(session, &records.entries, &records.submissions);
+    let wanted = nested_view::wanted(&records.entries);
+    let results = nested_view::load_results(sessions_dir, session, wanted).await;
+    let mut events = legacy_events_with(session, &records.entries, &records.submissions, results);
     events.retain(|event| event.seq > after);
     Ok(events)
 }
@@ -182,7 +197,7 @@ pub async fn spawn(core: &Arc<DurableCore>, hub: &SharedHub, shutdown: &Shutdown
             });
         }
     });
-    let feed = Feed::new(storage, Arc::clone(hub), floor);
+    let feed = Feed::new(storage, Arc::downgrade(core), Arc::clone(hub), floor);
     let shutdown = shutdown.clone();
     tokio::spawn(async move {
         feed.run(receiver, line, shutdown).await;
@@ -203,6 +218,8 @@ struct SessionFeed {
 
 struct Feed {
     storage: Arc<dyn Storage>,
+    /// 读 Session 目录的根用（弱引用：feed 不替 core 续命）。
+    core: Weak<DurableCore>,
     hub: SharedHub,
     /// conversation → Session（`None`：不属于任何 komo Session，没有事件可推）。
     conversations: HashMap<ConversationId, Option<String>>,
@@ -211,20 +228,24 @@ struct Feed {
     sessions: HashMap<String, SessionFeed>,
     /// 每个 conversation 上次发出的部分回复文字。
     partials: HashMap<ConversationId, String>,
+    /// 每个 conversation 里还在跑的 codemode 子调用（成员缓存与上次推出去的快照）。
+    nested: HashMap<ConversationId, LiveNested>,
     /// 见过的最大记录 ID（见模块文档）。
     floor: u64,
     tick: u64,
 }
 
 impl Feed {
-    fn new(storage: Arc<dyn Storage>, hub: SharedHub, floor: u64) -> Self {
+    fn new(storage: Arc<dyn Storage>, core: Weak<DurableCore>, hub: SharedHub, floor: u64) -> Self {
         Feed {
             storage,
+            core,
             hub,
             conversations: HashMap::new(),
             documents: HashMap::new(),
             sessions: HashMap::new(),
             partials: HashMap::new(),
+            nested: HashMap::new(),
             floor,
             tick: 0,
         }
@@ -289,6 +310,7 @@ impl Feed {
                 StorageWrite::DocumentRetire { id } => {
                     if let Some(Some(conversation)) = self.documents.remove(id) {
                         self.partials.remove(&conversation);
+                        self.nested.remove(&conversation);
                     }
                 }
                 StorageWrite::Entry(entry) => bump(entry.id.raw()),
@@ -320,8 +342,15 @@ impl Feed {
             }
         }
         let floor_before = self.floor;
+        let sessions_dir = self.sessions_dir();
         for (session, (entries, submissions)) in by_session {
             if self.sessions.contains_key(&session) {
+                let results = nested_view::load_results(
+                    sessions_dir.as_deref(),
+                    &session,
+                    nested_view::wanted(entries.iter().copied()),
+                )
+                .await;
                 let records: Vec<Record<'_>> = entries
                     .into_iter()
                     .map(Record::Entry)
@@ -330,6 +359,9 @@ impl Feed {
                 let hub = Arc::clone(&self.hub);
                 if let Some(feed) = self.sessions.get_mut(&session) {
                     feed.touched = self.tick;
+                    for (entry, result) in results {
+                        feed.projection.attach_result(entry, result);
+                    }
                     for event in feed.projection.project(&records) {
                         feed.last_seq = feed.last_seq.max(event.seq.0);
                         hub.publish_event(&event);
@@ -341,7 +373,7 @@ impl Feed {
             }
         }
 
-        // 3. `komo.live` 的部分回复 → AssistantDelta。
+        // 3. `komo.live` 的部分回复 → AssistantDelta，子调用槽位 → NestedCalls。
         for (id, value) in live_values {
             self.live_changed(id, value).await;
         }
@@ -352,12 +384,18 @@ impl Feed {
                 self.sessions.remove(&session);
             }
             self.partials.remove(&conversation);
+            self.nested.remove(&conversation);
             self.documents
                 .retain(|_, owner| *owner != Some(conversation));
         }
 
         self.floor = highest;
         self.evict();
+    }
+
+    /// Session 目录的根；core 没了或还没接上配置就是 `None`（不读外层结果）。
+    fn sessions_dir(&self) -> Option<PathBuf> {
+        self.core.upgrade().and_then(|core| core.sessions_dir())
     }
 
     /// 这个 conversation 属于哪个 Session；缓存没有就读存储。
@@ -390,7 +428,17 @@ impl Feed {
                 return;
             }
         };
+        let sessions_dir = self.sessions_dir();
+        let results = nested_view::load_results(
+            sessions_dir.as_deref(),
+            session,
+            nested_view::wanted(&records.entries),
+        )
+        .await;
         let mut projection = Projection::new(session);
+        for (entry, result) in results {
+            projection.attach_result(entry, result);
+        }
         let all: Vec<Record<'_>> = records
             .entries
             .iter()
@@ -414,28 +462,48 @@ impl Feed {
         );
     }
 
-    /// 一个 document 的值变了：是 `komo.live` 就看有没有新的部分回复。
+    /// 一个 document 的值变了：是 `komo.live` 就看有没有新的部分回复、子调用有没有变。
     async fn live_changed(&mut self, id: DocumentId, value: &Value) {
-        let conversation = match self.documents.get(&id) {
-            Some(owner) => *owner,
-            None => {
-                let owner = match self.storage.document(id).await {
-                    Ok(Some(record)) => {
-                        live_conversation(&record.address.kind, &record.address.scope)
-                    }
-                    Ok(None) => None,
-                    Err(error) => {
-                        tracing::warn!(document = %id, %error, "SSE feed 读不到 document");
-                        return;
-                    }
-                };
-                self.documents.insert(id, owner);
-                owner
-            }
-        };
-        let Some(conversation) = conversation else {
+        let Some(conversation) = self.live_owner(id).await else {
             return;
         };
+        self.partial_changed(conversation, value).await;
+        self.nested_changed(conversation, value).await;
+    }
+
+    /// `komo.live` 的 document → 它的 conversation；不是 `komo.live` 就是 `None`。
+    async fn live_owner(&mut self, id: DocumentId) -> Option<ConversationId> {
+        if let Some(owner) = self.documents.get(&id) {
+            return *owner;
+        }
+        let owner = match self.storage.document(id).await {
+            Ok(Some(record)) => live_conversation(&record.address.kind, &record.address.scope),
+            Ok(None) => None,
+            Err(error) => {
+                tracing::warn!(document = %id, %error, "SSE feed 读不到 document");
+                return None;
+            }
+        };
+        self.documents.insert(id, owner);
+        owner
+    }
+
+    /// 这个 conversation 的 Session 与它当前的 `last_seq`（只在 SSE 上的帧当 `id:` 用）。
+    async fn frame_target(&mut self, conversation: ConversationId) -> Option<(String, Seq)> {
+        let session = self.session_of(conversation).await?;
+        if !self.sessions.contains_key(&session) {
+            // 重启后一条在途 run 的第一个批次就是进度：先懒建，拿到 `last_seq`。
+            let floor = self.floor;
+            self.seed(&session, floor).await;
+        }
+        let id = self
+            .sessions
+            .get(&session)
+            .map_or(Seq::ZERO, |feed| Seq(feed.last_seq));
+        Some((session, id))
+    }
+
+    async fn partial_changed(&mut self, conversation: ConversationId, value: &Value) {
         let partial = partial_of(value);
         let Some(partial) = partial else {
             // 没有进行中的部分回复（一轮结束、换了一轮、run 收尾）：下次从头算。
@@ -448,18 +516,9 @@ impl Feed {
         };
         let delta = delta.to_owned();
         self.partials.insert(conversation, partial.text);
-        let Some(session) = self.session_of(conversation).await else {
+        let Some((session, id)) = self.frame_target(conversation).await else {
             return;
         };
-        if !self.sessions.contains_key(&session) {
-            // 重启后一条在途 run 的第一个批次就是进度：先懒建，拿到 `last_seq`。
-            let floor = self.floor;
-            self.seed(&session, floor).await;
-        }
-        let id = self
-            .sessions
-            .get(&session)
-            .map_or(Seq::ZERO, |feed| Seq(feed.last_seq));
         self.hub.publish(SseFrame {
             id,
             session: SessionId::from_raw(session),
@@ -469,6 +528,42 @@ impl Feed {
                 text: delta,
             },
         });
+    }
+
+    /// 子调用槽位变了：推内容变了的外层调用的整份快照。
+    async fn nested_changed(&mut self, conversation: ConversationId, value: &Value) {
+        let Ok(live) = LiveState::deserialize(value) else {
+            return;
+        };
+        if live.nested_tools.as_deref().is_none_or(<[_]>::is_empty) {
+            // 没有在跑的子调用：外层收尾时的帧是 `tool.result`，这里不发空快照。
+            self.nested.remove(&conversation);
+            return;
+        }
+        let storage = Arc::clone(&self.storage);
+        let frames = self
+            .nested
+            .entry(conversation)
+            .or_default()
+            .update(&*storage, &live)
+            .await;
+        if frames.is_empty() {
+            return;
+        }
+        let Some((session, id)) = self.frame_target(conversation).await else {
+            return;
+        };
+        for frame in frames {
+            self.hub.publish(SseFrame {
+                id,
+                session: SessionId::from_raw(&session),
+                event: SseEvent::NestedCalls {
+                    run: frame.run,
+                    call: frame.call,
+                    calls: frame.calls,
+                },
+            });
+        }
     }
 
     /// 投影留太多就丢最久没动的。

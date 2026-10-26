@@ -523,6 +523,7 @@ pub struct TestTool {
     pub child: Option<ChildStarted>,
     pub runs: AtomicUsize,
     pub prepares: AtomicUsize,
+    pub input_runs: Mutex<Vec<Option<komo_kernel::types::ids::RunId>>>,
     pub log: Log,
 }
 
@@ -546,6 +547,7 @@ impl TestTool {
             child: None,
             runs: AtomicUsize::new(0),
             prepares: AtomicUsize::new(0),
+            input_runs: Mutex::new(Vec::new()),
             log: log.clone(),
         }
     }
@@ -659,9 +661,10 @@ impl Tool for TestTool {
     async fn execute(
         &self,
         _plan: ExecutionPlan,
-        _ctx: &ToolContext,
+        ctx: &ToolContext,
         sink: &mut dyn OutputWriter,
     ) -> Result<ToolOutput, ToolError> {
+        self.input_runs.lock().unwrap().push(ctx.input_run.clone());
         let run = self.runs.fetch_add(1, Ordering::SeqCst) + 1;
         self.log.push(format!("start {} #{run}", self.name));
         if let Some(stdout) = &self.stdout {
@@ -942,6 +945,10 @@ impl TestHooks {
 
     pub fn set_tools(&self, tools: Vec<Arc<dyn Tool>>) {
         self.state.lock().unwrap().tools = tools;
+    }
+
+    pub fn set_cwd(&self, cwd: PathBuf) {
+        self.state.lock().unwrap().env.cwd = cwd;
     }
 
     pub fn set_surface(&self, surface: Option<Vec<&str>>) {

@@ -17,7 +17,13 @@
 //! 调用的全部内容，折掉一半等于没给。
 //!
 //! 结果正文是工具写的那段完整正文（[`ToolLine::preview`]），不是事件顶层那份 1 KiB 预览。
+//!
+//! codemode 还有第四块：脚本里的**子调用**（[`ToolLine::nested`]，照 pi 的 codemode renderer）。
+//! 子调用不是模型发起的调用，不单独成块，画在脚本与结果之间：每个一行，用的就是顶层调用的头
+//! 一行（记号、工具名、动了什么、耗时），再缩进一格；失败的接一行原因。
 
+use komo_kernel::protocol::nested::NestedCallView;
+use komo_kernel::types::ids::{Seq, ToolCallId};
 use komo_kernel::types::status::ToolCallState;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -33,6 +39,9 @@ pub const RESULT_LINES: usize = 3;
 
 /// 折叠时头一行（折出来的续行）与正文各最多几行。
 pub const BODY_LINES: usize = 4;
+
+/// 折叠时最多列几个子调用（pi 的 `CALL_PREVIEW_COUNT`）。
+pub const NESTED_LINES: usize = 8;
 
 /// 头一行以下那几块缩进多少。
 const INDENT: &str = "    ";
@@ -78,6 +87,7 @@ pub fn lines(
             }
         }
     }
+    out.extend(nested_lines(&tool.nested, detail, width, now));
     if detail {
         out.extend(extra_args(&tool.args, &view.used, width));
     }
@@ -385,6 +395,122 @@ fn head_lines(
         }
     }
     rows
+}
+
+/// codemode 脚本里的子调用：每个一行，与顶层调用同一个头一行，整体缩进一格；失败与结果不明的
+/// 接一行原因。折叠时一个子调用只占一行、最多列 [`NESTED_LINES`] 个（[`shown_calls`]），原因只留
+/// 头一行；`Ctrl-T` 打开就全列、原因整段给，再补上完整结果的入口（`read` 得到）。
+fn nested_lines(
+    calls: &[NestedCallView],
+    detail: bool,
+    width: usize,
+    now: Option<OffsetDateTime>,
+) -> Vec<Line<'static>> {
+    let dim = Style::default().fg(Color::DarkGray);
+    let shown = shown_calls(calls, detail);
+    let mut out = Vec::new();
+    let hidden = calls.len() - shown.len();
+    if hidden > 0 {
+        out.push(fit_spans(
+            vec![
+                Span::raw(INDENT),
+                Span::styled(
+                    format!("… 另有 {hidden} 个子调用没列出（Ctrl-T 展开）"),
+                    dim,
+                ),
+            ],
+            width,
+        ));
+    }
+    let inner = width.saturating_sub(INDENT.len());
+    for index in shown {
+        let call = &calls[index];
+        let line = nested_tool(call);
+        let view = View::of(&line, detail);
+        let mut rows = head_lines(&line, &view.head, detail, inner, now);
+        if !detail && rows.len() > 1 {
+            rows.truncate(1);
+            let mut spans = rows.pop().expect("一行").spans;
+            spans.push(Span::raw("…"));
+            rows.push(fit_spans(spans, inner));
+        }
+        if let Some(error) = call.error.as_deref() {
+            let style = match call.state {
+                ToolCallState::Failed | ToolCallState::Uncertain => {
+                    Style::default().fg(state_colour(call.state))
+                }
+                _ => Style::default().fg(Color::Gray),
+            };
+            rows.extend(block(
+                error,
+                Keep::Head,
+                1,
+                detail,
+                inner,
+                RESULT_MARK,
+                style,
+            ));
+        }
+        if detail && let Some(output) = &call.output {
+            rows.extend(row(
+                vec![
+                    Span::raw(INDENT),
+                    Span::styled(format!("结果：{output}"), dim),
+                ],
+                true,
+                inner,
+                INDENT,
+            ));
+        }
+        out.extend(rows.into_iter().map(|row| {
+            let mut spans = vec![Span::raw(INDENT)];
+            spans.extend(row.spans);
+            Line::from(spans)
+        }));
+    }
+    out
+}
+
+/// 一个子调用当成一次调用来画：同一套按工具拆开的头一行。
+fn nested_tool(call: &NestedCallView) -> ToolLine {
+    ToolLine {
+        call: ToolCallId::from_raw(&call.id),
+        run: None,
+        tool: call.tool.clone(),
+        state: call.state,
+        attempts: 0,
+        args: call.args.clone(),
+        cwd: None,
+        preview: None,
+        elapsed_ms: call.elapsed_ms.unwrap_or(0),
+        seq: Seq::ZERO,
+        detached: false,
+        nested: Vec::new(),
+    }
+}
+
+/// 折叠时列哪几个子调用（下标，按脚本次序）：没跑完、失败与结果不明的先留（它们是要看的），
+/// 剩下的位置留最近的。
+fn shown_calls(calls: &[NestedCallView], detail: bool) -> Vec<usize> {
+    if detail || calls.len() <= NESTED_LINES {
+        return (0..calls.len()).collect();
+    }
+    let mut keep: Vec<usize> = (0..calls.len())
+        .filter(|index| calls[*index].state != ToolCallState::Completed)
+        .collect();
+    if keep.len() > NESTED_LINES {
+        keep.drain(..keep.len() - NESTED_LINES);
+    }
+    for index in (0..calls.len()).rev() {
+        if keep.len() >= NESTED_LINES {
+            break;
+        }
+        if !keep.contains(&index) {
+            keep.push(index);
+        }
+    }
+    keep.sort_unstable();
+    keep
 }
 
 /// 结果那一块。
@@ -850,6 +976,7 @@ mod tests {
             elapsed_ms: 1200,
             seq: Seq(1),
             detached: false,
+            nested: Vec::new(),
         }
     }
 
@@ -1227,5 +1354,124 @@ mod tests {
         let detail = text_of(&lines(&tool, true, 80, None));
         assert!(detail.contains("alpha: 1"), "{detail}");
         assert!(detail.contains("beta: two\n      lines"), "{detail}");
+    }
+
+    fn sub(id: &str, tool: &str, args: Value, state: ToolCallState) -> NestedCallView {
+        NestedCallView {
+            id: id.into(),
+            tool: tool.into(),
+            args,
+            state,
+            elapsed_ms: Some(40),
+            error: None,
+            output: None,
+        }
+    }
+
+    fn script(calls: Vec<NestedCallView>) -> ToolLine {
+        let mut tool = call(
+            "codemode",
+            json!({ "code": "tools.read(path='src/main.rs')" }),
+            ToolCallState::Started,
+            None,
+        );
+        tool.nested = calls;
+        tool
+    }
+
+    /// 照 pi 的 codemode renderer：脚本下面一个子调用一行——记号、工具名、动了什么、耗时，用的是
+    /// 顶层调用那一套头一行；失败的接一行原因。
+    #[test]
+    fn sub_calls_are_drawn_under_the_script_with_the_per_tool_head_line() {
+        let mut failed = sub(
+            "c2",
+            "bash",
+            json!({ "command": "cargo test" }),
+            ToolCallState::Failed,
+        );
+        failed.error = Some("exit=101\nsecond line".into());
+        let tool = script(vec![
+            sub(
+                "c1",
+                "read",
+                json!({ "path": "src/main.rs", "start_line": 10, "line_count": 50 }),
+                ToolCallState::Completed,
+            ),
+            failed,
+            sub(
+                "c3",
+                "rg",
+                json!({ "pattern": "TODO" }),
+                ToolCallState::Started,
+            ),
+        ]);
+        let text = text_of(&lines(&tool, false, 80, None));
+        let rows: Vec<&str> = text.lines().collect();
+        let at = |needle: &str| {
+            rows.iter()
+                .position(|row| row.contains(needle))
+                .unwrap_or_else(|| panic!("{needle} missing:\n{text}"))
+        };
+        let (read, bash, rg) = (
+            at("read src/main.rs:10-59"),
+            at("bash $ cargo test"),
+            at("TODO"),
+        );
+        assert!(read < bash && bash < rg, "script order:\n{text}");
+        assert!(
+            rows[read].starts_with("      ✔ read"),
+            "indented one step:\n{text}"
+        );
+        assert!(rows[read].contains("40ms"), "{text}");
+        assert!(
+            rows[bash + 1].contains("exit=101"),
+            "the reason follows:\n{text}"
+        );
+        assert!(
+            !text.contains("second line"),
+            "folded keeps the reason's head:\n{text}"
+        );
+        let detail = text_of(&lines(&tool, true, 80, None));
+        assert!(detail.contains("second line"), "{detail}");
+    }
+
+    /// 折叠时最多列 [`NESTED_LINES`] 个，失败的不会被挤掉，并说清楚还有几个；`Ctrl-T` 全列，并给出
+    /// 完整结果的入口。
+    #[test]
+    fn many_sub_calls_fold_to_the_failures_and_the_latest() {
+        let mut calls: Vec<NestedCallView> = (1..=20)
+            .map(|n| {
+                sub(
+                    &format!("c{n}"),
+                    "read",
+                    json!({ "path": format!("f{n:02}.rs") }),
+                    ToolCallState::Completed,
+                )
+            })
+            .collect();
+        calls[2].state = ToolCallState::Failed;
+        calls[2].error = Some("不存在".into());
+        calls[19].output = Some("artifact://1/9/1/result".into());
+        let tool = script(calls);
+        let folded = text_of(&lines(&tool, false, 80, None));
+        assert!(folded.contains("另有 12 个子调用没列出"), "{folded}");
+        assert!(
+            folded.contains("f03.rs") && folded.contains("不存在"),
+            "{folded}"
+        );
+        assert!(
+            folded.contains("f20.rs") && !folded.contains("f01.rs"),
+            "{folded}"
+        );
+        assert!(!folded.contains("artifact://"), "{folded}");
+        assert_eq!(shown_calls(&tool.nested, false).len(), NESTED_LINES);
+
+        let detail = text_of(&lines(&tool, true, 80, None));
+        assert!(!detail.contains("没列出"), "{detail}");
+        assert!(
+            detail.contains("f01.rs") && detail.contains("f20.rs"),
+            "{detail}"
+        );
+        assert!(detail.contains("结果：artifact://1/9/1/result"), "{detail}");
     }
 }

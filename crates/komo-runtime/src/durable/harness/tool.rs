@@ -399,20 +399,33 @@ impl ToolTask {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn context(
+    async fn context(
         &self,
         env: &ToolEnv,
-        conversation: ConversationId,
-        task: TaskId,
+        rt: &TaskRuntime,
         attempt: u32,
         resumed: Option<ResumedCall>,
         cancel: CancelToken,
         nested: bool,
-    ) -> ToolContext {
-        let attempt_ref = attempt_ref(env, conversation, task, attempt);
-        ToolContext {
+    ) -> Result<ToolContext, TaskError> {
+        let conversation = rt.conversation();
+        // 生成任务等待所有工具（包括脚本子调用）收尾后才结算 Run。恢复仍读这份持久状态；
+        // 插话追加在 inputs 后面，不改变首个输入，也不能拿最新的 submission 代替它。
+        let document = rt
+            .find_document(&live::live_address(conversation))
+            .await?
+            .ok_or_else(|| TaskError::new("tool call has no live Run"))?;
+        let live: live::LiveState = serde_json::from_value(document.value)
+            .map_err(|error| TaskError::new(format!("invalid live Run: {error}")))?;
+        let first = live
+            .run
+            .and_then(|run| run.inputs.first().copied())
+            .ok_or_else(|| TaskError::new("tool call has no input submission"))?;
+        let attempt_ref = attempt_ref(env, conversation, rt.task_id(), attempt);
+        Ok(ToolContext {
             session: env.session.clone(),
             run: attempt_ref.run,
+            input_run: Some(komo_kernel::durable::legacy_ids::run_id(first)),
             call: attempt_ref.call,
             attempt: attempt_ref.attempt,
             source: env.source.clone(),
@@ -431,7 +444,7 @@ impl ToolTask {
                 env.interjected.clone().unwrap_or_default()
             },
             conversation: env.conversation,
-        }
+        })
     }
 
     // ------------------------------------------------------------------ call
@@ -463,15 +476,9 @@ impl ToolTask {
             return self.settle_unrun(rt, &set, &call, message).await;
         }
         let cancel = CancelToken::new();
-        let ctx = self.context(
-            &set.env,
-            conversation,
-            rt.task_id(),
-            1,
-            None,
-            cancel,
-            call.nested.is_some(),
-        );
+        let ctx = self
+            .context(&set.env, rt, 1, None, cancel, call.nested.is_some())
+            .await?;
         // `prepare` 不产生副作用，但可能慢（MCP）：取消赢了就停，意图还没提交，重来一遍无妨。
         let cancelled = rt.cancelled();
         let prepared = tokio::select! {
@@ -597,6 +604,11 @@ impl ToolTask {
     ) -> Result<(), TaskError> {
         let conversation = rt.conversation();
         let env = &set.env;
+        let nested = call.nested.is_some();
+        let cancel = CancelToken::new();
+        let ctx = self
+            .context(env, rt, attempt, resumed, cancel.clone(), nested)
+            .await?;
         let attempt_ref = attempt_ref(env, conversation, rt.task_id(), attempt);
         let mut writer = env.outputs.begin(&attempt_ref).await.map_err(store_error)?;
         let settings = self.deps.settings();
@@ -605,7 +617,6 @@ impl ToolTask {
         let wake = Arc::new(Notify::new());
         let stop = CancellationToken::new();
         // bash 交给脚本的是落盘后的有限视图；其他嵌套工具仍保留完整 stdout。
-        let nested = call.nested.is_some();
         let captured: Option<Arc<Mutex<Vec<u8>>>> =
             (nested && call.name != "bash").then(Arc::default);
         let progress = tokio::spawn(commit_output(
@@ -616,7 +627,6 @@ impl ToolTask {
             settings.output_interval,
         ));
         // kernel 的取消旗只有一个 flag：把引擎的取消信号接到它上面。
-        let cancel = CancelToken::new();
         let bridge = {
             let (cancel, signal, done) = (cancel.clone(), rt.cancelled(), stop.clone());
             tokio::spawn(async move {
@@ -626,15 +636,6 @@ impl ToolTask {
                 }
             })
         };
-        let ctx = self.context(
-            env,
-            conversation,
-            rt.task_id(),
-            attempt,
-            resumed,
-            cancel.clone(),
-            nested,
-        );
 
         let started = std::time::Instant::now();
         let executed = {

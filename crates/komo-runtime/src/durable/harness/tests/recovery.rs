@@ -93,6 +93,8 @@ async fn safe_and_safe_reruns_the_call_as_a_new_attempt() {
         2,
         "the second run is a new attempt of the same call"
     );
+    let run = Some(komo_kernel::durable::legacy_ids::run_id(id));
+    assert_eq!(*read.input_runs.lock().unwrap(), vec![run.clone(), run]);
     let tasks = world.tasks("komo.tool").await;
     assert_eq!(tasks.len(), 1, "one task, not a second call");
     let entries = world.entries_of("komo.tool-result").await;

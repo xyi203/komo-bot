@@ -3,6 +3,7 @@
 
 use komo_kernel::types::refs::ToolResultStatus;
 use serde::Serialize;
+use serde_json::Value;
 
 /// 摘要里每次调用的参数最多留这么长。
 pub(crate) const ARGS_PREVIEW: usize = 512;
@@ -15,6 +16,12 @@ pub(crate) struct NestedCall {
     pub(crate) id: String,
     pub(crate) tool: String,
     pub(crate) args: String,
+    /// 收窄过的参数本身（`komo_kernel::protocol::nested::bounded_args`），给界面画子调用那一行；
+    /// `args` 是截断的文字，可能解不开。
+    pub(crate) arguments: Value,
+    /// 结果不明（宿主没等到确定的结果，或前面的致命错误拦下了它）。
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) uncertain: bool,
     /// 宿主是否正常返回；不等同于工具结果的 status，保留旧字段含义。
     pub(crate) ok: bool,
     #[serde(skip_serializing_if = "Option::is_none")]

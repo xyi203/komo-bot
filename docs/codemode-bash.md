@@ -1,6 +1,6 @@
 # codemode 脚本里调 bash：嵌套调用的 live 槽位
 
-> 状态：**已实施**（2026-10-26），验收记录见 §7，§1 保留实施前的现状。来源：pi-durable 的嵌套调用（本机 `../pi` 提交 `d5b3de22d`：
+> 状态：**已实施**（2026-10-26），验收记录见 §7，TUI 画子调用见 §8，§1 保留实施前的现状。来源：pi-durable 的嵌套调用（本机 `../pi` 提交 `d5b3de22d`：
 > `packages/durable/docs/spec.md` §7.3「nested calls」、`src/harness/tool.ts` 的 `pi.live.nestedTools`、
 > `src/codemode/codemode.ts` 对 bash 非零退出的处理）。文中 §x 不带文件名时指 `codemode.md`。
 
@@ -15,7 +15,7 @@
 子进程身份，`probe` 与顶层共用一条路。另外把嵌套 bash 交给脚本的正文改成留尾的有限视图，不把整份 stdout
 存进 `komo.nested`。
 
-不在这次范围：脚本里的 `edit` / `write`（另议）、嵌套调用的 `detach_after`、TUI 画嵌套调用（§3.5）。
+不在这次范围：脚本里的 `edit` / `write`（另议）、嵌套调用的 `detach_after`、TUI 画嵌套调用（§3.5；后来在 §8 补上）。
 
 ## 1. 现状
 
@@ -129,9 +129,10 @@ MCP，不起 `run_child_detachable` 的子进程，所以也用不上 `probe`"�
 - **转后台**：嵌套调用的 `detach_after` 仍是 `None`。转后台的结果要交回一个已经结束的工具调用，脚本此时
   还在等这次答复，没有接手方。
 - **并发**：codemode 本来就是同一轮里的屏障（`docs/komo_bot.md` §6），不变。
-- **TUI**：槽位让嵌套调用的进度有了数据，但 SSE feed（`service/durable/feed.rs`）今天只把 `komo.live`
+- **TUI**：槽位让嵌套调用的进度有了数据，但 SSE feed（`service/durable/feed.rs`）当时只把 `komo.live`
   里的部分回复投成 `AssistantDelta`，顶层工具的输出尾巴也没有投，TUI 也还不画 codemode 的子调用
-  （`docs/komo_bot.md` §11，工具调用怎么画那一段）。把工具尾巴（顶层与嵌套）接到 SSE 是另一件事，不在这里做。
+  （`docs/komo_bot.md` §11，工具调用怎么画那一段）。子调用的展示已在 §8 补上；把工具的输出尾巴（顶层
+  与嵌套）接到 SSE 仍是另一件事。
 
 ## 4. 改动落点
 
@@ -184,3 +185,45 @@ Alive / Unknown / Gone 的 probe、取消结果里的 pid、安全重跑、完�
 工作区测试总数与 `cargo build --timings` 记录在 `docs/storage-durable.md` §13.5。
 
 本次没有扩展 `write` / `edit`、嵌套转后台、脚本并发或 SSE / TUI 子调用展示；对应限制仍见 §3.5、§6。
+子调用展示随后单独做了，见 §8。
+
+## 8. TUI 画子调用（2026-10-26）
+
+照 pi 的 codemode 扩展（本机 `../pi` 提交 `d5b3de22d`）：
+`packages/coding-agent/src/extensions/codemode/renderer.ts`（子调用列在脚本那一块里，每个一行：状态、
+工具名、参数、耗时；折叠最多 8 个，展开印原因）、`tool.ts` 的 `CodemodeNestedCall`、`execute.ts`（每次子调用
+开始 / 结束都 `onUpdate` 一份整份快照）、`core/nested-tool-calls.ts`（参数与错误的限额），以及
+`modes/interactive/interactive-mode.ts` 里带 `parentToolCallId` 的工具事件不单独成块。komo 的做法：
+
+- **一个视图**：kernel `protocol/nested.rs` 的 `NestedCallView {id, tool, args, state, elapsed_ms?, error?, output?}`。
+  参数用 `bounded_args` 收窄（字符串 200 字符、数组 / 对象 16 项、3 层），状态用 `state_of`（结果不明优先，
+  再看宿主 `ok` 与工具 status），错误留 500 字节，最多 256 个（与子调用上限一致）。
+- **跑完的**：runtime 的 `NestedCall` 多存一份收窄后的 `arguments` 与 `uncertain`，进外层 `output.json` 的
+  `result.calls`。gateway 投影 codemode 的 `komo.tool-result` 时先读这份 `output.json`（哈希核对，
+  `service/durable/nested_view.rs`），经 `legacy_events_with` / `Projection::attach_result` 收窄后放进事件
+  `body.result = {calls, error?}`。补读（JSON 分页与 SSE 重连）和直播走同一条路，所以两边逐帧相同。
+  只在事件上，不进模型 transcript：模型看到的仍是脚本输出加一句计数。
+- **还在跑的**：新增只在 SSE 上的 `SseEvent::NestedCalls {run, call, calls}`，每帧是一个外层调用的整份快照。
+  来源是 `komo.live.nestedTools`（`parentTaskId` 对上 `tools` 槽位得到外层 call）加各子调用的 `komo.nested`
+  成员（有结果的用结果）。`komo.live` 一变就重算，只推内容变了的外层；`id:` 与 `AssistantDelta` 一样取当前
+  `last_seq`。SSE 补读结束（含 lag 后当场补读）再追加一帧当前快照，重连也看得到在跑的子调用。
+- **TUI**：`ToolLine.nested` 由 `NestedCalls` 整份替换（外层已终结就不再接受），由 `tool.result` 的
+  `calls` 定稿。`tool_view::nested_lines` 把每个子调用当成一次调用，用顶层那套按工具拆开的头一行
+  （`read 路径:起-止`、`bash $ 命令`……）画在脚本与结果之间、缩进一格，失败与结果不明的接一行原因。
+  折叠时每个只占一行、最多 8 个：没跑完、失败、结果不明的先留，其余留最近的，并写明“另有 N 个子调用没列出
+  （Ctrl-T 展开）”；`Ctrl-T` 全列，原因整段给，并补上完整结果的 `artifact://` 入口。
+
+限制：
+
+- gateway 拿不到 `sessions_dir`（还没接上配置）或外层 `output.json` 读不到 / 哈希对不上时，结果事件不带
+  `calls`：补读的话不画已完成的子调用，直播的话留着最后一份快照（可能还是“在跑”的记号）。
+  `cron_watch` 的补读仍不带目录，那里的 codemode 结果同样不带 `calls`。
+- 在跑的快照只在 SSE 上，不落库；JSON 分页拿不到它。
+- 子调用的精确结果随外层终结从 `komo.nested` 退役，之后只剩 `result.calls` 的摘要与各自的
+  `artifact://` 入口。
+- 旧记录没有 `arguments`：从截断过的 `args` 文字解，解不开就当一段文字画。
+- 没有 pi 的 `cost` 字段；komo 的子调用不走模型，没有费用可记。
+
+测试：kernel `protocol::nested` 3 条、`sse` 帧往返 1 条、`legacy_events` 补读与直播同帧 1 条；runtime
+`the_outer_result_lists_each_sub_call_with_bounded_args_and_its_failure`；gateway `nested_view` 3 条；client
+`tool_view` 2 条（头一行与原因、折叠 / 展开）、`app` 1 条（快照替换、结果定稿、晚到快照不倒回）。

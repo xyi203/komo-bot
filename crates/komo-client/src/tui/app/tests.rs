@@ -815,6 +815,64 @@ fn a_result_handed_to_the_background_is_marked_detached() {
     }
 }
 
+/// codemode 的子调用：跑的时候按 `nested_calls` 快照整份替换；`tool.result` 带来的 `calls` 是定稿，
+/// 之后晚到的快照不把它倒回去。
+#[test]
+fn nested_call_snapshots_update_a_running_script_until_its_result_settles_them() {
+    use komo_kernel::protocol::nested::NestedCallView;
+    let view = |id: &str, state| NestedCallView {
+        id: id.into(),
+        tool: "read".into(),
+        args: serde_json::json!({ "path": id }),
+        state,
+        elapsed_ms: None,
+        error: None,
+        output: None,
+    };
+    let snapshot = |calls: Vec<NestedCallView>| {
+        ServerEvent::Frame(Box::new(SseFrame {
+            id: Seq(6),
+            session: fixture::session(),
+            event: SseEvent::NestedCalls {
+                run: fixture::run(),
+                call: fixture::call(),
+                calls,
+            },
+        }))
+    };
+    let mut app = app();
+    let mut events = fixture::conversation();
+    feed(&mut app, &events[..6]);
+    app.apply(snapshot(vec![view("a", ToolCallState::Started)]));
+    app.apply(snapshot(vec![
+        view("a", ToolCallState::Completed),
+        view("b", ToolCallState::Started),
+    ]));
+    let states: Vec<_> = app.tool_lines()[0].nested.iter().map(|c| c.state).collect();
+    assert_eq!(states, [ToolCallState::Completed, ToolCallState::Started]);
+
+    if let EventPayload::ToolResult(body) = &mut events[6].payload {
+        body.body = Some(Box::new(komo_kernel::types::refs::ToolResultBody {
+            status: ToolResultStatus::Completed,
+            result: serde_json::json!({ "calls": [
+                { "id": "a", "tool": "read", "args": { "path": "a" }, "state": "completed" },
+                { "id": "b", "tool": "read", "args": { "path": "b" }, "state": "failed", "error": "不存在" },
+            ] }),
+            error: None,
+            exit_code: None,
+            artifacts: vec![],
+            images: vec![],
+            preview: Some("done".into()),
+        }));
+    }
+    feed(&mut app, &events[6..7]);
+    app.apply(snapshot(vec![view("a", ToolCallState::Started)]));
+    let nested = &app.tool_lines()[0].nested;
+    assert_eq!(nested.len(), 2, "{nested:?}");
+    assert_eq!(nested[1].state, ToolCallState::Failed);
+    assert_eq!(nested[1].error.as_deref(), Some("不存在"));
+}
+
 /// `Ctrl-T` 是一个**模式**，管的是整段会话：切一次，下一帧就整段重画——已经落进回滚区
 /// 的那些也跟着展开或收起。
 #[test]

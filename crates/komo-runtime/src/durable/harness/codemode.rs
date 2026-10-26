@@ -24,6 +24,7 @@ use std::time::{Duration, Instant};
 
 use komo_kernel::durable::task::NextTaskState;
 use komo_kernel::durable::{TaskId, TaskOutcome, TaskState};
+use komo_kernel::protocol::nested::bounded_args;
 use komo_kernel::traits::OutputWriter;
 use komo_kernel::types::refs::{ImageRef, ToolResultStatus};
 use komo_kernel::types::tool::{ToolContext, ToolError, ToolImage, ToolOutput};
@@ -312,6 +313,8 @@ impl Script<'_> {
     async fn nested_call(&self, index: usize, name: String, args: Value) -> Result<Value, String> {
         let started = Instant::now();
         let preview = truncate(&args.to_string(), ARGS_PREVIEW);
+        let arguments = bounded_args(&args);
+        let shown = (preview, arguments);
         let result = self.admit_and_wait_at(index, &name, args).await;
         let result = match result {
             Ok(result) => {
@@ -321,8 +324,10 @@ impl Script<'_> {
             }
             Err(error) => {
                 let message = error.to_string();
+                let unknown = error.is_uncertain();
                 self.lock_fatal(error);
-                self.record_call(index, name, preview, started, &Err(message.clone()), None);
+                let reply = Err(message.clone());
+                self.record_call(index, name, shown, started, &reply, None, unknown);
                 return Err(message);
             }
         };
@@ -336,23 +341,30 @@ impl Script<'_> {
         } else {
             result.script_result()
         };
-        self.record_call(index, name, preview, started, &reply, Some(&result));
+        let unknown = result.uncertain;
+        self.record_call(index, name, shown, started, &reply, Some(&result), unknown);
         reply
     }
 
+    /// `shown` 是参数的两种样子：截断的文字（给模型摘要）与收窄的值（给界面）。
+    #[allow(clippy::too_many_arguments)]
     fn record_call(
         &self,
         index: usize,
         tool: String,
-        args: String,
+        shown: (String, Value),
         started: Instant,
         reply: &Result<Value, String>,
         result: Option<&NestedResult>,
+        uncertain: bool,
     ) {
+        let (args, arguments) = shown;
         let call = NestedCall {
             id: nested_key(index),
             tool,
             args,
+            arguments,
+            uncertain,
             ok: reply.is_ok(),
             status: result
                 .filter(|_| reply.is_ok())

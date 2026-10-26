@@ -601,3 +601,54 @@ fn tool_results_carry_status_output_and_preview() {
     assert_eq!(body.preview.as_deref(), Some("boom"));
     assert_eq!(body.call_id.as_str(), "c1");
 }
+
+#[test]
+fn codemode_results_carry_the_nested_calls_live_and_backfilled_alike() {
+    let output = json!({"path": "tool-output/2/m1/1/output.json", "size": 4, "hash": "ab"});
+    let codemode = entry(3, "komo.tool-result")
+        .with_model(vec![Message::tool_result("m1", "codemode", "done", 3000)])
+        .with_data(json!({
+            "tool": "codemode", "status": "completed", "attempt": 1, "elapsedMs": 9, "output": output,
+        }));
+    let entries = vec![assistant(2, "go", &["m1"]), codemode];
+    assert_eq!(
+        wants_result(&entries[1]).map(|output| output.path().to_owned()),
+        Some("tool-output/2/m1/1/output.json".to_owned())
+    );
+    assert!(
+        wants_result(&result(4, "c1", "x")).is_none(),
+        "别的工具不读"
+    );
+    // output.json 里的原样：大参数、运行时字段，还有模型看不到的脚本变量。
+    let raw = json!({
+        "calls": [{ "id": "c1", "tool": "write", "args": "{}", "ok": true, "status": "completed",
+                    "arguments": { "path": "a", "content": "x".repeat(5000) }, "elapsed_ms": 4 }],
+        "error": null,
+        "value": { "secret": 1 },
+    });
+    let results = HashMap::from([(eid(3), raw.clone())]);
+    let backfill = legacy_events_with(SESSION, &entries, &[], results);
+
+    let mut projection = Projection::new(SESSION);
+    let mut live = projection.project(&[Record::Entry(&entries[0])]);
+    projection.attach_result(eid(3), raw);
+    live.extend(projection.project(&[Record::Entry(&entries[1])]));
+    assert_eq!(live, backfill);
+
+    let EventPayload::ToolResult(body) = &backfill.last().unwrap().payload else {
+        panic!()
+    };
+    let shown = &body.body.as_ref().unwrap().result;
+    assert!(shown.get("value").is_none(), "{shown}");
+    let calls = crate::protocol::nested::calls_of(shown).unwrap();
+    assert_eq!(calls[0].tool, "write");
+    assert_eq!(calls[0].args["path"], "a");
+    assert!(calls[0].args["content"].as_str().unwrap().len() < 1000);
+    assert_eq!(calls[0].elapsed_ms, Some(4));
+    // 没读到：照旧是 Null。
+    let plain = legacy_events(SESSION, &entries, &[]);
+    let EventPayload::ToolResult(body) = &plain.last().unwrap().payload else {
+        panic!()
+    };
+    assert!(body.body.as_ref().unwrap().result.is_null());
+}

@@ -141,6 +141,7 @@ pub async fn run_command(
     let ctx = ToolContext {
         session: session_id,
         run: attempt.run.clone(),
+        input_run: None,
         call: attempt.call.clone(),
         attempt: attempt.attempt.clone(),
         source: tool_env.source.clone(),

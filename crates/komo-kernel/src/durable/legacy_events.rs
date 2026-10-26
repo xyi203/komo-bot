@@ -69,7 +69,12 @@
 //!   （第一条之前是 0）；`RunAccepted` / `RunQueued` 取 submission 的 `created_at`（提交时刻，没有才沿用）。
 //! - 工具调用的 `call_id` 与 `provider_call_id` 都是消息里的 `toolCallId`；`ToolResult` 的输出引用取
 //!   工具结果 entry 的 `data.output`，没有就合成一个占位路径。
-//! - `AssistantDelta`、`RunStatus` 不在这里：前者来自 `komo.live` 文档，后者由 hub 照旧派生。
+//! - `AssistantDelta`、`RunStatus`、`NestedCalls` 不在这里：前者与后者来自 `komo.live` 文档，`RunStatus`
+//!   由 hub 照旧派生。
+//! - `ToolResult` 的 `body.result` 默认是 `Null`；codemode 的结果 entry（[`wants_result`]）由调用方读出
+//!   外层 `output.json` 的 `result`、[`Projection::attach_result`] 进来，投影时收窄成
+//!   [`crate::protocol::nested::display_result`] 那一份（子调用清单，只给界面）。直播与补读都这样喂，
+//!   帧照样逐个相同；没读到就还是 `Null`。
 
 use std::collections::{HashMap, HashSet};
 
@@ -88,6 +93,7 @@ use crate::events::{
     EventPayload, MessageAssistant, MessageUser, RunAbsorbed, RunAccepted, RunCancelled,
     RunCompleted, RunFailed, RunQueued, RunStarted, ToolPlanned, ToolResult, ToolStarted,
 };
+use crate::protocol::nested::display_result;
 use crate::types::{
     AttemptId, ContentHash, EventId, ExecutorId, OutputRef, PlanHash, PlanSource, RequestKey,
     RunId, SessionId, TokenUsage, ToolCallId, ToolResultBody, ToolResultStatus,
@@ -99,6 +105,8 @@ pub const SETTLED_ENTRY_KIND: &str = "komo.settled";
 const USER_ENTRY_KIND: &str = "komo.user";
 const ASSISTANT_ENTRY_KIND: &str = "komo.assistant";
 const TOOL_RESULT_ENTRY_KIND: &str = "komo.tool-result";
+/// 结果里带子调用清单的工具（与 runtime `tools::codemode::CODEMODE_TOOL` 一致）。
+const CODEMODE_TOOL: &str = "codemode";
 
 /// 喂给投影的一条记录。
 #[derive(Debug, Clone, Copy)]
@@ -123,12 +131,39 @@ pub fn legacy_events(
     entries: &[EntryRecord],
     submissions: &[SubmissionRecord],
 ) -> Vec<Event> {
+    legacy_events_with(session, entries, submissions, HashMap::new())
+}
+
+/// 同 [`legacy_events`]，带上读出来的工具结果（[`wants_result`] 的那些 entry → `output.json` 的 `result`）。
+pub fn legacy_events_with(
+    session: &str,
+    entries: &[EntryRecord],
+    submissions: &[SubmissionRecord],
+    results: HashMap<EntryId, Value>,
+) -> Vec<Event> {
     let records: Vec<Record<'_>> = entries
         .iter()
         .map(Record::Entry)
         .chain(submissions.iter().map(Record::Submission))
         .collect();
-    Projection::new(session).project(&records)
+    let mut projection = Projection::new(session);
+    for (entry, result) in results {
+        projection.attach_result(entry, result);
+    }
+    projection.project(&records)
+}
+
+/// 这条 entry 的帧要不要外层结果：codemode 的工具结果 entry 要（子调用清单在 `output.json` 里，
+/// 不在 entry 上）。要就给出它的输出引用。
+pub fn wants_result(entry: &EntryRecord) -> Option<OutputRef> {
+    if entry.kind != TOOL_RESULT_ENTRY_KIND {
+        return None;
+    }
+    let data = entry.data.as_ref()?;
+    if data.get("tool").and_then(Value::as_str) != Some(CODEMODE_TOOL) {
+        return None;
+    }
+    serde_json::from_value(data.get("output")?.clone()).ok()
 }
 
 /// 一条还没结算的 run。
@@ -156,6 +191,8 @@ pub struct Projection {
     runs: HashMap<SubmissionId, RunState>,
     /// 每个 conversation 里最近开的那条 run。
     current: HashMap<ConversationId, SubmissionId>,
+    /// 调用方读好的外层结果（已收窄），投影到那条 entry 时取走。
+    results: HashMap<EntryId, Value>,
 }
 
 impl Projection {
@@ -169,6 +206,16 @@ impl Projection {
             member: HashMap::new(),
             runs: HashMap::new(),
             current: HashMap::new(),
+            results: HashMap::new(),
+        }
+    }
+
+    /// 交一份 entry 的外层结果（`output.json` 的 `result`），下一次投影到它时放进 `body.result`。
+    /// 只留界面那一份（[`display_result`]）；不是 codemode 结果就什么也不留。
+    pub fn attach_result(&mut self, entry: EntryId, result: Value) {
+        let shown = display_result(&result);
+        if !shown.is_null() {
+            self.results.insert(entry, shown);
         }
     }
 
@@ -590,7 +637,7 @@ impl Projection {
                 });
             let body = ToolResultBody {
                 status,
-                result: Value::Null,
+                result: self.results.get(&entry.id).cloned().unwrap_or(Value::Null),
                 error: (status != ToolResultStatus::Completed).then(|| text.clone()),
                 exit_code: None,
                 artifacts: Vec::new(),
@@ -616,6 +663,7 @@ impl Projection {
             );
             index += 1;
         }
+        self.results.remove(&entry.id);
     }
 
     fn compaction(&mut self, entry: &EntryRecord, frame: &Frame, out: &mut Vec<Event>) {

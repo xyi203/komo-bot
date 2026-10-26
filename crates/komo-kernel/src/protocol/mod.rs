@@ -6,6 +6,7 @@
 
 pub mod config;
 pub mod http;
+pub mod nested;
 pub mod sse;
 
 use serde::{Deserialize, Serialize};

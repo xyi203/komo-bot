@@ -105,6 +105,12 @@ impl DurableCore {
             .and_then(|slot| super::hooks::state_of(slot).ok())
     }
 
+    /// Session 目录的根（当前配置的 `paths.sessions_dir`）；还没接上 `GatewayState` 是 `None`。
+    pub fn sessions_dir(&self) -> Option<PathBuf> {
+        self.gateway()
+            .map(|state| state.snapshot().paths.sessions_dir.clone())
+    }
+
     /// 开始（或继续）调度。幂等。
     pub fn resume(&self) {
         self.engine.resume();

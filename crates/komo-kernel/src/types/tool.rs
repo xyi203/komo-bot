@@ -214,7 +214,10 @@ impl InterjectSignal {
 #[derive(Debug, Clone)]
 pub struct ToolContext {
     pub session: SessionId,
+    /// 产物命名空间；durable harness 使用 conversation id，不能当作输入 Run 身份。
     pub run: RunId,
+    /// 当前输入 Run 的首个 submission id；操作者直接运行的 `!` 命令没有输入 Run。
+    pub input_run: Option<RunId>,
     pub call: ToolCallId,
     pub attempt: AttemptId,
     pub source: PlanSource,
@@ -332,6 +335,7 @@ mod tests {
         let ctx = ToolContext {
             session: SessionId::from_raw("s"),
             run: RunId::from_raw("r"),
+            input_run: Some(RunId::from_raw("r")),
             call: ToolCallId::from_raw("c"),
             attempt: AttemptId::from_raw("a"),
             source: PlanSource::Interactive {

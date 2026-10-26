@@ -26,6 +26,7 @@
 //! （同一次提交里受理要先于它：受理读已提交状态，不能排在这个 conversation 的表写之后）；它没有
 //! `model`，不进上下文，所以次序只影响展示。
 
+use komo_kernel::durable::legacy_events::PROJECT_UPDATE_AT;
 use komo_kernel::durable::{
     Content, ConversationId, InputState, Message, SubmissionId, SubmissionKind, SubmissionRecord,
     SubmissionStatus, WriteState, legacy_ids,
@@ -262,6 +263,10 @@ impl DurableCore {
         };
         let body = match project_update.as_deref() {
             Some(update) if !update.trim().is_empty() => {
+                // 补的那段只给模型：记下原话多长，界面与记忆抽取按它切回用户说的话。
+                if let Some(Value::Object(data)) = entry.data.as_mut() {
+                    data.insert(PROJECT_UPDATE_AT.to_owned(), json!(request.text.len()));
+                }
                 format!("{}\n\n{update}", request.text)
             }
             _ => request.text.clone(),

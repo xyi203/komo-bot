@@ -652,3 +652,31 @@ fn codemode_results_carry_the_nested_calls_live_and_backfilled_alike() {
     };
     assert!(body.body.as_ref().unwrap().result.is_null());
 }
+
+/// 受理时补在正文后面的项目规范只给模型：消息面上只剩用户原话，另带一个标记。
+#[test]
+fn a_project_update_appended_to_an_input_is_cut_back_to_the_spoken_text() {
+    let spoken = "再说一句";
+    let mut input = user(
+        2,
+        &format!("{spoken}\n\n（项目规范在本会话中改过）\n<project_instructions>…"),
+    );
+    input = input.with_data(json!({"inputHash": "h", PROJECT_UPDATE_AT: spoken.len()}));
+    let events = legacy_events(SESSION, &[input], &[input_sub(1, placed(2))]);
+    let message = events
+        .iter()
+        .find_map(|event| match &event.payload {
+            EventPayload::MessageUser(body) => Some(body.clone()),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(message.text.as_deref(), Some(spoken));
+    assert!(message.project_update);
+
+    // 没有这一格的输入照旧全文、不带标记。
+    let events = legacy_events(SESSION, &[user(2, "q1")], &[input_sub(1, placed(2))]);
+    assert!(events.iter().any(|event| matches!(
+        &event.payload,
+        EventPayload::MessageUser(body) if body.text.as_deref() == Some("q1") && !body.project_update
+    )));
+}

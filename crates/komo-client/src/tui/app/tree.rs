@@ -348,6 +348,7 @@ fn display_message(id: &str, seq: Seq, role: Role, text: String) -> SurfaceMessa
         tool_results: Vec::new(),
         provider_blocks: None,
         absorbed_from: None,
+        project_update: false,
     }
 }
 

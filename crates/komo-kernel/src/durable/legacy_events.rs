@@ -354,6 +354,7 @@ impl Projection {
                         EventPayload::MessageUser(MessageUser {
                             text: Some(text),
                             text_ref: None,
+                            project_update: false,
                         }),
                     );
                 }
@@ -374,7 +375,8 @@ impl Projection {
         frame: &Frame,
         out: &mut Vec<Event>,
     ) {
-        let text = entry.model.iter().flatten().find_map(user_text);
+        let (text, project_update) =
+            spoken(entry, entry.model.iter().flatten().find_map(user_text));
         let own = run_id(submission);
         let host = self
             .current
@@ -385,6 +387,7 @@ impl Projection {
             EventPayload::MessageUser(MessageUser {
                 text,
                 text_ref: None,
+                project_update,
             })
         };
         match host {
@@ -759,6 +762,28 @@ impl Frame {
             entry: None,
         });
         event_id
+    }
+}
+
+/// 输入 entry 的 `data` 里这一格：受理时正文后面补了会话中改过的项目规范，值是用户原话的字节长度。
+///
+/// 补的那一段只给模型；界面与记忆抽取读到的输入只该是用户说的话。
+pub const PROJECT_UPDATE_AT: &str = "projectUpdateAt";
+
+/// 输入正文切回用户原话，并说明后面有没有补过项目规范（[`PROJECT_UPDATE_AT`]）。
+fn spoken(entry: &EntryRecord, text: Option<String>) -> (Option<String>, bool) {
+    let at = entry
+        .data
+        .as_ref()
+        .and_then(|data| data.get(PROJECT_UPDATE_AT))
+        .and_then(Value::as_u64)
+        .map(|at| at as usize);
+    match (text, at) {
+        (Some(mut text), Some(at)) if text.is_char_boundary(at) => {
+            text.truncate(at);
+            (Some(text), true)
+        }
+        (text, _) => (text, false),
     }
 }
 

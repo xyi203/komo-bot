@@ -284,6 +284,13 @@ async fn project_files_are_pinned_until_the_next_head_and_updates_ride_on_the_ne
         "{}",
         inputs[1]
     );
+    // 补的那段只给模型：entry 记下原话多长，界面与记忆抽取按它切回"再说一句"。
+    let marks: Vec<Option<u64>> = user_entries(&gateway, &session)
+        .await
+        .into_iter()
+        .map(|(_, at)| at)
+        .collect();
+    assert_eq!(marks, [None, Some("再说一句".len() as u64)]);
 
     // `/new`：下一次 head 才换系统提示，也不再补更新块。
     core(&gateway).boundary(&session, None).await.expect("/new");
@@ -313,6 +320,19 @@ async fn user_inputs(
     gateway: &komo_gateway::service::test_support::harness::TestGateway,
     session: &str,
 ) -> Vec<String> {
+    user_entries(gateway, session)
+        .await
+        .into_iter()
+        .map(|(text, _)| text)
+        .collect()
+}
+
+/// 每条用户输入的正文与 `data.projectUpdateAt`（补了项目规范时，用户原话的字节长度）。
+async fn user_entries(
+    gateway: &komo_gateway::service::test_support::harness::TestGateway,
+    session: &str,
+) -> Vec<(String, Option<u64>)> {
+    use komo_kernel::durable::legacy_events::PROJECT_UPDATE_AT;
     use komo_kernel::durable::storage::{ConversationQuery, EntryQuery};
     use komo_kernel::durable::{Content, ContentBlock, Message};
     let core = core(gateway);
@@ -342,7 +362,12 @@ async fn user_inputs(
         for stored in entries {
             for message in stored.model.iter().flatten() {
                 if let Message::User(user) = message {
-                    texts.push(match &user.content {
+                    let at = stored
+                        .data
+                        .as_ref()
+                        .and_then(|data| data.get(PROJECT_UPDATE_AT))
+                        .and_then(|at| at.as_u64());
+                    let text = match &user.content {
                         Content::Text(text) => text.clone(),
                         Content::Blocks(blocks) => blocks
                             .iter()
@@ -352,7 +377,8 @@ async fn user_inputs(
                             })
                             .collect::<Vec<_>>()
                             .join("\n"),
-                    });
+                    };
+                    texts.push((text, at));
                 }
             }
         }

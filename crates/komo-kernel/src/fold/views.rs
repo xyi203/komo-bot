@@ -41,6 +41,9 @@ pub struct SurfaceMessage {
     /// （消息面只追加），回放跳过它、只认这一条。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub absorbed_from: Option<RunId>,
+    /// 用户消息后面附了会话中改过的项目规范（[`MessageUser::project_update`](crate::events::MessageUser)）。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub project_update: bool,
 }
 
 /// 回放面上的一条工具结果。

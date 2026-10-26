@@ -414,6 +414,10 @@ pub struct MessageUser {
     pub text: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text_ref: Option<PayloadRef>,
+    /// 受理时正文后面还补了一份会话中改过的项目规范：那一段是给模型的，`text` 里只有用户原话，
+    /// 界面只提一句。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub project_update: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -921,6 +925,7 @@ mod tests {
             payload: EventPayload::MessageUser(MessageUser {
                 text: Some("第一行\n第二行".into()),
                 text_ref: None,
+                project_update: false,
             }),
         };
         let line = event.to_line().unwrap();

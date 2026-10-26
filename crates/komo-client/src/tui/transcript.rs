@@ -421,6 +421,13 @@ fn message_lines(message: &SurfaceMessage, width: u16) -> Vec<Line<'static>> {
             } else if message.text_ref.is_some() {
                 lines.push(dim(&format!("{USER_MARK}（正文已外置）")));
             }
+            // 补给模型的那份规范不印全文：一大段 AGENTS.md 夹在用户的话里像是出了错。
+            if message.project_update {
+                let indent = " ".repeat(markdown::display_width(USER_MARK));
+                lines.push(dim(&format!(
+                    "{indent}（另附本会话中改过的项目规范给模型）"
+                )));
+            }
         }
         Role::Assistant => {
             if let Some(text) = message.text.as_deref().filter(|t| !t.trim().is_empty()) {
@@ -560,6 +567,31 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    /// 附给模型的项目规范在界面上只提一句，不印全文。
+    #[test]
+    fn a_project_update_shows_as_one_dim_note() {
+        let message = SurfaceMessage {
+            seq: Seq(1),
+            event_id: komo_kernel::types::ids::EventId::from_raw("evt-1"),
+            role: Role::User,
+            run: None,
+            text: Some("再说一句".into()),
+            text_ref: None,
+            tool_calls: Vec::new(),
+            tool_results: Vec::new(),
+            provider_blocks: None,
+            absorbed_from: None,
+            project_update: true,
+        };
+        let shown = text_of(&message_lines(&message, 80));
+        assert!(shown.starts_with("-> 再说一句"), "{shown}");
+        assert!(
+            shown.contains("另附本会话中改过的项目规范给模型"),
+            "{shown}"
+        );
+        assert_eq!(shown.lines().count(), 2, "{shown}");
     }
 
     /// 提问用 `->` 开头，不是「你」——这是一行命令提示符，不是一句对白。

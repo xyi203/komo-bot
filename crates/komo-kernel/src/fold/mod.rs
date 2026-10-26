@@ -171,6 +171,7 @@ impl Surface {
                     tool_results: Vec::new(),
                     provider_blocks: None,
                     absorbed_from: None,
+                    project_update: false,
                 });
             }
             EventPayload::RunQueued(_) => {
@@ -257,6 +258,7 @@ impl Surface {
                         tool_results: Vec::new(),
                         provider_blocks: None,
                         absorbed_from: event.run.clone(),
+                        project_update: original.project_update,
                     };
                     self.last_role = Some(Role::User);
                     self.messages.push(copy);
@@ -273,6 +275,7 @@ impl Surface {
                 tool_results: Vec::new(),
                 provider_blocks: None,
                 absorbed_from: None,
+                project_update: body.project_update,
             }),
             EventPayload::MessageAssistant(body) => {
                 if event.run.is_some() {
@@ -290,6 +293,7 @@ impl Surface {
                     tool_results: Vec::new(),
                     provider_blocks: body.provider_blocks.clone(),
                     absorbed_from: None,
+                    project_update: false,
                 });
             }
             EventPayload::ConversationBoundary(_) => {
@@ -373,6 +377,7 @@ impl Surface {
                             tool_results: Vec::new(),
                             provider_blocks: None,
                             absorbed_from: None,
+                            project_update: false,
                         },
                     });
                 }
@@ -467,6 +472,7 @@ impl Surface {
             tool_results: vec![result],
             provider_blocks: None,
             absorbed_from: None,
+            project_update: false,
         });
     }
 
@@ -860,6 +866,22 @@ mod tests {
     }
 
     #[test]
+    fn a_project_update_mark_reaches_the_surface_message() {
+        let events = vec![event(
+            1,
+            Some("run-1"),
+            EventPayload::MessageUser(MessageUser {
+                text: Some("再说一句".into()),
+                text_ref: None,
+                project_update: true,
+            }),
+        )];
+        let surface = fold(&events);
+        assert!(surface.messages[0].project_update);
+        assert_eq!(surface.messages[0].text.as_deref(), Some("再说一句"));
+    }
+
+    #[test]
     fn two_user_messages_in_a_row_are_recorded_not_repaired() {
         let events = vec![
             accepted(1, "run-1", "第一句"),
@@ -869,6 +891,7 @@ mod tests {
                 EventPayload::MessageUser(MessageUser {
                     text: Some("第二句".into()),
                     text_ref: None,
+                    project_update: false,
                 }),
             ),
         ];

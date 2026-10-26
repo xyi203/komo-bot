@@ -59,39 +59,55 @@ text("\n".join(hits))
     assert_eq!(tool_results(&llm).len(), 1, "脚本里的两次读不进模型的消息");
 }
 
-/// 会改东西的工具在脚本里调不了：字面写着 `tools.write(` 的脚本在运行前就被拒，前面那句
-/// `text` 也没机会跑；文件没被写。
+/// 照 pi：`write` / `edit` 在脚本里能调，两个 `write` 也能用 `atools` 并行发出；改动不因脚本
+/// 后面的步骤回滚。
 #[tokio::test]
-async fn a_write_inside_a_script_is_refused_before_the_script_runs() {
+async fn writes_and_edits_inside_a_script_land_including_two_in_parallel() {
     let home = Home::new();
+    std::fs::create_dir_all(home.workspace()).unwrap();
     let code = r#"
-text("started")
-tools.write(path="x.txt", content="y")
+rs = await settle(
+    atools.write(path="a.txt", content="alpha\n"),
+    atools.write(path="b.txt", content="beta\n"),
+)
+text([r["ok"] for r in rs])
+e = tools.edit(path="a.txt", edits=[{"match_text": "alpha", "replace_text": "ALPHA"}])
+text(e["status"])
 "#;
     let (_, _, result) = run_script(&home, code).await;
-    assert!(result.contains("脚本里调不了 write"), "{result}");
-    assert!(!result.contains("started"), "脚本不该跑过：{result}");
-    assert!(!home.workspace().join("x.txt").exists());
+    assert!(result.contains("true,\n  true"), "{result}");
+    assert!(result.contains("completed"), "{result}");
+    assert!(
+        result.contains("调用了 3 次工具：write×2、edit×1"),
+        "{result}"
+    );
+    let read = |name: &str| std::fs::read_to_string(home.workspace().join(name)).unwrap();
+    assert_eq!(read("a.txt"), "ALPHA\n");
+    assert_eq!(read("b.txt"), "beta\n");
 }
 
-/// 绕过字面写法（`getattr`）也调不到：`write` 不在脚本的工具表里，根本没有这个属性。
+/// 编排工具在脚本里仍调不了：字面写着 `tools.task(` 的脚本在运行前就被拒，前面那句 `text` 也没机会跑；
+/// 绕过字面写法（`getattr`）也调不到，`task` 不在脚本的工具表里。
 #[tokio::test]
-async fn a_write_reached_through_getattr_is_still_refused() {
+async fn orchestration_inside_a_script_is_refused_literally_and_through_getattr() {
     let home = Home::new();
+    let (_, _, result) = run_script(&home, "text(\"started\")\ntools.task(prompt=\"x\")\n").await;
+    assert!(result.contains("脚本里调不了 task"), "{result}");
+    assert!(!result.contains("started"), "脚本不该跑过：{result}");
+
     let code = r#"
 try:
-    getattr(tools, "write")(path="x.txt", content="y")
+    getattr(tools, "task")(prompt="x")
 except AttributeError as error:
     text("refused: " + str(error))
-text("write" in TOOLS)
+text(["task" in TOOLS, "write" in TOOLS])
 "#;
     let (_, _, result) = run_script(&home, code).await;
     assert!(
-        result.contains("refused: ") && result.contains("no attribute 'write'"),
+        result.contains("refused: ") && result.contains("no attribute 'task'"),
         "{result}"
     );
-    assert!(result.contains("false"), "TOOLS 里不该有 write：{result}");
-    assert!(!home.workspace().join("x.txt").exists());
+    assert!(result.contains("false,\n  true"), "{result}");
 }
 
 /// 工作区外的读取在脚本里照样放行（D8：内层只看计划是不是只读，与 auto 一致），不会停下来等人。
@@ -117,4 +133,54 @@ async fn a_runaway_script_is_killed_at_the_call_timeout() {
     let home = Home::with_config(&config_toml("[execution]\ncall_timeout_secs = 2\n"));
     let (_, _, result) = run_script(&home, "while True:\n    pass\n").await;
     assert!(result.contains("脚本超时"), "{result}");
+}
+
+#[tokio::test]
+async fn a_bash_tail_can_be_followed_by_reading_its_complete_artifact_inside_the_script() {
+    let home = Home::with_config(&config_toml("[execution]\nmodel_result_bytes = 1024\n"));
+    let code = r#"
+r = tools.bash(command="printf 'FIRST_OUT\\n'; for ((i=0; i<1000; i++)); do printf 'line %04d data\\n' \"$i\"; done; printf 'LAST_OUT\\n'; printf 'STDERR_OUT\\n' >&2; exit 7")
+ref = r["text"].split("完整输出：", 1)[1].split("（", 1)[0].strip()
+full = tools.read(path=ref)["text"]
+text({"status": r["status"], "exit": r["result"]["exit_code"],
+      "tail": "LAST_OUT" in r["text"], "head_in_tail": "FIRST_OUT" in r["text"],
+      "full_head": "FIRST_OUT" in full, "full_tail": "LAST_OUT" in full,
+      "stderr": "STDERR_OUT" in full})
+"#;
+    let (_gw, _, result) = run_script(&home, code).await;
+    for expected in [
+        "\"status\": \"failed\"",
+        "\"exit\": 7",
+        "\"tail\": true",
+        "\"head_in_tail\": false",
+        "\"full_head\": true",
+        "\"full_tail\": true",
+        "\"stderr\": true",
+    ] {
+        assert!(result.contains(expected), "{expected}: {result}");
+    }
+}
+
+/// 并行的两个 `edit` 改同一个文件的两处：不能有一处被悄悄覆盖掉——要么都改上，要么后一个得到冲突失败。
+#[tokio::test]
+async fn two_parallel_edits_of_one_file_never_lose_an_update_silently() {
+    let home = Home::new();
+    std::fs::create_dir_all(home.workspace()).unwrap();
+    std::fs::write(home.workspace().join("f.txt"), "one\ntwo\n").unwrap();
+    let code = r#"
+rs = await settle(
+    atools.edit(path="f.txt", edits=[{"match_text": "one", "replace_text": "ONE"}]),
+    atools.edit(path="f.txt", edits=[{"match_text": "two", "replace_text": "TWO"}]),
+)
+text([r["value"]["status"] if r["ok"] else "rejected" for r in rs])
+text([r["value"]["text"] if r["ok"] else r["error"] for r in rs])
+"#;
+    let (_, _, result) = run_script(&home, code).await;
+    let body = std::fs::read_to_string(home.workspace().join("f.txt")).unwrap();
+    let applied = ["ONE", "TWO"].iter().filter(|s| body.contains(*s)).count();
+    let failed = result.matches("\"failed\"").count() + result.matches("\"rejected\"").count();
+    assert_eq!(applied + failed, 2, "{result}\n{body}");
+    if failed > 0 {
+        assert!(result.contains("版本冲突"), "{result}");
+    }
 }

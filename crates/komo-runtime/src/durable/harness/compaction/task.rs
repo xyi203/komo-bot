@@ -40,13 +40,13 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use komo_kernel::compaction::{CompactionDecision, CompactionInput, decide};
 use komo_kernel::durable::compaction::{
-    COMPACTION_ENTRY_KIND, compaction_data, estimate_messages_tokens, online_state, select_cut,
+    COMPACTION_ENTRY_KIND, compaction_data, estimate_messages_tokens, select_cut,
     serialize_conversation, summarized_messages, wrap_summary,
 };
 use komo_kernel::durable::task::RunningTask;
 use komo_kernel::durable::{
     AssistantMessage, Content, ContentBlock, ConversationId, EntryId, Message, StopReason,
-    SystemMessage, TaskId, derive_context,
+    SystemMessage, TaskId,
 };
 use komo_kernel::types::model::ModelConfig;
 use serde::{Deserialize, Serialize};
@@ -194,8 +194,8 @@ impl CompactionTask {
             }
             Err(HookError::Failed(message)) => return Err(TaskError::new(message)),
         };
-        let entries = rt.entries(conversation, None).await?;
-        let view = derive_context(&entries, None);
+        let context = rt.context_snapshot(conversation).await?;
+        let view = &context.view;
         let Some(cut) = select_cut(&view, setup.settings.keep_recent_tokens) else {
             return self.complete(rt, None).await;
         };
@@ -203,7 +203,7 @@ impl CompactionTask {
             Some(decision) => decision,
             None => {
                 // 手动压缩：没有谁替它算过账，按这个切点现算一份留档。
-                let online = online_state(&entries, None);
+                let online = context.online_state(None);
                 let tokens = estimate_messages_tokens(&view.messages)
                     .max(online.last_context_tokens.unwrap_or(0));
                 decide(

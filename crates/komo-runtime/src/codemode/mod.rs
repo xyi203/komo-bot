@@ -7,6 +7,7 @@
 //! "沙箱起不来就不注册 codemode"这回事。每次调用起一个 worker 进程（`komo __codemode-worker`，
 //! 本模块的 [`worker`]），宿主管墙钟、内存与取消，到限就 SIGKILL。
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::io::Read;
 use std::path::PathBuf;
@@ -14,6 +15,8 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
+use futures_util::FutureExt;
+use futures_util::stream::{FuturesUnordered, StreamExt};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 
 mod convert;
@@ -23,7 +26,8 @@ pub mod worker;
 /// 与根 `Cargo.toml` 里 `monty` 的精确钉版本同步（有测试守着）。
 pub const MONTY_VERSION: &str = "1.1.0";
 /// worker 协议版本：请求 / 消息 / 脚本前置代码（`prelude.py`）任一变了就加一。
-pub const WORKER_PROTOCOL: u32 = 2;
+/// 3：延后调用（`atools`）与 `wait`。
+pub const WORKER_PROTOCOL: u32 = 3;
 /// 一次 `os.urandom` / `random` 起始状态最多向宿主要这么多字节（Monty 给 `random` 起状态要 2496）。
 const MAX_URANDOM: usize = 1 << 16;
 
@@ -231,7 +235,9 @@ impl Worker {
         self
     }
 
-    /// 跑一段脚本。`on_call(name, args)` 回答脚本里的每一次工具调用；`catalog` 是脚本里
+    /// 跑一段脚本。`on_call(name, args)` 回答脚本里的每一次工具调用，按收到的顺序同步地调它
+    /// （编号之类要在这里定），返回的 future 可能与别的调用并发跑（脚本里的 `atools`）；
+    /// 脚本结束时还在跑的也等它们跑完再返回。`catalog` 是脚本里
     /// `ALL_TOOLS` / `search_tools` / `describe_tool` / `describe_namespace` 要的说明
     /// （`docs/codemode.md` §6），发现在 worker 里本地做完，不经宿主、不进 journal。
     ///
@@ -289,8 +295,19 @@ impl Worker {
             if let Err(error) = write_line(&mut link.writer, &first).await {
                 return Err(format!("脚本交不进 worker：{error}").into());
             }
+            // 延后调用：在跑的与跑完还没交给 worker 的。等 worker 下一行、等一次同步调用时，
+            // 它们都照样往前跑。
+            let mut inflight = FuturesUnordered::new();
+            let mut finished: HashMap<u64, Result<serde_json::Value, String>> = HashMap::new();
             loop {
-                let line = match lines.next_line().await {
+                let next = tokio::select! {
+                    line = lines.next_line() => line,
+                    Some((id, result)) = inflight.next(), if !inflight.is_empty() => {
+                        finished.insert(id, result);
+                        continue;
+                    }
+                };
+                let line = match next {
                     Ok(Some(line)) => line,
                     Ok(None) => return Err("脚本进程提前退出".to_string().into()),
                     Err(error) => return Err(format!("读不到 worker 输出：{error}").into()),
@@ -298,8 +315,34 @@ impl Worker {
                 let message: serde_json::Value = serde_json::from_str(&line)
                     .map_err(|error| format!("worker 输出不是协议：{error}"))?;
                 if let Some(done) = message.get("done") {
+                    // 脚本发出去没等的调用也已经在做了：等它们落下结果。
+                    while inflight.next().await.is_some() {}
                     return serde_json::from_value::<worker::Done>(done.clone())
                         .map_err(|error| format!("结束消息读不懂：{error}").into());
+                }
+                if let Some(ids) = message.get("wait") {
+                    let ids: Vec<u64> = serde_json::from_value(ids.clone())
+                        .map_err(|error| format!("wait 读不懂：{error}"))?;
+                    while !ids.iter().all(|id| finished.contains_key(id)) {
+                        match inflight.next().await {
+                            Some((id, result)) => {
+                                finished.insert(id, result);
+                            }
+                            None => break,
+                        }
+                    }
+                    let results: Vec<serde_json::Value> = ids
+                        .iter()
+                        .map(|id| match finished.remove(id) {
+                            Some(Ok(value)) => serde_json::json!({ "id": id, "ok": value }),
+                            Some(Err(error)) => serde_json::json!({ "id": id, "error": error }),
+                            None => serde_json::json!({ "id": id, "error": "宿主没有这次调用" }),
+                        })
+                        .collect();
+                    write_line(&mut link.writer, &serde_json::json!({ "results": results }))
+                        .await
+                        .map_err(|error| format!("答复交不进 worker：{error}"))?;
+                    continue;
                 }
                 if let Some(request) = message.get("os") {
                     let reply = match serde_json::from_value::<Nondet>(request.clone()) {
@@ -320,7 +363,25 @@ impl Worker {
                     return Err(format!("worker 输出不是协议：{line}").into());
                 };
                 let args = message.get("args").cloned().unwrap_or_default();
-                let reply = match on_call(name.to_string(), args).await {
+                let call = on_call(name.to_string(), args);
+                if message.get("defer").and_then(|defer| defer.as_bool()) == Some(true) {
+                    let Some(id) = message.get("id").and_then(|id| id.as_u64()) else {
+                        return Err(format!("延后调用没有 id：{line}").into());
+                    };
+                    inflight.push(call.map(move |result| (id, result)));
+                    continue;
+                }
+                // 同步调用：worker 在等这一个，在跑的延后调用照样往前走。
+                let mut call = std::pin::pin!(call);
+                let result = loop {
+                    tokio::select! {
+                        result = &mut call => break result,
+                        Some((id, result)) = inflight.next(), if !inflight.is_empty() => {
+                            finished.insert(id, result);
+                        }
+                    }
+                };
+                let reply = match result {
                     Ok(value) => serde_json::json!({ "ok": value }),
                     Err(error) => serde_json::json!({ "error": error }),
                 };

@@ -213,6 +213,89 @@ async fn a_restart_during_an_unsafe_sub_call_ends_the_script_uncertain_and_never
     engine.close().await.unwrap();
 }
 
+/// `docs/codemode.md` §5：`atools` 的调用是同时在跑的嵌套任务——第二个跑完时第一个还卡在闸门上；
+/// 序号仍按脚本里发出的顺序，结果按参数顺序回到脚本。
+#[tokio::test]
+async fn atools_calls_run_as_concurrent_nested_tasks_keyed_in_script_order() {
+    let world = World::new();
+    let gate = Arc::new(Notify::new());
+    let read = Arc::new(TestTool::reader("read", &world.log).with_gate(&gate));
+    let rg = Arc::new(TestTool::reader("rg", &world.log));
+    setup(&world, vec![read.clone(), rg.clone()]);
+    script_round(
+        &world,
+        "import asyncio\na, b = await asyncio.gather(atools.read(path='a'), atools.rg(pattern='x'))\n\
+         text(a['text'] + ' | ' + b['text'])",
+    );
+    let engine = world.open().await;
+    let id = world.submit(&engine, "go").await;
+    world.until_log("start read #1").await;
+    world.until_log("finish rg #1").await;
+    gate.notify_one();
+    world.harness.wait(&engine, id).await.unwrap();
+
+    let (status, view) = only_result(&world).await;
+    assert_eq!(status, "completed");
+    assert!(view.contains("read output | rg output"), "{view}");
+    assert!(view.contains("调用了 2 次工具：read×1、rg×1"), "{view}");
+    let tasks = world.tasks("komo.tool").await;
+    let children = nested(&tasks);
+    assert_eq!(children.len(), 2);
+    for (child, key, name) in [(children[0], "c1", "read"), (children[1], "c2", "rg")] {
+        assert_eq!(child.input["key"], key);
+        assert_eq!(child.input["name"], name);
+        assert!(completed(child), "{:?}", child.state);
+    }
+    engine.close().await.unwrap();
+}
+
+/// 并行调用中途重启：已交付的那个从槽位回放、不重做，没跑完的（Safe）重跑；结果成批交回，
+/// 所以重放的脚本发出同样顺序的调用，之后的新调用照常执行。
+#[tokio::test]
+async fn a_restart_during_parallel_calls_replays_the_delivered_one_and_continues() {
+    let world = World::new();
+    let read = Arc::new(TestTool::reader("read", &world.log).hanging_first(1));
+    let rg = Arc::new(TestTool::reader("rg", &world.log));
+    let ls = Arc::new(TestTool::reader("ls", &world.log));
+    setup(&world, vec![read.clone(), rg.clone(), ls.clone()]);
+    script_round(
+        &world,
+        "rs = await settle(atools.read(path='a'), atools.rg(pattern='x'))\nc = tools.ls()\n\
+         text(' / '.join([r['value']['text'] for r in rs] + [c['text']]))",
+    );
+    let engine = world.open().await;
+    let id = world.submit(&engine, "go").await;
+    world.until_log("start read #1").await;
+    world.until_log("finish rg #1").await;
+
+    let engine = world.restart(engine).await;
+    world.harness.wait(&engine, id).await.unwrap();
+
+    let (status, view) = only_result(&world).await;
+    assert_eq!(status, "completed", "{view}");
+    assert!(
+        view.contains("read output / rg output / ls output"),
+        "{view}"
+    );
+    assert_eq!(rg.runs(), 1, "the delivered call is replayed, not redone");
+    assert_eq!(read.runs(), 2, "the safe interrupted call runs again");
+    assert_eq!(ls.runs(), 1);
+    let tasks = world.tasks("komo.tool").await;
+    let keys: Vec<_> = nested(&tasks)
+        .iter()
+        .map(|task| (task.input["key"].clone(), task.input["name"].clone()))
+        .collect();
+    assert_eq!(
+        keys,
+        [
+            (json!("c1"), json!("read")),
+            (json!("c2"), json!("rg")),
+            (json!("c3"), json!("ls"))
+        ]
+    );
+    engine.close().await.unwrap();
+}
+
 /// `docs/codemode.md` §7「时钟与熵」：宿主应答作为 memo 记在外层任务上；重启后脚本整段重跑，同样的
 /// 值回放出来——否则第一个子调用的参数（用了时钟与随机数）会和记录对不上、整段分歧。
 #[tokio::test]
@@ -374,27 +457,36 @@ async fn a_sub_call_to_a_tool_the_surface_no_longer_allows_is_refused_and_the_sc
     engine.close().await.unwrap();
 }
 
-/// 脚本里只放行读文件与 MCP：本地写入与命令（`Operation` 不是 `ReadFile` / `McpCall`）在
-/// `prepare` 之后被拒，不执行；`bash` 一类名字直接不认识。
+/// 照 pi：计划是 WriteFile 的工具（write / edit）在脚本里照常执行；只认 prepare 交出的计划，名字绕不过去——
+/// 计划是读写文件、bash、MCP 之外的操作（这里是 MemoryChange）在 prepare 之后被拒、不执行。
 #[tokio::test]
-async fn a_local_write_inside_a_script_is_refused_after_prepare_and_never_executed() {
+async fn a_file_write_inside_a_script_runs_but_other_operations_are_refused_after_prepare() {
     let world = World::new();
-    let mutate = Arc::new(TestTool::writer("mutate", &world.log));
-    setup(&world, vec![mutate.clone()]);
+    let mutate = Arc::new(TestTool {
+        operation: Operation::WriteFile,
+        ..TestTool::writer("mutate", &world.log)
+    });
+    let remember = Arc::new(TestTool {
+        operation: Operation::MemoryChange,
+        ..TestTool::writer("remember", &world.log)
+    });
+    setup(&world, vec![mutate.clone(), remember.clone()]);
     script_round(
         &world,
-        "try:\n    tools.mutate()\nexcept ToolError as e:\n    text('refused: ' + str(e))",
+        "text(tools.mutate()['status'])\ntry:\n    tools.remember()\nexcept ToolError as e:\n    text('refused: ' + str(e))",
     );
     let engine = world.open().await;
     let id = world.submit(&engine, "go").await;
     world.harness.wait(&engine, id).await.unwrap();
 
     let (_, view) = only_result(&world).await;
+    assert!(view.contains("completed"), "{view}");
     assert!(
-        view.contains("mutate 不是只读工具或 MCP；脚本里不支持此操作"),
+        view.contains("remember 不是读写文件、bash 或 MCP；脚本里不支持此操作"),
         "{view}"
     );
-    assert_eq!(mutate.runs(), 0);
+    assert_eq!(mutate.runs(), 1);
+    assert_eq!(remember.runs(), 0);
     engine.close().await.unwrap();
 }
 
@@ -600,5 +692,402 @@ async fn on_a_turso_database_a_restart_in_the_second_sub_call_replays_the_first(
             .join(format!("tool-output/1/{child}/1/output.json"))
             .exists()
     );
+    engine.close().await.unwrap();
+}
+
+async fn nested_with_pid(world: &World) -> TaskRecord {
+    world
+        .until(|| async {
+            world
+                .live()
+                .await
+                .nested_tools
+                .as_ref()
+                .is_some_and(|slots| slots.iter().any(|nested| nested.slot.pid.is_some()))
+        })
+        .await;
+    let tasks = world.tasks("komo.tool").await;
+    nested(&tasks)
+        .into_iter()
+        .find(|task| task.input["name"] == "bash" || task.input["name"] == "read")
+        .unwrap()
+        .clone()
+}
+
+async fn child_phase(world: &World, id: komo_kernel::durable::TaskId) -> serde_json::Value {
+    let record = world
+        .tasks("komo.tool")
+        .await
+        .into_iter()
+        .find(|task| task.id == id)
+        .unwrap();
+    match record.state {
+        TaskState::Running { checkpoint } | TaskState::Pending { checkpoint } => checkpoint,
+        _ => serde_json::Value::Null,
+    }
+}
+
+fn quick_probe(world: &World) {
+    let mut settings = (*world.harness.deps().settings()).clone();
+    settings.probe_interval = Duration::from_millis(20);
+    world.harness.deps().set_settings(settings);
+}
+
+fn fake_child() -> komo_kernel::traits::ChildStarted {
+    komo_kernel::traits::ChildStarted {
+        pid: 4242,
+        pgid: 4242,
+        started_at_ms: 1761206400000,
+    }
+}
+
+#[tokio::test]
+async fn nested_live_slots_follow_admission_intent_progress_and_delivery_then_disappear() {
+    use super::super::live::SlotStatus;
+    use komo_kernel::durable::StorageWrite;
+    let world = World::new();
+    let bash_gate = Arc::new(Notify::new());
+    let after_gate = Arc::new(Notify::new());
+    let bash = Arc::new(
+        TestTool::writer("bash", &world.log)
+            .with_child(fake_child())
+            .with_stdout("stream tail")
+            .with_gate(&bash_gate),
+    );
+    let read = Arc::new(TestTool::reader("read", &world.log).with_gate(&after_gate));
+    setup(&world, vec![bash, read]);
+    script_round(
+        &world,
+        "r = tools.bash(command='test')\ntools.read(path='hold')\ntext(r['text'])",
+    );
+    let engine = world.open().await;
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let observed = seen.clone();
+    engine.line().subscribe_commits(move |publication| {
+        for write in &publication.writes {
+            if let StorageWrite::DocumentChange { value, .. } = write
+                && let Some(slots) = value.get("nestedTools")
+            {
+                observed.lock().unwrap().push(slots.clone());
+            }
+        }
+    });
+    let id = world.submit(&engine, "go").await;
+    let child = nested_with_pid(&world).await;
+    let live = world.live().await;
+    let slot = live.slot(child.id).unwrap();
+    assert_eq!(slot.status, SlotStatus::Running);
+    assert_eq!(
+        (slot.pid, slot.pgid, slot.started_at),
+        (Some(4242), Some(4242), Some(1761206400000))
+    );
+    assert_eq!(slot.output.as_deref(), Some("stream tail"));
+    assert_eq!(slot.attempt, Some(1));
+    assert_eq!(slot.replay, Some(komo_kernel::types::plan::Replay::Unsafe));
+    assert!(!world.storage.progress_commits().is_empty());
+    bash_gate.notify_one();
+    world.until_log("start read #1").await;
+    let live = world.live().await;
+    let slot = live.slot(child.id).unwrap();
+    assert_eq!(slot.status, SlotStatus::Done);
+    assert!(slot.pid.is_none() && slot.output.is_none() && slot.entry.is_none());
+    let seen = seen.lock().unwrap();
+    assert!(seen.iter().any(|slots| slots[0]["status"] == "pending"));
+    assert!(seen.iter().any(|slots| slots[0]["status"] == "running"));
+    assert!(seen.iter().any(|slots| slots[0]["status"] == "done"));
+    drop(seen);
+    after_gate.notify_one();
+    world.harness.wait(&engine, id).await.unwrap();
+    assert!(world.live().await.nested_tools.is_none());
+    engine.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_bash_view_is_bounded_in_the_nested_receipt_while_the_complete_stdout_stays_in_a_blob() {
+    use super::super::nested::{NestedDoc, nested_address};
+    let dir = tempfile::tempdir().unwrap();
+    let world = World::turso(dir.path());
+    let full = format!(
+        "FIRST_OUT\n{}LAST_OUT\n",
+        "line: content for the full blob\n".repeat(10_000)
+    );
+    let gate = Arc::new(Notify::new());
+    let bash = Arc::new(
+        TestTool::writer("bash", &world.log)
+            .with_stdout(&full)
+            .with_text(&full),
+    );
+    let read = Arc::new(TestTool::reader("read", &world.log).with_gate(&gate));
+    setup(&world, vec![bash, read]);
+    script_round(
+        &world,
+        "r = tools.bash(command='test')\ntools.read(path='hold')\ntext('last: ' + str('LAST_OUT' in r['text']))",
+    );
+    let engine = world.open().await;
+    let id = world.submit(&engine, "go").await;
+    world.until_log("start read #1").await;
+    let tasks = world.tasks("komo.tool").await;
+    let parent = outer(&tasks).id;
+    let child = nested(&tasks)[0];
+    let doc = world
+        .storage_handle()
+        .find_document(&nested_address(parent, "c1"))
+        .await
+        .unwrap()
+        .unwrap();
+    let encoded = serde_json::to_string(&doc.value).unwrap();
+    let doc: NestedDoc = serde_json::from_value(doc.value).unwrap();
+    let receipt = doc.result.unwrap().script_result().unwrap();
+    let text = receipt["text"].as_str().unwrap();
+    assert!(
+        text.contains("LAST_OUT") && !text.contains("FIRST_OUT"),
+        "{text}"
+    );
+    assert!(text.contains(&format!("artifact://1/{}/1/result", child.id)));
+    assert!(text.len() < 52 * 1024);
+    assert!(
+        encoded.len() < 60 * 1024,
+        "the full stdout is not in komo.nested"
+    );
+    let stored = tokio::fs::read_to_string(
+        dir.path()
+            .join(format!("tool-output/1/{}/1/stdout.txt", child.id)),
+    )
+    .await
+    .unwrap();
+    assert_eq!(stored, full);
+    gate.notify_one();
+    world.harness.wait(&engine, id).await.unwrap();
+    assert!(world.live().await.nested_tools.is_none());
+    engine.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn an_unsafe_nested_bash_probes_a_surviving_child_before_becoming_uncertain() {
+    use crate::recovery::Liveness;
+    let world = World::new();
+    let bash = Arc::new(
+        TestTool::writer("bash", &world.log)
+            .with_child(fake_child())
+            .hanging_first(1),
+    );
+    let after = Arc::new(TestTool::reader("rg", &world.log));
+    setup(&world, vec![bash.clone(), after.clone()]);
+    quick_probe(&world);
+    script_round(
+        &world,
+        "tools.bash(command='test')\ntools.rg(pattern='never')",
+    );
+    world.probe.set(Liveness::Alive);
+    let engine = world.open().await;
+    let id = world.submit(&engine, "go").await;
+    let child = nested_with_pid(&world).await;
+    let engine = world.restart(engine).await;
+    world
+        .until(|| async { world.probe.asked().len() >= 2 })
+        .await;
+    assert_eq!(child_phase(&world, child.id).await["phase"], "probe");
+    assert!(world.probe.asked().iter().all(|child| child.pid == 4242));
+    assert_eq!((bash.runs(), after.runs()), (1, 0));
+    world.probe.set(Liveness::Unknown);
+    tokio::time::sleep(Duration::from_millis(40)).await;
+    assert_eq!(child_phase(&world, child.id).await["phase"], "probe");
+    world.probe.set(Liveness::Gone);
+    world.harness.wait(&engine, id).await.unwrap();
+    let (status, view) = only_result(&world).await;
+    assert_eq!(status, "uncertain", "{view}");
+    assert_eq!((bash.runs(), after.runs()), (1, 0));
+    assert!(world.live().await.nested_tools.is_none());
+    engine.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn cancelling_a_nested_bash_in_probe_records_its_surviving_pid_and_clears_slots() {
+    use crate::recovery::Liveness;
+    use komo_kernel::traits::ToolOutputStore;
+    let world = World::new();
+    let bash = Arc::new(
+        TestTool::writer("bash", &world.log)
+            .with_child(fake_child())
+            .hanging_first(1),
+    );
+    setup(&world, vec![bash.clone()]);
+    quick_probe(&world);
+    script_round(&world, "tools.bash(command='test')");
+    world.probe.set(Liveness::Alive);
+    let engine = world.open().await;
+    let id = world.submit(&engine, "go").await;
+    let child = nested_with_pid(&world).await;
+    let engine = world.restart(engine).await;
+    world
+        .until(|| async { child_phase(&world, child.id).await["phase"] == "probe" })
+        .await;
+    let parent = outer(&world.tasks("komo.tool").await).id;
+    engine.abort_task(parent).await.unwrap();
+    world.harness.wait(&engine, id).await.unwrap();
+    let set = world.hooks.tools(CONV).await.unwrap();
+    let attempt = super::super::tool::attempt_ref(&set.env, CONV, child.id, 1);
+    let published = world.mem.find_published(&attempt).await.unwrap().unwrap();
+    assert!(published.body.unwrap().preview.unwrap().contains("4242"));
+    let tasks = world.tasks("komo.tool").await;
+    assert!(matches!(
+        outcome_of(nested(&tasks)[0]),
+        TaskOutcome::Aborted { .. }
+    ));
+    assert_eq!(bash.runs(), 1);
+    assert!(world.live().await.nested_tools.is_none());
+    engine.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_complete_truncated_bash_output_is_reused_from_disk_before_probing_the_child() {
+    use super::super::nested::{NestedDoc, NestedResult, nested_address};
+    use crate::recovery::Liveness;
+    use komo_kernel::types::refs::{ToolResultBody, ToolResultStatus};
+    let dir = tempfile::tempdir().unwrap();
+    let world = World::turso(dir.path());
+    let gate = Arc::new(Notify::new());
+    let stdout = "a full stdout line\n".repeat(10_000);
+    let bash = Arc::new(
+        TestTool::writer("bash", &world.log)
+            .with_child(fake_child())
+            .with_stdout(&stdout)
+            .hanging_first(1),
+    );
+    let after = Arc::new(TestTool::reader("read", &world.log).with_gate(&gate));
+    setup(&world, vec![bash.clone(), after]);
+    quick_probe(&world);
+    script_round(
+        &world,
+        "r = tools.bash(command='test')\ntools.read(path='hold')\ntext('done')",
+    );
+    world.probe.set(Liveness::Alive);
+    let engine = world.open().await;
+    let id = world.submit(&engine, "go").await;
+    let child = nested_with_pid(&world).await;
+    let set = world.hooks.tools(CONV).await.unwrap();
+    let attempt = super::super::tool::attempt_ref(&set.env, CONV, child.id, 1);
+    engine.close().await.unwrap();
+    // 结果已经发布、交付还没提交时崩溃：stdout 比 preview 长，bash 仍可准确重建脚本视图。
+    let writer = set.env.outputs.begin(&attempt).await.unwrap();
+    let published = set
+        .env
+        .outputs
+        .publish(
+            writer,
+            ToolResultBody {
+                status: ToolResultStatus::Completed,
+                result: json!({"exit_code": 0}),
+                error: None,
+                exit_code: Some(0),
+                artifacts: vec![],
+                images: vec![],
+                preview: Some("LAST_OUT\n".into()),
+            },
+        )
+        .await
+        .unwrap();
+    assert!(!super::super::nested::reusable(&published, "rg"));
+    let expected =
+        NestedResult::from_bash(&published, &attempt, &set.env.projection, false).unwrap();
+    let engine = world.open().await;
+    world.until_log("start read #1").await;
+    let parent = outer(&world.tasks("komo.tool").await).id;
+    let doc = world
+        .storage_handle()
+        .find_document(&nested_address(parent, "c1"))
+        .await
+        .unwrap()
+        .unwrap();
+    let doc: NestedDoc = serde_json::from_value(doc.value).unwrap();
+    assert_eq!(
+        doc.result.unwrap(),
+        expected,
+        "same persisted facts produce the same receipt"
+    );
+    assert!(
+        world.probe.asked().is_empty(),
+        "complete output wins before probe"
+    );
+    assert_eq!(bash.runs(), 1, "unsafe bash is never executed again");
+    gate.notify_one();
+    world.harness.wait(&engine, id).await.unwrap();
+    assert!(world.live().await.nested_tools.is_none());
+    engine.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_nested_host_timeout_stays_uncertain_on_disk_and_stops_following_calls() {
+    use komo_kernel::traits::ToolOutputStore;
+    use komo_kernel::types::refs::ToolResultStatus;
+    use komo_kernel::types::tool::ToolError;
+    let world = World::new();
+    let bash = Arc::new(TestTool {
+        execute_error: Some(ToolError::Timeout { after_secs: 1 }),
+        ..TestTool::writer("bash", &world.log)
+    });
+    let after = Arc::new(TestTool::reader("rg", &world.log));
+    setup(&world, vec![bash, after.clone()]);
+    script_round(
+        &world,
+        "try:\n    tools.bash(command='test')\nexcept ToolError:\n    pass\ntools.rg(pattern='never')",
+    );
+    let engine = world.open().await;
+    let id = world.submit(&engine, "go").await;
+    world.harness.wait(&engine, id).await.unwrap();
+    let (status, view) = only_result(&world).await;
+    assert_eq!(status, "uncertain", "{view}");
+    assert_eq!(after.runs(), 0);
+    let tasks = world.tasks("komo.tool").await;
+    let child = nested(&tasks)[0];
+    let set = world.hooks.tools(CONV).await.unwrap();
+    let attempt = super::super::tool::attempt_ref(&set.env, CONV, child.id, 1);
+    let published = world.mem.find_published(&attempt).await.unwrap().unwrap();
+    assert_eq!(published.status, ToolResultStatus::Uncertain);
+    assert!(
+        super::super::nested::NestedResult::from_bash(
+            &published,
+            &attempt,
+            &set.env.projection,
+            false
+        )
+        .unwrap()
+        .uncertain
+    );
+    engine.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_safe_nested_call_reruns_after_probe_and_clears_the_old_attempts_progress() {
+    use crate::recovery::Liveness;
+    let world = World::new();
+    let gate = Arc::new(Notify::new());
+    let read = Arc::new(
+        TestTool::reader("read", &world.log)
+            .with_child(fake_child())
+            .hanging_first(1),
+    );
+    let after = Arc::new(TestTool::reader("rg", &world.log).with_gate(&gate));
+    setup(&world, vec![read.clone(), after]);
+    quick_probe(&world);
+    script_round(&world, "tools.read(path='test')\ntools.rg(pattern='hold')");
+    world.probe.set(Liveness::Alive);
+    let engine = world.open().await;
+    let id = world.submit(&engine, "go").await;
+    let child = nested_with_pid(&world).await;
+    let engine = world.restart(engine).await;
+    world
+        .until(|| async { child_phase(&world, child.id).await["phase"] == "probe" })
+        .await;
+    world.probe.set(Liveness::Gone);
+    world.until_log("start rg #1").await;
+    let live = world.live().await;
+    let slot = live.slot(child.id).unwrap();
+    assert_eq!(read.runs(), 2);
+    assert_eq!(slot.attempt, Some(2));
+    assert!(slot.pid.is_none() && slot.output.is_none());
+    gate.notify_one();
+    world.harness.wait(&engine, id).await.unwrap();
+    assert!(world.live().await.nested_tools.is_none());
     engine.close().await.unwrap();
 }

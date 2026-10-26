@@ -23,6 +23,9 @@
 //!   重放策略、尝试序号、子进程身份（pid / pgid / 起来的时刻，恢复时的 `probe` 阶段用）与输出尾巴；`done` 时
 //!   只剩结果 entry，输出尾巴随结果清掉。
 //!
+//! - `nestedTools` 是脚本的子调用槽位，带 `parentTaskId`，与顶层共用意图、进度、probe 与收尾；
+//!   参数与精确结果留在 `komo.nested`，外层终结时清掉它名下的槽位。
+//!
 //! 进度写入（部分回复、输出尾巴）只替换这一个 document，经 `Line` 走 `commit_progress`。
 
 use komo_kernel::durable::{
@@ -87,6 +90,7 @@ pub enum SlotStatus {
     Pending,
     Running,
     Done,
+    Failed,
 }
 
 /// 一轮里一个调用的槽位。
@@ -159,6 +163,15 @@ impl ToolSlot {
     }
 }
 
+/// 脚本子调用复用普通槽位，只多记归属。参数与精确结果留在 `komo.nested`，不随进度重写。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NestedToolSlot {
+    pub parent_task_id: TaskId,
+    #[serde(flatten)]
+    pub slot: ToolSlot,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LiveState {
@@ -168,6 +181,8 @@ pub struct LiveState {
     pub generation: Option<GenerationLive>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tools: Option<Vec<ToolSlot>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nested_tools: Option<Vec<NestedToolSlot>>,
     /// 活着的压缩任务，按任务 ID 升序；没有就不写（spec §8.7）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compactions: Option<Vec<CompactionStatus>>,
@@ -223,16 +238,42 @@ impl LiveState {
 
     pub fn slot_mut(&mut self, task: TaskId) -> Option<&mut ToolSlot> {
         self.tools
-            .as_mut()?
             .iter_mut()
+            .flatten()
+            .chain(
+                self.nested_tools
+                    .iter_mut()
+                    .flatten()
+                    .map(|nested| &mut nested.slot),
+            )
             .find(|slot| slot.task_id == Some(task))
     }
 
     pub fn slot(&self, task: TaskId) -> Option<&ToolSlot> {
         self.tools
-            .as_ref()?
             .iter()
+            .flatten()
+            .chain(
+                self.nested_tools
+                    .iter()
+                    .flatten()
+                    .map(|nested| &nested.slot),
+            )
             .find(|slot| slot.task_id == Some(task))
+    }
+
+    /// 外层收尾（包括 fault / orphan）时移除它名下的所有子调用展示。
+    pub fn remove_nested(&mut self, parent: TaskId) -> bool {
+        let Some(slots) = self.nested_tools.as_mut() else {
+            return false;
+        };
+        let before = slots.len();
+        slots.retain(|nested| nested.parent_task_id != parent);
+        let changed = before != slots.len();
+        if slots.is_empty() {
+            self.nested_tools = None;
+        }
+        changed
     }
 }
 
@@ -278,6 +319,7 @@ pub async fn end_run(
     }
     live.generation = None;
     live.tools = None;
+    live.nested_tools = None;
     Ok(ended)
 }
 
@@ -302,4 +344,53 @@ pub async fn convert_partial(
     message.stop_reason = StopReason::Aborted;
     entries::append_assistant(tx, conversation, message).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn documents_written_before_nested_slots_still_decode() {
+        let live: LiveState = serde_json::from_value(json!({"tools": [
+            {"callId": "c1", "name": "read", "status": "done"}
+        ]}))
+        .unwrap();
+        assert!(live.nested_tools.is_none());
+        assert!(
+            serde_json::to_value(live)
+                .unwrap()
+                .get("nestedTools")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn nested_slots_are_addressable_without_top_level_tools_and_removed_by_owner() {
+        let parent = TaskId::new(9);
+        let child = TaskId::new(12);
+        let mut slot = ToolSlot::pending("m1/c1", "bash");
+        slot.task_id = Some(child);
+        let mut live = LiveState {
+            nested_tools: Some(vec![NestedToolSlot {
+                parent_task_id: parent,
+                slot,
+            }]),
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&live).unwrap();
+        assert_eq!(json["nestedTools"][0]["parentTaskId"], 9);
+        assert_eq!(json["nestedTools"][0]["callId"], "m1/c1");
+        assert!(json["nestedTools"][0].get("arguments").is_none());
+        let slot = live.slot_mut(child).unwrap();
+        slot.status = SlotStatus::Running;
+        slot.pid = Some(4242);
+        slot.output = Some("tail".into());
+        assert_eq!(live.slot(child).unwrap().pid, Some(4242));
+        assert!(!live.remove_nested(TaskId::new(8)));
+        assert!(live.remove_nested(parent));
+        assert!(live.nested_tools.is_none());
+        assert!(live.slot(child).is_none());
+    }
 }

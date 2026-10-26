@@ -472,6 +472,60 @@ pub fn online_state(entries: &[EntryRecord], refused_after: Option<EntryId>) -> 
     state
 }
 
+/// 可续折的全历史账本。拒绝标记来自可变的 `komo.live`，读取时才叠加；记录最后一次能
+/// 解除拒绝的 entry，就不必为了新的 `refused_after` 重读 head 之前的历史。
+#[derive(Debug, Clone, Default)]
+pub struct OnlineFold {
+    state: OnlineState,
+    last_clear: Option<EntryId>,
+}
+
+impl OnlineFold {
+    pub fn state(&self, refused_after: Option<EntryId>) -> OnlineState {
+        let mut state = self.state.clone();
+        if refused_after.is_some_and(|after| self.last_clear.is_none_or(|clear| clear <= after)) {
+            state.record_skipped(true);
+        }
+        state
+    }
+
+    pub fn extend(&mut self, entries: &[EntryRecord]) {
+        for entry in entries {
+            if entry.head == Some(entry.id) {
+                self.state = OnlineState::default();
+                self.last_clear = Some(entry.id);
+                continue;
+            }
+            match entry.kind.as_str() {
+                COMPACTION_ENTRY_KIND => {
+                    self.state.record_compaction(debt_of(entry));
+                    self.last_clear = Some(entry.id);
+                    continue;
+                }
+                DECAY_ENTRY_KIND => {
+                    self.state.record_decay(debt_of(entry));
+                    continue;
+                }
+                _ => {}
+            }
+            for message in entry.model.iter().flatten() {
+                match message {
+                    Message::Assistant(assistant)
+                        if !assistant.stop_reason.excluded_from_context() =>
+                    {
+                        self.state.record_provider_request(prompt_tokens(assistant));
+                    }
+                    Message::ToolResult(result) if !result.is_error => {
+                        self.state.record_tool_work();
+                        self.last_clear = Some(entry.id);
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
 /// 上一次请求写下的提示缓存是不是已经冷了：最后一条正常结束的 assistant 消息离 `now_ms`
 /// 超过 `ttl_ms`。没请求过不算冷——还没有缓存可以失效。
 pub fn cache_cold(entries: &[EntryRecord], now_ms: i64, ttl_ms: i64) -> bool {

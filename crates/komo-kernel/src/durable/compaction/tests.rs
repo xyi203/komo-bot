@@ -305,6 +305,40 @@ fn a_refused_summary_holds_until_real_tool_work() {
 }
 
 #[test]
+fn incremental_online_fold_matches_full_history_with_changing_refusal_markers() {
+    let mut entries = conversation();
+    entries.push(
+        entry(7, COMPACTION_ENTRY_KIND, vec![Message::user("summary", 1)])
+            .with_head(id(4))
+            .with_data(json!({"debt": {"debt_tokens": 1500.0, "repayment_tokens": 1000}})),
+    );
+    entries.push(assistant_text(8, "repay", 900));
+    entries.push(
+        EntryRecord::new(id(9), CONV, DECAY_ENTRY_KIND)
+            .with_data(json!({"debt": {"debt_tokens": 10.0, "repayment_tokens": 5}})),
+    );
+    entries.push(result(10, "c3", "work", None));
+    entries.push(EntryRecord::new(id(11), CONV, "komo.reset").with_head(id(11)));
+    entries.push(assistant_text(12, "new", 42));
+    for split in 0..=entries.len() {
+        let mut fold = OnlineFold::default();
+        fold.extend(&entries[..split]);
+        for end in split..=entries.len() {
+            if end > split {
+                fold.extend(&entries[end - 1..end]);
+            }
+            for refused in std::iter::once(None).chain((0..=13).map(|n| Some(id(n)))) {
+                assert_eq!(
+                    fold.state(refused),
+                    online_state(&entries[..end], refused),
+                    "split={split}, end={end}, refused={refused:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn the_cache_is_cold_after_the_ttl_and_only_counting_finished_replies() {
     let entries = vec![user(1, "hi"), assistant_text(2, "yo", 10)];
     // assistant_text 的时间戳是 1。

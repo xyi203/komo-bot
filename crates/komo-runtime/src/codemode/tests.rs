@@ -586,3 +586,154 @@ async fn a_worker_that_is_another_build_is_refused_before_the_script_runs() {
     assert!(outcome.incompatible.unwrap().contains("重启 Gateway"));
     assert!(outcome.outputs.is_empty());
 }
+
+/// 两个调用都在路上时才放行：串行执行会卡死在第一个上，到墙钟为止。
+fn rendezvous() -> impl FnMut(
+    String,
+    serde_json::Value,
+) -> std::pin::Pin<
+    Box<dyn Future<Output = Result<serde_json::Value, String>> + Send>,
+> {
+    let barrier = Arc::new(tokio::sync::Barrier::new(2));
+    move |name, args| {
+        let barrier = barrier.clone();
+        Box::pin(async move {
+            barrier.wait().await;
+            Ok(
+                json!({ "status": "completed", "text": format!("{name}:{}", args["path"].as_str().unwrap_or_default()) }),
+            )
+        })
+    }
+}
+
+#[tokio::test]
+async fn atools_calls_run_at_the_same_time_and_come_back_in_argument_order() {
+    let outcome = Worker::in_process()
+        .run(
+            "import asyncio\n\
+             a, b = await asyncio.gather(atools.read(path='a'), atools.read(path='b'))\n\
+             text([a['text'], b['text']])",
+            &["read".to_string()],
+            &ScriptCatalog::default(),
+            Duration::from_secs(5),
+            rendezvous(),
+        )
+        .await;
+    assert_eq!(outcome.error, None);
+    assert_eq!(outcome.outputs, vec!["[\n  \"read:a\",\n  \"read:b\"\n]"]);
+}
+
+#[tokio::test]
+async fn settle_keeps_every_result_when_one_call_fails() {
+    let outcome = Worker::in_process()
+        .run(
+            "rs = await settle(atools.read(path='a'), atools.read(path='missing'), atools.read(path='c'))\n\
+             text([r['value']['text'] if r['ok'] else r['error'] for r in rs])",
+            &["read".to_string()],
+            &ScriptCatalog::default(),
+            TIMEOUT,
+            |_, args| async move {
+                match args["path"].as_str() {
+                    Some("missing") => Err("没有这个文件".to_string()),
+                    path => Ok(json!({ "text": path })),
+                }
+            },
+        )
+        .await;
+    assert_eq!(outcome.error, None);
+    let seen: serde_json::Value = serde_json::from_str(&outcome.outputs[0]).unwrap();
+    assert_eq!(seen, json!(["a", "没有这个文件", "c"]));
+}
+
+#[tokio::test]
+async fn gather_raises_the_first_tool_error_like_promise_all() {
+    let outcome = Worker::in_process()
+        .run(
+            "import asyncio\n\
+             try:\n    await asyncio.gather(atools.read(path='a'), atools.read(path='missing'))\n\
+             except ToolError as e:\n    text('caught: ' + str(e))",
+            &["read".to_string()],
+            &ScriptCatalog::default(),
+            TIMEOUT,
+            |_, args| async move {
+                match args["path"].as_str() {
+                    Some("missing") => Err("没有这个文件".to_string()),
+                    _ => Ok(json!({})),
+                }
+            },
+        )
+        .await;
+    assert_eq!(outcome.error, None);
+    assert_eq!(outcome.outputs, vec!["caught: 没有这个文件".to_string()]);
+}
+
+#[tokio::test]
+async fn a_plain_call_is_answered_while_an_atools_call_is_still_running() {
+    let outcome = Worker::in_process()
+        .run(
+            "pending = atools.read(path='slow')\n\
+             fast = tools.read(path='fast')\n\
+             slow = await pending\n\
+             text([fast['text'], slow['text']])",
+            &["read".to_string()],
+            &ScriptCatalog::default(),
+            Duration::from_secs(5),
+            rendezvous(),
+        )
+        .await;
+    assert_eq!(outcome.error, None);
+    let seen: serde_json::Value = serde_json::from_str(&outcome.outputs[0]).unwrap();
+    assert_eq!(seen, json!(["read:fast", "read:slow"]));
+}
+
+#[tokio::test]
+async fn calls_reach_the_host_in_script_order_and_unawaited_ones_still_finish() {
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let finished = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (log, done) = (seen.clone(), finished.clone());
+    let outcome = Worker::in_process()
+        .run(
+            "fs = [atools.read(path=str(i)) for i in range(5)]\n\
+             atools.read(path='forgotten')\n\
+             rs = await settle(*fs)\n\
+             text(len(rs))",
+            &["read".to_string()],
+            &ScriptCatalog::default(),
+            TIMEOUT,
+            move |_, args| {
+                log.lock()
+                    .unwrap()
+                    .push(args["path"].as_str().unwrap().to_string());
+                let done = done.clone();
+                async move {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    done.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(json!({}))
+                }
+            },
+        )
+        .await;
+    assert_eq!(outcome.error, None);
+    assert_eq!(outcome.outputs, vec!["5".to_string()]);
+    assert_eq!(
+        *seen.lock().unwrap(),
+        ["0", "1", "2", "3", "4", "forgotten"]
+    );
+    assert_eq!(finished.load(std::sync::atomic::Ordering::SeqCst), 6);
+}
+
+#[tokio::test]
+async fn atools_count_toward_the_256_call_limit() {
+    let outcome = Worker::in_process()
+        .run(
+            "rs = await settle(*[atools.echo() for i in range(300)])\n\
+             text(len([r for r in rs if not r['ok']]))",
+            &["echo".to_string()],
+            &ScriptCatalog::default(),
+            TIMEOUT,
+            |_, _| async { Ok(json!({})) },
+        )
+        .await;
+    assert_eq!(outcome.error, None);
+    assert_eq!(outcome.outputs, vec!["44".to_string()]);
+}

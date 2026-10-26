@@ -516,6 +516,7 @@ pub struct TestTool {
     /// 前几次 `prepare` 永远不返回。
     pub hang_prepares: AtomicUsize,
     pub fail_prepare: Option<String>,
+    pub execute_error: Option<ToolError>,
     /// 写完输出、返回之前让存储开始失败："输出落盘了，结果没提交就崩了"。
     pub crash: Option<Arc<RecordingStorage>>,
     /// 写完输出之后报告"起了一个子进程"（新存储的槽位据此记 pid）。
@@ -540,6 +541,7 @@ impl TestTool {
             hang_runs: 0,
             hang_prepares: AtomicUsize::new(0),
             fail_prepare: None,
+            execute_error: None,
             crash: None,
             child: None,
             runs: AtomicUsize::new(0),
@@ -685,6 +687,9 @@ impl Tool for TestTool {
             storage.fail_commits.store(true, Ordering::SeqCst);
         }
         self.log.push(format!("finish {} #{run}", self.name));
+        if let Some(error) = &self.execute_error {
+            return Err(error.clone());
+        }
         Ok(ToolOutput {
             status: ToolResultStatus::Completed,
             result: Value::Null,

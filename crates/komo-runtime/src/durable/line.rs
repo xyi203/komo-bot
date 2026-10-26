@@ -192,7 +192,7 @@ impl Line {
         })
     }
 
-    fn settle_error(&self, error: DurableError) -> DurableError {
+    pub(super) fn settle_error(&self, error: DurableError) -> DurableError {
         if error.is_fatal_storage() {
             self.fail(error.clone());
         }

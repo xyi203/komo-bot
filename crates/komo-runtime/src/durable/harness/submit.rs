@@ -475,8 +475,15 @@ impl TaskHooks for HarnessHooks {
         match record.kind.as_str() {
             TOOL_KIND => {
                 let mut live = live::load(tx, record.conversation).await?;
+                let mut changed = live.remove_nested(record.id);
                 if let Some(slot) = live.slot_mut(record.id) {
                     slot.finish();
+                    if record.input["kind"] == "nested" {
+                        slot.status = super::live::SlotStatus::Failed;
+                    }
+                    changed = true;
+                }
+                if changed {
                     live::store(tx, record.conversation, &live).await?;
                 }
                 Ok(())

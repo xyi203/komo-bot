@@ -60,6 +60,15 @@ impl Engine {
         &self.line
     }
 
+    /// 已提交的活动上下文，与任务阶段共享增量缓存。
+    pub async fn context(
+        &self,
+        conversation: ConversationId,
+        at: Option<komo_kernel::durable::EntryId>,
+    ) -> Result<Arc<komo_kernel::durable::ContextView>, DurableError> {
+        self.sched.contexts.view(&self.line, conversation, at).await
+    }
+
     /// 开始（或继续）调度。幂等。
     pub fn resume(&self) {
         self.sched.resume();

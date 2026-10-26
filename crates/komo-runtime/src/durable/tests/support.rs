@@ -273,10 +273,27 @@ impl Log {
 // ------------------------------------------------------------------ 存储替身
 
 /// 转发给内存存储，可以让之后的提交失败。
+pub struct ScanPause {
+    pub started: tokio::sync::Notify,
+    pub release: tokio::sync::Notify,
+}
+
+impl ScanPause {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            started: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        })
+    }
+}
+
 pub struct FlakyStorage {
     pub inner: Arc<MemoryStorage>,
     pub fail_commits: AtomicBool,
     pub commits: Mutex<usize>,
+    pub entry_queries: Mutex<Vec<(EntryQuery, usize)>>,
+    pub pause_scan: Mutex<Option<Arc<ScanPause>>>,
+    pub fail_scans: AtomicBool,
 }
 
 impl FlakyStorage {
@@ -285,6 +302,9 @@ impl FlakyStorage {
             inner,
             fail_commits: AtomicBool::new(false),
             commits: Mutex::new(0),
+            entry_queries: Mutex::new(Vec::new()),
+            pause_scan: Mutex::new(None),
+            fail_scans: AtomicBool::new(false),
         })
     }
 }
@@ -347,6 +367,20 @@ impl Storage for FlakyStorage {
         limit: usize,
         cursor: Option<&Cursor>,
     ) -> Result<Page<EntryRecord>, StorageError> {
+        self.entry_queries
+            .lock()
+            .unwrap()
+            .push((query.clone(), limit));
+        if limit > 1 {
+            let pause = self.pause_scan.lock().unwrap().take();
+            if let Some(pause) = pause {
+                pause.started.notify_one();
+                pause.release.notified().await;
+            }
+            if self.fail_scans.load(Ordering::SeqCst) {
+                return Err(StorageError::Backend("entry scan failed".into()));
+            }
+        }
         self.inner.scan_entries(query, limit, cursor).await
     }
 

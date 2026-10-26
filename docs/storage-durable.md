@@ -83,7 +83,8 @@ komo 已经借过它的重放判据（§8.6"已存 / 当前 replay 双 Safe"）�
 - **存储错误让整条线失败**（spec §10.1）：Gateway 停止受理、关掉，由 launchd/systemd 拉起后从已提交状态
   恢复。这比今天"磁盘写失败进 `waiting + intervention`"更粗，但正确：提交了没有是未知的，重开是唯一干净的
   判断方式；客户端重发带请求键，命中已受理的那条。
-- 读不经过线：Turso 读连接直接读已提交状态。
+- 读的分页扫描不经过线：Turso 读连接直接读已提交状态。上下文在线上只捕获最新可见 entry 与 head 标记，
+  再在线外扫描固定范围（2026-10-26，`storage-durable-perf.md` §1）。
 - 写全部经过线，包括 cron、投递、Memory。**大批量写（记忆向量重建）切成多次小提交**，不长时间占线。
 - 吞吐（D0 实测，§10）：一次 fsync 提交约 13 ms，单线上限约 **70 次/秒**，MVCC 与 WAL 一样。线是串行的，
   这 13 ms 别的 conversation 也得排队，所以**只写进度的提交不 fsync**（§3.6），结构性提交（entry、任务状态、
@@ -156,6 +157,9 @@ pi-durable 不变量 3："There is no volatile publication path." SSE 只推已�
 日志是只追加的（WAL 的 `-wal`、MVCC 的 `-log`），下一次 FULL 提交的 fsync 会把之前没同步的进度一起落盘，所以
 任何掉电后剩下的状态都是一个提交前缀；最多丢掉最后一次结构性提交之后的进度，正是 pi-durable 说的"丢一个节流
 窗口"。进程崩溃不丢（写已经交给内核，页缓存还在）——这一条是按机制推的，D0 只用 strace 核对了 OFF 时确实不 fsync，没做崩溃注入，D2 的崩溃测试里补。§11 决定 4 不用退回易失例外。
+
+macOS 的写连接还启用 `PRAGMA fullfsync = ON`（2026-10-26）：FULL 提交用 `F_FULLFSYNC` 冲刷设备写缓存，
+进度提交的 OFF 档位保持不变；测量见 §10.1。
 
 ### 3.7 后端
 
@@ -274,8 +278,8 @@ Monty worker 进程、只读挂载、受保护路径都不变。
 
 - 外层 `komo.tool` 任务执行 `Operation::Codemode` 时（`CodemodeTool::replay` 是 Safe，恢复走 §5 的表重跑整段脚本），先写 memo `codemode.start`（指纹：脚本哈希、引擎 / worker 协议 / 前置代码版本、能力表、cwd；对不上就是回放分歧），再起 worker。
 - 脚本里第 `n` 个调用 = 一个输入 `{kind: "nested", parent, key: "c<n>", callId: "<外层 callId>/c<n>", name, arguments}` 的 `komo.tool` 任务，`Ownership::Task(外层)`，与 `komo.nested` 里 key 为 `c<n>` 的成员（`{taskId, name, arguments, result?}`，task 级 document，随外层退役）**在同一次提交里建出**；外层 `wait_for_task` 它，终结的那笔提交（`commit_nested`）把交给脚本的结果写进成员的 `result`。
-- 嵌套任务走和顶层调用同一条 `call → execute → 结果`：能力面（`ToolSet::get`）、`NOT_IN_SCRIPTS`、`Tool::prepare`、只放行 `ReadFile` / `McpCall` 且没有 `then_run`，意图 checkpoint、§5 的重放表都一样；不同的只有没有 `komo.live` 槽位（意图就是 checkpoint）、不发布输出尾巴、`detach_after` 取消、结果不进 transcript。被拒的是已落盘的失败结果（脚本里的 `ToolError`，可接住）。
-- 重启后外层重跑：第 `n` 个调用在 `komo.nested` 里找 `c<n>`，工具名与参数都对得上就等它的任务（不另建），对不上是分歧；任务停在 `execute` 的由引擎照 §5 恢复——Safe 新尝试重跑，Unsafe 写 `uncertain` 结果；脚本拿到 `uncertain` 就锁住宿主、之后任何调用不再执行，整段结果 uncertain 交给模型。记录用完之后的新调用才建新任务。
+- 嵌套任务走和顶层调用同一条 `call → execute → 结果`：能力面（`ToolSet::get`）、`NOT_IN_SCRIPTS`、`Tool::prepare`、只放行 `ReadFile` / `ShellCommand` / `McpCall` 且没有 `then_run`。建任务与 `komo.nested` 成员时同笔加 `komo.live.nestedTools` 的 pending 槽位；意图与 checkpoint 同笔转 running，输出尾巴、pid / pgid / startedAt 节流提交；终结清掉进度，外层终结删掉名下所有槽位。`detach_after` 为 None，结果不进 transcript。被拒的是已落盘的失败结果（脚本里的 `ToolError`，可接住）。
+- 重启后外层重跑：第 `n` 个调用在 `komo.nested` 里找 `c<n>`，工具名与参数都对得上就等它的任务（不另建），对不上是分歧；任务停在 `execute` 的由引擎照 §5 恢复——先验证并复用完整输出；记录的子进程先走 probe，Alive / Unknown 时等待，Gone 后 Safe 新尝试重跑、Unsafe 写 `uncertain` 结果；脚本拿到 `uncertain` 就锁住宿主、之后任何调用不再执行，整段结果 uncertain 交给模型。记录用完之后的新调用才建新任务。
 - 时钟与熵：宿主答复先攒在内存，**下一个新子调用建任务之前**（以及交结果之前）落成 memo `codemode.nondet.<n>`（一批一个，先写者赢），重启后按序原样还回去，请求对不上就是分歧；上限 10 000 次，与旧路径一致。
 - 脚本结束（任何原因）之前，外层先 `abort_owned` 名下还活着的嵌套任务并等它们落结果；被取消时由引擎自底向上 abort，各嵌套任务的 abort handler 写 `aborted`（脚本一侧视为结果不明）。worker 起不来 / 被杀 / 超时的处理同旧路径（`Worker::run` 没变）。
 
@@ -422,6 +426,23 @@ tmpfs，fsync 不算数）。代码：`.scratch/komo-v08-rewrite/spikes/durable-
 
 还没测：长期运行下 WAL checkpoint 的节奏与库增长。
 
+### 10.1 macOS 同步档位（2026-10-26）
+
+本机 macOS arm64、turso 0.7.2 release，库建在仓库所在卷；每档独立新库，1000 次事务，每次替换一行约 2 KiB 的不同正文，
+用于隔离同步成本。代码在 `komo-store/src/durable/schema.rs` 的 ignored 测试 `measure_sync_modes`，
+命令：`cargo test --workspace --lib measure_sync_modes --release -- --ignored --nocapture`。
+复测时构建与工作区测试已经结束。
+
+| 档位 | 提交 / 秒 | P50 | P95 | P99 | WAL 文件峰值 | 文件收缩次数 |
+|---|---|---|---|---|---|---|
+| FULL，fullfsync OFF | 17239 | 0.049 ms | 0.065 ms | 0.205 ms | 4,128,272 B | 2 |
+| **FULL，fullfsync ON（采用）** | **259** | **3.967 ms** | **4.164 ms** | **5.951 ms** | 4,128,272 B | 2 |
+| OFF，fullfsync ON | 17065 | 0.054 ms | 0.078 ms | 0.092 ms | 8,363,632 B | 0 |
+
+按 §3.1 估算的每 Run 约 60 次结构性提交，中位数合计约 0.24 秒，保留 fullfsync，暂不做组提交。
+WAL 文件收缩次数只是一项文件观察；真实 `komo.live` 的长回复 / 并发写放大与长期 checkpoint 节奏仍待测，
+这组单行微基准不足以决定 deferred 提交（`storage-durable-perf.md` §4）。
+
 ## 11. 决定（2026-10-23 全部按建议定）
 
 1. **接受"内容不再是 JSONL 文件"**：state.db 是唯一权威，events.jsonl 只做导出；AGENTS.md 的三条结构规则在 D7 改写。
@@ -434,6 +455,9 @@ tmpfs，fsync 不算数）。代码：`.scratch/komo-v08-rewrite/spikes/durable-
 7. **agent loop**：照 pi 的钩子组织，通用 Task 引擎一起移植（§12.4）；去掉执行段、有状态 driver、租约与段装配（§12.3）。
 
 8. **WAL、新库文件**（D0 之后定，§3.7）。
+9. **上下文范围与增量缓存**（2026-10-26）：线上只捕获边界，正文线外读；缓存不是权威，purge 后失效，
+   全历史缓存账独立于活动 head 与历史 cutoff（§13.4）。
+10. **macOS FULL 提交启用 fullfsync**（2026-10-26）：补齐设备写缓存同步；进度继续 OFF，组提交暂缓（§10.1）。
 
 ## 12. Agent loop：按 pi 的钩子组织，跑在 Task 引擎上（2026-10-23 定）
 
@@ -586,11 +610,11 @@ finalize     → blob 收尾同步 → 提交结果 entry（projection.rs 的 fu
 - **取消 probe 中的任务不终止那个子进程**（D4c）：abort handler 照常写 `aborted` 结果（带 `.partial` 末尾），再探一次，进程还在就在正文里写明"重启前这次调用起的子进程（pid N）取消时还在运行，komo 没有终止它"。旧 `monitors.rs` 会按身份核对后 `kill_process_group`；工具任务这边没有杀进程的注入口，暂不做。
 - **新增 `IdentityProbe`，不改 `SysProcessProbe`**（D4c）：登记行带 `started_at` 时核对起来的时刻（Linux 读 `/proc/<pid>/stat` 第 22 字段 + `btime` + `CLK_TCK`，其他平台 `ps -o stat=,etime=`，容差 10 s），对不上就是 pid 被复用 → `Gone`；僵尸进程也是 `Gone`；读不出来 `Unknown`。旧路径（`LockHolderLiveness`、gateway 锁）仍用只看 pid 在不在的 `SysProcessProbe`，行为不变。
 - **工具任务读自己的槽位用一次"不改状态的提交"**（D4c，`recorded_child`）：`TaskRuntime` 没有读 document 的入口，没有为此扩引擎。
-- **嵌套调用没有 `komo.live` 槽位，也不发布运行中的输出**（D4c codemode）：pi 的 `nestedTools` 在 live 里展示进度；这里嵌套任务的意图就是它的 checkpoint，结果只在外层名下的 `komo.nested` 成员里，运行中的输出尾巴、子进程身份都不记（脚本里放行的只有读文件与 MCP，不起 `run_child_detachable` 的子进程，所以也用不上 `probe`）。UI 要展示脚本里正在跑什么，之后读 `komo.nested` 的成员与嵌套任务记录。
+- **嵌套 live 槽位的偏离已补齐**（2026-10-26，`docs/codemode-bash.md`）：D4c 原来不记嵌套调用的进度与子进程身份；现在脚本可调 bash，`komo.live.nestedTools` 按 pi 的结构补上归属与槽位，意图、进度、重跑、收尾都与顶层共用路径。恢复共用 komo 的 probe；外层收尾（含 fault / orphan）清理名下槽位。SSE / TUI 的工具尾巴与子调用展示仍在后续范围。
 - **没有 `finished` 记录**（D4c codemode）：旧 journal 在脚本跑完后先外置整段结果再记 `finished`，好让"结果还没发布就崩"时不再起 worker。新路径外层结果一发布就按 §5 表第一行复用；发布之前崩了就整段重放——已交付的嵌套结果从 `komo.nested` 回放、不重做，所以代价只是再起一次 worker。
 - **时钟 / 熵与指纹是外层任务的 memo，不是 document**（D4c codemode）：memo 随任务记录整条重写，单批读数不小（`random` 起状态 2496 字节、十六进制 5 KB）。上限仍是 10 000 次读数，最坏的紧循环会让任务记录变到几百 KB；之后如果成问题再把批次搬进名下的 document（spec §5.2 说 memo 应当很小，大的进度放 document）。
-- **嵌套结果整值存在 `komo.nested` 成员里**（D4c codemode，同 spec §7.3）：脚本拿到的正文（`read` 的整份文件、`rg` 的整份 stdout）不设上限，由外层终结时随 document 一起退役。旧路径把它外置到 `tool-output/` 再引用；文件仍在每个嵌套任务自己的输出目录里。
-- **脚本拿到的"完整正文"只在刚执行完时精确**（D4c codemode）：`rg` 一类的 `preview` 比 stdout 短，所以"盘上有完整 `output.json`、结果没提交就崩"这一行对嵌套任务多一个条件（`nested::reusable`）——预览就是全部 stdout（或结果自带 `text`）才复用，否则落到下一行：Safe 新尝试重跑，Unsafe 中断。
+- **嵌套结果整值存在 `komo.nested` 成员里**（D4c codemode，同 spec §7.3）：`read` 的整份文件、`rg` 的整份 stdout 保持原接口；2026-10-26 起 bash 的 `text` 只存 kernel 的有限 full 视图，不额外缓存完整 stdout。原始输出照常在嵌套任务自己的输出目录，超限视图附可 `read` 的 artifact 引用。document 随外层终结退役。
+- **完整正文的恢复限制**（D4c codemode）：`rg` 一类的 `preview` 比 stdout 短，完整 `output.json` 的预览是全部 stdout（或结果自带 `text`）时才可原样复用，否则按双 Safe 判。2026-10-26 起 bash 是有限视图，可从已发布的正文与流引用重建，不再因 stdout 超限而丢弃可复用的结果。bash 视图使用输出存储记录的耗时，避免新一次本地计时改变恢复前后的字节；嵌套宿主超时 / 取消的 uncertain 状态也随输出一起落盘。
 - **子调用的图片随嵌套结果存引用，回放时也附上**（D4c codemode）：补上旧路径"journal 不存图片字节、回放的子调用不再附图"的缺口——嵌套任务的输出目录里有图，外层收尾时按引用读回、写进外层自己的输出目录。
 - **`FileToolOutputStore` 的打开流改按完整身份存**（D4c codemode，`komo-store`）：原来只按 attempt ID 存，而新存储的工具任务按任务目录分、尝试号都从 1 数——嵌套任务与它的外层（以及一轮里并行的两个只读调用）同时开着流时会互相顶掉对方，发布时报"没有在本存储上开过流"。旧 executor 的 attempt ID 是唯一的，不受影响。
 - **`HarnessDeps` 多了 `codemode: Option<Worker>`**（D4c codemode）：Gateway 装配时给；`None` 时 `codemode` 工具的任务以失败结果收场（旧路径是同一句话）。`ToolExecutor::codemode_fingerprint` 与摘要 / 失败首部的几个函数放宽成 `pub(crate)` 共用，旧路径行为不变。
@@ -649,3 +673,46 @@ finalize     → blob 收尾同步 → 提交结果 entry（projection.rs 的 fu
   放得越宽补读吞吐越高，但多出来的补读是在抢 CPU（每次补读全量投影整段历史），提交延迟被拖到 2.5 倍；提交延迟更要紧，所以限 2 路、给提交的读留 2 条空闲连接。补读改成增量投影（W1a 的限制）之后再放宽。
 - **编译时间**（`cargo build --timings`，本机 6 job）：release `-p komo` 5 分 53 秒（含这次改动之前未编过的依赖）；dev 增量（改 `komo-store` 之后重编 store / runtime / gateway / komo）1 分 31 秒。冷编预算 60 秒（§13.4）仍超，原因与此前相同（Turso / toasty / reqwest 等依赖），不是 D5 引入。
 - **D7b 之后的编译时间**（同一台机器、6 job，`cargo clean` 之后）：dev `cargo build` 冷编 2 分 00 秒；release `-p komo` 冷编 5 分 03 秒（D5 末尾的 5 分 53 秒含当时未编过的依赖，口径不完全相同；旧存储的约 7 万行删掉后少了一些）；dev 增量（给 `komo-store` 加一个 `pub fn` 之后 `cargo build`）8.7 秒（D5 末尾 1 分 31 秒，那次改的是带 toasty 宏的模型，重编范围更大）。冷编预算 60 秒仍超，原因同上。
+
+### 13.4 D7 之后的 P1 优化（2026-10-26）
+
+`storage-durable-perf.md` 的 §1、§2 已实施：
+
+- kernel `durable/context.rs` 的 `ContextRange` 保存已有贡献与 settled / open 消息，普通追加只重排开放的工具轮；
+  head / edits 的重推与原来的上下文规则一致。`durable/compaction.rs` 新增可续折的 `OnlineFold`，保留跨压缩的缓存债。
+- runtime `durable/context.rs` 按 conversation 共享范围与全历史账本；线上只捕获 tail / head，分页在线外完成。
+  `Arc<Vec<EntryRecord>>` 在没有旧快照读者时原地追加，读者共享 `Arc<ContextView>`；历史 cutoff 不回退在线账本。
+  每分钟清理空闲满 10 分钟的缓存，忙碌 / 在飞的保留；purge 清理缓存与在飞读，致命读取错误仍封住提交线。
+- 生成、超长救援、压缩、gateway 的项目规范检查已接入。`fork_seed` 只读本轮 assistant 到当前 tail 的范围，
+  保留本轮已完成调用的识别；任务进度仍扫描完整 transcript 确定 run 边界，但分页同样移到线外。
+- 写连接启用 fullfsync，Apple 平台读回测试通过，测量与采用理由见 §10.1。
+
+**验收**：`cargo test --workspace --no-fail-fast` **2293 通过、0 失败、12 忽略**（新增 9 条自动测试与 1 条 ignored 磁盘基准）。
+随机序列的增量结果与全量推导在 960 次追加上逐步相等，覆盖 12 个 fork 与历史 cutoff；另测未来 edit、多消息 entry、
+全历史账本的任意切分 / 拒绝位置、`/new` 的缓存冷暖、快照复用、淘汰、purge、读取失败。
+一万条历史的分页扫描暂停时，另一 conversation 仍能提交并读取上下文，暂停期间的新 entry 不越过已捕获的 tail。
+现有保护路径测试修正为向 `Protected::denies` 传真实路径，解决 macOS `/var` 与 `/private/var` 的夹具差异。
+`cargo fmt --check`、`git diff --check` 通过，没有新增依赖。
+
+**编译时间**：`cargo build --timings` dev 增量重编 kernel / store / agent / client / runtime / gateway / bin 共 **33.33 秒**；
+报告 `target/cargo-timings/cargo-timing-20261026T042444343Z-cad003b0e67e15b9.html`。此次未重测冷编。
+SSE / run 投影缓存、流式快照及 P3 项仍按优化清单后续执行。
+
+### 13.5 codemode 嵌套 bash 与 live 槽位（2026-10-26）
+
+`docs/codemode-bash.md` 已实施：脚本允许当前能力面里的 bash，嵌套调用的 `nestedTools` 槽位与任务、
+`komo.nested` 成员同笔创建，意图与进度共用顶层路径。子进程身份可进入 probe，完整输出优先复用，
+无完整输出且进程已结束时仍按双 Safe 判。终结清运行进度，外层终结清掉名下槽位，fault / orphan 也清理。
+
+bash 的 `text` 使用 kernel full 投影，不额外缓存整份 stdout；原始流留在 blob，截断时给 artifact 入口。
+脚本非零退出是 failed 字典；宿主 Timeout / Cancelled 的 uncertain 状态一起落盘，重建时不变。
+`LIVE_VERSION` 保持 1，新字段可选，旧 document 解码通过。转后台、write / edit、SSE / TUI 子调用展示继续按原范围。
+
+**验收**：新增 12 条测试；`cargo test --workspace --no-fail-fast` **2305 通过、0 失败、12 忽略**。
+约 300 KB stdout 在 blob 中保持完整，`komo.nested` 的编码小于 60 KiB；真实 worker 调 bash 的退出码 7 正常返回，
+真实 Gateway 的脚本从尾部视图继续 `read` 到完整 stdout / stderr。其余覆盖槽位生命周期、旧格式、
+存活 / Unknown / Gone 的 probe、安全重跑、取消的 pid、交付前崩溃的精确复用与宿主超时。
+`cargo fmt --check`、`git diff --check` 通过，没有新增依赖。
+
+**编译时间**：`cargo build --timings` dev 增量重编 runtime / gateway / bin 共 **18.55 秒**；
+报告 `target/cargo-timings/cargo-timing-20261026T045417339Z-cad003b0e67e15b9.html`。此次未重测冷编。

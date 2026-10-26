@@ -17,12 +17,14 @@
 //! `result.calls` 才是留给模型的摘要。
 
 use komo_kernel::durable::{DocumentAddress, DocumentScope, TaskId};
+use komo_kernel::projection::{ProjectionContext, project};
 use komo_kernel::types::refs::{AttemptRef, ImageRef, PublishedOutput, ToolResultStatus};
 use komo_kernel::types::resource::{OutputFile, ResourceUri};
 use komo_kernel::types::tool::{ToolError, ToolOutput};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use super::live::{self, SlotStatus};
 use super::outcome::{aborted, completed, failed};
 use super::tool::{Ending, ToolTask};
 use crate::durable::error::{DurableError, TaskError};
@@ -184,6 +186,24 @@ impl NestedResult {
         }
     }
 
+    /// bash 只交付 kernel 的有界 full 视图，事实来自已发布的 output.json 与流引用。
+    /// 不缓存完整 stdout；恢复时用同一份落盘事实重建，已交付后则直接回放 document 里的字节。
+    pub fn from_bash(
+        published: &PublishedOutput,
+        attempt: &AttemptRef,
+        projection: &ProjectionContext,
+        aborted: bool,
+    ) -> Result<Self, TaskError> {
+        let mut result = Self::from_published(published, attempt, aborted);
+        if let Some(value) = result.value.as_mut() {
+            value["text"] = Value::String(project(
+                &super::tool::result_facts("bash", published)?,
+                projection,
+            ));
+        }
+        Ok(result)
+    }
+
     /// 任务被调度器写了 `faulted` / `orphaned`，没来得及写结果：做没做过不知道。
     pub fn from_scheduler(message: &str) -> Self {
         Self {
@@ -217,11 +237,15 @@ fn output_uri(attempt: &AttemptRef) -> String {
 /// 盘上已发布的输出能不能原样当成"脚本收到的结果"复用：脚本要的文字是 `result.text`，没有就是
 /// 流进 stdout 的全部字节；而发布出来的只有预览。stdout 与预览是同一段文字（哈希一样，或者
 /// 根本没有 stdout）时才准确——`rg` 那类预览比 stdout 短的没法复原，交给 §5 的表（Safe 就重跑）。
-pub fn reusable(published: &PublishedOutput) -> bool {
+/// bash 的脚本正文是 kernel 的有限视图，完整输出通过验证后可直接重建，不要求预览等于 stdout。
+pub fn reusable(published: &PublishedOutput, tool: &str) -> bool {
     let Some(body) = published.body.as_deref() else {
         return false;
     };
-    if body.error.is_some() || body.result.get("text").is_some_and(Value::is_string) {
+    if tool == "bash"
+        || body.error.is_some()
+        || body.result.get("text").is_some_and(Value::is_string)
+    {
         return true;
     }
     match &published.stdout {
@@ -246,7 +270,8 @@ impl ToolTask {
     ) -> Result<(), TaskError> {
         let address = nested_address(nested.parent, &nested.key);
         let receipt = json!({ "kind": "nested", "key": nested.key });
-        rt.commit(move |tx, _task| {
+        let conversation = rt.conversation();
+        rt.commit(move |tx, task| {
             Box::pin(async move {
                 let Some((version, mut doc)) = tx.document(&address).await? else {
                     return Err(DurableError::rejected(format!(
@@ -257,6 +282,18 @@ impl ToolTask {
                 doc["result"] = serde_json::to_value(&result)
                     .map_err(|e| DurableError::rejected(format!("nested result: {e}")))?;
                 tx.put_document(address, version, doc).await?;
+                let mut live = live::load(tx, conversation).await?;
+                if let Some(slot) = live.slot_mut(task.id()) {
+                    slot.finish();
+                    if result.error.is_some()
+                        || result
+                            .status()
+                            .is_some_and(|status| status != ToolResultStatus::Completed)
+                    {
+                        slot.status = SlotStatus::Failed;
+                    }
+                }
+                live::store(tx, conversation, &live).await?;
                 Ok(Some(match ending {
                     Ending::Completed => completed(receipt),
                     Ending::Failed(message) => failed(message, "interrupted", Some(receipt)),
@@ -290,7 +327,10 @@ mod tests {
         PublishedOutput {
             status: body.status,
             body: Some(Box::new(body)),
-            output: OutputRef(content("output")),
+            output: OutputRef(ContentRef {
+                path: "tool-output/1/9/1/output.json".into(),
+                ..content("output")
+            }),
             elapsed_ms: 3,
             preview: None,
             stdout,
@@ -322,17 +362,17 @@ mod tests {
     #[test]
     fn a_published_output_is_reusable_when_its_preview_is_the_whole_stdout() {
         let same = published(body("hello", Value::Null), Some(content("hello")));
-        assert!(reusable(&same));
+        assert!(reusable(&same, "rg"));
         // 预览比 stdout 短（`rg` 一类）：脚本要的完整文字复原不了。
         let cut = published(body("hel", Value::Null), Some(content("hello")));
-        assert!(!reusable(&cut));
+        assert!(!reusable(&cut, "rg"));
         // 结果自带 `text`、或根本没有 stdout：准确。
         let text = published(
             body("hel", json!({ "text": "hello" })),
             Some(content("hello")),
         );
-        assert!(reusable(&text));
-        assert!(reusable(&published(body("x", Value::Null), None)));
+        assert!(reusable(&text, "read"));
+        assert!(reusable(&published(body("x", Value::Null), None), "read"));
     }
 
     #[test]
@@ -358,5 +398,35 @@ mod tests {
         );
         assert!(cancelled.uncertain);
         assert_eq!(cancelled.script_result(), Err("工具 read 被取消".into()));
+    }
+
+    #[test]
+    fn bash_rebuilds_a_bounded_tail_and_nonzero_exit_remains_a_value() {
+        let full = format!("FIRST\n{}LAST\n", "line with content\n".repeat(3000));
+        let mut failed = body(&full, json!({"exit_code": 7}));
+        failed.status = ToolResultStatus::Failed;
+        failed.exit_code = Some(7);
+        let output = published(failed, Some(content(&full)));
+        let projection = ProjectionContext {
+            model_result_bytes: 1024,
+            decay: None,
+        };
+        let result = NestedResult::from_bash(&output, &attempt(), &projection, false).unwrap();
+        let value = result.script_result().unwrap();
+        let text = value["text"].as_str().unwrap();
+        assert!(text.contains("LAST") && !text.contains("FIRST"));
+        assert!(text.contains("artifact://1/9/1/result"));
+        assert!(text.len() < 2048);
+        assert_eq!(value["status"], "failed");
+        assert_eq!(value["result"]["exit_code"], 7);
+        assert!(!result.uncertain);
+        assert_eq!(
+            result,
+            NestedResult::from_bash(&output, &attempt(), &projection, false).unwrap()
+        );
+        // stdout 与 preview 不相等也能复用：bash 给脚本的是可重建的有限视图。
+        let truncated = published(body("LAST", Value::Null), Some(content(&full)));
+        assert!(reusable(&truncated, "bash"));
+        assert!(!reusable(&truncated, "rg"));
     }
 }

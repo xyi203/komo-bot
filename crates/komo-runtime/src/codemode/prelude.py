@@ -1,6 +1,7 @@
 # 拼在每段脚本前面（docs/codemode.md §6）。Monty 的异常类型是封闭枚举、没有用户子类，`ToolError`
 # 只能是 `RuntimeError` 的别名；这段占着脚本前面的行，worker 把回溯里的行号按它的行数减回去。
-# `_call` / `TOOLS` / `_CATALOG` 是宿主交进来的输入：调一次工具、能调的工具名、工具说明与所属组。
+# `_call` / `_acall` / `TOOLS` / `_CATALOG` 是宿主交进来的输入：调一次工具（等结果 / 先发出、
+# 拿回 awaitable）、能调的工具名、工具说明与所属组。
 ToolError = RuntimeError
 
 
@@ -11,19 +12,37 @@ class Tools:
 
 
 tools = Tools()
+# `atools.<name>` 调用时就发出去，返回 awaitable（像 JS 的 promise）；多个一起 await 就是并行。
+atools = Tools()
 
 
-def _bind(name):
+def _bind(name, call_host):
     def call(_args=None, **kwargs):
         args = dict(_args or {})
         args.update(kwargs)
-        return _call(name, args)
+        return call_host(name, args)
 
     return call
 
 
 for _name in TOOLS:
-    setattr(tools, _name.replace("-", "_"), _bind(_name))
+    setattr(tools, _name.replace("-", "_"), _bind(_name, _call))
+    setattr(atools, _name.replace("-", "_"), _bind(_name, _acall))
+
+
+async def _settle(awaitable):
+    try:
+        return {"ok": True, "value": await awaitable}
+    except Exception as error:
+        return {"ok": False, "error": str(error)}
+
+
+# 照 Promise.allSettled：每项都等到，一项抛错不取消其他项（asyncio.gather 会取消，且 Monty 的
+# gather 没有 return_exceptions）。结果按参数顺序。
+async def settle(*awaitables):
+    import asyncio
+
+    return await asyncio.gather(*[_settle(awaitable) for awaitable in awaitables])
 
 # ---------------------------------------------------------------- 发现工具
 #

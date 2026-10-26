@@ -79,10 +79,18 @@ struct ForkSeed {
 /// 落在切口之外，在 fork 里变成"结果缺失"。发起调用的那条消息里还没有结果的调用在 fork 里
 /// 补一条结果，只进 C，不进父。
 async fn fork_seed(cx: &Cx<'_>) -> Result<Result<ForkSeed, String>, TaskError> {
-    let entries = cx.rt.entries(cx.conversation(), None).await?;
-    let Some(at) = entries.last().map(|entry| entry.id) else {
+    let Some(at) = cx
+        .rt
+        .latest_entry(cx.conversation())
+        .await?
+        .map(|entry| entry.id)
+    else {
         return Ok(Err("派任务的会话里还没有任何内容".into()));
     };
+    let entries = cx
+        .rt
+        .entries_between(cx.conversation(), Some(cx.assistant), at)
+        .await?;
     let Some(assistant) = entries.iter().find(|entry| entry.id == cx.assistant) else {
         return Ok(Err("发起这次调用的 assistant 消息不在派任务的会话里".into()));
     };

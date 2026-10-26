@@ -163,6 +163,7 @@ impl State {
 }
 
 pub(super) struct Sched {
+    pub contexts: super::context::ContextCache,
     pub line: Line,
     pub storage: Arc<dyn Storage>,
     pub registry: Registry,
@@ -208,6 +209,7 @@ impl Sched {
     ) -> Arc<Self> {
         let storage = line.storage().clone();
         Arc::new(Self {
+            contexts: super::context::ContextCache::default(),
             line,
             storage,
             registry,
@@ -288,6 +290,27 @@ impl Sched {
             .await?;
         // 崩溃前没来得及落的取消级联、没收尾的 `completing`，都由 reconcile 重新推出。
         self.schedule_reconcile();
+        let weak = Arc::downgrade(self);
+        let line = self.line.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = line.sealed() => break,
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(60)) => {}
+                }
+                let Some(sched) = weak.upgrade() else {
+                    break;
+                };
+                // 同 observe 一样先取 cache 锁再取 scheduler 锁。
+                sched.contexts.expire(|conversation| {
+                    sched
+                        .st()
+                        .graph
+                        .live()
+                        .any(|task| task.conversation == conversation)
+                });
+            }
+        });
         Ok(())
     }
 
@@ -340,6 +363,7 @@ impl Sched {
 
     /// 提交监听（在线上、同步）：把已提交的记录喂进内存镜像，叫醒等待者与各轮扫描。
     fn observe(self: &Arc<Self>, publication: &Publication) {
+        self.contexts.observe(publication);
         let mut resolved: Vec<(Vec<TaskWaiter>, TaskRecord)> = Vec::new();
         let mut signals: Vec<CancellationToken> = Vec::new();
         let mut changed = false;

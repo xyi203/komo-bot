@@ -12,7 +12,7 @@ use komo_kernel::durable::storage::EntryQuery;
 use komo_kernel::durable::task::{NextTaskState, RunningTask, memo_of, put_memo};
 use komo_kernel::durable::{
     ContextView, ConversationId, Cursor, DocumentAddress, DocumentRecord, EntryId, EntryRecord,
-    ScanOrder, TaskId, TaskRecord, TaskState, derive_context,
+    ScanOrder, TaskId, TaskRecord, TaskState,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -282,46 +282,120 @@ impl TaskRuntime {
         at: Option<EntryId>,
     ) -> Result<Vec<EntryRecord>, DurableError> {
         self.check()?;
+        // 线上只钉住 tail；分页读取不可变的 [min, tail] 不持有提交锁。
         let sched = self.sched.clone();
         let invocation = self.invocation.clone();
-        self.sched
+        let tail = self
+            .sched
             .line
             .read_on_line(move || {
                 Box::pin(async move {
                     invocation.check()?;
-                    let mut entries = Vec::new();
                     let query = EntryQuery {
-                        order: Some(ScanOrder::Ascending),
                         max: at,
                         ..EntryQuery::new(conversation)
                     };
-                    let mut cursor: Option<Cursor> = None;
-                    loop {
-                        let page = sched
-                            .storage
-                            .scan_entries(&query, SCAN_PAGE, cursor.as_ref())
-                            .await?;
-                        entries.extend(page.items);
-                        match page.next {
-                            Some(next) => cursor = Some(next),
-                            None => break,
-                        }
-                    }
-                    Ok(entries)
+                    Ok(sched
+                        .storage
+                        .scan_entries(&query, 1, None)
+                        .await?
+                        .items
+                        .first()
+                        .map(|entry| entry.id))
+                })
+            })
+            .await?;
+        let Some(tail) = tail else {
+            return Ok(Vec::new());
+        };
+        self.entries_between(conversation, None, tail).await
+    }
+
+    /// 固定上界的不可变范围，线外读；编排 fork 只需本轮的 assistant 与结果。
+    pub async fn entries_between(
+        &self,
+        conversation: ConversationId,
+        min: Option<EntryId>,
+        tail: EntryId,
+    ) -> Result<Vec<EntryRecord>, DurableError> {
+        self.check()?;
+        let query = EntryQuery {
+            order: Some(ScanOrder::Ascending),
+            min,
+            max: Some(tail),
+            ..EntryQuery::new(conversation)
+        };
+        let mut entries = Vec::new();
+        let mut cursor: Option<Cursor> = None;
+        loop {
+            self.check()?;
+            let page = self
+                .sched
+                .storage
+                .scan_entries(&query, SCAN_PAGE, cursor.as_ref())
+                .await
+                .map_err(|error| self.sched.line.settle_error(error.into()))?;
+            entries.extend(page.items);
+            match page.next {
+                Some(next) => cursor = Some(next),
+                None => break,
+            }
+        }
+        Ok(entries)
+    }
+
+    /// 最新可见 entry，只读一条，不扫描历史。
+    pub async fn latest_entry(
+        &self,
+        conversation: ConversationId,
+    ) -> Result<Option<EntryRecord>, DurableError> {
+        self.check()?;
+        let sched = self.sched.clone();
+        self.sched
+            .line
+            .read_on_line(move || {
+                Box::pin(async move {
+                    Ok(sched
+                        .storage
+                        .scan_entries(&EntryQuery::new(conversation), 1, None)
+                        .await?
+                        .items
+                        .into_iter()
+                        .next())
                 })
             })
             .await
     }
 
-    /// conversation 已提交的活动 transcript 与模型上下文（可截到 `at`）。不缓存：每次读
-    /// 可见历史再推导（pi 的 range 缓存是性能优化，这里留给 D4 需要时再加）。
+    /// 最新活动范围、推导结果与跨 head 的缓存账。
+    pub async fn context_snapshot(
+        &self,
+        conversation: ConversationId,
+    ) -> Result<super::context::ContextSnapshot, DurableError> {
+        self.check()?;
+        let snapshot = self
+            .sched
+            .contexts
+            .snapshot(&self.sched.line, conversation)
+            .await?;
+        self.check()?;
+        Ok(snapshot)
+    }
+
+    /// conversation 已提交的活动上下文。历史 cutoff 与当前范围共用缓存。
     pub async fn context(
         &self,
         conversation: ConversationId,
         at: Option<EntryId>,
-    ) -> Result<ContextView, DurableError> {
-        let entries = self.entries(conversation, at).await?;
-        Ok(derive_context(&entries, at))
+    ) -> Result<Arc<ContextView>, DurableError> {
+        self.check()?;
+        let view = self
+            .sched
+            .contexts
+            .view(&self.sched.line, conversation, at)
+            .await?;
+        self.check()?;
+        Ok(view)
     }
 
     /// 时钟（毫秒）。

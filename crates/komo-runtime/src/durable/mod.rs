@@ -4,6 +4,7 @@
 //! 提交后发布）、事务视图（[`Tx`]）、任务定义（[`TaskKind`]）与调度器（reservation、
 //! invocation、abort 协议、close、开库 reconciliation）。不含 agent 的任何东西。
 
+pub mod context;
 pub mod engine;
 pub mod error;
 pub mod harness;

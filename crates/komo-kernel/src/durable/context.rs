@@ -1,10 +1,11 @@
 //! 上下文推导（pi-durable spec §2.1 规则 1–10；设计 §2）：纯函数。
 //!
 //! 输入是一段可见 entry（已按 fork 祖先拼好、按 ID 升序）和可选的 cutoff（含），输出模型
-//! 消息序列与用到的 entry。没有存储、没有增量缓存——pi 的 `ContextRange` 是性能优化，
-//! 结果必须与从头推导相同，这里只做从头推导。
+//! 消息序列与用到的 entry。`ContextRange` 复用已推导的贡献，只重排最后一条 assistant
+//! 之后尚未稳定的工具结果；遇到 edits 或 head 变化则重新推导。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use super::ids::EntryId;
 use super::message::{AssistantMessage, ContentBlock, Message, ToolResultMessage};
@@ -41,8 +42,59 @@ impl ContextView {
     }
 }
 
+/// 已推导的范围。调用方保证 `extend` 的 entry 严格接在原范围后、head 标记不变。
+#[derive(Clone)]
+pub struct ContextRange {
+    pub view: Arc<ContextView>,
+    edited: HashSet<EntryId>,
+    settled: Vec<Tagged>,
+    open: Vec<Tagged>,
+    baseline: Baseline,
+}
+
+impl ContextRange {
+    /// `visible` 按 ID 升序，包含最新 head 指向的范围。
+    pub fn new(visible: &[EntryRecord]) -> Self {
+        derive_range(visible, None)
+    }
+
+    /// 只推导新增贡献；edit 可能改变已有贡献，此时用已有记录整段重推，不需要重读存储。
+    pub fn extend(&mut self, visible: &[EntryRecord], added: &[EntryRecord]) {
+        if added.iter().any(|entry| {
+            entry.head.is_some() || !entry.edits.is_empty() || self.edited.contains(&entry.id)
+        }) {
+            *self = Self::new(visible);
+            return;
+        }
+        let view = Arc::make_mut(&mut self.view);
+        let offset = view.entries.len();
+        if self.baseline == Baseline::Unknown {
+            let active: Vec<_> = added.iter().collect();
+            self.baseline = match find_baseline_id(view.head, &active) {
+                Baseline::Entry(index) => Baseline::Entry(offset + index),
+                other => other,
+            };
+        }
+        for (index, entry) in added.iter().enumerate() {
+            let contribution = contribute(entry, None);
+            self.open.extend(tag_contribution(
+                &contribution,
+                self.baseline == Baseline::Entry(offset + index),
+            ));
+            view.entries.push(entry.id);
+            view.contributions.push(contribution);
+        }
+        settle(&mut self.settled, &mut self.open);
+        view.messages = range_messages(&self.settled, &self.open);
+    }
+}
+
 /// 推导 `visible`（按 ID 升序）在 `cutoff`（含）处的上下文。
 pub fn derive_context(visible: &[EntryRecord], cutoff: Option<EntryId>) -> ContextView {
+    Arc::unwrap_or_clone(derive_range(visible, cutoff).view)
+}
+
+fn derive_range(visible: &[EntryRecord], cutoff: Option<EntryId>) -> ContextRange {
     let upto: Vec<&EntryRecord> = visible
         .iter()
         .filter(|entry| cutoff.is_none_or(|cutoff| entry.id <= cutoff))
@@ -63,7 +115,13 @@ pub fn derive_context(visible: &[EntryRecord], cutoff: Option<EntryId>) -> Conte
         None => upto,
     };
     if range.is_empty() && head.is_none() {
-        return ContextView::empty();
+        return ContextRange {
+            view: Arc::new(ContextView::empty()),
+            edited: HashSet::new(),
+            settled: Vec::new(),
+            open: Vec::new(),
+            baseline: Baseline::Unknown,
+        };
     }
 
     // 规则 4：范围内每个目标取最新的一条 edit。老的 head 标记的 edits 也算。
@@ -88,31 +146,61 @@ pub fn derive_context(visible: &[EntryRecord], cutoff: Option<EntryId>) -> Conte
 
     // 规则 6：system 消息按位置保留，不丢也不合并，直接随各 entry 的贡献进入序列。
     let baseline = find_baseline(head, &active);
-    let mut tagged = Vec::new();
+    let mut open = Vec::new();
     for (index, entry) in active.iter().enumerate() {
-        let unedited = !edits.contains_key(&entry.id);
-        let mut baseline_taken = false;
-        for message in &contributions[index] {
-            // 基线：未被 edit 动过的、那条 entry 自己的第一条 system 消息。
-            let is_baseline = message.is_system()
-                && unedited
-                && !baseline_taken
-                && baseline == Baseline::Entry(index);
-            baseline_taken |= message.is_system();
-            tagged.push(Tagged {
+        open.extend(tag_contribution(
+            &contributions[index],
+            !edits.contains_key(&entry.id) && baseline == Baseline::Entry(index),
+        ));
+    }
+    let mut settled = Vec::new();
+    settle(&mut settled, &mut open);
+    let messages = range_messages(&settled, &open);
+
+    ContextRange {
+        view: Arc::new(ContextView {
+            head: head.map(|head| head.id),
+            entries: active.iter().map(|entry| entry.id).collect(),
+            contributions,
+            messages,
+        }),
+        edited: edits.keys().copied().collect(),
+        settled,
+        open,
+        baseline,
+    }
+}
+
+fn tag_contribution(messages: &[Message], baseline: bool) -> Vec<Tagged> {
+    let mut taken = false;
+    messages
+        .iter()
+        .map(|message| {
+            let is_baseline = baseline && message.is_system() && !taken;
+            taken |= message.is_system();
+            Tagged {
                 message: message.clone(),
                 baseline: is_baseline,
-            });
-        }
-    }
-    let messages = lead_with_system(order_tagged(tagged));
+            }
+        })
+        .collect()
+}
 
-    ContextView {
-        head: head.map(|head| head.id),
-        entries: active.iter().map(|entry| entry.id).collect(),
-        contributions,
-        messages,
+fn settle(settled: &mut Vec<Tagged>, open: &mut Vec<Tagged>) {
+    if let Some(last) = open
+        .iter()
+        .rposition(|tagged| matches!(tagged.message, Message::Assistant(_)))
+        && last > 0
+    {
+        let tail = open.split_off(last);
+        settled.extend(order_tagged(std::mem::replace(open, tail)));
     }
+}
+
+fn range_messages(settled: &[Tagged], open: &[Tagged]) -> Vec<Message> {
+    let mut messages = settled.to_vec();
+    messages.extend(order_tagged(open.to_vec()));
+    lead_with_system(messages)
 }
 
 /// 一条 entry 在 edit 与停止原因过滤之后的消息（规则 4、9）。
@@ -148,8 +236,12 @@ enum Baseline {
 /// 压缩或重置之后，生成阶段会把当时生效的所有段与工具写进这条基线，并省掉保留下来的
 /// `komo.system` entry，所以它描述的是整个提示，值得放到最前面。
 fn find_baseline(head: Option<&EntryRecord>, active: &[&EntryRecord]) -> Baseline {
+    find_baseline_id(head.map(|head| head.id), active)
+}
+
+fn find_baseline_id(head: Option<EntryId>, active: &[&EntryRecord]) -> Baseline {
     for (index, entry) in active.iter().enumerate() {
-        if head.is_some_and(|head| entry.id <= head.id) {
+        if head.is_some_and(|head| entry.id <= head) {
             continue;
         }
         if entry.kind == SYSTEM_ENTRY_KIND {
@@ -204,6 +296,7 @@ fn lead_with_system(mut messages: Vec<Tagged>) -> Vec<Message> {
 }
 
 /// 带"是不是基线"标记走完工具结果排序的消息。
+#[derive(Clone)]
 struct Tagged {
     message: Message,
     baseline: bool,
@@ -623,6 +716,42 @@ mod tests {
             entry(4, SYSTEM_ENTRY_KIND, vec![system("later")]),
         ];
         assert_eq!(derive(&entries), ["a:a", "s:later"]);
+    }
+
+    #[test]
+    fn incremental_contributions_handle_future_edits_and_multiple_messages_per_entry() {
+        let entries = vec![
+            EntryRecord::new(id(1), CONV, "edit").with_edits(vec![ContextEdit::replace(
+                id(4),
+                vec![system("replacement"), user("future")],
+            )]),
+            entry(
+                2,
+                "m",
+                vec![assistant_calling(&["c1", "c2"]), user("steer")],
+            ),
+            entry(3, "m", vec![result("c2"), result("c2"), result("ghost")]),
+            entry(4, "m", vec![user("original")]),
+            entry(5, SYSTEM_ENTRY_KIND, vec![system("base"), system("second")]),
+            entry(
+                6,
+                "m",
+                vec![result("c1"), assistant_calling(&["c3"]), result("c3")],
+            ),
+            EntryRecord::new(id(7), CONV, "edit").with_edits(vec![ContextEdit::omit(id(2))]),
+            entry(8, "m", vec![assistant_text("done", StopReason::Stop)]),
+        ];
+        for split in 0..=entries.len() {
+            let mut range = ContextRange::new(&entries[..split]);
+            for end in split + 1..=entries.len() {
+                range.extend(&entries[..end], &entries[end - 1..end]);
+                assert_eq!(
+                    *range.view,
+                    derive_context(&entries[..end], None),
+                    "split={split}, end={end}"
+                );
+            }
+        }
     }
 
     #[test]

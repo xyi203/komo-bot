@@ -294,6 +294,7 @@ fn db_err(error: turso::Error) -> LineError {
 ///
 /// 连接配置：WAL（turso 默认的 journal 模式，开库后回读核对）、`synchronous=FULL`、
 /// `data_sync_retry=1`——默认 `false` 时 fsync 出错是 `panic!` 而不是 `Err`（`db.rs` 同一条理由）。
+/// 写连接还启用 `fullfsync`，让 Apple 平台的 FULL 提交冲刷设备写缓存。
 pub(crate) async fn open(path: &Path) -> Result<(Database, Connection), LineError> {
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
@@ -307,6 +308,9 @@ pub(crate) async fn open(path: &Path) -> Result<(Database, Connection), LineErro
         .map_err(db_err)?;
     let conn = database.connect().map_err(db_err)?;
     conn.execute("PRAGMA data_sync_retry = 1", ())
+        .await
+        .map_err(db_err)?;
+    conn.execute("PRAGMA fullfsync = ON", ())
         .await
         .map_err(db_err)?;
     conn.execute("PRAGMA synchronous = FULL", ())
@@ -557,6 +561,63 @@ mod tests {
         // 2 = FULL
         assert_eq!(pragma_text(&conn, "synchronous").await.unwrap(), "2");
         assert_eq!(pragma_text(&conn, "data_sync_retry").await.unwrap(), "1");
+        #[cfg(target_vendor = "apple")]
+        assert_eq!(pragma_text(&conn, "fullfsync").await.unwrap(), "1");
+    }
+
+    /// 真盘微基准：每次改变正文，避免 WAL 跳过相同页面造成虚假的吞吐。
+    #[tokio::test]
+    #[ignore = "manual disk sync benchmark; run with --ignored --nocapture"]
+    async fn measure_sync_modes() {
+        use std::time::Instant;
+        for (label, sync, fullfsync) in [
+            ("FULL", "FULL", "OFF"),
+            ("FULL+fullfsync", "FULL", "ON"),
+            ("OFF", "OFF", "ON"),
+        ] {
+            let dir = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+            let path = durable_db_path(dir.path());
+            let (_db, conn) = open(&path).await.unwrap();
+            conn.execute(&format!("PRAGMA fullfsync = {fullfsync}"), ())
+                .await
+                .unwrap();
+            conn.execute(&format!("PRAGMA synchronous = {sync}"), ())
+                .await
+                .unwrap();
+            let mut timings = Vec::new();
+            let mut wal_peak = 0;
+            let mut wal_resets = 0;
+            let mut previous_wal = 0;
+            let start = Instant::now();
+            for n in 0..1000 {
+                let value = format!("{n}:{}", "x".repeat(2048));
+                let commit_start = Instant::now();
+                conn.execute("BEGIN", ()).await.unwrap();
+                conn.execute(
+                    "INSERT OR REPLACE INTO durable_meta (name, value) VALUES ('benchmark', ?1)",
+                    [value],
+                )
+                .await
+                .unwrap();
+                conn.execute("COMMIT", ()).await.unwrap();
+                timings.push(commit_start.elapsed().as_secs_f64() * 1000.0);
+                let wal = std::fs::metadata(format!("{}-wal", path.display()))
+                    .map(|m| m.len())
+                    .unwrap_or(0);
+                wal_peak = wal_peak.max(wal);
+                wal_resets += usize::from(wal < previous_wal);
+                previous_wal = wal;
+            }
+            let elapsed = start.elapsed();
+            timings.sort_by(f64::total_cmp);
+            println!(
+                "{label}: 1000 commits, {:.0}/s, p50 {:.3} ms, p95 {:.3} ms, p99 {:.3} ms, WAL peak {wal_peak} bytes, file shrinks {wal_resets}",
+                1000.0 / elapsed.as_secs_f64(),
+                timings[500],
+                timings[950],
+                timings[990]
+            );
+        }
     }
 
     #[tokio::test]

@@ -5,6 +5,11 @@
 //!   宿主 → worker  第一行 [`Request`]；之后每行是一次工具调用的答复 `{"ok": ..}` / `{"error": ".."}`
 //!   worker → 宿主  `{"call": name, "args": {..}}`，最后一行 `{"done": {..}}`
 //!
+//! `atools.<name>(..)` 是延后调用：`{"call", "args", "id", "defer": true}` 不等答复，脚本拿到一个
+//! awaitable 接着跑；脚本卡在 `await` 上时 worker 发 `{"wait": [id..]}`，宿主等**所有**发出未答的
+//! 延后调用都有了结果，一次答 `{"results": [{"id", "ok"} | {"id", "error"}..]}`。结果总是成批
+//! 交给 Monty，不按完成先后，所以同一段脚本、同一批答复，跑出来的调用顺序每次一样（恢复靠它）。
+//!
 //! 第一行输出是握手 `{"hello": {..}}`（版本，见 [`Hello`]）；时钟与熵走 `{"os": {..}}`，由宿主
 //! 回答并记账（[`Nondet`]）。
 //!
@@ -12,6 +17,7 @@
 //! 每个 OsCall 先在这里拦（规范化路径、解符号链接，落在 komo 自己的状态里就拒，读也一样；
 //! 写类一律拒），再交给只读挂载的 `/`。环境变量答空。
 
+use std::collections::HashMap;
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -38,7 +44,7 @@ const OUTPUT_CAP: usize = 1 << 20;
 const MAX_SUSPENSIONS: usize = 1_000_000;
 /// 跑 Monty 的线程栈：递归深度由 Monty 自己的上限管，栈要给够（`docs/codemode.md` §8）。
 pub(super) const STACK_SIZE: usize = 64 << 20;
-const INPUT_NAMES: [&str; 4] = ["_call", "text", "TOOLS", "_CATALOG"];
+const INPUT_NAMES: [&str; 5] = ["_call", "_acall", "text", "TOOLS", "_CATALOG"];
 
 /// 宿主交进来的一次运行：脚本、能调的工具名、发现工具用的说明与限制。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -136,7 +142,11 @@ fn call_host(
     name: &str,
     args: &Map<String, Value>,
 ) -> Result<Value, String> {
-    ask_host(input, output, &json!({ "call": name, "args": args }))
+    answer(&ask_host(
+        input,
+        output,
+        &json!({ "call": name, "args": args }),
+    )?)
 }
 
 /// 问宿主一次时钟或熵（[`Nondet`]）。
@@ -145,7 +155,7 @@ fn os_host(
     output: &mut impl Write,
     request: &Nondet,
 ) -> Result<Value, String> {
-    ask_host(input, output, &json!({ "os": request }))
+    answer(&ask_host(input, output, &json!({ "os": request }))?)
 }
 
 fn ask_host(
@@ -160,9 +170,70 @@ fn ask_host(
     }
     let reply: Value =
         serde_json::from_str(&line).map_err(|error| format!("答复读不懂：{error}"))?;
+    Ok(reply)
+}
+
+/// 一条 `{"ok": v}` / `{"error": ".."}` 答复。
+fn answer(reply: &Value) -> Result<Value, String> {
     match reply.get("error") {
         Some(error) => Err(error.as_str().unwrap_or("error").to_owned()),
         None => Ok(reply.get("ok").cloned().unwrap_or(Value::Null)),
+    }
+}
+
+/// 发出未答的延后调用（`atools.<name>`）与已经拿到、还没交给 Monty 的结果。
+#[derive(Default)]
+struct Deferred {
+    outstanding: Vec<u32>,
+    settled: HashMap<u32, ExtFunctionResult>,
+}
+
+impl Deferred {
+    /// 脚本卡在 `await` 上：等宿主把发出未答的全答完，再把 Monty 在等的那些交回去。
+    fn resolve(
+        &mut self,
+        pending: &[u32],
+        input: &mut impl BufRead,
+        output: &mut impl Write,
+    ) -> Vec<(u32, ExtFunctionResult)> {
+        if !self.outstanding.is_empty() {
+            let ids = std::mem::take(&mut self.outstanding);
+            match ask_host(input, output, &json!({ "wait": ids })) {
+                Ok(reply) => {
+                    for item in reply
+                        .get("results")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                    {
+                        if let Some(id) = item.get("id").and_then(Value::as_u64) {
+                            self.settled.insert(id as u32, ext_result(answer(item)));
+                        }
+                    }
+                    for id in ids {
+                        self.settled
+                            .entry(id)
+                            .or_insert_with(|| tool_error("宿主没有答这次调用"));
+                    }
+                }
+                Err(message) => {
+                    for id in ids {
+                        self.settled.insert(id, tool_error(message.clone()));
+                    }
+                }
+            }
+        }
+        pending
+            .iter()
+            .filter_map(|id| self.settled.remove(id).map(|result| (*id, result)))
+            .collect()
+    }
+}
+
+fn ext_result(reply: Result<Value, String>) -> ExtFunctionResult {
+    match reply {
+        Ok(value) => ExtFunctionResult::Return(json_to_monty(&value)),
+        Err(message) => tool_error(message),
     }
 }
 
@@ -217,6 +288,7 @@ fn execute(request: Request, input: &mut impl BufRead, output: &mut impl Write) 
     };
     let inputs = vec![
         MontyObject::function("_call", None),
+        MontyObject::function("_acall", None),
         MontyObject::function("text", None),
         MontyObject::list(
             request
@@ -235,6 +307,7 @@ fn execute(request: Request, input: &mut impl BufRead, output: &mut impl Write) 
     );
 
     let (mut calls, mut text_bytes) = (0u32, 0usize);
+    let mut deferred = Deferred::default();
     loop {
         let paused = match progress {
             Ok(paused) => paused,
@@ -251,14 +324,36 @@ fn execute(request: Request, input: &mut impl BufRead, output: &mut impl Write) 
                 } else {
                     calls += 1;
                     match tool_call(&call.args) {
-                        Some((name, args)) => match call_host(input, output, &name, &args) {
-                            Ok(value) => ExtFunctionResult::Return(json_to_monty(&value)),
-                            Err(message) => tool_error(message),
-                        },
+                        Some((name, args)) => ext_result(call_host(input, output, &name, &args)),
                         None => tool_error("前置代码调 _call 的参数不对"),
                     }
                 };
                 call.resume(result, print(&mut streams))
+            }
+            // 延后调用：发出去不等答复，脚本拿到 awaitable 接着跑；拒掉的也放进 settled，
+            // 在 `await` 的地方抛出，与真正失败的调用一样。
+            RunProgress::FunctionCall(call) if call.function_name == "_acall" => {
+                let id = call.call_id;
+                if calls >= max_calls {
+                    let refused = tool_error(format!("一段脚本最多调 {max_calls} 次工具"));
+                    deferred.settled.insert(id, refused);
+                } else {
+                    calls += 1;
+                    match tool_call(&call.args) {
+                        Some((name, args)) => {
+                            send(
+                                output,
+                                &json!({ "call": name, "args": args, "id": id, "defer": true }),
+                            );
+                            deferred.outstanding.push(id);
+                        }
+                        None => {
+                            let refused = tool_error("前置代码调 _acall 的参数不对");
+                            deferred.settled.insert(id, refused);
+                        }
+                    }
+                }
+                call.resume_pending(print(&mut streams))
             }
             RunProgress::FunctionCall(call) if call.function_name == "text" => {
                 let rendered = match call.args.arg(0) {
@@ -287,10 +382,21 @@ fn execute(request: Request, input: &mut impl BufRead, output: &mut impl Write) 
             RunProgress::NameLookup(lookup) => {
                 lookup.resume(NameLookupResult::Undefined, print(&mut streams))
             }
-            RunProgress::ResolveFutures(futures) => futures.abort(
-                MontyException::new(ExcType::RuntimeError, Some("codemode 里没有 async".into())),
-                print(&mut streams),
-            ),
+            RunProgress::ResolveFutures(futures) => {
+                let results = deferred.resolve(futures.pending_call_ids(), input, output);
+                if results.is_empty() {
+                    // 在等的不是工具调用（比如 asyncio.sleep 之外的东西），再等也等不来。
+                    futures.abort(
+                        MontyException::new(
+                            ExcType::RuntimeError,
+                            Some("脚本在等一个不会完成的 awaitable".into()),
+                        ),
+                        print(&mut streams),
+                    )
+                } else {
+                    futures.resume(results, print(&mut streams))
+                }
+            }
         };
     }
     done.console = console(&streams);

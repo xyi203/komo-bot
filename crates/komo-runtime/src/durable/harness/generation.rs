@@ -51,7 +51,7 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use komo_kernel::compaction::PROMPT_CACHE_TTL;
-use komo_kernel::durable::compaction::{DECAY_ENTRY_KIND, cache_cold, decay_edits, online_state};
+use komo_kernel::durable::compaction::{DECAY_ENTRY_KIND, cache_cold, decay_edits};
 use komo_kernel::durable::task::RunningTask;
 use komo_kernel::durable::{
     AssistantMessage, ContentBlock, ConversationId, EntryId, EntryRecord, Message, StopReason,
@@ -268,8 +268,9 @@ impl GenerationTask {
             }
         }
 
-        let entries = rt.entries(conversation, None).await?;
-        let view = derive_context(&entries, None);
+        let context = rt.context_snapshot(conversation).await?;
+        let entries = &context.entries;
+        let view = &context.view;
         let setup = match self.deps.hooks.setup(conversation, &view.messages).await {
             Ok(setup) => setup,
             Err(HookError::NoModel(message)) => {
@@ -297,7 +298,7 @@ impl GenerationTask {
                 Err(HookError::Failed(message)) => return Err(TaskError::new(message)),
             };
             let live = compaction::read_live(rt, conversation).await?;
-            let online = online_state(&entries, compaction::refused_after(&live));
+            let online = context.online_state(compaction::refused_after(&live));
             let cold = cache_cold(&entries, rt.now()?, PROMPT_CACHE_TTL.as_millis() as i64);
             let planned: Vec<Message> = drafts
                 .iter()
@@ -469,9 +470,10 @@ impl GenerationTask {
             // 拿不到设置就救不了：照旧按超长失败。
             Err(_) => return Ok(false),
         };
-        let entries = rt.entries(conversation, None).await?;
-        let view = derive_context(&entries, None);
-        let online = online_state(&entries, None);
+        let context = rt.context_snapshot(conversation).await?;
+        let entries = &context.entries;
+        let view = &context.view;
+        let online = context.online_state(None);
         let cold = cache_cold(&entries, rt.now()?, PROMPT_CACHE_TTL.as_millis() as i64);
         let Some((decision, _)) =
             compaction::plan_overflow(&view, &online, &csetup.settings, &request.model, cold)

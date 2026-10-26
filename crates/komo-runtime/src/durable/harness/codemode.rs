@@ -31,6 +31,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::hooks::ToolSet;
+use super::live::{self as progress, NestedToolSlot, ToolSlot};
 use super::nested::{NESTED_VERSION, NestedDoc, NestedResult, nested_address, nested_key};
 use super::tool::{Call, ToolTask};
 use crate::codemode::{Nondet, ScriptCatalog, ScriptTool, live};
@@ -78,8 +79,9 @@ struct State {
     /// 本次读到、还没落账的读数：下一次新子调用建任务之前（或结束之前）才落。之间崩了也没关系——
     /// 这些值没被任何已提交的外部效果用过，恢复时重新读就是。
     pending: Vec<NondetEntry>,
-    calls: Vec<NestedCall>,
-    images: Vec<ImageRef>,
+    /// 按序号记：并发的调用交付先后不定，汇总时再排。
+    calls: Vec<(usize, NestedCall)>,
+    images: Vec<(usize, ImageRef)>,
 }
 
 fn uncertain(message: impl Into<String>) -> ToolError {
@@ -96,6 +98,10 @@ struct Script<'a> {
     state: Arc<Mutex<State>>,
     /// 开始时已有的嵌套调用，按序号。
     docs: Vec<NestedDoc>,
+    /// 已经过了准入（对上记录或建好任务）的最大序号。`atools` 的调用并发跑，但准入一个接
+    /// 一个按序号来：`komo.nested` 的 `c<n>` 必须连续（恢复时缺一个就到头），读数也要在用到它们的
+    /// 那次建任务之前落账。
+    admitted: tokio::sync::watch::Sender<usize>,
 }
 
 /// 执行 codemode 一次：脚本跑完交回整段结果。任何出口之前，名下还活着的嵌套任务都先收掉
@@ -175,6 +181,7 @@ async fn run_script(
         outer,
         state: Arc::new(Mutex::new(state)),
         docs,
+        admitted: tokio::sync::watch::Sender::new(0),
     };
 
     // 被接续的 Run 里 MCP 工具可能还没挂上：等它们的服务器是钩子（`AgentHooks::tools`）的事，
@@ -186,7 +193,9 @@ async fn run_script(
         .in_dir(ctx.cwd.clone())
         .with_nondet(Arc::new(move |request| read(&reads, request)))
         .run(code, &names, &catalog, ctx.call_timeout, |name, args| {
-            script.nested_call(name, args)
+            // 序号按 worker 发来的顺序定，不等 future 被轮询。
+            let index = script.reserve();
+            script.nested_call(index, name, args)
         })
         .await;
 
@@ -206,7 +215,17 @@ async fn run_script(
 
     let (calls, images) = {
         let mut state = script.state();
-        (std::mem::take(&mut state.calls), state.images.clone())
+        let mut calls = std::mem::take(&mut state.calls);
+        calls.sort_by_key(|(index, _)| *index);
+        let mut images = state.images.clone();
+        images.sort_by_key(|(index, _)| *index);
+        (
+            calls.into_iter().map(|(_, call)| call).collect::<Vec<_>>(),
+            images
+                .into_iter()
+                .map(|(_, image)| image)
+                .collect::<Vec<_>>(),
+        )
     };
     // 非 bash 结果的模型视图保留头部：失败原因与已交付调用必须先于大段脚本输出。
     let child_failed = calls
@@ -273,15 +292,31 @@ impl Script<'_> {
         self.state().fatal.get_or_insert(error);
     }
 
-    /// 脚本里的一次工具调用（`docs/codemode.md` §5）。错误就是交给脚本的 `ToolError` 正文；
+    /// 给下一次调用分序号。在 worker 发来调用的那一刻做：这时的读数正好是脚本在它之前读的。
+    fn reserve(&self) -> usize {
+        let mut state = self.state();
+        state.cursor += 1;
+        let index = state.cursor;
+        // 回放到已记录的调用时，它之前的读数应当全是录下来的；读多了说明脚本走了别的路。
+        if index <= state.recorded && !state.pending.is_empty() {
+            let name = self.docs.get(index - 1).map_or("", |doc| doc.name.as_str());
+            state.fatal.get_or_insert(uncertain(format!(
+                "codemode 回放分歧：子调用 {index} ({name}) 之前多读了时钟 / 随机数"
+            )));
+        }
+        index
+    }
+
+    /// 脚本里的第 `index` 次工具调用（`docs/codemode.md` §5）。错误就是交给脚本的 `ToolError` 正文；
     /// 结果不明或宿主自己出错时锁住 fatal，之后的调用一律不再执行，脚本接住异常也解不开。
-    async fn nested_call(&self, name: String, args: Value) -> Result<Value, String> {
+    async fn nested_call(&self, index: usize, name: String, args: Value) -> Result<Value, String> {
         let started = Instant::now();
         let preview = truncate(&args.to_string(), ARGS_PREVIEW);
-        let (index, result) = self.admit_and_wait(&name, args).await;
+        let result = self.admit_and_wait_at(index, &name, args).await;
         let result = match result {
             Ok(result) => {
-                self.state().images.extend(result.images.iter().cloned());
+                let images = result.images.iter().cloned().map(|image| (index, image));
+                self.state().images.extend(images);
                 result
             }
             Err(error) => {
@@ -295,9 +330,9 @@ impl Script<'_> {
             let message = result
                 .error
                 .clone()
-                .unwrap_or_else(|| "MCP 子调用结果不明；停止脚本后续调用".into());
+                .unwrap_or_else(|| "子调用结果不明；停止脚本后续调用".into());
             self.lock_fatal(uncertain(message));
-            Err("MCP 子调用结果不明；停止脚本后续调用".to_owned())
+            Err("子调用结果不明；停止脚本后续调用".to_owned())
         } else {
             result.script_result()
         };
@@ -326,29 +361,35 @@ impl Script<'_> {
             elapsed_ms: started.elapsed().as_millis() as u64,
             error: reply.as_ref().err().cloned(),
         };
-        self.state().calls.push(call);
+        self.state().calls.push((index, call));
     }
 
-    /// 第 `index` 个调用：记录里有就等它的任务，没有就建一个再等。返回它的序号与结果。
-    async fn admit_and_wait(
-        &self,
-        name: &str,
-        args: Value,
-    ) -> (usize, Result<NestedResult, ToolError>) {
-        let index = {
-            let mut state = self.state();
-            state.cursor += 1;
-            state.cursor
-        };
-        (index, self.admit_and_wait_at(index, name, args).await)
-    }
-
+    /// 第 `index` 个调用：记录里有就等它的任务，没有就建一个再等。准入按序号一个接一个，
+    /// 等结果可以并发。
     async fn admit_and_wait_at(
         &self,
         index: usize,
         name: &str,
         args: Value,
     ) -> Result<NestedResult, ToolError> {
+        let mut turn = self.admitted.subscribe();
+        // Sender 活得比这里久，`wait_for` 不会因为通道关闭而失败。
+        let _ = turn.wait_for(|admitted| *admitted + 1 >= index).await;
+        let admitted = self.admit_at(index, name, args).await;
+        // 不论成败都轮到下一个；失败的已经锁了 fatal（或只是这一次被拒），后面的自己会看到。
+        self.admitted
+            .send_modify(|admitted| *admitted = (*admitted).max(index));
+        let (key, id) = admitted?;
+        self.wait_nested(&key, id).await
+    }
+
+    /// 准入第 `index` 个调用：对上记录，或者先把读数落账再建任务。返回它的 key 与任务。
+    async fn admit_at(
+        &self,
+        index: usize,
+        name: &str,
+        args: Value,
+    ) -> Result<(String, TaskId), ToolError> {
         {
             let state = self.state();
             if let Some(error) = &state.fatal {
@@ -356,12 +397,6 @@ impl Script<'_> {
             }
             if index > MAX_CALLS {
                 return Err(uncertain(format!("codemode 子调用超过 {MAX_CALLS} 次")));
-            }
-            // 回放到已记录的调用时，它之前的读数应当全是录下来的；读多了说明脚本走了别的路。
-            if index <= state.recorded && !state.pending.is_empty() {
-                return Err(uncertain(format!(
-                    "codemode 回放分歧：子调用 {index} ({name}) 之前多读了时钟 / 随机数"
-                )));
             }
         }
         let key = nested_key(index);
@@ -383,11 +418,16 @@ impl Script<'_> {
                 }
             }
         };
+        Ok((key, id))
+    }
+
+    /// 等嵌套任务终结，读它交付的结果。
+    async fn wait_nested(&self, key: &str, id: TaskId) -> Result<NestedResult, ToolError> {
         let record = match self.rt.wait_for_task(id).await {
             Ok(record) => record,
             Err(error) => return Err(host_error(self.rt, error).await),
         };
-        let doc = match read_doc(self.rt, &key).await {
+        let doc = match read_doc(self.rt, key).await {
             Ok(doc) => doc,
             Err(error) => return Err(host_error(self.rt, error).await),
         };
@@ -415,9 +455,11 @@ impl Script<'_> {
         let key = key.to_owned();
         let call_id = format!("{}/{key}", self.outer.id);
         let name = name.to_owned();
+        let conversation = self.rt.conversation();
         self.rt
             .commit(move |tx, task| {
                 Box::pin(async move {
+                    let mut live = progress::load(tx, conversation).await?;
                     let input = json!({
                         "kind": "nested",
                         "parent": task.id(),
@@ -434,6 +476,15 @@ impl Script<'_> {
                             TaskOptions::default(),
                         )
                         .await?;
+                    let mut slot = ToolSlot::pending(call_id, name.clone());
+                    slot.task_id = Some(id);
+                    live.nested_tools
+                        .get_or_insert_with(Vec::new)
+                        .push(NestedToolSlot {
+                            parent_task_id: task.id(),
+                            slot,
+                        });
+                    progress::store(tx, conversation, &live).await?;
                     let doc = NestedDoc {
                         task_id: id,
                         name,

@@ -301,25 +301,7 @@ impl DurableCore {
         if resolved.is_task() || !resolved.profile.project_files {
             return None;
         }
-        let mut entries = Vec::new();
-        let query = komo_kernel::durable::storage::EntryQuery {
-            order: Some(komo_kernel::durable::ScanOrder::Ascending),
-            ..komo_kernel::durable::storage::EntryQuery::new(conversation)
-        };
-        let mut cursor = None;
-        loop {
-            let page = self
-                .storage
-                .scan_entries(&query, 1_000, cursor.as_ref())
-                .await
-                .ok()?;
-            entries.extend(page.items);
-            match page.next {
-                Some(next) => cursor = Some(next),
-                None => break,
-            }
-        }
-        let view = komo_kernel::durable::derive_context(&entries, None);
+        let view = self.engine.context(conversation, None).await.ok()?;
         let shown = komo_runtime::durable::harness::system::replay_sections(&view.messages);
         if shown.is_empty() {
             return None;

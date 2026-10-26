@@ -175,9 +175,12 @@ commands run, terminal output when CLI behavior changes.
 - Design: `docs/komo_bot.md` (§14 has the acceptance table and the
   "pending verification" list — write verified facts back there).
 - Storage and agent loop (the pi-durable commit model): `docs/storage-durable.md`
-  (derivation, deviations, progress) and `docs/storage-durable-d5.md` (gateway wiring);
-  `docs/session-tree.md` (forks), `docs/background-tasks.md`, `docs/monitor.md`,
-  `docs/codemode.md` describe the pieces on top of it.
+  (derivation, deviations, progress), `docs/storage-durable-d5.md` (gateway wiring) and
+  `docs/storage-durable-perf.md` (P1 implemented; later optimizations pending);
+  `docs/session-tree.md`, `docs/background-tasks.md`, `docs/monitor.md`,
+  `docs/codemode.md` and `docs/codemode-bash.md` describe the pieces on top of it
+  (including implemented nested bash calls and live slots). `docs/handoff.md`
+  proposes a model-initiated reset that keeps the run going; not implemented yet.
 - Memory: `docs/memory.md` — §9 spec, planned memory designs, and memory
   research/analysis appendices. Memory changes update this file, not a new one.
 - Observability: `docs/observability.md` — OpenTelemetry traces/metrics, logs,

@@ -230,6 +230,7 @@ impl World {
             tools: vec![
                 Arc::new(CodemodeTool::new()),
                 Arc::new(ReadTool::new()),
+                Arc::new(komo_runtime::tools::BashTool::new()),
                 tick,
             ],
             env,
@@ -420,5 +421,98 @@ async fn a_killed_real_worker_is_replayed_from_the_nested_slots_after_a_restart(
     assert_eq!(tick.runs.load(Ordering::SeqCst), 2);
     let tasks = world.tool_tasks().await;
     assert_eq!(nested(&tasks).len(), 2, "no third nested task");
+    engine.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_real_worker_can_call_bash_and_handle_a_nonzero_exit_as_a_value() {
+    let dir = tempfile::tempdir().unwrap();
+    let world = World::new(
+        "r = tools.bash(command='printf hello; printf stderr >&2; exit 7')\n\
+         text(r['status'])\ntext(r['result']['exit_code'])\ntext(r['text'])\ntext('continued')",
+        dir.path().to_path_buf(),
+        Arc::new(Tick {
+            runs: AtomicUsize::new(0),
+            hang_first: false,
+        }),
+    );
+    let engine = world.open().await;
+    let id = world
+        .harness
+        .submit(&engine, CONV, SubmissionDraft::input("go"))
+        .await
+        .unwrap();
+    world.harness.wait(&engine, id).await.unwrap();
+    let (status, view) = world.only_result().await;
+    assert_eq!(status, "completed", "{view}");
+    for expected in ["hello", "stderr", "failed", "7", "continued"] {
+        assert!(view.contains(expected), "{expected}: {view}");
+    }
+    let tasks = world.tool_tasks().await;
+    assert_eq!(nested(&tasks).len(), 1);
+    assert!(tasks.iter().all(completed));
+    assert!(
+        Harness::live(&*world.storage, CONV)
+            .await
+            .unwrap()
+            .nested_tools
+            .is_none()
+    );
+    engine.close().await.unwrap();
+}
+
+/// 照 pi 的 `Promise.allSettled([...])`：真 worker 里用 `settle(atools...)` 并行发出四个调用，
+/// 读不到的文件不影响其他项；两条 bash 互相等对方先落下的文件，串行跑就只能各自等到超时。
+#[tokio::test]
+async fn a_real_worker_settles_parallel_calls_like_promise_all_settled() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().display();
+    std::fs::write(dir.path().join("a.log"), "alpha\n").unwrap();
+    let meet = |mine: &str, theirs: &str| {
+        format!(
+            "touch {root}/{mine}; for i in $(seq 200); do [ -f {root}/{theirs} ] && echo met && exit 0; sleep 0.05; done; echo alone"
+        )
+    };
+    let code = format!(
+        "rs = await settle(\n    atools.read(path='{root}/a.log'),\n    atools.read(path='{root}/missing.log'),\n    \
+         atools.bash(command={x:?}),\n    atools.bash(command={y:?}),\n)\n\
+         for i, r in enumerate(rs):\n    \
+         v = r['value'] if r['ok'] else {{}}\n    \
+         text({{'i': i, 'ok': r['ok'], 'status': v.get('status'), 'text': v.get('text', r.get('error', '')).strip()}})",
+        x = meet("x", "y"),
+        y = meet("y", "x"),
+    );
+    let world = World::new(
+        &code,
+        dir.path().to_path_buf(),
+        Arc::new(Tick {
+            runs: AtomicUsize::new(0),
+            hang_first: false,
+        }),
+    );
+    let engine = world.open().await;
+    let id = world
+        .harness
+        .submit(&engine, CONV, SubmissionDraft::input("go"))
+        .await
+        .unwrap();
+    world.harness.wait(&engine, id).await.unwrap();
+
+    let (status, view) = world.only_result().await;
+    assert_eq!(status, "completed", "{view}");
+    assert!(view.contains("==> text 4/4 <=="), "{view}");
+    assert!(view.contains("\"text\": \"alpha\""), "{view}");
+    assert_eq!(view.matches("\\nmet\"").count(), 2, "{view}");
+    assert!(
+        view.contains("missing.log"),
+        "the failed read is settled in place: {view}"
+    );
+    assert!(!view.contains("alone"), "{view}");
+    let tasks = world.tool_tasks().await;
+    let keys: Vec<_> = nested(&tasks)
+        .iter()
+        .map(|task| task.input["key"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(keys, ["c1", "c2", "c3", "c4"]);
     engine.close().await.unwrap();
 }

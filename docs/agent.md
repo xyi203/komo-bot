@@ -636,8 +636,8 @@ pub struct StoredOutput {
 `history::latest_user_text`：Gateway 依赖 agent，这样调没问题。
 
 工具结果只有 `kernel::projection` 一处投影，这条铁律不变。Agent 层调它，不自己拼
-“完整输出在哪”那句话。full 模型视图默认最多 50 KiB 或 2000 行（二者先到）：bash（旧记录里的 shell 同）
-保留尾部，其他工具保留头部；UTF-8 边界不会切坏，超限结果总带可 `read` 的完整
+“完整输出在哪”那句话。full 模型视图放得下（30 KiB 且 2000 行以内，30 KiB 也是上限）给全文，放不下每个工具
+都只给开头 2 KiB 预览并写明裁了多少；UTF-8 边界不会切坏，超限结果总带可 `read` 的完整
 `artifact://` 引用。即时路径与恢复路径都用 RunSnapshot 冻结的投影设置和同一份落盘事实，
 因此逐字节相同；后续 decay 仍只换成更短的模型视图，不改 JSONL 或 tool-output 原件。
 

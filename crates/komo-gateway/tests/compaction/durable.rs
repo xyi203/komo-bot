@@ -75,7 +75,7 @@ async fn a_short_task_is_never_compacted_and_the_driver_goes_on_unchanged() {
     );
 }
 
-/// 每次 `read` 交回约 24 KiB（600 行），50 KiB 预览能完整容纳。
+/// 每次 `read` 交回约 24 KiB（600 行），在 `read` 的 28 KiB 与投影的 30 KiB 之内，原样交给模型。
 const READ_TOKENS: u64 = 6_050;
 /// 空会话第一次请求（系统提示 + 工具表 + 任务）的估价，约数：窗口按它定，差不到半次
 /// `read` 就不影响哪一轮过线。

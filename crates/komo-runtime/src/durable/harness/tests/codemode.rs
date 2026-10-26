@@ -890,11 +890,13 @@ async fn a_bash_view_is_bounded_in_the_nested_receipt_while_the_complete_stdout_
     let receipt = doc.result.unwrap().script_result().unwrap();
     let text = receipt["text"].as_str().unwrap();
     assert!(
-        text.contains("LAST_OUT") && !text.contains("FIRST_OUT"),
+        text.contains("FIRST_OUT")
+            && !text.contains("LAST_OUT")
+            && text.contains("超过单条结果上限"),
         "{text}"
     );
     assert!(text.contains(&format!("artifact://1/{}/1/result", child.id)));
-    assert!(text.len() < 52 * 1024);
+    assert!(text.len() < 4 * 1024, "放不下只给开头预览");
     assert!(
         encoded.len() < 60 * 1024,
         "the full stdout is not in komo.nested"

@@ -58,7 +58,7 @@ fn home_with_a_big_file() -> Home {
 }
 
 #[tokio::test]
-async fn a_big_tool_output_keeps_both_ends_and_the_uri_it_points_at_really_reads() {
+async fn a_big_tool_output_is_previewed_visibly_and_the_uri_it_points_at_really_reads() {
     let home = home_with_a_big_file();
     let llm = FakeLlm::new(vec![vec![
         call_round(
@@ -79,11 +79,14 @@ async fn a_big_tool_output_keeps_both_ends_and_the_uri_it_points_at_really_reads
     assert_eq!(detail.summary.state, RunState::Completed, "{detail:?}");
 
     let live = fed_back(&llm, "read");
-    // 抬头、头尾两段、省了多少——不是"砍掉一半"。
+    // 抬头、开头预览、裁了多少——不是悄悄"砍掉一半"。
     assert!(live.starts_with("[read · 完成 · "), "{live}");
-    assert!(live.contains("中间省略"), "超了预算要说省了多少：\n{live}");
+    assert!(
+        live.contains("超过单条结果上限"),
+        "超了预算要说裁了多少：\n{live}"
+    );
     assert!(live.contains("行 1"), "头部要留着：\n{live}");
-    // 中间那一段（行 300 左右）正好落在被省略的区间里。
+    // 后面那一段（行 300 左右）不在预览里。
     assert!(
         !live.contains("行 300"),
         "被省略的部分不该声称给了：\n{live}"
@@ -121,7 +124,7 @@ async fn a_big_tool_output_keeps_both_ends_and_the_uri_it_points_at_really_reads
         text_round(2, "打开了。"),
     ]]);
     gateway.stop().await;
-    // 首次请求刻意用 2 KiB 测截断；重新读单行 JSON 时恢复默认 50 KiB。
+    // 首次请求刻意用 2 KiB 测截断；重新读单行 JSON 时恢复默认 30 KiB。
     // pi 的 head 视图不切开长行，因此 2 KiB 无法展示这一整行。
     std::fs::write(home.path().join("config.toml"), config_toml("")).expect("恢复默认模型输出预算");
     let gateway = home.start(Arc::clone(&llm)).await;

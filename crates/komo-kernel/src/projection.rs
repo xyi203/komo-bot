@@ -7,8 +7,9 @@
 //!
 //! 同一份事实渲染出**两个视图**（[`project_views`]）：
 //!
-//! - **full**：最多 50 KiB / 2000 行；bash 保留尾部（旧记录里叫 shell，两个名字都认），其他工具保留头部。还有更多时给出
-//!   **可直接 `read` 的完整输出引用**（`artifact://<run>/<call>/<attempt>/…`，§4.7）。
+//! - **full**：放得下（30 KiB / 2000 行以内）就给全文；放不下只给开头 2 KiB 的预览，加一行
+//!   写明原文多大、为什么只给这些。还有更多时给出**可直接 `read` 的完整输出引用**
+//!   （`artifact://<run>/<call>/<attempt>/…`，§4.7）。
 //! - **decayed**：大结果换下来的稳定短视图——抬头 + 首尾整行 + 那条引用。
 //!   省略不等于丢失：完整事实始终在 `output.json` / `stdout.txt` 里。
 //!
@@ -69,13 +70,20 @@ pub struct DecayPolicy {
     pub tail_bytes: usize,
 }
 
-/// 交给模型的正文默认预算。
+/// 交给模型的正文默认预算，**也是上限**：配置只能往小调。
 ///
 /// 这只约束模型视图，不约束 JSONL 或 tool-output 中保存的完整事实。默认值可由配置覆盖，
 /// 并随 [`ProjectionContext`] 冻结进 RunSnapshot（§6「Gateway 设置……输出长度」）。
-pub const DEFAULT_MODEL_RESULT_BYTES: usize = 50 * 1024;
-/// 交给模型的工具结果正文最多保留多少行。与 pi 一样，行数与字节数谁先到就按谁截断。
+///
+/// 30 KiB 是照模型后端定的：magpie 把工具结果当 MCP 结果交给 Claude Code，超过
+/// `MAX_MCP_OUTPUT_TOKENS`（默认 25000 token）它就把**整条**结果换成一句报错、全文另存——
+/// 账上记的是一份，模型看到的是另一份，komo 却不知道。30 KiB 的日志 / JSON / 中文都远在
+/// 25000 token 以下，所以裁剪总在这里发生、写在正文里，后端不会再动它。
+pub const DEFAULT_MODEL_RESULT_BYTES: usize = 30 * 1024;
+/// 交给模型的工具结果正文最多多少行；行数与字节数谁先超都按放不下处理。
 pub const MODEL_RESULT_LINES: usize = 2000;
+/// 放不下时开头预览给多少字节的整行。预览只用来让模型认出这是什么、决定去读哪一段。
+pub const PREVIEW_BYTES: usize = 2 * 1024;
 
 /// decayed 视图至少要比 full 短这么多才值得换：省几十字节却让模型面对一份变了样的
 /// 结果，不划算。
@@ -106,22 +114,22 @@ pub fn select(projected: Projected, decayed: bool) -> String {
     }
 }
 
-/// 交给模型的正文（§8.3）：full 视图。
+/// 交给模型的正文（§8.3）：full 视图。放得下给全文，放不下给开头预览（[`push_preview`]）。
+///
+/// 每个工具都一样：bash 的退出码与流大小在正文第一行，预览里就有。
 pub fn project(facts: &ToolResultFacts<'_>, ctx: &ProjectionContext) -> String {
     let mut out = header(facts);
-    let room = ctx
-        .model_result_bytes
-        .min(DEFAULT_MODEL_RESULT_BYTES)
-        .saturating_sub(out.len());
+    let limit = ctx.model_result_bytes.min(DEFAULT_MODEL_RESULT_BYTES);
+    let room = limit.saturating_sub(out.len());
 
     let text = facts.text.unwrap_or_default();
-    let cut = if matches!(facts.tool, "shell" | "bash") {
-        truncate_tail(text, room, MODEL_RESULT_LINES)
+    let fits = text.len() <= room && text.lines().count() <= MODEL_RESULT_LINES;
+    if fits {
+        push_excerpt(&mut out, &whole(text));
     } else {
-        truncate_head(text, room, MODEL_RESULT_LINES)
-    };
-    push_excerpt(&mut out, &cut);
-    if cut.omitted > 0 || has_more(facts, text) {
+        push_preview(&mut out, text, limit, room);
+    }
+    if !fits || has_more(facts, text) {
         out.push_str(&recall(facts));
     }
     out.push_str(&artifacts(facts));
@@ -161,6 +169,26 @@ fn decay(facts: &ToolResultFacts<'_>, policy: &DecayPolicy) -> String {
     out.push_str(&artifacts(facts));
     out.push_str(&images(facts));
     out
+}
+
+/// 放不下的正文：开头一段整行预览，再用一行写明原文多大、为什么只给这些、剩下的怎么看。
+///
+/// 裁剪**必须写在正文里**：模型据此知道自己看到的不是全部，不会把预览当成结论的依据。
+fn push_preview(out: &mut String, text: &str, limit: usize, room: usize) {
+    let head = &text[..head_end(text, PREVIEW_BYTES.min(room))];
+    out.push_str(head);
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push_str(&format!(
+        "…（正文 {} 字节 / {} 行，超过单条结果上限（{} / {} 行），只给了开头 {} 字节；\
+         其余在下面的完整输出里，用 read 的 start_line/line_count 分段读，或用 rg 搜要的那几行）…\n",
+        text.len(),
+        text.lines().count(),
+        bytes(limit as u64),
+        MODEL_RESULT_LINES,
+        head.len()
+    ));
 }
 
 /// 头 → 省略那条 → 尾，结尾补齐换行。
@@ -306,70 +334,6 @@ struct Truncated<'a> {
     head: &'a str,
     tail: &'a str,
     omitted: u64,
-}
-
-/// 普通工具保留头部；只收完整行。第一行本身超过字节预算时返回空摘录，提示模型读完整输出。
-fn truncate_head(text: &str, max_bytes: usize, max_lines: usize) -> Truncated<'_> {
-    let lines = line_ranges(text);
-    if text.len() <= max_bytes && lines.len() <= max_lines {
-        return whole(text);
-    }
-    let mut end = 0;
-    for &(start, line_end) in lines.iter().take(max_lines) {
-        let content_end = if line_end > start && text.as_bytes()[line_end - 1] == b'\n' {
-            line_end - 1
-        } else {
-            line_end
-        };
-        if content_end > max_bytes {
-            break;
-        }
-        end = line_end;
-    }
-    Truncated {
-        head: &text[..end],
-        tail: "",
-        omitted: (text.len() - end) as u64,
-    }
-}
-
-/// shell / bash 保留尾部；末行本身超过预算时允许取其 UTF-8 安全的尾部片段。
-fn truncate_tail(text: &str, max_bytes: usize, max_lines: usize) -> Truncated<'_> {
-    let lines = line_ranges(text);
-    if text.len() <= max_bytes && lines.len() <= max_lines {
-        return whole(text);
-    }
-    let mut start = text.len();
-    for &(line_start, _) in lines.iter().rev().take(max_lines) {
-        if text.len() - line_start > max_bytes {
-            if start == text.len() {
-                start = boundary_rev(text, text.len().saturating_sub(max_bytes));
-            }
-            break;
-        }
-        start = line_start;
-    }
-    Truncated {
-        head: "",
-        tail: &text[start..],
-        omitted: start as u64,
-    }
-}
-
-/// 每个逻辑行在原字符串里的范围；末尾换行不额外制造空行。
-fn line_ranges(text: &str) -> Vec<(usize, usize)> {
-    let mut ranges = Vec::new();
-    let mut start = 0;
-    for (index, byte) in text.bytes().enumerate() {
-        if byte == b'\n' {
-            ranges.push((start, index + 1));
-            start = index + 1;
-        }
-    }
-    if start < text.len() {
-        ranges.push((start, text.len()));
-    }
-    ranges
 }
 
 /// 头尾各留一段，预算各自固定（decayed 视图）。
@@ -668,34 +632,67 @@ mod tests {
         assert!(!printed.contains("artifact://"), "{printed}");
     }
 
+    /// 放不下的结果每个工具都一样：开头预览 + 一行写明裁了多少、为什么 + 完整输出的入口。
     #[test]
-    fn bash_keeps_the_tail_while_other_tools_keep_the_head() {
+    fn an_oversized_result_gets_a_visible_head_preview_for_every_tool() {
         let text = format!("HEAD\n{}TAIL\n", "middle\n".repeat(200));
-        let shell = project(&facts(Some(&text), None), &budget(400));
-        assert!(!shell.contains("HEAD"), "bash 不留头：{shell}");
-        assert!(shell.contains("TAIL"), "bash 要留末尾：{shell}");
-        // 改名前落账的结果叫 `shell`：回放必须与当年一样留尾。
-        let legacy = ToolResultFacts {
-            tool: "shell",
-            ..facts(Some(&text), None)
-        };
-        assert!(project(&legacy, &budget(400)).contains("TAIL"));
-
-        let ordinary = ToolResultFacts {
-            tool: "read",
-            ..facts(Some(&text), None)
-        };
-        let read = project(&ordinary, &budget(400));
-        assert!(read.contains("HEAD"), "普通工具要留开头：{read}");
-        assert!(!read.contains("TAIL"), "普通工具不留尾：{read}");
-        for printed in [shell, read] {
-            assert!(printed.contains("…（中间省略"), "{printed}");
+        for tool in ["bash", "shell", "read", "rg"] {
+            let oversized = ToolResultFacts {
+                tool,
+                ..facts(Some(&text), None)
+            };
+            let printed = project(&oversized, &budget(400));
+            assert!(printed.contains("HEAD\nmiddle\n"), "要留开头：{printed}");
+            assert!(!printed.contains("TAIL"), "预览只有开头：{printed}");
+            assert!(
+                printed.contains(&format!(
+                    "…（正文 {} 字节 / 202 行，超过单条结果上限",
+                    text.len()
+                )),
+                "裁剪要写在正文里：{printed}"
+            );
             assert!(printed.contains("完整输出：artifact://"), "{printed}");
+            assert!(printed.len() <= 400 + 400, "{printed}");
         }
     }
 
-    /// python 工具（2026-10-15 删除）留下的结果：投影只认落盘的事实，不认工具名，所以回放与
-    /// 当年逐字节一致——抬头带 stdout 大小，长正文留头（不是 bash 那样留尾），截断时给完整引用。
+    /// 配置写得比上限大也不放大：超过后端那条线的结果会被整条换掉，那时谁都看不见裁剪。
+    #[test]
+    fn a_configured_budget_above_the_cap_is_held_to_the_cap() {
+        let text = lines(1000);
+        assert!(text.len() > DEFAULT_MODEL_RESULT_BYTES && text.len() < 64 * 1024);
+        let printed = project(&facts(Some(&text), None), &budget(64 * 1024));
+        assert!(
+            printed.contains("超过单条结果上限（30.0 KB / 2000 行）"),
+            "{printed}"
+        );
+        assert!(!printed.contains("line 0999: "), "{printed}");
+    }
+
+    /// 不管正文多大、长什么样，交给模型的那一份都在上限之内——裁剪只发生在 komo 这里。
+    #[test]
+    fn every_result_stays_within_the_cap() {
+        let cap = DEFAULT_MODEL_RESULT_BYTES;
+        let texts = [
+            "x\n".repeat(cap / 2 - 64),
+            "x\n".repeat(cap / 2 + 64),
+            lines(4000),
+            "汉".repeat(200_000),
+            (0..2_001).map(|n| format!("{n}\n")).collect(),
+        ];
+        for text in &texts {
+            let printed = project(&facts(Some(text), Some(&STDOUT)), &budget(cap));
+            assert!(
+                printed.len() <= cap + 512,
+                "{} 字节的正文投影成了 {} 字节",
+                text.len(),
+                printed.len()
+            );
+        }
+    }
+
+    /// python 工具（2026-10-15 删除）留下的结果：投影只认落盘的事实，不认工具名——抬头带
+    /// stdout 大小，短正文原样给，长正文给开头预览，截断时给完整引用。
     #[test]
     fn a_historical_python_result_replays_byte_for_byte() {
         let stdout = STDOUT.clone();
@@ -728,37 +725,39 @@ mod tests {
     }
 
     #[test]
-    fn default_model_limits_match_pi() {
-        assert_eq!(DEFAULT_MODEL_RESULT_BYTES, 50 * 1024);
+    fn default_model_limits_stay_under_the_backend_cap() {
+        assert_eq!(DEFAULT_MODEL_RESULT_BYTES, 30 * 1024);
         assert_eq!(MODEL_RESULT_LINES, 2000);
+        assert_eq!(PREVIEW_BYTES, 2 * 1024);
     }
 
     #[test]
-    fn byte_limits_keep_utf8_valid_at_a_single_long_line() {
+    fn a_single_long_line_previews_on_a_char_boundary() {
         let text = "汉".repeat(30_000);
-        let shell = truncate_tail(&text, DEFAULT_MODEL_RESULT_BYTES, MODEL_RESULT_LINES);
-        assert!(shell.head.is_empty());
-        assert!(!shell.tail.is_empty());
-        assert!(shell.tail.len() <= DEFAULT_MODEL_RESULT_BYTES);
-        assert!(shell.tail.chars().all(|ch| ch == '汉'));
-
-        let read = truncate_head(&text, DEFAULT_MODEL_RESULT_BYTES, MODEL_RESULT_LINES);
-        assert!(read.head.is_empty(), "pi 的 head 语义不返回半条首行");
-        assert_eq!(read.omitted, text.len() as u64);
+        let printed = project(
+            &facts(Some(&text), None),
+            &budget(DEFAULT_MODEL_RESULT_BYTES),
+        );
+        let head = printed.lines().nth(1).expect("抬头之后是预览");
+        assert!(!head.is_empty(), "有正文就不给空预览");
+        assert!(head.len() <= PREVIEW_BYTES && head.len() > PREVIEW_BYTES - 3);
+        assert!(head.chars().all(|ch| ch == '汉'), "{head}");
     }
 
     #[test]
     fn line_limit_is_independent_from_the_byte_limit() {
         let text = (0..2_001).map(|n| format!("{n}\n")).collect::<String>();
-        let head = truncate_head(&text, usize::MAX, MODEL_RESULT_LINES);
-        assert_eq!(head.head.lines().count(), MODEL_RESULT_LINES);
-        assert!(!head.head.contains("2000\n"));
-        assert!(head.omitted > 0);
-
-        let tail = truncate_tail(&text, usize::MAX, MODEL_RESULT_LINES);
-        assert_eq!(tail.tail.lines().count(), MODEL_RESULT_LINES);
-        assert!(!tail.tail.starts_with("0\n"));
-        assert!(tail.tail.ends_with("2000\n"));
+        assert!(text.len() < DEFAULT_MODEL_RESULT_BYTES);
+        let printed = project(
+            &facts(Some(&text), None),
+            &budget(DEFAULT_MODEL_RESULT_BYTES),
+        );
+        assert!(printed.contains("\n0\n1\n"), "{printed}");
+        assert!(!printed.contains("\n2000\n"), "{printed}");
+        assert!(
+            printed.contains(&format!("…（正文 {} 字节 / 2001 行，", text.len())),
+            "{printed}"
+        );
     }
 
     #[test]
@@ -801,13 +800,14 @@ mod tests {
             artifacts: &artifacts,
             ..facts(Some(&text), Some(&STDOUT))
         };
-        let printed = project_views(&one, &decaying(8 * 1024));
+        let ctx = decaying(DEFAULT_MODEL_RESULT_BYTES);
+        let printed = project_views(&one, &ctx);
         assert_eq!(
             printed,
-            project_views(&two, &decaying(8 * 1024)),
+            project_views(&two, &ctx),
             "投影是纯函数：同一份事实两次投影，两个视图都必须一样"
         );
-        assert_eq!(printed.full, project(&one, &decaying(8 * 1024)));
+        assert_eq!(printed.full, project(&one, &ctx));
         let decayed = printed.decayed.expect("这么大的结果要有 decayed 视图");
         for view in [&printed.full, &decayed] {
             assert!(
@@ -820,28 +820,21 @@ mod tests {
     #[test]
     fn excerpts_cut_on_whole_lines() {
         let text = lines(200);
-        let head = truncate_head(&text, 1000, MODEL_RESULT_LINES);
-        assert!(head.omitted > 0);
-        assert!(head.head.ends_with('\n'), "头停在行尾：{:?}", head.head);
-        assert!(head.head.starts_with("line 0000: "), "{:?}", head.head);
+        let head = &text[..head_end(&text, 1000)];
+        assert!(head.ends_with('\n'), "头停在行尾：{head:?}");
+        assert!(head.starts_with("line 0000: "), "{head:?}");
+        let tail = &text[tail_start(&text, 1000)..];
+        assert!(tail.starts_with("line "), "尾从行首开始：{tail:?}");
+        assert!(tail.ends_with('\n'), "{tail:?}");
 
-        let tail = truncate_tail(&text, 1000, MODEL_RESULT_LINES);
-        assert!(tail.omitted > 0);
-        assert!(
-            tail.tail.starts_with("line "),
-            "尾从行首开始：{:?}",
-            tail.tail
-        );
-        assert!(tail.tail.ends_with('\n'), "{:?}", tail.tail);
-
-        // decay 仍保留首尾，缓存策略不因 full 视图改成 pi 风格而改变。
+        // decay 仍保留首尾。
         let cut = excerpt(&text, 700, 400);
         assert_eq!(cut.head.lines().count(), 13);
         assert_eq!(cut.tail.lines().count(), 7);
 
-        // 投影里省略那条单独占一行，不和摘录挤在一起。
+        // 预览停在整行上，裁剪说明单独占一行，不和预览挤在一起。
         let printed = project(&facts(Some(&text), None), &budget(1000));
-        assert!(printed.contains("…（中间省略 "), "{printed}");
+        assert!(printed.contains("x\n…（正文 "), "{printed}");
     }
 
     #[test]

@@ -121,8 +121,9 @@ depends on `agent`; `client` knows only protocol types.
   checks that referenced blobs are readable; one that is not faults that task.
 - **Tool result 的模型视图只有一处投影**（`komo-kernel/src/projection.rs`），**收尾时算一次、
   存进结果 entry 的 `model`**，所以"刚跑完"与"重启后回放"逐字节相同（存下的就是那份）。
-  输入只有落盘的事实（完整 `output.json` / stdout / stderr blob）。full 视图默认最多
-  50 KiB 或 2000 行（二者先到）：`bash` 留尾（旧名 `shell` 也认），其他工具留头；超限时必须给出可
+  输入只有落盘的事实（完整 `output.json` / stdout / stderr blob）。full 视图放得下
+  （30 KiB 且 2000 行以内；30 KiB 也是上限，配置只能往小调——模型后端超过约 25000 token 会把整条
+  结果换掉）就给全文，放不下每个工具都只给开头 2 KiB 预览并写明裁了多少；超限时必须给出可
   `read` 的完整 `artifact://<conversation>/<task>/<attempt>/result` 引用。`[execution] model_result_bytes`
   只影响之后落的结果；当前 Session 的 `tool-output/` 与 `artifacts/` 是只读根。衰减写成一条
   `komo.decay` entry，只带 `edits`（`replace` 成 `data.decayed` 的短视图），回放按 edits 选视图；

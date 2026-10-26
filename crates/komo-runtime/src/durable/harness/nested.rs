@@ -401,7 +401,7 @@ mod tests {
     }
 
     #[test]
-    fn bash_rebuilds_a_bounded_tail_and_nonzero_exit_remains_a_value() {
+    fn bash_rebuilds_a_bounded_preview_and_nonzero_exit_remains_a_value() {
         let full = format!("FIRST\n{}LAST\n", "line with content\n".repeat(3000));
         let mut failed = body(&full, json!({"exit_code": 7}));
         failed.status = ToolResultStatus::Failed;
@@ -414,7 +414,8 @@ mod tests {
         let result = NestedResult::from_bash(&output, &attempt(), &projection, false).unwrap();
         let value = result.script_result().unwrap();
         let text = value["text"].as_str().unwrap();
-        assert!(text.contains("LAST") && !text.contains("FIRST"));
+        assert!(text.contains("FIRST") && !text.contains("LAST"), "{text}");
+        assert!(text.contains("超过单条结果上限"), "{text}");
         assert!(text.contains("artifact://1/9/1/result"));
         assert!(text.len() < 2048);
         assert_eq!(value["status"], "failed");

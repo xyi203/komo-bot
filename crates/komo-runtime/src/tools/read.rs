@@ -10,6 +10,7 @@
 //! 拒绝（越权、面外、不存在的 skill…）发生在 `prepare`——**不进计划就没有执行**。
 
 use async_trait::async_trait;
+use komo_kernel::projection::{DEFAULT_MODEL_RESULT_BYTES, MODEL_RESULT_LINES};
 use komo_kernel::traits::{OutputWriter, Tool};
 use komo_kernel::types::ids::OperationId;
 use komo_kernel::types::plan::{
@@ -25,9 +26,14 @@ use super::resources::{self, ResolvedResource, ResourceError};
 use super::{FileVersion, as_text, current, normalized, parse_args, plan_time};
 
 /// 一次 `read` 最多交出多少字节的正文。超出就截断并报告未读范围。
-pub const DEFAULT_BYTE_LIMIT: u64 = 64 * 1024;
-/// 不指定行数时最多给多少行。
-pub const DEFAULT_LINE_LIMIT: u64 = 2000;
+///
+/// 比 kernel 的单条结果上限（[`DEFAULT_MODEL_RESULT_BYTES`]）小一截：截断在这里按整行发生、
+/// 带准确的未读行号，投影就不会再把它换成 2 KiB 预览——否则模型照着引用 `read` 回来，
+/// 拿到的又是一份预览。
+pub const DEFAULT_BYTE_LIMIT: u64 = 28 * 1024;
+/// 不指定行数时最多给多少行。比投影的行数上限少一行：抬头占一行，不然读满默认行数的
+/// 一段会被投影当成放不下、换成预览。
+pub const DEFAULT_LINE_LIMIT: u64 = MODEL_RESULT_LINES as u64 - 1;
 
 /// 模型给的参数。也认 pi 的 `offset` / `limit`（同样 1 起、同样是行数）；其他不认识的字段直接拒，
 /// 免得写错的参数被悄悄丢掉、从第 1 行读起。
@@ -359,12 +365,12 @@ fn slice(
     }
 }
 
-/// 一次 `read` 交给模型多少正文。
+/// 一次 `read` 交给模型多少正文（含抬头）。
 ///
-/// JSONL 保存完整结构化结果；模型能看到多少由投影层
-/// 按 `model_result_bytes` 决定。这里给的是一个够它裁的量——400 字符那种做法会让模型每次
-/// 读文件都只看见开头一小截，而它以为那就是全部。
-pub const PREVIEW_BYTES: usize = 50 * 1024;
+/// JSONL 保存完整结构化结果；模型能看到多少由投影层按 `model_result_bytes` 决定。这里
+/// 比投影上限留出 1 KiB 给投影自己的抬头，默认读出来的一段（[`DEFAULT_BYTE_LIMIT`]）总能
+/// 原样过投影。
+pub const PREVIEW_BYTES: usize = DEFAULT_MODEL_RESULT_BYTES - 1024;
 
 fn preview_of(result: &ReadResult) -> String {
     let header = if result.truncated {
@@ -621,6 +627,63 @@ mod tests {
                 panic!("{raw}：{error:?}")
             };
             assert!(message.contains("会话"), "{raw}：{message}");
+        }
+    }
+
+    /// 默认读一个大文件：截断在 `read` 这里按整行发生、说出未读范围，投影原样放行，
+    /// 不会再被换成预览——照着引用读回来的模型拿到的是正文，不是又一份预览。
+    #[tokio::test]
+    async fn a_default_read_of_a_big_file_passes_the_projection_whole() {
+        use komo_kernel::projection::{ProjectionContext, ToolResultFacts, project};
+        use komo_kernel::types::digest::ContentHash;
+        use komo_kernel::types::refs::{ContentRef, OutputRef};
+
+        let scene = Scene::new();
+        let ctx = scene.ctx();
+        let tool = ReadTool::new();
+        // 长行先碰字节上限，短行先碰行数上限：两种都要原样过投影。
+        for (name, line) in [("long.txt", "汉".repeat(20)), ("short.txt", String::new())] {
+            let body: String = (0..5000)
+                .map(|i| format!("line {i:04}: {line}\n"))
+                .collect();
+            std::fs::write(scene.dir.path().join(name), &body).unwrap();
+            let plan = tool
+                .prepare(serde_json::json!({ "path": name }), &ctx)
+                .await
+                .unwrap();
+            let output = tool.execute(plan, &ctx, &mut writer(&ctx)).await.unwrap();
+            let preview = output.preview.clone().expect("有模型预览");
+            assert!(
+                preview.lines().next().unwrap().contains("未读"),
+                "{preview}"
+            );
+            assert!(preview.ends_with('\n'), "停在整行上");
+
+            let stored = OutputRef(ContentRef {
+                path: "tool-output/1/2/3/output.json".into(),
+                size: body.len() as u64,
+                hash: ContentHash::of_str(&body),
+                pointer: None,
+            });
+            let printed = project(
+                &ToolResultFacts {
+                    tool: "read",
+                    status: ToolResultStatus::Completed,
+                    elapsed_ms: 1,
+                    text: Some(&preview),
+                    output: &stored,
+                    stdout: None,
+                    stderr: None,
+                    artifacts: &[],
+                    images: &[],
+                },
+                &ProjectionContext {
+                    model_result_bytes: DEFAULT_MODEL_RESULT_BYTES,
+                    decay: None,
+                },
+            );
+            assert!(printed.contains(&preview), "{name}: {printed}");
+            assert!(!printed.contains("超过单条结果上限"), "{name}: {printed}");
         }
     }
 

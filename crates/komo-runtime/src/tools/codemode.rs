@@ -41,7 +41,7 @@ write 覆盖已有文件时，用 read 或上次写入回执的 result.version �
 脚本里不支持 then_run，编辑成功后单独 tools.bash(command=...)。\n\
 - 子调用逐次持久化，unsafe 中断不重跑；中断后重跑脚本，已记录的调用原样回放，\
 之后的调用照常执行，分歧或结果不明会终止整段脚本。\n\
-- bash 的 text 留尾并受结果预算限制，完整输出按 artifact:// 引用用 read 取回；\
+- bash 的 text 受结果预算限制，放不下时只给开头预览并写明裁了多少，完整输出按 artifact:// 引用用 read 取回；\
 非零退出正常返回 status=failed 与 result.exit_code。\n\
 - 外层墙钟包含等待子调用的时间；脚本里的 bash 不转后台，长命令可直接在脚本外调用。\n\
 - 一段脚本最多调 256 次工具；完整输出会落盘，给模型的视图统一受结果预算限制。";

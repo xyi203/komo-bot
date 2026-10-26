@@ -426,7 +426,7 @@ fn default_max_observations() -> usize {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecutionConfig {
     /// 交给模型的工具结果正文字节上限。**完整输出永远在 `output.json` 里**，这里限的是
-    /// 投影给模型看多少（§8.3）。
+    /// 投影给模型看多少（§8.3）。只能往小调：超过 30 KiB 按 30 KiB 算（`config check` 报警告）。
     #[serde(default = "default_model_result_bytes")]
     pub model_result_bytes: usize,
     /// 单次工具调用的活动执行时限（秒）。工具自己的超时（如 bash 的 `timeout_secs`）

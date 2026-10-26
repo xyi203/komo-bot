@@ -22,8 +22,8 @@ use crate::executor::cancel::cancelled;
 
 /// 取消或超时后，等进程组真正消失的上限。
 const REAP_TIMEOUT: Duration = Duration::from_secs(5);
-/// 预览保留的头、尾字节数。kernel 最终按工具类型取最多 50 KiB；这里两端都至少保留同样
-/// 多的原始字节，避免工具在统一投影之前先把模型需要的那一端丢掉。
+/// 预览保留的头、尾字节数。kernel 放得下（30 KiB 内）给全文，放不下只给开头预览；这里
+/// 两端都多留一些原始字节，投影前不先替它丢东西。
 const HEAD_LIMIT: usize = 50 * 1024;
 const TAIL_LIMIT: usize = 50 * 1024;
 

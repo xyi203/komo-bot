@@ -32,7 +32,7 @@ use super::{normalized, parse_args, plan_time};
 
 /// 一条命令默认跑多久。
 pub const DEFAULT_TIMEOUT_SECS: u64 = 120;
-/// 默认把输出完整写进已有的 `tool-output`；模型视图的 50 KiB / 2000 行限制在 kernel
+/// 默认把输出完整写进已有的 `tool-output`；模型视图的 30 KiB / 2000 行限制在 kernel
 /// 投影里执行。测试和嵌入方仍可通过 `with_limits` 明确设置存储上限。
 pub const DEFAULT_OUTPUT_LIMIT: u64 = u64::MAX;
 /// 用户插话后，前台命令至少跑这么久才提前转后台：几秒就完的命令照常跑完。

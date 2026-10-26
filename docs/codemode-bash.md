@@ -12,7 +12,7 @@
 记 `uncertain`，哪怕那个进程还在跑。
 
 做法照 pi-durable 的结构：`komo.live` 加一张 `nestedTools`，嵌套任务和顶层一样写意图、节流写输出尾巴与
-子进程身份，`probe` 与顶层共用一条路。另外把嵌套 bash 交给脚本的正文改成留尾的有限视图，不把整份 stdout
+子进程身份，`probe` 与顶层共用一条路。另外把嵌套 bash 交给脚本的正文改成有限视图，不把整份 stdout
 存进 `komo.nested`。
 
 不在这次范围：脚本里的 `edit` / `write`（另议）、嵌套调用的 `detach_after`、TUI 画嵌套调用（§3.5；后来在 §8 补上）。
@@ -114,7 +114,7 @@ MCP，不起 `run_child_detachable` 的子进程，所以也用不上 `probe`"�
 今天嵌套结果的 `text` 是 `captured`，也就是整份 stdout，原样存进 `komo.nested`。`read` 一个文件尚可，
 `cargo test` 的几 MB 日志不该进 `durable.db` 的 document。改成：
 
-- bash 的 `text` 取 `projection.rs` 的 full 视图（留尾，默认 50 KiB / 2000 行），超限时带 `output`
+- bash 的 `text` 取 `projection.rs` 的 full 视图（默认 30 KiB / 2000 行，放不下给开头预览），超限时带 `output`
   里已有的 `artifact://…/result` 引用，脚本要全文可以 `tools.read` 它；
 - 这份视图由已发布的 `output.json` 正文、持久化耗时与 stdout / stderr 引用决定；
   `nested::reusable` 对 bash 按"完整输出通过身份 / 哈希验证、有限视图可重建"复用，不再要求预览等于全部 stdout。
@@ -142,7 +142,7 @@ MCP，不起 `run_child_detachable` 的子进程，所以也用不上 `probe`"�
 | `komo-runtime` `durable/harness/live.rs` | `NestedToolSlot` 或给 `ToolSlot` 加 `parent_task_id`；`LiveState.nested_tools`；`slot` / `slot_mut` 两表查找；删外层名下行的函数 |
 | `komo-runtime` `durable/harness/codemode.rs` | 建嵌套任务的提交里推 `pending` 槽位 |
 | `komo-runtime` `durable/harness/tool.rs` | 嵌套放行 `ShellCommand`；意图、重跑、`commit_output` 去掉 `slotted` 分支；外层收尾删行 |
-| `komo-runtime` `durable/harness/nested.rs` | `commit_nested` 改槽位状态；bash 的 `text` 取留尾视图；`reusable` 的 bash 条件 |
+| `komo-runtime` `durable/harness/nested.rs` | `commit_nested` 改槽位状态；bash 的 `text` 取 full 投影视图；`reusable` 的 bash 条件 |
 | `docs/codemode.md` | 文首状态、§4 文件段、§5 第 1–3 条、§7 恢复表加 `probe` 一行、§8 限制、§9 落点 |
 | `docs/komo_bot.md` | §4 codemode 一段与"搜索走 `rg`"一段里"脚本里只放行只读与 MCP" |
 | `docs/storage-durable.md` | §4.7 嵌套一段、§13.2 那条偏离改成"已按 pi 补上" |
@@ -152,7 +152,7 @@ MCP，不起 `run_child_detachable` 的子进程，所以也用不上 `probe`"�
 ## 5. 测试
 
 - `harness/tests/codemode.rs`：脚本调 `bash` 拿到 `status` / `text` / `exit_code`，非零退出不抛；输出超限时
-  `text` 留尾并带 `artifact://` 引用，`tools.read` 能读全文；`komo.nested` 成员不含整份 stdout。
+  `text` 是有限视图并带 `artifact://` 引用，`tools.read` 能读全文；`komo.nested` 成员不含整份 stdout。
 - `harness/tests/codemode.rs`（probe 场景）：嵌套 bash 报告进程身份后"崩溃"，重启时嵌套任务进 `probe`、外层重跑脚本等它；
   进程结束后 unsafe 记 `uncertain`、有完整 `output.json` 则复用；取消时写 `aborted` 且正文点名 pid。
 - 槽位生命周期：建任务 `pending` → 意图 `running` → 进度带 pid → 终结清尾巴 → 外层终结后 `nestedTools`
@@ -175,7 +175,7 @@ MCP，不起 `run_child_detachable` 的子进程，所以也用不上 `probe`"�
 - pending 槽位、任务与 `komo.nested` 成员同笔创建。顶层与嵌套共用意图、节流进度、probe、安全重跑与清理；
   完成的子槽位清掉尾巴与进程身份，外层收尾（含 fault / orphan）移除名下行。
 - bash 结果使用同一处 kernel 投影，输入来自已发布的正文、流引用与持久化耗时；
-  不再额外收集完整 stdout。超限时保留尾部与 artifact 入口，其他工具的完整正文接口保留。
+  不再额外收集完整 stdout。超限时给开头预览、裁剪说明与 artifact 入口，其他工具的完整正文接口保留。
 - 补齐嵌套宿主 `Timeout` / `Cancelled` 的持久化状态：fresh 执行与完整输出重建都保持 uncertain，
   脚本捕获异常也不能执行后续调用。bash 的非零退出仍是 failed 字典，可以检查后继续。
 

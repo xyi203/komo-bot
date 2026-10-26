@@ -176,7 +176,7 @@ Monty 的 `max_turn_duration` 不含等宿主答复的时间，所以墙钟由�
 ```
 
 bash 非零退出正常返回 `status: failed` 与 `result.exit_code`，脚本可检查后继续。
-它的 `text` 用 kernel full 投影，默认最多 50 KiB / 2000 行，超限附 `artifact://…/result`；
+它的 `text` 用 kernel full 投影，放得下（30 KiB / 2000 行以内）给全文，放不下给开头 2 KiB 预览加裁剪说明，并附 `artifact://…/result`；
 原始 stdout / stderr 留在 blob，脚本可以再调 `tools.read`。不额外收集完整 bash stdout，也不把它存进 `komo.nested`。
 
 普通执行/参数/不支持操作的错误可被 `try/except ToolError` 捕获；这些结果也持久化。
@@ -345,7 +345,7 @@ BM25 在 Monty 里做完（原来 `driver.py` 的那份，逻辑未动），不�
 
 ## 8. 限制
 
-- 时限：`[execution] call_timeout_secs`，包含等待工具与恢复后等待 probe 的时间，到点 SIGKILL worker；嵌套 bash 不转后台，长命令可在脚本外调。完整输出落盘，模型视图最多 50 KiB / 2000 行；内层调用最多 256 次。
+- 时限：`[execution] call_timeout_secs`，包含等待工具与恢复后等待 probe 的时间，到点 SIGKILL worker；嵌套 bash 不转后台，长命令可在脚本外调。完整输出落盘，模型视图最多 30 KiB / 2000 行；内层调用最多 256 次。
 - 内存、输出、递归等 worker 侧限制见 §4 的表。
 - 脚本之间不共享状态（pi 的 `store/load` 不做）。
 - 不跑模型（pi 的 `models` 不做）。

@@ -428,6 +428,13 @@ fn check_execution(snapshot: &ConfigSnapshot, issues: &mut Vec<ConfigIssue>) {
             "model_result_bytes 不能是 0（模型就什么都看不到了）",
         ));
     }
+    let cap = komo_kernel::projection::DEFAULT_MODEL_RESULT_BYTES;
+    if snapshot.execution.model_result_bytes > cap {
+        issues.push(warning(
+            "execution.model_result_bytes",
+            format!("model_result_bytes 最大 {cap}，按 {cap} 算（再大会被模型后端整条换成报错）"),
+        ));
+    }
     if snapshot.execution.call_timeout_secs == 0 {
         issues.push(error(
             "execution.call_timeout_secs",
@@ -734,6 +741,16 @@ mod tests {
         let issues = validate(&snapshot);
         assert_eq!(keys(&issues), vec!["mcp.servers.gh.read_only"]);
         assert_eq!(issues[0].severity, IssueSeverity::Warning);
+    }
+
+    #[test]
+    fn a_model_result_budget_above_the_cap_is_a_warning() {
+        let mut snapshot = snapshot_fixture();
+        snapshot.execution.model_result_bytes = 51200;
+        let issues = validate(&snapshot);
+        assert_eq!(keys(&issues), vec!["execution.model_result_bytes"]);
+        assert_eq!(issues[0].severity, IssueSeverity::Warning);
+        assert!(issues[0].message.contains("30720"), "{:?}", issues[0]);
     }
 
     #[test]

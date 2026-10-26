@@ -136,14 +136,15 @@ async fn a_runaway_script_is_killed_at_the_call_timeout() {
 }
 
 #[tokio::test]
-async fn a_bash_tail_can_be_followed_by_reading_its_complete_artifact_inside_the_script() {
+async fn a_bash_preview_can_be_followed_by_reading_its_complete_artifact_inside_the_script() {
     let home = Home::with_config(&config_toml("[execution]\nmodel_result_bytes = 1024\n"));
     let code = r#"
 r = tools.bash(command="printf 'FIRST_OUT\\n'; for ((i=0; i<1000; i++)); do printf 'line %04d data\\n' \"$i\"; done; printf 'LAST_OUT\\n'; printf 'STDERR_OUT\\n' >&2; exit 7")
 ref = r["text"].split("完整输出：", 1)[1].split("（", 1)[0].strip()
 full = tools.read(path=ref)["text"]
 text({"status": r["status"], "exit": r["result"]["exit_code"],
-      "tail": "LAST_OUT" in r["text"], "head_in_tail": "FIRST_OUT" in r["text"],
+      "head": "FIRST_OUT" in r["text"], "tail_in_head": "LAST_OUT" in r["text"],
+      "notice": "超过单条结果上限" in r["text"],
       "full_head": "FIRST_OUT" in full, "full_tail": "LAST_OUT" in full,
       "stderr": "STDERR_OUT" in full})
 "#;
@@ -151,8 +152,9 @@ text({"status": r["status"], "exit": r["result"]["exit_code"],
     for expected in [
         "\"status\": \"failed\"",
         "\"exit\": 7",
-        "\"tail\": true",
-        "\"head_in_tail\": false",
+        "\"head\": true",
+        "\"tail_in_head\": false",
+        "\"notice\": true",
         "\"full_head\": true",
         "\"full_tail\": true",
         "\"stderr\": true",

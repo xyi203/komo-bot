@@ -1,6 +1,6 @@
 # komo Memory
 
-> 状态：§9.1–§9.7 是 Memory 的**规格**，2026-10-19 从 [`komo_bot.md`](komo_bot.md) §9 原样迁来，小节号不变——代码注释与其他文档里的 §9.x 照旧指这里。§9.8–§9.10 已实现（§9.10 含 `used` 采纳）。附录 A–D 是调研、分析与评估，不是规格；与正文冲突时以正文为准，任何一条要落地，先改正文。
+> 状态：§9.1–§9.7 是 Memory 的**规格**，2026-10-19 从 [`komo_bot.md`](komo_bot.md) §9 原样迁来，小节号不变——代码注释与其他文档里的 §9.x 照旧指这里。§9.8–§9.10 已实现（§9.10 含 `used` 采纳）。附录 A–E 是调研、分析与评估，不是规格；与正文冲突时以正文为准，任何一条要落地，先改正文。
 > 2026-10-25 起 Memory 跑在新存储上（`docs/storage-durable.md`）：条目 / 证据 / 索引 / 采纳计数在 `aux.db`（toasty，与 `durable.db` 分库），会话内容是 `durable.db` 的 entry，证据引用仍是 `Seq` / `RunId`（新编码，`komo-kernel/src/durable/legacy_ids.rs`）；注入是系统段 `memory` + 会话级 document `komo.memory`，提取游标是 document `komo.memory_cursor`，提取读的是 entry / submission 经 `legacy_events` 投影出的事件。正文里仍写"事件""Run""`memory.injected`"的地方指这层投影的词汇，不再是 JSONL 事件。
 > 文中不带文件名的其他章节号（§3、§8.2、§8.5、§10 …）指 [`komo_bot.md`](komo_bot.md)。附录内的编号只在本附录内有效。
 
@@ -20,6 +20,7 @@
 | 附录 B | 记忆机制改进方案（原 `docs/memory-improvements.md`） | 2026-10-16 提案 |
 | 附录 C | 对照 v0.8 的差距分析（原 `docs/memory.md`） | 2026-09-24 分析 |
 | 附录 D | 记忆效果基线：注入有没有用、该召回的召回了没有 | 2026-10-19 回溯评估 |
+| 附录 E | Claude Code 的记忆机制（官方文档核对） | 2026-10-26 调研 |
 
 ## 9.1 两类内容，分别保存
 
@@ -988,3 +989,53 @@ preference 的最近一条证据早于阈值时，`render_line` 附"较久未佐
 4. **被用上的多是可执行的环境事实**；偏好与设计意图类很少直接改变决定。
 
 **下一次评估**：`used` 上线后，`komo.memory.injected` / `komo.memory.used` 指标与 `memory_items.adopted_count` 自动给出采纳率趋势；漏召回仍要按 D.3 的方法定期回溯。改了召回之后，用同一口径对比本附录的数字。
+
+## 附录 E：Claude Code 的记忆机制（2026-10-26 调研）
+
+来源：官方文档 [memory](https://code.claude.com/docs/en/memory.md)、[context-window](https://code.claude.com/docs/en/context-window.md)（"What survives compaction"）、[settings-reference](https://code.claude.com/docs/en/settings-reference.md)，2026-10-26 抓取；另对照了一次实际会话收到的系统提示。changelog 太大没有通读。下文没标"未公开"的都有文档原文支撑。
+
+### E.1 两层，全是文件
+
+| | CLAUDE.md | 自动记忆（auto memory） |
+|---|---|---|
+| 谁写 | 主要是人；模型被要求时也写 | 模型自己用普通文件工具写 |
+| 位置 | managed 路径 → `~/.claude/CLAUDE.md` → 项目 `CLAUDE.md` / `.claude/CLAUDE.md` → `CLAUDE.local.md`；加 `.claude/rules/` | `~/.claude/projects/<project>/memory/`，`<project>` 由 git 仓库决定，worktree 与子目录共用一份；只在本机，不跨机器 |
+| 进上下文 | 启动时整份（≤ 4 MiB，超过整个跳过），作为系统提示之后的一条 user message；多层**拼接**不覆盖，从文件系统根到工作目录排序，同目录 `CLAUDE.local.md` 在后 | 只有 `MEMORY.md` 的前 200 行或前 25KB（先到为准）；主题文件不预载，模型需要时自己读 |
+| 子目录 | 子目录的 CLAUDE.md 在模型读 / 写 / 编辑该目录下文件时才加载（bash `cat` 单文件也算），按需加载的文件有字符上限，超出只给开头并提示去读 | — |
+| 压缩后 | 项目根 CLAUDE.md 与无路径规则从磁盘重新注入；子目录的等下次用到 | 从磁盘重新注入 |
+| 子代理 | — | 主对话的自动记忆不进子代理；子代理定义里的 `memory` 字段可开自己的记忆 |
+
+其他细节：`@import` 相对引用文件解析，最多 4 层；块级 HTML 注释注入前剥掉；工作目录及以上都没有 CLAUDE.md 时读 AGENTS.md；`claudeMdExcludes` 按 glob 排除（不能排除 managed）。
+
+### E.2 自动记忆的写法
+
+- 一条事实一个 Markdown 文件，frontmatter 有 `name` / `description` / `type`（user · feedback · project · reference）；`MEMORY.md` 是索引，每条一行。`description` 写成一句话能判断相关性的摘要，因为常驻的只有索引。
+- 写入规则（文档与系统提示一致）：能从代码库推出的不存，CLAUDE.md 已写的不存；先查重，更新已有文件而不是新建；错了就删。系统提示另外要求相对日期转绝对日期、feedback / project 类写明 Why 与 How to apply、用 `[[name]]` 互链。
+- 召回到的记忆被当作背景而不是指令，代表写入当时的情况；里面提到的文件、函数、配置项在推荐前要先核实还在。
+- 索引的上限是硬的：模型写 `MEMORY.md` 接近 200 行 / 25KB 时 harness 警告，超过时写入报错——逼模型自己整理，而不是悄悄截断。
+- 会话记录过了 `cleanupPeriodDays` 会被删，记忆文件不在其列，除非人或模型改删。
+- 开关：默认开（自托管环境默认关）；`/memory` 里切换（写 `autoMemoryEnabled`）、项目级设置可单独关、`CLAUDE_CODE_DISABLE_AUTO_MEMORY=1`；`autoMemoryDirectory` 改位置。没有团队共享记忆，团队共享只靠提交进仓库的 CLAUDE.md 与 `.claude/rules/`。
+
+### E.3 未公开 / 未证实
+
+- **召回怎么选**：界面会显示 "Recalled N memories"，但是模型自己挑文件读，还是 harness 有一个按 `description` 筛选的选择器，以及每次几条、按轮还是按会话，文档都没写。
+- **后台抽取**：文档只说 Claude 在会话中自己写，没说有没有不经主模型的后台抽取。
+- **离线整理（"Auto Dream"）**：只见于第三方文章（[implicator.ai](https://www.implicator.ai/anthropic-adds-auto-dream-to-claude-code-fixing-memory-decay-between-sessions)、[claudefa.st](https://claudefa.st/blog/guide/mechanics/auto-dream)），说是 orient / gather / consolidate / prune 四步、距上次 >24h 且 ≥5 个会话触发；官方 memory 页与 settings 页都没有，状态、触发与能否关闭都无法确认。
+
+### E.4 与 komo 的对照（未决定）
+
+| | Claude Code | komo |
+|---|---|---|
+| 事实源 | Markdown 文件 | `aux.db` 条目 + 证据（§9.2） |
+| 写入 | 主模型在会话中顺手写 | 会话后单独一次提取调用（§9.10） |
+| 常驻 | 索引（≤ 200 行），正文按需读 | 每段检索注入最多 8 条（§9.4） |
+| 召回 | 模型读索引后自己读文件（选择器未公开） | 关键词 + 向量混合检索 |
+| 来源 / 确认 / 失效 | 没有，只有"可能过期、先核实" | 来源、确认、证据 seq、取代与遗忘（§9.6） |
+| 整理压力 | 索引硬上限，写超报错 | `consolidate` / `sweep`（§9.8） |
+
+值得留意的两点：
+
+1. 常驻的是**目录**而不是**检索结果**，相关性判断交给主模型、对着当前任务做，绕开了附录 D.4 里"第一轮召回只能对着第一句话"的问题，代价是每轮都占索引那几百行。
+2. 硬上限 + 写超报错把整理变成写入路径上的必经一步，而不是另起的离线任务。
+
+Claude Code 没有来源与确认，靠"用之前先核实"兜底；komo 的写入侧比它严，差距在召回时机与常驻形态上。

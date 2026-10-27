@@ -152,12 +152,12 @@ impl App {
     }
 
     /// **Esc 的两个意思**：Run 在跑时取消它；空闲时什么都不做——一个有时会清掉草稿的
-    /// 停止键，比多按一下还糟。
+    /// 停止键，比多按一下还糟。取消不留提示：提示会进回滚区一直留着，而状态行已经
+    /// 写着「已取消」（同 `/cancel`）。
     fn escape(&mut self) -> Vec<Effect> {
         match (self.current_run.clone(), self.run_state()) {
             (Some(run), Some(status)) if !status.is_terminal() => {
                 let request_key = self.next_key("cancel");
-                self.note(format!("已请求取消 {run}"));
                 vec![Effect::Cancel { run, request_key }]
             }
             _ => Vec::new(),

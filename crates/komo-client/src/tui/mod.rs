@@ -497,11 +497,8 @@ async fn run_effect(
                 request_key: Some(request_key),
             };
             match client.cancel_run(&run, &request).await {
-                Ok(response) => Some(ServerEvent::Notice(format!(
-                    "{} 现在是 {}",
-                    response.run,
-                    app::status_text(response.state)
-                ))),
+                // 成功不说话：Run 的终态由事件流送到，状态行会写出来；进回滚区的提示删不掉。
+                Ok(_) => None,
                 Err(error) => Some(ServerEvent::Failed(format!("取消失败：{error}"))),
             }
         }

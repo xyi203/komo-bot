@@ -233,6 +233,7 @@ fn esc_while_a_run_is_going_cancels_it() {
         matches!(&effects[0], Effect::Cancel { run, .. } if run == &fixture::run()),
         "{effects:?}"
     );
+    assert!(app.notices.is_empty(), "取消不留提示：{}", notices(&app));
 }
 
 #[test]

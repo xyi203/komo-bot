@@ -63,6 +63,9 @@ pub struct RunControl {
     /// 已花的 token（输入 + 输出）。
     #[serde(default)]
     pub tokens: u64,
+    /// run 开始的时刻（毫秒）。任务交回时报用时；旧文档没有它，读成 0 就不报。
+    #[serde(default)]
+    pub started_at: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

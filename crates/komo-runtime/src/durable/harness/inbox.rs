@@ -673,6 +673,7 @@ pub async fn start_run(
         inputs,
         rounds: 0,
         tokens: 0,
+        started_at: tx.now(),
     });
     Ok(task)
 }

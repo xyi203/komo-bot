@@ -216,6 +216,7 @@ async fn write_live(
                         inputs: vec![SubmissionId::new(7)],
                         rounds,
                         tokens: 0,
+                        started_at: 0,
                     }),
                     generation: Some(GenerationLive {
                         attempt: 1,

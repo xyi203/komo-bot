@@ -279,6 +279,7 @@ async fn spawn(cx: &Cx<'_>, request: Request) -> Result<(), TaskError> {
                 effort,
                 contracts: BTreeMap::new(),
                 last_run: None,
+                continued: None,
             };
             if let Some(contract) = contract {
                 doc.contracts.insert(first.to_string(), contract);

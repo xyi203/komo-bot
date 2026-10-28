@@ -15,16 +15,28 @@
 //!   交回是普通 followUp，会被撤）。
 //!
 //! 收尾的每个出口（回答、模型失败、预算、abort、调度器写的 faulted / orphaned）都经
-//! [`end_run`] / [`end_run_abnormal`]，所以任务无论怎么结束父都会收到一条（"已完成"或"没有
-//! 完成"）。
+//! [`end_run`] / [`end_answered_run`] / [`end_run_abnormal`]，所以任务无论怎么结束父都会收到一条
+//! （标题是"已完成""受阻""交回了，没说做完没有"或"没有完成"，后面带工具调用轮数与用时）。
+//!
+//! - **状态行与自动续跑**（`docs/background-tasks.md` §2c）：任务的回答末行写
+//!   [`TASK_STATUS_DONE`] / [`TASK_STATUS_BLOCKED`]，标题按它定——只看 `stopReason` 分不出"做完了"
+//!   和"自己觉得差不多了"。没写状态行的回答先不交回：同一次提交里往任务会话放一条
+//!   [`TASK_CONTINUE_ENTRY`] 输入、起后继 run（Claude Code 的 SubagentStop hook 返回 block 也是
+//!   这样让子 agent 接着做）。以续跑输入开头的 run 不再续跑，所以每条派出 / 追问的输入最多续跑
+//!   一次；带结果契约的回答只放 JSON，不看状态行。
 
 use komo_kernel::durable::{
-    Content, ConversationId, EntryRecord, Message, SessionLifecycle, SubmissionSettlement, TaskId,
+    Content, ConversationId, EntryId, EntryRecord, Message, SessionLifecycle, SubmissionSettlement,
+    TaskId,
 };
 use komo_kernel::types::delegate::DelegateContract;
+use komo_kernel::types::task::{TASK_STATUS_BLOCKED, TASK_STATUS_DONE, duration_words};
 use serde_json::{Value, json};
 
-use super::{LastRun, TASK_RESULT_ENTRY, load_task_doc, store_task_doc};
+use super::{
+    LastRun, TASK_CONTINUE_ENTRY, TASK_CONTINUE_PROMPT, TASK_RESULT_ENTRY, TaskDoc, load_task_doc,
+    store_task_doc,
+};
 use crate::durable::error::DurableError;
 use crate::durable::harness::generation::GenerationTask;
 use crate::durable::harness::inbox::{self, At, Boundary, InputEntry, SubmissionDraft, WhenBusy};
@@ -36,6 +48,50 @@ use crate::durable::tx::Tx;
 enum Outcome {
     Completed,
     NotCompleted,
+}
+
+/// 回答末行写的状态（模块文档的"状态行"）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Status {
+    Done,
+    Blocked,
+    Unstated,
+}
+
+/// 末行是不是 [`TASK_STATUS_DONE`] / [`TASK_STATUS_BLOCKED`]。模型常给它加粗、套引用或列表
+/// 符号，冒号也会写成半角，这些都认；"状态：未完成"之类不认，按没写算。
+fn status_of(text: &str) -> Status {
+    let Some(line) = text.lines().map(str::trim).rfind(|line| !line.is_empty()) else {
+        return Status::Unstated;
+    };
+    let line: String = line
+        .chars()
+        .filter(|c| !matches!(c, '*' | '`' | '_'))
+        .collect();
+    let line = line
+        .trim_start_matches(['>', '-', '#', ' '])
+        .replace(':', "：")
+        .replace("： ", "：");
+    if line.starts_with(TASK_STATUS_DONE) {
+        Status::Done
+    } else if line.starts_with(TASK_STATUS_BLOCKED) {
+        Status::Blocked
+    } else {
+        Status::Unstated
+    }
+}
+
+/// 标题里跟在结局后面的数字：工具调用轮数与用时（旧 `komo.live` 没有开始时刻就不报用时）。
+fn facts(run: &live::RunControl, now: i64, continued: bool) -> String {
+    let mut out = format!(" · {} 轮工具调用", run.rounds);
+    if run.started_at > 0 {
+        let span = time::Duration::milliseconds(now - run.started_at);
+        out.push_str(&format!(" · {}", duration_words(span)));
+    }
+    if continued {
+        out.push_str(" · 自动续跑过一次");
+    }
+    out
 }
 
 fn answer_text(entry: &EntryRecord) -> String {
@@ -164,24 +220,68 @@ pub(crate) async fn end_run(
     let Some(run) = live::end_run(tx, live, task, settlement).await? else {
         return Ok(false);
     };
-    report(tx, generation, conversation, &run, settlement).await?;
+    report(tx, generation, conversation, &run, settlement, false).await?;
     Ok(true)
 }
 
+/// 回答收尾用的 [`end_run`]：任务会话的回答没写状态行时不交回，同一次提交里放一条续跑输入、
+/// 起后继 run（模块文档的"自动续跑"）。`idle`：这次 final boundary 没放任何用户项、收件箱也空了
+/// ——否则后继 run 本来就要起（派它的会话追问过来了），续跑让给它，回答照常交回。
+pub(crate) async fn end_answered_run(
+    tx: &mut Tx,
+    generation: &GenerationTask,
+    conversation: ConversationId,
+    live: &mut LiveState,
+    task: TaskId,
+    answer: EntryId,
+    idle: bool,
+) -> Result<(), DurableError> {
+    let settlement = SubmissionSettlement::Done { answer };
+    let Some(run) = live::end_run(tx, live, task, &settlement).await? else {
+        return Ok(());
+    };
+    let Some(mut doc) = report(tx, generation, conversation, &run, &settlement, idle).await? else {
+        return Ok(());
+    };
+    let now = tx.now();
+    let entry = InputEntry::new(
+        TASK_CONTINUE_ENTRY,
+        Some(json!({ "after": run.inputs.first() })),
+    );
+    let id = inbox::place_idle_input(
+        tx,
+        generation,
+        conversation,
+        live,
+        &Content::Text(TASK_CONTINUE_PROMPT.to_owned()),
+        Some(&entry),
+        None,
+        now,
+    )
+    .await?;
+    doc.continued = Some(id);
+    store_task_doc(tx, conversation, &doc).await
+}
+
 /// run 结束了，往父交回结果（这不是后台任务的 conversation、父不在了、没有输入都什么都不做）。
+/// `may_continue` 时没写状态行的回答不交回，返回那份 `komo.task` 交给调用方去续跑（lastRun
+/// 不动、契约不取，都留给续跑之后那次收尾）。
 async fn report(
     tx: &mut Tx,
     generation: &GenerationTask,
     conversation: ConversationId,
     run: &live::RunControl,
     settlement: &SubmissionSettlement,
-) -> Result<(), DurableError> {
+    may_continue: bool,
+) -> Result<Option<TaskDoc>, DurableError> {
     let Some(mut doc) = load_task_doc(tx, conversation).await? else {
-        return Ok(());
+        return Ok(None);
     };
     let Some(first) = run.inputs.first().copied() else {
-        return Ok(());
+        return Ok(None);
     };
+    let continued = doc.continued == Some(first);
+    let has_contract = doc.contracts.contains_key(&first.to_string());
 
     let (outcome, text, last) = match settlement {
         SubmissionSettlement::Done { answer } => {
@@ -189,6 +289,9 @@ async fn report(
                 .staged_entry(*answer)
                 .map(answer_text)
                 .unwrap_or_default();
+            if may_continue && !continued && !has_contract && status_of(&text) == Status::Unstated {
+                return Ok(Some(doc));
+            }
             let last = LastRun {
                 state: "completed".into(),
                 ended_at: tx.now(),
@@ -219,7 +322,7 @@ async fn report(
     // 父不在了就没有可交回的对象；不能因此让这次收尾失败（失败路径会再走一遍这里）。
     let parent = doc.parent;
     let Some(parent_record) = tx.conversation(parent).await? else {
-        return Ok(());
+        return Ok(None);
     };
     // 父所在的 Session 已经在删（`closing` / `deleted` / `purged`）：不再交回——交回的输入是内部
     // 输入，会在父里起后继 run，删除流程撤过一遍之后晚到的结果不能再让已删的会话动起来。
@@ -229,12 +332,17 @@ async fn report(
             .await?
             .is_some_and(|record| record.lifecycle != SessionLifecycle::Active)
     {
-        return Ok(());
+        return Ok(None);
     }
-    let headline = match outcome {
-        Outcome::Completed => "已完成",
-        Outcome::NotCompleted => "没有完成",
+    // 带契约的回答只放 JSON，结局看契约复验，不看状态行。
+    let status = (outcome == Outcome::Completed && !has_contract).then(|| status_of(&text));
+    let headline = match (outcome, status) {
+        (Outcome::Completed, Some(Status::Blocked)) => "受阻",
+        (Outcome::Completed, Some(Status::Unstated)) => "交回了，没说做完没有",
+        (Outcome::Completed, _) => "已完成",
+        (Outcome::NotCompleted, _) => "没有完成",
     };
+    let facts = facts(run, tx.now(), continued);
     let verdict = match (outcome, &contract) {
         (Outcome::Completed, Some(contract)) => {
             format!("{}\n\n", contract_verdict(contract, &text))
@@ -242,7 +350,7 @@ async fn report(
         _ => String::new(),
     };
     let input = format!(
-        "[后台任务 #{handle}「{title}」{headline}]\n\n{text}\n\n{verdict}\
+        "[后台任务 #{handle}「{title}」{headline}{facts}]\n\n{text}\n\n{verdict}\
          （这是后台任务交回的结果，不是用户发来的消息；用户看不到上面这段，请把结论转告用户。）",
         handle = conversation,
         title = doc.title,
@@ -260,6 +368,12 @@ async fn report(
                         Outcome::Completed => "completed",
                         Outcome::NotCompleted => "notCompleted",
                     },
+                    "status": status.map(|status| match status {
+                        Status::Done => "done",
+                        Status::Blocked => "blocked",
+                        Status::Unstated => "unstated",
+                    }),
+                    "rounds": run.rounds,
                 }
             })),
         )),
@@ -269,5 +383,42 @@ async fn report(
         internal: true,
     };
     inbox::admit(tx, generation, parent, &draft, generation.modes()).await?;
-    Ok(())
+    Ok(None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_status_line_is_read_from_the_last_non_empty_line() {
+        assert_eq!(
+            status_of(&format!("改完了，测试全过。\n\n{TASK_STATUS_DONE}\n")),
+            Status::Done
+        );
+        assert_eq!(
+            status_of(&format!("{TASK_STATUS_BLOCKED}：方案的前提不成立")),
+            Status::Blocked
+        );
+        // 加粗、引用、半角冒号都认。
+        assert_eq!(status_of("结论……\n**状态**: 完成"), Status::Done);
+        assert_eq!(status_of("> 状态：受阻：缺权限"), Status::Blocked);
+    }
+
+    /// fork 任务的说明教的写法就是这里认的写法（fresh 任务的在 komo-agent 的测试里核对）。
+    #[test]
+    fn the_fork_notice_teaches_both_status_lines() {
+        for status in [TASK_STATUS_DONE, TASK_STATUS_BLOCKED] {
+            assert!(super::super::FORK_NOTICE.contains(status), "{status}");
+        }
+    }
+
+    #[test]
+    fn a_missing_or_unknown_status_counts_as_unstated() {
+        assert_eq!(status_of(""), Status::Unstated);
+        assert_eq!(status_of("改了一半，还没跑测试。"), Status::Unstated);
+        assert_eq!(status_of("状态：未完成"), Status::Unstated);
+        // 状态行不在末行不算：后面又写了东西，说明它不是收尾。
+        assert_eq!(status_of("状态：完成\n还有一件事没做"), Status::Unstated);
+    }
 }

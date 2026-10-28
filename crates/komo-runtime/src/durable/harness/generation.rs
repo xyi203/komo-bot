@@ -813,13 +813,15 @@ impl GenerationTask {
                 let now = tx.now();
                 let entry = append_assistant(tx, conversation, message).await?;
                 let result = inbox::apply_boundary(tx, &mut boundary, At::Final, now).await?;
-                report::end_run(
+                let idle = result.users.is_empty() && boundary.inbox.items.is_empty();
+                report::end_answered_run(
                     tx,
                     &this,
                     conversation,
                     &mut live,
                     task.id(),
-                    &SubmissionSettlement::Done { answer: entry.id },
+                    entry.id,
+                    idle,
                 )
                 .await?;
                 if !result.users.is_empty() {

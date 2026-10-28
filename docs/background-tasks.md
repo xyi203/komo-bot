@@ -31,7 +31,7 @@
                        │ run 收尾（回答 / 失败 / 取消 / 预算 / faulted）
                        ▼
                      同一次提交里往 home 的 conversation 提交一条内部输入
-                       │ "[后台任务 #12「标题」已完成] …"
+                       │ "[后台任务 #12「标题」已完成 · 6 轮工具调用 · 2 分 5 秒] …"
                        ▼
                      home 跑一轮，把结论转告来源渠道
 ```
@@ -39,7 +39,7 @@
 - **没有分发器。** home 用会话自己的 Agent 跑；什么时候派、什么时候自己做，由模型按 `task` 的工具说明判断（几秒能做完的直接做）。工具说明只留这条判断、prompt 要自包含与结果交回的方式，追问、查进度、`contract`、并行的细则在 `tool://task/doc`（按需读，`docs/komo_bot.md` §4）。
 - **派出 = 一次提交。** `task` 是一个 `komo.tool` 任务，`call` 阶段在 `Tool::prepare` 之后转进 `orchestration`（不走通用的 intent → execute）：同一次提交里建**锚任务**（`komo.background`，conversation 所有、background、立刻 completed）、子 conversation（所有者是锚任务）、`komo.task` document（父、标题、模型 / effort 名字、结果契约）、`sessions` 行（`kind = task`、`parent_session`）、第一条输入与它的 run，并把工具任务的 checkpoint 推进到 `orchestrate { reply }`，之后另一次提交落"已派出"结果 entry。两次之间崩溃，恢复从 `orchestrate` 接着落结果，**不会再派一遍**。锚任务让子 conversation 是 background 的：它不挡父的 idle，父的 run 被取消也不连带子（与旧规则一致）；子有活时锚任务停在 `completing`。
 - **句柄**是子 conversation 的十进制 ID（`#12`；`komo session list` 里的"任务·#xxxx"标注仍是会话 UUID 后四位，客户端协议冻结，与它对不上）：`task_id` 解析成 conversation 后核对 `komo.task.parent` 就是调用方，不需要登记表。
-- **交回 = runtime 的 `report`，同一次提交。** 子 conversation 的 run 每个出口（回答、模型失败、预算、abort、调度器写的 faulted / orphaned）都经 `report::end_run` / `end_run_abnormal`：在结束 run 的**同一次提交**里往父 conversation 受理一条 steer 输入——entry kind `task.result`，请求键 `task-result:{子 conversation}:{这条 run 的首个输入}`，在父里按请求键去重，所以原子、幂等，没有"终态了、交回之前崩溃"那个旧窗口。正文是 `[后台任务 #12「标题」已完成 / 没有完成] …`（任务的最终回复，或失败 / 取消的原因）。
+- **交回 = runtime 的 `report`，同一次提交。** 子 conversation 的 run 每个出口（回答、模型失败、预算、abort、调度器写的 faulted / orphaned）都经 `report::end_run` / `end_answered_run` / `end_run_abnormal`：在结束 run 的**同一次提交**里往父 conversation 受理一条 steer 输入——entry kind `task.result`，请求键 `task-result:{子 conversation}:{这条 run 的首个输入}`，在父里按请求键去重，所以原子、幂等，没有"终态了、交回之前崩溃"那个旧窗口。正文是 `[后台任务 #12「标题」<结局> · <轮数> 轮工具调用 · <用时>] …`（任务的最终回复，或失败 / 取消的原因）；结局与自动续跑见 §2c。
 - **内部输入。** 交回的输入（以及监听的 `monitor.event` / `monitor.end`）带 `internal` 标记，规则三条：①取消父的 run 时 `abort_conversation` 只撤用户输入，**不撤内部输入**；②父的 run 非正常收尾（取消、失败、预算、fault、orphan）时，同一次提交里按 final boundary 放置收件箱里排着的全部输入、起后继 run——父照旧跑一轮把结论转告用户；③显式的单条 `Harness::withdraw` 对内部输入仍有效。**删除会话**时先撤回全部排队的输入（含内部输入）再 abort，不会再起后继 run（`docs/komo_bot.md` §8.10）。
 - **父忙时并入。** 交回的输入是 steer：父的 run 在跑，就在它的 postTools boundary 并进当前 run（旧实现的"插话并入"）；父空闲就直接放置、起新 run。回复由宿主那一轮投回来源对端——来源对端取"当前路径上最近一条带 peer 的用户输入"的 peer，没有就退回 home chat（只有主会话；TUI / HTTP 开的会话不投）。任务自己的最终回复不再直接投给渠道。
 - **父会话不在了**（删掉、purge）：`report` 在受理之前就返回，结果不交（任务会话本身仍在，`komo session list` 看得到）。
@@ -48,6 +48,15 @@
 - **查进度**：`task(task_id)` 不带 `prompt`，只读那个任务的 `komo.live`、entry 与 `komo.task`，不提交任何东西：状态、已跑多久、正在执行的调用及其输出尾部；已收尾的 run 的终态来自 `komo.task.lastRun`。
 - **取消**：模型没有取消子任务的工具；显式取消是 `Harness::abort_conversation(engine, 子 conversation)`（子 run 以 `aborted` 收尾，照常交回一条"没有完成"）。`/cancel` 只停 home 当前这一轮（`abort_run`），不动任务。
 - **"需要你判断"**：任务里的调用没有审批，也没有结果不明的等待；会让任务停下的只有 faulted 的任务（blob 引用损坏），出现在 `komo intervention list` 里，句柄前挂上 `后台任务 #12「标题」：`，同时看着几个任务时分得清是哪一个在问（`docs/komo_bot.md` §7.5）。
+
+## 2c. 状态行与自动续跑（2026-10-28 定并落地）
+
+任务以 `stopReason=stop` 收尾只说明模型不再调工具，分不出"做完了"和"自己觉得差不多了"：同一天四个 terra 任务里三个第一轮就交回，代码改到一半、测试没跑，标题却是"已完成"，父会话读了正文才发现、再手动转回去。任务模式提示（§2b、`docs/komo_bot.md` §4）解决"想问一句"，这里解决"没说做完就停"。
+
+- **状态行。** 任务模式提示与 `FORK_NOTICE` 要求最后的回复末行写 `状态：完成`，做不下去写 `状态：受阻：原因`（写法是 kernel 的 `TASK_STATUS_DONE` / `TASK_STATUS_BLOCKED`）。`report` 读末行定标题：`已完成` / `受阻` / `交回了，没说做完没有`；失败、取消仍是 `没有完成`。加粗、引用、半角冒号都认，`状态：未完成` 按没写算。`task.result` 的 data 多 `status`（`done` / `blocked` / `unstated`，契约任务与没完成的为 null）与 `rounds`。
+- **标题带数字。** 结局后面是这条 run 的工具调用轮数（`komo.live.run.rounds`，不含最后那次回答）与用时（`run.startedAt` 到收尾；旧 `komo.live` 没有开始时刻就不报）。父会话一眼看得出交得早不早，不用去翻任务会话。
+- **自动续跑。** 回答没写状态行时先不交回：`answer` 的收尾提交里改调 `report::end_answered_run`，往任务会话放一条 `task.continue` 输入（"这条是 komo 自动发的……重新写一份完整的最后回复，末行写状态"）、起后继 run，`komo.task.continued` 记下它。以续跑输入开头的 run 收尾时不再续跑、照常交回，标题后加 `· 自动续跑过一次`——每条派出 / 追问的输入最多续跑一次，不会循环。父只收到续跑之后的那条回答，所以续跑提示要的是完整的最后回复。参考的是 Claude Code 的 `SubagentStop` hook：返回 block 时子 agent 接着做。
+- **不续跑的情况。** 带结果契约的回答只放 JSON，不看状态行，结局看契约复验；这次 final boundary 放了用户项或收件箱还有东西（派它的会话追问过来了）时，后继 run 本来就要起，续跑让给它，回答照常交回；失败、取消、预算等非正常收尾不续跑。
 
 ## 2a. `task`：合并 `dispatch` / `follow` / `delegate`（2026-10-16 定并落地）
 

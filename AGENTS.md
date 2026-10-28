@@ -186,4 +186,7 @@ commands run, terminal output when CLI behavior changes.
   research/analysis appendices. Memory changes update this file, not a new one.
 - Observability: `docs/observability.md` — OpenTelemetry traces/metrics, logs,
   operator views. Telemetry is never a source of truth; nothing reads it back.
+- Direction: `docs/roadmap-muse.md` — gaps and phases toward a Muse-style
+  proactive personal agent (goals, proactivity, outward-action confirmation);
+  draft, not approved. Approved pieces move into the specs above.
 - Work plan: `.scratch/komo-v08-rewrite/PLAN.md`, progress in `STATUS.md`.

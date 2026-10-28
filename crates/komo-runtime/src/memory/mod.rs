@@ -131,6 +131,10 @@ pub trait MemoryCatalog: Send + Sync {
         limit: usize,
     ) -> Result<Vec<MemoryItem>, RepoError>;
 
+    /// 全部 active + convention 的条目，按 id（创建先后）排；每个 Run 的召回块用它带上约定
+    /// （§9.4「约定不过门槛」）。
+    async fn conventions(&self) -> Result<Vec<MemoryItem>, RepoError>;
+
     async fn find_by_content(
         &self,
         scope: &MemoryScope,
@@ -197,6 +201,10 @@ impl MemoryCatalog for komo_store::TursoMemoryRepo {
         limit: usize,
     ) -> Result<Vec<MemoryItem>, RepoError> {
         komo_store::TursoMemoryRepo::list(self, scope, state, limit).await
+    }
+
+    async fn conventions(&self) -> Result<Vec<MemoryItem>, RepoError> {
+        komo_store::TursoMemoryRepo::conventions(self).await
     }
 
     async fn find_by_content(
@@ -320,7 +328,10 @@ pub struct PassReport {
 /// 召回结果 → 注入段的渲染函数（§13.2）：实现在 `komo-agent::context::memory::render`，
 /// Gateway 装配 [`MemoryParts`] 时把它递进来。`fn` 指针而不是 trait：只有一个实现，也
 /// 不必为了传一份渲染逻辑就让 `MemoryManager` 认识 `dyn` 对象——runtime 不依赖 agent。
-pub type RenderInjection = fn(&[MemoryItem], u32) -> Injection;
+///
+/// 参数依次是：不过门槛的常驻约定、过了门槛的召回结果、召回结果的 token 预算、约定组的 token
+/// 预算（§9.4「约定不过门槛」）。
+pub type RenderInjection = fn(&[MemoryItem], &[MemoryItem], u32, u32) -> Injection;
 
 /// 装配一台 MemoryManager 要的东西。
 pub struct MemoryParts {
@@ -744,12 +755,16 @@ impl MemoryManager {
         carried: &[MemoryUse],
         scopes: &[MemoryScope],
     ) -> Injection {
-        self.prepare_with(run, text, carried, &[], scopes).await
+        self.prepare_with(run, text, carried, &[], scopes, false)
+            .await
     }
 
     /// 一个 Run 的召回块（§9.4「按 Run 召回」）：召回、过门槛、选 `top_k`，再去掉这一段上下文里
     /// 已经展示过的 `id@revision`（`shown`），剩下的才渲染。空出来的名额不拿排名更低的补——
     /// 选中的就是这次相关的，已展示的那几条本来就在模型眼前。
+    ///
+    /// 约定（active + convention）另走一路：放行作用域里的全部约定减去已展示的，不过门槛、不占
+    /// `top_k`，花自己的预算 `convention_tokens`（§9.4「约定不过门槛」）。
     pub async fn recall_for_run(
         &self,
         run: &RunId,
@@ -757,7 +772,7 @@ impl MemoryManager {
         shown: &[MemoryUse],
         scopes: &[MemoryScope],
     ) -> Injection {
-        self.prepare_with(run, text, &[], shown, scopes).await
+        self.prepare_with(run, text, &[], shown, scopes, true).await
     }
 
     async fn prepare_with(
@@ -767,11 +782,17 @@ impl MemoryManager {
         carried: &[MemoryUse],
         shown: &[MemoryUse],
         scopes: &[MemoryScope],
+        with_conventions: bool,
     ) -> Injection {
         if !self.enabled() {
             return Injection::default();
         }
         let now = self.clock.now();
+        let conventions = if with_conventions {
+            self.scoped_conventions(scopes, now).await
+        } else {
+            Vec::new()
+        };
         let mut items = self.revalidate(carried, now).await;
         // 带过来的旧注入也要落在**现在**放行的作用域里：模式或作用域改过、或者那一条本来
         // 就不该被这个 Agent 看见（别的 Agent 的私有记忆）的，掉出去重新召回。
@@ -781,6 +802,8 @@ impl MemoryManager {
         if items.is_empty() && !text.trim().is_empty() {
             let mut query = self.query(text, None);
             query.scopes = scopes.to_vec();
+            // 约定不占 `top_k`：它们若也排进了名单，之后要被去掉，多取几条把名额补回来。
+            query.top_k = (query.top_k + conventions.len() as u32).min(query.candidate_limit);
             diagnostics.mode = Some(query.mode);
             match self.search(query).await {
                 Ok(result) => {
@@ -810,18 +833,73 @@ impl MemoryManager {
         }
 
         let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
-        let mut items = stale::mark_missing_paths(items, home.as_deref());
-        items.retain(|item| {
+        let unshown = |item: &MemoryItem| {
             !shown
                 .iter()
                 .any(|use_| use_.memory == item.id && use_.revision == item.revision)
-        });
-        let mut injection = (self.render)(&items, self.retrieval().max_tokens);
-        diagnostics.dropped_by_budget =
-            Some(items.len().saturating_sub(injection.uses.len()) as u32);
+        };
+        let retrieval = self.retrieval();
+        let mut resident = stale::mark_missing_paths(conventions.clone(), home.as_deref());
+        resident.retain(unshown);
+        // 先单独渲染一遍常驻约定，看预算放下了哪几条：没放下的约定回到门槛那条路（过了门槛
+        // 仍渲染在约定组里），放下的就不该再从召回结果里占名额。
+        let kept = (self.render)(
+            &resident,
+            &[],
+            retrieval.max_tokens,
+            retrieval.convention_tokens,
+        )
+        .uses;
+        let over_budget = resident.len() - kept.len();
+        let exempt: Vec<&MemoryId> = conventions
+            .iter()
+            .map(|item| &item.id)
+            .filter(|id| {
+                kept.iter().any(|use_| &use_.memory == *id)
+                    || !resident.iter().any(|item| &item.id == *id)
+            })
+            .collect();
+        let mut items = stale::mark_missing_paths(items, home.as_deref());
+        // 名额只被线索占：约定从召回结果里去掉之后再按 `top_k` 截，已展示的照旧占着名额。
+        items.retain(|item| !exempt.contains(&&item.id));
+        items.truncate(retrieval.top_k as usize);
+        items.retain(unshown);
+        let mut injection = (self.render)(
+            &resident,
+            &items,
+            retrieval.max_tokens,
+            retrieval.convention_tokens,
+        );
+        diagnostics.dropped_by_budget = Some(
+            items
+                .len()
+                .saturating_sub(injection.uses.len().saturating_sub(kept.len())) as u32,
+        );
+        if over_budget > 0 {
+            diagnostics.conventions_over_budget = Some(over_budget as u32);
+        }
         injection.diagnostics = Some(diagnostics);
         self.record_usage(&injection, now).await;
         injection
+    }
+
+    /// 这一次放行作用域里全部 active + convention 的条目（未过期、按创建先后）。读不出来就当
+    /// 没有：约定是召回的增益，读失败不拦这一轮，只留一条日志。
+    async fn scoped_conventions(
+        &self,
+        scopes: &[MemoryScope],
+        now: OffsetDateTime,
+    ) -> Vec<MemoryItem> {
+        match self.catalog.conventions().await {
+            Ok(items) => items
+                .into_iter()
+                .filter(|item| item.is_recallable_at(now) && scope_allowed(scopes, &item.scope))
+                .collect(),
+            Err(error) => {
+                tracing::warn!(%error, "约定这一次没读成，本轮不带常驻约定");
+                Vec::new()
+            }
+        }
     }
 
     /// 这一段的注入段（§9.4）。

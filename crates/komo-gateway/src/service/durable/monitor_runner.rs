@@ -236,6 +236,11 @@ impl GatewayMonitorRunner {
         let session = session_of(&*ctx.core.storage, record.conversation).await;
 
         let mut env: BTreeMap<String, String> = komo_runtime::tools::bash::base_environment();
+        // 与 bash 工具同理：监听脚本里的 `komo` 要连到这台 Gateway（附录 C.3.3）。
+        env.insert(
+            "KOMO_HOME".into(),
+            ctx.state.home.to_string_lossy().into_owned(),
+        );
         env.insert("KOMO_SESSION".into(), session.to_string());
         env.insert("KOMO_MONITOR".into(), id.to_string());
         let snapshot = ctx.state.snapshot();

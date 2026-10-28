@@ -816,6 +816,11 @@ pub struct MemoryListQuery {
     pub mode: Option<RetrievalMode>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<u32>,
+    /// 在 Run 里跑的 CLI 带上自己的会话（`KOMO_SESSION`）：Gateway 按这个会话的 Profile 放行
+    /// 作用域，与自动召回同一处判断（§9.4「Agent 主动查」）；`memory = off` 的会话被拒。
+    /// 不带 = 操作者终端，不按会话限制。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<SessionId>,
 }
 
 /// `?scope=project:komo` 与 `{"kind":"project","project_id":"komo"}` 都收。

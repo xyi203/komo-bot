@@ -731,6 +731,7 @@ async fn operator(
                         state,
                         limit,
                         full,
+                        search: false,
                     },
                 )
                 .await
@@ -751,6 +752,7 @@ async fn operator(
                         state,
                         limit,
                         full: false,
+                        search: true,
                     },
                 )
                 .await

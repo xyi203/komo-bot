@@ -18,8 +18,8 @@ use komo_kernel::types::ids::{
     AttemptId, EventId, MemoryId, RequestKey, RunId, Seq, SessionId, ToolCallId,
 };
 use komo_kernel::types::memory::{
-    Confirmation, EvidenceRef, MemoryApplication, MemoryKind, MemoryScope, MemoryState, MemoryWork,
-    Provenance, RetrievalMode,
+    Confirmation, EvidenceRef, MEMORY_QUERY_MARKER, MemoryApplication, MemoryKind, MemoryScope,
+    MemoryState, MemoryWork, Provenance, RetrievalMode,
 };
 use komo_kernel::types::model::{
     DistanceRule, Effort, EmbeddingConfig, EmbeddingSpace, InputKind, ModelConfig, Vector,
@@ -273,6 +273,7 @@ fn memory_config(enabled: bool, mode: RetrievalMode) -> MemoryConfig {
             candidate_limit: 40,
             top_k: 8,
             max_tokens: 1500,
+            convention_tokens: 800,
             rerank: false,
             rerank_shortlist: 20,
             min_similarity: 0.0,
@@ -287,13 +288,19 @@ fn memory_config(enabled: bool, mode: RetrievalMode) -> MemoryConfig {
 /// 测试用的渲染函数：一条一行，只带正文（真正的格式在 `komo-agent::context::memory`，
 /// 那边有自己的测试；这里的断言只关心"同一段逐字复用""遗忘的条目不回来"，与具体格式
 /// 无关，§13.4）。runtime 不为此加对 `komo-agent` 的 dev-dependency。
-fn test_render(items: &[MemoryItem], _max_tokens: u32) -> Injection {
+fn test_render(
+    resident: &[MemoryItem],
+    items: &[MemoryItem],
+    _max_tokens: u32,
+    _convention_tokens: u32,
+) -> Injection {
+    let items: Vec<MemoryItem> = resident.iter().chain(items).cloned().collect();
     if items.is_empty() {
         return Injection::default();
     }
     let mut lines = Vec::new();
     let mut uses = Vec::new();
-    for item in items {
+    for item in &items {
         lines.push(item.content.clone());
         uses.push(MemoryUse {
             memory: item.id.clone(),
@@ -1765,6 +1772,45 @@ fn a_task_result_input_cannot_be_cited_as_a_user_statement() {
 
     let observations = transcript.validate(raw, 8, &model("memory-model", None), &[], NOW);
     assert!(observations.is_empty(), "{observations:?}");
+}
+
+/// `komo memory search` 在 Run 里的输出以宿主标记开头：那是已有记忆，不是新观察，标成「记忆查询」，
+/// 引它的观察一律丢掉；认输出标记而不认命令行，所以管道、别名里跑出来的也一样。
+#[test]
+fn a_marked_memory_query_result_is_labelled_and_cannot_be_cited() {
+    let run = RunId::from_raw("run-1");
+    // 工具结果的预览本身以标记开头。
+    let events = vec![
+        user_event(1, &run, "空调怎么设"),
+        tool_event(
+            2,
+            &run,
+            &format!("{MEMORY_QUERY_MARKER}\nm-1@1\t客厅空调设 26 度"),
+        ),
+        tool_event(3, &run, "exit=0 · 普通命令的输出"),
+    ];
+    let transcript = transcript(&events);
+    assert!(
+        transcript.rendered.contains("记忆查询"),
+        "{}",
+        transcript.rendered
+    );
+    assert!(
+        transcript.rendered.contains("工具结果"),
+        "{}",
+        transcript.rendered
+    );
+
+    let cite = |event: &str| {
+        let raw: Vec<RawObservation> = serde_json::from_str(&format!(
+            r#"[{{"content":"客厅空调设 26 度","kind":"fact","scope":"personal",
+                 "said_by":"tool_observation","evidence":["{event}"]}}]"#
+        ))
+        .unwrap();
+        transcript.validate(raw, 8, &model("memory-model", None), &[], NOW)
+    };
+    assert!(cite("evt-2").is_empty(), "记忆查询不能当证据");
+    assert_eq!(cite("evt-3").len(), 1, "普通工具结果照常能引");
 }
 
 /// 监听事件、监听结束、转后台命令的结束同样是系统交回，不是用户原话。
@@ -3853,7 +3899,7 @@ fn a_well_formed_convention_keeps_its_application_and_condition() {
         observations[0].applies_when.as_deref(),
         Some("创建发布工单、需要选 Platform 时")
     );
-    assert_eq!(extract::PROMPT_VERSION, "memory-extract/v8");
+    assert_eq!(extract::PROMPT_VERSION, "memory-extract/v9");
 }
 
 /// basis 不在所引的任何用户事件里（编的一句原话，或只在工具结果里出现）→ 降为 reference，
@@ -3973,7 +4019,7 @@ async fn an_extracted_convention_lands_with_its_condition() {
         Some("创建发布工单、需要选 Platform 时")
     );
     assert_eq!(stored[0].confirmation, Confirmation::Unconfirmed);
-    assert_eq!(stored[0].extraction.prompt_version, "memory-extract/v8");
+    assert_eq!(stored[0].extraction.prompt_version, "memory-extract/v9");
 }
 
 fn convention_memory(id: &str) -> MemoryItem {

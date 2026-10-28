@@ -92,3 +92,19 @@ fn system_sections_are_keyed_in_prompt_order_and_skip_the_empty_ones() {
     let keys: Vec<&str> = bare.iter().map(|(key, _)| key.as_str()).collect();
     assert_eq!(keys, ["base"]);
 }
+
+/// 能跑 bash 时系统提示教 Agent 自己查记忆（`docs/memory.md` §9.4「Agent 主动查」）；这句是静态文字，
+/// 跨轮、跨输入逐字不变，不影响前缀缓存。没有 bash 就没有这一段。
+#[test]
+fn the_self_block_teaches_searching_memory_and_stays_byte_stable() {
+    let with_bash = ContextInput {
+        tools: vec!["bash".into()],
+        ..input(None)
+    };
+    let first = prompt_of(&with_bash);
+    assert!(first.contains("komo memory search"), "{first}");
+    assert!(first.contains("约定照做，线索先核实"), "{first}");
+    // 同一份输入再装配一次逐字相同；换了工作目录之外的输入（比如召回）不会进系统段。
+    assert_eq!(first, prompt_of(&with_bash));
+    assert!(!prompt_of(&input(None)).contains("komo memory search"));
+}

@@ -735,6 +735,263 @@ async fn forgetting_one_of_several_rewrites_the_block_without_that_line() {
     );
 }
 
+const GATED_MEMORY: &str =
+    "[memory]\nenabled = true\n\n[memory.retrieval]\nmode = \"keyword\"\ntop_k = 1\n";
+
+fn seeded_convention(id: &str, content: &str, when: &str) -> MemoryItem {
+    let mut item = seeded_memory(id, content);
+    item.application = Some(komo_kernel::types::memory::MemoryApplication::Convention);
+    item.applies_when = Some(when.into());
+    item
+}
+
+/// 约定不过门槛、不占 `top_k`（§9.4「约定不过门槛」）：用一句和约定一个字都不重合的话要求提单，
+/// 召回块里照样有约定；同时匹配这句话的线索仍然受 `top_k = 1` 约束，约定没有挤掉它。
+#[tokio::test]
+async fn a_convention_is_injected_for_a_paraphrase_and_takes_no_top_k_slot() {
+    let world = World::new(&config_with("", GATED_MEMORY), finisher()).await;
+    let state = world.gateway.state();
+    for item in [
+        seeded_convention("m-1", "发布工单 Platform 默认选 saas", "创建发布工单时"),
+        seeded_memory("m-2", "深色主题字号 14"),
+        seeded_memory("m-3", "深色主题用黑色"),
+    ] {
+        state.memory.put(item, None).await.unwrap();
+    }
+    let hooks = world.hooks();
+    let conversation = world.conversation(Some(agent("assistant"))).await;
+    let mut transcript = Transcript {
+        conversation,
+        entries: Vec::new(),
+    };
+
+    transcript.input("帮我上线一下 xx");
+    let drafts = transcript.ask(&hooks, 1).await;
+    assert_eq!(drafts.len(), 1, "{drafts:?}");
+    let text = model_text(&drafts[0]);
+    assert!(text.contains("适用的长期约定"), "{text}");
+    assert!(text.contains("Platform 默认选 saas"), "{text}");
+    assert!(!text.contains("历史线索"), "没有线索命中：{text}");
+    transcript.push(drafts.into_iter().next().unwrap());
+
+    // 同一段里的第二个 Run 不重复带；门槛路上的线索仍只给 top_k 条。
+    transcript.input("深色主题");
+    let drafts = transcript.ask(&hooks, 2).await;
+    assert_eq!(drafts.len(), 1, "{drafts:?}");
+    let text = model_text(&drafts[0]);
+    assert!(!text.contains("saas"), "本段已展示过：{text}");
+    assert_eq!(
+        text.matches("深色主题").count(),
+        1,
+        "线索按 top_k = 1：{text}"
+    );
+}
+
+/// 约定与它同时命中的线索各走各的路：约定组不占 `top_k` 名额，查询刚好命中约定时线索也还在。
+#[tokio::test]
+async fn a_matching_convention_does_not_displace_a_clue_from_top_k() {
+    let world = World::new(&config_with("", GATED_MEMORY), finisher()).await;
+    let state = world.gateway.state();
+    for item in [
+        seeded_convention("m-1", "深色主题优先用黑色", "改界面配色时"),
+        seeded_memory("m-2", "深色主题字号 14"),
+    ] {
+        state.memory.put(item, None).await.unwrap();
+    }
+    let hooks = world.hooks();
+    let conversation = world.conversation(Some(agent("assistant"))).await;
+    let mut transcript = Transcript {
+        conversation,
+        entries: Vec::new(),
+    };
+    transcript.input("深色主题");
+    let drafts = transcript.ask(&hooks, 1).await;
+    let text = model_text(&drafts[0]);
+    assert!(text.contains("优先用黑色"), "{text}");
+    assert!(text.contains("字号 14"), "约定没有占掉线索的名额：{text}");
+}
+
+/// 新增的约定只在下一个 Run 补上；遗忘它之后旧块被改写；压缩开新段之后在新段第一个 Run 重新带上。
+#[tokio::test]
+async fn a_new_convention_is_added_a_forgotten_one_is_rewritten_and_a_new_segment_brings_it_again()
+{
+    let world = World::new(&config_with("", KEYWORD_MEMORY), finisher()).await;
+    let state = world.gateway.state();
+    state
+        .memory
+        .put(
+            seeded_convention("m-1", "发布工单 Platform 默认选 saas", "创建发布工单时"),
+            None,
+        )
+        .await
+        .unwrap();
+    let hooks = world.hooks();
+    let conversation = world.conversation(Some(agent("assistant"))).await;
+    let mut transcript = Transcript {
+        conversation,
+        entries: Vec::new(),
+    };
+    transcript.input("你好");
+    let drafts = transcript.ask(&hooks, 1).await;
+    assert!(model_text(&drafts[0]).contains("Platform 默认选 saas"));
+    transcript.push(drafts.into_iter().next().unwrap());
+    let first_block = transcript.entries[1].id;
+
+    // 之后 `memory add` 的约定在下一个 Run 补上，旧的那条不重复。
+    state
+        .memory
+        .put(
+            seeded_convention("m-2", "查日志默认用 sls", "查日志时"),
+            None,
+        )
+        .await
+        .unwrap();
+    transcript.input("你好");
+    let drafts = transcript.ask(&hooks, 2).await;
+    let text = model_text(&drafts[0]);
+    assert!(
+        text.contains("查日志默认用 sls") && !text.contains("saas"),
+        "{text}"
+    );
+    transcript.push(drafts.into_iter().next().unwrap());
+
+    // 遗忘 m-1：第一块整块去掉（只剩它一条），第二块不动。
+    state
+        .memories
+        .forget(&MemoryId::from_raw("m-1"), 1)
+        .await
+        .unwrap();
+    let drafts = transcript.ask(&hooks, 2).await;
+    assert_eq!(drafts.len(), 1, "{drafts:?}");
+    assert_eq!(drafts[0].kind, MEMORY_REVOKE_ENTRY_KIND);
+    assert_eq!(drafts[0].edits, vec![ContextEdit::omit(first_block)]);
+    transcript.push(drafts.into_iter().next().unwrap());
+    assert!(!joined(&transcript.view()).contains("saas"));
+
+    // 新段：这一条 entry 把上下文的起点挪到自己，旧块不在视图里，约定重新带一次（只剩没被遗忘的）。
+    transcript.input("接着聊");
+    let mut head = transcript.entries.pop().unwrap();
+    head.head = Some(head.id);
+    transcript.entries.push(head);
+    let drafts = transcript.ask(&hooks, 3).await;
+    assert_eq!(drafts.len(), 1, "{drafts:?}");
+    let text = model_text(&drafts[0]);
+    assert!(text.contains("查日志默认用 sls"), "新段重新带上：{text}");
+    assert!(!text.contains("saas"), "被遗忘的不回来：{text}");
+}
+
+/// 预算放不下的约定从后（创建较晚的）往前截；截掉的回到门槛那条路，命中了仍渲染在约定组里，
+/// 没命中就不带，并在召回记录里留下"约定超出预算"。
+#[tokio::test]
+async fn conventions_over_budget_fall_back_to_the_gated_path() {
+    let config = "[memory]\nenabled = true\n\n[memory.retrieval]\nmode = \"keyword\"\nconvention_tokens = 170\n";
+    let world = World::new(&config_with("", config), finisher()).await;
+    let state = world.gateway.state();
+    for item in [
+        seeded_convention("m-1", "发布工单 Platform 默认选 saas", "创建发布工单时"),
+        seeded_convention("m-2", "查日志默认用 sls", "查日志时"),
+    ] {
+        state.memory.put(item, None).await.unwrap();
+    }
+    let hooks = world.hooks();
+    let conversation = world.conversation(Some(agent("assistant"))).await;
+
+    // 没命中：m-2 被截掉，也不带。
+    let mut transcript = Transcript {
+        conversation,
+        entries: Vec::new(),
+    };
+    transcript.input("你好");
+    let drafts = transcript.ask(&hooks, 1).await;
+    let text = model_text(&drafts[0]);
+    assert!(
+        text.contains("Platform 默认选 saas") && !text.contains("sls"),
+        "{text}"
+    );
+    assert_eq!(
+        drafts[0].data.as_ref().unwrap()["recall"]["conventions_over_budget"],
+        1
+    );
+
+    // 命中：m-2 走门槛那条路，仍在约定组里。
+    let mut transcript = Transcript {
+        conversation,
+        entries: Vec::new(),
+    };
+    transcript.input("查日志");
+    let drafts = transcript.ask(&hooks, 1).await;
+    let text = model_text(&drafts[0]);
+    assert!(
+        text.contains("Platform 默认选 saas") && text.contains("查日志默认用 sls"),
+        "{text}"
+    );
+    let conventions = text.find("适用的长期约定").unwrap();
+    assert!(
+        !text.contains("历史线索") && conventions < text.find("sls").unwrap(),
+        "{text}"
+    );
+}
+
+/// `private` 只带本 Agent 自己作用域的约定；个人作用域的约定它看不见。
+#[tokio::test]
+async fn a_private_agent_gets_only_its_own_scopes_conventions() {
+    let world = World::new(
+        &config_with("memory = \"private\"", KEYWORD_MEMORY),
+        finisher(),
+    )
+    .await;
+    let state = world.gateway.state();
+    let mut own = seeded_convention("m-own", "这个助手的口令是蓝色", "任何时候");
+    own.scope = MemoryScope::Agent {
+        agent_id: "assistant".into(),
+    };
+    let mut other = seeded_convention("m-other", "别的助手的口令是红色", "任何时候");
+    other.scope = MemoryScope::Agent {
+        agent_id: "helper".into(),
+    };
+    for item in [
+        own,
+        other,
+        seeded_convention("m-personal", "个人的口令是绿色", "任何时候"),
+    ] {
+        state.memory.put(item, None).await.unwrap();
+    }
+    let hooks = world.hooks();
+    let conversation = world.conversation(Some(agent("assistant"))).await;
+    let mut transcript = Transcript {
+        conversation,
+        entries: Vec::new(),
+    };
+    transcript.input("你好");
+    let drafts = transcript.ask(&hooks, 1).await;
+    let text = model_text(&drafts[0]);
+    assert!(text.contains("蓝色"), "{text}");
+    assert!(!text.contains("红色") && !text.contains("绿色"), "{text}");
+}
+
+/// `memory = off`：一条约定也不带。
+#[tokio::test]
+async fn memory_off_brings_no_conventions() {
+    let world = World::new(&config_with("memory = \"off\"", KEYWORD_MEMORY), finisher()).await;
+    let state = world.gateway.state();
+    state
+        .memory
+        .put(
+            seeded_convention("m-1", "发布工单 Platform 默认选 saas", "创建发布工单时"),
+            None,
+        )
+        .await
+        .unwrap();
+    let hooks = world.hooks();
+    let conversation = world.conversation(Some(agent("assistant"))).await;
+    let mut transcript = Transcript {
+        conversation,
+        entries: Vec::new(),
+    };
+    transcript.input("你好");
+    assert!(transcript.ask(&hooks, 1).await.is_empty());
+}
+
 /// skills 目录行同样钉住（W4b）：展示过之后注册表变了（多了 skill、重载），已展示的那份原样不动，
 /// 直到下一次 head；"没有"也钉住。
 #[tokio::test]

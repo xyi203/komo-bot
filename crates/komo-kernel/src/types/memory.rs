@@ -373,6 +373,12 @@ fn is_zero(value: &f32) -> bool {
     *value == 0.0
 }
 
+/// `komo memory search` / `list` 带会话调用时输出的首行（§9.4「Agent 主动查」）。提取构建窗口时
+/// 认这一行，把以它开头的工具结果标成「记忆查询」、不能被引为证据：查到的是已有记忆，不是新
+/// 观察。认输出标记而不认命令行，命令可能经过管道、别名或脚本。CLI 与提取各在一端，只共享
+/// kernel，所以串定义在这里。
+pub const MEMORY_QUERY_MARKER: &str = "〔komo 记忆查询结果：已有记忆，不是新证据〕";
+
 /// 这一次放行的作用域里有没有 `scope`。`allowed` 空 = 不限，但**不含**任何
 /// [`MemoryScope::Agent`]：`agent:<id>` 是那个 Agent 的私有记忆，只有它自己显式列出
 /// （`allowed = [agent:<id>]`）才进得来——否则别的 Agent 私有记忆里的话会被这个 Agent
@@ -463,6 +469,10 @@ pub struct RecallDiagnostics {
     /// 筛完之后因 token 预算没放进注入段的条数。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dropped_by_budget: Option<u32>,
+    /// 约定组因 `convention_tokens` 预算放不下、被截掉的条数（§9.4「约定不过门槛」）。截掉的
+    /// 回到门槛那条路，过了门槛仍会渲染在约定组里。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conventions_over_budget: Option<u32>,
     /// 留下的候选的两臂分数（§9.4）。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub arm_scores: Vec<ArmScore>,

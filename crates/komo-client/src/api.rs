@@ -594,6 +594,9 @@ impl KomoClient {
         if let Some(limit) = query.limit {
             params.push(("limit", limit.to_string()));
         }
+        if let Some(session) = &query.session {
+            params.push(("session", session.to_string()));
+        }
         self.get_with("/v1/memories", &params).await
     }
 

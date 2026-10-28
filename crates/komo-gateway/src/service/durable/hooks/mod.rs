@@ -36,6 +36,7 @@ use komo_store::{FileToolOutputStore, SessionPaths};
 use super::assemble::StateSlot;
 use crate::service::state::GatewayState;
 
+pub(crate) use sections::recall_scopes;
 pub(crate) use setup::{Resolved, catalog_model, profile_model, resolve};
 
 /// `AgentHooks` 的 Gateway 实现。

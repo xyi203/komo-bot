@@ -8,7 +8,9 @@
 use komo_kernel::protocol::http::IndexState;
 use komo_kernel::traits::{RepoError, StoreError};
 use komo_kernel::types::ids::{MemoryId, SessionId};
-use komo_kernel::types::memory::{EvidenceRef, MemoryItem, MemoryScope, MemoryState};
+use komo_kernel::types::memory::{
+    EvidenceRef, MemoryApplication, MemoryItem, MemoryScope, MemoryState,
+};
 use komo_kernel::types::model::EmbeddingSpace;
 use time::OffsetDateTime;
 
@@ -81,6 +83,34 @@ impl TursoMemoryRepo {
                         }
                         if out.len() >= limit {
                             break;
+                        }
+                    }
+                    Ok(out)
+                }) as BoxFuture<'_, Result<Vec<MemoryItem>, StoreError>>
+            })
+            .await
+            .map_err(RepoError::from)
+    }
+
+    /// 全部 active + convention 的条目，按 id（创建先后）排（§9.4「约定不过门槛」）。
+    /// 状态与分类在行上就能判，不是约定的不用加载全貌。作用域与有效期由调用方按这一次放行的
+    /// 范围筛。
+    pub async fn conventions(&self) -> Result<Vec<MemoryItem>, RepoError> {
+        self.db()
+            .read(move |ex| {
+                Box::pin(async move {
+                    let mut rows = MemoryItemRow::all().exec(ex).await.map_err(map_toasty)?;
+                    rows.sort_by(|a, b| a.id.cmp(&b.id));
+                    let mut out = Vec::new();
+                    for row in &rows {
+                        if row.state != enum_str(&MemoryState::Active)
+                            || row.application.as_deref()
+                                != Some(enum_str(&MemoryApplication::Convention).as_str())
+                        {
+                            continue;
+                        }
+                        if let Some(item) = load_item(ex, &row.id).await? {
+                            out.push(item);
                         }
                     }
                     Ok(out)

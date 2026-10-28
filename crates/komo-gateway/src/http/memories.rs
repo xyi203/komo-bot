@@ -18,12 +18,14 @@ use komo_kernel::protocol::http::{
     MemoryIndexStatus, MemoryListQuery, MemoryListResponse, MemoryRevisionRequest,
     MemorySweepRequest, MemorySweepResponse, RebuildIndexRequest, RebuildIndexResponse,
 };
-use komo_kernel::types::ids::MemoryId;
+use komo_kernel::types::ids::{MemoryId, SessionId};
+use komo_kernel::types::memory::{MemoryScope, scope_allowed};
 use komo_runtime::memory::MemoryError;
 
 use super::Api;
 use super::error::{ApiFailure, ApiResult};
 use super::idempotency::body_hash;
+use crate::service::durable::hooks;
 
 /// 不带查询词时一次最多列多少条。
 const LIST_LIMIT: usize = 200;
@@ -35,10 +37,22 @@ pub async fn list(
 ) -> ApiResult<Json<MemoryListResponse>> {
     let memories = &api.state.memories;
     let text = query.query.clone().unwrap_or_default();
+    // 带会话 = Agent 在 Run 里自己查：只给这个会话放行的作用域（§9.4「Agent 主动查」）。
+    let allowed = match &query.session {
+        Some(session) => Some(session_scopes(&api, session).await?),
+        None => None,
+    };
+    if let (Some(allowed), Some(scope)) = (&allowed, &query.scope)
+        && !scope_allowed(allowed, scope)
+    {
+        return Err(ApiFailure::invalid(format!(
+            "这个会话的 Agent 没有 {scope} 作用域的记忆权限"
+        )));
+    }
 
     if text.trim().is_empty() {
         // 库存清单。这条路不碰 embedding，所以没配向量模型也列得出来。
-        let items = memories
+        let mut items = memories
             .catalog()
             .list(
                 query.scope.clone(),
@@ -47,6 +61,9 @@ pub async fn list(
             )
             .await
             .map_err(ApiFailure::from)?;
+        if let Some(allowed) = &allowed {
+            items.retain(|item| scope_allowed(allowed, &item.scope));
+        }
         return Ok(Json(MemoryListResponse {
             memories: items,
             degraded: false,
@@ -56,7 +73,13 @@ pub async fn list(
 
     let mode = query.mode.unwrap_or(memories.retrieval().mode);
     let mut recall = memories.query(text, Some(mode));
-    recall.scopes = query.scope.clone().into_iter().collect();
+    // 明确写了作用域就只查它；否则会话放行的那些（空 = 不限，但不含任何 `agent:*`，
+    // `scope_allowed` 的口径）。
+    recall.scopes = match (&query.scope, allowed) {
+        (Some(scope), _) => vec![scope.clone()],
+        (None, Some(allowed)) => allowed,
+        (None, None) => Vec::new(),
+    };
     if let Some(top_k) = query.limit {
         recall.top_k = top_k;
     }
@@ -71,6 +94,23 @@ pub async fn list(
         degraded: result.degraded,
         degraded_reason: result.degraded_reason,
     }))
+}
+
+/// 这个会话的 Profile 放行哪些记忆作用域：与自动召回同一处判断（`recall_scopes`）。
+/// `memory = off` 的会话不能查。
+async fn session_scopes(api: &Api, session: &SessionId) -> ApiResult<Vec<MemoryScope>> {
+    let core = api.state.core()?;
+    let record = core.session(session.as_str()).await?;
+    let snapshot = api.state.snapshot();
+    let resolved = hooks::resolve(&api.state, &*core.storage, record.current_branch, &snapshot)
+        .await
+        .map_err(|error| ApiFailure::invalid(error.to_string()))?;
+    hooks::recall_scopes(&resolved).ok_or_else(|| {
+        ApiFailure::invalid(format!(
+            "这个会话的 Agent（{}）的记忆是关着的（memory = off），不能查记忆",
+            resolved.agent_id
+        ))
+    })
 }
 
 /// `GET /v1/memories/{id}`

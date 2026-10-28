@@ -17,8 +17,8 @@ use komo_kernel::events::{Event, EventPayload};
 use komo_kernel::traits::{Clock, LlmClient};
 use komo_kernel::types::ids::{EventId, MemoryId, RunId, Seq, SessionId};
 use komo_kernel::types::memory::{
-    Confirmation, Evidence, EvidenceRef, ExtractionMetadata, MemoryApplication, MemoryItem,
-    MemoryKind, MemoryScope, MemoryState, Provenance,
+    Confirmation, Evidence, EvidenceRef, ExtractionMetadata, MEMORY_QUERY_MARKER,
+    MemoryApplication, MemoryItem, MemoryKind, MemoryScope, MemoryState, Provenance,
 };
 use komo_kernel::types::model::ModelConfig;
 use komo_kernel::types::status::RunState;
@@ -31,7 +31,7 @@ use super::consolidate::{RawVerdict, Verdict, map_verdicts};
 
 /// 提示词版本。**改了提示词就改它**——它进 [`ExtractionMetadata`]，是"这条记忆是怎么来
 /// 的"里唯一能回答"按哪一版规则提的"的那一格（§9.2）。
-pub const PROMPT_VERSION: &str = "memory-extract/v8";
+pub const PROMPT_VERSION: &str = "memory-extract/v9";
 
 /// 一条记忆正文的上限。再长就不是"简短、尽量单一的陈述"了（§9.2）。
 pub(super) const MAX_CONTENT_CHARS: usize = 300;
@@ -190,6 +190,10 @@ enum Role {
     TaskResult,
     /// 可验证的工具结果。
     Tool,
+    /// `komo memory search` / `list` 在 Run 里的输出（预览以 [`MEMORY_QUERY_MARKER`] 开头）：
+    /// 查到的是**已有记忆**，不是新观察。再记一遍等于复制，引它给旧条目补证据违反 §9.3
+    /// 「已有记忆不算新的独立证据」，所以和任务交回一样不能被引用。
+    MemoryQuery,
     /// 助手自己说的话。**不算新的独立证据**（§9.3）。
     Assistant,
 }
@@ -271,7 +275,14 @@ impl Transcript {
                     (Role::Assistant, text)
                 }
                 EventPayload::ToolResult(body) => (
-                    Role::Tool,
+                    // 认输出里的宿主标记，不解析命令行：命令可能经过管道、别名或脚本。
+                    if body.preview.as_deref().is_some_and(|preview| {
+                        preview.trim_start().starts_with(MEMORY_QUERY_MARKER)
+                    }) {
+                        Role::MemoryQuery
+                    } else {
+                        Role::Tool
+                    },
                     format!(
                         "{} · {:?} · {}",
                         calls
@@ -317,7 +328,7 @@ impl Transcript {
         if total > MAX_TRANSCRIPT_CHARS {
             let mut keep = vec![true; lines.len()];
             for class in [
-                [Role::Tool, Role::Tool],
+                [Role::Tool, Role::MemoryQuery],
                 [Role::Assistant, Role::TaskResult],
             ] {
                 for (index, line) in lines.iter().enumerate() {
@@ -589,7 +600,7 @@ impl Transcript {
                 Role::Tool => cited_tool = true,
                 // 助手摘要不算新的独立证据（§9.3）；任务交回的结果是任务 agent 写的摘要，
                 // 同理（§9.10）。所以它们连证据都不记。
-                Role::Assistant | Role::TaskResult => continue,
+                Role::Assistant | Role::TaskResult | Role::MemoryQuery => continue,
             }
             evidence.push(Evidence {
                 reference: EvidenceRef::Event {
@@ -759,6 +770,7 @@ fn label(role: Role) -> &'static str {
         Role::User => "用户",
         Role::TaskResult => "任务交回",
         Role::Tool => "工具结果",
+        Role::MemoryQuery => "记忆查询",
         Role::Assistant => "助手",
     }
 }
@@ -985,7 +997,8 @@ const SYSTEM_PROMPT: &str = "\
 规则：
 1. 每条都必须在 evidence 里引至少一个**用户**或**工具结果**事件的 ID，原样照抄方括号里\
 那个 ID。引不出来就不要提这一条。标成「任务交回」的是后台任务、监听或后台命令交回的内容，**不是用户说的\
-话**，不能引用它，也不能把它当成 user_statement。
+话**，不能引用它，也不能把它当成 user_statement。标成「记忆查询」的是 `komo memory search` 查到的\
+已有记忆，不是新发生的事，同样不能引用，也不要把它再记一遍。
 2. said_by 如实说：用户原话是 user_statement，工具结果是 tool_observation，你自己从中\
 推断出来的是 model_inference。不要把推断说成用户原话。
 3. content 是一句独立成立的陈述，短，只说一件事，不含代词指代（「他」「那个」要展开）。\

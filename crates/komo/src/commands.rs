@@ -20,7 +20,7 @@ use komo_kernel::protocol::http::{
 };
 use komo_kernel::types::ids::{CronJobId, MemoryId, RunId, SessionId};
 use komo_kernel::types::memory::{
-    MemoryApplication, MemoryKind, MemoryScope, MemoryState, RetrievalMode,
+    MEMORY_QUERY_MARKER, MemoryApplication, MemoryKind, MemoryScope, MemoryState, RetrievalMode,
 };
 use komo_kernel::types::model::Effort;
 
@@ -399,6 +399,8 @@ pub struct MemoryFilter {
     pub limit: Option<u32>,
     /// 正文不截断、一条一行（[`render::memory_list_full`]）。
     pub full: bool,
+    /// `komo memory search`：约定与线索分开列（[`render::memory_search`]）。
+    pub search: bool,
 }
 
 pub async fn memory_list(client: &KomoClient, filter: MemoryFilter) -> Outcome {
@@ -436,6 +438,14 @@ pub async fn memory_list(client: &KomoClient, filter: MemoryFilter) -> Outcome {
         }
     };
 
+    // 在 Run 里跑（bash 子进程带着 `KOMO_SESSION`）= Agent 自己查：Gateway 按这个会话放行的
+    // 作用域答，输出首行写宿主标记，提取据此不把查到的已有记忆当新证据（§9.4）。终端里没有
+    // 会话，照旧。
+    let session = std::env::var("KOMO_SESSION")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .map(SessionId::from_raw);
+    let in_run = session.is_some();
     let response = client
         .memories(&MemoryListQuery {
             query: filter.query,
@@ -443,13 +453,21 @@ pub async fn memory_list(client: &KomoClient, filter: MemoryFilter) -> Outcome {
             scope,
             state,
             limit: filter.limit,
+            session,
         })
         .await
         .map_err(failed)?;
-    if filter.full {
-        return Ok(render::memory_list_full(&response));
+    let body = if filter.search {
+        render::memory_search(&response)
+    } else if filter.full {
+        render::memory_list_full(&response)
+    } else {
+        render::memory_list(&response)
+    };
+    if in_run {
+        return Ok(format!("{MEMORY_QUERY_MARKER}\n{body}"));
     }
-    Ok(render::memory_list(&response))
+    Ok(body)
 }
 
 pub async fn memory_show(client: &KomoClient, id: &str) -> Outcome {

@@ -644,6 +644,7 @@ mod tests {
             candidates_before_fusion: Some(12),
             candidates_after_fusion: Some(8),
             dropped_by_budget: Some(3),
+            conventions_over_budget: None,
             arm_scores: vec![],
             dropped_by_threshold: None,
             reused_pin: false,

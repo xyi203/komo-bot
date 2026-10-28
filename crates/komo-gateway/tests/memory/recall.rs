@@ -499,10 +499,10 @@ async fn the_recalled_memory_block_follows_the_input_as_a_host_message() {
     assert!(said[block..].contains("客厅空调设 26 度"), "{said}");
 }
 
-/// 附录 F / §9.4 的验收：同一个会话中途换任务，新任务的约定能召回到。先问日志、后说"提个发布
-/// 工单"，第二个 Run 的请求里有发布工单那条约定，第一个请求原样是它的前缀。
+/// 附录 F / §9.4 的验收：同一个会话先问日志、后说"提个发布工单"。约定不过门槛，第一个 Run 就随块带上
+/// （与问什么无关）；换任务后第二个 Run 只补它新命中的线索，不重复约定，第一个请求原样是它的前缀。
 #[tokio::test]
-async fn switching_tasks_mid_session_recalls_the_new_tasks_convention() {
+async fn a_convention_rides_along_on_the_first_run_and_is_not_repeated_after_a_task_switch() {
     use komo_kernel::types::memory::MemoryApplication;
 
     let llm = ScriptedLlm::new(vec![
@@ -543,8 +543,8 @@ async fn switching_tasks_mid_session_recalls_the_new_tasks_convention() {
     let first = crate::said(&seen[0]);
     assert!(first.contains("dev-saas-log"), "{first}");
     assert!(
-        !first.contains("Platform 默认选 saas"),
-        "查日志时不带发布约定：{first}"
+        first.contains("Platform 默认选 saas"),
+        "约定不靠检索命中，查日志时也带上：{first}"
     );
     assert_eq!(seen[1].system_prompt, seen[0].system_prompt);
     assert_eq!(
@@ -552,10 +552,58 @@ async fn switching_tasks_mid_session_recalls_the_new_tasks_convention() {
         seen[0].messages[..]
     );
     let second = crate::said(&seen[1]);
-    let ask = second.rfind("提个发布工单").expect("第二个输入");
-    let convention = second
-        .rfind("发布工单 Platform 默认选 saas")
-        .unwrap_or_else(|| panic!("换任务后召回到约定：{second}"));
-    assert!(ask < convention, "约定在第二个输入之后：{second}");
-    assert!(second[ask..].contains("适用的长期约定"), "{second}");
+    assert_eq!(
+        second.matches("Platform 默认选 saas").count(),
+        1,
+        "同一段里换任务也不重复带：{second}"
+    );
+}
+
+/// §9.4「约定不过门槛」的端到端：用一句和约定正文、条件都没有共同字眼的话要求提单，约定仍随第一个
+/// Run 带上；同一段里第二个 Run 不重复带，第一个请求原样是第二个请求的前缀。
+#[tokio::test]
+async fn a_convention_arrives_even_when_the_wording_matches_nothing() {
+    use komo_kernel::types::memory::MemoryApplication;
+
+    let llm = ScriptedLlm::new(vec![
+        vec![text_round(1, "好。")],
+        vec![text_round(1, "好。")],
+    ]);
+    let gateway = super::gateway(&memory_config("keyword", false))
+        .scripted(llm.clone())
+        .start()
+        .await;
+    let mut convention = seeded(
+        "m-ticket",
+        "发布工单 Platform 默认选 saas",
+        Provenance::UserStatement,
+        MemoryState::Active,
+    );
+    convention.application = Some(MemoryApplication::Convention);
+    convention.applies_when = Some("创建发布工单、需要选 Platform 时".into());
+    gateway.state().memory.put(convention, None).await.unwrap();
+
+    let (session, run) = a_run(&gateway, "rk-1", "帮我上线一下 xx").await;
+    wait_for_terminal(&gateway, &run).await;
+    let run = run_in(&gateway, &session, "rk-2", "再帮我上线一下 yy").await;
+    wait_for_terminal(&gateway, &run).await;
+
+    let seen = llm.requests.lock().expect("请求表").clone();
+    assert_eq!(seen.len(), 2);
+    let first = crate::said(&seen[0]);
+    let ask = first.find("帮我上线一下 xx").expect("输入");
+    let block = first
+        .find("Platform 默认选 saas")
+        .unwrap_or_else(|| panic!("约定不靠检索命中：{first}"));
+    assert!(ask < block, "{first}");
+    let second = crate::said(&seen[1]);
+    assert_eq!(
+        second.matches("Platform 默认选 saas").count(),
+        1,
+        "同一段里不重复带：{second}"
+    );
+    assert_eq!(
+        seen[1].messages[..seen[0].messages.len()],
+        seen[0].messages[..]
+    );
 }

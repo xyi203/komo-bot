@@ -269,7 +269,7 @@ impl GatewayState {
             events,
             work,
             clock: Arc::clone(&clock),
-            render: komo_agent::context::memory::render,
+            render: komo_agent::context::memory::render_run,
         }));
         if injected_embeddings.is_none() {
             spawn_embedding_probe(Arc::clone(&memories), Arc::clone(&config));

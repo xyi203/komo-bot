@@ -34,6 +34,7 @@ mod governance;
 mod index;
 mod inspect;
 mod recall;
+mod session_search;
 mod startup;
 
 use std::sync::Arc;

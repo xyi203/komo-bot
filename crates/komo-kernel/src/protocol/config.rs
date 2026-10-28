@@ -264,6 +264,10 @@ pub struct RetrievalConfig {
     pub top_k: u32,
     #[serde(default = "default_max_tokens")]
     pub max_tokens: u32,
+    /// 约定组的 token 预算（§9.4「约定不过门槛」）：约定不过相关度门槛、不占 `top_k`，也不与
+    /// `max_tokens` 互相挤占；超出的按创建先后截断，截掉的回到门槛那条路。
+    #[serde(default = "default_convention_tokens")]
+    pub convention_tokens: u32,
     /// 把融合后的短名单交给判断后端重排（§9.4）。默认关：开着就要发一次外部请求。
     #[serde(default)]
     pub rerank: bool,
@@ -294,6 +298,9 @@ fn default_top_k() -> u32 {
 fn default_max_tokens() -> u32 {
     1500
 }
+fn default_convention_tokens() -> u32 {
+    800
+}
 
 impl Default for RetrievalConfig {
     fn default() -> Self {
@@ -302,6 +309,7 @@ impl Default for RetrievalConfig {
             candidate_limit: default_candidate_limit(),
             top_k: default_top_k(),
             max_tokens: default_max_tokens(),
+            convention_tokens: default_convention_tokens(),
             rerank: false,
             rerank_shortlist: default_rerank_shortlist(),
             min_similarity: 0.0,

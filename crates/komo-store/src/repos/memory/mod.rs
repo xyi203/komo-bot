@@ -2248,6 +2248,56 @@ mod tests {
         assert_eq!(plain.applies_when, None);
     }
 
+    /// `conventions` 只给 active + convention，按 id（创建先后）排：线索、没分类的、已遗忘的约定都不在。
+    #[tokio::test]
+    async fn conventions_lists_only_active_conventions_in_id_order() {
+        let (db, _dir) = temp().await;
+        let repo = TursoMemoryRepo::new(db);
+        for (id, state, application) in [
+            (
+                "m-3",
+                MemoryState::Active,
+                Some(MemoryApplication::Convention),
+            ),
+            (
+                "m-1",
+                MemoryState::Active,
+                Some(MemoryApplication::Convention),
+            ),
+            (
+                "m-2",
+                MemoryState::Active,
+                Some(MemoryApplication::Reference),
+            ),
+            ("m-4", MemoryState::Active, None),
+            (
+                "m-5",
+                MemoryState::Forgotten,
+                Some(MemoryApplication::Convention),
+            ),
+            (
+                "m-6",
+                MemoryState::Candidate,
+                Some(MemoryApplication::Convention),
+            ),
+        ] {
+            let mut memory = item(id, &format!("正文 {id}"), state);
+            memory.application = application;
+            if application == Some(MemoryApplication::Convention) {
+                memory.applies_when = Some("任何时候".into());
+            }
+            repo.put(memory, None).await.unwrap();
+        }
+        let ids: Vec<String> = repo
+            .conventions()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|memory| memory.id.to_string())
+            .collect();
+        assert_eq!(ids, ["m-1", "m-3"]);
+    }
+
     /// 正文相同、条件不同的是两条：按"正文 + 条件"找不会撞到另一条，只按正文找则不论条件。
     #[tokio::test]
     async fn the_same_content_with_another_condition_is_found_separately() {

@@ -132,6 +132,8 @@ pub struct BashTool {
     register: Option<ChildRegistration>,
     /// 数据目录只读挂载。`None` = 直接跑（没给名单，或这台机器上 bwrap 用不了）。
     sandbox: Option<Sandbox>,
+    /// Gateway 的数据目录，作为 `KOMO_HOME` 交给子进程（附录 C.3.3）。`None` = 不带。
+    komo_home: Option<PathBuf>,
     /// 转后台的接手方（Gateway 装配）。空 = 不转。
     detach: Option<Arc<DetachSlot>>,
 }
@@ -223,8 +225,18 @@ impl BashTool {
             shell: default_shell(),
             register: None,
             sandbox: None,
+            komo_home: None,
             detach: None,
         }
+    }
+
+    /// 子进程里的 `komo` 靠 `KOMO_HOME` 找数据目录，没有它就落到 `~/.komo`，非默认数据目录的
+    /// 实例里模型的自查命令会连到另一台 Gateway。这里要的是 Gateway **实际**用的目录，由
+    /// 装配处算好递进来，不从环境继承（前台跑的 `KOMO_HOME=… komo gateway --foreground`
+    /// 与配置里改过目录的都对）。它是路径，不是凭证。
+    pub fn with_komo_home(mut self, home: PathBuf) -> Self {
+        self.komo_home = Some(home);
+        self
     }
 
     /// 对话会话里跑久了的命令交给这个槽里的接手方（`docs/monitor.md` §8）。
@@ -354,7 +366,7 @@ impl Tool for BashTool {
             program,
             args: child_args,
             cwd: cwd.clone(),
-            env: environment(ctx),
+            env: self.environment(ctx),
             timeout,
             output_limit: self.output_limit,
             register: self.register.clone(),
@@ -518,16 +530,21 @@ impl Tool for BashTool {
     // `replay` 用默认的 unsafe：任意命令重启后不重跑（§8.6）。
 }
 
-fn environment(ctx: &ToolContext) -> BTreeMap<String, String> {
-    let mut env = base_environment();
-    env.insert("KOMO_SESSION".into(), ctx.session.to_string());
-    // `!` 没有输入 Run，沿用产物身份以保持 Gateway 子进程识别及拒绝无证据记忆的行为。
-    // Agent 工具上下文必须提供 input_run；harness 缺少输入时在执行前报错。
-    env.insert(
-        "KOMO_RUN".into(),
-        ctx.input_run.as_ref().unwrap_or(&ctx.run).to_string(),
-    );
-    env
+impl BashTool {
+    fn environment(&self, ctx: &ToolContext) -> BTreeMap<String, String> {
+        let mut env = base_environment();
+        if let Some(home) = &self.komo_home {
+            env.insert("KOMO_HOME".into(), home.to_string_lossy().into_owned());
+        }
+        env.insert("KOMO_SESSION".into(), ctx.session.to_string());
+        // `!` 没有输入 Run，沿用产物身份以保持 Gateway 子进程识别及拒绝无证据记忆的行为。
+        // Agent 工具上下文必须提供 input_run；harness 缺少输入时在执行前报错。
+        env.insert(
+            "KOMO_RUN".into(),
+            ctx.input_run.as_ref().unwrap_or(&ctx.run).to_string(),
+        );
+        env
+    }
 }
 
 /// 交给子进程的明确环境：继承的那几个变量 + 非交互终端。不带会话与 Run。
@@ -592,6 +609,41 @@ mod tests {
             std::fs::read_to_string(home.join("other")).unwrap().trim(),
             "ok"
         );
+    }
+
+    /// 附录 C.3.3：子进程里的 `komo` 连的是装配时给的数据目录，不是继承来的环境，也不是 `~/.komo`。
+    #[tokio::test]
+    async fn the_child_gets_the_gateways_data_dir_as_komo_home() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = context(dir.path());
+        let data_dir = dir.path().join("instance-b");
+        let tool = BashTool::new().with_komo_home(data_dir.clone());
+        let mut sink = writer(&ctx);
+        let plan = tool
+            .prepare(
+                serde_json::json!({ "command": "printf %s \"$KOMO_HOME\"" }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        let output = tool.execute(plan, &ctx, &mut sink).await.unwrap();
+        assert_eq!(
+            shell_result(&output).stdout_excerpt,
+            data_dir.to_string_lossy()
+        );
+
+        // 没装配时不带：不从 Gateway 自己的环境里继承一个可能不对的值。
+        let bare = BashTool::new();
+        let mut sink = writer(&ctx);
+        let plan = bare
+            .prepare(
+                serde_json::json!({ "command": "printf %s \"${KOMO_HOME-unset}\"" }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        let output = bare.execute(plan, &ctx, &mut sink).await.unwrap();
+        assert_eq!(shell_result(&output).stdout_excerpt, "unset");
     }
 
     #[tokio::test]

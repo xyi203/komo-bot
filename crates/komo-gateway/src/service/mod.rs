@@ -390,6 +390,7 @@ async fn build_tools(
             BashTool::new()
                 .registered(registration.clone())
                 .protecting(protected.clone())
+                .with_komo_home(config.home().to_path_buf())
                 .detaching(Arc::clone(detach_slot)),
         ),
         // 搜索是**进程内**的（`grep` + `ignore` 书库）：没有外部二进制，也就没有"这台机器

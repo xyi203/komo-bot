@@ -140,7 +140,7 @@ fn model() -> ModelConfig {
     }
 }
 
-fn render(_: &[MemoryItem], _: u32) -> Injection {
+fn render(_: &[MemoryItem], _: &[MemoryItem], _: u32, _: u32) -> Injection {
     Injection::default()
 }
 

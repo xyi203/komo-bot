@@ -23,7 +23,7 @@
 //! 不依赖这个 crate。
 
 use komo_kernel::types::memory::{
-    Confirmation, Injection, MemoryItem, MemoryKind, MemoryState, Provenance,
+    Confirmation, Injection, MemoryItem, MemoryKind, MemoryState, Provenance, RecallDiagnostics,
 };
 use komo_kernel::types::turn::MemoryUse;
 
@@ -55,16 +55,44 @@ fn is_convention(item: &MemoryItem) -> bool {
 
 /// 把召回到的条目渲染成注入段，并在 token 预算处停下（§9.4：「按条数和 token 预算选入
 /// 上下文」「不强行填满」）。组内保持召回的名次；一组的小标题在这一组放进第一条时才计入
-/// 预算。
+/// 预算。没有常驻约定的调用（邻居展示、旧的按段注入）用它。
 pub fn render(items: &[MemoryItem], max_tokens: u32) -> Injection {
-    if items.is_empty() {
-        return Injection::default();
-    }
+    render_run(&[], items, max_tokens, 0)
+}
+
+/// 一个 Run 的召回块（§9.4「约定不过门槛」）。`resident` 是不过门槛的约定（按 id 先后），
+/// 先放进约定组，花 `convention_tokens`；放不下的从那一条起整段截掉（按创建先后），数量记在
+/// 交回的诊断里。`items` 是过了门槛的召回结果，花 `max_tokens`：已经作为常驻约定渲染过的
+/// 跳过；被截掉的约定若也在 `items` 里，就照旧渲染在约定组里。
+pub fn render_run(
+    resident: &[MemoryItem],
+    items: &[MemoryItem],
+    max_tokens: u32,
+    convention_tokens: u32,
+) -> Injection {
     let mut used = approx_tokens(HEADER);
     let mut conventions: Vec<(String, MemoryUse)> = Vec::new();
     let mut clues: Vec<(String, MemoryUse)> = Vec::new();
 
+    let mut resident_used = 0;
+    for item in resident {
+        let line = render_line(item, true);
+        let mut cost = approx_tokens(&line) + 1;
+        if conventions.is_empty() {
+            cost += approx_tokens(CONVENTION_HEADER) + 1;
+        }
+        if resident_used + cost > convention_tokens {
+            break;
+        }
+        resident_used += cost;
+        conventions.push((line, use_of(item)));
+    }
+    let over_budget = resident.len() - conventions.len();
+
     for item in items {
+        if conventions.iter().any(|(_, use_)| use_.memory == item.id) {
+            continue;
+        }
         let convention = is_convention(item);
         let line = render_line(item, convention);
         let (group, header) = if convention {
@@ -74,6 +102,7 @@ pub fn render(items: &[MemoryItem], max_tokens: u32) -> Injection {
         };
         // 每一行前面的换行也算进去，预算才是渲染出来的真实长度。
         let mut cost = approx_tokens(&line) + 1;
+        // 约定组的标题常驻那几条已经在约定预算里付过；一条都没放下时才轮到这里付。
         if group.is_empty() {
             cost += approx_tokens(header) + 1;
         }
@@ -81,13 +110,7 @@ pub fn render(items: &[MemoryItem], max_tokens: u32) -> Injection {
             break;
         }
         used += cost;
-        group.push((
-            line,
-            MemoryUse {
-                memory: item.id.clone(),
-                revision: item.revision,
-            },
-        ));
+        group.push((line, use_of(item)));
     }
 
     if conventions.is_empty() && clues.is_empty() {
@@ -108,7 +131,17 @@ pub fn render(items: &[MemoryItem], max_tokens: u32) -> Injection {
     Injection {
         text: Some(lines.join("\n")),
         uses,
-        diagnostics: None,
+        diagnostics: (over_budget > 0).then(|| RecallDiagnostics {
+            conventions_over_budget: Some(over_budget as u32),
+            ..RecallDiagnostics::default()
+        }),
+    }
+}
+
+fn use_of(item: &MemoryItem) -> MemoryUse {
+    MemoryUse {
+        memory: item.id.clone(),
+        revision: item.revision,
     }
 }
 
@@ -430,6 +463,52 @@ mod tests {
         assert_eq!(injection.uses.len(), 1, "线索放不下，只剩约定");
         assert!(!injection.text.unwrap().contains("历史线索"));
     }
+    /// 常驻约定花自己的预算，不挤线索的预算；放不下的从那一条起截掉并记数（§9.4「约定不过门槛」）。
+    #[test]
+    fn resident_conventions_have_their_own_budget_and_overflow_is_counted() {
+        let resident = vec![
+            convention("m-1", "发布工单 Platform 默认选 saas", "创建发布工单时"),
+            convention("m-2", "查日志默认用 sls", "查日志时"),
+        ];
+        let clues = vec![memory("m-3", "查 dev 日志用 dev-saas-log")];
+        // 约定预算只够一条；线索预算宽裕。
+        let injection = render_run(&resident, &clues, 5_000, 170);
+        let text = injection.text.as_deref().unwrap();
+        assert!(
+            text.contains("默认选 saas") && !text.contains("默认用 sls"),
+            "{text}"
+        );
+        assert!(text.contains("dev-saas-log"), "线索照常渲染：{text}");
+        assert_eq!(
+            injection.diagnostics.unwrap().conventions_over_budget,
+            Some(1)
+        );
+        // 约定预算放得下就一条不丢，也不留诊断。
+        let injection = render_run(&resident, &clues, 5_000, 5_000);
+        assert_eq!(injection.uses.len(), 3);
+        assert!(injection.diagnostics.is_none());
+    }
+
+    /// 被截掉的约定若也过了门槛（在线索那一路里），照旧渲染在约定组；已经常驻的不重复。
+    #[test]
+    fn a_truncated_convention_that_passed_the_gate_still_renders_in_the_convention_group() {
+        let first = convention("m-1", "发布工单 Platform 默认选 saas", "创建发布工单时");
+        let second = convention("m-2", "查日志默认用 sls", "查日志时");
+        let injection = render_run(
+            &[first.clone(), second.clone()],
+            &[first, second, memory("m-3", "查 dev 日志用 dev-saas-log")],
+            5_000,
+            170,
+        );
+        let text = injection.text.as_deref().unwrap();
+        assert_eq!(text.matches("默认选 saas").count(), 1, "{text}");
+        let conventions = text.find("适用的长期约定").unwrap();
+        let clues = text.find("历史线索").unwrap();
+        let sls = text.find("默认用 sls").unwrap();
+        assert!(conventions < sls && sls < clues, "{text}");
+        assert_eq!(injection.uses.len(), 3);
+    }
+
     /// 遗忘改写（§9.4）：去掉的行没了、空了的组标题跟着去掉；整块不剩是 `None`。
     #[test]
     fn without_drops_the_lines_and_the_groups_they_empty() {

@@ -113,7 +113,7 @@ pub(super) fn build(
     Ok(out)
 }
 
-pub(super) fn recall_scopes(resolved: &Resolved) -> Option<Vec<MemoryScope>> {
+pub(crate) fn recall_scopes(resolved: &Resolved) -> Option<Vec<MemoryScope>> {
     scopes_for(
         resolved.profile.memory,
         &resolved.agent_id,

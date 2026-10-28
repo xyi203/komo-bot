@@ -289,6 +289,7 @@ fn inspected_detail() -> RunDetail {
         candidates_before_fusion: Some(12),
         candidates_after_fusion: Some(8),
         dropped_by_budget: Some(2),
+        conventions_over_budget: None,
         arm_scores: vec![],
         dropped_by_threshold: None,
         reused_pin: false,
@@ -1208,4 +1209,71 @@ fn a_consolidation_report_shows_members_actions_reasons_and_authorization() {
     assert!(text.contains("[降级]"));
     assert!(text.contains("实际：冲突 m-1@2 与 m-2@1"));
     assert!(text.contains("加 --apply"));
+}
+
+#[test]
+fn memory_search_lists_conventions_apart_from_clues_with_usage_and_condition() {
+    use komo_kernel::protocol::http::MemoryListResponse;
+    use komo_kernel::types::memory::{MemoryApplication, MemoryItem};
+
+    let item = |id: &str,
+                content: &str,
+                application: Option<MemoryApplication>,
+                when: Option<&str>| {
+        let mut item: MemoryItem = serde_json::from_value(serde_json::json!({
+                "id": id, "revision": 1, "content": content, "kind": "preference",
+                "scope": {"kind": "personal"}, "provenance": "user_statement",
+                "confirmation": "unconfirmed", "state": "active",
+                "observed_at": "2026-09-17T08:00:00Z", "created_at": "2026-09-17T08:00:00Z",
+                "updated_at": "2026-09-17T08:00:00Z",
+                "extraction": {"model": "m", "effort": {"kind": "provider_default"}, "prompt_version": "v1"}
+            }))
+            .expect("样例条目");
+        item.application = application;
+        item.applies_when = when.map(str::to_string);
+        item
+    };
+    let response = MemoryListResponse {
+        memories: vec![
+            item(
+                "m-1",
+                "查日志用 sls",
+                Some(MemoryApplication::Reference),
+                None,
+            ),
+            item(
+                "m-2",
+                "发布工单 Platform 默认选 saas",
+                Some(MemoryApplication::Convention),
+                Some("创建发布工单时"),
+            ),
+        ],
+        degraded: false,
+        degraded_reason: None,
+    };
+    let out = memory_search(&response);
+    let conventions = out.find("约定").expect("约定组");
+    let clues = out.find("线索").expect("线索组");
+    assert!(conventions < clues, "{out}");
+    let line = out
+        .lines()
+        .find(|line| line.starts_with("m-2@1"))
+        .expect("约定行");
+    assert!(line.contains("\tconvention\t创建发布工单时\t"), "{line}");
+    let line = out
+        .lines()
+        .find(|line| line.starts_with("m-1@1"))
+        .expect("线索行");
+    assert!(line.contains("\treference\t-\t"), "{line}");
+    assert!(
+        out.find("m-2@1").unwrap() < out.find("m-1@1").unwrap(),
+        "约定先列：{out}"
+    );
+
+    let empty = MemoryListResponse {
+        memories: vec![],
+        degraded: false,
+        degraded_reason: None,
+    };
+    assert_eq!(memory_search(&empty), "没有匹配的记忆");
 }

@@ -92,7 +92,7 @@ Gateway 持有模型连接、数据库与提交线、工具环境、运行状态
 | `komo gateway status/stop/restart`           | 管理后台进程。在 Gateway 自己的 `bash` 里跑 `stop` / `restart`（TUI 的 `!`、模型发起的都算）不当场做，推迟到这条命令结束、结果记进会话之后（见下文"在 Gateway 里重启自己"） |
 | `komo intervention list/show/answer`         | 待处理清单：结果不明、阻塞两类一张表；等价于聊天里的 `/pending` 与 `/answer`（§7.5、§11.3） |
 | `komo cron add/list/run/pause/resume/remove` | 管理定时任务                                                                |
-| `komo memory list/search/show`               | 查看自动记忆、来源与确认状态；search 支持 hybrid / keyword / vector；list --full 一条一行不截断，列为 `id@版本 状态 来源 确认 用量 使用方式 条件 正文`（无条件写 `-`，旧条目使用方式写「未分类」）；show 同样显示使用方式与条件 |
+| `komo memory list/search/show`               | 查看自动记忆、来源与确认状态；search 支持 hybrid / keyword / vector，输出同 `list --full` 的列、约定与线索分开列；list --full 一条一行不截断，列为 `id@版本 状态 来源 确认 用量 使用方式 条件 正文`（无条件写 `-`，旧条目使用方式写「未分类」）；show 同样显示使用方式与条件。在 Run 里（bash 子进程带 `KOMO_SESSION`）跑 list / search 时按该会话 Profile 放行的作用域答（`memory = off` 的会话被拒），输出首行是宿主标记「记忆查询结果：已有记忆，不是新证据」，提取不把它当证据（`docs/memory.md` §9.4）；终端里不带会话，照旧 |
 | `komo memory add`                            | 手动记一条（§9.3）；在 Run 里（带 `KOMO_SESSION` / `KOMO_RUN`）记成未确认、引用户原话，终端里直接记成已确认；`--application convention --applies-when "条件"` 记成长期约定，省略记成线索（`docs/memory.md` §9.2） |
 | `komo memory confirm/forget`                 | 确认具体版本或停用自动记忆；不删除 Memos 原文                               |
 | `komo memory classify`                       | 操作者给指定 revision 定使用方式（约定 / 线索）与条件，升一版；存量分类用（`docs/memory.md` §9.3） |
@@ -1131,6 +1131,8 @@ mode = "hybrid"
 candidate_limit = 40
 top_k = 8
 max_tokens = 1500
+# 约定组（active + convention）不过门槛、不占 top_k，另有一份 token 预算；超出的按创建先后截掉，回到门槛那条路。
+convention_tokens = 800
 # 相关度门槛（docs/memory.md §9.4）：过任一道才留下；0 = 不启用（默认）。
 # 分数随 embedding 模型与前缀变，按自己的向量空间校准后再填，例如 qwen3-embedding:0.6b 无前缀：
 # min_similarity = 0.56

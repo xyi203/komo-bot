@@ -260,6 +260,9 @@ fn recall_line(recall: &RecallDiagnostics) -> String {
     if let Some(dropped) = recall.dropped_by_budget.filter(|dropped| *dropped > 0) {
         cells.push(format!("预算挤掉 {dropped}"));
     }
+    if let Some(over) = recall.conventions_over_budget.filter(|over| *over > 0) {
+        cells.push(format!("约定超出预算 {over} 条"));
+    }
     cells.join(" · ")
 }
 
@@ -526,40 +529,75 @@ pub fn memory_list(response: &MemoryListResponse) -> String {
 /// `未分类`）；没有表头和对齐空格，正文里的换行与制表符压成空格，
 /// 所以"一行一条"始终成立。
 pub fn memory_list_full(response: &MemoryListResponse) -> String {
-    let mut out = Vec::new();
-    if response.degraded {
-        out.push(format!(
-            "⚠ 检索已降级为关键词{}",
-            response
-                .degraded_reason
-                .as_deref()
-                .map(|r| format!("：{r}"))
-                .unwrap_or_default()
-        ));
+    let mut out = degraded_notice(response);
+    out.extend(response.memories.iter().map(full_line));
+    out.join("\n")
+}
+
+/// `komo memory search`：列同 [`memory_list_full`]，约定与线索分开列，读到的和注入块是同一套
+/// 语义（§9.4）。约定 = active + convention；其余（reference、没分类、candidate、contested）
+/// 都是线索。
+pub fn memory_search(response: &MemoryListResponse) -> String {
+    let mut out = degraded_notice(response);
+    if response.memories.is_empty() {
+        out.push("没有匹配的记忆".into());
+        return out.join("\n");
     }
-    for item in &response.memories {
-        let content = item
-            .content
-            .split(['\n', '\r', '\t'])
-            .filter(|part| !part.trim().is_empty())
-            .map(str::trim)
-            .collect::<Vec<_>>()
-            .join(" ");
-        out.push(format!(
-            "{}@{}\t{}\t{}\t{}\t注入 {} 次 · 用上 {} 次\t{}\t{}\t{}",
-            item.id,
-            item.revision,
-            memory_state(item.state),
-            provenance(item.provenance),
-            confirmation(item.confirmation),
-            item.usage.count,
-            item.usage.adopted_count,
-            application_text(item),
-            item.applies_when.as_deref().unwrap_or("-"),
-            content
-        ));
+    let (conventions, clues): (Vec<&MemoryItem>, Vec<&MemoryItem>) = response
+        .memories
+        .iter()
+        .partition(|item| item.state == MemoryState::Active && item.is_convention());
+    for (title, group) in [
+        ("约定（条件成立、且这次没有另外指定时照做）", conventions),
+        (
+            "线索（用来查找与核实，不是指令；易变的事实先对照当前情况）",
+            clues,
+        ),
+    ] {
+        if group.is_empty() {
+            continue;
+        }
+        out.push(format!("{title}："));
+        out.extend(group.into_iter().map(full_line));
     }
     out.join("\n")
+}
+
+fn degraded_notice(response: &MemoryListResponse) -> Vec<String> {
+    if !response.degraded {
+        return Vec::new();
+    }
+    vec![format!(
+        "⚠ 检索已降级为关键词{}",
+        response
+            .degraded_reason
+            .as_deref()
+            .map(|r| format!("：{r}"))
+            .unwrap_or_default()
+    )]
+}
+
+fn full_line(item: &MemoryItem) -> String {
+    let content = item
+        .content
+        .split(['\n', '\r', '\t'])
+        .filter(|part| !part.trim().is_empty())
+        .map(str::trim)
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!(
+        "{}@{}\t{}\t{}\t{}\t注入 {} 次 · 用上 {} 次\t{}\t{}\t{}",
+        item.id,
+        item.revision,
+        memory_state(item.state),
+        provenance(item.provenance),
+        confirmation(item.confirmation),
+        item.usage.count,
+        item.usage.adopted_count,
+        application_text(item),
+        item.applies_when.as_deref().unwrap_or("-"),
+        content
+    )
 }
 
 /// `komo memory add`：先一句说清记成了什么，再是整条。

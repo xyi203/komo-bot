@@ -264,6 +264,10 @@ const BASH_TOOL: &str = "bash";
 /// 「记住」那句的约定分支（2026-10-28，附录 F）：用户说了"以后""默认""每次都"这类话才带
 /// `--application convention` 与条件，当次要求不 add；不带 `--application` 记成线索。
 ///
+/// 「查记忆」那句（2026-10-28，§9.4「Agent 主动查」）：注入的记忆不够用、或报错之后想看以前
+/// 的排查经验，由 Agent 自己 `komo memory search`，替代宿主在 Run 中途插召回。静态文字，不
+/// 影响前缀；查到的按注入块同一套规则用（约定照做、线索先核实）。
+///
 /// 末句（2026-10-15）：会话里 6 次在 Run 里重启 Gateway，8 个调用因此记成 uncertain，
 /// 最长的一条两个多小时后才收尾。
 const SELF_BLOCK: &str = "komo 自己的状态（cron、会话 / Run、记忆、介入、配置、skills、\
@@ -275,6 +279,9 @@ const SELF_BLOCK: &str = "komo 自己的状态（cron、会话 / Run、记忆、
                           `--application convention --applies-when \"适用的条件\"` 记成长期约定；\
                           只管眼前这件事的要求（\"这个工单选 saas\"）不要 add；拿不准就不带 \
                           `--application`，记成线索。\
+                          注入的记忆不够用、或者报错之后想看以前的排查经验，用 \
+                          `komo memory search \"关键词\"` 查；查到的按同样的规则用——约定照做，\
+                          线索先核实。\
                           你自己就跑在 Gateway 里：`komo gateway restart|stop` 和会重启 \
                           Gateway 的安装脚本会打断你正在做的这件事，要跑就放在最后一步，\
                           或者交给用户自己跑。";

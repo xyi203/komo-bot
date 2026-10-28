@@ -1779,13 +1779,15 @@ fn a_task_result_input_cannot_be_cited_as_a_user_statement() {
 #[test]
 fn a_marked_memory_query_result_is_labelled_and_cannot_be_cited() {
     let run = RunId::from_raw("run-1");
-    // 工具结果的预览本身以标记开头。
+    // 照 bash 预览的真实形状：首行是退出码与字节数，标记在 stdout 的第一行。
     let events = vec![
         user_event(1, &run, "空调怎么设"),
         tool_event(
             2,
             &run,
-            &format!("{MEMORY_QUERY_MARKER}\nm-1@1\t客厅空调设 26 度"),
+            &format!(
+                "exit=0 stdout=120B stderr=0B\n{MEMORY_QUERY_MARKER}\nm-1@1\t客厅空调设 26 度"
+            ),
         ),
         tool_event(3, &run, "exit=0 · 普通命令的输出"),
     ];

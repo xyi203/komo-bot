@@ -276,8 +276,12 @@ impl Transcript {
                 }
                 EventPayload::ToolResult(body) => (
                     // 认输出里的宿主标记，不解析命令行：命令可能经过管道、别名或脚本。
+                    // 标记不在预览开头：bash 的预览首行是 `exit=… stdout=…B stderr=…B`，
+                    // 命令前面还可能先打印了别的，所以认"某一行以它开头"。
                     if body.preview.as_deref().is_some_and(|preview| {
-                        preview.trim_start().starts_with(MEMORY_QUERY_MARKER)
+                        preview
+                            .lines()
+                            .any(|line| line.trim_start().starts_with(MEMORY_QUERY_MARKER))
                     }) {
                         Role::MemoryQuery
                     } else {

@@ -162,6 +162,8 @@ pub enum LlmError {
     Rejected { status: u16, message: String },
     #[error("超时")]
     Timeout,
+    #[error("收到数据后超时")]
+    TimeoutAfterData,
     #[error("回复未收齐——不能按半轮调用执行")]
     Incomplete,
     /// 模型不支持配置里的 effort。不能删掉 effort 自动重试（§13.3）。

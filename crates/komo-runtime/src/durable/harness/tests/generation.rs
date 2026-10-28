@@ -186,6 +186,33 @@ async fn model_errors_back_off_from_two_to_sixty_seconds_and_fail_after_ten_atte
     engine.close().await.unwrap();
 }
 
+#[tokio::test(start_paused = true)]
+async fn three_consecutive_empty_timeouts_stop_but_timeouts_after_data_retry() {
+    use komo_kernel::types::turn::LlmError;
+    let world = World::new();
+    for _ in 0..10 {
+        world.script.push(Step::Error(LlmError::Timeout));
+    }
+    let engine = world.open().await;
+    let id = world.submit(&engine, "hi").await;
+    let settled = world.harness.wait(&engine, id).await.unwrap();
+    assert_eq!(world.script.request_times().len(), 3);
+    let detail = unanswered(&settled).1.unwrap();
+    assert!(detail.contains("连续 3 次在 5 秒内没收到数据"), "{detail}");
+    engine.close().await.unwrap();
+
+    let world = World::new();
+    for _ in 0..4 {
+        world.script.push(Step::Error(LlmError::TimeoutAfterData));
+    }
+    world.script.reply("finally");
+    let engine = world.open().await;
+    let id = world.submit(&engine, "hi").await;
+    world.harness.wait(&engine, id).await.unwrap();
+    assert_eq!(world.script.request_times().len(), 5);
+    engine.close().await.unwrap();
+}
+
 /// D4b 验收："成功一轮后计数清零"；pi harness-generation "retries a retryable error after a
 /// durable backoff and then answers"。
 #[tokio::test(start_paused = true)]

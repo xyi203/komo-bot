@@ -195,7 +195,7 @@ impl Backend {
             .post(request)
             .await
             .map_err(|error| match error {
-                TransportError::Timeout => EmbedError::Timeout,
+                TransportError::Timeout | TransportError::TimeoutAfterData => EmbedError::Timeout,
                 TransportError::Failed(message) => EmbedError::Unavailable(message),
             })
     }

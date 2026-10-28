@@ -101,6 +101,8 @@ pub struct Limits {
 pub enum Checkpoint {
     Prepare {
         attempt: u32,
+        #[serde(default)]
+        empty_timeouts: u32,
         /// 这个生成等过的阻塞压缩：之后不再起别的压缩（要么这一轮已经压过，要么压不动）。
         #[serde(default, skip_serializing_if = "Option::is_none")]
         compacted: Option<TaskId>,
@@ -113,6 +115,8 @@ pub enum Checkpoint {
     },
     Request {
         attempt: u32,
+        #[serde(default)]
+        empty_timeouts: u32,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         compacted: Option<TaskId>,
         /// 这一轮刚把 `messages[i]` 起的工具结果换了短视图（衰减）：Anthropic 的缓存断点要补在
@@ -131,6 +135,8 @@ pub enum Checkpoint {
     },
     Retry {
         attempt: u32,
+        #[serde(default)]
+        empty_timeouts: u32,
         /// 到点时刻（毫秒）。
         until: i64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -151,9 +157,10 @@ fn encode(checkpoint: &Checkpoint) -> Value {
 }
 
 impl Checkpoint {
-    fn prepare(attempt: u32, compacted: Option<TaskId>) -> Self {
+    fn prepare(attempt: u32, compacted: Option<TaskId>, empty_timeouts: u32) -> Self {
         Checkpoint::Prepare {
             attempt,
+            empty_timeouts,
             compacted,
             overflow: None,
             threshold: false,
@@ -173,7 +180,7 @@ impl TaskKind for GenerationDefinition {
     }
 
     fn initial(&self, _input: &Value) -> Value {
-        encode(&Checkpoint::prepare(1, None))
+        encode(&Checkpoint::prepare(1, None, 0))
     }
 
     async fn run_phase(&self, _task: &RunningTask, _rt: &TaskRuntime) -> Result<(), TaskError> {
@@ -239,6 +246,7 @@ impl GenerationTask {
     ) -> Result<(), TaskError> {
         let conversation = rt.conversation();
         let Resumed {
+            empty_timeouts,
             compacted,
             overflow,
             threshold,
@@ -318,7 +326,9 @@ impl GenerationTask {
             match plan {
                 Plan::Nothing => {}
                 Plan::Compact { decision } => {
-                    return self.wait_for_compaction(rt, attempt, decision).await;
+                    return self
+                        .wait_for_compaction(rt, attempt, empty_timeouts, decision)
+                        .await;
                 }
                 Plan::Background { decision } => background = Some(decision),
                 Plan::Decay {
@@ -341,6 +351,7 @@ impl GenerationTask {
         let newest = entries.last().map(|entry| entry.id);
         let request = Checkpoint::Request {
             attempt,
+            empty_timeouts,
             compacted,
             revised_from,
             model: setup.model.clone(),
@@ -421,6 +432,7 @@ impl GenerationTask {
         &self,
         rt: &TaskRuntime,
         attempt: u32,
+        empty_timeouts: u32,
         decision: komo_kernel::compaction::CompactionDecision,
     ) -> Result<(), TaskError> {
         let conversation = rt.conversation();
@@ -440,6 +452,7 @@ impl GenerationTask {
                 live::store(tx, conversation, &live).await?;
                 let checkpoint = Checkpoint::Prepare {
                     attempt,
+                    empty_timeouts,
                     compacted: Some(id),
                     overflow: None,
                     threshold: true,
@@ -502,6 +515,7 @@ impl GenerationTask {
                 live::store(tx, conversation, &live).await?;
                 let checkpoint = Checkpoint::Prepare {
                     attempt,
+                    empty_timeouts: 0,
                     compacted: Some(id),
                     overflow: Some(text),
                     threshold: false,
@@ -658,6 +672,23 @@ impl GenerationTask {
         {
             return Ok(());
         }
+        let empty_timeouts = if matches!(error, LlmError::Timeout) {
+            request.empty_timeouts + 1
+        } else {
+            0
+        };
+        if empty_timeouts >= 3 {
+            return self
+                .fail_with_message(
+                    rt,
+                    message,
+                    format!(
+                        "连续 3 次在 {} 秒内没收到数据",
+                        request.model.timeout_secs.max(1)
+                    ),
+                )
+                .await;
+        }
         let retryable = retry_cause(&error).is_some();
         if retryable && request.limits.retry.allows_another(request.attempt) {
             let conversation = rt.conversation();
@@ -681,6 +712,7 @@ impl GenerationTask {
                         live::store(tx, conversation, &live).await?;
                         Ok(Some(running(encode(&Checkpoint::Retry {
                             attempt,
+                            empty_timeouts,
                             until,
                             compacted,
                         }))))
@@ -1002,6 +1034,7 @@ impl GenerationTask {
 
 /// `prepare` 是从什么恢复的：等过的阻塞压缩与它的起因。
 struct Resumed {
+    empty_timeouts: u32,
     compacted: Option<TaskId>,
     overflow: Option<String>,
     threshold: bool,
@@ -1149,6 +1182,7 @@ async fn commit_partials(
 #[derive(Debug, Clone)]
 pub(super) struct RequestCheckpoint {
     attempt: u32,
+    empty_timeouts: u32,
     compacted: Option<TaskId>,
     revised_from: Option<usize>,
     model: ModelConfig,
@@ -1165,18 +1199,20 @@ impl TaskKind for GenerationTask {
     }
 
     fn initial(&self, _input: &Value) -> Value {
-        encode(&Checkpoint::prepare(1, None))
+        encode(&Checkpoint::prepare(1, None, 0))
     }
 
     async fn run_phase(&self, task: &RunningTask, rt: &TaskRuntime) -> Result<(), TaskError> {
         match decode(task)? {
             Checkpoint::Prepare {
                 attempt,
+                empty_timeouts,
                 compacted,
                 overflow,
                 threshold,
             } => {
                 let resumed = Resumed {
+                    empty_timeouts,
                     compacted,
                     overflow,
                     threshold,
@@ -1185,6 +1221,7 @@ impl TaskKind for GenerationTask {
             }
             Checkpoint::Request {
                 attempt,
+                empty_timeouts,
                 compacted,
                 revised_from,
                 model,
@@ -1197,6 +1234,7 @@ impl TaskKind for GenerationTask {
                     rt,
                     RequestCheckpoint {
                         attempt,
+                        empty_timeouts,
                         compacted,
                         revised_from,
                         model,
@@ -1210,6 +1248,7 @@ impl TaskKind for GenerationTask {
             }
             Checkpoint::Retry {
                 attempt,
+                empty_timeouts,
                 until,
                 compacted,
             } => {
@@ -1227,6 +1266,7 @@ impl TaskKind for GenerationTask {
                         Ok(Some(running(encode(&Checkpoint::prepare(
                             attempt + 1,
                             compacted,
+                            empty_timeouts,
                         )))))
                     })
                 })

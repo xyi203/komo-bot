@@ -115,7 +115,7 @@ pub fn retry_cause(error: &LlmError) -> Option<RetryCause> {
             408 | 409 | 425 => Some(RetryCause::Transport),
             _ => None,
         },
-        LlmError::Timeout => Some(RetryCause::Transport),
+        LlmError::Timeout | LlmError::TimeoutAfterData => Some(RetryCause::Transport),
         // 「回复未收齐」——包括流断在终止帧之前。
         LlmError::Incomplete => Some(RetryCause::Transport),
         LlmError::Transport(_) => Some(RetryCause::Transport),

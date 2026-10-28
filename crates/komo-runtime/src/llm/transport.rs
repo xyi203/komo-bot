@@ -22,6 +22,8 @@ use serde_json::Value;
 pub enum TransportError {
     #[error("超时")]
     Timeout,
+    #[error("收到数据后超时")]
+    TimeoutAfterData,
     #[error("{0}")]
     Failed(String),
 }
@@ -155,6 +157,7 @@ impl ReqwestTransport {
         self.client.get_or_init(|| {
             reqwest::Client::builder()
                 .user_agent(concat!("komo/", env!("CARGO_PKG_VERSION")))
+                .connect_timeout(Duration::from_secs(10))
                 .build()
                 .expect("HTTP 客户端：TLS provider 由 main 安装（§13.4）")
         })
@@ -183,18 +186,49 @@ async fn send(
 ) -> Result<HttpResponse, TransportError> {
     use futures_util::StreamExt;
 
-    builder = builder.timeout(request.timeout);
     for (name, value) in &request.headers {
         builder = builder.header(name, value);
     }
     if let Some(key) = &request.api_key {
         builder = builder.bearer_auth(key);
     }
-    let response = builder.send().await.map_err(map_reqwest)?;
+    let response = tokio::time::timeout(request.timeout, builder.send())
+        .await
+        .map_err(|_| TransportError::Timeout)?
+        .map_err(map_reqwest)?;
     let status = response.status().as_u16();
-    let body = response
-        .bytes_stream()
-        .map(|chunk| chunk.map(|bytes| bytes.to_vec()).map_err(map_reqwest))
+    let timeout = request.timeout;
+    let stream = response.bytes_stream();
+    let body =
+        futures_util::stream::unfold((stream, false), move |(mut stream, received)| async move {
+            let deadline = tokio::time::Instant::now() + timeout;
+            loop {
+                match tokio::time::timeout_at(deadline, stream.next()).await {
+                    Err(_) => {
+                        return Some((
+                            Err(if received {
+                                TransportError::TimeoutAfterData
+                            } else {
+                                TransportError::Timeout
+                            }),
+                            (stream, received),
+                        ));
+                    }
+                    Ok(None) => return None,
+                    Ok(Some(Err(error))) => {
+                        let mapped = map_reqwest(error);
+                        let mapped = if received && mapped == TransportError::Timeout {
+                            TransportError::TimeoutAfterData
+                        } else {
+                            mapped
+                        };
+                        return Some((Err(mapped), (stream, received)));
+                    }
+                    Ok(Some(Ok(bytes))) if bytes.is_empty() => continue,
+                    Ok(Some(Ok(bytes))) => return Some((Ok(bytes.to_vec()), (stream, true))),
+                }
+            }
+        })
         .boxed();
     Ok(HttpResponse { status, body })
 }
@@ -204,6 +238,85 @@ fn map_reqwest(error: reqwest::Error) -> TransportError {
         TransportError::Timeout
     } else {
         TransportError::Failed(error.to_string())
+    }
+}
+
+#[cfg(test)]
+mod socket_tests {
+    use super::*;
+    use futures_util::StreamExt;
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::TcpListener;
+
+    async fn server(header_delay: Duration, gaps: Vec<Duration>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(header_delay).await;
+            let frame = b"data: x\n\n";
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                frame.len() * gaps.len()
+            );
+            if socket.write_all(headers.as_bytes()).await.is_err() {
+                return;
+            }
+            for gap in gaps {
+                tokio::time::sleep(gap).await;
+                if socket.write_all(frame).await.is_err() {
+                    return;
+                }
+            }
+        });
+        format!("http://{address}/")
+    }
+
+    fn transport() -> ReqwestTransport {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        ReqwestTransport::new()
+    }
+
+    #[tokio::test]
+    async fn active_stream_can_outlast_idle_timeout() {
+        let url = server(Duration::ZERO, vec![Duration::from_millis(60); 5]).await;
+        let request = HttpRequest::get(url).with_timeout(Duration::from_millis(200));
+        let started = std::time::Instant::now();
+        let text = transport()
+            .get(request)
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert_eq!(text, "data: x\n\n".repeat(5));
+        assert!(started.elapsed() > Duration::from_millis(200));
+    }
+
+    #[tokio::test]
+    async fn idle_body_times_out_after_data() {
+        let url = server(
+            Duration::ZERO,
+            vec![Duration::ZERO, Duration::from_millis(400)],
+        )
+        .await;
+        let request = HttpRequest::get(url).with_timeout(Duration::from_millis(150));
+        let mut body = transport().get(request).await.unwrap().body;
+        assert!(!body.next().await.unwrap().unwrap().is_empty());
+        assert_eq!(
+            body.next().await.unwrap().unwrap_err(),
+            TransportError::TimeoutAfterData
+        );
+    }
+
+    #[tokio::test]
+    async fn delayed_headers_time_out_without_data() {
+        let url = server(Duration::from_millis(400), vec![]).await;
+        let request = HttpRequest::get(url).with_timeout(Duration::from_millis(150));
+        assert!(matches!(
+            transport().get(request).await,
+            Err(TransportError::Timeout)
+        ));
     }
 }
 

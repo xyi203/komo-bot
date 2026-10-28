@@ -113,6 +113,7 @@ instructions = "你是我的个人助手，回答用中文，简洁直接。"
 base_url = "https://api.openai.com/v1"
 api_backend = "responses"
 env_key = "{API_KEY_VARIABLE}"          # 凭证在 .env 里的变量名
+# timeout_secs = 120  # 等待响应头或正文多久没收到数据算超时；连续 3 次零字节超时停止重试
 
 # 对话模型：model 换成服务提供的模型名；effort 不写就用模型默认。
 [model.chat]

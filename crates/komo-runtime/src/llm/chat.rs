@@ -495,6 +495,7 @@ impl ChatAssembled {
 fn transport_error(error: TransportError) -> LlmError {
     match error {
         TransportError::Timeout => LlmError::Timeout,
+        TransportError::TimeoutAfterData => LlmError::TimeoutAfterData,
         TransportError::Failed(message) => LlmError::Transport(message),
     }
 }

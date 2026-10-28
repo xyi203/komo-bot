@@ -36,7 +36,7 @@ pub const METRICS: &str = "komo::metrics";
 pub fn error_type(error: &LlmError) -> String {
     match error {
         LlmError::Rejected { status, .. } => status.to_string(),
-        LlmError::Timeout => "timeout".into(),
+        LlmError::Timeout | LlmError::TimeoutAfterData => "timeout".into(),
         LlmError::Incomplete => "incomplete".into(),
         LlmError::UnsupportedEffort { .. } => "unsupported_effort".into(),
         LlmError::Transport(_) => "transport".into(),

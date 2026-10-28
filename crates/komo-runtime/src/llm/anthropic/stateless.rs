@@ -131,7 +131,10 @@ impl ModelStream for AnthropicMessagesLlm {
             http = http.with_header("x-api-key", key.clone());
         }
         let started = Instant::now();
-        let outcome = self.stream_round_trip(model, http, progress).await;
+        let mut stats = (None, 0usize);
+        let outcome = self
+            .stream_round_trip(model, http, progress, started, &mut stats)
+            .await;
         let elapsed_ms = started.elapsed().as_millis() as u64;
         match &outcome {
             Ok(message) => tracing::info!(
@@ -143,7 +146,9 @@ impl ModelStream for AnthropicMessagesLlm {
                 elapsed_ms,
                 "model stream completed"
             ),
-            Err(error) => tracing::warn!(
+            Err(error) if stats.0.is_some() => tracing::warn!(
+                first_byte_ms = stats.0.unwrap(),
+                bytes = stats.1,
                 role = %self.role,
                 model = %model.model,
                 api_backend = "anthropic_messages",
@@ -151,6 +156,10 @@ impl ModelStream for AnthropicMessagesLlm {
                 elapsed_ms,
                 error = %error,
                 "model stream failed"
+            ),
+            Err(error) => tracing::warn!(
+                role = %self.role, model = %model.model, bytes = stats.1, elapsed_ms,
+                error = %error, "model stream failed"
             ),
         }
         outcome
@@ -163,11 +172,35 @@ impl AnthropicMessagesLlm {
         model: &ModelConfig,
         http: HttpRequest,
         progress: &mut F,
+        started: Instant,
+        stats: &mut (Option<u64>, usize),
     ) -> Result<AssistantMessage, LlmError> {
         let response = self.transport.post(http).await.map_err(transport_error)?;
         let status = response.status;
         if !(200..300).contains(&status) {
-            let text = response.text().await.unwrap_or_default();
+            let mut body = response.body;
+            let mut bytes = Vec::new();
+            let mut failed = false;
+            while let Some(chunk) = body.next().await {
+                match chunk {
+                    Ok(chunk) => {
+                        if !chunk.is_empty() {
+                            stats.0.get_or_insert(started.elapsed().as_millis() as u64);
+                            stats.1 += chunk.len();
+                            bytes.extend_from_slice(&chunk);
+                        }
+                    }
+                    Err(_) => {
+                        failed = true;
+                        break;
+                    }
+                }
+            }
+            let text = if failed {
+                String::new()
+            } else {
+                String::from_utf8_lossy(&bytes).into_owned()
+            };
             return Err(LlmError::Rejected {
                 status,
                 message: wire::error_message(status, &text),
@@ -179,6 +212,10 @@ impl AnthropicMessagesLlm {
         let mut assembled = Assembled::default();
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(transport_error)?;
+            if !chunk.is_empty() {
+                stats.0.get_or_insert(started.elapsed().as_millis() as u64);
+                stats.1 += chunk.len();
+            }
             let mut changed = false;
             for frame in decoder.push(&chunk) {
                 assembled.absorb(frame.name.as_deref(), &frame.data);

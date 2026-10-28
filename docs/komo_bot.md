@@ -1087,6 +1087,7 @@ Axum 已提供 SSE 响应；toasty 的 turso 驱动提供连接与事务，MVCC 
 base_url = "https://openrouter.ai/api/v1"
 api_backend = "chat_completions"
 env_key = "OPENROUTER_API_KEY"
+# 等待响应头或正文多久没收到数据算超时；连续 3 次零字节超时停止重试。
 timeout_secs = 120
 
 [model.union]

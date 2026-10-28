@@ -75,7 +75,9 @@ fn io_error(path: &Path, message: impl std::fmt::Display) -> CodexAuthError {
 
 fn transport_error(error: TransportError) -> CodexAuthError {
     match error {
-        TransportError::Timeout => CodexAuthError::Transport("超时".into()),
+        TransportError::Timeout | TransportError::TimeoutAfterData => {
+            CodexAuthError::Transport("超时".into())
+        }
         TransportError::Failed(message) => CodexAuthError::Transport(message),
     }
 }

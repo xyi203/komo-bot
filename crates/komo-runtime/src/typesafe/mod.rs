@@ -123,7 +123,9 @@ async fn read(
 
 fn classify_transport(error: &TransportError) -> SystemOneError {
     match error {
-        TransportError::Timeout => SystemOneError::Transport("超时".into()),
+        TransportError::Timeout | TransportError::TimeoutAfterData => {
+            SystemOneError::Transport("超时".into())
+        }
         TransportError::Failed(message) => SystemOneError::Transport(message.clone()),
     }
 }

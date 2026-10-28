@@ -15,6 +15,7 @@ fn input(instructions: Option<&str>, memory: Option<&str>) -> ContextInput {
         memory: memory.map(str::to_string),
         skills: None,
         invocation: InvocationContext::Main,
+        background_task: false,
     }
 }
 
@@ -57,6 +58,21 @@ fn memory_trails_the_prompt() {
         "{prompt}"
     );
     assert!(prompt.starts_with("你是 coder。"), "{prompt}");
+}
+
+/// 任务会话的 `base` 段末尾是任务模式；对话会话没有，段的 key 与次序不变。
+#[test]
+fn a_task_session_ends_its_base_with_the_task_mode() {
+    let task = system_sections(&ContextInput {
+        background_task: true,
+        ..input(Some("你是 coder。"), Some("记忆"))
+    });
+    let keys: Vec<&str> = task.iter().map(|(key, _)| key.as_str()).collect();
+    assert_eq!(keys, ["instructions", "base", "memory"]);
+    assert!(task[1].1.ends_with(TASK_MODE_BLOCK), "{}", task[1].1);
+
+    let prompt = prompt_of(&input(None, None));
+    assert!(!prompt.contains(TASK_MODE_BLOCK), "{prompt}");
 }
 
 /// 没有记忆时结尾就是提示本身，一个字不多。

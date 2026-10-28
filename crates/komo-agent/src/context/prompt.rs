@@ -101,6 +101,7 @@ pub(crate) fn sections(
     tools: &[String],
     mcp_servers: &[ToolNamespace],
     invocation: &InvocationContext,
+    background_task: bool,
     project_files: &[ProjectFile],
     skills: Option<&str>,
     memory: Option<&str>,
@@ -122,7 +123,10 @@ pub(crate) fn sections(
     match invocation {
         InvocationContext::Main => {
             let has_shell = tools.iter().any(|tool| tool == BASH_TOOL);
-            push(SECTION_BASE, main_base(workspace, &rules, has_shell));
+            push(
+                SECTION_BASE,
+                main_base(workspace, &rules, has_shell, background_task),
+            );
             if let Some(block) = project_block(project_files) {
                 push(SECTION_PROJECT, block);
             }
@@ -212,8 +216,8 @@ fn truncate(text: &str, max: usize) -> String {
 }
 
 /// 主 Agent 提示里不随项目规范与 skills 变的那一段：身份 / 工作目录 / 行为约束，能跑命令时
-/// 再加「komo 自查」。[`sections`] 用它。
-fn main_base(workspace: &Path, rules: &str, has_shell: bool) -> String {
+/// 再加「komo 自查」，任务会话最后再加 [`TASK_MODE_BLOCK`]。[`sections`] 用它。
+fn main_base(workspace: &Path, rules: &str, has_shell: bool, background_task: bool) -> String {
     let mut prompt = format!(
         "你是 komo，跑在用户自己机器上的助手。\n\
          工作目录：{}\n\
@@ -224,8 +228,28 @@ fn main_base(workspace: &Path, rules: &str, has_shell: bool) -> String {
         prompt.push_str("\n\n");
         prompt.push_str(SELF_BLOCK);
     }
+    if background_task {
+        prompt.push_str("\n\n");
+        prompt.push_str(TASK_MODE_BLOCK);
+    }
     prompt
 }
+
+/// 任务会话（`task` 派出的 fresh 任务）的「任务模式」：中途没人能回答（2026-10-28）。
+///
+/// 任务会话按主 Agent 装配，身份指令里的「有多个做法先问一句」「不确定就直说」照样在；而派它的
+/// 会话不在等，问一句就是把事停在一半交回去——同一天四个 terra 任务里三个第一轮就这样交回，
+/// `stopReason=stop`、`phase=final_answer`，代码改到一半、测试没跑。fork 任务的系统提示是父那份，
+/// 同样的话写在输入开头的 `FORK_NOTICE` 里。
+pub const TASK_MODE_BLOCK: &str = "你是一个后台任务：派你的会话把这件事交给你之后就去做别的了，\
+                                   中途没有人能回答你，问了只会让这件事停在一半。所以「先问一句」\
+                                   「拿不准就说」这类规矩在这里换成：几种做法代价不同、或者方案和\
+                                   代码对不上时，自己选更保守、更容易回退的那一种接着做，把选了\
+                                   什么、为什么写进最后的回复；拿不准的事先用工具查清。只在两种\
+                                   时候结束：事情做完了（任务要求的验证都跑过），或者真的做不\
+                                   下去——缺权限、缺信息又查不到、任务的前提不成立、接着做会留下\
+                                   难以撤回的后果。没做完就结束时，说清做到哪一步、卡在哪、需要\
+                                   派你的人决定什么。你最后的回复会作为结果交回给派你的会话。";
 
 /// 能跑 komo CLI 的那个工具；没挂它时 [`SELF_BLOCK`] 不出现——说了也跑不了。
 const BASH_TOOL: &str = "bash";

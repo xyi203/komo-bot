@@ -17,7 +17,7 @@ use komo_kernel::types::tool::ToolNamespace;
 
 pub use prompt::{
     PROJECT_UPDATE_HEAD, SECTION_BASE, SECTION_INSTRUCTIONS, SECTION_MEMORY, SECTION_PROJECT,
-    SECTION_SKILLS,
+    SECTION_SKILLS, TASK_MODE_BLOCK,
 };
 
 /// 一次装配所需的**全部事实**（`docs/agent.md` §5）。
@@ -48,6 +48,9 @@ pub struct ContextInput {
     /// [`SkillCatalog::prompt_block`]: crate::skills::SkillCatalog::prompt_block
     pub skills: Option<String>,
     pub invocation: InvocationContext,
+    /// 这是 `task` 派出的 fresh 任务会话：`base` 段末尾补 [`TASK_MODE_BLOCK`]（中途没人能回答）。
+    /// fork 任务不走这里，它沿用父的段。
+    pub background_task: bool,
 }
 
 /// 这一段是主 Agent 的对话，还是一次委派（`docs/agent.md` §11）。
@@ -72,6 +75,7 @@ pub fn system_sections(input: &ContextInput) -> Vec<(String, String)> {
         &input.tools,
         &input.mcp_servers,
         &input.invocation,
+        input.background_task,
         &input.project_files,
         input.skills.as_deref(),
         input.memory.as_deref(),

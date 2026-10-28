@@ -102,6 +102,7 @@ pub(super) async fn build(
         memory,
         skills,
         invocation: InvocationContext::Main,
+        background_task: resolved.is_task(),
     };
     let fresh = system_sections(&input);
     let fresh_text = |key: &str| {

@@ -363,6 +363,33 @@ async fn fork_task_reuses_parent_sections_and_cache_key() {
     assert_eq!(setup.model.model, "gpt-test");
 }
 
+/// fresh 任务的 `base` 段带任务模式（中途没人能回答）；对话会话不带。
+#[tokio::test]
+async fn a_fresh_task_session_gets_the_task_mode_in_its_base() {
+    let world = World::new(&config_with("", NO_MEMORY), finisher()).await;
+    let hooks = world.hooks();
+    let parent = world.conversation(Some(agent("assistant"))).await;
+    let task = world.task_conversation(parent, None, |doc| doc).await;
+    let base_of = |sections: &[komo_runtime::durable::harness::PromptSection]| {
+        sections
+            .iter()
+            .find(|section| section.key == "base")
+            .map(|section| section.text.clone())
+            .expect("有 base 段")
+    };
+
+    let base = base_of(&hooks.setup(task, &[]).await.unwrap().sections);
+    assert!(
+        base.ends_with(komo_agent::context::TASK_MODE_BLOCK),
+        "{base}"
+    );
+    let base = base_of(&hooks.setup(parent, &[]).await.unwrap().sections);
+    assert!(
+        !base.contains(komo_agent::context::TASK_MODE_BLOCK),
+        "{base}"
+    );
+}
+
 /// 任务会话交给模型的工具表里没有 `task` 与 `monitor`（fresh 任务）；对话会话有。
 #[tokio::test]
 async fn task_sessions_lack_task_and_monitor_in_schema() {

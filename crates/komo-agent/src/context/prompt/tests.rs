@@ -23,6 +23,7 @@ fn build(
         tools,
         mcp_servers,
         invocation,
+        false,
         project_files,
         skills,
         None,

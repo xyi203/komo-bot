@@ -73,7 +73,7 @@ task(prompt, title, task_id?, model?, effort?, contract?, context?)   context: "
 
 - **只用于新开任务。** 带 `task_id` 时给 `context` 在 `prepare` 拒；fork 时给 `model` / `effort` 也拒：fork 沿用父的模型与 effort，换了就不是同一个缓存前缀。`contract` 照常。
 - **切口在父此刻最新的 entry 上**（`fork(at = 父最新 entry)`，派出时只有这一个工具任务在写父）。切在"发起调用的那条 assistant entry"上会把同一轮里排在前面、已收尾的调用结果落在切口之外，所以取最新一条。发起调用的那条消息里还没有结果的调用，在**子里**补一条 `komo.tool-result`，不进父：`task` 那次是"这次调用派出的就是你（fork）。……你最后的回复会作为这次调用的结果交回给它"（`FORK_CALL_RESULT`）；同一轮排在后面的是"派你的会话在派出你之后才执行这次调用，你看不到它的结果"（`FORK_LATER_CALL_RESULT`）。
-- **角色说明在输入里，不在系统提示里。** 子的第一条输入开头是 `FORK_NOTICE`：上面是派你的会话到此刻的对话，你只做下面这件事；父同时还在跑，同一个工作目录里的文件可能正在变，不要接着做它没做完的事，不要改它正在改的东西，也不要再派任务；做完就停，最后的回复交回。然后是 `prompt`。
+- **角色说明在输入里，不在系统提示里。** 子的第一条输入开头是 `FORK_NOTICE`：上面是派你的会话到此刻的对话，你只做下面这件事；父同时还在跑，同一个工作目录里的文件可能正在变，不要接着做它没做完的事，不要改它正在改的东西，也不要再派任务；中途没人能回答，几种做法代价不同时自己选更保守的、在最后的回复里写明，只在做完或真的做不下去时才停（2026-10-28，fresh 任务同一套话在系统提示 `base` 段末尾，见 `docs/komo_bot.md` §4）；最后的回复交回。然后是 `prompt`。
 - **身份沿用父。** fork 任务的系统段取父那份（`replay_sections`），模型与 effort 沿用父，provider session 身份（提示缓存路由键）用父的——pi-durable 里 fork 会拿新的 provider session 身份，这里按 komo 改成不换；记忆段已在父的系统提示里，不再召回。能力面**保留父的（含 `task` 与 `monitor`）**，否则工具声明变了整段缓存作废；"不能再派"落在派出那一步（调用方 conversation 有 `komo.task` 就拒，落一条失败结果）。
 - **fork 不复制 document**：子不继承父的 `komo.live` 等；父追加在切口之后的 entry 子看不到。
 - **局限。** ① 前缀压不掉：父会话已经贴着窗口时派 fork，fork 自己跑几轮就可能超长（超长时按压缩的救援路径压 fork 自己，`docs/komo_bot.md` §6）——工具说明因此让模型在对话很长时用 fresh。② 前缀里的 `artifact://` 与 `tool-output/` 引用指向父会话的 Session 目录，fork 里 `read` 不到（只读根是当前会话的）。

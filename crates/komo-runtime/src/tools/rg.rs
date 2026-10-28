@@ -73,6 +73,17 @@ const CHANNEL_DEPTH: usize = 4;
 const MAX_RECORDED_ERRORS: usize = 32;
 /// 预览里最多印几条读不了的。
 const PREVIEW_ERROR_LINES: usize = 3;
+/// 搜正文命中超过这么多行、写下的又超过 [`PREVIEW_SUMMARY_BYTES`] 时，预览换成统计 + 开头
+/// 这么多行（照 pi `grep` 的 100 条上限）。2026-10-28 的统计：8 次 rg 结果超过 15 KB
+/// （在整个 `pi/packages` 下搜 `nested` 107 KB），截下来的头部用不上，模型最后还是缩小范围重搜。
+const PREVIEW_MATCH_LINES: usize = 100;
+/// 统计模式的门槛（字节）。行数多但很短的结果整份给也不贵；门槛是开头那段的两倍，所以
+/// 预览总比写下的短，投影一定印出完整输出的入口。
+const PREVIEW_SUMMARY_BYTES: usize = 16 * 1024;
+/// 统计模式里开头那段匹配最多多少字节。
+const PREVIEW_MATCH_BYTES: usize = 8 * 1024;
+/// 统计里列出命中最多的几个文件。
+const TOP_FILES: usize = 10;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RgArgs {
@@ -112,6 +123,12 @@ pub struct RgResult {
     pub timed_out: bool,
     pub stdout_bytes: u64,
     pub stderr_bytes: u64,
+    /// 一共写下几行（搜正文是匹配行数，`list_files` 是文件数）。
+    #[serde(default)]
+    pub match_lines: u64,
+    /// 有命中的文件数（搜正文时；超时没等到搜索线程收尾时是 0）。
+    #[serde(default)]
+    pub matched_files: u64,
     /// 读不了的目录或文件，最多 [`MAX_RECORDED_ERRORS`] 条。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub errors: Vec<String>,
@@ -160,7 +177,7 @@ impl Tool for RgTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "rg".into(),
-            description: "搜索文件正文返回「路径:行号:正文」；list_files=true 时列出文件路径（类似 rg --files）。"
+            description: "搜索文件正文返回「路径:行号:正文」；命中太多（超过 100 行且超过 16 KiB）时只给统计（总行数、命中最多的文件）和开头 100 行，这时缩小 path / glob 再搜。list_files=true 时列出文件路径（类似 rg --files）。"
                 .into(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -275,6 +292,7 @@ impl Tool for RgTool {
         let mut stdout_bytes = 0u64;
         let mut stderr_bytes = 0u64;
         let mut truncated = false;
+        let mut match_lines = 0u64;
         let mut head: Vec<u8> = Vec::with_capacity(PREVIEW_HEAD_BYTES);
         let drained = tokio::time::timeout(self.default_timeout, async {
             while let Some(chunk) = rx.recv().await {
@@ -309,6 +327,7 @@ impl Tool for RgTool {
                     stderr_bytes += slice.len() as u64;
                 } else {
                     stdout_bytes += slice.len() as u64;
+                    match_lines += slice.iter().filter(|&&byte| byte == b'\n').count() as u64;
                     let room = PREVIEW_HEAD_BYTES.saturating_sub(head.len());
                     head.extend_from_slice(&slice[..slice.len().min(room)]);
                 }
@@ -360,6 +379,8 @@ impl Tool for RgTool {
             timed_out,
             stdout_bytes,
             stderr_bytes,
+            match_lines,
+            matched_files: walked.files.len() as u64,
             errors: walked.errors.clone(),
             error_count: walked.error_count,
         };
@@ -406,7 +427,17 @@ impl Tool for RgTool {
             preview.push_str(error);
             preview.push('\n');
         }
-        preview.push_str(&String::from_utf8_lossy(&head));
+        let body = String::from_utf8_lossy(&head);
+        let crowded = !result.list_files
+            && result.match_lines > PREVIEW_MATCH_LINES as u64
+            && result.stdout_bytes > PREVIEW_SUMMARY_BYTES as u64;
+        match crowded {
+            true => {
+                preview.push_str(&summary(&result, &walked.files));
+                preview.push_str(first_lines(&body, PREVIEW_MATCH_LINES, PREVIEW_MATCH_BYTES));
+            }
+            false => preview.push_str(&body),
+        }
         Ok(ToolOutput {
             status,
             result: serde_json::to_value(&result).map_err(|error| ToolError::Failed {
@@ -596,6 +627,8 @@ struct SearchOutcome {
     matched: bool,
     errors: Vec<String>,
     error_count: u64,
+    /// 有命中的文件（显示路径）与各自命中几行，按搜索顺序。
+    files: Vec<(PathBuf, u64)>,
 }
 
 impl SearchOutcome {
@@ -648,7 +681,14 @@ fn search(job: &SearchJob, tx: &mpsc::Sender<Chunk>) -> SearchOutcome {
     let mut search_one = |path: &Path, outcome: &mut SearchOutcome| {
         let display = display_path(path, &job.cwd);
         let result = if let Some(matcher) = &job.matcher {
-            searcher.search_path(matcher, path, printer.sink_with_path(matcher, &display))
+            let mut sink = printer.sink_with_path(matcher, &display);
+            let result = searcher.search_path(matcher, path, &mut sink);
+            // 每个文件命中几行：命中太多时预览靠它说出集中在哪（[`summary`]）。
+            match sink.match_count() {
+                0 => {}
+                count => outcome.files.push((display.clone(), count)),
+            }
+            result
         } else {
             // 用同一份有背压的 writer 写路径；超时/取消/输出上限仍由调用方处理。
             let mut writer = writer.borrow_mut();
@@ -728,6 +768,41 @@ fn display_path(path: &Path, cwd: &Path) -> PathBuf {
             false => rest.to_path_buf(),
         })
         .unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// 命中太多时预览开头那一段：一共多少、集中在哪，接下来怎么缩小范围。
+fn summary(result: &RgResult, files: &[(PathBuf, u64)]) -> String {
+    let spread = match result.matched_files {
+        0 => String::new(),
+        count => format!("，分布在 {count} 个文件"),
+    };
+    let mut out = format!(
+        "命中 {} 行{spread}，超过 {PREVIEW_MATCH_LINES} 行只给统计和开头 {PREVIEW_MATCH_LINES} 行；\
+         缩小 path / glob 或把 pattern 写具体再搜，全部匹配在结尾的完整输出里。\n",
+        result.match_lines
+    );
+    let mut top: Vec<&(PathBuf, u64)> = files.iter().collect();
+    top.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    if !top.is_empty() {
+        out.push_str("命中最多的文件：\n");
+    }
+    for (path, count) in top.into_iter().take(TOP_FILES) {
+        out.push_str(&format!("  {} ×{count}\n", path.display()));
+    }
+    out.push_str("开头的匹配：\n");
+    out
+}
+
+/// 开头最多 `lines` 行、`bytes` 字节的整行。
+fn first_lines(text: &str, lines: usize, bytes: usize) -> &str {
+    let mut end = 0;
+    for (count, (index, _)) in text.match_indices('\n').enumerate() {
+        if count >= lines || index + 1 > bytes {
+            break;
+        }
+        end = index + 1;
+    }
+    &text[..end]
 }
 
 fn build_overrides(root: &Path, glob: Option<&str>) -> Result<Option<Override>, String> {
@@ -1052,6 +1127,56 @@ mod tests {
         assert!(!result.matched);
         assert_eq!(result.stdout_bytes, 0);
         assert!(printed.contains("无匹配"), "{printed}");
+    }
+
+    /// 命中太多时预览换成统计 + 开头 100 行：一共多少、命中最多的文件排前面；完整匹配照样
+    /// 写进输出。
+    #[tokio::test]
+    async fn too_many_matches_preview_as_counts_and_the_first_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let line = format!("foo {}\n", "x".repeat(60));
+        std::fs::write(dir.path().join("big.txt"), line.repeat(400)).unwrap();
+        std::fs::write(dir.path().join("small.txt"), "foo\nfoo\nfoo\n").unwrap();
+        let (output, printed) = run(
+            &RgTool::new(),
+            dir.path(),
+            serde_json::json!({ "pattern": "foo" }),
+        )
+        .await;
+
+        let result = rg_result(&output);
+        assert_eq!(result.match_lines, 403);
+        assert_eq!(result.matched_files, 2);
+        assert!(result.stdout_bytes > PREVIEW_SUMMARY_BYTES as u64);
+        assert!(
+            printed.contains("命中 403 行，分布在 2 个文件"),
+            "{printed}"
+        );
+        let big = printed.find("big.txt ×400").expect(&printed);
+        let small = printed.find("small.txt ×3").expect(&printed);
+        assert!(big < small, "命中多的排前面：{printed}");
+        let shown = printed.lines().filter(|line| line.contains(":foo")).count();
+        assert_eq!(shown, PREVIEW_MATCH_LINES, "{printed}");
+    }
+
+    /// 命中不少但很短：整份给也不贵，不换成统计。
+    #[tokio::test]
+    async fn many_short_matches_are_shown_in_full() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "foo\n".repeat(150)).unwrap();
+        let (output, printed) = run(
+            &RgTool::new(),
+            dir.path(),
+            serde_json::json!({ "pattern": "foo" }),
+        )
+        .await;
+
+        assert_eq!(rg_result(&output).match_lines, 150);
+        assert!(!printed.contains("命中最多的文件"), "{printed}");
+        assert_eq!(
+            printed.lines().filter(|line| line.contains(":foo")).count(),
+            150
+        );
     }
 
     /// 正则的语法错误是**参数错误**：它撞在 prepare 上，模型改一个字就能重发，不用先建

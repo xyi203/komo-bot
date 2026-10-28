@@ -27,8 +27,27 @@ fn rules(tools: &[String]) -> String {
         lines.push("- 找代码、文字和列文件用 rg（列文件设 list_files=true），别用 bash 拼 rg / grep / find / ls。");
     }
     // 2026-10 的统计：364 次 shell 里 126 次是 cat / head / ls 这类纯只读命令。
+    // 2026-10-28：只说"别做"时三天里仍有 16 次 `sed -n 'a,bp'` 读行范围——补上换成什么、为什么。
     if has(READ_TOOL) && has(BASH_TOOL) {
-        lines.push("- 看文件用 read，别用 bash 跑 cat / head / tail / sed。");
+        lines.push(
+            "- 看文件用 read，别用 bash 跑 cat / head / tail / sed：要几行就给 start_line/line_count，\
+             read 会写明未读范围，还能和别的读同一轮并行。",
+        );
+    }
+    // 2026-10-28 的统计：101 次重复 read 里 55 次读的范围前面已经读过、文件也没改；
+    // 不带 line_count 的整文件 read 单条 30–45 KB。
+    if has(READ_TOOL) && has(RG_TOOL) {
+        lines.push(
+            "- 几百行以上的文件先用 rg 找到位置，再按行号读那一段；前面读过、后来只剩首尾摘录的内容，\
+             也只按行号读回要的那段，别整份重读。",
+        );
+    }
+    // 2026-10-28：查日志时 4 次 bash 把 38–51 KB 的原始日志整份打印出来。
+    if has(BASH_TOOL) {
+        lines.push(
+            "- bash 的输出先在命令或脚本里聚合、过滤（计数、去重、只留命中行），\
+             原始数据写进文件再按需查，别整份打印。",
+        );
     }
     // 2026-10-15 的统计：Opus 88% 的回合只发一个调用，执行器早就能让同一轮的读同时跑。
     // 照 Claude Code：互不依赖的调用同一轮一起发。

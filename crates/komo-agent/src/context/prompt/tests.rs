@@ -264,6 +264,28 @@ fn the_read_over_cat_rule_needs_both_read_and_shell() {
     }
 }
 
+/// "先 rg 定位再按行号读"要 read 与 rg 都在；"bash 输出先聚合"只跟着 bash。
+#[test]
+fn the_output_size_rules_follow_their_tools() {
+    let prompt_with = |tools: &[&str]| {
+        build(
+            Path::new("/tmp/w"),
+            &tools
+                .iter()
+                .map(|tool| tool.to_string())
+                .collect::<Vec<_>>(),
+            &[],
+            &InvocationContext::Main,
+            &[],
+            None,
+        )
+    };
+    assert!(prompt_with(&["read", "rg"]).contains("先用 rg 找到位置"));
+    assert!(!prompt_with(&["read"]).contains("先用 rg 找到位置"));
+    assert!(prompt_with(&["bash"]).contains("别整份打印"));
+    assert!(!prompt_with(&["read", "rg"]).contains("别整份打印"));
+}
+
 /// "互不依赖的调用同一轮一起发"跟着 read / rg 走：能同时跑的只有它们。
 #[test]
 fn the_parallel_calls_rule_needs_read_or_rg() {

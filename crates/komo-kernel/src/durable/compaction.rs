@@ -115,6 +115,8 @@ pub struct Cut {
 fn is_candidate(contributions: &[Vec<Message>], index: usize) -> bool {
     match contributions[index].first() {
         Some(Message::Assistant(_)) => return true,
+        // 宿主附上的记忆块紧跟着它那条输入：切在它前面会把输入收进摘要、只留下记忆块。
+        Some(message) if message.is_host_injected() => return false,
         Some(Message::User(_)) => {}
         _ => return false,
     }
@@ -241,6 +243,8 @@ pub fn serialize_conversation(messages: &[Message]) -> String {
     let mut parts: Vec<String> = Vec::new();
     for message in messages {
         match message {
+            // 宿主附上的记忆块不是用户说的，也不该被摘要成对话的一部分（§9.4）。
+            Message::User(user) if user.host_origin().is_some() => {}
             Message::User(user) => {
                 let text = content_text(&user.content);
                 if !text.is_empty() {

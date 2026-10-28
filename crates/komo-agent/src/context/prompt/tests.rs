@@ -8,7 +8,7 @@ use komo_kernel::types::ids::{RunId, ToolCallId};
 use super::*;
 use crate::skills::{OfferContext, SkillRegistry};
 
-/// 不带 instructions / memory 的整段系统提示：各段用 `"\n\n"` 连起来。
+/// 不带 instructions 的整段系统提示：各段用 `"\n\n"` 连起来。
 fn build(
     workspace: &Path,
     tools: &[String],
@@ -26,7 +26,6 @@ fn build(
         false,
         project_files,
         skills,
-        None,
     )
     .into_iter()
     .map(|(_, text)| text)

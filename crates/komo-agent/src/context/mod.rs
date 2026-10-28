@@ -16,8 +16,8 @@ use komo_kernel::types::delegate::{DelegateContract, DelegateSpec};
 use komo_kernel::types::tool::ToolNamespace;
 
 pub use prompt::{
-    PROJECT_UPDATE_HEAD, SECTION_BASE, SECTION_INSTRUCTIONS, SECTION_MEMORY, SECTION_PROJECT,
-    SECTION_SKILLS, TASK_MODE_BLOCK,
+    PROJECT_UPDATE_HEAD, SECTION_BASE, SECTION_INSTRUCTIONS, SECTION_PROJECT, SECTION_SKILLS,
+    TASK_MODE_BLOCK,
 };
 
 /// 一次装配所需的**全部事实**（`docs/agent.md` §5）。
@@ -39,9 +39,6 @@ pub struct ContextInput {
     /// 只在 codemode 里调的那些工具所属的组（MCP 服务器，`docs/mcp.md` §3）：工具没进 schema，
     /// 模型从系统提示的这一段知道它们在。空 = 不出这一段。
     pub mcp_servers: Vec<ToolNamespace>,
-    /// 这一段钉住的记忆注入段；`None` = 不注入（子代理、记忆关闭、没召回到）。
-    /// 正文由 [`memory::render`] 渲染、由 `MemoryManager` 按段钉住，这里只决定它放在哪。
-    pub memory: Option<String>,
     /// 渲染好的 skills 目录块（[`SkillCatalog::prompt_block`]）；只有主 Agent 有。是文本
     /// 而不是目录值：这条 Run 受理时冻结下来的就是这段正文，续跑按它逐字装配。
     ///
@@ -64,10 +61,10 @@ pub enum InvocationContext {
 }
 
 /// 系统提示按段交回 `(key, 正文)`（新存储的 `komo.system` entry 按段名补丁，
-/// `docs/storage-durable-d5.md` §6）：`instructions` / `base` / `project` / `skills` /
-/// `memory`，空的段不出现，key 常量见 [`SECTION_INSTRUCTIONS`] 等；用 `"\n\n"` 连起来就是
-/// 完整的系统提示（身份指令在最前，记忆在最后）。只看 `input` 里拼系统提示的那几样事实（身份、
-/// 项目规范、工作目录、工具名、服务器、记忆、skills、调用方式）。
+/// `docs/storage-durable-d5.md` §6）：`instructions` / `base` / `project` / `skills`，空的段
+/// 不出现，key 常量见 [`SECTION_INSTRUCTIONS`] 等；用 `"\n\n"` 连起来就是完整的系统提示（身份
+/// 指令在最前）。只看 `input` 里拼系统提示的那几样事实（身份、项目规范、工作目录、工具名、服务器、
+/// skills、调用方式）。召回的记忆不在这里，见 [`memory`]。
 pub fn system_sections(input: &ContextInput) -> Vec<(String, String)> {
     prompt::sections(
         input.instructions.as_deref(),
@@ -78,7 +75,6 @@ pub fn system_sections(input: &ContextInput) -> Vec<(String, String)> {
         input.background_task,
         &input.project_files,
         input.skills.as_deref(),
-        input.memory.as_deref(),
     )
 }
 

@@ -3,8 +3,8 @@
 //!
 //! 模型替身还是 `ScriptedLlm`：同一个实例既当聊天（经 `DriverStream` 演成 `ModelStream`）又当记忆
 //! 模型（`LlmClient`），脚本按调用先后消费；等一轮结束用 `TestGateway::wait_run`；记忆处理进度读
-//! conversation 级 document `komo.memory_cursor`（`progress`）；模型收到的"注入了哪些记忆"看系统
-//! 提示正文与 `komo.memory` document。
+//! conversation 级 document `komo.memory_cursor`（`progress`）；模型收到的"注入了哪些记忆"看请求
+//! 消息里的召回块（[`said`]，§9.4：每个 Run 一块，追加在输入之后）与 run 详情。
 //!
 //! 验收列逐句 → 测试：
 //!
@@ -52,6 +52,16 @@ use komo_kernel::traits::{EmbeddingClient, LlmClient};
 use komo_runtime::memory::durable::{RunCursor, read_cursor_doc};
 
 use harness::*;
+
+/// 模型这一次请求收到的全部消息正文（召回块是其中一条宿主附上的 user 消息，§9.4）。
+pub fn said(request: &komo_kernel::types::turn::TurnRequest) -> String {
+    request
+        .messages
+        .iter()
+        .filter_map(|message| message.text.as_deref())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
 
 /// 一段只说话、不调工具的模型回复。
 pub fn text_round(round: u32, text: &str) -> Round {

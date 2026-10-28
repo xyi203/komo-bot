@@ -128,6 +128,34 @@ fn a_user_entry_between_a_call_and_its_result_is_not_a_cut_candidate() {
     }
 }
 
+/// 宿主附上的记忆召回块（§9.4）不是切点：切在它前面会把它那条输入收进摘要、只留下记忆块。
+/// 它也不进摘要材料——不是用户说的话。
+#[test]
+fn a_memory_recall_block_is_neither_a_cut_nor_summarized() {
+    let mut block = Message::user("[已知记忆]\n- 用户喜欢深色主题", 1);
+    if let Message::User(user) = &mut block {
+        user.extra.insert(
+            crate::durable::message::HOST_ORIGIN_KEY.into(),
+            json!("memory"),
+        );
+    }
+    let entries = vec![
+        user(1, "task"),
+        assistant_text(2, &big(400), 10),
+        user(3, "next"),
+        entry(4, "komo.memory.recall", vec![block.clone()]),
+        assistant_text(5, &big(400), 20),
+    ];
+    let view = derive_context(&entries, None);
+    for keep in 0..400 {
+        if let Some(cut) = select_cut(&view, keep) {
+            assert_ne!(cut.first_kept, id(4), "keep = {keep}");
+        }
+    }
+    let text = serialize_conversation(&[Message::user("next", 1), block]);
+    assert_eq!(text, "[User]: next");
+}
+
 #[test]
 fn an_earlier_summary_is_summarized_again_with_the_history_after_it() {
     let mut entries = conversation();

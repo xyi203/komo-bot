@@ -195,7 +195,7 @@
 | cron | W3b；`cron_jobs` / `cron_firings` repo 不变（换到 `aux.db`） |
 | intervention | faulted 任务列表 → `Blocked`、问题 = fault 原因、可答 `abandon`；`WaitReason` 不再产生 |
 | 生命周期 | W4a |
-| memory | 条目 / 证据 / 索引仍在 `aux.db`；提取输入经 `DurableSessionEvents`；注入是系统段 `memory`，uses 记在 `komo.memory` document；证据引用仍是 `Seq` / `RunId`（新编码） |
+| memory | 条目 / 证据 / 索引仍在 `aux.db`；提取输入经 `DurableSessionEvents`；注入是系统段 `memory`，uses 记在 `komo.memory` document（2026-10-28 起改为每个 Run 一条 `komo.memory.recall` entry，`docs/memory.md` §9.4）；证据引用仍是 `Seq` / `RunId`（新编码） |
 | 标题 | `titles.rs` 逻辑不变，读写 sessions 行的 `title` / `title_provisional` |
 
 ## 9. 已拍板的决定（2026-10-25）
@@ -208,7 +208,7 @@
 | 4 | cron / 投递 / memory 的表 | 新 toasty 库 `aux.db`，从空开始；跨库靠预分配 ID 与请求键幂等；"同库同提交"推迟到 D7 之后 |
 | 5 | 任务会话 sessions 行与短号 | runtime 在派出提交里原子写 sessions 行；短号统一 `#<conversation ID>` |
 | 6 | 交回输入的来源对端 | 当前路径上最近一条带 peer 的用户输入的 peer，没有就退回 home chat |
-| 7 | memory 注入形态 | 系统段 `memory`，uses 记在 `komo.memory` document |
+| 7 | memory 注入形态 | 系统段 `memory`，uses 记在 `komo.memory` document（2026-10-28 起改为每个 Run 一条 `komo.memory.recall` entry 追加在输入之后，`docs/memory.md` §9.4） |
 | 8 | `/cancel` / Esc | **只停当前一轮**（用户确认）：`Harness::abort_run` 不撤回收件箱；任何非正常收尾后，排队的输入（write、内部、用户）都接着放置开跑——恢复旧 komo 行为。排队中的单条用 `Harness::withdraw` |
 | 9 | `!` 命令与命令型 cron | gateway 直接用 bash 工具跑，不建 harness run；输出落 blob，提交一条 `shell.command` write；不做崩溃重放 |
 | 10 | fork 时 document | 会话内分支复制 `komo.agent`，其余不带；`/fork` `/clone` 复制 `komo.agent`，不复制 live / inbox / task |

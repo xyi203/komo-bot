@@ -65,7 +65,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::compaction::{self, CompactionTask, Plan, PlanInput, Reason, Settled};
 use super::entries::append_assistant;
-use super::hooks::{HarnessDeps, HookError, RetryPolicy, ToolSet};
+use super::hooks::{ContextRequest, HarnessDeps, HookError, RetryPolicy, ToolSet};
 use super::inbox::{self, At, QueueModes};
 use super::live::{self, GenerationLive, RetryLive, ToolSlot};
 use super::orchestration::report;
@@ -293,9 +293,30 @@ impl GenerationTask {
             &setup.tools.definitions(),
             rt.now()?,
         );
+        // 系统段之外追加的上下文（记忆召回块与它的遗忘改写，`docs/memory.md` §9.4）。
+        let live = compaction::read_live(rt, conversation).await?;
+        let added = self
+            .deps
+            .hooks
+            .context_entries(ContextRequest {
+                conversation,
+                run: live
+                    .run
+                    .as_ref()
+                    .and_then(|run| run.inputs.first().copied()),
+                entries,
+                view,
+                now: rt.now()?,
+            })
+            .await
+            .map_err(|error| TaskError::new(error.to_string()))?;
+        let revises = added.iter().any(|draft| !draft.edits.is_empty());
+        drafts.extend(added);
 
         // 压缩判断（spec §8.3 / §8.7）：这个生成还没等过压缩才判。
-        let mut revised_from = None;
+        let mut revised_from = revises
+            .then(|| first_revised(conversation, entries, view, &drafts))
+            .flatten();
         let mut background = None;
         if compacted.is_none() {
             let csetup = match self.deps.hooks.compaction(conversation).await {
@@ -305,7 +326,6 @@ impl GenerationTask {
                 }
                 Err(HookError::Failed(message)) => return Err(TaskError::new(message)),
             };
-            let live = compaction::read_live(rt, conversation).await?;
             let online = context.online_state(compaction::refused_after(&live));
             let cold = cache_cold(&entries, rt.now()?, PROMPT_CACHE_TTL.as_millis() as i64);
             let planned: Vec<Message> = drafts
@@ -1042,8 +1062,9 @@ struct Resumed {
     threshold: bool,
 }
 
-/// 追加 `drafts` 之后，请求里第一条被换了视图的工具结果的下标（Anthropic 缓存断点要补在它
-/// 之前）。追加的 entry 在模拟里按顺序编号，推导出来的消息与现在的逐条比。
+/// 追加 `drafts` 之后，请求里第一条被换了视图的消息（工具结果被衰减、记忆召回块被遗忘改写）
+/// 的下标（Anthropic 缓存断点要补在它之前）。追加的 entry 在模拟里按顺序编号，推导出来的消息
+/// 与现在的逐条比；system 消息另有回放，不算。
 fn first_revised(
     conversation: ConversationId,
     entries: &[EntryRecord],
@@ -1063,7 +1084,7 @@ fn first_revised(
     after
         .iter()
         .zip(&view.messages)
-        .position(|(new, old)| matches!(new, Message::ToolResult(_)) && new != old)
+        .position(|(new, old)| !new.is_system() && new != old)
 }
 
 /// 这条消息里的工具调用 `(id, name)`，按调用顺序。

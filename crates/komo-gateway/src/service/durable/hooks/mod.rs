@@ -7,6 +7,7 @@
 //! | `tools` | 能力面与工具表：MCP 有超时地等连上，撤掉的工具放桩，任务会话去掉 `task` / `monitor` |
 //! | `env` | 工具执行环境：根与挂载、投影、时限、Session 目录上的输出存储 |
 //! | `sections` | 系统段（key 与"已展示的段钉住"的规则见该文件） |
+//! | `recall` | 每个 Run 的记忆召回块与遗忘改写（`docs/memory.md` §9.4） |
 //! | `compaction` | `[compaction]` 的旋钮、摘要提示与摘要用的模型 |
 //!
 //! 钩子拿 `GatewayState` 的路径是 `StateSlot`（`assemble` 的断环）：槽没填之前被问到就干净地
@@ -15,6 +16,7 @@
 mod compaction;
 /// `!` 命令直跑（`shell.rs`）也要同一份执行环境与能力面。
 pub(crate) mod env;
+mod recall;
 mod sections;
 mod setup;
 pub(crate) mod tools;
@@ -25,7 +27,10 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use komo_kernel::durable::{ConversationId, Message};
 use komo_kernel::types::ids::SessionId;
-use komo_runtime::durable::harness::{AgentHooks, AgentSetup, CompactionSetup, HookError, ToolSet};
+use komo_runtime::durable::EntryDraft;
+use komo_runtime::durable::harness::{
+    AgentHooks, AgentSetup, CompactionSetup, ContextRequest, HookError, ToolSet,
+};
 use komo_store::{FileToolOutputStore, SessionPaths};
 
 use super::assemble::StateSlot;
@@ -104,7 +109,7 @@ impl AgentHooks for GatewayHooks {
         // 刚登录的 MCP 服务器这时连上，它的工具进这一轮的能力面（旧 `freeze_run` 同一步）。
         state.refresh_mcp().await;
         let tools = self.resolve_tools(&state, &resolved).await?;
-        let sections = sections::build(&state, core, &resolved, &tools, context).await?;
+        let sections = sections::build(&state, &resolved, &tools, context)?;
         Ok(AgentSetup {
             sections,
             tools,
@@ -113,6 +118,17 @@ impl AgentHooks for GatewayHooks {
             cache_key: Some(resolved.cache_key.clone()),
             max_output_tokens: None,
         })
+    }
+
+    async fn context_entries(
+        &self,
+        request: ContextRequest<'_>,
+    ) -> Result<Vec<EntryDraft>, HookError> {
+        let state = self.state()?;
+        let config = state.snapshot();
+        let core = state.core().map_err(|e| HookError::Failed(e.to_string()))?;
+        let resolved = resolve(&state, &*core.storage, request.conversation, &config).await?;
+        Ok(recall::entries(&state, &resolved, request).await)
     }
 
     /// 只要工具表：不召回记忆、不渲染系统段（默认实现会走完整的 `setup`）。
@@ -135,11 +151,3 @@ impl AgentHooks for GatewayHooks {
 
 #[cfg(test)]
 mod tests;
-
-/// 测试用：`komo.memory` document 的地址。
-#[cfg(test)]
-pub(crate) fn memory_address_for_tests(
-    conversation: ConversationId,
-) -> komo_kernel::durable::DocumentAddress {
-    sections::memory_address(conversation)
-}

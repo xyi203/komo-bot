@@ -2,8 +2,9 @@
 //! 不再各写一份——重复的那几句（工作目录、工具名、`RULES`）漂了，模型真正照着做的那一条
 //! 就是漂掉的那一条。
 //!
-//! 这里只管**正文本身**；`instructions`（最前）与 `memory`（最后）两段由
-//! [`sections`] 一并按段交回，[`super::system_sections`] 是对外入口。
+//! 这里只管**正文本身**；`instructions`（最前）由 [`sections`] 一并按段交回，
+//! [`super::system_sections`] 是对外入口。召回的记忆不在系统提示里：每个 Run 一条召回块追加在
+//! 输入之后（`docs/memory.md` §9.4，正文见 [`super::memory`]）。
 
 use std::path::Path;
 
@@ -89,10 +90,9 @@ pub const SECTION_INSTRUCTIONS: &str = "instructions";
 pub const SECTION_BASE: &str = "base";
 pub const SECTION_PROJECT: &str = "project";
 pub const SECTION_SKILLS: &str = "skills";
-pub const SECTION_MEMORY: &str = "memory";
 
 /// 按段交回 `(key, 正文)`：`instructions`（最前，已 trim）→ `base`（身份 / 工作目录 /
-/// RULES / komo 自查；子代理是它那份提示）→ `project`（项目规范）→ `skills` → `memory`（最后）。
+/// RULES / komo 自查；子代理是它那份提示）→ `project`（项目规范）→ `skills`。
 /// 空的段不出现。**用 `\n\n` 连起来就是完整的系统提示**
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn sections(
@@ -104,7 +104,6 @@ pub(crate) fn sections(
     background_task: bool,
     project_files: &[ProjectFile],
     skills: Option<&str>,
-    memory: Option<&str>,
 ) -> Vec<(String, String)> {
     let mut rules = rules(tools);
     if let Some(block) = servers_block(mcp_servers) {
@@ -137,9 +136,6 @@ pub(crate) fn sections(
         InvocationContext::Delegated(spec) => {
             push(SECTION_BASE, subagent_prompt(workspace, &rules, spec));
         }
-    }
-    if let Some(memory) = memory {
-        push(SECTION_MEMORY, memory.to_owned());
     }
     out
 }

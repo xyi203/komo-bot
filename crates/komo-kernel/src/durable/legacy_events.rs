@@ -36,6 +36,7 @@
 //! | `komo.compaction` | `ContextCompacted::Compacted`（C,0） |
 //! | `komo.decay` | `ContextCompacted::Decayed`（D,0） |
 //! | `model.change` | `ConfigChanged`（M,0） |
+//! | `komo.memory.recall` | `MemoryInjected`（K,0，`run` 是 `data.submission` 所在的 run，只带 `uses` 与诊断）；正文不出 `MessageUser`，提取引不到它（`docs/memory.md` §9.4） |
 //! | 别的 entry：有 `model` 里的 user 消息、kind 不是 `komo.*`（`komo.user` 除外）与 `branch.summary` | `MessageUser`（E,0），`run` 为空——`!` 命令这类"不开启 run 的用户消息" |
 //! | 其余（`komo.system`、`label`、`session.info`、`branch.summary`、`context.edit`、不认识的 kind） | **不出帧**。不认识的 kind 在 pi 树里是 `Custom`（见 [`pi_tree`](super::pi_tree)），事件流里没有对应词汇，宁可不出也不出一个误导的帧 |
 //!
@@ -86,12 +87,14 @@ use super::ids::{ConversationId, EntityId, EntryId, SubmissionId};
 use super::legacy_ids::{run_id, seq};
 use super::message::{AssistantMessage, ContentBlock, Message, StopReason};
 use super::pi_tree::{BRANCH_SUMMARY_KIND, MODEL_CHANGE_KIND, entry_millis, user_text};
+use super::recall::{MEMORY_RECALL_ENTRY_KIND, RecallData};
 use super::records::{EditAction, EntryRecord, InputState, SubmissionKind, SubmissionRecord};
 use crate::compaction::{CompactionDebt, CompactionDecision, CompactionReason};
 use crate::events::{
     ConfigChanged, ContextCompacted, ConversationBoundary, EVENT_FORMAT_VERSION, Event,
-    EventPayload, MessageAssistant, MessageUser, RunAbsorbed, RunAccepted, RunCancelled,
-    RunCompleted, RunFailed, RunQueued, RunStarted, ToolPlanned, ToolResult, ToolStarted,
+    EventPayload, MemoryInjected, MessageAssistant, MessageUser, RunAbsorbed, RunAccepted,
+    RunCancelled, RunCompleted, RunFailed, RunQueued, RunStarted, ToolPlanned, ToolResult,
+    ToolStarted,
 };
 use crate::protocol::nested::display_result;
 use crate::types::{
@@ -323,6 +326,7 @@ impl Projection {
         }
         match entry.kind.as_str() {
             DECAY_ENTRY_KIND => self.decay(entry, &frame, out),
+            MEMORY_RECALL_ENTRY_KIND => self.recall(entry, &frame, out),
             MODEL_CHANGE_KIND => {
                 frame.emit(
                     out,
@@ -691,6 +695,29 @@ impl Projection {
                 decision: decision_of(entry),
                 debt: debt_of(entry),
                 usage: TokenUsage::default(),
+            }),
+        );
+    }
+
+    /// 召回块挂到它所属的 run 上（并进别人 run 的输入归宿主）。
+    fn recall(&mut self, entry: &EntryRecord, frame: &Frame, out: &mut Vec<Event>) {
+        let Some(data) = RecallData::of(entry) else {
+            return;
+        };
+        let first = self
+            .member
+            .get(&data.submission)
+            .copied()
+            .unwrap_or(data.submission);
+        frame.emit(
+            out,
+            0,
+            Some(run_id(first)),
+            EventPayload::MemoryInjected(MemoryInjected {
+                text: None,
+                text_ref: None,
+                uses: data.uses,
+                recall: data.recall,
             }),
         );
     }

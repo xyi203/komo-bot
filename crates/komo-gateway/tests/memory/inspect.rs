@@ -17,8 +17,9 @@ async fn detail(gateway: &TestGateway, run: &RunId) -> RunDetail {
     serde_json::from_str(&body).expect("RunDetail")
 }
 
-/// 第一条 Run 自己记了 `memory.injected`：`memories` 列出 `id@revision`，`recall` 带着
-/// 召回诊断；同一段里的第二条 Run 没有自己的事件，沿用并标出来。
+/// 每个 Run 的召回块投影成它自己的 `memory.injected`（§9.4）：`memories` 列出 `id@revision`，
+/// `recall` 带着召回诊断。同一段里第二个 Run 问同一件事，那条已经展示过、不再追加：它的块是
+/// 空的，召回诊断照记。
 #[tokio::test]
 async fn run_detail_lists_injected_memories_and_how_they_were_recalled() {
     let embeddings = ConceptEmbeddings::new();
@@ -65,6 +66,8 @@ async fn run_detail_lists_injected_memories_and_how_they_were_recalled() {
     let second: RunId = run_in(&gateway, &session, "ri-2", "空调几度来着").await;
     wait_for_terminal(&gateway, &second).await;
     let two = detail(&gateway, &second).await;
-    assert_eq!(two.memories, one.memories, "同一段沿用同一块");
-    assert!(two.recall.expect("沿用要说出来").reused_pin);
+    assert!(two.memories.is_empty(), "本段已展示过：{:?}", two.memories);
+    let recall = two.recall.expect("自己召回过一次");
+    assert_eq!(recall.mode, Some(RetrievalMode::Hybrid));
+    assert!(!recall.reused_pin);
 }

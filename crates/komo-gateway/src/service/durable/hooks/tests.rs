@@ -8,8 +8,10 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use komo_kernel::durable::recall::{MEMORY_RECALL_ENTRY_KIND, MEMORY_REVOKE_ENTRY_KIND};
 use komo_kernel::durable::{
-    Content, ConversationId, EntryId, Message, Sections, SystemMessage, TaskId,
+    Content, ContextEdit, ContextView, ConversationId, EditAction, EntryId, EntryRecord, Message,
+    Sections, SubmissionId, SystemMessage, TaskId, derive_context,
 };
 use komo_kernel::traits::{OutputWriter, Tool};
 use komo_kernel::types::delegate::DelegateContract;
@@ -21,13 +23,14 @@ use komo_kernel::types::memory::{
 use komo_kernel::types::model::Effort;
 use komo_kernel::types::plan::ExecutionPlan;
 use komo_kernel::types::tool::{ToolContext, ToolDefinition, ToolError, ToolOutput};
-use komo_runtime::durable::ConversationOwnership;
+use komo_kernel::types::turn::MemoryUse;
 use komo_runtime::durable::harness::orchestration::store_task_doc;
 use komo_runtime::durable::harness::{
-    AgentHooks, HookError, OrchestrationHooks, SubmissionDraft, TaskDoc,
+    AgentHooks, ContextRequest, HookError, OrchestrationHooks, SubmissionDraft, TaskDoc,
 };
+use komo_runtime::durable::{ConversationOwnership, EntryDraft};
 
-use super::{GatewayHooks, memory_address_for_tests};
+use super::GatewayHooks;
 use crate::service::durable::agent_doc::{self, AgentDoc};
 use crate::service::durable::assemble::{self as assemble_slot, StateSlot};
 use crate::service::durable::orchestration::{GatewayOrchestration, MonitorRunner};
@@ -462,16 +465,16 @@ fn seeded_memory(id: &str, content: &str) -> MemoryItem {
 
 const KEYWORD_MEMORY: &str = "[memory]\nenabled = true\n\n[memory.retrieval]\nmode = \"keyword\"\n";
 
-/// 召回的记忆与项目规范一旦展示就钉住，直到下一次 head（上下文里没有已展示的段）才换；
-/// 被遗忘的记忆立刻作废那一块。
+/// 项目规范一旦展示就钉住，直到下一次 head（上下文里没有已展示的段）才换；召回的记忆不进系统段。
 #[tokio::test]
-async fn memory_section_is_pinned_until_the_next_head() {
+async fn project_section_is_pinned_until_the_next_head() {
     let dir = tempfile::tempdir().unwrap();
     let workdir = komo_runtime::tools::paths::real_root(dir.path());
     std::fs::write(workdir.join("AGENTS.md"), "规范一").unwrap();
     let world = World::new(&config_with("", KEYWORD_MEMORY), finisher()).await;
-    let state = world.gateway.state();
-    state
+    world
+        .gateway
+        .state()
         .memory
         .put(seeded_memory("m-1", "用户喜欢深色主题"), None)
         .await
@@ -484,78 +487,252 @@ async fn memory_section_is_pinned_until_the_next_head() {
         }))
         .await;
     let ask = [Message::user("深色主题", 1)];
-
-    // 第一次：没有已展示的段，召回并读规范。
-    let first = hooks.setup(conversation, &ask).await.unwrap();
-    let first = texts(&first.sections);
     let find = |sections: &[(String, String)], key: &str| {
         sections
             .iter()
             .find(|(have, _)| have == key)
             .map(|(_, text)| text.clone())
     };
-    assert!(
-        find(&first, "memory").is_some_and(|text| text.contains("深色主题")),
-        "{first:?}"
-    );
+
+    let first = texts(&hooks.setup(conversation, &ask).await.unwrap().sections);
     assert!(find(&first, "project").is_some_and(|text| text.contains("规范一")));
     let keys: Vec<&str> = first.iter().map(|(key, _)| key.as_str()).collect();
-    assert_eq!(keys, ["base", "project", "memory"], "段的次序");
+    assert_eq!(keys, ["base", "project"], "记忆不是系统段");
 
-    // 之后：规范文件变了、记忆库里多了更相关的条目，已展示的两段原样不动。
+    // 之后规范文件变了：已展示的那份原样不动。
     std::fs::write(workdir.join("AGENTS.md"), "规范二").unwrap();
+    let shown = system_message(
+        &first
+            .iter()
+            .map(|(key, text)| (key.as_str(), text.as_str()))
+            .collect::<Vec<_>>(),
+    );
+    let context = [shown, Message::user("深色主题", 2)];
+    let pinned = texts(&hooks.setup(conversation, &context).await.unwrap().sections);
+    assert_eq!(pinned, first);
+
+    // 升级前钉着的 `memory` 段不再交回：补丁把它去掉。
+    let mut old = first.clone();
+    old.push(("memory".into(), "[已知记忆]\n- 旧块".into()));
+    let legacy = system_message(
+        &old.iter()
+            .map(|(key, text)| (key.as_str(), text.as_str()))
+            .collect::<Vec<_>>(),
+    );
+    let context = [legacy, Message::user("深色主题", 3)];
+    let upgraded = texts(&hooks.setup(conversation, &context).await.unwrap().sections);
+    assert_eq!(upgraded, first, "旧的记忆段不在期望的段里");
+
+    // 下一次 head：上下文里没有已展示的段，规范读新的。
+    let after_head = texts(&hooks.setup(conversation, &ask).await.unwrap().sections);
+    assert!(find(&after_head, "project").is_some_and(|text| text.contains("规范二")));
+}
+
+/// 按钩子交回的 draft 推进的一份上下文（不经 harness：ID 按顺序编）。
+struct Transcript {
+    conversation: ConversationId,
+    entries: Vec<EntryRecord>,
+}
+
+impl Transcript {
+    fn push(&mut self, draft: EntryDraft) {
+        let id = EntryId::new(self.entries.last().map_or(1, |entry| entry.id.get() + 1));
+        let mut record = EntryRecord::new(id, self.conversation, draft.kind);
+        record.model = draft.model;
+        record.data = draft.data;
+        record.edits = draft.edits;
+        self.entries.push(record);
+    }
+
+    fn input(&mut self, text: &str) {
+        let mut draft = EntryDraft::new("cli.input");
+        draft.model = Some(vec![Message::user(text, 1)]);
+        self.push(draft);
+    }
+
+    fn view(&self) -> ContextView {
+        derive_context(&self.entries, None)
+    }
+
+    async fn ask(&self, hooks: &GatewayHooks, run: u64) -> Vec<EntryDraft> {
+        let view = self.view();
+        hooks
+            .context_entries(ContextRequest {
+                conversation: self.conversation,
+                run: Some(SubmissionId::new(run)),
+                entries: &self.entries,
+                view: &view,
+                now: 1,
+            })
+            .await
+            .unwrap()
+    }
+}
+
+fn model_text(draft: &EntryDraft) -> String {
+    match draft.model.as_deref() {
+        Some([Message::User(user)]) => match &user.content {
+            Content::Text(text) => text.clone(),
+            other => panic!("{other:?}"),
+        },
+        other => panic!("召回块是一条 user 消息：{other:?}"),
+    }
+}
+
+fn joined(view: &ContextView) -> String {
+    format!("{:?}", view.messages)
+}
+
+/// 记忆按 Run 召回、作为一条宿主附上的 user 消息追加在输入之后（§9.4）：同一 Run 只召回一次；
+/// 下一个 Run 只追加本段没展示过的条目，之前的消息逐字不动；遗忘用 `edits` 改写旧块；
+/// 筛空的 Run 只落一条不进上下文的记录。
+#[tokio::test]
+async fn memory_recall_is_appended_once_per_run_and_forgetting_rewrites_it() {
+    let world = World::new(&config_with("", KEYWORD_MEMORY), finisher()).await;
+    let state = world.gateway.state();
+    state
+        .memory
+        .put(seeded_memory("m-1", "用户喜欢深色主题"), None)
+        .await
+        .unwrap();
+    let hooks = world.hooks();
+    let conversation = world.conversation(Some(agent("assistant"))).await;
+    let mut transcript = Transcript {
+        conversation,
+        entries: Vec::new(),
+    };
+
+    // Run 1：召回一块，带宿主标记，挂在 Run 上。
+    transcript.input("深色主题");
+    let drafts = transcript.ask(&hooks, 1).await;
+    assert_eq!(drafts.len(), 1, "{drafts:?}");
+    let block = &drafts[0];
+    assert_eq!(block.kind, MEMORY_RECALL_ENTRY_KIND);
+    assert!(model_text(block).contains("用户喜欢深色主题"));
+    assert!(block.model.as_ref().unwrap()[0].is_host_injected());
+    assert_eq!(block.data.as_ref().unwrap()["submission"], 1);
+    transcript.push(drafts.into_iter().next().unwrap());
+    // 同一 Run 的后续轮次（重启后也一样：看的是已提交的 entry）不再召回。
+    assert!(transcript.ask(&hooks, 1).await.is_empty());
+
+    // Run 2：多了一条更相关的记忆。只追加没展示过的那条，之前的消息是新上下文的前缀。
     state
         .memory
         .put(seeded_memory("m-2", "用户的深色主题偏好是黑色"), None)
         .await
         .unwrap();
-    let shown = Message::System(
-        match system_message(
-            &first
-                .iter()
-                .map(|(key, text)| (key.as_str(), text.as_str()))
-                .collect::<Vec<_>>(),
-        ) {
-            Message::System(system) => system,
-            _ => unreachable!(),
-        },
-    );
-    let context = [shown.clone(), Message::user("深色主题", 2)];
-    let pinned = texts(&hooks.setup(conversation, &context).await.unwrap().sections);
-    assert_eq!(find(&pinned, "memory"), find(&first, "memory"));
-    assert_eq!(find(&pinned, "project"), find(&first, "project"));
-    assert_eq!(find(&pinned, "base"), find(&first, "base"));
+    let before = transcript.view().messages;
+    transcript.input("深色主题偏好");
+    let drafts = transcript.ask(&hooks, 2).await;
+    assert_eq!(drafts.len(), 1, "{drafts:?}");
+    let text = model_text(&drafts[0]);
+    assert!(text.contains("偏好是黑色"), "{text}");
+    assert!(!text.contains("用户喜欢深色主题"), "本段已展示过：{text}");
+    transcript.push(drafts.into_iter().next().unwrap());
+    let after = transcript.view().messages;
+    assert_eq!(after[..before.len()], before[..], "追加不动前缀");
+    let first_block = transcript.entries[1].id;
 
-    // 下一次 head：上下文里没有已展示的段，规范读新的、记忆重召回。
-    let after_head = texts(&hooks.setup(conversation, &ask).await.unwrap().sections);
-    assert!(find(&after_head, "project").is_some_and(|text| text.contains("规范二")));
-    assert_ne!(find(&after_head, "memory"), find(&first, "memory"));
+    // 遗忘 m-1：同一 Run 的下一轮追加一条只带 edits 的 write entry，把第一块整块去掉。
+    state
+        .memories
+        .forget(&MemoryId::from_raw("m-1"), 1)
+        .await
+        .unwrap();
+    let drafts = transcript.ask(&hooks, 2).await;
+    assert_eq!(drafts.len(), 1, "{drafts:?}");
+    let revoke = &drafts[0];
+    assert_eq!(revoke.kind, MEMORY_REVOKE_ENTRY_KIND);
+    assert!(revoke.model.is_none());
+    assert_eq!(revoke.edits, vec![ContextEdit::omit(first_block)]);
+    transcript.push(drafts.into_iter().next().unwrap());
+    let view = transcript.view();
+    assert!(!joined(&view).contains("用户喜欢深色主题"), "{view:?}");
+    assert!(joined(&view).contains("偏好是黑色"), "别的块不动");
+    // 改写过之后不再重复改写。
+    assert!(transcript.ask(&hooks, 2).await.is_empty());
 
-    // 被遗忘的条目立刻让钉住的那一块作废（`komo.memory` 里记着 uses）。
-    let with_uses = hooks.setup(conversation, &ask).await.unwrap();
-    let with_uses = texts(&with_uses.sections);
-    let shown_now = system_message(
-        &with_uses
-            .iter()
-            .map(|(key, text)| (key.as_str(), text.as_str()))
-            .collect::<Vec<_>>(),
+    // Run 3：门槛 / 关键词筛空：只落一条没有 model 的记录，上下文一个字不多。
+    let before = transcript.view().messages;
+    transcript.input("今天天气怎么样");
+    let drafts = transcript.ask(&hooks, 3).await;
+    assert_eq!(drafts.len(), 1, "{drafts:?}");
+    assert_eq!(drafts[0].kind, MEMORY_RECALL_ENTRY_KIND);
+    assert!(drafts[0].model.is_none(), "{drafts:?}");
+    transcript.push(drafts.into_iter().next().unwrap());
+    assert_eq!(
+        transcript.view().messages.len(),
+        before.len() + 1,
+        "只多了输入"
     );
-    for id in ["m-1", "m-2"] {
+    assert!(
+        transcript.ask(&hooks, 3).await.is_empty(),
+        "记录过就不再召回"
+    );
+}
+
+/// 块里只有一部分条目失效时 `replace` 成去掉那几行的视图，别的行一个字不改。
+#[tokio::test]
+async fn forgetting_one_of_several_rewrites_the_block_without_that_line() {
+    let world = World::new(&config_with("", KEYWORD_MEMORY), finisher()).await;
+    let state = world.gateway.state();
+    for (id, content) in [("m-1", "深色主题用黑色"), ("m-2", "深色主题字号 14")] {
         state
-            .memories
-            .forget(&MemoryId::from_raw(id), 1)
+            .memory
+            .put(seeded_memory(id, content), None)
             .await
             .unwrap();
     }
-    let context = [shown_now, Message::user("深色主题", 3)];
-    let forgotten = texts(&hooks.setup(conversation, &context).await.unwrap().sections);
-    assert_eq!(
-        find(&forgotten, "memory"),
-        None,
-        "遗忘的记忆不会再被注入：{forgotten:?}"
+    let hooks = world.hooks();
+    let conversation = world.conversation(Some(agent("assistant"))).await;
+    let mut transcript = Transcript {
+        conversation,
+        entries: Vec::new(),
+    };
+    transcript.input("深色主题");
+    let drafts = transcript.ask(&hooks, 1).await;
+    let text = model_text(&drafts[0]);
+    assert!(
+        text.contains("用黑色") && text.contains("字号 14"),
+        "{text}"
     );
-    assert!(find(&forgotten, "project").is_some(), "规范仍钉着");
-    let _ = memory_address_for_tests(conversation);
+    transcript.push(drafts.into_iter().next().unwrap());
+
+    state
+        .memories
+        .forget(&MemoryId::from_raw("m-2"), 1)
+        .await
+        .unwrap();
+    let drafts = transcript.ask(&hooks, 1).await;
+    assert_eq!(drafts.len(), 1, "{drafts:?}");
+    let [edit] = drafts[0].edits.as_slice() else {
+        panic!("{drafts:?}")
+    };
+    let EditAction::Replace { messages } = &edit.action else {
+        panic!("{edit:?}")
+    };
+    let Message::User(user) = &messages[0] else {
+        panic!("{messages:?}")
+    };
+    let Content::Text(left) = &user.content else {
+        panic!()
+    };
+    assert!(
+        left.contains("用黑色") && !left.contains("字号 14"),
+        "{left}"
+    );
+    assert_eq!(user.host_origin(), Some("memory"), "改写后仍是宿主附上的");
+    assert_eq!(
+        left.as_str(),
+        komo_agent::context::memory::without(
+            &text,
+            &[MemoryUse {
+                memory: MemoryId::from_raw("m-2"),
+                revision: 1,
+            }]
+        )
+        .unwrap()
+    );
 }
 
 /// skills 目录行同样钉住（W4b）：展示过之后注册表变了（多了 skill、重载），已展示的那份原样不动，

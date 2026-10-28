@@ -146,6 +146,25 @@ pub struct UserMessage {
     pub extra: Extra,
 }
 
+/// user 消息 `extra` 里标"这不是用户说的，是宿主附上的"的那一格（值是来源，如 `memory`）。
+/// 发给模型时它照样是 user 角色（Anthropic 不收对话中间的 system 消息）；代码找"最近的用户输入"、
+/// 压缩挑切点、序列化摘要材料时靠它跳过这条（§9.4）。
+pub const HOST_ORIGIN_KEY: &str = "komoOrigin";
+
+impl UserMessage {
+    /// 宿主附上的来源；用户自己的输入是 `None`。
+    pub fn host_origin(&self) -> Option<&str> {
+        self.extra.get(HOST_ORIGIN_KEY).and_then(Value::as_str)
+    }
+}
+
+impl Message {
+    /// 宿主附上的 user 消息（[`HOST_ORIGIN_KEY`]）。
+    pub fn is_host_injected(&self) -> bool {
+        matches!(self, Message::User(user) if user.host_origin().is_some())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AssistantMessage {

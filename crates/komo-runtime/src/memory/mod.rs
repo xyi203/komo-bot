@@ -744,6 +744,30 @@ impl MemoryManager {
         carried: &[MemoryUse],
         scopes: &[MemoryScope],
     ) -> Injection {
+        self.prepare_with(run, text, carried, &[], scopes).await
+    }
+
+    /// 一个 Run 的召回块（§9.4「按 Run 召回」）：召回、过门槛、选 `top_k`，再去掉这一段上下文里
+    /// 已经展示过的 `id@revision`（`shown`），剩下的才渲染。空出来的名额不拿排名更低的补——
+    /// 选中的就是这次相关的，已展示的那几条本来就在模型眼前。
+    pub async fn recall_for_run(
+        &self,
+        run: &RunId,
+        text: &str,
+        shown: &[MemoryUse],
+        scopes: &[MemoryScope],
+    ) -> Injection {
+        self.prepare_with(run, text, &[], shown, scopes).await
+    }
+
+    async fn prepare_with(
+        &self,
+        run: &RunId,
+        text: &str,
+        carried: &[MemoryUse],
+        shown: &[MemoryUse],
+        scopes: &[MemoryScope],
+    ) -> Injection {
         if !self.enabled() {
             return Injection::default();
         }
@@ -786,7 +810,12 @@ impl MemoryManager {
         }
 
         let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
-        let items = stale::mark_missing_paths(items, home.as_deref());
+        let mut items = stale::mark_missing_paths(items, home.as_deref());
+        items.retain(|item| {
+            !shown
+                .iter()
+                .any(|use_| use_.memory == item.id && use_.revision == item.revision)
+        });
         let mut injection = (self.render)(&items, self.retrieval().max_tokens);
         diagnostics.dropped_by_budget =
             Some(items.len().saturating_sub(injection.uses.len()) as u32);

@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use komo_kernel::durable::{ConversationId, Message};
+use komo_kernel::durable::{ContextView, ConversationId, EntryRecord, Message, SubmissionId};
 use komo_kernel::projection::ProjectionContext;
 use komo_kernel::traits::{Tool, ToolOutputStore};
 use komo_kernel::types::ids::SessionId;
@@ -28,6 +28,7 @@ use serde::{Deserialize, Serialize};
 
 use super::compaction::{CompactionSetup, SummaryPrompt};
 use super::orchestration::{NoOrchestration, OrchestrationHooks};
+use crate::durable::EntryDraft;
 use crate::llm::ImageResolver;
 use crate::recovery::{IdentityProbe, ProcessProbe};
 
@@ -227,6 +228,17 @@ pub struct AgentSetup {
     pub max_output_tokens: Option<u32>,
 }
 
+/// [`AgentHooks::context_entries`] 看到的：这一轮请求前已提交的上下文。
+pub struct ContextRequest<'a> {
+    pub conversation: ConversationId,
+    /// 这次生成所属 Run 的首个输入（`komo.live.run.inputs[0]`）；不在 Run 里是 `None`。
+    pub run: Option<SubmissionId>,
+    pub entries: &'a [EntryRecord],
+    pub view: &'a ContextView,
+    /// 这一轮的时刻（毫秒），追加的消息用它作时间戳。
+    pub now: i64,
+}
+
 #[async_trait]
 pub trait AgentHooks: Send + Sync {
     /// 生成的 `prepare` 问：conversation 此刻的 agent 是什么样。`context` 是已提交上下文
@@ -236,6 +248,16 @@ pub trait AgentHooks: Send + Sync {
         conversation: ConversationId,
         context: &[Message],
     ) -> Result<AgentSetup, HookError>;
+
+    /// 系统段之外、这一轮请求之前要追加的 entry（`docs/memory.md` §9.4：Run 的记忆召回块，以及
+    /// 遗忘之后改写旧块的 write entry）。生成的 `prepare` 每轮问一次，交回的 entry 排在系统段补丁
+    /// 之后、与它们同一次提交；带 `edits` 的会让缓存断点补在第一条被改的消息之前。默认什么都不加。
+    async fn context_entries(
+        &self,
+        _request: ContextRequest<'_>,
+    ) -> Result<Vec<EntryDraft>, HookError> {
+        Ok(Vec::new())
+    }
 
     /// 只要工具表（工具任务、图片解析）。默认从 [`Self::setup`] 里取；钩子可以覆盖成更便宜的。
     async fn tools(&self, conversation: ConversationId) -> Result<ToolSet, HookError> {

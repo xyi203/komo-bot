@@ -137,12 +137,12 @@ async fn a_forgotten_memory_never_comes_back_into_a_turn() {
     let (session, run) = a_run(&gateway, "rk-1", "空调几度来着").await;
     wait_for_terminal(&gateway, &run).await;
     {
-        // 新 harness 的请求没有 `memories` 字段：看系统提示里的记忆段与 `komo.memory` 里记的 uses。
+        // 新 harness 的请求没有 `memories` 字段：看请求里的召回块与 run 详情记的 uses。
         let seen = llm.requests.lock().expect("请求表").clone();
         assert!(
-            seen[0].system_prompt.contains("客厅空调设 26 度"),
-            "第一轮注入了：{}",
-            seen[0].system_prompt
+            crate::said(&seen[0]).contains("客厅空调设 26 度"),
+            "第一轮注入了：{:?}",
+            seen[0].messages
         );
         let detail = detail_of(&gateway, &run).await;
         assert_eq!(
@@ -168,11 +168,12 @@ async fn a_forgotten_memory_never_comes_back_into_a_turn() {
 
     let seen = llm.requests.lock().expect("请求表").clone();
     assert_eq!(seen.len(), 2, "跑了两轮");
-    // 钉住的那一块里有条目被遗忘：作废重召回（没有别的可召回），第二轮的系统提示里不再有它。
+    // 第一个 Run 的召回块里有条目被遗忘：第二轮请求前追加一条只带 edits 的 write entry 把那块
+    // 改掉（§9.4），整个请求里不再有它——历史里的旧块也不行。
     assert!(
-        !seen[1].system_prompt.contains("客厅空调设 26 度"),
-        "遗忘的内容不能回到上下文（§9.7）：{}",
-        seen[1].system_prompt
+        !crate::said(&seen[1]).contains("客厅空调设 26 度"),
+        "遗忘的内容不能回到上下文（§9.7）：{:?}",
+        seen[1].messages
     );
 }
 

@@ -489,8 +489,9 @@ impl DurableCore {
                 .try_into()
                 .unwrap_or(u64::MAX)
         });
-        // 注入的记忆记在 conversation 级 `komo.memory` document 里：合成一条 `MemoryInjected`
-        // 挂到触发召回的 run 上，之后的 run 沿用并标出来（同旧 `memory.injected` 的口径）。
+        // 注入的记忆：每个 Run 的召回块（`komo.memory.recall`）投影成挂在它上面的 `MemoryInjected`
+        // （`docs/memory.md` §9.4）。升级前的会话只在 conversation 级 `komo.memory` document 里记了
+        // 最后一块：合成一条挂到触发召回的 run 上，之后的 run 沿用并标出来。
         let (memories, recall) = match komo_runtime::memory::durable::read_memory_doc(
             &*self.storage,
             submission.conversation,
@@ -502,7 +503,7 @@ impl DurableCore {
                 komo_runtime::memory::durable::inject_memory_events(&mut events, &doc);
                 injection_of(&events, run)
             }
-            None => (Vec::new(), None),
+            None => injection_of(&folded.events, run),
         };
         Ok(RunDetail {
             calls,

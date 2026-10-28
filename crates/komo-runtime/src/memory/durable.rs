@@ -6,8 +6,10 @@
 //!   1. `RunAccepted` 在投影里没有正文（正文在放置输入的 entry 上，成了 run 的第一条 `MessageUser`）；
 //!      旧提取把 `RunAccepted.text` 当用户陈述，所以把那条 `MessageUser` 的正文并回 `RunAccepted`
 //!      （并且去掉那条 `MessageUser`，否则同一句话进两次）；
-//!   2. 注入的记忆（`memory.injected`）在新存储里只记在 conversation 级 document `komo.memory`
-//!      （[`MemoryDoc`]），投影合成一条 `MemoryInjected`，挂在触发那次召回的 run 上（见 [`inject_memory_events`]）。
+//!   2. 注入的记忆（`memory.injected`）：每个 Run 的召回块 entry（`komo.memory.recall`，`docs/memory.md`
+//!      §9.4）由投影直接出成挂在它 run 上的 `MemoryInjected`，正文不进提取窗口。升级前的会话只在
+//!      conversation 级 document `komo.memory`（[`MemoryDoc`]）里记了最后一块，合成一条 `MemoryInjected`
+//!      挂在触发那次召回的 run 上（见 [`inject_memory_events`]）。
 //! - [`DurableMemoryWork`]：[`MemoryWorkLog`] 的新存储实现。工作来源是**已结算的输入 submission**
 //!   （经投影得到终态的 run）；处理游标记在 conversation 级 document `komo.memory_cursor`
 //!   （[`CursorDoc`]），`finish` 走 engine 提交；领取只在进程内（[`HashSet`] 记着手里的 run），
@@ -43,7 +45,8 @@ const SCAN_PAGE: usize = 512;
 
 // ------------------------------------------------------------------ komo.memory
 
-/// 这一块记忆注入的 uses（conversation 级 document；钩子在召回时写，`revalidate` 与 run 详情读）。
+/// 升级前的会话钉住的那一块记忆注入的 uses（conversation 级 document）。按 Run 召回之后不再写，
+/// 旧会话里的那份只给提取与 run 详情补旧 Run 的注入（`docs/memory.md` §9.4）。
 pub const MEMORY_DOC_KIND: &str = "komo.memory";
 pub const MEMORY_DOC_VERSION: u32 = 1;
 

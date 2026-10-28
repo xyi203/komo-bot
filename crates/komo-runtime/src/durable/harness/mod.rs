@@ -49,8 +49,8 @@ mod tests;
 pub use compaction::{CompactionSettings, CompactionSetup, CompactionTask, SummaryPrompt};
 pub use generation::GenerationTask;
 pub use hooks::{
-    AgentHooks, AgentSetup, HarnessDeps, HarnessSettings, HookError, PromptSection, QueueMode,
-    RetryPolicy, RunBudget, ToolEnv, ToolSet,
+    AgentHooks, AgentSetup, ContextRequest, HarnessDeps, HarnessSettings, HookError, PromptSection,
+    QueueMode, RetryPolicy, RunBudget, ToolEnv, ToolSet,
 };
 pub use inbox::{InboxItem, InboxState, InputEntry, SubmissionDraft, WhenBusy, WriteDraft};
 pub use live::{

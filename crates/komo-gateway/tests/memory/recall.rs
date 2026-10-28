@@ -273,12 +273,12 @@ async fn a_turn_records_which_memories_reached_it() {
     .await;
 
     let seen = requests.lock().expect("请求表").clone();
-    // 新 harness 的请求没有 `memories` 字段：系统提示里带着正文，run 详情（读 `komo.memory`）记着
+    // 新 harness 的请求没有 `memories` 字段：召回块里带着正文，run 详情（读召回块的投影）记着
     // 条目与版本。
     assert!(
-        seen[0].system_prompt.contains("客厅空调设 26 度"),
-        "注入了一条：{}",
-        seen[0].system_prompt
+        crate::said(&seen[0]).contains("客厅空调设 26 度"),
+        "注入了一条：{:?}",
+        seen[0].messages
     );
     gateway.wait_run(&_run).await;
     let (status, detail) = gateway.get_json(&format!("/v1/runs/{_run}")).await;
@@ -359,9 +359,9 @@ async fn an_agent_only_recalls_its_own_scope_plus_the_shared_profile() {
 
     let seen = llm.requests.lock().expect("请求表").clone();
     assert_eq!(seen.len(), 2, "两段各请求了一次");
-    // 新 harness 的请求没有 `memories` 字段：按系统提示里出现的正文认。
+    // 新 harness 的请求没有 `memories` 字段：按召回块里出现的正文认。
     let ids = |index: usize| {
-        let prompt = &seen[index].system_prompt;
+        let prompt = crate::said(&seen[index]);
         let mut ids = Vec::new();
         for (id, text) in [
             ("m-acme", "acme 的空调遥测在 26 度"),
@@ -386,14 +386,11 @@ async fn an_agent_only_recalls_its_own_scope_plus_the_shared_profile() {
     );
 }
 
-/// Phase 5：记忆段是 `TurnRequest.system_prompt` 自己的一部分，不再靠适配器另外拼接
-/// （`docs/agent.md` §13.2、§20 Phase 5）。开着记忆、有一条能召回的记忆时，模型收到的
-/// 系统提示要以 `[已知记忆]` 那一块收尾，且带着这条记忆的正文。
-/// §9.4 同一段里逐字复用，**跨 Gateway 重启也算**：重启之后第二轮问的是另一件事，系统
-/// 提示（连记忆段）仍与第一轮逐字相同——注入段按 Session 日志里记下的那一块复用，不按新的
-/// 用户输入重新召回。否则重启一次，整条前缀缓存就从头失效。
+/// §9.4「按 Run 召回」：召回块跨 Gateway 重启复用，之后的 Run 只往尾部追加。重启之后第二个 Run
+/// 问另一件事：系统提示与第一个请求逐字相同，第一个请求的全部消息原样是第二个请求的前缀，新召回
+/// 到的那条在新的一块里。
 #[tokio::test]
-async fn the_memory_block_survives_a_restart_within_one_segment() {
+async fn the_memory_block_survives_a_restart_and_later_runs_only_append() {
     let config = memory_config("keyword", false);
     let first = ScriptedLlm::new(vec![vec![text_round(1, "26 度。")]]);
     let mut gateway = super::gateway(&config)
@@ -414,11 +411,16 @@ async fn the_memory_block_survives_a_restart_within_one_segment() {
 
     let (session, run) = a_run(&gateway, "rk-1", "空调设多少度来着").await;
     wait_for_terminal(&gateway, &run).await;
-    let before = first.requests.lock().expect("请求表")[0]
-        .system_prompt
-        .clone();
-    assert!(before.contains("客厅空调设 26 度"), "{before}");
-    assert!(!before.contains("台灯"), "第一轮只召回到空调那条：{before}");
+    let before = first.requests.lock().expect("请求表")[0].clone();
+    assert!(
+        crate::said(&before).contains("客厅空调设 26 度"),
+        "{:?}",
+        before.messages
+    );
+    assert!(
+        !crate::said(&before).contains("台灯"),
+        "第一个 Run 只召回到空调那条"
+    );
 
     let second = ScriptedLlm::new(vec![vec![text_round(1, "暖光。")]]);
     // 旧的那台留着直到测试结束（它的 `Drop` 会删临时数据目录）。
@@ -427,14 +429,37 @@ async fn the_memory_block_survives_a_restart_within_one_segment() {
     let run = run_in(&gateway, &session, "rk-2", "台灯是什么光").await;
     wait_for_terminal(&gateway, &run).await;
 
-    let after = second.requests.lock().expect("请求表")[0]
-        .system_prompt
-        .clone();
-    assert_eq!(after, before, "重启前后同一段的系统提示逐字相同");
+    let after = second.requests.lock().expect("请求表")[0].clone();
+    assert_eq!(
+        after.system_prompt, before.system_prompt,
+        "系统提示逐字相同"
+    );
+    assert!(
+        !after.system_prompt.contains("[已知记忆]"),
+        "记忆不在系统提示里"
+    );
+    assert_eq!(
+        after.messages[..before.messages.len()],
+        before.messages[..],
+        "第一个请求的消息原样是前缀"
+    );
+    let tail = crate::said(&komo_kernel::types::turn::TurnRequest {
+        messages: after.messages[before.messages.len()..].to_vec(),
+        ..after.clone()
+    });
+    assert!(
+        tail.contains("卧室台灯是暖光"),
+        "新的一块追加在尾部：{tail}"
+    );
+    assert!(
+        !tail.contains("客厅空调设 26 度"),
+        "已展示过的不再追加：{tail}"
+    );
 }
 
+/// 召回块是一条宿主附上的 user 消息，跟在这次输入后面；系统提示里没有它。
 #[tokio::test]
-async fn the_system_prompt_the_model_receives_ends_with_the_recalled_memory_block() {
+async fn the_recalled_memory_block_follows_the_input_as_a_host_message() {
     let llm = ScriptedLlm::new(vec![vec![text_round(1, "26 度。")]]);
     let gateway = super::gateway(&memory_config("keyword", false))
         .scripted(llm.clone())
@@ -460,20 +485,77 @@ async fn the_system_prompt_the_model_receives_ends_with_the_recalled_memory_bloc
 
     let seen = llm.requests.lock().expect("请求表").clone();
     assert_eq!(seen.len(), 1);
-    let prompt = seen[0].system_prompt.trim_end();
-    let block_at = prompt
-        .find("[已知记忆]")
-        .unwrap_or_else(|| panic!("系统提示里没有记忆段：{prompt}"));
-    let block = &prompt[block_at..];
     assert!(
-        block.contains("客厅空调设 26 度"),
-        "记忆段要带着召回到的正文：{prompt}"
+        !seen[0].system_prompt.contains("[已知记忆]"),
+        "{}",
+        seen[0].system_prompt
     );
-    // 渲染的每一行都以 `id@revision〕` 收尾（`komo-agent::context::memory::render_line`）；
-    // 系统提示原样以它结束，说明记忆段接在最后，不是夹在中间（Gateway 在
-    // `with_instructions` 之后才追加，§13.2）。
+    let said = crate::said(&seen[0]);
+    let input = said.find("空调设多少度来着").expect("输入");
+    let block = said
+        .find("[已知记忆]（komo 按这次输入召回后附上，不是用户说的话")
+        .unwrap_or_else(|| panic!("没有召回块：{said}"));
+    assert!(input < block, "召回块在输入之后：{said}");
+    assert!(said[block..].contains("客厅空调设 26 度"), "{said}");
+}
+
+/// 附录 F / §9.4 的验收：同一个会话中途换任务，新任务的约定能召回到。先问日志、后说"提个发布
+/// 工单"，第二个 Run 的请求里有发布工单那条约定，第一个请求原样是它的前缀。
+#[tokio::test]
+async fn switching_tasks_mid_session_recalls_the_new_tasks_convention() {
+    use komo_kernel::types::memory::MemoryApplication;
+
+    let llm = ScriptedLlm::new(vec![
+        vec![text_round(1, "用 sls 查。")],
+        vec![text_round(1, "Platform 选 saas。")],
+    ]);
+    let gateway = super::gateway(&memory_config("keyword", false))
+        .scripted(llm.clone())
+        .start()
+        .await;
+    let mut convention = seeded(
+        "m-ticket",
+        "发布工单 Platform 默认选 saas",
+        Provenance::UserStatement,
+        MemoryState::Active,
+    );
+    convention.application = Some(MemoryApplication::Convention);
+    convention.applies_when = Some("创建发布工单、需要选 Platform 时".into());
+    for item in [
+        seeded(
+            "m-log",
+            "查 dev 日志用 sls 的 dev-saas-log",
+            Provenance::ToolObservation,
+            MemoryState::Active,
+        ),
+        convention,
+    ] {
+        gateway.state().memory.put(item, None).await.unwrap();
+    }
+
+    let (session, run) = a_run(&gateway, "rk-1", "帮我查一下日志").await;
+    wait_for_terminal(&gateway, &run).await;
+    let run = run_in(&gateway, &session, "rk-2", "提个发布工单").await;
+    wait_for_terminal(&gateway, &run).await;
+
+    let seen = llm.requests.lock().expect("请求表").clone();
+    assert_eq!(seen.len(), 2);
+    let first = crate::said(&seen[0]);
+    assert!(first.contains("dev-saas-log"), "{first}");
     assert!(
-        prompt.ends_with('〕'),
-        "记忆段要接在系统提示的最后：{prompt}"
+        !first.contains("Platform 默认选 saas"),
+        "查日志时不带发布约定：{first}"
     );
+    assert_eq!(seen[1].system_prompt, seen[0].system_prompt);
+    assert_eq!(
+        seen[1].messages[..seen[0].messages.len()],
+        seen[0].messages[..]
+    );
+    let second = crate::said(&seen[1]);
+    let ask = second.rfind("提个发布工单").expect("第二个输入");
+    let convention = second
+        .rfind("发布工单 Platform 默认选 saas")
+        .unwrap_or_else(|| panic!("换任务后召回到约定：{second}"));
+    assert!(ask < convention, "约定在第二个输入之后：{second}");
+    assert!(second[ask..].contains("适用的长期约定"), "{second}");
 }

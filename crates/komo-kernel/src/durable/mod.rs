@@ -16,6 +16,7 @@ pub mod legacy_ids;
 pub mod memory;
 pub mod message;
 pub mod pi_tree;
+pub mod recall;
 pub mod records;
 pub mod storage;
 pub mod task;
@@ -28,8 +29,8 @@ pub use ids::{
 #[cfg(any(test, feature = "test-support"))]
 pub use memory::MemoryStorage;
 pub use message::{
-    AssistantMessage, Content, ContentBlock, Message, Sections, StopReason, SystemMessage,
-    ToolResultMessage, UserMessage,
+    AssistantMessage, Content, ContentBlock, HOST_ORIGIN_KEY, Message, Sections, StopReason,
+    SystemMessage, ToolResultMessage, UserMessage,
 };
 pub use records::{
     ContextEdit, ConversationRecord, DocumentAddress, DocumentRecord, DocumentScope, EditAction,

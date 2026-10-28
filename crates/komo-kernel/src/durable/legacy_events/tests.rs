@@ -509,6 +509,52 @@ fn a_reset_in_a_run_closes_it_so_the_following_input_starts_a_new_run() {
     assert!(names.contains(&("1".to_owned(), "run.cancelled")));
 }
 
+/// 记忆召回块（§9.4）投影成挂在所属 run 上的 `memory.injected`：只带 uses，正文不出
+/// `message.user`——提取窗口里看不到它，也就引不成用户原话。改写它的 `komo.memory.revoke` 不出帧。
+#[test]
+fn a_memory_recall_block_is_an_injection_on_its_run_not_a_user_message() {
+    use crate::durable::message::HOST_ORIGIN_KEY;
+    use crate::durable::recall::{MEMORY_RECALL_ENTRY_KIND, MEMORY_REVOKE_ENTRY_KIND};
+
+    let mut block = Message::user("[已知记忆]\n- 发布工单默认 saas 〔· m-1@2〕", 3000);
+    if let Message::User(user) = &mut block {
+        user.extra.insert(HOST_ORIGIN_KEY.into(), json!("memory"));
+    }
+    let entries = vec![
+        user(2, "提个发布工单"),
+        entry(3, MEMORY_RECALL_ENTRY_KIND)
+            .with_model(vec![block])
+            .with_data(
+                json!({"submission": 1, "uses": [{"memory": "m-1", "revision": 2}], "at": 3}),
+            ),
+        entry(4, MEMORY_REVOKE_ENTRY_KIND).with_edits(vec![ContextEdit::omit(eid(3))]),
+        assistant(5, "好", &[]),
+        settled(6, 1, Some(5)),
+    ];
+    let subs = vec![input_sub(1, done(2, 5))];
+    let events = legacy_events(SESSION, &entries, &subs);
+    let users: Vec<&str> = events
+        .iter()
+        .filter_map(|event| match &event.payload {
+            EventPayload::MessageUser(body) => body.text.as_deref(),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(users, ["提个发布工单"], "召回块的正文不是用户消息");
+    let injected: Vec<&Event> = events
+        .iter()
+        .filter(|event| matches!(event.payload, EventPayload::MemoryInjected(_)))
+        .collect();
+    assert_eq!(injected.len(), 1);
+    assert_eq!(injected[0].run.as_ref().map(RunId::as_str), Some("1"));
+    let EventPayload::MemoryInjected(body) = &injected[0].payload else {
+        panic!()
+    };
+    assert_eq!(body.uses.len(), 1);
+    assert_eq!(body.uses[0].revision, 2);
+    assert!(body.text.is_none());
+}
+
 #[test]
 fn context_changes_and_plain_user_messages_have_their_own_frames() {
     let entries = vec![

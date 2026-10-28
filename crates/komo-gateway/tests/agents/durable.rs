@@ -674,7 +674,8 @@ async fn a_background_task_reports_back_through_home() {
             .any(|t| t == "转告：功耗 300W。")
     })
     .await;
-    assert_eq!(inputs_of(&gateway, task.conversation).await.len(), 2);
+    // 派出、追问，外加追问的回答没写状态行时 komo 自动放的续跑（`docs/background-tasks.md` §2c）。
+    assert_eq!(inputs_of(&gateway, task.conversation).await.len(), 3);
     let follow_request = llm
         .requests
         .lock()
@@ -691,7 +692,7 @@ async fn a_background_task_reports_back_through_home() {
     // ── 5. 带契约的追问也进同一个任务会话。
     let (_, home_run_3) = dm(&gateway, "功耗带契约", "dm-3").await;
     gateway.wait_run(&home_run_3).await;
-    assert_eq!(inputs_of(&gateway, task.conversation).await.len(), 3);
+    assert_eq!(inputs_of(&gateway, task.conversation).await.len(), 4);
 
     gateway.stop().await;
 }
@@ -854,9 +855,12 @@ async fn a_follow_up_absorbed_into_a_busy_task_reports_back_once() {
     )
     .await;
     assert_eq!(reports.len(), 1, "只有宿主那一次交回：{reports:?}");
+    // 宿主那次回答没写状态行，续跑之后才交回：交回键的首个输入是那条续跑输入，不是被并走的追问。
+    let task_inputs = inputs_of(&gateway, task.conversation).await;
+    assert_eq!(task_inputs.len(), 3, "{task_inputs:?}");
     assert_eq!(
         reports[0].request_id.as_deref(),
-        Some(format!("task-result:{}:{}", task.conversation, host.id).as_str()),
+        Some(format!("task-result:{}:{}", task.conversation, task_inputs[2].id).as_str()),
         "被并走的追问不另交回"
     );
 

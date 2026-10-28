@@ -221,6 +221,15 @@ fn last_user_text(req: &TurnRequest) -> String {
         .unwrap_or_default()
 }
 
+fn last_assistant_text(req: &TurnRequest) -> String {
+    req.messages
+        .iter()
+        .rev()
+        .find(|message| message.role == komo_kernel::types::turn::Role::Assistant)
+        .and_then(|message| message.text.clone())
+        .unwrap_or_default()
+}
+
 /// 最后一条用户消息之后已经有工具结果了（这一段是接着上一段跑的）。
 fn answered_since_last_user(req: &TurnRequest) -> bool {
     use komo_kernel::types::turn::Role;
@@ -245,6 +254,13 @@ impl LlmClient for TasksLlm {
         let script = if input.starts_with("[后台任务") {
             let result = input.lines().nth(2).unwrap_or_default();
             Script::Reply(format!("转告：{result}"))
+        } else if input.starts_with("（这条是 komo 自动发的") {
+            // 任务的回答没写状态行，komo 让它续跑：把上一条回答补上状态行重答一遍。
+            Script::Reply(format!(
+                "{}\n{}",
+                last_assistant_text(&req),
+                komo_kernel::types::task::TASK_STATUS_DONE
+            ))
         } else {
             match input.lines().next().unwrap_or_default() {
                 "帮我查一下空调" => Script::Calls(vec![(

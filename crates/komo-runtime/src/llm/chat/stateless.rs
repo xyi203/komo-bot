@@ -139,8 +139,9 @@ impl ModelStream for ChatCompletionsLlm {
                 elapsed_ms,
                 "model stream completed"
             ),
-            Err(error) if stats.0.is_some() => tracing::warn!(
-                first_byte_ms = stats.0.unwrap(),
+            // first_byte_ms 只在收到过数据时出现：没有它就是零字节失败。
+            Err(error) => tracing::warn!(
+                first_byte_ms = stats.0,
                 bytes = stats.1,
                 role = %self.role,
                 model = %model.model,
@@ -149,10 +150,6 @@ impl ModelStream for ChatCompletionsLlm {
                 elapsed_ms,
                 error = %error,
                 "model stream failed"
-            ),
-            Err(error) => tracing::warn!(
-                role = %self.role, model = %model.model, bytes = stats.1, elapsed_ms,
-                error = %error, "model stream failed"
             ),
         }
         outcome

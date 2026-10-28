@@ -14,12 +14,14 @@ use komo_kernel::durable::{
 };
 use komo_kernel::traits::Tool;
 use komo_kernel::types::model::Effort;
+use komo_kernel::types::task::{TASK_STATUS_BLOCKED, TASK_STATUS_DONE};
 use serde_json::json;
 use tokio::sync::Notify;
 
 use super::super::orchestration::monitor::{self, Reconciled};
 use super::super::orchestration::{
-    ANCHOR_KIND, FORK_NOTICE, LaunchMode, MonitorState, TASK_RESULT_ENTRY, task_doc,
+    ANCHOR_KIND, FORK_NOTICE, LaunchMode, MonitorState, TASK_CONTINUE_ENTRY, TASK_CONTINUE_PROMPT,
+    TASK_RESULT_ENTRY, task_doc,
 };
 use super::super::{InboxItem, SubmissionDraft};
 use super::support::*;
@@ -44,6 +46,11 @@ fn install(world: &World) -> (Fixture, Arc<TestTool>, Arc<Notify>) {
         slow.clone(),
     ]);
     (fixture, read, gate)
+}
+
+/// 子任务做完时的回答：末行是状态行，不写会被自动续跑（`report` 模块文档）。
+fn finished(text: &str) -> String {
+    format!("{text}\n{TASK_STATUS_DONE}")
 }
 
 fn gated(gate: &Arc<Notify>, text: &str) -> Step {
@@ -138,7 +145,7 @@ async fn a_dispatched_task_runs_in_a_child_and_its_result_reaches_the_parent() {
     world.script.reply("the task says it is on"); // 父：收到交回之后
     world
         .script
-        .push_for("CHILD", gated(&child_gate, "AC is on"));
+        .push_for("CHILD", gated(&child_gate, &finished("AC is on")));
     let engine = world.open().await;
     let id = world.submit(&engine, "go").await;
     world.harness.wait(&engine, id).await.unwrap();
@@ -178,7 +185,7 @@ async fn a_dispatched_task_runs_in_a_child_and_its_result_reaches_the_parent() {
     assert_eq!(
         user_texts(&parent)[1],
         format!(
-            "[后台任务 #{child}「查空调」已完成]\n\nAC is on\n\n\
+            "[后台任务 #{child}「查空调」已完成 · 0 轮工具调用 · 0 秒]\n\nAC is on\n{TASK_STATUS_DONE}\n\n\
              （这是后台任务交回的结果，不是用户发来的消息；用户看不到上面这段，请把结论转告用户。）"
         )
     );
@@ -198,7 +205,11 @@ async fn a_dispatched_task_runs_in_a_child_and_its_result_reaches_the_parent() {
     // 子自己的对话：系统段、任务、回复；输入 done。
     assert_eq!(
         outline(&world.messages_in(child).await),
-        ["system", "user: CHILD check the AC", "assistant: AC is on"]
+        [
+            "system".to_owned(),
+            "user: CHILD check the AC".to_owned(),
+            format!("assistant: {}", finished("AC is on")),
+        ]
     );
     // 锚任务 completed，子 conversation 的 owner 就是它。
     let anchors = world.tasks(ANCHOR_KIND).await;
@@ -208,6 +219,146 @@ async fn a_dispatched_task_runs_in_a_child_and_its_result_reaches_the_parent() {
         .until(|| async { terminal_completed(&world.tasks(ANCHOR_KIND).await[0]) })
         .await;
     engine.close().await.unwrap();
+}
+
+/// 子 conversation 里自动续跑放进去的输入。
+async fn continues(world: &World, child: ConversationId) -> usize {
+    world
+        .entries_in(child)
+        .await
+        .iter()
+        .filter(|entry| entry.kind == TASK_CONTINUE_ENTRY)
+        .count()
+}
+
+/// 派出一个子任务、等它交回，返回子 conversation 与父收到的那条交回正文。子的脚本由调用方先排好；
+/// 父在交回之后回 `relayed`。
+async fn dispatch_and_collect(world: &World, call: serde_json::Value) -> (ConversationId, String) {
+    world.script.calls(&[("c1", "task", call)]);
+    world.script.reply("dispatched");
+    world.script.reply("relayed");
+    let engine = world.open().await;
+    let id = world.submit(&engine, "go").await;
+    world.harness.wait(&engine, id).await.unwrap();
+    let child = world.child().await;
+    world
+        .until(|| async {
+            outline(&world.messages().await).contains(&"assistant: relayed".to_owned())
+        })
+        .await;
+    let results = world.entries_of(TASK_RESULT_ENTRY).await;
+    assert_eq!(results.len(), 1, "exactly one result reached the parent");
+    let text = user_texts(&world.messages().await).remove(1);
+    engine.close().await.unwrap();
+    (child, text)
+}
+
+/// `docs/background-tasks.md` §2c：回答末行没写状态，先不交回，在任务会话里自动续跑一次；父只收到
+/// 续跑之后那条回答，标题注明续跑过。
+#[tokio::test(start_paused = true)]
+async fn an_answer_without_a_status_line_is_continued_once_before_it_is_reported() {
+    let world = World::new();
+    let (_fixture, ..) = install(&world);
+    world.script.reply_for("CHILD fix", "改了一半");
+    world
+        .script
+        .reply_for("komo 自动发的", &finished("全部改完，测试通过"));
+    let (child, text) = dispatch_and_collect(&world, spawn_call("CHILD fix", "修")).await;
+
+    assert!(
+        text.starts_with(&format!("[后台任务 #{child}「修」已完成 · 0 轮工具调用 · ")),
+        "{text}"
+    );
+    assert!(text.contains(" · 自动续跑过一次]"), "{text}");
+    assert!(text.contains("全部改完，测试通过"), "{text}");
+    assert!(
+        !text.contains("改了一半"),
+        "only the continued answer is reported: {text}"
+    );
+    assert_eq!(
+        outline(&world.messages_in(child).await),
+        [
+            "system".to_owned(),
+            "user: CHILD fix".to_owned(),
+            "assistant: 改了一半".to_owned(),
+            format!("user: {TASK_CONTINUE_PROMPT}"),
+            format!("assistant: {}", finished("全部改完，测试通过")),
+        ]
+    );
+    assert_eq!(continues(&world, child).await, 1);
+}
+
+/// 续跑之后还是没写状态：不再续跑，照样交回，标题说它没说做完没有。
+#[tokio::test(start_paused = true)]
+async fn a_continued_answer_is_reported_even_without_a_status_line() {
+    let world = World::new();
+    let (_fixture, ..) = install(&world);
+    world.script.reply_for("CHILD fix", "改了一半");
+    world.script.reply_for("komo 自动发的", "还是一半");
+    let (child, text) = dispatch_and_collect(&world, spawn_call("CHILD fix", "修")).await;
+
+    assert!(
+        text.starts_with(&format!(
+            "[后台任务 #{child}「修」交回了，没说做完没有 · 0 轮工具调用 · "
+        )),
+        "{text}"
+    );
+    assert!(text.contains(" · 自动续跑过一次]\n\n还是一半"), "{text}");
+    assert_eq!(continues(&world, child).await, 1);
+    let data = world.entries_of(TASK_RESULT_ENTRY).await[0]
+        .data
+        .clone()
+        .unwrap();
+    assert_eq!(data["task"]["status"], json!("unstated"));
+}
+
+/// 写了"受阻"的回答直接交回，不续跑。
+#[tokio::test(start_paused = true)]
+async fn a_blocked_answer_is_reported_without_continuing() {
+    let world = World::new();
+    let (_fixture, ..) = install(&world);
+    world.script.reply_for(
+        "CHILD fix",
+        &format!("方案的前提不成立。\n{TASK_STATUS_BLOCKED}：直播投影不存历史帧"),
+    );
+    let (child, text) = dispatch_and_collect(&world, spawn_call("CHILD fix", "修")).await;
+
+    assert!(
+        text.starts_with(&format!("[后台任务 #{child}「修」受阻 · 0 轮工具调用 · ")),
+        "{text}"
+    );
+    assert!(!text.contains("自动续跑"), "{text}");
+    assert_eq!(continues(&world, child).await, 0);
+    let data = world.entries_of(TASK_RESULT_ENTRY).await[0]
+        .data
+        .clone()
+        .unwrap();
+    assert_eq!(data["task"]["status"], json!("blocked"));
+}
+
+/// 带结果契约的回答只放 JSON：不看状态行、不续跑，结局看契约复验。
+#[tokio::test(start_paused = true)]
+async fn an_answer_under_a_contract_is_reported_without_a_status_line() {
+    let world = World::new();
+    let (_fixture, ..) = install(&world);
+    world.script.reply_for("CHILD check", r#"{"ok": true}"#);
+    let call = json!({
+        "prompt": "CHILD check",
+        "title": "查",
+        "contract": {
+            "type": "object",
+            "required": ["ok"],
+            "properties": { "ok": { "type": "boolean" } }
+        }
+    });
+    let (child, text) = dispatch_and_collect(&world, call).await;
+
+    assert!(
+        text.starts_with(&format!("[后台任务 #{child}「查」已完成 · 0 轮工具调用 · ")),
+        "{text}"
+    );
+    assert!(text.contains("（结果契约复验：符合"), "{text}");
+    assert_eq!(continues(&world, child).await, 0);
 }
 
 /// 父所在的 Session 已经在删（`closing`）时，子任务跑完不再往父交回：交回是内部输入，会在父里起
@@ -225,7 +376,7 @@ async fn a_task_finishing_after_its_parent_session_started_closing_reports_nothi
     world.script.reply("dispatched");
     world
         .script
-        .push_for("CHILD", gated(&child_gate, "AC is on"));
+        .push_for("CHILD", gated(&child_gate, &finished("AC is on")));
     let engine = world.open().await;
     let parent = engine
         .commit(|tx| {
@@ -301,8 +452,12 @@ async fn a_spawned_task_has_its_own_session_row() {
         ),
     ]);
     world.script.reply("dispatched");
-    world.script.push_for("CHILD", gated(&child_gate, "ok"));
-    world.script.push_for("CHILD", gated(&child_gate, "ok"));
+    world
+        .script
+        .push_for("CHILD", gated(&child_gate, &finished("ok")));
+    world
+        .script
+        .push_for("CHILD", gated(&child_gate, &finished("ok")));
     let engine = world.open().await;
     // 父是一个属于 komo Session `sess-parent` 的 conversation。
     let parent = engine
@@ -408,7 +563,7 @@ async fn a_running_child_does_not_hold_the_parent_idle() {
     world.script.reply("noted");
     world
         .script
-        .push_for("CHILD", gated(&child_gate, "finally"));
+        .push_for("CHILD", gated(&child_gate, &finished("finally")));
     let engine = world.open().await;
     let id = world.submit(&engine, "go").await;
     world.harness.wait(&engine, id).await.unwrap();
@@ -457,7 +612,7 @@ async fn a_fork_child_starts_from_the_parents_conversation_at_that_moment() {
     world.script.reply("it got fixed");
     world
         .script
-        .push_for("CHILD fix B1", gated(&child_gate, "B1 fixed"));
+        .push_for("CHILD fix B1", gated(&child_gate, &finished("B1 fixed")));
     let engine = world.open().await;
     let id = world.submit(&engine, "go").await;
     world.harness.wait(&engine, id).await.unwrap();
@@ -516,10 +671,10 @@ async fn a_follow_up_goes_into_the_same_child_and_reports_again() {
     world.script.reply("dispatched");
     world
         .script
-        .push_for("CHILD one", gated(&first, "first done"));
+        .push_for("CHILD one", gated(&first, &finished("first done")));
     world
         .script
-        .push_for("FOLLOW more", gated(&second, "second done"));
+        .push_for("FOLLOW more", gated(&second, &finished("second done")));
     let engine = world.open().await;
     let id = world.submit(&engine, "go").await;
     world.harness.wait(&engine, id).await.unwrap();
@@ -558,18 +713,20 @@ async fn a_follow_up_goes_into_the_same_child_and_reports_again() {
     assert_eq!(
         outline(&world.messages_in(child).await),
         [
-            "system",
-            "user: CHILD one",
-            "assistant: first done",
-            "user: FOLLOW more",
-            "assistant: second done",
+            "system".to_owned(),
+            "user: CHILD one".to_owned(),
+            format!("assistant: {}", finished("first done")),
+            "user: FOLLOW more".to_owned(),
+            format!("assistant: {}", finished("second done")),
         ]
     );
     let delivered = submissions_with(&world, CONV, &format!("task-result:{child}:")).await;
     assert_eq!(delivered.len(), 2, "one hand-back per run");
     let users = user_texts(&world.messages().await);
-    assert!(users[1].starts_with(&format!("[后台任务 #{child}「活」已完成]\n\nfirst done")));
-    assert!(users[2].starts_with(&format!("[后台任务 #{child}「活」已完成]\n\nsecond done")));
+    assert!(users[1].starts_with(&format!("[后台任务 #{child}「活」已完成 · 0 轮工具调用 · ")));
+    assert!(users[1].contains("]\n\nfirst done"));
+    assert!(users[2].starts_with(&format!("[后台任务 #{child}「活」已完成 · 0 轮工具调用 · ")));
+    assert!(users[2].contains("]\n\nsecond done"));
     engine.close().await.unwrap();
 }
 
@@ -618,7 +775,9 @@ async fn a_task_conversation_cannot_spawn_another_task() {
         "CHILD nested",
         &[("k1", "task", spawn_call("again", "deeper"))],
     );
-    world.script.reply_for("CHILD nested", "I did it myself");
+    world
+        .script
+        .reply_for("CHILD nested", &finished("I did it myself"));
     let engine = world.open().await;
     let id = world.submit(&engine, "go").await;
     world.harness.wait(&engine, id).await.unwrap();
@@ -627,7 +786,7 @@ async fn a_task_conversation_cannot_spawn_another_task() {
         .until(|| async {
             outline(&world.messages_in(child).await)
                 .last()
-                .is_some_and(|l| l == "assistant: I did it myself")
+                .is_some_and(|l| *l == format!("assistant: {}", finished("I did it myself")))
         })
         .await;
     assert!(
@@ -648,7 +807,9 @@ async fn a_result_for_a_busy_parent_waits_in_the_inbox_for_the_boundary() {
         ("c2", "slow", json!({})),
     ]);
     world.script.reply("saw the result");
-    world.script.reply_for("CHILD quick", "quick answer");
+    world
+        .script
+        .reply_for("CHILD quick", &finished("quick answer"));
     let engine = world.open().await;
     let id = world.submit(&engine, "go").await;
 
@@ -722,7 +883,7 @@ async fn a_restart_never_hands_the_same_result_back_twice() {
     world.script.push_for("CHILD flaky", Step::Hang);
     world
         .script
-        .reply_for("CHILD flaky", "survived the restart");
+        .reply_for("CHILD flaky", &finished("survived the restart"));
     let engine = world.open().await;
     let id = world.submit(&engine, "go").await;
     world.harness.wait(&engine, id).await.unwrap();
@@ -840,10 +1001,12 @@ async fn the_model_and_effort_reach_the_child_run() {
         json!({ "prompt": "CHILD m", "title": "t", "model": "chat", "effort": "low" }),
     )]);
     world.script.reply("dispatched");
-    world.script.push_for("CHILD m", gated(&first, "done"));
     world
         .script
-        .push_for("FOLLOW e", gated(&second, "done again"));
+        .push_for("CHILD m", gated(&first, &finished("done")));
+    world
+        .script
+        .push_for("FOLLOW e", gated(&second, &finished("done again")));
     let engine = world.open().await;
     let id = world.submit(&engine, "go").await;
     world.harness.wait(&engine, id).await.unwrap();
@@ -904,7 +1067,7 @@ async fn cancelling_the_parent_leaves_the_child_running() {
     world.script.reply("noted the late result");
     world
         .script
-        .push_for("CHILD long", gated(&child_gate, "long result"));
+        .push_for("CHILD long", gated(&child_gate, &finished("long result")));
     let engine = world.open().await;
     let id = world.submit(&engine, "go").await;
     world.until_log("start slow #1").await;
@@ -975,9 +1138,12 @@ async fn aborting_the_child_reports_that_it_did_not_finish() {
         .await;
     let text = user_texts(&world.messages().await).remove(1);
     assert!(
-        text.starts_with(&format!("[后台任务 #{child}「卡住」没有完成]\n\n已取消")),
+        text.starts_with(&format!(
+            "[后台任务 #{child}「卡住」没有完成 · 0 轮工具调用 · "
+        )),
         "{text}"
     );
+    assert!(text.contains("]\n\n已取消"), "{text}");
     assert!(world.live_of(child).await.run.is_none());
     engine.close().await.unwrap();
 }
@@ -994,7 +1160,7 @@ async fn a_status_query_reads_the_child_without_disturbing_it() {
     world.script.reply("dispatched");
     world
         .script
-        .push_for("CHILD slow work", gated(&child_gate, "AC is on"));
+        .push_for("CHILD slow work", gated(&child_gate, &finished("AC is on")));
     let engine = world.open().await;
     let id = world.submit(&engine, "go").await;
     world.harness.wait(&engine, id).await.unwrap();
@@ -1110,7 +1276,7 @@ async fn a_crash_between_the_spawn_and_its_result_does_not_spawn_twice() {
         .calls(&[("c1", "task", spawn_call("CHILD once", "一次"))]);
     world.script.reply("dispatched");
     world.script.reply("noted");
-    world.script.reply_for("CHILD once", "done");
+    world.script.reply_for("CHILD once", &finished("done"));
     *outputs.crash.lock().unwrap() = Some(world.storage.clone());
     let engine = world.open().await;
     let id = world.submit(&engine, "go").await;
@@ -1586,7 +1752,9 @@ async fn a_task_conversation_cannot_start_a_monitor() {
         "CHILD watch",
         &[("k1", "monitor", monitor_call("x", false, 5))],
     );
-    world.script.reply_for("CHILD watch", "never mind");
+    world
+        .script
+        .reply_for("CHILD watch", &finished("never mind"));
     let engine = world.open().await;
     let id = world.submit(&engine, "go").await;
     world.harness.wait(&engine, id).await.unwrap();
@@ -1595,7 +1763,7 @@ async fn a_task_conversation_cannot_start_a_monitor() {
         .until(|| async {
             outline(&world.messages_in(child).await)
                 .last()
-                .is_some_and(|l| l == "assistant: never mind")
+                .is_some_and(|l| *l == format!("assistant: {}", finished("never mind")))
         })
         .await;
     assert!(
@@ -1620,7 +1788,9 @@ async fn a_task_result_queued_for_a_busy_parent_survives_cancelling_the_parent()
         ("c2", "slow", json!({})),
     ]);
     world.script.reply("told the user");
-    world.script.reply_for("CHILD quick", "quick answer");
+    world
+        .script
+        .reply_for("CHILD quick", &finished("quick answer"));
     let engine = world.open().await;
     let id = world.submit(&engine, "go").await;
     world
@@ -1672,7 +1842,7 @@ async fn a_task_result_queued_for_a_parent_whose_model_fails_runs_right_after() 
     world.script.reply("told the user");
     world
         .script
-        .push_for("CHILD slow", gated(&child_gate, "late answer"));
+        .push_for("CHILD slow", gated(&child_gate, &finished("late answer")));
     let engine = world.open().await;
     let id = world.submit(&engine, "go").await;
     // 父的第二次请求卡在 `model_gate` 上（父忙），这时子收尾：交回的结果排进收件箱。
@@ -1785,7 +1955,7 @@ async fn a_dispatched_task_reports_back_once_on_a_turso_database() {
     world.script.reply("got it");
     world
         .script
-        .push_for("CHILD on disk", gated(&child_gate, "stored"));
+        .push_for("CHILD on disk", gated(&child_gate, &finished("stored")));
     let engine = world.open().await;
     let id = world.submit(&engine, "go").await;
     world.harness.wait(&engine, id).await.unwrap();
@@ -1811,7 +1981,11 @@ async fn a_dispatched_task_reports_back_once_on_a_turso_database() {
     assert_eq!(world.entries_of(TASK_RESULT_ENTRY).await.len(), 1);
     assert_eq!(
         outline(&world.messages_in(child).await),
-        ["system", "user: CHILD on disk", "assistant: stored"]
+        [
+            "system".to_owned(),
+            "user: CHILD on disk".to_owned(),
+            format!("assistant: {}", finished("stored")),
+        ]
     );
     engine.close().await.unwrap();
 }
@@ -1833,7 +2007,7 @@ async fn a_task_result_kept_through_a_cancel_runs_on_after_reopening_a_turso_dat
         .script
         .push(Step::Gate(stuck.clone(), Box::new(Step::Hang)));
     world.script.reply("told the user");
-    world.script.reply_for("CHILD on disk", "stored");
+    world.script.reply_for("CHILD on disk", &finished("stored"));
     let engine = world.open().await;
     let id = world.submit(&engine, "go").await;
     world
@@ -1892,8 +2066,12 @@ async fn a_fork_and_a_follow_up_work_on_a_turso_database() {
         ),
     ]);
     world.script.reply("dispatched");
-    world.script.push_for("CHILD forked", gated(&first, "one"));
-    world.script.push_for("MORE", gated(&second, "two"));
+    world
+        .script
+        .push_for("CHILD forked", gated(&first, &finished("one")));
+    world
+        .script
+        .push_for("MORE", gated(&second, &finished("two")));
     let engine = world.open().await;
     let id = world.submit(&engine, "go").await;
     world.harness.wait(&engine, id).await.unwrap();

@@ -17,6 +17,12 @@ use super::ids::{AttemptId, RunId, SessionId, ToolCallId};
 use super::model::Effort;
 use super::status::RunState;
 
+/// 任务最后一条回复的末行：做完了（`docs/background-tasks.md` §2c）。任务模式的提示（agent）
+/// 与 fork 的说明（runtime）教模型写它，交回（runtime）按它定标题，三处共用这两个写法。
+pub const TASK_STATUS_DONE: &str = "状态：完成";
+/// 同上：做不下去了，冒号后面写原因。
+pub const TASK_STATUS_BLOCKED: &str = "状态：受阻";
+
 /// 建一个任务要交代的事：自包含的正文 + 给人看的标题（§4.1）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskSpec {
@@ -223,7 +229,7 @@ impl TaskProgress {
 }
 
 /// 一段时间的人话：不到一分钟说秒，不到一小时说分秒，再长说时分。负数按 0。
-fn duration_words(span: time::Duration) -> String {
+pub fn duration_words(span: time::Duration) -> String {
     let secs = span.whole_seconds().max(0);
     if secs < 60 {
         format!("{secs} 秒")

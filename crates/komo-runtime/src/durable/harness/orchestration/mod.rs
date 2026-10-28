@@ -55,7 +55,9 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use komo_kernel::durable::task::{NextTaskState, RunningTask};
-use komo_kernel::durable::{ConversationId, DocumentAddress, DocumentScope, EntryId, Storage};
+use komo_kernel::durable::{
+    ConversationId, DocumentAddress, DocumentScope, EntryId, Storage, SubmissionId,
+};
 use komo_kernel::types::delegate::DelegateContract;
 use komo_kernel::types::model::Effort;
 use komo_kernel::types::plan::{ExecutionPlan, Operation};
@@ -88,7 +90,17 @@ pub const FORK_NOTICE: &str = "（以上是派你的那个会话到此刻为止�
 只做下面这件事。派你的会话同时还在跑，同一个工作目录里的文件可能正在变——不要接着做它没做完的事，\
 不要改它正在改的东西，也不要再派任务。中途没有人能回答你：几种做法代价不同时自己选更保守的那种接着做，\
 在最后的回复里写明；只在做完、或者真的做不下去（缺权限、缺信息又查不到、任务的前提不成立）时才停，\
-你最后的回复会作为那次 task 调用的结果交回给它。）";
+你最后的回复会作为那次 task 调用的结果交回给它。最后的回复末行写「状态：完成」；做不下去写\
+「状态：受阻：原因」（带结果契约时只给 JSON，不写这一行）。）";
+
+/// 任务的回答没写状态行时，在任务会话里自动续跑的那条输入的 entry kind（`docs/background-tasks.md`
+/// §2c）。不带 `komo.` 前缀、`model` 是 user 消息，gateway 认它是输入。
+pub const TASK_CONTINUE_ENTRY: &str = "task.continue";
+
+/// 自动续跑那条输入的正文。派它的会话只收到续跑之后的那条回复，所以要的是一份完整的最后回复。
+pub(crate) const TASK_CONTINUE_PROMPT: &str = "（这条是 komo 自动发的，不是派你的会话。）你上一条回复的末行\
+没有写「状态：完成」或「状态：受阻：原因」，所以还没交回。没做完就接着做；做完了、或者真的做不下去时，\
+重新写一份完整的最后回复——派你的会话只收到这一条，看不到上一条——末行写状态。";
 
 /// 派出这个 fork 的那次调用在 fork 里的结果。
 pub(crate) const FORK_CALL_RESULT: &str = "这次调用派出的就是你（fork）。派你的会话在继续它自己的事，你最后的回复会作为这次调用的结果交回给它。";
@@ -209,6 +221,10 @@ pub struct TaskDoc {
     pub contracts: BTreeMap<String, DelegateContract>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_run: Option<LastRun>,
+    /// 最近一次自动续跑放进去的输入（`docs/background-tasks.md` §2c）。以它开头的 run 没写
+    /// 状态行也照样交回：每条派出 / 追问的输入最多续跑一次。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continued: Option<SubmissionId>,
 }
 
 /// 提交里读 `komo.task`（document 读，不是表读：排在表写之后也行）。

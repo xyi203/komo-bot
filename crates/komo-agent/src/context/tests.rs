@@ -3,6 +3,8 @@
 
 use std::path::PathBuf;
 
+use komo_kernel::types::task::{TASK_STATUS_BLOCKED, TASK_STATUS_DONE};
+
 use super::*;
 
 fn input(instructions: Option<&str>, memory: Option<&str>) -> ContextInput {
@@ -70,6 +72,10 @@ fn a_task_session_ends_its_base_with_the_task_mode() {
     let keys: Vec<&str> = task.iter().map(|(key, _)| key.as_str()).collect();
     assert_eq!(keys, ["instructions", "base", "memory"]);
     assert!(task[1].1.ends_with(TASK_MODE_BLOCK), "{}", task[1].1);
+    // 交回按这两种末行定标题（runtime 的 report），写法以 kernel 的常量为准。
+    for status in [TASK_STATUS_DONE, TASK_STATUS_BLOCKED] {
+        assert!(TASK_MODE_BLOCK.contains(status), "{status}");
+    }
 
     let prompt = prompt_of(&input(None, None));
     assert!(!prompt.contains(TASK_MODE_BLOCK), "{prompt}");

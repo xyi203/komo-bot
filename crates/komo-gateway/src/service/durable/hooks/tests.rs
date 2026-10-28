@@ -138,6 +138,7 @@ impl World {
                         effort: None,
                         contracts: BTreeMap::new(),
                         last_run: None,
+                        continued: None,
                     });
                     store_task_doc(tx, record.id, &doc).await?;
                     Ok(record.id)

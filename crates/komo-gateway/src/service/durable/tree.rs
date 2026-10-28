@@ -376,7 +376,7 @@ pub(super) async fn realize(
 
 /// 提交开始前的校验：会话还开着、结构没被别处改过（`current_branch` 与 `leaf` 和操作开始时读到的
 /// 一致）、所有分支空闲。在提交闭包里用——线上串行，读到的就是提交那一刻的状态。
-async fn verify(
+pub(super) async fn verify(
     storage: &dyn Storage,
     id: &str,
     expect: &Expect,

@@ -689,7 +689,7 @@ Session 不是只能追加的对象。pi-durable 没有删除，komo 保留三�
 
 - `/tree` 在同一 Session 内导航：从根 conversation 出发，把各 fork 挂在各自的 `parent.at` 上拼出 pi 的树。选择 user / custom message 时，当前位置移到其父节点，原文回到输入框；选择其他条目时，从该条目之后继续。**提交编辑后的输入才形成新分支**（`fork(at = 那条输入的父 entry)`，编辑后的输入作为子 conversation 的第一条 submission），旧分支原样保留；子沿 `parent.at` 读父的 entry，不复制。
 - **导航持久化在 `sessions` 行的 `leaf`**（偏离 pi：pi 只在内存里，重载时取文件最后一条）；导航不追加 entry。`leaf` 为空 = 跟着当前分支的末端；"第一条之前"是一个哨兵。
-- `/fork` 从选中的历史输入提取路径，建立独立 Session；`/clone` 复制当前路径。两者都**复制** entry（`head` / `edits` / label / 分支摘要的引用按 ID 映射重写）与 blob（先复制并同步、再提交），**不复制** task、submission、live；新会话记录 `parent_session`，但后续读取不依赖原会话存在。
+- `/fork` 从选中的历史输入提取路径，建立独立 Session；`/clone` 复制当前路径。两者都**复制** entry（`head` / `edits` / label / 分支摘要的引用按 ID 映射重写）与 blob（先复制并同步、核对引用文件及大小，再在提交时复核源会话状态和树位置；源被删除或复制期间被改动时返回 409 并清理副本），**不复制** task、submission、live；新会话记录 `parent_session`，但后续读取不依赖原会话存在。
 - 导航可选择总结离开的分支：沿旧路径找共同祖先，摘要作为 `branch.summary` entry 接到目标位置。标签（`label`）、会话命名（`session.info`）、树的搜索与当前位置显示一并纳入。
 - 生成回复、压缩或分支总结期间不能同时导航：**任一分支忙（`komo.live.run` 在、收件箱非空、压缩进行中）就 409**（首版保留，D5 决定；Run 固定自己所在的 conversation，导航换的是"下一条输入去哪个分支"）。
 - 导航改变的是对话路径，已经发生的文件修改、外部请求和工具副作用不会回退。

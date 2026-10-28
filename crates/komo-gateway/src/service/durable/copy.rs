@@ -24,13 +24,16 @@ use std::path::{Path, PathBuf};
 
 use komo_kernel::durable::{ContextEdit, EntryId, EntryRecord, SessionKind, SessionRecord};
 use komo_kernel::types::ids::SessionId;
+use komo_kernel::types::refs::ContentRef;
 use komo_runtime::durable::{DraftHead, EntryDraft};
 use serde_json::{Value, json};
 
 use super::DurableCore;
 use super::agent_doc::{self, AgentDoc};
 use super::sessions::{NewSession, SessionError, create_in};
-use super::tree::{BRANCH_SUMMARY_ENTRY, LABEL_ENTRY, entry_id_text, input_text, parse_entry_id};
+use super::tree::{
+    BRANCH_SUMMARY_ENTRY, Expect, LABEL_ENTRY, entry_id_text, input_text, parse_entry_id, verify,
+};
 
 /// 整份复制的 blob 子目录。
 const BLOB_DIRS: [&str; 3] = ["tool-output", "artifacts", "payloads"];
@@ -100,13 +103,63 @@ async fn copy_dir(source: &Path, target: &Path) -> Result<(), SessionError> {
     Ok(())
 }
 
+/// 从结构化 entry 中收集 ContentRef，不把普通字符串当作引用。
+fn blob_refs(entries: &[EntryRecord]) -> Result<Vec<ContentRef>, SessionError> {
+    fn collect(value: &Value, refs: &mut Vec<ContentRef>) -> Result<(), SessionError> {
+        match value {
+            Value::Object(map) => {
+                if let Ok(reference) = serde_json::from_value::<ContentRef>(value.clone()) {
+                    let path = Path::new(&reference.path);
+                    if BLOB_DIRS.iter().any(|dir| path.starts_with(dir)) {
+                        if path
+                            .components()
+                            .any(|part| !matches!(part, std::path::Component::Normal(_)))
+                        {
+                            return Err(SessionError::Conflict("源会话的输出引用无效".into()));
+                        }
+                        refs.push(reference);
+                        return Ok(());
+                    }
+                }
+                for value in map.values() {
+                    collect(value, refs)?;
+                }
+            }
+            Value::Array(values) => {
+                for value in values {
+                    collect(value, refs)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+    let mut refs = Vec::new();
+    for entry in entries {
+        let value = serde_json::to_value(entry).map_err(|e| io_error("读取 entry 引用", e))?;
+        collect(&value, &mut refs)?;
+    }
+    Ok(refs)
+}
+
 /// 把源 Session 的 blob 复制成 `sessions/{target}/`：先放暂存目录，同步完再改名。
-async fn copy_blobs(sessions: &Path, source: &str, target: &str) -> Result<(), SessionError> {
+async fn copy_blobs(
+    sessions: &Path,
+    source: &str,
+    target: &str,
+    refs: &[ContentRef],
+) -> Result<(), SessionError> {
     let source_dir = sessions.join(source);
     if !BLOB_DIRS.iter().any(|dir| source_dir.join(dir).exists()) {
-        return Ok(());
+        return if refs.is_empty() {
+            Ok(())
+        } else {
+            Err(SessionError::Conflict("源会话的输出已被清理".into()))
+        };
     }
     let staging: PathBuf = sessions.join(format!(".{target}.fork"));
+    let destination = sessions.join(target);
+    let mut renamed = false;
     let prepared: Result<(), SessionError> = async {
         komo_store::session_dir::create_dir_all_synced(&staging)
             .await
@@ -114,12 +167,21 @@ async fn copy_blobs(sessions: &Path, source: &str, target: &str) -> Result<(), S
         for dir in BLOB_DIRS {
             copy_dir(&source_dir.join(dir), &staging.join(dir)).await?;
         }
+        for reference in refs {
+            let metadata = tokio::fs::metadata(staging.join(&reference.path))
+                .await
+                .map_err(|_| SessionError::Conflict("源会话的输出已被清理".into()))?;
+            if !metadata.is_file() || metadata.len() != reference.size {
+                return Err(SessionError::Conflict("源会话的输出缺失或大小不符".into()));
+            }
+        }
         komo_store::session_dir::sync_dir(&staging)
             .await
             .map_err(|e| io_error("同步暂存目录", e))?;
-        tokio::fs::rename(&staging, sessions.join(target))
+        tokio::fs::rename(&staging, &destination)
             .await
             .map_err(|e| io_error("改名暂存目录", e))?;
+        renamed = true;
         komo_store::session_dir::sync_dir(sessions)
             .await
             .map_err(|e| io_error("同步 sessions 目录", e))?;
@@ -128,6 +190,9 @@ async fn copy_blobs(sessions: &Path, source: &str, target: &str) -> Result<(), S
     .await;
     if prepared.is_err() {
         let _ = tokio::fs::remove_dir_all(&staging).await;
+        if renamed {
+            let _ = tokio::fs::remove_dir_all(&destination).await;
+        }
     }
     prepared
 }
@@ -176,6 +241,10 @@ fn redraft(entry: &EntryRecord, map: &HashMap<EntryId, EntryId>) -> EntryDraft {
     }
 }
 
+#[cfg(test)]
+pub(super) type CopyHook =
+    Box<dyn FnOnce() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send>;
+
 impl DurableCore {
     /// `/fork` 与 `/clone`：复制成一个新会话，返回新会话的行。源会话忙时 409。
     pub async fn fork_session(
@@ -183,7 +252,35 @@ impl DurableCore {
         source: &str,
         request: ForkRequest,
     ) -> Result<SessionRecord, SessionError> {
+        self.fork_session_inner(
+            source,
+            request,
+            #[cfg(test)]
+            None,
+        )
+        .await
+    }
+
+    #[cfg(test)]
+    pub(super) async fn fork_session_with_hook(
+        &self,
+        source: &str,
+        request: ForkRequest,
+        before_copy: bool,
+        hook: CopyHook,
+    ) -> Result<SessionRecord, SessionError> {
+        self.fork_session_inner(source, request, Some((before_copy, hook)))
+            .await
+    }
+
+    async fn fork_session_inner(
+        &self,
+        source: &str,
+        request: ForkRequest,
+        #[cfg(test)] mut hook: Option<(bool, CopyHook)>,
+    ) -> Result<SessionRecord, SessionError> {
         let tree = self.editable_tree(source).await?;
+        let expect = Expect::of(&tree);
         let target = match request.target {
             Some(target) => {
                 self.entry_in(&tree, target)?;
@@ -205,6 +302,7 @@ impl DurableCore {
             .map(|upto| tree.path(upto).into_iter().cloned().collect())
             .unwrap_or_default();
 
+        let refs = blob_refs(&entries)?;
         let doc = agent_doc::read(&*self.storage, tree.session.current_branch)
             .await?
             .unwrap_or_else(|| AgentDoc::new(tree.session.agent.clone().unwrap_or_default()));
@@ -220,14 +318,38 @@ impl DurableCore {
 
         let new_id = SessionId::new_at(self.clock.now()).to_string();
         let sessions = self.home.join("sessions");
-        copy_blobs(&sessions, source, &new_id).await?;
+        #[cfg(test)]
+        if hook.as_ref().is_some_and(|(before, _)| *before) {
+            if let Some((_, hook)) = hook.take() {
+                hook().await;
+            }
+        }
+        copy_blobs(&sessions, source, &new_id, &refs).await?;
+        #[cfg(test)]
+        if let Some((_, hook)) = hook.take() {
+            hook().await;
+        }
 
+        let storage = self.storage.clone();
+        let source = source.to_owned();
         let committed = self
             .engine
             .commit({
                 let new_id = new_id.clone();
                 move |tx| {
                     Box::pin(async move {
+                        if let Err(error) = verify(&*storage, &source, &expect).await {
+                            let error = match error {
+                                SessionError::NotOpen(_) | SessionError::NotFound(_) => {
+                                    SessionError::Conflict("源会话被删除".into())
+                                }
+                                SessionError::Conflict(_) | SessionError::Busy(_) => {
+                                    SessionError::Conflict("源会话在复制期间被改动".into())
+                                }
+                                other => other,
+                            };
+                            return Ok(Err(error));
+                        }
                         let record = create_in(tx, &spec, &new_id).await?;
                         let mut map: HashMap<EntryId, EntryId> = HashMap::new();
                         for entry in &entries {
@@ -235,17 +357,21 @@ impl DurableCore {
                             let copied = tx.append_entry(record.root_conversation, draft).await?;
                             map.insert(entry.id, copied.id);
                         }
-                        Ok(record)
+                        Ok(Ok(record))
                     })
                 }
             })
             .await;
         match committed {
-            Ok(record) => Ok(record),
-            Err(error) => {
+            Ok(Ok(record)) => Ok(record),
+            result => {
                 // 引用没落下，这份 blob 不属于任何会话：删掉（目录是新 UUID，只有我们碰过它）。
                 let _ = tokio::fs::remove_dir_all(sessions.join(&new_id)).await;
-                Err(error.into())
+                match result {
+                    Ok(Err(error)) => Err(error),
+                    Err(error) => Err(error.into()),
+                    Ok(Ok(_)) => unreachable!(),
+                }
             }
         }
     }

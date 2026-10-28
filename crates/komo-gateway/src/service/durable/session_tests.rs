@@ -853,6 +853,84 @@ async fn labels_names_and_context_edits_are_entries_that_leave_history_alone() {
 // ------------------------------------------------------------------ 复制
 
 #[tokio::test]
+async fn clone_rejects_purged_output_before_copy_without_residue() {
+    let fx = Fixture::new(FakeLlm::finisher("好")).await;
+    let (session, _) = fx.session_with(&[user("hello")]).await;
+    let tree = fx.tree(&session).await;
+    let conversation = tree.session.current_branch;
+    fx.core.engine.commit(move |tx| Box::pin(async move {
+        tx.append_entry(conversation, EntryDraft::new("tool.result").with_data(json!({"output": {"path": "tool-output/1/2/1/output.json", "size": 3, "hash": "abc"}}))).await?;
+        Ok(())
+    })).await.unwrap();
+    let source_dir = fx.dir.path().join("sessions").join(&session);
+    std::fs::create_dir_all(source_dir.join("tool-output/1/2/1")).unwrap();
+    std::fs::write(source_dir.join("tool-output/1/2/1/output.json"), "abc").unwrap();
+    let core = fx.core.clone();
+    let source = session.clone();
+    let error = fx
+        .core
+        .fork_session_with_hook(
+            &session,
+            ForkRequest {
+                clone: true,
+                target: None,
+            },
+            true,
+            Box::new(move || {
+                Box::pin(async move {
+                    core.delete_session(&source, true).await.unwrap();
+                    std::fs::remove_dir_all(source_dir).unwrap();
+                })
+            }),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, SessionError::Conflict(ref msg) if msg.contains("输出已被清理")),
+        "{error:?}"
+    );
+    let sessions = fx.dir.path().join("sessions");
+    assert_eq!(std::fs::read_dir(sessions).unwrap().count(), 0);
+}
+
+#[tokio::test]
+async fn clone_rejects_tree_change_after_copy_without_residue() {
+    let fx = Fixture::new(FakeLlm::finisher("好")).await;
+    let (session, ids) = fx.session_with(&[user("hello"), assistant("answer")]).await;
+    let source_dir = fx.dir.path().join("sessions").join(&session);
+    std::fs::create_dir_all(source_dir.join("artifacts")).unwrap();
+    std::fs::write(source_dir.join("artifacts/file"), "data").unwrap();
+    let core = fx.core.clone();
+    let source = session.clone();
+    let target = ids[0];
+    let error = fx
+        .core
+        .fork_session_with_hook(
+            &session,
+            ForkRequest {
+                clone: true,
+                target: None,
+            },
+            false,
+            Box::new(move || {
+                Box::pin(async move {
+                    core.navigate(&source, NavigateRequest::to(target))
+                        .await
+                        .unwrap();
+                })
+            }),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, SessionError::Conflict(ref msg) if msg.contains("复制期间被改动")),
+        "{error:?}"
+    );
+    let sessions = fx.dir.path().join("sessions");
+    assert_eq!(std::fs::read_dir(sessions).unwrap().count(), 1);
+}
+
+#[tokio::test]
 async fn clone_copies_entries_and_blobs_and_survives_source_purge() {
     let fx = Fixture::new(FakeLlm::finisher("好")).await;
     let (session, ids) = fx.session_with(&[user("task"), assistant("result")]).await;

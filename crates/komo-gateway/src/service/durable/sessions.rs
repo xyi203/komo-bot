@@ -137,6 +137,7 @@ pub struct NewSession {
     pub parent_session: Option<String>,
     /// 创建请求的幂等键。
     pub request_key: Option<String>,
+    pub request_hash: Option<String>,
     /// 根 conversation 上的 `komo.agent`：Agent、模型 / effort 覆盖、工作目录、`maxRounds`、来源。
     /// `sessions.agent` / `source` / `cwd` 取自它，免得两处漂移。
     pub doc: AgentDoc,
@@ -151,6 +152,7 @@ impl NewSession {
             title_provisional: false,
             parent_session: None,
             request_key: None,
+            request_hash: None,
             doc: AgentDoc::new(agent),
         }
     }
@@ -204,6 +206,7 @@ pub async fn create_in(
     record.title_provisional = spec.title_provisional;
     record.parent_session = spec.parent_session.clone();
     record.request_key = spec.request_key.clone();
+    record.request_hash = spec.request_hash.clone();
     record.agent = Some(spec.doc.agent.clone());
     record.source = spec.doc.source.clone();
     record.cwd = spec.doc.workdir.clone();
@@ -249,6 +252,40 @@ impl DurableCore {
             .engine
             .commit(move |tx| Box::pin(async move { create_in(tx, &spec, &id).await }))
             .await?)
+    }
+
+    /// 同一提交线内按请求键查找或创建，返回行和是否去重。
+    pub async fn create_session_idempotent(
+        &self,
+        mut spec: NewSession,
+        key: Option<String>,
+        body_hash: String,
+    ) -> Result<(SessionRecord, bool), SessionError> {
+        let Some(key) = key else {
+            return Ok((self.create_session(spec).await?, false));
+        };
+        let storage = self.storage.clone();
+        let id = spec.id.clone().unwrap_or_else(|| self.fresh_session_id());
+        spec.request_key = Some(key.clone());
+        spec.request_hash = Some(body_hash.clone());
+        let result = self
+            .engine
+            .commit(move |tx| {
+                Box::pin(async move {
+                    if let Some(record) = storage.session_by_request(&key).await? {
+                        return Ok(
+                            if record.request_hash.as_deref() == Some(body_hash.as_str()) {
+                                Ok((record, true))
+                            } else {
+                                Err(SessionError::RequestKeyConflict(key))
+                            },
+                        );
+                    }
+                    Ok(Ok((create_in(tx, &spec, &id).await?, false)))
+                })
+            })
+            .await?;
+        result
     }
 
     /// 一个会话的行；不在是 [`SessionError::NotFound`]。

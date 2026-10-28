@@ -102,7 +102,9 @@ pub const SESSIONS_TABLE_DDL: &str = "CREATE TABLE sessions (
     lifecycle TEXT NOT NULL,
     current_branch INTEGER,
     root_conversation INTEGER NOT NULL,
-    record TEXT NOT NULL CHECK (json_valid(record))
+    record TEXT NOT NULL CHECK (json_valid(record)),
+    request_key TEXT,
+    request_hash TEXT
 ) STRICT";
 
 /// 一列的补列材料：`ALTER TABLE ADD COLUMN` 的子句（类型 + 约束，须可空或带默认值）。
@@ -205,6 +207,8 @@ pub const TABLES: &[TableSpec] = &[
             col("current_branch", "INTEGER"),
             col("root_conversation", "INTEGER NOT NULL DEFAULT 0"),
             col("record", "TEXT NOT NULL DEFAULT '{}'"),
+            col("request_key", "TEXT"),
+            col("request_hash", "TEXT"),
         ],
     },
 ];
@@ -281,6 +285,10 @@ pub const INDEXES: &[(&str, &str)] = &[
         "CREATE INDEX documents_by_scope_kind ON documents (scope_kind, owner_id, kind, id)",
     ),
     (
+        "sessions_by_request_key",
+        "CREATE UNIQUE INDEX sessions_by_request_key ON sessions (request_key) WHERE request_key IS NOT NULL",
+    ),
+    (
         "sessions_by_lifecycle",
         "CREATE INDEX sessions_by_lifecycle ON sessions (lifecycle, id)",
     ),
@@ -349,7 +357,15 @@ async fn create_all(conn: &Connection) -> Result<(), LineError> {
             conn.execute(&ddl, ()).await?;
         }
         for (_, sql) in INDEXES {
-            let sql = sql.replacen("CREATE INDEX ", "CREATE INDEX IF NOT EXISTS ", 1);
+            let sql = if sql.starts_with("CREATE UNIQUE INDEX ") {
+                sql.replacen(
+                    "CREATE UNIQUE INDEX ",
+                    "CREATE UNIQUE INDEX IF NOT EXISTS ",
+                    1,
+                )
+            } else {
+                sql.replacen("CREATE INDEX ", "CREATE INDEX IF NOT EXISTS ", 1)
+            };
             conn.execute(&sql, ()).await?;
         }
         conn.execute(DURABLE_META_TABLE_DDL, ()).await?;
@@ -551,6 +567,20 @@ mod tests {
             assert!(indexes.iter().any(|i| i == name), "缺索引 {name}");
         }
         assert_eq!(indexes.len(), INDEXES.len(), "多出了未登记的索引");
+    }
+
+    #[tokio::test]
+    async fn session_request_key_index_is_unique_and_allows_null() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_db, conn) = fresh(dir.path()).await;
+        let sql = query_one_text(&conn, "SELECT sql FROM sqlite_schema WHERE type = 'index' AND name = 'sessions_by_request_key'").await.unwrap().unwrap();
+        assert_eq!(
+            sql,
+            "CREATE UNIQUE INDEX IF NOT EXISTS sessions_by_request_key ON sessions (request_key) WHERE request_key IS NOT NULL"
+        );
+        conn.execute("INSERT INTO sessions (id, lifecycle, root_conversation, record, request_key) VALUES ('a', 'active', 1, '{}', 'key')", ()).await.unwrap();
+        assert!(conn.execute("INSERT INTO sessions (id, lifecycle, root_conversation, record, request_key) VALUES ('b', 'active', 1, '{}', 'key')", ()).await.is_err());
+        conn.execute("INSERT INTO sessions (id, lifecycle, root_conversation, record) VALUES ('c', 'active', 1, '{}'), ('d', 'active', 1, '{}')", ()).await.unwrap();
     }
 
     #[tokio::test]

@@ -539,7 +539,7 @@ pub enum SessionKind {
 /// 对外的 komo Session：id 是 UUIDv7 字符串（不在数字命名空间里），整条替换。
 ///
 /// 一个 Session 是一组 conversation 加一个"当前分支"指针（§4.2）。D5 起带上 gateway 要的展示与
-/// 路由信息，全部只放在 `record` JSON 里（不改 DDL）；新字段都有默认值，旧记录照样读得出。
+/// 路由信息放在 `record` JSON 里；创建请求键与正文哈希也抽成列供索引查询。新字段有默认值，旧记录照样读得出。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionRecord {
@@ -577,6 +577,9 @@ pub struct SessionRecord {
     /// 创建请求的幂等键（同一键同一内容是同一个会话）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_key: Option<String>,
+    /// 创建请求正文的哈希，旧记录为空。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_hash: Option<String>,
 }
 
 impl SessionRecord {
@@ -598,6 +601,7 @@ impl SessionRecord {
             created_at: 0,
             changed_at: 0,
             request_key: None,
+            request_hash: None,
         }
     }
 }

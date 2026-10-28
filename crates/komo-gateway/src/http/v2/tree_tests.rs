@@ -27,6 +27,26 @@ async fn setup() -> (TestGateway, std::sync::Arc<FakeLlm>, SessionId) {
     (gw, llm, summary.session)
 }
 
+#[tokio::test]
+async fn create_session_rejects_the_same_key_with_different_content() {
+    let gw = TestGateway::with(&config_toml(""), FakeLlm::finisher("ok")).await;
+    let (status, body) = gw
+        .post(
+            "/v1/sessions",
+            json!({"request_key": "same", "title": "one"}),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let (status, body) = gw
+        .post(
+            "/v1/sessions",
+            json!({"request_key": "same", "title": "two"}),
+        )
+        .await;
+    assert_eq!(status, 409, "{body}");
+    assert!(body.contains("request_key_conflict"), "{body}");
+}
+
 /// 在当前分支末端追加一条消息，返回它的 entry ID（pi 的 entry id）。
 async fn seed(gw: &TestGateway, session: &SessionId, role: &str, text: &str) -> String {
     let core = gw.state().core().unwrap();

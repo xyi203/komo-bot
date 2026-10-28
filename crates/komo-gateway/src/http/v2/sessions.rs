@@ -72,18 +72,12 @@ async fn list(
 }
 
 /// `POST /v1/sessions`：建会话（sessions 行 + 根 conversation + `komo.agent`，一次提交），落在默认
-/// Agent 名下。请求键幂等沿用进程内的那份。
+/// Agent 名下。请求键和正文哈希随会话持久化。
 async fn create(
     State(api): State<Api>,
     Json(request): Json<CreateSessionRequest>,
 ) -> ApiResult<Json<SessionSummary>> {
     let hash = body_hash(&request);
-    if let Some(previous) = api
-        .idempotency
-        .lookup::<SessionSummary>(request.request_key.as_ref(), &hash)?
-    {
-        return Ok(Json(previous));
-    }
     let core = api.state.core()?;
     let mut spec = NewSession::new(api.state.snapshot().agent.default_agent.clone());
     if let Some(title) = &request.title {
@@ -92,14 +86,14 @@ async fn create(
     if let Some(workdir) = &request.workdir {
         spec = spec.workdir(workdir);
     }
-    if let Some(key) = &request.request_key {
-        spec = spec.request_key(key.as_str());
-    }
-    let record = core.create_session(spec).await?;
-    let summary = core.session_summary(&record).await?;
-    api.idempotency
-        .remember(request.request_key.as_ref(), &hash, &summary);
-    Ok(Json(summary))
+    let key = request
+        .request_key
+        .as_ref()
+        .map(|key| key.as_str().to_owned());
+    let (record, _) = core
+        .create_session_idempotent(spec, key, hash.to_string())
+        .await?;
+    Ok(Json(core.session_summary(&record).await?))
 }
 
 /// `GET /v1/home-session`：默认 Agent 的主会话（没有就建）。

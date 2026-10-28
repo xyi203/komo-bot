@@ -900,6 +900,19 @@ impl Storage for TursoStorage {
         }
     }
 
+    async fn session_by_request(&self, key: &str) -> StorageResult<Option<SessionRecord>> {
+        match self
+            .one(
+                "SELECT record FROM sessions WHERE request_key = ?1",
+                vec![text(key)],
+            )
+            .await?
+        {
+            Some(row) => Ok(Some(decode(&row[0])?)),
+            None => Ok(None),
+        }
+    }
+
     async fn scan_sessions(
         &self,
         query: &SessionQuery,

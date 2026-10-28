@@ -453,6 +453,26 @@ pub trait Storage: Send + Sync {
     ) -> StorageResult<Page<DocumentRecord>>;
 
     async fn session(&self, id: &str) -> StorageResult<Option<SessionRecord>>;
+    /// 按创建请求键查已提交的会话。
+    async fn session_by_request(&self, key: &str) -> StorageResult<Option<SessionRecord>> {
+        let query = SessionQuery {
+            lifecycle: None,
+            order: Some(ScanOrder::Ascending),
+        };
+        let mut cursor = None;
+        loop {
+            let page = self.scan_sessions(&query, 256, cursor.as_ref()).await?;
+            if let Some(record) = page.items.into_iter().find(|record| {
+                record.request_key.as_deref() == Some(key) && record.request_hash.is_some()
+            }) {
+                return Ok(Some(record));
+            }
+            match page.next {
+                Some(next) => cursor = Some(next),
+                None => return Ok(None),
+            }
+        }
+    }
     /// 按 id（UUIDv7，即创建序）分页，可按生命周期过滤。
     async fn scan_sessions(
         &self,

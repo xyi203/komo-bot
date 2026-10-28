@@ -211,6 +211,59 @@ impl Fixture {
     }
 }
 
+#[tokio::test]
+async fn session_request_key_survives_concurrency_and_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let llm = FakeLlm::finisher("ok");
+    let (core, _) = open_at(dir.path(), llm.clone()).await;
+    let mut tasks = tokio::task::JoinSet::new();
+    for _ in 0..20 {
+        let core = core.clone();
+        tasks.spawn(async move {
+            core.create_session_idempotent(
+                NewSession::new("assistant"),
+                Some("key".into()),
+                "hash".into(),
+            )
+            .await
+            .unwrap()
+        });
+    }
+    let mut ids = Vec::new();
+    let mut created = 0;
+    while let Some(result) = tasks.join_next().await {
+        let (record, deduplicated) = result.unwrap();
+        ids.push(record.id);
+        created += usize::from(!deduplicated);
+    }
+    assert_eq!(created, 1);
+    assert!(ids.iter().all(|id| id == &ids[0]));
+    assert_eq!(core.list_sessions(true).await.unwrap().len(), 1);
+    core.storage.close().await.unwrap();
+    drop(core);
+    let (reopened, _) = open_at(dir.path(), llm).await;
+    let (record, deduplicated) = reopened
+        .create_session_idempotent(
+            NewSession::new("assistant"),
+            Some("key".into()),
+            "hash".into(),
+        )
+        .await
+        .unwrap();
+    assert!(deduplicated);
+    assert_eq!(record.id, ids[0]);
+    assert!(matches!(
+        reopened
+            .create_session_idempotent(
+                NewSession::new("assistant"),
+                Some("key".into()),
+                "other".into()
+            )
+            .await,
+        Err(SessionError::RequestKeyConflict(_))
+    ));
+}
+
 fn user(text: &str) -> (&'static str, Message) {
     ("komo.user", Message::user(text, 1))
 }

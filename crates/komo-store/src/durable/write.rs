@@ -524,12 +524,22 @@ impl Write {
                 root_conversation,
                 record,
             } => {
+                // 旧记录的 JSON 可能有键但没有哈希，不能把它们纳入新的唯一索引。
+                // 显式检查重复键，使约束冲突成为可恢复的 Rejected，而不是终止提交线。
+                let duplicate = rows(
+                    conn,
+                    "SELECT id FROM sessions WHERE request_key = json_extract(?1, '$.requestKey') AND json_extract(?1, '$.requestHash') IS NOT NULL AND id != ?2",
+                    vec![text(record), text(id)],
+                ).await?;
+                if !duplicate.is_empty() {
+                    return Err(rejected("会话创建请求键已被使用"));
+                }
                 exec(
                     conn,
                     what,
-                    "INSERT INTO sessions (id, lifecycle, current_branch, root_conversation, record) VALUES (?1, ?2, ?3, ?4, ?5) \
+                    "INSERT INTO sessions (id, lifecycle, current_branch, root_conversation, record, request_key, request_hash) VALUES (?1, ?2, ?3, ?4, ?5, CASE WHEN json_extract(?5, '$.requestHash') IS NOT NULL THEN json_extract(?5, '$.requestKey') END, json_extract(?5, '$.requestHash')) \
                      ON CONFLICT(id) DO UPDATE SET lifecycle = excluded.lifecycle, current_branch = excluded.current_branch, \
-                     root_conversation = excluded.root_conversation, record = excluded.record",
+                     root_conversation = excluded.root_conversation, record = excluded.record, request_key = excluded.request_key, request_hash = excluded.request_hash",
                     vec![
                         text(id),
                         text(lifecycle),

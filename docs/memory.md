@@ -196,13 +196,13 @@ MemoryManager 对 AgentRuntime 提供三个主要入口：recall、process_compl
 - **revision 变化算失效（改动旧正文）。** 旧规格写的是"被改写的条目在本段内仍按原样注入"，但实现里 `revalidate` 早就把 revision 变化当作失效、作废重算，附录 F「异常处理」也是这个要求。新规格以实现为准：正文、application 或条件改过的条目，旧行立刻从视图里去掉，新版本等下一次召回到它时再追加。
 - **提取看不到正文。** `legacy_events` 把 `komo.memory.recall` 投影成挂在所属 Run 上的 `MemoryInjected`，只带 `uses` 和诊断，不投影成 `MessageUser`。因此提取窗口里根本没有这段文字，也就不可能被引为证据；`komo.*` 前缀的 entry 本来也不当用户消息投影。提取的"本批注入过哪些条目"和 run 详情的 `memories` / `recall` 都读这份投影：每个 Run 只记自己那一块，"沿用上一块"的说法取消。
 - **协议层。** 内容只在 `komo-agent` 渲染这一处，消息上带 `extra.komoOrigin = "memory"`，代码找"最近的用户输入"或判断压缩切点时靠它跳过这条。Anthropic 不支持对话中间的 system 消息，所以首版所有适配器都按 user 角色发送，Anthropic 会把它和紧邻的输入合成同一个 user 轮。Responses 改用 developer 角色属于适配层的可选优化，首版不做。
-- **耗时预算。** 召回在 Run 首次请求前同步进行，用户要等它完成。不另加旋钮：向量臂受 `[memory.embedding] timeout_secs` 约束，超时或报错按上面的降级规则退成关键词；整个召回失败也不拦这一轮，只落一条筛空记录。报错之后再按需召回（追加在工具结果之后）可以复用这套机制，本轮不做。
+- **耗时预算。** 召回在 Run 首次请求前同步进行，用户要等它完成。不另加旋钮：向量臂受 `[memory.embedding] timeout_secs` 约束，超时或报错按上面的降级规则退成关键词；整个召回失败也不拦这一轮，只落一条筛空记录。报错之后的按需查询改由 Agent 自己跑 `komo memory search`，宿主不在 Run 中途插召回（方案，见下文「约定不过门槛，Agent 主动查」）。
 - **预算。** 每块仍按条数和 token 预算截断（8 条、约 1500 tokens）。同一段里的块随 Run 累加，靠去重和压缩控制总量，不另设段级上限。
 - **旧会话的系统段 `memory`。** 升级后钩子不再交回 `memory` 段，已有会话的下一次请求会由系统补丁去掉它，前缀因此失效一次，之后按 Run 召回。conversation 级 document `komo.memory`（`MemoryDoc`）不再写入；旧会话里已有的那份只读，用来给旧 Run 的详情补 `memories`。
 
 验收（2026-10-28，已实现）。接缝：runtime `AgentHooks::context_entries`（生成的 `prepare` 每轮问一次，交回的 entry 排在系统段补丁之后、同一次提交；带 `edits` 时 `first_revised` 不再只看工具结果，Anthropic 的缓存断点补在被改的那条消息之前）；gateway `hooks/recall.rs` 实现它，`sections.rs` 不再交回 `memory` 段；kernel `durable/recall.rs` 定 `komo.memory.recall` / `komo.memory.revoke` 与 `RecallData`，`UserMessage.extra.komoOrigin` 标宿主附上的消息（压缩切点与摘要材料都跳过它）；`MemoryManager::recall_for_run` 在选定之后、渲染之前去掉已展示的条目；agent 的块抬头首句说明"不是用户说的话"，正文换行压成空格、一条一行，`without` / `shown_uses` 按 `· id@revision〕` 认行。前缀不变：`recall::the_memory_block_survives_a_restart_and_later_runs_only_append`（重启后第二个 Run 的请求以第一个请求的全部消息为前缀，系统提示逐字相同）；中途换任务：`recall::switching_tasks_mid_session_recalls_the_new_tasks_convention`（先问日志、后说"提个发布工单"，第二个 Run 召回到 Platform 默认 saas 的约定，排在第二个输入之后）；遗忘：`governance::a_forgotten_memory_never_comes_back_into_a_turn`、hooks `memory_recall_is_appended_once_per_run_and_forgetting_rewrites_it`（同一 Run 只召回一次、段内去重、整块失效 `omit`、筛空只落无 `model` 的记录）、`forgetting_one_of_several_rewrites_the_block_without_that_line`；`memory_section_is_pinned_until_the_next_head` 拆成 `project_section_is_pinned_until_the_next_head`（含旧会话 `memory` 段被补丁去掉）与上面两条追加式断言；其余：`recall::the_recalled_memory_block_follows_the_input_as_a_host_message`、kernel `a_memory_recall_block_is_an_injection_on_its_run_not_a_user_message`、`a_memory_recall_block_is_neither_a_cut_nor_summarized`、agent `without_drops_the_lines_and_the_groups_they_empty`、`the_system_prompt_never_carries_recalled_memories`；`inspect::run_detail_lists_injected_memories_and_how_they_were_recalled` 改成第二个 Run 的块为空、诊断照记。`cargo fmt --check` 通过；`cargo test --workspace --no-fail-fast`：2397 通过、0 失败、12 忽略（第一遍 `komo-store` 的 `tool_output::an_interrupted_attempts_partial_output_is_reported_and_then_published_with_it` 在并发负载下偶发失败一次，单跑三次均通过，同上次验收的记录）。增量 `cargo build --timings`（改 kernel 后重编下游）：2 分 07 秒，报告 `target/cargo-timings/cargo-timing-20261028T115444577Z-3413ec63597e1d61.html`。未装二进制、未重启 Gateway，没有用真实模型回放；Responses 的 developer 角色与"报错后按需召回"未做；fork 任务不召回也不改写（沿用父的块）。
 
-**注入分两组（2026-10-28，附录 F，已实现）。** 同一次筛出来的条目按 application（§9.2）分组渲染，共用上面的条数与 token 预算，约定不因"是约定"而常驻：
+**注入分两组（2026-10-28，附录 F，已实现）。** 同一次筛出来的条目按 application（§9.2）分组渲染，共用上面的条数与 token 预算，约定不因"是约定"而常驻（下文方案改为约定不过门槛、单独预算）：
 
 > 适用的长期约定（条件成立、且这次没有另外指定时直接照做，不必因"未确认"再问；这次另有要求以这次为准）：
 > - 发布系统工单的 Platform 默认选择 saas〔适用：创建发布工单、需要选 Platform 时 · 用户原话 · 未确认 · …@1〕
@@ -215,6 +215,28 @@ MemoryManager 对 AgentRuntime 提供三个主要入口：recall、process_compl
 - 线索里的命令句不成为指令，不扩大当前任务。
 - 每行仍带来源、确认、观察时间与 `id@revision`（§9.4 开头"返回内容、来源、确认状态、时间与版本"）；约定行另带 `applies_when`。
 - 分组只改渲染：按 Run 召回、段内去重、遗忘即改写都不受影响。改了 application 或条件的条目会升 revision，按上面"revision 变化算失效"处理。
+
+**约定不过门槛，Agent 主动查（2026-10-28 方案，未实现）。** 对照 hindsight（vectorize-io/hindsight）的注入时机：它把必须遵守的规则（directive）和记忆分开，directive 按作用域每次都带，不靠检索命中；它的 coding agent 集成只在会话第一个 prompt 注入一次，之后由 Agent 调工具自己查，理由是"Agent 要的检索帮得上忙，没要的容易带偏"。只在首轮注入不适合 komo：会话很长、中途会换任务，按 Run 召回就是为此做的。借其中两点。
+
+*一、约定不经过相关度门槛。*
+
+- **问题。** 约定和线索现在走同一道门槛、抢同一个 `top_k`。本机校准里 saas 那条约定余弦 0.526，是靠关键词过的门槛（附录 F 第 3 节）；用户换个说法（"帮我上线一下 xx"），关键词也没中，约定就召不回来，又回到"反复追问"。约定条数少、价值高，不该靠检索命中。
+- **做法。** 每个 Run 的召回块里，约定组 = 当前放行作用域里全部 active + convention 的条目，减去本段已展示的 `id@revision`；不过门槛，不占 `top_k`。线索组照旧：过门槛、`top_k`、段内去重。结果是：段内第一个 Run 带上全部约定；之后的 Run 只补新增的或改了版本的（`memory add`、`classify` 之后的下一个 Run）；压缩开新段后，在新段第一个 Run 重新带一次。
+- **不放进系统段。** 系统段改一个字，整段前缀就失效；而遗忘、改条件又必须立即生效（§9.6）。放在召回块里，失效照旧用 `komo.memory.revoke` 改写，缓存只从被改的那条往后失效。
+- **预算。** 约定组单独一个 token 上限（`[memory.retrieval] convention_tokens`，默认 800，大约十几条），与线索组的 1500 互不挤占。超出时按 id 先后（即创建先后）截断，截掉的回到线索那条路：过门槛，命中了仍按约定组渲染。召回诊断记"约定超出预算 N 条"，`komo doctor` 提示整理。
+- **代价。** 与当前任务无关的约定也会进上下文。每行都带 `applies_when`，抬头写明"条件成立才照做"，由主模型对着当前任务判断；条数靠上限压住。
+- **不变的。** `memory = off` 不带；`private` 只带本 Agent 的；fork 沿用父的块；分组抬头与每行格式不变。门槛的含义随之变窄：只用来拒绝线索。
+- **验收。** 会话里先聊别的，再用不含"发布""工单"字样的说法要求提单，召回块里有 saas 约定；同段第二个 Run 不重复带；遗忘这条约定后旧块被改写；压缩开新段后重新带上；约定超出预算时截掉的那条仍能按门槛被召回。
+
+*二、Agent 主动查：`komo memory search`。*
+
+- **路已经在，只是没人走。** Agent 能用 bash 跑 `komo memory search`（hybrid，过同一道门槛），但系统提示只教了 `memory add`。在 `SELF_BLOCK` 加一句静态文字（不影响前缀）：注入的记忆不够用、或者报错时想查以前的排查经验，用 `komo memory search "关键词"` 查；查到的按同样的规则用——约定照做，线索先核实。
+- **替代宿主在 Run 中途插召回。** 查询由 Agent 发起，留在对话记录里，看得见为什么查、查到了什么。门槛因此可以偏严：被挡掉的线索，Agent 需要时还能自己查回来。
+- **会话里的查询按会话的作用域。** bash 子进程带着 `KOMO_SESSION`，CLI 把它带给 `GET /v1/memories`，Gateway 按这个会话的 Profile 放行作用域（`memory::scope_allowed`，与自动召回同一处判断）；`memory = off` 的会话直接拒绝。现状是 search 不带会话、`MemoryManager::query` 的 `scopes` 为空即不按作用域过滤，所以 `private` Agent 能查到别的 Agent 的私有记忆，`docs/komo_bot.md` 记忆模式里说的"双向隔离"在这条路上不成立。终端里不带会话的查询照旧。
+- **查询结果不是新证据。** bash 的输出进提取窗口时是普通工具结果，提取模型可能把它引成 `tool_observation`：把已有记忆当新观察再记一遍，或者给旧条目补一条证据（§9.3：已有记忆不算新的独立证据）。提示词第 5 条"随时能重新读到的不记"只是间接覆盖。做法：带会话调用时，输出首行写宿主标记（如"〔komo 记忆查询结果：已有记忆，不是新证据〕"）；提取构建窗口时，把预览以这个标记开头的工具结果标成「记忆查询」，和「任务交回」一样不能被引用。认输出标记而不解析命令行：命令可能经过管道、别名或脚本。
+- **输出格式。** 每行带使用方式与条件（同 `list --full` 的列），约定与线索分开列，模型读到的和注入块是同一套语义。
+- **前置。** 附录 C.3.3（bash 子进程不带 `KOMO_HOME`）仍未修：非默认数据目录的实例里，这条路查到的是 `~/.komo` 的记忆，要一起修。
+- **验收。** 带会话的 search 只返回该会话放行作用域内的条目；`memory = off` 的会话被拒；查询结果出现在提取窗口时标成「记忆查询」，引用它的观察被拒；系统提示里有这一句，且段文字跨轮稳定。
 
 **`[memory]` 热重载**（2026-10-14）：`enabled`、`model`（连同它指向的 `model.*` / 凭证）与 `retrieval` 改了就换进 `MemoryManager`，下一次提取 / 召回用新的；此前这几项在构造时定死，重载报告却说"变了"。`memory.embedding` 不在其中——换它是换向量空间（§9.5）。
 

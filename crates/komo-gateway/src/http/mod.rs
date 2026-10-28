@@ -69,6 +69,7 @@ fn shared_routes() -> Router<Api> {
         .route("/v1/memories", get(memories::list).post(memories::add))
         .route("/v1/memories/{id}", get(memories::show))
         .route("/v1/memories/{id}/confirm", post(memories::confirm))
+        .route("/v1/memories/{id}/classify", post(memories::classify))
         .route("/v1/memories/{id}/forget", post(memories::forget))
         .route("/v1/memories/{id}/restore", post(memories::restore))
         .route("/v1/memory-sweep", post(memories::sweep))

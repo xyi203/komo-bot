@@ -22,6 +22,7 @@ use super::{TursoMemoryRepo, enum_str, load_item, scope_kind};
 pub struct IndexCandidate {
     pub memory: MemoryId,
     pub revision: u32,
+    /// 要拿去算向量的**索引输入**（§9.5），不是裸正文。
     pub content: String,
     /// 入库前要核对的正文哈希——模型调用在事务外，回来时正文可能已经变了（§9.5）。
     pub content_hash: String,
@@ -89,31 +90,58 @@ impl TursoMemoryRepo {
             .map_err(RepoError::from)
     }
 
-    /// 同一作用域里正文**逐字相同**的那一条（如果有）。
+    /// 同一作用域里正文**逐字相同**的那一条（如果有），不论条件。
     ///
     /// 「重复来源幂等合并」（§9.6）落到实现上的第一道闸：同一段话被提取第二次时，它先
-    /// 撞上这里，于是走的是"补一条证据"而不是"新增一条记忆"。
+    /// 撞上这里，于是走的是"补一条证据"而不是"新增一条记忆"。按 `content` 列比而不是
+    /// `content_hash`：哈希是索引输入的，带条件的条目与它的正文哈希对不上（§9.5）。
     pub async fn find_by_content(
         &self,
         scope: &MemoryScope,
         content: &str,
     ) -> Result<Option<MemoryItem>, RepoError> {
-        let hash = komo_kernel::types::digest::ContentHash::of_str(content)
-            .as_str()
-            .to_string();
+        self.find_matching(scope, content, None).await
+    }
+
+    /// 正文**和条件**都逐字相同的那一条：正文相同、条件不同的是两条（§9.6）。
+    pub async fn find_by_content_and_condition(
+        &self,
+        scope: &MemoryScope,
+        content: &str,
+        applies_when: Option<&str>,
+    ) -> Result<Option<MemoryItem>, RepoError> {
+        let when = applies_when.map(str::trim).filter(|w| !w.is_empty());
+        self.find_matching(scope, content, Some(when.map(str::to_string)))
+            .await
+    }
+
+    async fn find_matching(
+        &self,
+        scope: &MemoryScope,
+        content: &str,
+        when: Option<Option<String>>,
+    ) -> Result<Option<MemoryItem>, RepoError> {
+        let content = content.to_string();
         let scope = scope.clone();
         self.db()
             .read(move |ex| {
-                let (hash, scope) = (hash.clone(), scope.clone());
+                let (content, scope, when) = (content.clone(), scope.clone(), when.clone());
                 Box::pin(async move {
-                    let rows = MemoryItemRow::filter(
-                        MemoryItemRow::fields().content_hash().eq(hash.as_str()),
+                    let mut rows = MemoryItemRow::filter(
+                        MemoryItemRow::fields().content().eq(content.as_str()),
                     )
                     .exec(ex)
                     .await
                     .map_err(map_toasty)?;
+                    rows.sort_by(|a, b| a.id.cmp(&b.id));
                     for row in &rows {
                         if row.scope_kind != scope_kind(&scope) {
+                            continue;
+                        }
+                        if let Some(want) = &when
+                            && row.applies_when.as_deref().filter(|w| !w.trim().is_empty())
+                                != want.as_deref()
+                        {
                             continue;
                         }
                         let stored: MemoryScope = decode(&row.scope, "memory_items.scope")?;
@@ -214,7 +242,10 @@ impl TursoMemoryRepo {
                         out.push(IndexCandidate {
                             memory: MemoryId::from_raw(row.id.clone()),
                             revision: row.revision.max(0) as u32,
-                            content: row.content.clone(),
+                            content: komo_kernel::types::memory::index_text(
+                                &row.content,
+                                row.applies_when.as_deref(),
+                            ),
                             content_hash: row.content_hash.clone(),
                         });
                         if out.len() >= limit {

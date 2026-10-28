@@ -22,8 +22,8 @@
 
 use komo_kernel::types::ids::MemoryId;
 use komo_kernel::types::memory::{
-    Confirmation, MemoryItem, MemoryScope, MemoryState, MemoryUsage, Provenance, RetrievalMode,
-    SupersededRef,
+    Confirmation, MemoryApplication, MemoryItem, MemoryScope, MemoryState, MemoryUsage, Provenance,
+    RetrievalMode, SupersededRef,
 };
 use serde::Deserialize;
 use time::OffsetDateTime;
@@ -82,11 +82,25 @@ impl Plan {
     /// 把模型说的关系换成能做的动作，并在这里挡住两条越权（§9.6）。
     fn authorize(relation: Relation, new: &Observation, existing: &MemoryItem) -> Plan {
         match relation {
+            // 正文相同、条件（或使用方式）不同的是两条，不判 same（§9.6）：并进去会把"这个
+            // 任务"的条件抹掉，或者把线索与约定混成一条。没分类的旧条目按 reference 比。
+            Relation::Same if !same_usage(new, existing) => Plan::Insert,
             Relation::Same => Plan::MergeInto(existing.id.clone()),
             // 支持一条别的主张：新主张仍然是它自己的一条记忆，旧的那条不动。
             Relation::Supports | Relation::Unrelated => Plan::Insert,
             Relation::Contradicts => Plan::Contest(existing.id.clone()),
             Relation::Supersedes => {
+                // **只有 convention 能取代 convention**（§9.6）：线索或推断想停掉用户的
+                // 长期约定，降成冲突，让人来定。
+                if existing.application == Some(MemoryApplication::Convention)
+                    && new.application != Some(MemoryApplication::Convention)
+                {
+                    tracing::info!(
+                        memory = %existing.id,
+                        "一条线索想取代长期约定：降级成冲突，等人裁"
+                    );
+                    return Plan::Contest(existing.id.clone());
+                }
                 // **新推断不能覆盖用户陈述**（§9.6）。
                 if new.provenance == Provenance::ModelInference
                     && existing.provenance == Provenance::UserStatement
@@ -109,6 +123,18 @@ impl Plan {
             }
         }
     }
+}
+
+/// 使用方式与条件逐字相同（没分类按 reference，空条件与没有条件一样）。
+fn same_usage(new: &Observation, existing: &MemoryItem) -> bool {
+    let application = |a: Option<MemoryApplication>| a.unwrap_or(MemoryApplication::Reference);
+    let when = |w: Option<&str>| {
+        w.map(str::trim)
+            .filter(|w| !w.is_empty())
+            .map(str::to_string)
+    };
+    application(new.application) == application(existing.application)
+        && when(new.applies_when.as_deref()) == when(existing.applies_when.as_deref())
 }
 
 /// 把一批观察落进库里。
@@ -172,7 +198,11 @@ impl<'a> Consolidator<'a> {
         if let Some(existing) = self
             .manager
             .catalog
-            .find_by_content(&observation.scope, &observation.content)
+            .find_by_content_and_condition(
+                &observation.scope,
+                &observation.content,
+                observation.applies_when.as_deref(),
+            )
             .await?
         {
             return self.merge(&existing, observation, now).await;
@@ -181,6 +211,8 @@ impl<'a> Consolidator<'a> {
         // 第一道半：这段对话里手动记过的那句话，换个说法又提了一遍（§9.3「手动记一条」）。
         if let Some(id) = self.recorded_as(observation)
             && let Some(existing) = self.manager.repo.get(id).await?
+            // 使用方式或条件不同的不并（§9.6）：手动记的线索不能吞掉一条约定，反过来也一样。
+            && same_usage(observation, &existing)
             && matches!(
                 existing.state,
                 MemoryState::Active | MemoryState::Candidate | MemoryState::Contested
@@ -270,6 +302,9 @@ impl<'a> Consolidator<'a> {
         query.top_k = RECALL_LIMIT;
         query.include_states = states.clone();
         query.scopes = scopes.to_vec();
+        // 找近邻是为了去重与整理，不是挑"相关到值得注入"的——门槛只管注入召回。
+        query.min_similarity = 0.0;
+        query.min_keyword_score = 0.0;
         match self.manager.search(query).await {
             Ok(result) => result.items,
             Err(MemoryError::VectorUnconfigured) | Err(MemoryError::VectorUnavailable(_)) => {
@@ -278,6 +313,8 @@ impl<'a> Consolidator<'a> {
                 fallback.top_k = RECALL_LIMIT;
                 fallback.include_states = states;
                 fallback.scopes = scopes.to_vec();
+                fallback.min_similarity = 0.0;
+                fallback.min_keyword_score = 0.0;
                 self.manager
                     .search(fallback)
                     .await
@@ -385,6 +422,8 @@ impl<'a> Consolidator<'a> {
             usage: MemoryUsage::default(),
             supersedes,
             superseded_by: None,
+            application: observation.application,
+            applies_when: observation.applies_when.clone(),
         };
         Ok(self.manager.repo.put(item, None).await?)
     }

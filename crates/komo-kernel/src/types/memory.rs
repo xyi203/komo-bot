@@ -21,6 +21,46 @@ pub enum MemoryKind {
     Experience,
 }
 
+/// 这条记忆该怎么影响行为（§9.2「约定与线索」）。kind 说内容是什么、provenance 说从哪来、
+/// confirmation 说有没有复核过——三者都不回答这一问，所以单独一格。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryApplication {
+    /// 长期约定：`applies_when` 成立且当次没有另外指定时直接照做。
+    Convention,
+    /// 线索：查找与判断用，不是指令。
+    Reference,
+}
+
+impl MemoryApplication {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MemoryApplication::Convention => "convention",
+            MemoryApplication::Reference => "reference",
+        }
+    }
+}
+
+impl fmt::Display for MemoryApplication {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for MemoryApplication {
+    type Err = String;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        match raw.trim() {
+            "convention" => Ok(MemoryApplication::Convention),
+            "reference" => Ok(MemoryApplication::Reference),
+            other => Err(format!(
+                "application 要写成 convention / reference，收到：{other}"
+            )),
+        }
+    }
+}
+
 /// 作用域，绑定当前操作者、稳定项目 ID 或实例 ID。工作路径相似**不**自动意味着同一
 /// 项目（§9.2）。
 ///
@@ -249,12 +289,38 @@ pub struct MemoryItem {
     /// 被哪一条取代了（§9.8）。`None` = 没被取代。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub superseded_by: Option<SupersededRef>,
+    /// 使用方式（§9.2）。`None` = 加列之前的旧条目尚未分类，按 reference 使用，读取时不
+    /// 静默改写。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub application: Option<MemoryApplication>,
+    /// 条件：convention 必填，写成一句能独立理解的话。不是作用域也不是权限。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub applies_when: Option<String>,
 }
 
 impl MemoryItem {
+    /// 关键词与向量共用的索引输入（§9.5）：条件为空时就是 content，不空时是
+    /// content + 换行 + applies_when。application 不进——它决定怎么用，不决定和什么相关。
+    pub fn index_text(&self) -> String {
+        index_text(&self.content, self.applies_when.as_deref())
+    }
+
+    /// 是不是"适用的长期约定"：application 为 convention。生命周期（active）另由调用方判。
+    pub fn is_convention(&self) -> bool {
+        self.application == Some(MemoryApplication::Convention)
+    }
+
     /// 在 `now` 这一刻能不能进入自动召回：状态可召回，且没过有效期（§9.4）。
     pub fn is_recallable_at(&self, now: OffsetDateTime) -> bool {
         self.state.is_recallable() && self.valid_until.is_none_or(|until| until > now)
+    }
+}
+
+/// 索引输入（§9.5）。空白条件视同没有。
+pub fn index_text(content: &str, applies_when: Option<&str>) -> String {
+    match applies_when.map(str::trim).filter(|w| !w.is_empty()) {
+        Some(when) => format!("{content}\n{when}"),
+        None => content.to_string(),
     }
 }
 
@@ -295,6 +361,16 @@ pub struct RecallQuery {
     /// 否则没人帮得上把冲突定下来（§9.6）。去重与冲突整理也走这一口，它要看见候选。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub include_states: Vec<MemoryState>,
+    /// 相关度门槛（§9.4）：向量臂余弦下限；0 = 该臂不设限。
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub min_similarity: f32,
+    /// 关键词臂归一化 IDF 和的下限；0 = 该臂不设限。
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub min_keyword_score: f32,
+}
+
+fn is_zero(value: &f32) -> bool {
+    *value == 0.0
 }
 
 /// 这一次放行的作用域里有没有 `scope`。`allowed` 空 = 不限，但**不含**任何
@@ -338,11 +414,39 @@ pub struct RecallResult {
     /// 融合去重之后的候选数（还没按状态、作用域和 `top_k` 筛）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub candidates_after_fusion: Option<u32>,
+    /// 留下的候选各自的两臂原始分数与过了哪道门槛（§9.4）。没跑的臂记 `None`。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub arm_scores: Vec<ArmScore>,
+    /// 两道门槛都没过、在融合之后被丢掉的条数；丢掉的不逐条记。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dropped_by_threshold: Option<u32>,
+}
+
+/// 召回的两条臂。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecallArm {
+    Keyword,
+    Vector,
+}
+
+/// 一条留下的候选在两条臂里的原始分数（§9.4 相关度门槛）：关键词臂是归一化的 IDF 和，
+/// 向量臂是余弦。不在某条臂的候选名单里就是 `None`。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ArmScore {
+    pub id: MemoryId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keyword: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vector: Option<f32>,
+    /// 过了哪几道门槛；门槛不启用的臂不在其中。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub passed: Vec<RecallArm>,
 }
 
 /// 一段注入是怎么来的（附录 B.3.5 的"为什么选中"）。只记进 `memory.injected` 供事后
 /// 排查，不参与"这一块与上一块是不是同一块"的判断。
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct RecallDiagnostics {
     /// 这次召回用的模式；`None` = 没有跑检索（沿用锚，或检查点里带来的条目仍然有效）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -359,6 +463,12 @@ pub struct RecallDiagnostics {
     /// 筛完之后因 token 预算没放进注入段的条数。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dropped_by_budget: Option<u32>,
+    /// 留下的候选的两臂分数（§9.4）。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub arm_scores: Vec<ArmScore>,
+    /// 被相关度门槛丢掉的条数。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dropped_by_threshold: Option<u32>,
     /// 这一块是沿用这一段之前钉下的那一块，没有重新召回。
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub reused_pin: bool,
@@ -418,6 +528,8 @@ mod tests {
             usage: MemoryUsage::default(),
             supersedes: None,
             superseded_by: None,
+            application: None,
+            applies_when: None,
         }
     }
 
@@ -432,6 +544,8 @@ mod tests {
             now: datetime!(2026-09-15 00:00:00 UTC),
             query_vector: None,
             include_states,
+            min_similarity: 0.0,
+            min_keyword_score: 0.0,
         }
     }
 

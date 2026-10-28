@@ -107,6 +107,8 @@ fn scoped_with(
         usage: MemoryUsage::default(),
         supersedes: None,
         superseded_by: None,
+        application: None,
+        applies_when: None,
     }
 }
 

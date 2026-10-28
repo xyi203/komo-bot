@@ -13,8 +13,8 @@ use komo_kernel::test_support::ScriptedLlm;
 use komo_kernel::traits::{Clock, LlmClient, MemoryRepo};
 use komo_kernel::types::ids::{EventId, MemoryId, Seq, SessionId};
 use komo_kernel::types::memory::{
-    Confirmation, Evidence, EvidenceRef, ExtractionMetadata, Injection, MemoryItem, MemoryKind,
-    MemoryScope, MemoryState, Provenance, RetrievalMode,
+    Confirmation, Evidence, EvidenceRef, ExtractionMetadata, Injection, MemoryApplication,
+    MemoryItem, MemoryKind, MemoryScope, MemoryState, Provenance, RetrievalMode,
 };
 use komo_kernel::types::model::{Effort, ModelConfig};
 use komo_kernel::types::turn::{Round, TurnRequest};
@@ -247,6 +247,8 @@ struct Seed {
     provenance: Provenance,
     confirmation: Confirmation,
     state: MemoryState,
+    application: Option<MemoryApplication>,
+    applies_when: Option<String>,
 }
 
 impl Seed {
@@ -259,7 +261,14 @@ impl Seed {
             provenance: Provenance::UserStatement,
             confirmation: Confirmation::Unconfirmed,
             state: MemoryState::Active,
+            application: None,
+            applies_when: None,
         }
+    }
+    fn usage(mut self, application: MemoryApplication, when: Option<&str>) -> Seed {
+        self.application = Some(application);
+        self.applies_when = when.map(str::to_string);
+        self
     }
     fn kind(mut self, kind: MemoryKind) -> Seed {
         self.kind = kind;
@@ -310,6 +319,8 @@ impl Seed {
             usage: Default::default(),
             supersedes: None,
             superseded_by: None,
+            application: self.application,
+            applies_when: self.applies_when,
         }
     }
 }
@@ -391,6 +402,99 @@ async fn an_agent_scope_consolidates_on_its_own_and_leaves_personal_alone() {
     assert_eq!(rig.get("g-2").await.state, MemoryState::Superseded);
     assert_eq!(rig.get("p-1").await.state, MemoryState::Active);
     assert_eq!(rig.get("p-2").await.state, MemoryState::Active);
+}
+
+/// §9.8：合并的成员 application 与 applies_when 必须逐字相同，否则不执行、标"需要人看"——
+/// 合并既不能把线索抬成约定，也不能把"这个任务"的条件扩成"所有任务"。
+#[tokio::test]
+async fn members_with_a_different_condition_or_application_are_never_merged() {
+    use MemoryApplication::{Convention, Reference};
+    for (first, second) in [
+        (
+            Seed::new("a-1", DARK_A).usage(Convention, Some("创建发布工单时")),
+            Seed::new("a-2", DARK_B).usage(Convention, Some("写周报时")),
+        ),
+        (
+            Seed::new("a-1", DARK_A).usage(Convention, Some("创建发布工单时")),
+            Seed::new("a-2", DARK_B).usage(Reference, Some("创建发布工单时")),
+        ),
+        (
+            Seed::new("a-1", DARK_A).usage(Reference, None),
+            Seed::new("a-2", DARK_B).usage(Reference, Some("只在这个任务里")),
+        ),
+    ] {
+        let rig = Rig::new(&[&merge_json(0, &[1])]).await;
+        rig.seed(first).await;
+        rig.seed(second).await;
+
+        let response = rig.run(true).await;
+        let entry = &response.groups[0].actions[0];
+        assert_eq!(entry.outcome, ConsolidateOutcome::Skipped);
+        assert!(entry.note.as_deref().unwrap().contains("需要人看"));
+        assert_eq!(rig.get("a-1").await.state, MemoryState::Active);
+        assert_eq!(
+            rig.get("a-2").await.state,
+            MemoryState::Active,
+            "没有被吸收"
+        );
+    }
+}
+
+/// 使用方式与条件都相同时照常合并（没分类的旧条目按 reference 比）。
+#[tokio::test]
+async fn members_with_the_same_usage_still_merge() {
+    use MemoryApplication::{Convention, Reference};
+    for (first, second) in [
+        (
+            Seed::new("a-1", DARK_A).usage(Convention, Some("创建发布工单时")),
+            Seed::new("a-2", DARK_B).usage(Convention, Some("创建发布工单时")),
+        ),
+        (
+            Seed::new("a-1", DARK_A),
+            Seed::new("a-2", DARK_B).usage(Reference, None),
+        ),
+    ] {
+        let rig = Rig::new(&[&merge_json(0, &[1])]).await;
+        rig.seed(first).await;
+        rig.seed(second).await;
+        let response = rig.run(true).await;
+        assert_eq!(
+            response.groups[0].actions[0].outcome,
+            ConsolidateOutcome::Executed
+        );
+        assert_eq!(rig.get("a-2").await.state, MemoryState::Superseded);
+    }
+}
+
+/// §9.8：old 是 convention、by 不是 → 降级为 contest，不让一条线索悄悄停掉约定。
+#[tokio::test]
+async fn a_reference_cannot_supersede_a_convention() {
+    let json = r#"{"actions":[{"action":"supersede","old":0,"by":1,"reason":"新答案"}]}"#;
+    let rig = Rig::new(&[json]).await;
+    rig.seed(Seed::new("a-1", DARK_A).usage(MemoryApplication::Convention, Some("选 Platform 时")))
+        .await;
+    rig.seed(Seed::new("a-2", DARK_B).usage(MemoryApplication::Reference, None))
+        .await;
+
+    let response = rig.run(true).await;
+    let entry = &response.groups[0].actions[0];
+    assert_eq!(entry.outcome, ConsolidateOutcome::Downgraded);
+    assert_eq!(rig.get("a-1").await.state, MemoryState::Contested);
+    assert_eq!(rig.get("a-2").await.state, MemoryState::Contested);
+
+    let requests = rig.llm.requests.lock().unwrap();
+    let prompt = requests[0].messages[0].text.clone().unwrap();
+    assert!(
+        prompt.contains("使用方式=convention 条件：选 Platform 时"),
+        "{prompt}"
+    );
+    assert!(prompt.contains("使用方式=reference"), "{prompt}");
+}
+
+/// 组内编号行带上使用方式与条件，提示词是 `memory-consolidate/v2`。
+#[test]
+fn the_consolidation_prompt_version_is_v2() {
+    assert_eq!(PROMPT_VERSION, "memory-consolidate/v2");
 }
 
 #[tokio::test]
@@ -535,6 +639,8 @@ async fn rereadable_never_touches_confirmed_or_preference_and_a_forgotten_source
         valid_until: None,
         extraction: ExtractionMetadata::new("memory-model", None, "v3"),
         relations: vec![],
+        application: None,
+        applies_when: None,
     };
     Consolidator::new(&rig.manager)
         .apply(&[observation])

@@ -18,8 +18,8 @@ use komo_kernel::types::ids::{
     AttemptId, EventId, MemoryId, RequestKey, RunId, Seq, SessionId, ToolCallId,
 };
 use komo_kernel::types::memory::{
-    Confirmation, EvidenceRef, MemoryKind, MemoryScope, MemoryState, MemoryWork, Provenance,
-    RetrievalMode,
+    Confirmation, EvidenceRef, MemoryApplication, MemoryKind, MemoryScope, MemoryState, MemoryWork,
+    Provenance, RetrievalMode,
 };
 use komo_kernel::types::model::{
     DistanceRule, Effort, EmbeddingConfig, EmbeddingSpace, InputKind, ModelConfig, Vector,
@@ -275,6 +275,8 @@ fn memory_config(enabled: bool, mode: RetrievalMode) -> MemoryConfig {
             max_tokens: 1500,
             rerank: false,
             rerank_shortlist: 20,
+            min_similarity: 0.0,
+            min_keyword_score: 0.0,
         },
         consolidate: Default::default(),
         extract_idle_secs: 600,
@@ -593,6 +595,8 @@ async fn a_paraphrase_still_recalls_the_same_preference_and_keeps_its_provenance
                 usage: Default::default(),
                 supersedes: None,
                 superseded_by: None,
+                application: None,
+                applies_when: None,
             },
             None,
         )
@@ -2569,6 +2573,8 @@ fn memory(id: &str, content: &str) -> komo_kernel::types::memory::MemoryItem {
         usage: Default::default(),
         supersedes: None,
         superseded_by: None,
+        application: None,
+        applies_when: None,
     }
 }
 
@@ -3150,6 +3156,8 @@ fn add_request(content: &str, kind: MemoryKind, in_run: Option<&str>) -> MemoryA
         session: in_run.map(|_| SessionId::from_raw("sess-1")),
         run: in_run.map(RunId::from_raw),
         request_key: None,
+        application: None,
+        applies_when: None,
     }
 }
 
@@ -3389,6 +3397,42 @@ async fn extraction_folds_a_rephrase_of_what_was_added_by_hand() {
         all[0].content, "汇报先给结论再给依据",
         "手动记的正文不被改写"
     );
+}
+
+/// 兜底合并也守使用方式：手动记的是线索，提取交回的是约定（条件不同）时不并，新增一条。
+#[tokio::test]
+async fn extraction_does_not_fold_a_convention_into_a_hand_added_reference() {
+    let harness = HarnessBuilder::new()
+        .script(vec![round(
+            r#"{"observations":[{"content":"用户希望汇报时先说结论",
+                "kind":"preference","scope":"personal","said_by":"user_statement",
+                "evidence":["evt-1"],"application":"convention",
+                "applies_when":"写汇报时","basis":"以后汇报先给结论"}]}"#,
+        )])
+        .work(vec![work_item(RunState::Completed, interactive())])
+        .build()
+        .await;
+    harness
+        .ledger
+        .seed(&SessionId::from_raw("sess-1"), run_with_user_words());
+    let (added, _) = harness
+        .manager
+        .add(&add_request(
+            "汇报先给结论再给依据",
+            MemoryKind::Preference,
+            Some("run-1"),
+        ))
+        .await
+        .unwrap();
+
+    harness.manager.process_pending(1).await.unwrap();
+
+    let all = harness.repo.list(None, None, 10).await.unwrap();
+    assert_eq!(all.len(), 2, "不并，新增一条");
+    let fresh = all.iter().find(|item| item.id != added.id).unwrap();
+    assert_eq!(fresh.application, Some(MemoryApplication::Convention));
+    let manual = all.iter().find(|item| item.id == added.id).unwrap();
+    assert_eq!(manual.application, Some(MemoryApplication::Reference));
 }
 
 /// 同一句话里说到的另一件**不同种类**的事照常记下。
@@ -3769,4 +3813,465 @@ async fn a_shared_recall_skips_agent_scopes_and_drops_carried_entries_from_them(
         .await;
     assert_eq!(own.uses.len(), 1);
     assert_eq!(own.uses[0].memory.as_str(), "g-1");
+}
+
+// =========================================================== 长期约定与使用方式（§9.2、§9.3、§9.6）
+
+/// 一句带长期意图的用户话 + 一条工具结果，供 convention 校验用。
+fn convention_events() -> Vec<Event> {
+    let run = RunId::from_raw("run-1");
+    vec![
+        user_event(1, &run, "以后发布工单 Platform 都选 saas，别再问我"),
+        tool_event(2, &run, "上一张工单选了 saas"),
+    ]
+}
+
+fn raw_convention(extra: &str) -> Vec<RawObservation> {
+    serde_json::from_str(&format!(
+        r#"[{{"content":"发布工单的 Platform 默认选 saas","kind":"preference","scope":"personal",
+              "said_by":"user_statement","evidence":["evt-1"],
+              "application":"convention","applies_when":"创建发布工单、需要选 Platform 时",
+              "basis":"以后发布工单 Platform 都选 saas"{extra}}}]"#
+    ))
+    .unwrap()
+}
+
+fn validated(raw: Vec<RawObservation>) -> Vec<extract::Observation> {
+    transcript(&convention_events()).validate(raw, 8, &model("memory-model", None), &[], NOW)
+}
+
+/// 合格的 convention：kind、来源、条件、basis 原话都对得上，落库带条件。basis 不落库。
+#[test]
+fn a_well_formed_convention_keeps_its_application_and_condition() {
+    let observations = validated(raw_convention(""));
+    assert_eq!(observations.len(), 1);
+    assert_eq!(
+        observations[0].application,
+        Some(MemoryApplication::Convention)
+    );
+    assert_eq!(
+        observations[0].applies_when.as_deref(),
+        Some("创建发布工单、需要选 Platform 时")
+    );
+    assert_eq!(extract::PROMPT_VERSION, "memory-extract/v8");
+}
+
+/// basis 不在所引的任何用户事件里（编的一句原话，或只在工具结果里出现）→ 降为 reference，
+/// 观察照常落库；空白差异不影响比较。
+#[test]
+fn a_convention_whose_basis_is_not_in_a_user_event_becomes_a_reference() {
+    let mut forged = raw_convention("");
+    forged[0].basis = Some("用户说过永远选 saas".into());
+    let observations = validated(forged);
+    assert_eq!(observations.len(), 1, "不丢");
+    assert_eq!(
+        observations[0].application,
+        Some(MemoryApplication::Reference)
+    );
+
+    let mut from_tool = raw_convention("");
+    from_tool[0].basis = Some("上一张工单选了 saas".into());
+    assert_eq!(
+        validated(from_tool)[0].application,
+        Some(MemoryApplication::Reference),
+        "basis 只认用户事件，工具结果里的不算"
+    );
+
+    let mut spaced = raw_convention("");
+    spaced[0].basis = Some("以后发布工单   Platform\n都选 saas".into());
+    assert_eq!(
+        validated(spaced)[0].application,
+        Some(MemoryApplication::Convention),
+        "空白归一后逐字相同"
+    );
+
+    let mut missing = raw_convention("");
+    missing[0].basis = None;
+    assert_eq!(
+        validated(missing)[0].application,
+        Some(MemoryApplication::Reference)
+    );
+}
+
+/// 工具观察 / 模型推断 / 事实 / 没有条件，都不能当 convention。
+#[test]
+fn a_convention_claim_without_a_preference_user_statement_and_condition_becomes_a_reference() {
+    // 工具观察声称 convention：只引得出工具结果。
+    let tool: Vec<RawObservation> = serde_json::from_str(
+        r#"[{"content":"用户默认选 saas","kind":"preference","scope":"personal",
+             "said_by":"tool_observation","evidence":["evt-2"],
+             "application":"convention","applies_when":"创建发布工单时",
+             "basis":"上一张工单选了 saas"}]"#,
+    )
+    .unwrap();
+    let observations = validated(tool);
+    assert_eq!(
+        observations[0].application,
+        Some(MemoryApplication::Reference)
+    );
+    assert_eq!(observations[0].provenance, Provenance::ToolObservation);
+
+    // 自称用户陈述却是推断。
+    let mut inference = raw_convention("");
+    inference[0].said_by = extract::SaidBy::ModelInference;
+    assert_eq!(
+        validated(inference)[0].application,
+        Some(MemoryApplication::Reference)
+    );
+
+    // 事实不是约定。
+    let mut fact = raw_convention("");
+    fact[0].kind = "fact".into();
+    assert_eq!(
+        validated(fact)[0].application,
+        Some(MemoryApplication::Reference)
+    );
+
+    // 没有条件。
+    let mut no_when = raw_convention("");
+    no_when[0].applies_when = Some("  ".into());
+    let observations = validated(no_when);
+    assert_eq!(
+        observations[0].application,
+        Some(MemoryApplication::Reference)
+    );
+    assert_eq!(observations[0].applies_when, None);
+
+    // 没写 application 的一律是 reference。
+    let mut plain = raw_convention("");
+    plain[0].application = None;
+    assert_eq!(
+        validated(plain)[0].application,
+        Some(MemoryApplication::Reference)
+    );
+}
+
+/// 端到端：合格的 convention 落库带 application 与条件，basis 没有落库的地方。
+#[tokio::test]
+async fn an_extracted_convention_lands_with_its_condition() {
+    let harness = HarnessBuilder::new()
+        .script(vec![round(
+            r#"{"observations":[{"content":"发布工单的 Platform 默认选 saas","kind":"preference",
+              "scope":"personal","said_by":"user_statement","evidence":["evt-1"],
+              "application":"convention","applies_when":"创建发布工单、需要选 Platform 时",
+              "basis":"以后发布工单 Platform 都选 saas"}]}"#,
+        )])
+        .work(vec![work_item(RunState::Completed, interactive())])
+        .build()
+        .await;
+    harness
+        .ledger
+        .seed(&SessionId::from_raw("sess-1"), convention_events());
+
+    harness.manager.process_pending(4).await.unwrap();
+
+    let stored = harness.repo.list(None, None, 10).await.unwrap();
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0].application, Some(MemoryApplication::Convention));
+    assert_eq!(
+        stored[0].applies_when.as_deref(),
+        Some("创建发布工单、需要选 Platform 时")
+    );
+    assert_eq!(stored[0].confirmation, Confirmation::Unconfirmed);
+    assert_eq!(stored[0].extraction.prompt_version, "memory-extract/v8");
+}
+
+fn convention_memory(id: &str) -> MemoryItem {
+    let mut item = memory(id, "发布工单的 Platform 默认选 saas");
+    item.application = Some(MemoryApplication::Convention);
+    item.applies_when = Some("创建发布工单、需要选 Platform 时".into());
+    item
+}
+
+/// §9.6：只有 convention 能取代 convention。用户陈述级别的 reference 想 supersede 一条
+/// convention，也只能降成冲突，双方 contested。
+#[tokio::test]
+async fn a_reference_cannot_supersede_a_convention_it_only_contests_it() {
+    let harness = HarnessBuilder::new()
+        .script(vec![round(
+            r#"{"observations":[{"content":"发布工单的 Platform 现在选 terra","kind":"fact",
+              "scope":"personal","said_by":"user_statement","evidence":["evt-1"],
+              "relations":[{"memory":0,"relation":"supersedes"}]}]}"#,
+        )])
+        .work(vec![work_item(RunState::Completed, interactive())])
+        .build()
+        .await;
+    harness
+        .repo
+        .put(convention_memory("m-1"), None)
+        .await
+        .unwrap();
+    harness.ledger.seed(
+        &SessionId::from_raw("sess-1"),
+        vec![user_event(
+            1,
+            &RunId::from_raw("run-1"),
+            "这张工单 Platform 用 terra",
+        )],
+    );
+
+    harness.manager.process_pending(4).await.unwrap();
+
+    let old = harness
+        .repo
+        .get(&MemoryId::from_raw("m-1"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(old.state, MemoryState::Contested);
+    let all = harness.repo.list(None, None, 10).await.unwrap();
+    let fresh = all.iter().find(|item| item.id.as_str() != "m-1").unwrap();
+    assert!(fresh.supersedes.is_none());
+    assert_eq!(fresh.state, MemoryState::Contested, "双方都标 contested");
+    assert_eq!(fresh.application, Some(MemoryApplication::Reference));
+}
+
+/// 正文相同、条件不同的是两条：同一句话带着另一个条件被提取出来，不并进已有的那条。
+#[tokio::test]
+async fn the_same_words_with_another_condition_are_a_separate_memory() {
+    let harness = HarnessBuilder::new()
+        .script(vec![round(
+            r#"{"observations":[{"content":"发布工单的 Platform 默认选 saas","kind":"preference",
+              "scope":"personal","said_by":"user_statement","evidence":["evt-1"],
+              "application":"convention","applies_when":"在 ob-note 仓库里发布时",
+              "basis":"以后发布工单 Platform 都选 saas"}]}"#,
+        )])
+        .work(vec![work_item(RunState::Completed, interactive())])
+        .build()
+        .await;
+    harness
+        .repo
+        .put(convention_memory("m-1"), None)
+        .await
+        .unwrap();
+    harness
+        .ledger
+        .seed(&SessionId::from_raw("sess-1"), convention_events());
+
+    harness.manager.process_pending(4).await.unwrap();
+
+    let all = harness.repo.list(None, None, 10).await.unwrap();
+    assert_eq!(all.len(), 2, "条件不同，不合并");
+}
+
+fn convention_request(content: &str, kind: MemoryKind, when: Option<&str>) -> MemoryAddRequest {
+    MemoryAddRequest {
+        application: Some(MemoryApplication::Convention),
+        applies_when: when.map(str::to_string),
+        ..add_request(content, kind, None)
+    }
+}
+
+/// add：省略 application 记成 reference；convention 缺条件或不是 preference 按参数错误拒绝。
+#[tokio::test]
+async fn add_defaults_to_reference_and_refuses_a_malformed_convention() {
+    let harness = HarnessBuilder::new().build().await;
+
+    let (plain, _) = harness
+        .manager
+        .add(&add_request("周末不开会", MemoryKind::Preference, None))
+        .await
+        .unwrap();
+    assert_eq!(plain.application, Some(MemoryApplication::Reference));
+    assert_eq!(extract::PROMPT_VERSION.len() > 0, true);
+    assert_eq!(plain.extraction.prompt_version, "memory-add/v2");
+    assert!(add::is_manual(&plain));
+
+    for bad in [
+        convention_request("发布默认 saas", MemoryKind::Preference, None),
+        convention_request("发布默认 saas", MemoryKind::Preference, Some("   ")),
+        convention_request("发布默认 saas", MemoryKind::Fact, Some("创建发布工单时")),
+        convention_request(
+            "发布默认 saas",
+            MemoryKind::Experience,
+            Some("创建发布工单时"),
+        ),
+    ] {
+        assert!(
+            matches!(
+                harness.manager.add(&bad).await,
+                Err(MemoryError::Invalid(_))
+            ),
+            "{bad:?}"
+        );
+    }
+
+    let (good, created) = harness
+        .manager
+        .add(&convention_request(
+            "发布默认 saas",
+            MemoryKind::Preference,
+            Some("创建发布工单时"),
+        ))
+        .await
+        .unwrap();
+    assert!(created);
+    assert_eq!(good.application, Some(MemoryApplication::Convention));
+    assert_eq!(good.applies_when.as_deref(), Some("创建发布工单时"));
+}
+
+/// 逐字相同的条目已存在、这次带了不同的使用方式：升一版改过来，证据保留；没带
+/// `--application` 的重复 add 不会把已有约定降级。
+#[tokio::test]
+async fn adding_the_same_words_with_a_new_application_bumps_the_revision() {
+    let harness = HarnessBuilder::new().build().await;
+    harness
+        .ledger
+        .seed(&SessionId::from_raw("sess-1"), run_with_user_words());
+    let (first, _) = harness
+        .manager
+        .add(&add_request(
+            "汇报先给结论再给依据",
+            MemoryKind::Preference,
+            Some("run-1"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(first.application, Some(MemoryApplication::Reference));
+
+    let upgrade = MemoryAddRequest {
+        application: Some(MemoryApplication::Convention),
+        applies_when: Some("写汇报时".into()),
+        ..add_request(
+            "汇报先给结论再给依据",
+            MemoryKind::Preference,
+            Some("run-1"),
+        )
+    };
+    let (upgraded, created) = harness.manager.add(&upgrade).await.unwrap();
+    assert!(!created);
+    assert_eq!(upgraded.id, first.id);
+    assert_eq!(upgraded.revision, first.revision + 1);
+    assert_eq!(upgraded.application, Some(MemoryApplication::Convention));
+    assert_eq!(upgraded.applies_when.as_deref(), Some("写汇报时"));
+    assert_eq!(cited_events(&upgraded), cited_events(&first), "证据保留");
+    assert_eq!(harness.repo.list(None, None, 10).await.unwrap().len(), 1);
+
+    let (again, _) = harness
+        .manager
+        .add(&add_request(
+            "汇报先给结论再给依据",
+            MemoryKind::Preference,
+            Some("run-1"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(again.application, Some(MemoryApplication::Convention));
+    assert_eq!(again.revision, upgraded.revision, "没带分类就不动它");
+}
+
+/// classify：写新 revision，证据与确认原样保留；规则同 add。
+#[tokio::test]
+async fn classify_writes_a_new_revision_and_keeps_evidence_and_confirmation() {
+    let harness = HarnessBuilder::new().build().await;
+    harness
+        .ledger
+        .seed(&SessionId::from_raw("sess-1"), run_with_user_words());
+    let (item, _) = harness
+        .manager
+        .add(&add_request(
+            "汇报先给结论再给依据",
+            MemoryKind::Preference,
+            Some("run-1"),
+        ))
+        .await
+        .unwrap();
+    let confirmed = harness
+        .manager
+        .confirm(&item.id, item.revision)
+        .await
+        .unwrap();
+
+    let classified = harness
+        .manager
+        .classify(
+            &confirmed.id,
+            confirmed.revision,
+            MemoryApplication::Convention,
+            Some("写汇报时"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(classified.revision, confirmed.revision + 1);
+    assert_eq!(classified.application, Some(MemoryApplication::Convention));
+    assert_eq!(classified.applies_when.as_deref(), Some("写汇报时"));
+    assert_eq!(
+        classified.confirmation,
+        Confirmation::UserConfirmed,
+        "确认原样"
+    );
+    assert_eq!(
+        cited_events(&classified),
+        cited_events(&confirmed),
+        "证据原样"
+    );
+    assert_eq!(classified.content, confirmed.content);
+
+    // 分类没变就不升版；旧 revision 再来是冲突。
+    let same = harness
+        .manager
+        .classify(
+            &classified.id,
+            classified.revision,
+            MemoryApplication::Convention,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(same.revision, classified.revision);
+    let stale = harness
+        .manager
+        .classify(
+            &classified.id,
+            confirmed.revision,
+            MemoryApplication::Reference,
+            None,
+        )
+        .await;
+    assert!(
+        matches!(
+            stale,
+            Err(MemoryError::Store(_)) | Err(MemoryError::Repo(_))
+        ),
+        "{stale:?}"
+    );
+}
+
+/// classify 的规则同 add：convention 只给 preference 且必须有条件。
+#[tokio::test]
+async fn classify_refuses_a_convention_without_a_condition_or_for_a_fact() {
+    let harness = HarnessBuilder::new().build().await;
+    let (pref, _) = harness
+        .manager
+        .add(&add_request("周末不开会", MemoryKind::Preference, None))
+        .await
+        .unwrap();
+    let (fact, _) = harness
+        .manager
+        .add(&add_request("公司在杭州", MemoryKind::Fact, None))
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        harness
+            .manager
+            .classify(&pref.id, pref.revision, MemoryApplication::Convention, None)
+            .await,
+        Err(MemoryError::Invalid(_))
+    ));
+    assert!(matches!(
+        harness
+            .manager
+            .classify(
+                &fact.id,
+                fact.revision,
+                MemoryApplication::Convention,
+                Some("订会议室时")
+            )
+            .await,
+        Err(MemoryError::Invalid(_))
+    ));
+    // 没条件也没改动：库里还是原样。
+    let still = harness.repo.get(&pref.id).await.unwrap().unwrap();
+    assert_eq!(still.revision, pref.revision);
 }

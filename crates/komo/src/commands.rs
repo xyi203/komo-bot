@@ -14,12 +14,14 @@ use komo_gateway::skills::{OfferContext, SkillRegistry, one_line};
 use komo_kernel::cron::{JobStatus, NotifyPolicy, OverlapPolicy};
 use komo_kernel::protocol::http::{
     CancelRunRequest, CreateCronRequest, InterventionAnswerRequest, InterventionListQuery,
-    InterventionVerdict, MemoryAddRequest, MemoryConsolidateRequest, MemoryListQuery,
-    MemoryRevisionRequest, MemorySweepRequest, RebuildIndexRequest, SessionListQuery,
-    UpdateCronRequest,
+    InterventionVerdict, MemoryAddRequest, MemoryClassifyRequest, MemoryConsolidateRequest,
+    MemoryListQuery, MemoryRevisionRequest, MemorySweepRequest, RebuildIndexRequest,
+    SessionListQuery, UpdateCronRequest,
 };
 use komo_kernel::types::ids::{CronJobId, MemoryId, RunId, SessionId};
-use komo_kernel::types::memory::{MemoryKind, MemoryScope, MemoryState, RetrievalMode};
+use komo_kernel::types::memory::{
+    MemoryApplication, MemoryKind, MemoryScope, MemoryState, RetrievalMode,
+};
 use komo_kernel::types::model::Effort;
 
 pub type Outcome = Result<String, String>;
@@ -460,8 +462,18 @@ pub async fn memory_show(client: &KomoClient, id: &str) -> Outcome {
 
 /// `komo memory add`：谁在调由环境说——bash 工具的子进程带着 `KOMO_SESSION` 与
 /// `KOMO_RUN`，Gateway 据此把它记成"Agent 替用户记、未确认"（§9.3「手动记一条」）。
-pub async fn memory_add(client: &KomoClient, content: &str, kind: &str, scope: &str) -> Outcome {
+pub async fn memory_add(
+    client: &KomoClient,
+    content: &str,
+    kind: &str,
+    scope: &str,
+    application: Option<&str>,
+    applies_when: Option<&str>,
+) -> Outcome {
     let kind = parse_kind(kind)?;
+    let application = application
+        .map(str::parse::<MemoryApplication>)
+        .transpose()?;
     let scope = scope
         .parse::<MemoryScope>()
         .map_err(|error| error.to_string())?;
@@ -474,6 +486,8 @@ pub async fn memory_add(client: &KomoClient, content: &str, kind: &str, scope: &
             session: from_env("KOMO_SESSION").map(SessionId::from_raw),
             run: from_env("KOMO_RUN").map(RunId::from_raw),
             request_key: Some(RequestKeys::fresh(time::OffsetDateTime::now_utc())),
+            application,
+            applies_when: applies_when.map(str::to_string),
         })
         .await
         .map_err(failed)?;
@@ -489,6 +503,31 @@ fn parse_kind(raw: &str) -> Result<MemoryKind, String> {
             "不认识的种类 `{other}`：支持 preference / fact / experience"
         )),
     }
+}
+
+/// `komo memory classify`：操作者给指定 revision 定使用方式与条件（§9.3「存量分类」）。
+/// 键按 id + revision + 内容取，同一次分类重试命中幂等缓存，改了参数就是新的一次。
+pub async fn memory_classify(
+    client: &KomoClient,
+    id: &str,
+    revision: u32,
+    application: &str,
+    applies_when: Option<&str>,
+) -> Outcome {
+    let application = application.parse::<MemoryApplication>()?;
+    let detail = client
+        .memory_classify(
+            &MemoryId::from_raw(id),
+            &MemoryClassifyRequest {
+                expected_revision: revision,
+                application,
+                applies_when: applies_when.map(str::to_string),
+                request_key: Some(RequestKeys::fresh(time::OffsetDateTime::now_utc())),
+            },
+        )
+        .await
+        .map_err(failed)?;
+    Ok(render::memory_show(&detail.memory))
 }
 
 pub async fn memory_confirm(client: &KomoClient, id: &str, revision: u32) -> Outcome {

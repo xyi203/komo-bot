@@ -160,6 +160,8 @@ mod live {
             usage: Default::default(),
             supersedes: None,
             superseded_by: None,
+            application: None,
+            applies_when: None,
         }
     }
 

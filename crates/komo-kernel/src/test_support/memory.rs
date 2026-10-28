@@ -91,6 +91,8 @@ impl MemoryRepo for MemMemoryRepo {
             vector_coverage: Some(if state.vectors.is_empty() { 0.0 } else { 1.0 }),
             candidates_before_fusion: None,
             candidates_after_fusion: None,
+            arm_scores: Vec::new(),
+            dropped_by_threshold: None,
         })
     }
 

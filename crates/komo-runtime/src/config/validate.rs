@@ -362,6 +362,18 @@ fn check_retrieval(snapshot: &ConfigSnapshot, issues: &mut Vec<ConfigIssue>) {
     if retrieval.max_tokens == 0 {
         issues.push(error("memory.retrieval.max_tokens", "max_tokens 不能是 0"));
     }
+    if !(0.0..=1.0).contains(&retrieval.min_similarity) {
+        issues.push(error(
+            "memory.retrieval.min_similarity",
+            "min_similarity 是余弦下限，写 0 到 1（0 = 不启用）",
+        ));
+    }
+    if !retrieval.min_keyword_score.is_finite() || retrieval.min_keyword_score < 0.0 {
+        issues.push(error(
+            "memory.retrieval.min_keyword_score",
+            "min_keyword_score 不能是负数或非有限值（0 = 不启用）",
+        ));
+    }
     if retrieval.rerank {
         // 重排换的是"谁进得了 top_k"。短名单和 top_k 一样宽时它只是换个顺序——写了这个
         // 组合的人想要的是重排，拿到的却是一个空转的开关。

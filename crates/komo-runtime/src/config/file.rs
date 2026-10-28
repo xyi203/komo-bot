@@ -257,6 +257,8 @@ pub(super) struct RetrievalSection {
     pub max_tokens: Option<u32>,
     pub rerank: Option<bool>,
     pub rerank_shortlist: Option<u32>,
+    pub min_similarity: Option<f32>,
+    pub min_keyword_score: Option<f32>,
 }
 
 impl RetrievalSection {
@@ -269,6 +271,8 @@ impl RetrievalSection {
             max_tokens: self.max_tokens.unwrap_or(base.max_tokens),
             rerank: self.rerank.unwrap_or(base.rerank),
             rerank_shortlist: self.rerank_shortlist.unwrap_or(base.rerank_shortlist),
+            min_similarity: self.min_similarity.unwrap_or(base.min_similarity),
+            min_keyword_score: self.min_keyword_score.unwrap_or(base.min_keyword_score),
         }
     }
 }

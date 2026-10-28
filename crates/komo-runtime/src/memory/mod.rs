@@ -137,6 +137,14 @@ pub trait MemoryCatalog: Send + Sync {
         content: &str,
     ) -> Result<Option<MemoryItem>, RepoError>;
 
+    /// 正文与条件都逐字相同的那一条（§9.6：条件不同的是两条）。
+    async fn find_by_content_and_condition(
+        &self,
+        scope: &MemoryScope,
+        content: &str,
+        applies_when: Option<&str>,
+    ) -> Result<Option<MemoryItem>, RepoError>;
+
     /// 当前版本的证据引了这个会话事件的那些记忆（提取前找手动记过的，§9.3）。
     async fn citing_session(&self, session: &SessionId) -> Result<Vec<MemoryItem>, RepoError>;
 
@@ -197,6 +205,21 @@ impl MemoryCatalog for komo_store::TursoMemoryRepo {
         content: &str,
     ) -> Result<Option<MemoryItem>, RepoError> {
         komo_store::TursoMemoryRepo::find_by_content(self, scope, content).await
+    }
+
+    async fn find_by_content_and_condition(
+        &self,
+        scope: &MemoryScope,
+        content: &str,
+        applies_when: Option<&str>,
+    ) -> Result<Option<MemoryItem>, RepoError> {
+        komo_store::TursoMemoryRepo::find_by_content_and_condition(
+            self,
+            scope,
+            content,
+            applies_when,
+        )
+        .await
     }
 
     async fn citing_session(&self, session: &SessionId) -> Result<Vec<MemoryItem>, RepoError> {
@@ -699,6 +722,8 @@ impl MemoryManager {
             now: self.clock.now(),
             query_vector: None,
             include_states: vec![],
+            min_similarity: retrieval.min_similarity,
+            min_keyword_score: retrieval.min_keyword_score,
         }
     }
 
@@ -746,6 +771,8 @@ impl MemoryManager {
                     diagnostics.degraded_reason = result.degraded_reason;
                     diagnostics.candidates_before_fusion = result.candidates_before_fusion;
                     diagnostics.candidates_after_fusion = result.candidates_after_fusion;
+                    diagnostics.arm_scores = result.arm_scores;
+                    diagnostics.dropped_by_threshold = result.dropped_by_threshold;
                     items = result.items;
                 }
                 Err(error) => {

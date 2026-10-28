@@ -254,7 +254,7 @@ impl ChannelsConfig {
 }
 
 /// `[memory.retrieval]`（§9.4）。这些是可调整的初始预算，不强行填满。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RetrievalConfig {
     #[serde(default)]
     pub mode: RetrievalMode,
@@ -271,6 +271,14 @@ pub struct RetrievalConfig {
     /// 任何本来进不了 `top_k` 的条目（校验会拒绝这种组合）。
     #[serde(default = "default_rerank_shortlist")]
     pub rerank_shortlist: u32,
+    /// 向量臂相关度门槛：查询向量与条目向量的余弦下限，0–1。0 = 不启用。分数随 embedding
+    /// 模型与前缀变，没有放之四海的值（§9.4）。
+    #[serde(default)]
+    pub min_similarity: f32,
+    /// 关键词臂相关度门槛：命中 token 的 IDF 之和（每个 IDF 除以 `ln(N+2)`），≥ 0。
+    /// 0 = 不启用。
+    #[serde(default)]
+    pub min_keyword_score: f32,
 }
 
 fn default_rerank_shortlist() -> u32 {
@@ -296,6 +304,8 @@ impl Default for RetrievalConfig {
             max_tokens: default_max_tokens(),
             rerank: false,
             rerank_shortlist: default_rerank_shortlist(),
+            min_similarity: 0.0,
+            min_keyword_score: 0.0,
         }
     }
 }
@@ -348,7 +358,7 @@ impl Default for TypesafeConfig {
 }
 
 /// `[memory]`（§13.3）。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MemoryConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,

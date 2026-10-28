@@ -22,8 +22,8 @@ use komo_kernel::traits::{ConsolidationWrite, MemoryRepo, RepoError, StoreError}
 use komo_kernel::types::digest::ContentHash;
 use komo_kernel::types::ids::{MemoryId, RunId};
 use komo_kernel::types::memory::{
-    Evidence, MemoryItem, MemoryScope, MemoryState, RecallQuery, RecallResult, RetrievalMode,
-    scope_allowed,
+    ArmScore, Evidence, MemoryItem, MemoryScope, MemoryState, RecallArm, RecallQuery, RecallResult,
+    RetrievalMode, scope_allowed,
 };
 use komo_kernel::types::model::Vector;
 use time::OffsetDateTime;
@@ -439,7 +439,11 @@ async fn put_in(
         });
     }
 
-    let content_hash = ContentHash::of_str(&item.content).as_str().to_string();
+    // 哈希的是索引输入：条件为空时就是正文，与加列之前逐字相同，存量向量不失效（§9.5）。
+    let index_text = item.index_text();
+    let content_hash = ContentHash::of_str(&index_text).as_str().to_string();
+    let application = item.application.map(|a| enum_str(&a));
+    let applies_when = item.applies_when.clone().filter(|w| !w.trim().is_empty());
     let scope_kind = scope_kind(&item.scope);
     let supersedes = match &item.supersedes {
         Some(reference) => Some(encode(reference)?),
@@ -473,6 +477,8 @@ async fn put_in(
                 .superseded_by(superseded_by.clone())
                 .adopted_count(adopted_count)
                 .last_adopted_at(item.usage.last_adopted_at.map(to_ts))
+                .application(application.clone())
+                .applies_when(applies_when.clone())
                 .exec(ex)
                 .await
                 .map_err(map_toasty)?;
@@ -501,6 +507,8 @@ async fn put_in(
                 consolidated_at: None,
                 adopted_count,
                 last_adopted_at: item.usage.last_adopted_at.map(to_ts),
+                application: application.clone(),
+                applies_when: applies_when.clone(),
             })
             .exec(ex)
             .await
@@ -539,7 +547,7 @@ async fn put_in(
     }
 
     // 关键词索引跟着正文走。后台刚入库但尚未生成向量的记忆仍可通过关键词命中（§9.4）。
-    let (terms, count) = terms_column(&item.content);
+    let (terms, count) = terms_column(&index_text);
     match MemoryTermsRow::filter_by_id(&id)
         .first()
         .exec(ex)
@@ -596,6 +604,9 @@ fn vector_unavailable(reason: &str) -> Option<String> {
     Some(reason.to_string())
 }
 
+/// 一条臂的有序候选，带原始分数：关键词臂是归一化 IDF 和，向量臂是余弦。
+type ScoredArm = Vec<(String, f32)>;
+
 async fn recall_in(ex: &mut dyn Executor, query: &RecallQuery) -> Result<RecallResult, StoreError> {
     let candidate_limit = query.candidate_limit.max(1) as usize;
     let wants_keyword = !matches!(query.mode, RetrievalMode::Vector);
@@ -623,30 +634,65 @@ async fn recall_in(ex: &mut dyn Executor, query: &RecallQuery) -> Result<RecallR
     } else {
         Vec::new()
     };
+    let vector_ran = wants_vector && vector_note.is_none();
 
     // 「按排名融合（RRF），避免直接相加不同量纲的分数」（§9.4）。一条臂没跑时融合退化
     // 成恒等，所以这里不必分支。
     let mut arms: Vec<Vec<String>> = Vec::new();
     if wants_keyword {
-        arms.push(keyword);
+        arms.push(keyword.iter().map(|(id, _)| id.clone()).collect());
     }
-    if wants_vector && vector_note.is_none() {
-        arms.push(vector);
+    if vector_ran {
+        arms.push(vector.iter().map(|(id, _)| id.clone()).collect());
     }
     let before_fusion: usize = arms.iter().map(Vec::len).sum();
     let ranked = reciprocal_rank_fusion(&arms);
     let after_fusion = ranked.len();
 
+    // 相关度门槛（§9.4）：过任一臂的门槛即留下，两臂都没过的在重排与 `top_k` 截断之前丢
+    // 掉。名次仍是上面按两臂原始名单融出来的，门槛只删人、不改名次。没跑的臂不参与判断；
+    // 门槛 0 = 该臂不设限，名单里的条目都算过。
+    let keyword_scores: std::collections::BTreeMap<&str, f32> =
+        keyword.iter().map(|(id, s)| (id.as_str(), *s)).collect();
+    let vector_scores: std::collections::BTreeMap<&str, f32> =
+        vector.iter().map(|(id, s)| (id.as_str(), *s)).collect();
+    let gate = |score: Option<&f32>, floor: f32| score.is_some_and(|s| *s >= floor);
+    let mut passed_by: std::collections::BTreeMap<String, Vec<RecallArm>> = Default::default();
+    let mut dropped = 0u32;
+    let mut kept: Vec<String> = Vec::with_capacity(ranked.len());
+    for id in ranked {
+        let mut passed = Vec::new();
+        if wants_keyword && gate(keyword_scores.get(id.as_str()), query.min_keyword_score) {
+            passed.push(RecallArm::Keyword);
+        }
+        if vector_ran && gate(vector_scores.get(id.as_str()), query.min_similarity) {
+            passed.push(RecallArm::Vector);
+        }
+        if passed.is_empty() {
+            dropped += 1;
+            continue;
+        }
+        passed_by.insert(id.clone(), passed);
+        kept.push(id);
+    }
+
     // 去重后核对当前 revision、来源与冲突状态（§9.4）——`admits` 是"这一次放行哪些状态"
     // 那条规则的唯一实现，自动召回与显式 search 都经它。
     let mut items: Vec<MemoryItem> = Vec::new();
-    for id in ranked {
+    let mut arm_scores: Vec<ArmScore> = Vec::new();
+    for id in kept {
         let Some(item) = load_item(ex, &id).await? else {
             continue;
         };
         if !query.admits(&item) {
             continue;
         }
+        arm_scores.push(ArmScore {
+            id: item.id.clone(),
+            keyword: keyword_scores.get(id.as_str()).copied(),
+            vector: vector_scores.get(id.as_str()).copied(),
+            passed: passed_by.remove(&id).unwrap_or_default(),
+        });
         items.push(item);
         if items.len() >= query.top_k.max(1) as usize {
             break;
@@ -661,15 +707,18 @@ async fn recall_in(ex: &mut dyn Executor, query: &RecallQuery) -> Result<RecallR
         vector_coverage: wants_vector.then_some(coverage),
         candidates_before_fusion: Some(before_fusion as u32),
         candidates_after_fusion: Some(after_fusion as u32),
+        arm_scores,
+        dropped_by_threshold: Some(dropped),
     })
 }
 
-/// 关键词臂：`memory_terms` 的 `instr` 命中数按 IDF 加权（§9.4）。返回按分降序的 id。
+/// 关键词臂：`memory_terms` 的 `instr` 命中数按 IDF 加权（§9.4）。返回按分降序的
+/// `(id, 归一化分)`。
 async fn keyword_arm(
     ex: &mut dyn Executor,
     query: &RecallQuery,
     candidate_limit: usize,
-) -> Result<Vec<String>, StoreError> {
+) -> Result<ScoredArm, StoreError> {
     let tokens = lexical_terms(&query.text);
     if tokens.is_empty() {
         // 没有可检索的 token 时不回退成"给你全部"——§9.4：没有足够相关内容时返回空。
@@ -685,6 +734,8 @@ async fn keyword_arm(
         .and_then(|row| column_i64(row, 0))
         .unwrap_or(0)
         .max(1) as f64;
+    // 归一化分母：命中 0 行时单个 token 的理论最大 IDF，即 `ln(N + 2)`（§9.4 相关度门槛）。
+    let max_idf = (total_rows + 2.0).ln();
 
     let mut scores: std::collections::BTreeMap<String, f64> = Default::default();
     for token in &tokens {
@@ -725,11 +776,14 @@ async fn keyword_arm(
             .then(a.0.cmp(&b.0))
     });
     ranked.truncate(candidate_limit);
-    Ok(ranked.into_iter().map(|(id, _)| id).collect())
+    Ok(ranked
+        .into_iter()
+        .map(|(id, score)| (id, (score / max_idf) as f32))
+        .collect())
 }
 
 enum VectorArm {
-    Ran { ranked: Vec<String>, covered: f32 },
+    Ran { ranked: ScoredArm, covered: f32 },
     Unavailable { reason: String },
 }
 
@@ -824,7 +878,7 @@ async fn vector_arm(
     scored.truncate(candidate_limit);
 
     Ok(VectorArm::Ran {
-        ranked: scored.into_iter().map(|(id, _)| id).collect(),
+        ranked: scored,
         covered,
     })
 }
@@ -895,6 +949,11 @@ pub(super) async fn load_item(
             Some(raw) => Some(decode(raw, "memory_items.superseded_by")?),
             None => None,
         },
+        application: match &row.application {
+            Some(raw) => Some(decode(&format!("\"{raw}\""), "memory_items.application")?),
+            None => None,
+        },
+        applies_when: row.applies_when.clone(),
     }))
 }
 
@@ -926,8 +985,8 @@ mod tests {
     use super::*;
     use komo_kernel::types::ids::{EventId, Seq, SessionId};
     use komo_kernel::types::memory::{
-        Confirmation, Evidence, EvidenceRef, ExtractionMetadata, MemoryKind, MemoryUsage,
-        Provenance,
+        Confirmation, Evidence, EvidenceRef, ExtractionMetadata, MemoryApplication, MemoryKind,
+        MemoryUsage, Provenance,
     };
     use time::macros::datetime;
 
@@ -969,6 +1028,8 @@ mod tests {
             usage: MemoryUsage::default(),
             supersedes: None,
             superseded_by: None,
+            application: None,
+            applies_when: None,
         }
     }
 
@@ -983,6 +1044,8 @@ mod tests {
             now: NOW,
             query_vector: None,
             include_states: vec![],
+            min_similarity: 0.0,
+            min_keyword_score: 0.0,
         }
     }
 
@@ -1993,6 +2056,231 @@ mod tests {
             read.supersedes.unwrap().memory.as_str(),
             "m-1",
             "前向链读得回来"
+        );
+    }
+
+    // ---------------------------------------------------------------- 相关度门槛（§9.4）
+
+    /// 三条记忆：m-1 只有关键词认（命中"空调"、没有向量）、m-2 只有向量认（同向、正文不含
+    /// "空调"）、m-3 两臂都不认（向量正交、正文无关）。
+    async fn gated_repo() -> (TursoMemoryRepo, tempfile::TempDir) {
+        let (db, dir) = temp().await;
+        let repo = TursoMemoryRepo::new(db);
+        repo.put_generation("gen-1", Some(&space(2)), IndexState::Ready, true)
+            .await
+            .unwrap();
+        for (id, content) in [
+            ("m-1", "客厅空调设 26 度"),
+            ("m-2", "喜欢深色主题"),
+            ("m-3", "咖啡豆放冰箱"),
+        ] {
+            repo.put(item(id, content, MemoryState::Active), None)
+                .await
+                .unwrap();
+        }
+        for (id, v) in [("m-2", vec![1.0, 0.0]), ("m-3", vec![0.0, 1.0])] {
+            repo.put_vector(&MemoryId::from_raw(id), 1, "gen-1", Vector(v))
+                .await
+                .unwrap();
+        }
+        (repo, dir)
+    }
+
+    fn gated(min_similarity: f32, min_keyword_score: f32) -> RecallQuery {
+        RecallQuery {
+            query_vector: Some(Vector(vec![1.0, 0.0])),
+            min_similarity,
+            min_keyword_score,
+            ..query("空调", RetrievalMode::Hybrid)
+        }
+    }
+
+    fn ids_of(result: &RecallResult) -> Vec<&str> {
+        let mut ids: Vec<&str> = result.items.iter().map(|i| i.id.as_str()).collect();
+        ids.sort();
+        ids
+    }
+
+    /// 过任一臂门槛就留下；两臂都没过的丢掉，而且不拿别的补足 `top_k`。
+    #[tokio::test]
+    async fn an_item_that_clears_either_arms_threshold_stays_and_the_rest_are_dropped() {
+        let (repo, _dir) = gated_repo().await;
+        let result = repo.recall(&gated(0.9, 0.5)).await.unwrap();
+        assert_eq!(
+            ids_of(&result),
+            vec!["m-1", "m-2"],
+            "m-1 只过关键词、m-2 只过向量、m-3 两臂都没过"
+        );
+        assert_eq!(result.dropped_by_threshold, Some(1));
+        let by_id = |id: &str| {
+            result
+                .arm_scores
+                .iter()
+                .find(|s| s.id.as_str() == id)
+                .unwrap()
+        };
+        let keyword_only = by_id("m-1");
+        assert!(keyword_only.vector.is_none());
+        assert!(keyword_only.keyword.unwrap() > 0.5);
+        assert_eq!(
+            keyword_only.passed,
+            vec![komo_kernel::types::memory::RecallArm::Keyword]
+        );
+        let vector_only = by_id("m-2");
+        assert!(vector_only.keyword.is_none());
+        assert!((vector_only.vector.unwrap() - 1.0).abs() < 1e-5);
+        assert_eq!(
+            vector_only.passed,
+            vec![komo_kernel::types::memory::RecallArm::Vector]
+        );
+    }
+
+    /// 关键词分归一化到 `ln(N+2)` 以内：只命中一个词的分小于 1，所以 1.0 的门槛挡得住它。
+    #[tokio::test]
+    async fn the_keyword_score_is_normalised_so_one_word_stays_below_one() {
+        let (repo, _dir) = gated_repo().await;
+        let result = repo.recall(&gated(0.0, 0.0)).await.unwrap();
+        let score = result
+            .arm_scores
+            .iter()
+            .find(|s| s.id.as_str() == "m-1")
+            .unwrap()
+            .keyword
+            .unwrap();
+        // N = 3：ln(1 + 4/2) / ln(5)。
+        assert!(
+            (score - (3.0f32.ln() / 5.0f32.ln())).abs() < 1e-5,
+            "{score}"
+        );
+        let strict = repo.recall(&gated(0.9, 1.0)).await.unwrap();
+        assert_eq!(ids_of(&strict), vec!["m-2"]);
+    }
+
+    /// 两个门槛都是 0 时与没有门槛一样：两臂名单里的都留着。
+    #[tokio::test]
+    async fn zero_thresholds_keep_everything_the_arms_returned() {
+        let (repo, _dir) = gated_repo().await;
+        let result = repo.recall(&gated(0.0, 0.0)).await.unwrap();
+        assert_eq!(ids_of(&result), vec!["m-1", "m-2", "m-3"]);
+        assert_eq!(result.dropped_by_threshold, Some(0));
+    }
+
+    /// 向量臂没跑（没有查询向量）：只看关键词门槛，向量门槛不会把关键词命中也一并挡掉。
+    #[tokio::test]
+    async fn when_the_vector_arm_did_not_run_only_the_keyword_threshold_counts() {
+        let (repo, _dir) = gated_repo().await;
+        let degraded = |min_keyword_score| RecallQuery {
+            query_vector: None,
+            min_similarity: 0.9,
+            min_keyword_score,
+            ..query("空调", RetrievalMode::Hybrid)
+        };
+        let kept = repo.recall(&degraded(0.5)).await.unwrap();
+        assert!(kept.degraded);
+        assert_eq!(ids_of(&kept), vec!["m-1"]);
+        let dropped = repo.recall(&degraded(0.9)).await.unwrap();
+        assert!(dropped.items.is_empty(), "关键词分没过门槛就是空，不补足");
+    }
+
+    // ---------------------------------------------------------------- 使用方式与索引输入（§9.5）
+
+    /// 条件为空时 `content_hash` 与加列之前逐字相同（存量向量不失效）；带条件时哈希的是
+    /// 索引输入，向量也据此生成。
+    #[tokio::test]
+    async fn the_content_hash_covers_the_index_input_and_matches_the_old_one_without_a_condition() {
+        let (db, _dir) = temp().await;
+        let repo = TursoMemoryRepo::new(db);
+        repo.put(item("m-1", "喜欢深色主题", MemoryState::Active), None)
+            .await
+            .unwrap();
+        let mut conditional = item("m-2", "发布工单 Platform 默认 saas", MemoryState::Active);
+        conditional.application = Some(MemoryApplication::Convention);
+        conditional.applies_when = Some("创建发布工单、需要选 Platform 时".into());
+        repo.put(conditional, None).await.unwrap();
+
+        let pending = repo.pending_vectors("gen-1", None, 10).await.unwrap();
+        assert_eq!(pending[0].content, "喜欢深色主题");
+        assert_eq!(
+            pending[0].content_hash,
+            ContentHash::of_str("喜欢深色主题").as_str(),
+            "没有条件时与旧算法相同"
+        );
+        assert_eq!(
+            pending[1].content,
+            "发布工单 Platform 默认 saas\n创建发布工单、需要选 Platform 时"
+        );
+        assert_eq!(
+            pending[1].content_hash,
+            ContentHash::of_str(&pending[1].content).as_str()
+        );
+    }
+
+    /// 关键词臂也对索引输入建：只出现在条件里的词能命中；application 与条件读得回来，
+    /// 旧行（没有这两列）读成 `None`。
+    #[tokio::test]
+    async fn the_condition_is_searchable_and_both_columns_round_trip() {
+        let (db, _dir) = temp().await;
+        let repo = TursoMemoryRepo::new(db);
+        let mut conditional = item("m-1", "Platform 默认 saas", MemoryState::Active);
+        conditional.application = Some(MemoryApplication::Convention);
+        conditional.applies_when = Some("创建发布工单时".into());
+        repo.put(conditional, None).await.unwrap();
+        repo.put(item("m-2", "喜欢深色主题", MemoryState::Active), None)
+            .await
+            .unwrap();
+
+        let found = repo
+            .recall(&query("发布工单", RetrievalMode::Keyword))
+            .await
+            .unwrap();
+        assert_eq!(found.items.len(), 1);
+        assert_eq!(
+            found.items[0].application,
+            Some(MemoryApplication::Convention)
+        );
+        assert_eq!(
+            found.items[0].applies_when.as_deref(),
+            Some("创建发布工单时")
+        );
+
+        let plain = repo.get(&MemoryId::from_raw("m-2")).await.unwrap().unwrap();
+        assert_eq!(plain.application, None);
+        assert_eq!(plain.applies_when, None);
+    }
+
+    /// 正文相同、条件不同的是两条：按"正文 + 条件"找不会撞到另一条，只按正文找则不论条件。
+    #[tokio::test]
+    async fn the_same_content_with_another_condition_is_found_separately() {
+        let (db, _dir) = temp().await;
+        let repo = TursoMemoryRepo::new(db);
+        let mut a = item("m-1", "默认选 saas", MemoryState::Active);
+        a.applies_when = Some("创建发布工单时".into());
+        repo.put(a, None).await.unwrap();
+
+        let scope = MemoryScope::Personal;
+        assert!(
+            repo.find_by_content(&scope, "默认选 saas")
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            repo.find_by_content_and_condition(&scope, "默认选 saas", Some("创建发布工单时"))
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            repo.find_by_content_and_condition(&scope, "默认选 saas", Some("写周报时"))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            repo.find_by_content_and_condition(&scope, "默认选 saas", None)
+                .await
+                .unwrap()
+                .is_none()
         );
     }
 }

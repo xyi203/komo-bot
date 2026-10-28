@@ -153,6 +153,8 @@ mod tests {
             },
             supersedes: None,
             superseded_by: None,
+            application: None,
+            applies_when: None,
         }
     }
 

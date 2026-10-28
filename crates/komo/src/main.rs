@@ -287,7 +287,7 @@ enum MemoryCommand {
         /// 最多列多少条。
         #[arg(long)]
         limit: Option<u32>,
-        /// 一条一行、制表符分隔、正文不截断：`id@版本 状态 来源 确认 正文`。
+        /// 一条一行、制表符分隔、正文不截断：`id@版本 状态 来源 确认 用量 使用方式 条件 正文`。
         #[arg(long)]
         full: bool,
     },
@@ -323,6 +323,27 @@ enum MemoryCommand {
         /// 作用域：personal（默认）/ project:<id> / environment:<id>。
         #[arg(long, default_value = "personal")]
         scope: String,
+        /// 使用方式：convention（长期约定）/ reference（线索）。省略 = reference；
+        /// convention 只给 preference，且必须带 --applies-when。
+        #[arg(long)]
+        application: Option<String>,
+        /// 约定适用的条件，一句能独立理解的话，如「创建发布工单、需要选 Platform 时」。
+        #[arg(long)]
+        applies_when: Option<String>,
+    },
+    /// 操作者给指定 revision 定使用方式（约定 / 线索）与条件，写成新 revision；证据与确认不变。
+    Classify {
+        /// 记忆 ID。
+        memory_id: String,
+        /// 预期 revision。
+        #[arg(long)]
+        revision: u32,
+        /// 使用方式：convention / reference。convention 只给 preference，且要有条件。
+        #[arg(long)]
+        application: String,
+        /// 条件；省略 = 沿用现有条件。
+        #[arg(long)]
+        applies_when: Option<String>,
     },
     /// 操作者确认指定 revision。
     Confirm {
@@ -739,7 +760,34 @@ async fn operator(
                 content,
                 kind,
                 scope,
-            } => commands::memory_add(client, &content, &kind, &scope).await,
+                application,
+                applies_when,
+            } => {
+                commands::memory_add(
+                    client,
+                    &content,
+                    &kind,
+                    &scope,
+                    application.as_deref(),
+                    applies_when.as_deref(),
+                )
+                .await
+            }
+            MemoryCommand::Classify {
+                memory_id,
+                revision,
+                application,
+                applies_when,
+            } => {
+                commands::memory_classify(
+                    client,
+                    &memory_id,
+                    revision,
+                    &application,
+                    applies_when.as_deref(),
+                )
+                .await
+            }
             MemoryCommand::Confirm {
                 memory_id,
                 revision,

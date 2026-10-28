@@ -522,7 +522,8 @@ pub fn memory_list(response: &MemoryListResponse) -> String {
 
 /// `komo memory list --full`：一条一行、制表符分隔、正文不截断，给模型一次读完。
 ///
-/// 列是 `id@版本  状态  来源  确认  正文`；没有表头和对齐空格，正文里的换行与制表符压成空格，
+/// 列是 `id@版本  状态  来源  确认  用量  使用方式  条件  正文`（没有条件写 `-`，旧条目的使用方式写
+/// `未分类`）；没有表头和对齐空格，正文里的换行与制表符压成空格，
 /// 所以"一行一条"始终成立。
 pub fn memory_list_full(response: &MemoryListResponse) -> String {
     let mut out = Vec::new();
@@ -545,7 +546,7 @@ pub fn memory_list_full(response: &MemoryListResponse) -> String {
             .collect::<Vec<_>>()
             .join(" ");
         out.push(format!(
-            "{}@{}\t{}\t{}\t{}\t注入 {} 次 · 用上 {} 次\t{}",
+            "{}@{}\t{}\t{}\t{}\t注入 {} 次 · 用上 {} 次\t{}\t{}\t{}",
             item.id,
             item.revision,
             memory_state(item.state),
@@ -553,6 +554,8 @@ pub fn memory_list_full(response: &MemoryListResponse) -> String {
             confirmation(item.confirmation),
             item.usage.count,
             item.usage.adopted_count,
+            application_text(item),
+            item.applies_when.as_deref().unwrap_or("-"),
             content
         ));
     }
@@ -573,6 +576,14 @@ pub fn memory_added(response: &komo_kernel::protocol::http::MemoryAddResponse) -
     format!("{head}\n\n{}", memory_show(item))
 }
 
+/// 使用方式的显示：没分类的旧条目如实写"未分类"（按线索用，§9.2）。
+fn application_text(item: &MemoryItem) -> &'static str {
+    match item.application {
+        Some(application) => application.as_str(),
+        None => "未分类",
+    }
+}
+
 /// `komo memory show <id>`。
 pub fn memory_show(item: &MemoryItem) -> String {
     let mut out = vec![
@@ -589,6 +600,11 @@ pub fn memory_show(item: &MemoryItem) -> String {
             confirmation(item.confirmation)
         ),
         format!("状态    {}", memory_state(item.state)),
+        format!(
+            "使用方式  {}   条件  {}",
+            application_text(item),
+            item.applies_when.as_deref().unwrap_or("（无）")
+        ),
         // 观察时间与入库时间是两回事（§9.2）。
         format!(
             "观察    {}   入库 {}   更新 {}",

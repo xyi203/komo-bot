@@ -17,8 +17,8 @@ use komo_kernel::events::{Event, EventPayload};
 use komo_kernel::traits::{Clock, LlmClient};
 use komo_kernel::types::ids::{EventId, MemoryId, RunId, Seq, SessionId};
 use komo_kernel::types::memory::{
-    Confirmation, Evidence, EvidenceRef, ExtractionMetadata, MemoryItem, MemoryKind, MemoryScope,
-    MemoryState, Provenance,
+    Confirmation, Evidence, EvidenceRef, ExtractionMetadata, MemoryApplication, MemoryItem,
+    MemoryKind, MemoryScope, MemoryState, Provenance,
 };
 use komo_kernel::types::model::ModelConfig;
 use komo_kernel::types::status::RunState;
@@ -31,7 +31,7 @@ use super::consolidate::{RawVerdict, Verdict, map_verdicts};
 
 /// 提示词版本。**改了提示词就改它**——它进 [`ExtractionMetadata`]，是"这条记忆是怎么来
 /// 的"里唯一能回答"按哪一版规则提的"的那一格（§9.2）。
-pub const PROMPT_VERSION: &str = "memory-extract/v7";
+pub const PROMPT_VERSION: &str = "memory-extract/v8";
 
 /// 一条记忆正文的上限。再长就不是"简短、尽量单一的陈述"了（§9.2）。
 pub(super) const MAX_CONTENT_CHARS: usize = 300;
@@ -82,6 +82,17 @@ pub struct RawObservation {
     /// 再用编号表映射回 id——一条坏的不拖累整批。
     #[serde(default)]
     pub relations: Vec<serde_json::Value>,
+    /// 模型自称的使用方式：`convention` / `reference`（§9.2）。也只是"自称"，
+    /// [`Transcript::validate`] 对 convention 逐条核对，不合格降为 reference。
+    #[serde(default)]
+    pub application: Option<String>,
+    /// convention 的条件，写成一句能独立理解的话；reference 可省。
+    #[serde(default)]
+    pub applies_when: Option<String>,
+    /// convention 的依据：所引用户事件里表达长期意图与条件的原话片段。**只用于校验，
+    /// 不落库**（§9.3）。
+    #[serde(default)]
+    pub basis: Option<String>,
 }
 
 fn default_kind() -> String {
@@ -120,6 +131,9 @@ pub struct Observation {
     pub extraction: ExtractionMetadata,
     /// 与已有记忆的关系，编号已映射成 id（§9.9）。
     pub relations: Vec<Verdict>,
+    /// 校验过的使用方式。提取一律给出 `Some`：没通过 convention 校验的是 reference。
+    pub application: Option<MemoryApplication>,
+    pub applies_when: Option<String>,
 }
 
 impl Observation {
@@ -157,6 +171,8 @@ pub struct Transcript {
     statements: String,
     /// 事件 ID → （所属 Run，seq，角色）。**校验引用位置**用的就是它。
     roles: BTreeMap<String, (RunId, Seq, Role)>,
+    /// 用户事件 ID → 空白归一后的完整原文：convention 的 `basis` 要在它里面逐字出现。
+    user_texts: BTreeMap<String, String>,
     /// 这一批 Run 的系统提示里注入过的记忆（去重、按首次出现排序）。
     injected: Vec<MemoryUse>,
     /// `memory = "private"` 的 Profile：这一批只许写进这一个作用域（`agent:<id>`）。模型
@@ -202,6 +218,7 @@ impl Transcript {
     /// 再删最旧的助手 / 任务交回行（§9.10）。
     pub fn build(session: &SessionId, runs: &[RunWindow], events: &[Event]) -> Transcript {
         let mut roles = BTreeMap::new();
+        let mut user_texts = BTreeMap::new();
         let mut lines: Vec<Line> = Vec::new();
         let mut cursors: BTreeMap<RunId, Seq> =
             runs.iter().map(|w| (w.run.clone(), w.cursor)).collect();
@@ -268,6 +285,9 @@ impl Transcript {
                 _ => continue,
             };
             roles.insert(event.event_id.to_string(), (run.clone(), event.seq, role));
+            if role == Role::User {
+                user_texts.insert(event.event_id.to_string(), squash_whitespace(&body));
+            }
             // 旧证据仍然渲染给模型当上下文，但标出来——它不是新发生的事。
             let seen = if fresh { "" } else { " · 已处理过" };
             if fresh && role == Role::User {
@@ -358,6 +378,7 @@ impl Transcript {
             statuses: runs.iter().map(|w| (w.run.clone(), w.status)).collect(),
             statements: statements.join("\n"),
             roles,
+            user_texts,
             injected,
             confined: None,
         }
@@ -615,6 +636,8 @@ impl Transcript {
             .unwrap_or_else(|| evidence.first().map(|e| e.observed_at).unwrap_or(now));
         let valid_until = raw.valid_until.as_deref().and_then(parse_time);
 
+        let (application, applies_when) = self.classify(&raw, kind, provenance, &evidence);
+
         let mut extraction =
             ExtractionMetadata::new(model.model.clone(), model.effort.clone(), PROMPT_VERSION);
         extraction.source_cursor = Some(self.cursor());
@@ -644,8 +667,66 @@ impl Transcript {
             valid_until,
             extraction,
             relations,
+            application: Some(application),
+            applies_when,
         })
     }
+
+    /// 使用方式的校验（§9.3）：convention 必须同时满足——kind 是 preference、模型自称与
+    /// 证据都是用户陈述、`applies_when` 非空、`basis` 逐字出现在所引的某条用户事件里（空白
+    /// 归一后比较）。任何一条不满足就降为 reference：观察照常落库，只是不当约定。
+    ///
+    /// 原话匹配只证明引用真实，不证明语义理解对；这一步挡的是"工具观察 / 推断冒充约定"
+    /// 和"编一句原话"，长期性本身靠提示词把关。
+    fn classify(
+        &self,
+        raw: &RawObservation,
+        kind: MemoryKind,
+        provenance: Provenance,
+        evidence: &[Evidence],
+    ) -> (MemoryApplication, Option<String>) {
+        let applies_when = raw
+            .applies_when
+            .as_deref()
+            .map(str::trim)
+            .filter(|when| !when.is_empty() && when.chars().count() <= MAX_CONTENT_CHARS)
+            .map(str::to_string);
+        if raw.application.as_deref().map(str::trim) != Some("convention") {
+            return (MemoryApplication::Reference, applies_when);
+        }
+        let basis = raw
+            .basis
+            .as_deref()
+            .map(squash_whitespace)
+            .unwrap_or_default();
+        let quoted = !basis.is_empty()
+            && evidence.iter().any(|evidence| match &evidence.reference {
+                EvidenceRef::Event { event, .. } => self
+                    .user_texts
+                    .get(event.as_str())
+                    .is_some_and(|text| text.contains(&basis)),
+                EvidenceRef::Memos { .. } => false,
+            });
+        let qualifies = kind == MemoryKind::Preference
+            && raw.said_by == SaidBy::UserStatement
+            && provenance == Provenance::UserStatement
+            && applies_when.is_some()
+            && quoted;
+        if qualifies {
+            (MemoryApplication::Convention, applies_when)
+        } else {
+            tracing::debug!(
+                session = %self.session,
+                "convention 校验没过（preference / 用户陈述 / 条件 / basis 原话），降为 reference"
+            );
+            (MemoryApplication::Reference, applies_when)
+        }
+    }
+}
+
+/// 空白归一：连续空白（含换行）折成一个空格并去掉首尾，basis 与原文都按它比较。
+fn squash_whitespace(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// 把一批 Run 按受理顺序切成几段，每段的用户输入行加起来不超窗口预算（§9.10）。
@@ -894,6 +975,8 @@ const SYSTEM_PROMPT: &str = "\
 \"said_by\":\"user_statement|tool_observation|model_inference\",\
 \"evidence\":[\"<事件 ID>\"],\"observed_at\":\"RFC3339，可省略\",\
 \"valid_until\":\"RFC3339，可省略\",\
+\"application\":\"convention|reference\",\"applies_when\":\"条件，convention 必填\",\
+\"basis\":\"仅 convention：所引用户事件里的原话片段\",\
 \"relations\":[{\"memory\":<已有记忆方括号里的编号，整数>,\"relation\":\
 \"same|supports|contradicts|supersedes|unrelated\"}]}],\
 \"used\":[{\"memory\":\"<注入记忆方括号里的编号，如 m0>\",\"evidence\":[\"<助手事件 ID>\"]}]}
@@ -928,7 +1011,34 @@ unrelated = 不相干（可不写）。判冲突前先看作用域和时间：�
 一遍、或者根本没体现，都不算。evidence 引批内助手事件的 ID（工具调用在发起它的助手事件上），不能\
 引用户行或单独的工具结果。没有就交回空数组；不要凑。
 12. 「已有的相关记忆」里标着「本段已手动记下」的，是这段对话里已经用 `komo memory add` 记过的：\
-同一件事不要再交回，换个说法也不要；同一句话里说到的**别的**值得记的事照常提。";
+同一件事不要再交回，换个说法也不要；同一句话里说到的**别的**值得记的事照常提。
+13. 每条都要定 application，先判**长期性**再定使用方式：
+- convention = 用户表达了长期意图（「以后」「默认」「每次都」「一律」「别再」这类话）的偏好或限制。\
+只能是 kind=preference、said_by=user_statement；applies_when 必填，写成一句能独立理解的条件\
+（「创建发布工单、需要选 Platform 时」）；basis 必填，从你引的**用户**事件里原样摘出表达长期意图与\
+条件的那句话，不要改写。
+- reference = 其余一切：事实、排查得来的经验、工具观察、你的推断，以及拿不准长期性或条件的用户话。\
+applies_when 可省。拿不准时一律交回 reference，不要硬标 convention。
+- **当次要求不是记忆**：「这个工单选 saas」「这次优化用 terra 子 Agent 并行做」只管眼前的任务，\
+不要提。工具结果显示上次选了 saas，通常也不提；提也只能是 reference，推不出用户的默认值。
+示例：用户说「以后发布工单 Platform 都选 saas」→ preference + convention，applies_when=「创建发布\
+工单、需要选 Platform 时」，basis=「以后发布工单 Platform 都选 saas」；用户说「ob-note 这个仓库的 Git \
+设置别改全局」→ preference + convention，scope 用该项目，applies_when=「在 ob-note 仓库里改 Git \
+设置时」；排查证明某接口要 `issueKey` → experience + reference；你猜用户喜欢 saas → \
+model_inference + reference。";
+
+/// 编号候选行里的使用方式与条件（§9.6：判关系要看它们——正文相同、条件不同的是两条）。
+/// 旧条目没分类，如实写「未分类」，不替它说成 reference。
+pub(super) fn application_label(item: &MemoryItem) -> String {
+    let application = item
+        .application
+        .map(|a| a.as_str().to_string())
+        .unwrap_or_else(|| "未分类".to_string());
+    match item.applies_when.as_deref() {
+        Some(when) => format!(" 使用方式={application} 条件：{when}"),
+        None => format!(" 使用方式={application}"),
+    }
+}
 
 fn user_prompt(
     transcript: &Transcript,
@@ -961,8 +1071,13 @@ fn user_prompt(
                     ""
                 };
                 format!(
-                    "[{index}] 状态={:?} 来源={:?} 确认={:?} 作用域={}{by_hand} 内容：{}",
-                    item.state, item.provenance, item.confirmation, item.scope, item.content
+                    "[{index}] 状态={:?} 来源={:?} 确认={:?} 作用域={}{by_hand}{} 内容：{}",
+                    item.state,
+                    item.provenance,
+                    item.confirmation,
+                    item.scope,
+                    application_label(item),
+                    item.content
                 )
             })
             .collect::<Vec<_>>()

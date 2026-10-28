@@ -263,14 +263,20 @@ const BASH_TOOL: &str = "bash";
 /// 「记住」那句（2026-10-20）：记忆原本只能等后台提取，用户说"记住这个习惯"时只能回一句
 /// "等它出现在列表里再确认"。
 ///
+/// 「记住」那句的约定分支（2026-10-28，附录 F）：用户说了"以后""默认""每次都"这类话才带
+/// `--application convention` 与条件，当次要求不 add；不带 `--application` 记成线索。
+///
 /// 末句（2026-10-15）：会话里 6 次在 Run 里重启 Gateway，8 个调用因此记成 uncertain，
 /// 最长的一条两个多小时后才收尾。
 const SELF_BLOCK: &str = "komo 自己的状态（cron、会话 / Run、记忆、介入、配置、skills、\
                           Gateway）用 bash 跑 `komo <子命令>` 查，例如 `komo cron list`，\
                           其余看 `komo --help`；别去翻系统 crontab、launchctl 或同名 skill。\
-                          用户要你记住什么（偏好、习惯、约定），当场用 `komo memory add \"一句陈述\"` \
-                          记下，它记成用户原话、未确认，告诉用户可以用 `komo memory confirm` 确认；\
-                          别替用户 confirm。\
+                          用户要你记住什么，当场用 `komo memory add \"一句陈述\"` 记下，它记成用户\
+                          原话、未确认，告诉用户可以用 `komo memory confirm` 确认；别替用户 \
+                          confirm。用户表达了长期意图（\"以后\"\"默认\"\"每次都\"）的偏好，带 \
+                          `--application convention --applies-when \"适用的条件\"` 记成长期约定；\
+                          只管眼前这件事的要求（\"这个工单选 saas\"）不要 add；拿不准就不带 \
+                          `--application`，记成线索。\
                           你自己就跑在 Gateway 里：`komo gateway restart|stop` 和会重启 \
                           Gateway 的安装脚本会打断你正在做的这件事，要跑就放在最后一步，\
                           或者交给用户自己跑。";

@@ -15,6 +15,7 @@
 //! | `PATCH /v1/cron/{id}` | [`UpdateCronRequest`] | [`CronJob`] |
 //! | `POST /v1/cron/{id}/run` | [`ManualCronRunRequest`] | [`ManualCronRunResponse`] |
 //! | `POST /v1/memories/{id}/confirm` | [`MemoryRevisionRequest`] | [`MemoryDetail`] |
+//! | `POST /v1/memories/{id}/classify` | [`MemoryClassifyRequest`] | [`MemoryDetail`] |
 //! | `POST /v1/memories/{id}/forget` | [`MemoryRevisionRequest`] | [`MemoryDetail`] |
 //! | `POST /v1/memories/{id}/restore` | [`MemoryRevisionRequest`] | [`MemoryDetail`] |
 //! | `POST /v1/memory-sweep` | [`MemorySweepRequest`] | [`MemorySweepResponse`] |
@@ -37,7 +38,9 @@ use super::config::{ConfigIssue, KeyPath, SourceFile};
 use crate::cron::{CronFiring, CronJob, JobStatus, NotifyPolicy, OverlapPolicy};
 use crate::types::chat::PeerId;
 use crate::types::ids::{CronJobId, MemoryId, RequestKey, RunId, Seq, SessionId};
-use crate::types::memory::{MemoryItem, MemoryKind, MemoryScope, MemoryState, RetrievalMode};
+use crate::types::memory::{
+    MemoryApplication, MemoryItem, MemoryKind, MemoryScope, MemoryState, RetrievalMode,
+};
 use crate::types::model::{Effort, EmbeddingSpace, ModelConfig};
 use crate::types::plan::{PlanHash, PlanSource};
 use crate::types::status::{RunState, SessionState, WaitReason};
@@ -876,6 +879,25 @@ pub struct MemoryAddRequest {
     pub session: Option<SessionId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run: Option<RunId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_key: Option<RequestKey>,
+    /// 使用方式（§9.2）。省略 = reference：默认 kind 是 preference，但"是偏好"不等于
+    /// "是长期约定"。`convention` 要求 kind 为 preference 且带 `applies_when`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub application: Option<MemoryApplication>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub applies_when: Option<String>,
+}
+
+/// `POST /v1/memories/{id}/classify`：操作者给指定 revision 定使用方式与条件（§9.3
+/// 「存量分类」）。写成新 revision，证据与确认原样保留；规则同 add。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryClassifyRequest {
+    pub expected_revision: u32,
+    pub application: MemoryApplication,
+    /// 省略 = 沿用现有条件。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub applies_when: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_key: Option<RequestKey>,
 }

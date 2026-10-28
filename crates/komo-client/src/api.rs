@@ -614,6 +614,15 @@ impl KomoClient {
             .await
     }
 
+    pub async fn memory_classify(
+        &self,
+        memory: &MemoryId,
+        request: &MemoryClassifyRequest,
+    ) -> ClientResult<MemoryDetail> {
+        self.post(&format!("/v1/memories/{memory}/classify"), request)
+            .await
+    }
+
     pub async fn memory_forget(
         &self,
         memory: &MemoryId,

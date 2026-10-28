@@ -85,6 +85,8 @@ fn synthetic(index: usize, now: OffsetDateTime) -> MemoryItem {
         usage: MemoryUsage::default(),
         supersedes: None,
         superseded_by: None,
+        application: None,
+        applies_when: None,
     }
 }
 
@@ -139,6 +141,8 @@ fn query(text: &str, mode: RetrievalMode, probe: Option<Vector>) -> RecallQuery 
         now: OffsetDateTime::now_utc(),
         query_vector: probe,
         include_states: vec![],
+        min_similarity: 0.0,
+        min_keyword_score: 0.0,
     }
 }
 

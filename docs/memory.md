@@ -1,6 +1,6 @@
 # komo Memory
 
-> 状态：§9.1–§9.7 是 Memory 的**规格**，2026-10-19 从 [`komo_bot.md`](komo_bot.md) §9 原样迁来，小节号不变——代码注释与其他文档里的 §9.x 照旧指这里。§9.8–§9.10 已实现（§9.10 含 `used` 采纳）。各节标"2026-10-28，附录 F"的段落（约定与线索、相关度门槛、注入分组、索引输入含条件、`classify`）是已认可、**尚未实现**的规格。附录 A–F 是调研、分析与评估，不是规格；与正文冲突时以正文为准，任何一条要落地，先改正文。
+> 状态：§9.1–§9.7 是 Memory 的**规格**，2026-10-19 从 [`komo_bot.md`](komo_bot.md) §9 原样迁来，小节号不变——代码注释与其他文档里的 §9.x 照旧指这里。§9.8–§9.10 已实现（§9.10 含 `used` 采纳）。各节标"2026-10-28，附录 F"的段落（约定与线索、相关度门槛、注入分组、索引输入含条件、`classify`）已于 2026-10-28 实现并通过验收（见 §9.4「附录 F 的实现与验收」）。附录 A–F 是调研、分析与评估，不是规格；与正文冲突时以正文为准，任何一条要落地，先改正文。
 > 2026-10-25 起 Memory 跑在新存储上（`docs/storage-durable.md`）：条目 / 证据 / 索引 / 采纳计数在 `aux.db`（toasty，与 `durable.db` 分库），会话内容是 `durable.db` 的 entry，证据引用仍是 `Seq` / `RunId`（新编码，`komo-kernel/src/durable/legacy_ids.rs`）；注入是系统段 `memory` + 会话级 document `komo.memory`，提取游标是 document `komo.memory_cursor`，提取读的是 entry / submission 经 `legacy_events` 投影出的事件。正文里仍写"事件""Run""`memory.injected`"的地方指这层投影的词汇，不再是 JSONL 事件。
 > 文中不带文件名的其他章节号（§3、§8.2、§8.5、§10 …）指 [`komo_bot.md`](komo_bot.md)。附录内的编号只在本附录内有效。
 
@@ -21,7 +21,7 @@
 | 附录 C | 对照 v0.8 的差距分析（原 `docs/memory.md`） | 2026-09-24 分析 |
 | 附录 D | 记忆效果基线：注入有没有用、该召回的召回了没有 | 2026-10-19 回溯评估 |
 | 附录 E | Claude Code 的记忆机制（官方文档核对） | 2026-10-26 调研 |
-| 附录 F | 长期约定与历史线索的使用模型 | 2026-10-28 提案；已并入 §9.2–§9.8 正文，代码未实施 |
+| 附录 F | 长期约定与历史线索的使用模型 | 2026-10-28 提案；已并入 §9.2–§9.8 正文，已实现（§9.4 验收记录） |
 
 ## 9.1 两类内容，分别保存
 
@@ -60,7 +60,7 @@
 
 用户主动保存到 Memos 表示“要求保留这段内容”，其中可能有引用、假设或待办，不等于确认了其中每一句话。只有用户明确确认的具体陈述才能获得 user_confirmed。
 
-**约定与线索（2026-10-28，附录 F）。** kind 说内容是什么，provenance 说从哪来，confirmation 说用户有没有复核过这一版的文字——三者都不回答"这条该怎么影响行为"。用户说过"以后发布工单 Platform 都选 saas"，记成 active + user_statement + unconfirmed 之后，旧的注入把"未确认"读成"先问用户"，同一个默认值每次都要再问一遍。所以使用方式单独一格：
+**约定与线索（2026-10-28，附录 F，已实现）。** kind 说内容是什么，provenance 说从哪来，confirmation 说用户有没有复核过这一版的文字——三者都不回答"这条该怎么影响行为"。用户说过"以后发布工单 Platform 都选 saas"，记成 active + user_statement + unconfirmed 之后，旧的注入把"未确认"读成"先问用户"，同一个默认值每次都要再问一遍。所以使用方式单独一格：
 
 | application | 使用 | 谁能产生 |
 |---|---|---|
@@ -102,7 +102,7 @@ MemoryManager 对 AgentRuntime 提供三个主要入口：recall、process_compl
 
 记忆只收翻不到的东西。工作目录里的文档、源码、配置、skill 说明和命令帮助随时能重读，而且比记忆新，原样摘录不入库；值得记的是用户的偏好、约定与背景，排查或试错后才得出的结论，以及文档没写的坑。为让记忆模型分得清，会话窗口里每个工具结果都标出产生它的调用（工具名与截到 200 字的参数）。一批（一个会话空闲后的全部 Run，一次调用）最多收 `[memory].max_observations` 条，初值 8（提示词 `memory-extract/v5`，2026-10-19 起；v3 为每 Run 5 条，v2 为 12 条且窗口不带调用）。窗口超过 24 000 字符时用户输入行一行不丢，从最旧的工具结果删起，再删最旧的助手行；用户行自己就超预算时按 Run 边界切成几段，每段一次调用、各自推进游标。
 
-**长期约定与当次要求（2026-10-28，附录 F）。** 提取先判长期性，再定使用方式（§9.2）：
+**长期约定与当次要求（2026-10-28，附录 F，已实现）。** 提取先判长期性，再定使用方式（§9.2）：
 
 | 会话里的内容 | 提取结果 |
 |---|---|
@@ -113,14 +113,14 @@ MemoryManager 对 AgentRuntime 提供三个主要入口：recall、process_compl
 | 排查证明某接口要 `issueKey` | experience + reference |
 | 模型猜用户喜欢 saas | model_inference + reference，进 candidate |
 
-模型对 convention 额外交回 `basis`：所引用户事件里表达长期意图与条件的原话片段。Rust 校验（`Transcript::validate`）：kind 是 preference、`said_by` 是 user_statement、evidence 含用户事件、`applies_when` 非空、`basis` 逐字出现在所引的某条用户事件里（空白归一后比较）。任何一条不满足，这条观察**降为 reference** 照常落库，不丢、也不当约定。`basis` 只用于校验，不落库。原话匹配只证明引用真实，不证明语义理解对；所以长期性或条件拿不准时，提示词要求交回 reference。提示词升 `memory-extract/v8`。
+模型对 convention 额外交回 `basis`：所引用户事件里表达长期意图与条件的原话片段。Rust 校验（`Transcript::validate`）：kind 是 preference、`said_by` 是 user_statement、evidence 含用户事件、`applies_when` 非空、`basis` 逐字出现在所引的某条用户事件里（空白归一后比较）。任何一条不满足，这条观察**降为 reference** 照常落库，不丢、也不当约定。去重同样看使用方式：逐字相同的正文只有条件与 application 也相同才算同一条，「本段已手动记下」的兜底合并也一样，不同就新增一条。`basis` 只用于校验，不落库。原话匹配只证明引用真实，不证明语义理解对；所以长期性或条件拿不准时，提示词要求交回 reference。提示词升 `memory-extract/v8`。
 
 **手动记一条（2026-10-20）。** 以前写记忆只有后台提取一条路：用户在聊天里说"记住这个习惯"，Agent 只能回"等它出现在列表里再确认"。现在有 `komo memory add "一句陈述" [--kind preference|fact|experience] [--scope …]`（默认 preference、personal），经 Gateway 的 `POST /v1/memories` 写库，按调用方分两种确认等级：
 
 - **Agent 在 Run 里替用户记**：bash 子进程带着 `KOMO_SESSION` / `KOMO_RUN`，CLI 自动带上。证据是这个 Run 里用户说的话——它受理的那句、并进它的插话（`run.absorbed`）与 `message.user`；任务 / 监听 / 后台命令交回、Cron 提示词、子 Run 的委派正文都不算。一句都没有就拒绝。记成 active + user_statement + unconfirmed，与提取到一句明确的用户原话同级（§9.2），立即进召回，等操作者 confirm。后台任务会话（`kind = task`）里的调用被拒：任务正文是主 Agent 写的，不是用户原话。
 - **操作者在终端自己记**：不带会话，记成 active + user_statement + user_confirmed，没有事件证据。
 
-使用方式用 `--application convention|reference` 与 `--applies-when "条件"` 给（2026-10-28，附录 F）。**省略 `--application` 记成 reference**：默认 kind 是 preference，但"是偏好"不等于"是长期约定"。`convention` 要求 kind 为 preference 且带 `--applies-when`，否则按参数错误拒绝。Agent 代记的 convention 同样以这个 Run 里用户说的话为证据，不另要 `basis`——判断用户有没有长期意图的是 Agent 自己，系统提示要它只在用户说了"以后""默认""每次都"这类话时才带 `convention`；当次要求不 add。操作者在终端写的 convention 是受信任输入，直接生效。
+使用方式用 `--application convention|reference` 与 `--applies-when "条件"` 给（2026-10-28，附录 F，已实现）。**省略 `--application` 记成 reference**：默认 kind 是 preference，但"是偏好"不等于"是长期约定"。`convention` 要求 kind 为 preference 且带 `--applies-when`，否则按参数错误拒绝。Agent 代记的 convention 同样以这个 Run 里用户说的话为证据，不另要 `basis`——判断用户有没有长期意图的是 Agent 自己，系统提示要它只在用户说了"以后""默认""每次都"这类话时才带 `convention`；当次要求不 add。操作者在终端写的 convention 是受信任输入，直接生效。
 
 **存量分类。** 加列之前的条目 application 为 NULL，按 reference 用，不从 user_statement 自动推成 convention。分类由操作者做：`komo memory classify --revision N ID --application … [--applies-when …]`（经 `POST /v1/memories/{id}/classify`），带预期 revision，写成新 revision，证据与 confirmation 原样保留，规则同 `memory add`（convention 只给 preference、必须带条件）。它与 confirm 同属操作者动作（§9.6）：Agent 可以列出建议清单、请求分类，不替用户执行。
 
@@ -153,7 +153,7 @@ MemoryManager 对 AgentRuntime 提供三个主要入口：recall、process_compl
 
 关键词索引不用 FTS5（Turso MVCC 下不可用，§8.2）：索引时把内容（有 `applies_when` 时连同它，§9.5）经 `lexical_terms` 切成 token 串写入 `memory_terms.terms`（首尾带空格），查询时每个 token 一个 `instr(terms, ' tok ') > 0`，命中数按 IDF 加权。`lexical_terms` 对 CJK 连续字符切 bigram、对 ASCII 切单词并小写化——"空调"本身就是一个 bigram，两字查询天然命中，不需要子串后备。IDF 在查询时用 `memory_terms` 行数和每个 token 的命中行数算；1 万条量级是一次全表 `instr`，§14 要求实测 P95，这里不预先宣称达标。
 
-**相关度门槛（2026-10-28，附录 F）。** 每条臂一道绝对门槛，**过任一道即留下**，两道都没过的在融合、重排与预算截断之前丢掉；留下的照旧按 RRF 排序。
+**相关度门槛（2026-10-28，附录 F，已实现）。** 每条臂一道绝对门槛，**过任一道即留下**，两道都没过的在重排与预算截断之前丢掉。名次仍按两臂的**完整名单**做 RRF，门槛只删人、不改名次；留下的照旧按这个名次排序。
 
 | 臂 | 分数 | 门槛（`[memory.retrieval]`） |
 |---|---|---|
@@ -186,7 +186,7 @@ MemoryManager 对 AgentRuntime 提供三个主要入口：recall、process_compl
 
 **这一块记在会话里，跨 Gateway 重启仍逐字复用**（2026-10-14 旧路径；新存储下是系统段）。注入是一个系统段 `memory`（`komo.system` entry 里的一段，key 为 `memory`）：第一次钉住、换段或有条目被遗忘而重算时才写，之后每个请求都取已展示的那一份，直到下一个 head 标记（`/new` 的 `komo.reset`、压缩）——`memory_section_is_pinned_until_the_next_head`。同一份的 `uses`（选了哪些条目与 revision）、召回诊断和召回时刻记在 conversation 级 document `komo.memory`（`MemoryDoc { uses, recall, at }`，只留最后一份）：每个请求前据 `uses` 核对条目还算不算数，遗忘照旧立即作废重算；run 详情的 `memories` / `recall` 读它。一条召回都没有的一段也记（空段），否则重启后会把新记忆塞进段中。重启前后同一段的系统提示逐字相同。旧路径的"追加 `memory.injected` JSONL 事件、`checkpoints` 没人写"随存储重写移除。验收：`hooks` 测试 `memory_section_is_pinned_until_the_next_head`、`recall::the_memory_block_survives_a_restart_within_one_segment`。
 
-**注入分两组（2026-10-28，附录 F）。** 同一次筛出来的条目按 application（§9.2）分组渲染，共用上面的条数与 token 预算，约定不因"是约定"而常驻：
+**注入分两组（2026-10-28，附录 F，已实现）。** 同一次筛出来的条目按 application（§9.2）分组渲染，共用上面的条数与 token 预算，约定不因"是约定"而常驻：
 
 > 适用的长期约定（条件成立、且这次没有另外指定时直接照做，不必因"未确认"再问；这次另有要求以这次为准）：
 > - 发布系统工单的 Platform 默认选择 saas〔适用：创建发布工单、需要选 Platform 时 · 用户原话 · 未确认 · …@1〕
@@ -202,6 +202,8 @@ MemoryManager 对 AgentRuntime 提供三个主要入口：recall、process_compl
 
 **`[memory]` 热重载**（2026-10-14）：`enabled`、`model`（连同它指向的 `model.*` / 凭证）与 `retrieval` 改了就换进 `MemoryManager`，下一次提取 / 召回用新的；此前这几项在构造时定死，重载报告却说"变了"。`memory.embedding` 不在其中——换它是换向量空间（§9.5）。
 
+**附录 F 的实现与验收（2026-10-28）。** 类型与存储：`MemoryItem.application` / `applies_when`，aux.db `memory_items` 追加 `application`、`applies_when` 两列（旧行读成 NULL）；`RetrievalConfig.min_similarity` / `min_keyword_score`（默认 0，热重载）。实现处的几个定法：门槛在 RRF 之后、重排与 `top_k` 之前删人，名次按两臂完整名单融合；一臂没跑只看另一臂，门槛 0 = 该臂名单里的条目都算过；邻居检索（提取前召回、离线整理）不受门槛约束。新增测试：store `an_item_that_clears_either_arms_threshold_stays_and_the_rest_are_dropped`、`the_keyword_score_is_normalised_so_one_word_stays_below_one`、`zero_thresholds_keep_everything_the_arms_returned`、`when_the_vector_arm_did_not_run_only_the_keyword_threshold_counts`、`the_content_hash_covers_the_index_input_and_matches_the_old_one_without_a_condition`、`the_condition_is_searchable_and_both_columns_round_trip`、`the_same_content_with_another_condition_is_found_separately`、`the_application_columns_are_added_to_an_existing_memory_items_table`；agent `conventions_and_clues_render_in_two_groups`、`the_header_no_longer_tells_the_model_to_ask_before_using_unconfirmed_memories`、`both_groups_share_one_budget`；runtime `a_well_formed_convention_keeps_its_application_and_condition`、`a_convention_whose_basis_is_not_in_a_user_event_becomes_a_reference`、`a_convention_claim_without_a_preference_user_statement_and_condition_becomes_a_reference`、`an_extracted_convention_lands_with_its_condition`、`a_reference_cannot_supersede_a_convention_it_only_contests_it`、`the_same_words_with_another_condition_are_a_separate_memory`、`extraction_does_not_fold_a_convention_into_a_hand_added_reference`、`add_defaults_to_reference_and_refuses_a_malformed_convention`、`adding_the_same_words_with_a_new_application_bumps_the_revision`、`classify_writes_a_new_revision_and_keeps_evidence_and_confirmation`、`classify_refuses_a_convention_without_a_condition_or_for_a_fact`、离线 `members_with_a_different_condition_or_application_are_never_merged`、`members_with_the_same_usage_still_merge`、`a_reference_cannot_supersede_a_convention`、`the_consolidation_prompt_version_is_v2`。`cargo fmt --check` 通过；`cargo test --workspace`：2385 通过、0 失败、12 忽略（含 hooks `memory_section_is_pinned_until_the_next_head`、`recall::the_memory_block_survives_a_restart_within_one_segment`、`a_forgotten_memory_never_comes_back_into_a_turn`）；开发过程中 `tool_output::an_interrupted_attempts_partial_output_is_reported_and_then_published_with_it` 在并发负载下偶发失败一次，单跑两次均通过，与本改动无关。增量 `cargo build --timings`：7.09 秒，报告 `target/cargo-timings/cargo-timing-20261028T090408704Z-f55de822e3512fa2.html`。未装二进制、未重启 Gateway、未改写真实记忆；`classify` 路由与 CLI 只有 runtime 层测试，没有 HTTP 端到端用例。
+
 ## 9.5 向量索引与模型切换
 
 一个 embedding_space 指纹至少包括：
@@ -214,7 +216,7 @@ MemoryManager 对 AgentRuntime 提供三个主要入口：recall、process_compl
 
 memory_vectors 按 memory_id + memory_revision + content_hash + generation_id 定位。生成任务在事务外调用模型，入库前检查正文、版本、状态与指纹未变；不满足则丢弃过期结果。校验返回数量、维度、有限数值和非零范数，不能接受截断或结构错误的向量。
 
-**索引输入含条件（2026-10-28，附录 F）。** 关键词与向量都对"索引输入"建：`applies_when` 为空时就是 content，不空时是 content + 换行 + applies_when。`content_hash` 改为索引输入的哈希——条件为空时与原来逐字相同，存量向量不失效、不需要换代次；带条件的条目因为改条件必升 revision，旧向量本来就 join 不上。入库前的"正文未变"核对同样比索引输入，不能只比 content。application 本身不进索引输入：它决定怎么用，不决定和什么相关。
+**索引输入含条件（2026-10-28，附录 F，已实现）。** 关键词与向量都对"索引输入"建：`applies_when` 为空时就是 content，不空时是 content + 换行 + applies_when。`content_hash` 改为索引输入的哈希——条件为空时与原来逐字相同，存量向量不失效、不需要换代次；带条件的条目因为改条件必升 revision，旧向量本来就 join 不上。入库前的"正文未变"核对同样比索引输入，不能只比 content。实现上 `put_vector` 核的是 revision 与状态，向量行按当前 `content_hash` 落库、召回时按 revision 与 `content_hash` 再 join 一次：改条件必升 revision，所以过期结果入不了库，漏过去的也 join 不上，不必另给 `put_vector` 传哈希。application 本身不进索引输入：它决定怎么用，不决定和什么相关。
 
 更换向量模型、维度或预处理方式时：
 
@@ -240,7 +242,7 @@ memory_vectors 按 memory_id + memory_revision + content_hash + generation_id �
 
 新推断不能覆盖用户陈述，自动整理不能静默改写用户已确认内容。存在实质冲突时保留证据并标记 contested，暂停正常召回，等待用户纠正或确认新版本；旧版本随后标为 superseded。使用次数和多次模型复述不能增加确认等级。
 
-**约定的覆盖与冲突（2026-10-28，附录 F）。** 已有约定"发布工单 Platform 默认 saas"时：
+**约定的覆盖与冲突（2026-10-28，附录 F，已实现）。** 已有约定"发布工单 Platform 默认 saas"时：
 
 | 用户这次说 | 当次 | 长期记忆 |
 |---|---|---|
@@ -249,7 +251,7 @@ memory_vectors 按 memory_id + memory_revision + content_hash + generation_id �
 | "以后默认换成别的" | 用新值 | 新约定按 supersedes 取代旧的，走上面的规则：旧的已确认 → 双方 contested 等用户定 |
 
 - 只有 convention 能取代 convention；reference 或模型推断与约定冲突时，`Plan::authorize` 把 supersedes 降成 contradicts（双方 contested），不让一条线索悄悄停掉用户的约定。
-- 正文相同、条件不同的是两条，不合并、不判 same。判关系时编号候选行带上使用方式与条件（`memory-extract/v8`）。
+- 正文相同、条件不同的是两条，不合并、不判 same。`Plan::authorize` 另有一道：模型判了 same，但新观察与已有条目的 application 或 applies_when 不同（没分类按 reference 比）时按新增处理。判关系时编号候选行带上使用方式与条件（`memory-extract/v8`）。
 - 多条约定实质冲突、无法确定哪条现行时照旧 contested、停召回；只有它会实质改变当前结果时，主模型才问用户。
 
 关联 Memos 的记忆在引用原文前重新读取并核对更新时间或内容哈希；原文改动使关联摘要待更新，删除或失去访问权限时停止把它当成当前有效证据。网络故障只能标为无法验证，不能推断原文已删除。当前不实现跨实例自动同步。
@@ -311,7 +313,7 @@ Memory 内容以带来源的数据进入上下文，不能成为系统指令或�
 - 合并不提升确认等级：keep 多了证据，`state` 与 `confirmation` 照旧（§9.6"多次复述不能增加确认等级"）。
 - 合并不能降低生效状态：被吸收方里有 `active`、keep 却不是 `active` → 不执行，报告标"需要人看"。否则一条生效记忆会被吸收进一条不参与召回的 candidate，等于绕过授权停掉了它。
 - `merge` 的成员里不能有 `contested`：吸收掉冲突的一方，另一方就成了没有对手的 contested。contested 只参与 `supersede` 与 `contest`。
-- 使用方式与条件（2026-10-28，附录 F）：`merge` 的成员 application 必须相同、`applies_when` 必须逐字相同（同为空也算），否则不执行、报告标"需要人看"——合并既不能把线索抬成约定，也不能把"这个任务"的条件扩成"所有任务"。`supersede` 的 old 是 convention、by 不是 → 降级为 `contest`（§9.6）。`rereadable` 不作用于 convention（它只给 preference，上面已排除）。组内编号行带上使用方式与条件，提示词升 `memory-consolidate/v2`。
+- 使用方式与条件（2026-10-28，附录 F，已实现）：`merge` 的成员 application 必须相同、`applies_when` 必须逐字相同（同为空也算），否则不执行、报告标"需要人看"——合并既不能把线索抬成约定，也不能把"这个任务"的条件扩成"所有任务"。`supersede` 的 old 是 convention、by 不是 → 降级为 `contest`（§9.6）。`rereadable` 不作用于 convention（它只给 preference，上面已排除）。组内编号行带上使用方式与条件，提示词升 `memory-consolidate/v2`。
 
 **数据模型的追加（schema 只加不删，§8.2）。** 现在 `supersedes: Option<SupersededRef>` 挂在**新条目**上、只指一条旧的；merge 是一对多，keep 也不是新条目。被吸收方要记下"被谁吸收"：`memory_items` 追加可空列 `superseded_by`（id + revision）。离线的 `merge` 与 `supersede` 都写这一列；**写入时的 `mark_superseded` 也写**（列与写入时路径已实现：先落新条目、再标旧条目，`komo memory show` 两个方向都显示；离线部分未实现），否则只有离线整理留下的关系能双向查。这也补上写入时的一个缺口：一条观察判出多条 supersedes 时，新条目的 `supersedes` 只留得下最后一条，`superseded_by` 记在每条旧条目上，一条都不丢。之后 `komo memory show` 能从任一方找到另一方。另一列是上面的 `consolidated_at`。
 
@@ -1125,9 +1127,9 @@ Claude Code 没有来源与确认，靠"用之前先核实"兜底；komo 的写�
 
 ## 附录 F：长期约定与历史线索的使用模型（2026-10-28 提案）
 
-> 状态：待实施。本附录整理本次用户需求、只读排查结果与建议设计；没有修改运行配置、真实记忆或代码。实施前同步修订 §9.2–§9.4、§9.6–§9.8；本文不覆盖现行规格。同日补入：检索门槛的离线校准（第 3 节"召回"下的「门槛校准」）、`memory add` 与系统提示的联动、项目作用域现状、`default` / `constraint` 是否分开的待决项、动态注入阶段的缓存做法。
+> 状态：已实现（2026-10-28，验收见 §9.4）。本附录整理本次用户需求、只读排查结果与建议设计；没有修改运行配置、真实记忆或代码。实施前同步修订 §9.2–§9.4、§9.6–§9.8；本文不覆盖现行规格。同日补入：检索门槛的离线校准（第 3 节"召回"下的「门槛校准」）、`memory add` 与系统提示的联动、项目作用域现状、`default` / `constraint` 是否分开的待决项、动态注入阶段的缓存做法。
 >
-> **2026-10-28 已并入正文（§9.2–§9.8），代码未实施。** 三项决定：application 只取 `convention` / `reference` 两值（下文的 `default` 与 `constraint` 都对应 `convention`）；两道检索门槛默认为 0（不启用），本机配置写校准值 0.56 / 1.0；本轮正文覆盖发布步骤 1–4，动态注入另起。存量分类用新命令 `komo memory classify`（§9.3）。下文保留提案原貌，与正文不一致处以正文为准。
+> **2026-10-28 已并入正文（§9.2–§9.8），并已实现。** 三项决定：application 只取 `convention` / `reference` 两值（下文的 `default` 与 `constraint` 都对应 `convention`）；两道检索门槛默认为 0（不启用），本机配置写校准值 0.56 / 1.0；本轮正文覆盖发布步骤 1–4，动态注入另起。存量分类用新命令 `komo memory classify`（§9.3）。下文保留提案原貌，与正文不一致处以正文为准。
 
 ### 1. 需求背景
 
@@ -1219,7 +1221,7 @@ default / constraint 仅用于 preference，且必须有对应的用户陈述证
 
 查询结合当前用户要求与本次任务的必要上下文。例如用户在创建发布工单过程中说“继续”，仍以创建发布工单为检索主题。对话中贴入的引用或工具文本不能变成新的用户约定。
 
-向量臂保留原始相似度，关键词臂保留命中信息；不能用 RRF 排名充当绝对相关度。**每条臂一道绝对门槛，过任一道即保留**：向量余弦 ≥ `min_similarity`，或关键词得分 ≥ `min_keyword_score`；两道都没过的在融合与预算截断之前丢掉，留下的再按 RRF 排序。关键词得分是命中 token 的 IDF 之和，每个 IDF 除以 `ln(N + 2)`（N 为 `memory_terms` 行数，即命中 0 行时的理论最大值）归一，使"命中一个最罕见的词"略小于 1。只设向量门槛不够，见下面的校准。门槛值随 embedding 模型与前缀变化，进 `[memory.retrieval]` 配置；已定默认不启用（§9.4）。作用域不匹配的条目在检索前就排除；筛完为空就不注入，不补足 top_k。
+向量臂保留原始相似度，关键词臂保留命中信息；不能用 RRF 排名充当绝对相关度。**每条臂一道绝对门槛，过任一道即保留**：向量余弦 ≥ `min_similarity`，或关键词得分 ≥ `min_keyword_score`；两道都没过的在重排与预算截断之前丢掉；名次仍按两臂的完整名单做 RRF，门槛只删人、不改名次。关键词得分是命中 token 的 IDF 之和，每个 IDF 除以 `ln(N + 2)`（N 为 `memory_terms` 行数，即命中 0 行时的理论最大值）归一，使"命中一个最罕见的词"略小于 1。只设向量门槛不够，见下面的校准。门槛值随 embedding 模型与前缀变化，进 `[memory.retrieval]` 配置；已定默认不启用（§9.4）。作用域不匹配的条目在检索前就排除；筛完为空就不注入，不补足 top_k。
 
 "业务条件不匹配"在前三个发布步骤里**没有专门的判定器**（流量评估：第一阶段不增加 LLM 调用）：`applies_when` 进索引文本，参与关键词与向量打分；过了门槛的条目连同条件一起注入，条件是否成立由主模型对着当前任务判断。要在注入前按条件拒绝候选，需要另加判断调用，单独测量后再定。
 

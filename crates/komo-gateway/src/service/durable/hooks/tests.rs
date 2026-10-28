@@ -454,6 +454,8 @@ fn seeded_memory(id: &str, content: &str) -> MemoryItem {
         usage: MemoryUsage::default(),
         supersedes: None,
         superseded_by: None,
+        application: None,
+        applies_when: None,
     }
 }
 

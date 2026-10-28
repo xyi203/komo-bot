@@ -14,9 +14,9 @@ use axum::Json;
 use axum::extract::{Path, Query, State};
 use komo_kernel::protocol::http::{
     ConsolidateGroupStatus, ConsolidateOutcome, MemoryAddRequest, MemoryAddResponse,
-    MemoryConsolidateRequest, MemoryConsolidateResponse, MemoryDetail, MemoryIndexStatus,
-    MemoryListQuery, MemoryListResponse, MemoryRevisionRequest, MemorySweepRequest,
-    MemorySweepResponse, RebuildIndexRequest, RebuildIndexResponse,
+    MemoryClassifyRequest, MemoryConsolidateRequest, MemoryConsolidateResponse, MemoryDetail,
+    MemoryIndexStatus, MemoryListQuery, MemoryListResponse, MemoryRevisionRequest,
+    MemorySweepRequest, MemorySweepResponse, RebuildIndexRequest, RebuildIndexResponse,
 };
 use komo_kernel::types::ids::MemoryId;
 use komo_runtime::memory::MemoryError;
@@ -154,6 +154,44 @@ pub async fn add(
     api.idempotency
         .remember(request.request_key.as_ref(), &hash, &response);
     Ok(Json(response))
+}
+
+/// `POST /v1/memories/{id}/classify`：操作者给指定 revision 定使用方式与条件（§9.3「存量
+/// 分类」）。与 confirm 同属操作者动作，边界同样靠系统提示与约定，不是硬边界（§9.6）。
+/// 改了条件就改了索引输入：像 restore 一样提交一次索引补齐。
+pub async fn classify(
+    State(api): State<Api>,
+    Path(id): Path<String>,
+    Json(request): Json<MemoryClassifyRequest>,
+) -> ApiResult<Json<MemoryDetail>> {
+    let memory = MemoryId::from_raw(id);
+    let hash = body_hash(&request);
+    if let Some(previous) = api
+        .idempotency
+        .lookup::<MemoryDetail>(request.request_key.as_ref(), &hash)?
+    {
+        return Ok(Json(previous));
+    }
+    let item = api
+        .state
+        .memories
+        .classify(
+            &memory,
+            request.expected_revision,
+            request.application,
+            request.applies_when.as_deref(),
+        )
+        .await
+        .map_err(memory_failure)?;
+    if api.state.memories.space().is_some()
+        && let Err(error) = api.state.memories.schedule_index()
+    {
+        tracing::warn!(%error, memory = %memory, "分类之后补向量没提交上，先只靠关键词命中");
+    }
+    let detail = MemoryDetail { memory: item };
+    api.idempotency
+        .remember(request.request_key.as_ref(), &hash, &detail);
+    Ok(Json(detail))
 }
 
 /// `POST /v1/memories/{id}/forget`：停用指定 revision 并失效索引。

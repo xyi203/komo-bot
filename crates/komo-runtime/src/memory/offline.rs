@@ -22,8 +22,8 @@ use komo_kernel::protocol::http::{
 use komo_kernel::traits::{ConsolidationWrite, RepoError};
 use komo_kernel::types::ids::MemoryId;
 use komo_kernel::types::memory::{
-    Confirmation, MemoryItem, MemoryKind, MemoryScope, MemoryState, Provenance, RetrievalMode,
-    SupersededRef,
+    Confirmation, MemoryApplication, MemoryItem, MemoryKind, MemoryScope, MemoryState, Provenance,
+    RetrievalMode, SupersededRef,
 };
 use komo_kernel::types::turn::{ReplayMessage, RoundInput, TurnRequest};
 use serde::Deserialize;
@@ -34,7 +34,7 @@ use tracing::field::Empty;
 use super::{MemoryError, MemoryManager};
 
 /// 提示词版本（§9.8）。只进 span，不进库：整理不产生新正文，没有地方可写。
-pub const PROMPT_VERSION: &str = "memory-consolidate/v1";
+pub const PROMPT_VERSION: &str = "memory-consolidate/v2";
 
 /// 每条取多少个近邻（含它自己）。
 const NEIGHBORS: u32 = 6;
@@ -156,6 +156,9 @@ impl MemoryManager {
             query.scopes = vec![item.scope.clone()];
             query.top_k = NEIGHBORS;
             query.include_states = STATES.to_vec();
+            // 近邻是整理用的，不受注入召回的相关度门槛约束。
+            query.min_similarity = 0.0;
+            query.min_keyword_score = 0.0;
             query
         };
         match self.search(build(None)).await {
@@ -305,12 +308,13 @@ impl MemoryManager {
             .enumerate()
             .map(|(index, item)| {
                 format!(
-                    "[{index}] 状态={:?} 种类={:?} 来源={:?} 确认={:?} 观察于={} 内容：{}",
+                    "[{index}] 状态={:?} 种类={:?} 来源={:?} 确认={:?} 观察于={}{} 内容：{}",
                     item.state,
                     item.kind,
                     item.provenance,
                     item.confirmation,
                     item.observed_at.date(),
+                    super::extract::application_label(item),
                     item.content
                 )
             })
@@ -329,7 +333,8 @@ impl MemoryManager {
              ]}}\n\n\
              编号都是方括号里的整数。没有要做的就输出 {{\"actions\":[]}}。\n\
              merge = 同一件事换了说法：keep 是留下的那一条，absorb 是并入它的；\
-             不要改写、合写正文，只能从组里选一条现有的当 keep。\n\
+             不要改写、合写正文，只能从组里选一条现有的当 keep。使用方式或条件不同的条目\
+             （约定与线索、适用条件不同）不是同一件事，不要合并。\n\
              supersede = 同一个问题的新答案，old 已经不成立。\n\
              contest = 实质冲突，两者不能同时为真。\n\
              rereadable = 正文只是工作目录里随时能重读的内容（目录结构、配置内容之类），\
@@ -715,6 +720,24 @@ fn merge(
                 .into(),
         );
     }
+    // 使用方式与条件必须逐字相同（§9.8）：合并既不能把线索抬成约定，也不能把"这个任务"的
+    // 条件扩成"所有任务"。没分类的旧条目按 reference 比；空条件与没有条件一样。
+    let usage = |item: &MemoryItem| {
+        (
+            item.application.unwrap_or(MemoryApplication::Reference),
+            item.applies_when
+                .as_deref()
+                .map(str::trim)
+                .filter(|when| !when.is_empty())
+                .map(str::to_string),
+        )
+    };
+    if involved().any(|index| usage(&work[index]) != usage(&work[keep])) {
+        return Verdict::Skip(
+            "合并的成员使用方式或条件不同：不能把线索抬成约定，也不能扩大条件的范围。需要人看"
+                .into(),
+        );
+    }
     let keeper = work[keep].clone();
     for &index in &absorb {
         let gone = &work[index];
@@ -779,7 +802,11 @@ fn supersede(
     if old == by || consumed[old] || consumed[by] {
         return Verdict::Skip("条目已被本组前一个动作处理，或两端是同一条".into());
     }
-    let downgrade = if work[by].provenance == Provenance::ModelInference
+    let downgrade = if work[old].application == Some(MemoryApplication::Convention)
+        && work[by].application != Some(MemoryApplication::Convention)
+    {
+        Some("只有约定能取代约定")
+    } else if work[by].provenance == Provenance::ModelInference
         && work[old].provenance == Provenance::UserStatement
     {
         Some("模型推断不能取代用户陈述")

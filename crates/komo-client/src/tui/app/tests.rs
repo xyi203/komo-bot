@@ -461,12 +461,20 @@ fn new_and_status_and_pending_each_produce_their_call() {
 fn an_unknown_command_is_reported_not_sent_as_a_message() {
     let mut app = app();
     assert!(command(&mut app, "/aprove").is_empty());
-    assert!(
-        notices(&app).contains("没有 /aprove 这个命令"),
-        "{}",
-        notices(&app)
-    );
-    assert!(app.notices.last().unwrap().is_error);
+    assert!(app.notices.is_empty());
+    assert!(app.input_hint().contains("没有 /aprove 这个命令"));
+    assert_eq!(app.input.text(), "/aprove");
+}
+
+#[test]
+fn input_error_clears_on_the_next_key() {
+    let mut app = app();
+    let normal_hint = app.input_hint();
+    command(&mut app, "/aprove");
+    app.handle_input(InputEvent::Key(key(KeyCode::Char('x'))));
+    assert_eq!(app.input_error, None);
+    assert_eq!(app.input_hint(), normal_hint);
+    assert_eq!(app.input.text(), "/aprovex");
 }
 
 #[test]
@@ -486,7 +494,8 @@ fn a_leading_path_is_sent_as_a_message() {
 fn an_illegal_effort_is_refused_with_the_options_spelled_out() {
     let mut app = app();
     assert!(command(&mut app, "/effort hgih").is_empty());
-    let printed = notices(&app);
+    let printed = app.input_hint();
+    assert!(app.notices.is_empty());
     assert!(printed.contains("hgih"), "{printed}");
     for level in command::EFFORT_LEVELS {
         assert!(printed.contains(level), "{printed}");
@@ -650,7 +659,7 @@ fn a_model_outside_the_menu_is_refused_with_the_menu_spelled_out() {
     let mut app = app();
     app.apply(ServerEvent::ModelMenu(menu()));
     assert!(command(&mut app, "/model gpt-z").is_empty());
-    assert!(notices(&app).contains("gpt-x"), "{}", notices(&app));
+    assert!(app.input_hint().contains("gpt-x"), "{}", app.input_hint());
     assert!(app.model.is_none());
 }
 
@@ -674,7 +683,11 @@ fn the_effort_options_come_from_the_menus_entry_for_the_current_model() {
     // 没选模型 ⇒ 菜单里标了 default 的那一个。
     assert_eq!(app.effort_options(), vec!["low", "high"]);
     assert!(command(&mut app, "/effort medium").is_empty());
-    assert!(notices(&app).contains("low · high"), "{}", notices(&app));
+    assert!(
+        app.input_hint().contains("low · high"),
+        "{}",
+        app.input_hint()
+    );
     assert!(app.effort.is_none());
     assert!(command(&mut app, "/effort high").is_empty());
     assert_eq!(
@@ -692,9 +705,9 @@ fn a_model_that_takes_no_explicit_effort_refuses_every_level() {
     assert!(app.effort_options().is_empty());
     assert!(command(&mut app, "/effort low").is_empty());
     assert!(
-        notices(&app).contains("不接受显式 effort"),
+        app.input_hint().contains("不接受显式 effort"),
         "{}",
-        notices(&app)
+        app.input_hint()
     );
     assert!(app.effort.is_none());
 }
@@ -1170,6 +1183,47 @@ fn a_boundary_moves_the_replay_window_without_losing_the_transcript() {
     assert!(app.surface.replay().is_empty());
 }
 
+#[test]
+fn a_live_run_failure_keeps_its_reason_without_a_notice() {
+    let mut app = app();
+    feed(
+        &mut app,
+        &[
+            fixture::conversation()[0].clone(),
+            fixture::event(
+                2,
+                Some(fixture::run()),
+                EventPayload::RunFailed(komo_kernel::events::RunFailed {
+                    reason: "重试超时".into(),
+                }),
+            ),
+        ],
+    );
+    assert!(app.notices.is_empty());
+    assert_eq!(app.run_reason(), Some("重试超时"));
+}
+
+#[test]
+fn a_resume_does_not_notice_historical_run_failures() {
+    let mut app = App::new(Some(fixture::session()), TuiMode::Resume, "seed");
+    let events = vec![
+        fixture::conversation()[0].clone(),
+        fixture::event(
+            2,
+            Some(fixture::run()),
+            EventPayload::RunFailed(komo_kernel::events::RunFailed {
+                reason: "历史超时".into(),
+            }),
+        ),
+    ];
+    app.apply(ServerEvent::HistoryPage(Box::new(fixture::page(
+        events, false,
+    ))));
+    app.apply(ServerEvent::HistoryDone);
+    assert!(app.notices.is_empty());
+    assert_eq!(app.run_reason(), Some("历史超时"));
+}
+
 // ---- 补读历史 ----
 
 #[test]
@@ -1187,7 +1241,8 @@ fn a_resume_reads_the_whole_history_before_it_becomes_interactive() {
     // 补读期间敲回车不会提交——那条消息会插到一段还没读完的上下文前面。
     app.input.set("等不及了");
     assert!(app.handle_key(key(KeyCode::Enter)).is_empty());
-    assert!(notices(&app).contains("正在补读历史"));
+    assert!(app.notices.is_empty());
+    assert!(app.input_hint().contains("正在补读历史，读完再发"));
 
     app.apply(ServerEvent::HistoryPage(Box::new(fixture::page(
         events[4..].to_vec(),
@@ -1429,8 +1484,10 @@ fn a_verdict_that_does_not_belong_to_the_kind_is_refused_locally() {
 fn a_bad_verdict_word_lists_the_options() {
     let mut app = app();
     app.apply(pending_mixed());
+    let notices_before = app.notices.len();
     assert!(command(&mut app, "/answer run-1 satisfiedd").is_empty());
-    let printed = notices(&app);
+    let printed = app.input_hint();
+    assert_eq!(app.notices.len(), notices_before);
     assert!(printed.contains("satisfiedd"), "{printed}");
     for word in command::VERDICT_WORDS {
         assert!(printed.contains(word.as_str()), "{printed}");
@@ -1438,7 +1495,11 @@ fn a_bad_verdict_word_lists_the_options() {
 
     // 少给一个参数也要说清楚它要两个。
     assert!(command(&mut app, "/answer run-1").is_empty());
-    assert!(notices(&app).contains("要两个参数"), "{}", notices(&app));
+    assert!(
+        app.input_hint().contains("要两个参数"),
+        "{}",
+        app.input_hint()
+    );
 }
 
 /// 回执那句话由服务端给（`note`）：同一句结论的措辞不该在四个界面里各写一遍。
@@ -1542,16 +1603,21 @@ fn a_bang_command_that_needs_a_terminal_is_refused_and_the_draft_stays() {
     type_text(&mut app, "!vim notes.md");
     let effects = app.handle_key(key(KeyCode::Enter));
     assert!(effects.is_empty(), "{effects:?}");
-    assert!(notices(&app).contains("没有 TTY"), "{}", notices(&app));
+    assert!(app.notices.is_empty());
+    assert!(
+        app.input_hint().contains("没有 TTY"),
+        "{}",
+        app.input_hint()
+    );
     assert_eq!(app.input.text(), "!vim notes.md", "草稿留在框里改");
 
     let mut app = super::App::new(Some(fixture::session()), TuiMode::New, "seed");
     type_text(&mut app, "!");
     assert!(app.handle_key(key(KeyCode::Enter)).is_empty());
     assert!(
-        notices(&app).contains("!ls -la"),
+        app.input_hint().contains("!ls -la"),
         "空命令给用法：{}",
-        notices(&app)
+        app.input_hint()
     );
 }
 

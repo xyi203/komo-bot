@@ -209,7 +209,11 @@ fn draw_input(frame: &mut Frame<'_>, app: &App, area: Rect) {
                 &hint,
                 hint_area.width.saturating_sub(2 * INPUT_PAD) as usize,
             ),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(if app.input_hint_is_error() {
+                Color::Red
+            } else {
+                Color::DarkGray
+            }),
         ))
         .block(Block::default().padding(Padding::horizontal(INPUT_PAD))),
         hint_area,
@@ -261,6 +265,12 @@ fn status_line(app: &App, width: u16) -> Paragraph<'static> {
                 Style::default()
                     .fg(run_colour(state))
                     .add_modifier(Modifier::BOLD),
+            ));
+        }
+        if let Some(reason) = app.run_reason() {
+            left.push(Span::styled(
+                format!("{} ", reason.replace(['\r', '\n'], " ")),
+                Style::default().fg(run_colour(state)),
             ));
         }
         if let Some(reason) = app.run_wait() {
@@ -742,6 +752,27 @@ fn main() {
     }
 
     #[test]
+    fn input_error_is_visible_in_red() {
+        let mut app = App::new(Some(fixture::session()), TuiMode::New, "seed");
+        app.input.set("/aprove");
+        app.handle_input(crate::tui::paste::InputEvent::Key(
+            crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Enter,
+                crossterm::event::KeyModifiers::NONE,
+            ),
+        ));
+        let terminal = viewport(&app, 100, 12);
+        let buffer = terminal.backend().buffer();
+        assert!(rows(buffer).join("\n").contains("没有 /aprove 这个命令"));
+        assert!(
+            buffer
+                .content()
+                .iter()
+                .any(|cell| cell.symbol() == "没" && cell.fg == Color::Red)
+        );
+    }
+
+    #[test]
     fn the_title_is_kappa_and_the_directory_name() {
         assert_eq!(title("/Users/x/01-code/komo-bot"), "κ - komo-bot");
         assert_eq!(title("/"), "κ", "根目录没有最后一段");
@@ -946,8 +977,40 @@ fn main() {
         ];
         feed(&mut app, &events);
 
-        let screen = screen(&app, 80, 24);
-        assert!(screen.contains("上游拒绝了这次请求"), "{screen}");
+        let rows = screen_rows(&app, 80, 24);
+        assert!(
+            rows.iter()
+                .any(|row| row.contains("已失败") && row.contains("上游拒绝了这次请求")),
+            "{rows:?}"
+        );
+    }
+
+    #[test]
+    fn a_long_failure_reason_keeps_the_right_status_cells_visible() {
+        let mut app = App::new(Some(fixture::session()), TuiMode::New, "seed");
+        app.apply(ServerEvent::Connection(ConnectionState::Connected));
+        feed(
+            &mut app,
+            &[
+                fixture::conversation()[0].clone(),
+                fixture::event(
+                    2,
+                    Some(fixture::run()),
+                    EventPayload::RunFailed(komo_kernel::events::RunFailed {
+                        reason: format!("第一行\n第二行{}", "很长的原因".repeat(40)),
+                    }),
+                ),
+            ],
+        );
+        let rows = screen_rows(&app, 60, 24);
+        assert_within(&rows, 60);
+        let status = rows
+            .iter()
+            .find(|row| row.contains("已失败"))
+            .expect("有失败状态行");
+        assert!(status.contains("第一行 第二行"), "{status}");
+        assert!(status.contains("已连接"), "{status}");
+        assert!(status.contains("↑"), "{status}");
     }
 
     /// 每一行都恰好占满缓冲区的宽度——没有一格越界，也没有一行被截短。

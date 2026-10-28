@@ -345,6 +345,8 @@ pub struct App {
     pub cursor: Seq,
     pub connection: ConnectionState,
     pub input: Input,
+    /// 输入框下方的一句临时错误；不进回滚区，因为回滚区里的提示删不掉。下一次按键或粘贴时清掉。
+    pub input_error: Option<String>,
     /// 发过的输入。存的是整个 [`Input`] 而不只是文字：翻回来时折起来的粘贴还是折着的。
     pub history: Vec<Input>,
     history_pos: Option<usize>,
@@ -430,6 +432,7 @@ impl App {
             cursor: Seq::ZERO,
             connection: ConnectionState::Connecting,
             input: Input::new(),
+            input_error: None,
             history: Vec::new(),
             history_pos: None,
             history_draft: None,
@@ -519,6 +522,15 @@ impl App {
             .runs
             .get(run)
             .and_then(|view| view.wait.as_ref())
+    }
+
+    /// 当前 Run 失败或被放弃的原因。
+    pub fn run_reason(&self) -> Option<&str> {
+        let run = self.current_run.as_ref()?;
+        self.surface
+            .runs
+            .get(run)
+            .and_then(|view| view.reason.as_deref())
     }
 
     pub fn run_meta(&self) -> Option<&RunMeta> {
@@ -682,6 +694,9 @@ impl App {
         if let Some(picker) = &self.model_picker {
             return format!("选择下一个 Run 的模型 · {}", picker.keys_hint());
         }
+        if let Some(error) = &self.input_error {
+            return error.clone();
+        }
         if self.pending_count() > 0 {
             // 有待处理：没有弹窗，出路是 `/pending` 的清单与 `/answer`，一次答一条（§11.3）。
             // **说出路，不要只说状态**。
@@ -702,6 +717,15 @@ impl App {
             .to_string()
     }
 
+    /// 提示行当前显示的是输入错误，而不是弹窗提示。
+    pub fn input_hint_is_error(&self) -> bool {
+        self.input_error.is_some()
+            && self.tree_picker.is_none()
+            && self.opening_tree.is_none()
+            && !self.tree_busy
+            && self.model_picker.is_none()
+    }
+
     /// 命令面板的候选。
     pub fn palette(&self) -> Vec<(&'static str, &'static str)> {
         if !self.input_enabled() {
@@ -711,6 +735,10 @@ impl App {
     }
 
     // ---- 输入 ----
+
+    fn reject(&mut self, text: impl Into<String>) {
+        self.input_error = Some(text.into());
+    }
 
     pub fn note(&mut self, text: impl Into<String>) {
         self.push_notice(text.into(), false);

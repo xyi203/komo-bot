@@ -432,16 +432,14 @@ impl App {
                     }
                 }
             }
-            EventPayload::RunFailed(body) => {
+            EventPayload::RunFailed(_) => {
                 if let Some(run) = &event.run {
                     self.runs.entry(run.clone()).or_default().ended_at = Some(event.ts);
                     if self.draft.as_ref().is_some_and(|draft| &draft.run == run) {
                         self.draft = None;
                     }
-                    self.fail(format!("任务 {run} 失败：{}", body.reason));
-                } else {
-                    self.fail(format!("任务失败：{}", body.reason));
                 }
+                // 进回滚区的提示删不掉；原因跟着当前 Run 写在状态行，补读时也不重印。
             }
             EventPayload::RunWaiting(body) => {
                 // 状态由 fold 折出来，读它的是状态行；这里只说**要人**的那一种——等干预

@@ -16,6 +16,7 @@ impl App {
         match event {
             InputEvent::Key(key) => self.handle_key(key),
             InputEvent::Paste(text) => {
+                self.input_error = None;
                 if self.input_enabled() {
                     self.input.paste(&text);
                 }
@@ -30,6 +31,7 @@ impl App {
         if key.kind == KeyEventKind::Release {
             return Vec::new();
         }
+        self.input_error = None;
         // **`Ctrl-C` 是暂停，先于一切状态处理**：模型菜单开着、补读历史——哪里都要走得掉。
         // 一块菜单不该把唯一一个"先走开"的键吞掉。Run 留在 Gateway 里照跑，回来用
         // `komo resume <会话>`——驱动在退出时把那行命令印出来。
@@ -166,7 +168,7 @@ impl App {
 
     fn submit(&mut self) -> Vec<Effect> {
         if self.phase.is_backfilling() {
-            self.fail("正在补读历史，读完再发");
+            self.reject("正在补读历史，读完再发");
             return Vec::new();
         }
         let text = self.input.text().trim().to_string();
@@ -177,7 +179,6 @@ impl App {
         self.reset_history_browse();
 
         if command::is_command(&text) {
-            self.input.clear();
             return self.run_command(&text);
         }
         if let Some(command) = shell::command_of(&text) {
@@ -205,7 +206,7 @@ impl App {
     /// 留在框里改。
     fn submit_shell(&mut self, text: &str, command: String) -> Vec<Effect> {
         if let Some(reason) = shell::refuse(&command) {
-            self.fail(reason);
+            self.reject(reason);
             return Vec::new();
         }
         self.input.clear();
@@ -229,10 +230,11 @@ impl App {
         let command = match command::parse(text, &self.command_menu()) {
             Ok(command) => command,
             Err(error) => {
-                self.fail(error.to_string());
+                self.reject(error.to_string());
                 return Vec::new();
             }
         };
+        self.input.clear();
         match command {
             Command::Tree { target, summarize } => match target {
                 Some(target) => self.tree_mutation(Effect::Navigate { target, summarize }),

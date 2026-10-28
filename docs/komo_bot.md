@@ -93,8 +93,9 @@ Gateway 持有模型连接、数据库与提交线、工具环境、运行状态
 | `komo intervention list/show/answer`         | 待处理清单：结果不明、阻塞两类一张表；等价于聊天里的 `/pending` 与 `/answer`（§7.5、§11.3） |
 | `komo cron add/list/run/pause/resume/remove` | 管理定时任务                                                                |
 | `komo memory list/search/show`               | 查看自动记忆、来源与确认状态；search 支持 hybrid / keyword / vector；list --full 一条一行不截断 |
-| `komo memory add`                            | 手动记一条（§9.3）；在 Run 里（带 `KOMO_SESSION` / `KOMO_RUN`）记成未确认、引用户原话，终端里直接记成已确认 |
+| `komo memory add`                            | 手动记一条（§9.3）；在 Run 里（带 `KOMO_SESSION` / `KOMO_RUN`）记成未确认、引用户原话，终端里直接记成已确认；`--application convention --applies-when "条件"` 记成长期约定，省略记成线索（`docs/memory.md` §9.2，未实现） |
 | `komo memory confirm/forget`                 | 确认具体版本或停用自动记忆；不删除 Memos 原文                               |
+| `komo memory classify`                       | 操作者给指定 revision 定使用方式（约定 / 线索）与条件，升一版；存量分类用（`docs/memory.md` §9.3，未实现） |
 | `komo memory consolidate`                    | 离线整理（§9.8）：对已有记忆去重、取代、标冲突，不新增正文；`--scope` `--kind` `--instruction`，默认预演，`--apply` 才写 |
 | `komo memory index status/rebuild`           | 查看索引覆盖率或重建当前向量索引                                            |
 | `komo init`                                  | 在数据目录（`KOMO_HOME`，默认 `~/.komo`）生成带注释的最小 `config.toml`（`default_agent` 与 `[agents.assistant]` 在最前面、一个 `[model_providers.default]` 占位、一个 completion 模型、`[models] default`、`[memory.retrieval] mode = "keyword"`——没有 embedding 时默认的 hybrid 校验不过）和权限 600 的 `.env` 模板；已有 `config.toml` **拒绝覆盖**，已有 `.env` 不碰。打印下一步：填 API key、`komo config check`。不经 Gateway |
@@ -1130,6 +1131,10 @@ mode = "hybrid"
 candidate_limit = 40
 top_k = 8
 max_tokens = 1500
+# 相关度门槛（docs/memory.md §9.4，未实现）：过任一道才留下；0 = 不启用（默认）。
+# 分数随 embedding 模型与前缀变，按自己的向量空间校准后再填，例如 qwen3-embedding:0.6b 无前缀：
+# min_similarity = 0.56
+# min_keyword_score = 1.0
 
 [execution]
 # 交给模型的工具结果正文上限（字节）。完整输出在 sessions/<id>/tool-output/ 下；这里

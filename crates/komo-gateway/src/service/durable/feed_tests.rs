@@ -143,6 +143,22 @@ async fn live_frames_equal_backfill_frames() {
         serde_json::to_value(&backfill).unwrap(),
         "直播的帧与补读的帧逐个相同"
     );
+    // 游标可以落在同一条记录生成的多帧之间，补读仍须逐帧一致。
+    for event in &backfill {
+        let after = event.seq;
+        let suffix = feed::backfill(&*core.storage, &session, after)
+            .await
+            .expect("带游标补读");
+        let expected: Vec<_> = backfill
+            .iter()
+            .filter(|event| event.seq > after)
+            .cloned()
+            .collect();
+        assert_eq!(
+            serde_json::to_value(suffix).unwrap(),
+            serde_json::to_value(expected).unwrap()
+        );
+    }
     let seqs: Vec<u64> = live.iter().map(|event| event.seq.0).collect();
     assert!(seqs.windows(2).all(|pair| pair[0] < pair[1]), "{seqs:?}");
 

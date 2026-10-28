@@ -45,7 +45,8 @@ use komo_kernel::durable::{
     AssistantMessage, ContentBlock, ConversationId, Cursor, DocumentId, DocumentScope, EntityId,
     EntryRecord, ScanOrder, Storage, StorageWrite, SubmissionRecord,
 };
-use komo_kernel::events::Event;
+use komo_kernel::events::{Event, EventPayload};
+use komo_kernel::protocol::nested::display_result;
 use komo_kernel::protocol::sse::{SseEvent, SseFrame};
 use komo_kernel::traits::Shutdown;
 use komo_kernel::types::ids::{Seq, SessionId};
@@ -141,11 +142,59 @@ pub async fn backfill_with(
     after: Seq,
 ) -> Result<Vec<Event>, SessionError> {
     let records = read_session_records(storage, session).await?;
-    let wanted = nested_view::wanted(&records.entries);
-    let results = nested_view::load_results(sessions_dir, session, wanted).await;
-    let mut events = legacy_events_with(session, &records.entries, &records.submissions, results);
+    Ok(project_backfill(session, &records, after, |wanted| {
+        nested_view::load_results(sessions_dir, session, wanted)
+    })
+    .await)
+}
+
+/// 投影一次，再给返回的工具结果帧补上与 Projection::attach_result 相同的展示视图。
+async fn project_backfill<F, Fut>(
+    session: &str,
+    records: &SessionRecords,
+    after: Seq,
+    load: F,
+) -> Vec<Event>
+where
+    F: FnOnce(
+        Vec<(
+            komo_kernel::durable::EntryId,
+            komo_kernel::types::refs::OutputRef,
+        )>,
+    ) -> Fut,
+    Fut: std::future::Future<Output = HashMap<komo_kernel::durable::EntryId, Value>>,
+{
+    let mut events = legacy_events_with(
+        session,
+        &records.entries,
+        &records.submissions,
+        HashMap::new(),
+    );
     events.retain(|event| event.seq > after);
-    Ok(events)
+    let returned: std::collections::HashSet<u64> = events
+        .iter()
+        .filter(|event| matches!(event.payload, EventPayload::ToolResult(_)))
+        .map(|event| record_of(event.seq))
+        .collect();
+    let wanted = nested_view::wanted(
+        records
+            .entries
+            .iter()
+            .filter(|entry| returned.contains(&entry.id.raw())),
+    );
+    if wanted.is_empty() {
+        return events;
+    }
+    let results = load(wanted).await;
+    for event in &mut events {
+        if let EventPayload::ToolResult(result) = &mut event.payload {
+            let id = komo_kernel::durable::EntryId::new(record_of(event.seq));
+            if let (Some(raw), Some(body)) = (results.get(&id), result.body.as_mut()) {
+                body.result = display_result(raw);
+            }
+        }
+    }
+    events
 }
 
 // ------------------------------------------------------------------- 启动
@@ -634,6 +683,89 @@ pub fn delta_of<'a>(last: &str, now: &'a str) -> Option<&'a str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn backfill_matches_old_projection_for_submission_states_and_nested_results() {
+        use komo_kernel::durable::legacy_ids::seq;
+        use komo_kernel::durable::{EntryId, InputState, Message, SubmissionId, SubmissionKind};
+        use serde_json::json;
+        let conversation = ConversationId::new(1);
+        let entry = |id, kind| EntryRecord::new(EntryId::new(id), conversation, kind);
+        let codemode = |id, call: &str| {
+            entry(id, "komo.tool-result")
+                .with_model(vec![Message::tool_result(call, "codemode", "done", 0), Message::tool_result(call, "codemode", "done again", 0)])
+                .with_data(json!({"tool": "codemode", "output": {"path": format!("tool-output/{id}/output.json"), "size": 4, "hash": "ab"}}))
+        };
+        let entries = vec![
+            entry(2, "komo.user").with_model(vec![Message::user("hi", 0)]),
+            codemode(3, "one"),
+            codemode(5, "two"),
+            entry(6, "komo.assistant").with_model(vec![Message::assistant(
+                vec![ContentBlock::text("done")],
+                komo_kernel::durable::StopReason::Stop,
+                0,
+            )]),
+        ];
+        let raw = json!({"calls": [{"id": "c1", "tool": "read", "args": "{}", "ok": true, "status": "completed"}], "value": {"secret": true}});
+        let results = HashMap::from([(EntryId::new(3), raw.clone()), (EntryId::new(5), raw)]);
+        for state in [
+            InputState::Queued,
+            InputState::Placed {
+                entry: EntryId::new(2),
+            },
+            InputState::Done {
+                entry: EntryId::new(2),
+                answer: EntryId::new(6),
+            },
+        ] {
+            let records = SessionRecords {
+                entries: entries.clone(),
+                submissions: vec![SubmissionRecord {
+                    id: SubmissionId::new(1),
+                    conversation,
+                    request_id: Some("request".into()),
+                    created_at: Some(0),
+                    kind: SubmissionKind::Input { state },
+                }],
+            };
+            let old =
+                legacy_events_with("s", &records.entries, &records.submissions, results.clone());
+            let cursors = std::iter::once(Seq::ZERO).chain(old.iter().map(|event| event.seq));
+            for after in cursors {
+                let requested = std::cell::RefCell::new(Vec::new());
+                let actual = project_backfill("s", &records, after, |wanted| {
+                    requested
+                        .borrow_mut()
+                        .extend(wanted.iter().map(|(id, _)| *id));
+                    let found = wanted
+                        .into_iter()
+                        .filter_map(|(id, _)| results.get(&id).cloned().map(|value| (id, value)))
+                        .collect();
+                    async move { found }
+                })
+                .await;
+                let expected: Vec<_> = old
+                    .iter()
+                    .filter(|event| event.seq > after)
+                    .cloned()
+                    .collect();
+                assert_eq!(actual, expected, "after={after:?}");
+                let ids = requested.into_inner();
+                assert_eq!(
+                    ids.contains(&EntryId::new(3)),
+                    after < seq(EntryId::new(3), 1)
+                );
+                assert_eq!(
+                    ids.contains(&EntryId::new(5)),
+                    after < seq(EntryId::new(5), 1)
+                );
+                assert_eq!(
+                    ids.len(),
+                    ids.iter().collect::<std::collections::HashSet<_>>().len()
+                );
+            }
+        }
+    }
 
     #[test]
     fn a_delta_is_the_suffix_when_the_prefix_matches_and_the_whole_text_otherwise() {

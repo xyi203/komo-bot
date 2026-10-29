@@ -517,6 +517,7 @@ pub async fn purge(
         })
         .await?;
     core.faults().forget(&ids);
+    core.confirms().forget(&ids);
     // 账先落、内容后删：这里被杀，下次启动的 `boot` 收尾。
     let removed_bytes = remove_content(&paths).await?;
     Ok(Ok(Purged { removed_bytes }))

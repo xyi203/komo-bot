@@ -61,7 +61,7 @@ async fn answer(
     }
     let core = api.state.core()?;
     let response = core
-        .answer_intervention(&handle, request.verdict)
+        .answer_intervention(&handle, request.verdict, "cli".to_owned())
         .await
         .map_err(|error| match error {
             // 结论与这条对不上：请求读得懂，但和此刻这条对不上 → 422。

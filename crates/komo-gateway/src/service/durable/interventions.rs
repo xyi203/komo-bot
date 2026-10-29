@@ -61,7 +61,7 @@ const ACK_VERSION: u32 = 1;
 
 const SCAN_PAGE: usize = 512;
 /// 轮询停机旗子的间隔（`Shutdown` 只是个标志，不能 await）。
-const SHUTDOWN_POLL: Duration = Duration::from_millis(250);
+pub(super) const SHUTDOWN_POLL: Duration = Duration::from_millis(250);
 
 pub fn ack_address(session: &str) -> DocumentAddress {
     DocumentAddress {
@@ -303,7 +303,7 @@ impl DurableCore {
     }
 
     /// conversation 属于哪个 Session（行读得出才算）。
-    async fn session_of_conversation(
+    pub(super) async fn session_of_conversation(
         &self,
         conversation: ConversationId,
     ) -> Result<Option<SessionRecord>, SessionError> {
@@ -327,19 +327,26 @@ impl DurableCore {
         }
         let only = query.session.as_ref().map(SessionId::as_str);
         let mut runs = RunLookup::default();
-        let mut out = Vec::new();
-        for faulted in self.faulted(only).await? {
-            let summary = self.summary_of(&faulted, &mut runs).await;
-            if query
-                .run
-                .as_ref()
-                .is_some_and(|run| summary.run.as_ref() != Some(run))
-            {
-                continue;
+        let mut all = Vec::new();
+        if query.kind != Some(InterventionKind::Confirm) {
+            for faulted in self.faulted(only).await? {
+                all.push(self.summary_of(&faulted, &mut runs).await);
             }
-            out.push(summary);
         }
-        Ok(out)
+        if query.kind != Some(InterventionKind::Blocked) {
+            for found in self.confirming(only).await? {
+                all.push(self.confirm_summary(&found, &mut runs).await);
+            }
+        }
+        Ok(all
+            .into_iter()
+            .filter(|summary| {
+                query
+                    .run
+                    .as_ref()
+                    .is_none_or(|run| summary.run.as_ref() == Some(run))
+            })
+            .collect())
     }
 
     /// 一个 Session 的待处理清单（会话详情与 resume 的 `pending`）。
@@ -359,6 +366,9 @@ impl DurableCore {
         &self,
         handle: &str,
     ) -> Result<Option<InterventionDetail>, SessionError> {
+        if let Some(found) = self.find_confirming(handle).await? {
+            return Ok(Some(self.confirm_detail(&found).await));
+        }
         let Some(faulted) = self.find_faulted(handle).await? else {
             return Ok(None);
         };
@@ -422,14 +432,20 @@ impl DurableCore {
         }
     }
 
-    /// 答复。**只有 `abandon`**（决定 13）：记进 `komo.interventions.ack`，之后不再列出、不再投递。
-    /// 同一条再答一次返回原结论（`already_answered`）；别的结论是 `InvalidRequest`（HTTP 映射成 422）。
+    /// 答复。待确认的调用答 `approve` / `reject`（`confirms`，`by` 记谁答的：渠道 peer 或 `cli`）；
+    /// faulted 任务**只有 `abandon`**（决定 13）：记进 `komo.interventions.ack`，之后不再列出、不再
+    /// 投递。同一条再答一次返回原结论（`already_answered`）；别的结论是 `InvalidRequest`（HTTP 映射成
+    /// 422）。
     pub async fn answer_intervention(
         &self,
         handle: &str,
         verdict: InterventionVerdict,
+        by: String,
     ) -> Result<InterventionAnswerResponse, GatewayError> {
         let gateway = |error: SessionError| GatewayError::Internal(error.to_string());
+        if let Some(found) = self.find_confirming(handle).await.map_err(gateway)? {
+            return self.answer_confirm(&found, verdict, by).await;
+        }
         let Some(faulted) = self.find_faulted(handle).await.map_err(gateway)? else {
             return Err(GatewayError::NotFound {
                 what: format!("Intervention {handle}"),
@@ -501,7 +517,7 @@ fn generation_run(task: &TaskRecord) -> Option<RunId> {
 }
 
 /// 工具任务输入里的 assistant entry（`{"kind":"model","assistant":13,…}`）；嵌套调用与别的任务没有。
-fn task_entry(task: &TaskRecord) -> Option<EntryId> {
+pub(super) fn task_entry(task: &TaskRecord) -> Option<EntryId> {
     if task.kind != TOOL_KIND {
         return None;
     }
@@ -513,12 +529,17 @@ fn task_entry(task: &TaskRecord) -> Option<EntryId> {
 
 /// 一个 Session 的投影事件，按需读、一次调用内复用：用来把 assistant entry 对到它所属的 run。
 #[derive(Default)]
-struct RunLookup {
+pub(super) struct RunLookup {
     events: HashMap<String, Vec<komo_kernel::events::Event>>,
 }
 
 impl RunLookup {
-    async fn run_of(&mut self, core: &DurableCore, session: &str, entry: EntryId) -> Option<RunId> {
+    pub(super) async fn run_of(
+        &mut self,
+        core: &DurableCore,
+        session: &str,
+        entry: EntryId,
+    ) -> Option<RunId> {
         if !self.events.contains_key(session) {
             let events =
                 super::feed::backfill(&*core.storage, session, komo_kernel::types::ids::Seq::ZERO)
@@ -617,7 +638,19 @@ async fn announce(state: &Arc<GatewayState>, faulted: &Faulted) {
             .unwrap_or_else(|| RunId::from_raw(faulted.handle())),
         reason,
     };
-    let peer = attention_peer(core, &faulted.session).await;
+    deliver_attention(state, &faulted.session, message, &key, &faulted.handle()).await;
+}
+
+/// 一条提醒投给谁：来源对端（有的话，不是 home 才单投）+ home chat，按 `key` 幂等。
+pub(super) async fn deliver_attention(
+    state: &Arc<GatewayState>,
+    session: &SessionRecord,
+    message: Outbound,
+    key: &str,
+    handle: &str,
+) {
+    let Ok(core) = state.core() else { return };
+    let peer = attention_peer(core, session).await;
     let mut delivered_to_source = false;
     if let Some(peer) = peer {
         let is_home = state
@@ -629,18 +662,18 @@ async fn announce(state: &Arc<GatewayState>, faulted: &Faulted) {
             && let Err(error) = state
                 .notifier
                 .log()
-                .deliver_once(&DeliveryTarget::to_peer(peer), message.clone(), &key)
+                .deliver_once(&DeliveryTarget::to_peer(peer), message.clone(), key)
                 .await
         {
-            tracing::warn!(%error, "faulted 任务的提醒投不到来源会话");
+            tracing::warn!(%error, "提醒投不到来源会话");
         }
         delivered_to_source = !is_home;
     }
-    if let Err(error) = state.notifier.deliver_home_once(message, &key).await {
+    if let Err(error) = state.notifier.deliver_home_once(message, key).await {
         if delivered_to_source {
             tracing::debug!(%error, "没有 home chat，只提醒了来源会话");
         } else {
-            tracing::warn!(%error, handle = %faulted.handle(), "没有 home chat 也没有来源会话，这条没人看得见");
+            tracing::warn!(%error, %handle, "没有 home chat 也没有来源会话，这条没人看得见");
         }
     }
 }

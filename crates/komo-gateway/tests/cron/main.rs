@@ -28,6 +28,7 @@
 mod harness;
 
 mod command;
+mod confirm;
 mod definition;
 mod firing;
 mod notify;

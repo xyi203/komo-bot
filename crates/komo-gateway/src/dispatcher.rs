@@ -556,6 +556,7 @@ fn kind_text(kind: InterventionKind) -> &'static str {
     match kind {
         InterventionKind::Verify => "结果不明",
         InterventionKind::Blocked => "前提没了",
+        InterventionKind::Confirm => "待确认",
     }
 }
 
@@ -598,11 +599,11 @@ pub(crate) fn parse_answer_help(text: &str) -> Option<String> {
             "`/answer {} …` 还要一个结论：{}。",
             parts[1],
             InterventionVerdict::parse("satisfied")
-                .map(|_| "satisfied / not_performed / resolve / abandon")
+                .map(|_| "approve / reject / abandon（见 `/pending`）")
                 .unwrap_or_default()
         )),
         _ => Some(format!(
-            "`{}` 不是一个结论。能答的是：satisfied / not_performed / resolve / abandon。",
+            "`{}` 不是一个结论。能答的是：approve / reject（待确认）、abandon（出错的任务）。",
             parts[2]
         )),
     }

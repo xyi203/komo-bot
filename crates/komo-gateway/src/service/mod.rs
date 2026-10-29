@@ -239,6 +239,7 @@ pub async fn start(options: ServiceOptions) -> Result<Running, ServiceError> {
     //   4. 看客与未结算输入的小任务（`wait_submission` 内部会 `resume`，所以排在 3 之后）。
     durable::feed::spawn(&core, &state.hub, &shutdown).await;
     durable::interventions::spawn_attention(&state, &shutdown);
+    durable::confirms::spawn_confirm_attention(&state, &shutdown);
     durable::lifecycle::boot(&state).await;
     durable::watch::reattach(&state).await;
     core.resume();

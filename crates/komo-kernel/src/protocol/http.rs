@@ -523,6 +523,9 @@ pub enum InterventionKind {
     Verify,
     /// 前提没了：引用损坏、旧执行者未确认、会话不可服务（§8.9）。
     Blocked,
+    /// 无人值守的 Run 要调对外工具，等操作者确认（`docs/confirm.md`）。这个枚举标着冻结，这次是
+    /// 有意的扩展。
+    Confirm,
 }
 
 impl InterventionKind {
@@ -537,6 +540,9 @@ impl InterventionKind {
             InterventionKind::Blocked => {
                 vec![InterventionVerdict::Resolve, InterventionVerdict::Abandon]
             }
+            InterventionKind::Confirm => {
+                vec![InterventionVerdict::Approve, InterventionVerdict::Reject]
+            }
         }
     }
 
@@ -544,6 +550,7 @@ impl InterventionKind {
         match self {
             InterventionKind::Verify => "verify",
             InterventionKind::Blocked => "blocked",
+            InterventionKind::Confirm => "confirm",
         }
     }
 }
@@ -562,6 +569,10 @@ pub enum InterventionVerdict {
     Resolve,
     /// 两类共有：这条 Run 到此为止。
     Abandon,
+    /// `confirm`：执行这一次对外调用。
+    Approve,
+    /// `confirm`：不执行，告诉模型操作者拒绝了。
+    Reject,
 }
 
 impl InterventionVerdict {
@@ -571,6 +582,8 @@ impl InterventionVerdict {
             InterventionVerdict::NotPerformed => "not_performed",
             InterventionVerdict::Resolve => "resolve",
             InterventionVerdict::Abandon => "abandon",
+            InterventionVerdict::Approve => "approve",
+            InterventionVerdict::Reject => "reject",
         }
     }
 
@@ -583,6 +596,8 @@ impl InterventionVerdict {
             }
             "resolve" | "retry" => Some(InterventionVerdict::Resolve),
             "abandon" | "cancel" => Some(InterventionVerdict::Abandon),
+            "approve" | "yes" => Some(InterventionVerdict::Approve),
+            "reject" | "no" => Some(InterventionVerdict::Reject),
             _ => None,
         }
     }
@@ -622,6 +637,14 @@ pub enum InterventionDetail {
     Blocked {
         summary: InterventionSummary,
         reason: String,
+    },
+    Confirm {
+        summary: InterventionSummary,
+        tool: String,
+        arguments: serde_json::Value,
+        /// 到这一刻还没答就不执行。
+        #[serde(with = "time::serde::rfc3339")]
+        deadline: OffsetDateTime,
     },
 }
 

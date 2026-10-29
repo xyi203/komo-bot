@@ -40,14 +40,14 @@ impl GatewayState {
 
     /// 答复一条 Intervention（§7.5）。**结论与种类不符**是一句明确的失败
     /// （[`GatewayError::InvalidRequest`]，HTTP 那一层映射成 422），**已经答过**则回原结论、
-    /// 不报错（§11.3）。`by` 是聊天渠道的答复者；新存储的答复记录不带它。
+    /// 不报错（§11.3）。`by` 是聊天渠道的答复者，没有 = CLI / TUI（经 HTTP）；确认卡的答复记下它。
     pub async fn answer_intervention(
         self: &Arc<Self>,
         handle: &str,
         verdict: InterventionVerdict,
         by: Option<PeerId>,
     ) -> Result<InterventionAnswerResponse, GatewayError> {
-        let _ = by;
-        self.durable.answer_intervention(handle, verdict).await
+        let by = by.map_or_else(|| "cli".to_owned(), |peer| peer.to_string());
+        self.durable.answer_intervention(handle, verdict, by).await
     }
 }

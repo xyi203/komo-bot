@@ -164,9 +164,8 @@ pub async fn intervention_show(client: &KomoClient, handle: &str) -> Outcome {
 /// "这个结论对这一条不适用"。这里先看词表，再让服务端按权威判定（种类不符时它照样
 /// 会拒，那是最后一道）。
 pub async fn intervention_answer(client: &KomoClient, handle: &str, verdict: &str) -> Outcome {
-    let verdict = InterventionVerdict::parse(verdict).ok_or_else(|| {
-        format!("不认识这个结论：{verdict}；能写的是 satisfied / not_performed / resolve / abandon")
-    })?;
+    let verdict = InterventionVerdict::parse(verdict)
+        .ok_or_else(|| format!("不认识这个结论：{verdict}；能写的是 approve / reject / abandon"))?;
     let response = client
         .answer_intervention(
             handle,
@@ -200,6 +199,8 @@ fn answer_word(verdict: InterventionVerdict) -> &'static str {
         InterventionVerdict::NotPerformed => "已记下：确定没有执行",
         InterventionVerdict::Resolve => "已记下：前提已处理，重新核对",
         InterventionVerdict::Abandon => "已放弃这条 Run",
+        InterventionVerdict::Approve => "已批准：这次对外调用马上执行",
+        InterventionVerdict::Reject => "已拒绝：这次对外调用不会执行",
     }
 }
 

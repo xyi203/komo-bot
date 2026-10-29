@@ -151,7 +151,7 @@ pub const COMMANDS: [(&str, &str); 16] = [
     ),
     (
         "/answer",
-        "<句柄> <结论> 答一条：satisfied / not_performed / resolve / abandon",
+        "<句柄> <结论> 答一条：approve / reject / abandon",
     ),
     ("/model", "[模型] 列出或设定下一个 Run 的模型"),
     ("/effort", "[档位] 列出或设定下一个 Run 的推理强度"),

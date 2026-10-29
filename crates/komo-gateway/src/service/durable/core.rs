@@ -31,6 +31,8 @@ pub struct DurableCore {
     interjections: Mutex<HashMap<ConversationId, InterjectSignal>>,
     /// faulted 任务的索引（W4a，`interventions`）：开库时接上提交订阅。
     pub(super) faults: Arc<super::interventions::FaultIndex>,
+    /// 停在 `confirm` 的工具任务的索引（`confirms`）：同样开库时接上提交订阅。
+    pub(super) confirms: Arc<super::confirms::ConfirmIndex>,
     /// `GatewayState` 的槽（`assemble::wire` 填）：提交输入时核对规范文件是不是改过要读配置与工作目录，
     /// 这些在 `GatewayState` 上，而 `DurableCore` 先于它造出来。
     state: OnceLock<super::assemble::StateSlot>,
@@ -80,6 +82,13 @@ impl DurableCore {
                 .line()
                 .subscribe_commits(move |publication| faults.observe(&publication.writes));
         }
+        let confirms = Arc::new(super::confirms::ConfirmIndex::default());
+        {
+            let confirms = Arc::clone(&confirms);
+            let _ = engine
+                .line()
+                .subscribe_commits(move |publication| confirms.observe(&publication.writes));
+        }
         Ok(Arc::new(DurableCore {
             engine: Arc::new(engine),
             harness,
@@ -89,6 +98,7 @@ impl DurableCore {
             closed: AtomicBool::new(false),
             interjections: Mutex::new(HashMap::new()),
             faults,
+            confirms,
             state: OnceLock::new(),
         }))
     }

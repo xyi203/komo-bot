@@ -33,6 +33,7 @@
 pub mod agent_doc;
 pub mod assemble;
 pub mod background;
+pub mod confirms;
 pub mod copy;
 pub mod core;
 pub mod cron;

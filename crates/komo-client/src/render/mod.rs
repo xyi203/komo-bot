@@ -355,6 +355,23 @@ pub fn intervention_detail(detail: &InterventionDetail) -> String {
             out.push(format!("问题   {reason}"));
             out.join("\n")
         }
+        InterventionDetail::Confirm {
+            summary,
+            tool,
+            arguments,
+            deadline,
+        } => {
+            let mut out = intervention_head(summary);
+            out.push(format!("调用   {tool}"));
+            out.push(format!("参数   {arguments}"));
+            out.push(format!(
+                "截止   {}（到点没答就不执行）",
+                deadline
+                    .format(&time::format_description::well_known::Rfc3339)
+                    .unwrap_or_default()
+            ));
+            out.join("\n")
+        }
     }
 }
 

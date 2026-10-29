@@ -797,10 +797,12 @@ pub fn resume_summary(response: &ResumeResponse) -> Option<String> {
     let resumed = response.resumed.len();
     let mut verify = 0;
     let mut blocked = 0;
+    let mut confirm = 0;
     for item in &response.pending {
         match item.kind {
             InterventionKind::Verify => verify += 1,
             InterventionKind::Blocked => blocked += 1,
+            InterventionKind::Confirm => confirm += 1,
         }
     }
     let mut parts = Vec::new();
@@ -812,6 +814,9 @@ pub fn resume_summary(response: &ResumeResponse) -> Option<String> {
     }
     if blocked > 0 {
         parts.push(format!("{blocked} 个阻塞"));
+    }
+    if confirm > 0 {
+        parts.push(format!("{confirm} 个待确认"));
     }
     // 没有未完成的任务是默认情况，不说话。
     (!parts.is_empty()).then(|| parts.join("，"))
@@ -838,6 +843,7 @@ pub fn intervention_kind_text(kind: InterventionKind) -> &'static str {
     match kind {
         InterventionKind::Verify => "结果不明",
         InterventionKind::Blocked => "阻塞",
+        InterventionKind::Confirm => "待确认",
     }
 }
 

@@ -7,7 +7,7 @@
 
 use komo_kernel::protocol::http::IndexState;
 use komo_kernel::traits::{RepoError, StoreError};
-use komo_kernel::types::ids::{MemoryId, SessionId};
+use komo_kernel::types::ids::{MatterId, MemoryId, SessionId};
 use komo_kernel::types::memory::{
     EvidenceRef, MemoryApplication, MemoryItem, MemoryScope, MemoryState,
 };
@@ -107,6 +107,32 @@ impl TursoMemoryRepo {
                             || row.application.as_deref()
                                 != Some(enum_str(&MemoryApplication::Convention).as_str())
                         {
+                            continue;
+                        }
+                        if let Some(item) = load_item(ex, &row.id).await? {
+                            out.push(item);
+                        }
+                    }
+                    Ok(out)
+                }) as BoxFuture<'_, Result<Vec<MemoryItem>, StoreError>>
+            })
+            .await
+            .map_err(RepoError::from)
+    }
+
+    /// 归属某件事项的全部条目（任何状态），按 id（创建先后）排。结案归档与重开恢复要它
+    /// （`docs/goals.md` §6）。
+    pub async fn belonging_to(&self, matter: &MatterId) -> Result<Vec<MemoryItem>, RepoError> {
+        let matter = matter.to_string();
+        self.db()
+            .read(move |ex| {
+                let matter = matter.clone();
+                Box::pin(async move {
+                    let mut rows = MemoryItemRow::all().exec(ex).await.map_err(map_toasty)?;
+                    rows.sort_by(|a, b| a.id.cmp(&b.id));
+                    let mut out = Vec::new();
+                    for row in &rows {
+                        if row.belongs_to.as_deref() != Some(matter.as_str()) {
                             continue;
                         }
                         if let Some(item) = load_item(ex, &row.id).await? {

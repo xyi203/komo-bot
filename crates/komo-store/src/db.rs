@@ -1110,6 +1110,24 @@ mod tests {
         }
     }
 
+    /// 归属一列（`docs/goals.md` §6）在旧形状的 memory_items 表上补得回来，旧行读出来是 NULL。
+    #[tokio::test]
+    async fn the_belongs_to_column_is_added_to_an_existing_memory_items_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("aux.db");
+
+        let legacy = crate::models::memory_item::DDL.replace(r#""belongs_to" TEXT, "#, "");
+        assert!(!legacy.contains("belongs_to"), "旧形状里不该有这一列");
+        plain_build_old(&path, Some(("memory_items", legacy))).await;
+
+        Db::connect(&path).await.unwrap();
+        let after = plain_columns(&path, "memory_items").await;
+        assert!(
+            after.iter().any(|name| name == "belongs_to"),
+            "belongs_to 补回来了，而且落盘：{after:?}"
+        );
+    }
+
     /// `cron_jobs.command`（命令直跑模式，Cron 加法字段）在**旧形状**的表上补得回来，
     /// 旧行读成 `None`（这一列本来就没有），新写的命令 Job 逐字往返。
     #[tokio::test]

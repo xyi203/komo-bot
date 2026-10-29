@@ -9,7 +9,8 @@ use std::str::FromStr;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
-use super::ids::{EventId, MemoryId, RunId, Seq, SessionId};
+use super::ids::{EventId, MatterId, MemoryId, RunId, Seq, SessionId};
+use super::matter::{Matter, MatterState};
 use super::model::{Effort, EffortSetting, Vector};
 
 /// 记忆的种类。
@@ -152,6 +153,9 @@ pub enum MemoryState {
     Contested,
     Superseded,
     Forgotten,
+    /// 所属的事结案后，它下面的线索转到这里（`docs/goals.md` §6）：不注入、不进提取的候选表，
+    /// 默认不列出；重开那件事时恢复成 active。不是遗忘。
+    Archived,
 }
 
 impl MemoryState {
@@ -296,6 +300,10 @@ pub struct MemoryItem {
     /// 条件：convention 必填，写成一句能独立理解的话。不是作用域也不是权限。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub applies_when: Option<String>,
+    /// 为哪件事记的：某个目标或领域（`docs/goals.md`）。`None` = 不属于任何进行中的事，加列
+    /// 之前的旧条目都是它。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub belongs_to: Option<MatterId>,
 }
 
 impl MemoryItem {
@@ -313,6 +321,30 @@ impl MemoryItem {
     /// 在 `now` 这一刻能不能进入自动召回：状态可召回，且没过有效期（§9.4）。
     pub fn is_recallable_at(&self, now: OffsetDateTime) -> bool {
         self.state.is_recallable() && self.valid_until.is_none_or(|until| until > now)
+    }
+}
+
+/// 召回时这条线索要不要推（§9.4「按"现在要不要用"分层」第 3、4 层；第 5 层 archived 本来就
+/// 不是 active，召回不会给出它）。`matters` 是全部事项（含搁置与已结案的）：
+///
+/// - 没有归属：看 `push_unattached`；
+/// - 归属一件进行中的事（goal 的 active / waiting、area 的 active）：推；
+/// - 归属一件搁置的目标：不推（搁置不归档，重启时原样回来）；
+/// - 归属的事已结案、但这条还没来得及归档（结案与归档不在同一个事务里）：不推；
+/// - 归属的事不在清单里（读不到）：按没有归属算，不因为查不到就把条目藏起来。
+///
+/// 约定不按归属分层，调用方不对约定调它（§9.4）。
+pub fn clue_is_pushed(
+    belongs_to: Option<&MatterId>,
+    matters: &[Matter],
+    push_unattached: bool,
+) -> bool {
+    let Some(id) = belongs_to else {
+        return push_unattached;
+    };
+    match matters.iter().find(|matter| &matter.id == id) {
+        Some(matter) => matches!(matter.state, MatterState::Active | MatterState::Waiting),
+        None => push_unattached,
     }
 }
 
@@ -547,6 +579,7 @@ mod tests {
             superseded_by: None,
             application: None,
             applies_when: None,
+            belongs_to: None,
         }
     }
 
@@ -665,5 +698,59 @@ mod tests {
         let m: MemoryItem = serde_json::from_str(json).unwrap();
         assert_eq!(m.usage.count, 0);
         assert!(m.evidence.is_empty());
+    }
+    fn matter(id: &str, kind: super::super::matter::MatterKind, state: MatterState) -> Matter {
+        use super::super::matter::NewMatter;
+        let mut matter = NewMatter {
+            kind,
+            title: "t".into(),
+            next: None,
+            due: None,
+            standard: None,
+        }
+        .build(MatterId::from_raw(id), datetime!(2026-10-29 08:00 UTC))
+        .unwrap();
+        matter.state = state;
+        matter
+    }
+
+    /// 分层（§9.4）：进行中的事推、搁置与已结案的不推、无归属看开关、查不到按无归属算。
+    #[test]
+    fn a_clue_is_pushed_by_what_its_matter_is_doing_now() {
+        use super::super::matter::MatterKind::{Area, Goal};
+        let matters = vec![
+            matter("g-active", Goal, MatterState::Active),
+            matter("g-wait", Goal, MatterState::Waiting),
+            matter("g-parked", Goal, MatterState::Parked),
+            matter("g-done", Goal, MatterState::Done),
+            matter("a-active", Area, MatterState::Active),
+            matter("a-retired", Area, MatterState::Retired),
+        ];
+        let id = |raw: &str| MatterId::from_raw(raw);
+        for (raw, pushed) in [
+            ("g-active", true),
+            ("g-wait", true),
+            ("g-parked", false),
+            ("g-done", false),
+            ("a-active", true),
+            ("a-retired", false),
+        ] {
+            assert_eq!(
+                clue_is_pushed(Some(&id(raw)), &matters, true),
+                pushed,
+                "{raw}"
+            );
+            // 有归属的不看 push_unattached。
+            assert_eq!(
+                clue_is_pushed(Some(&id(raw)), &matters, false),
+                pushed,
+                "{raw}"
+            );
+        }
+        assert!(clue_is_pushed(None, &matters, true));
+        assert!(!clue_is_pushed(None, &matters, false));
+        // 归属的事读不到：不因此把条目藏起来，按没有归属算。
+        assert!(clue_is_pushed(Some(&id("g-gone")), &matters, true));
+        assert!(!clue_is_pushed(Some(&id("g-gone")), &matters, false));
     }
 }

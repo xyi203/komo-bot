@@ -92,11 +92,11 @@ Gateway 持有模型连接、数据库与提交线、工具环境、运行状态
 | `komo gateway status/stop/restart`           | 管理后台进程。在 Gateway 自己的 `bash` 里跑 `stop` / `restart`（TUI 的 `!`、模型发起的都算）不当场做，推迟到这条命令结束、结果记进会话之后（见下文"在 Gateway 里重启自己"） |
 | `komo intervention list/show/answer`         | 待处理清单：结果不明、阻塞两类一张表；等价于聊天里的 `/pending` 与 `/answer`（§7.5、§11.3） |
 | `komo cron add/list/run/pause/resume/remove` | 管理定时任务                                                                |
-| `komo memory list/search/show`               | 查看自动记忆、来源与确认状态；search 支持 hybrid / keyword / vector，输出同 `list --full` 的列、约定与线索分开列；list --full 一条一行不截断，列为 `id@版本 状态 来源 确认 用量 使用方式 条件 正文`（无条件写 `-`，旧条目使用方式写「未分类」）；show 同样显示使用方式与条件。在 Run 里（bash 子进程带 `KOMO_SESSION`）跑 list / search 时按该会话 Profile 放行的作用域答（`memory = off` 的会话被拒），输出首行是宿主标记「记忆查询结果：已有记忆，不是新证据」，提取不把它当证据（`docs/memory.md` §9.4）；终端里不带会话，照旧 |
-| `komo memory add`                            | 手动记一条（§9.3）；在 Run 里（带 `KOMO_SESSION` / `KOMO_RUN`）记成未确认、引用户原话，终端里直接记成已确认；`--application convention --applies-when "条件"` 记成长期约定，省略记成线索（`docs/memory.md` §9.2） |
+| `komo memory list/search/show`               | 查看自动记忆、来源与确认状态；`--include-archived` 带上随事项结案归档的条目（默认不列，`--state archived` 明确问时不受限）；search 支持 hybrid / keyword / vector，输出同 `list --full` 的列、约定与线索分开列；list --full 一条一行不截断，列为 `id@版本 状态 来源 确认 用量 使用方式 条件 归属 正文`（无条件、无归属写 `-`，旧条目使用方式写「未分类」）；show 同样显示使用方式与条件。在 Run 里（bash 子进程带 `KOMO_SESSION`）跑 list / search 时按该会话 Profile 放行的作用域答（`memory = off` 的会话被拒），输出首行是宿主标记「记忆查询结果：已有记忆，不是新证据」，提取不把它当证据（`docs/memory.md` §9.4）；终端里不带会话，照旧 |
+| `komo memory add`                            | 手动记一条（§9.3）；在 Run 里（带 `KOMO_SESSION` / `KOMO_RUN`）记成未确认、引用户原话，终端里直接记成已确认；`--application convention --applies-when "条件"` 记成长期约定，省略记成线索（`docs/memory.md` §9.2）；`--for <事项 id>` 记明为哪件目标或领域记的（事项要存在且未结案） |
 | `komo memory confirm/forget`                 | 确认具体版本或停用自动记忆；不删除 Memos 原文                               |
-| `komo goal …` / `komo area …`               | 目标与领域（`docs/goals.md`，2026-10-29 认可，P1a 已实现）：add / list / show / edit，goal 另有 next / wait / resume / park / done / drop / reopen，area 另有 retire / reopen；两者都有 link / unlink 挂 Cron Job 或 monitor（P1e，结案时提示仍挂着的）；在 Run 里改承诺类操作要有用户原话，推进类（含 link / unlink）不要；`memory = private` / `off` 的会话被拒 |
-| `komo memory classify`                       | 操作者给指定 revision 定使用方式（约定 / 线索）与条件，升一版；存量分类用（`docs/memory.md` §9.3） |
+| `komo goal …` / `komo area …`               | 目标与领域（`docs/goals.md`，2026-10-29 认可，P1a–P1e 已实现）：add / list / show / edit，goal 另有 next / wait / resume / park / done / drop / reopen，area 另有 retire / reopen；两者都有 link / unlink 挂 Cron Job 或 monitor（P1e，结案时提示仍挂着的）；done / drop / retire 归档名下线索、列出名下约定问去向，reopen 恢复（P1c）；在 Run 里改承诺类操作要有用户原话，推进类（含 link / unlink）不要；`memory = private` / `off` 的会话被拒 |
+| `komo memory classify`                       | 操作者给指定 revision 定使用方式（约定 / 线索）、条件与归属，升一版；`--for <事项 id\|none>` 改挂 / 清空归属（事项要存在且未结案；带 private / off 会话被拒），`--application` 可省；存量分类用（`docs/memory.md` §9.3、§9.6） |
 | `komo memory consolidate`                    | 离线整理（§9.8）：对已有记忆去重、取代、标冲突，不新增正文；`--scope` `--kind` `--instruction`，默认预演，`--apply` 才写 |
 | `komo memory index status/rebuild`           | 查看索引覆盖率或重建当前向量索引                                            |
 | `komo init`                                  | 在数据目录（`KOMO_HOME`，默认 `~/.komo`）生成带注释的最小 `config.toml`（`default_agent` 与 `[agents.assistant]` 在最前面、一个 `[model_providers.default]` 占位、一个 completion 模型、`[models] default`、`[memory.retrieval] mode = "keyword"`——没有 embedding 时默认的 hybrid 校验不过）和权限 600 的 `.env` 模板；已有 `config.toml` **拒绝覆盖**，已有 `.env` 不碰。打印下一步：填 API key、`komo config check`。不经 Gateway |
@@ -1138,6 +1138,8 @@ top_k = 8
 max_tokens = 1500
 # 约定组（active + convention）不过门槛、不占 top_k，另有一份 token 预算；超出的按创建先后截掉，回到门槛那条路。
 convention_tokens = 800
+# 没有归属的线索要不要推（docs/memory.md §9.4 分层）；false 时它们只能 komo memory search 查到。存量挂好归属之前保持 true。
+push_unattached = true
 # 相关度门槛（docs/memory.md §9.4）：过任一道才留下；0 = 不启用（默认）。
 # 分数随 embedding 模型与前缀变，按自己的向量空间校准后再填，例如 qwen3-embedding:0.6b 无前缀：
 # min_similarity = 0.56

@@ -702,6 +702,7 @@ fn memory_item() -> MemoryItem {
         superseded_by: None,
         application: None,
         applies_when: None,
+        belongs_to: None,
     }
 }
 
@@ -736,9 +737,9 @@ fn a_full_memory_list_is_one_untruncated_line_per_memory() {
     assert_eq!(
         lines,
         vec![
-            format!("mem-1@3\t候选\t模型推断\t未确认\t注入 5 次 · 用上 2 次\t未分类\t-\t{long}")
+            format!("mem-1@3\t候选\t模型推断\t未确认\t注入 5 次 · 用上 2 次\t未分类\t-\t-\t{long}")
                 .as_str(),
-            "mem-2@3\t候选\t模型推断\t未确认\t注入 5 次 · 用上 2 次\t未分类\t-\t第一行 第二行",
+            "mem-2@3\t候选\t模型推断\t未确认\t注入 5 次 · 用上 2 次\t未分类\t-\t-\t第一行 第二行",
         ]
     );
 }

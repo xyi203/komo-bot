@@ -20,7 +20,7 @@ use async_trait::async_trait;
 use komo_kernel::protocol::http::{IndexState, MemoryIndexStatus};
 use komo_kernel::traits::{ConsolidationWrite, MemoryRepo, RepoError, StoreError};
 use komo_kernel::types::digest::ContentHash;
-use komo_kernel::types::ids::{MemoryId, RunId};
+use komo_kernel::types::ids::{MatterId, MemoryId, RunId};
 use komo_kernel::types::memory::{
     ArmScore, Evidence, MemoryItem, MemoryScope, MemoryState, RecallArm, RecallQuery, RecallResult,
     RetrievalMode, scope_allowed,
@@ -444,6 +444,7 @@ async fn put_in(
     let content_hash = ContentHash::of_str(&index_text).as_str().to_string();
     let application = item.application.map(|a| enum_str(&a));
     let applies_when = item.applies_when.clone().filter(|w| !w.trim().is_empty());
+    let belongs_to = item.belongs_to.as_ref().map(|id| id.to_string());
     let scope_kind = scope_kind(&item.scope);
     let supersedes = match &item.supersedes {
         Some(reference) => Some(encode(reference)?),
@@ -479,6 +480,7 @@ async fn put_in(
                 .last_adopted_at(item.usage.last_adopted_at.map(to_ts))
                 .application(application.clone())
                 .applies_when(applies_when.clone())
+                .belongs_to(belongs_to.clone())
                 .exec(ex)
                 .await
                 .map_err(map_toasty)?;
@@ -509,6 +511,7 @@ async fn put_in(
                 last_adopted_at: item.usage.last_adopted_at.map(to_ts),
                 application: application.clone(),
                 applies_when: applies_when.clone(),
+                belongs_to: belongs_to.clone(),
             })
             .exec(ex)
             .await
@@ -954,6 +957,7 @@ pub(super) async fn load_item(
             None => None,
         },
         applies_when: row.applies_when.clone(),
+        belongs_to: row.belongs_to.clone().map(MatterId::from_raw),
     }))
 }
 
@@ -1030,6 +1034,7 @@ mod tests {
             superseded_by: None,
             application: None,
             applies_when: None,
+            belongs_to: None,
         }
     }
 
@@ -2246,6 +2251,51 @@ mod tests {
         let plain = repo.get(&MemoryId::from_raw("m-2")).await.unwrap().unwrap();
         assert_eq!(plain.application, None);
         assert_eq!(plain.applies_when, None);
+    }
+
+    /// 归属（`docs/goals.md` §6）逐字往返；没有归属的条目读出来是 `None`；`belonging_to` 只给
+    /// 归属这件事的条目（任何状态），按 id 排。
+    #[tokio::test]
+    async fn belongs_to_round_trips_and_belonging_to_lists_only_that_matters_items() {
+        let (db, _dir) = temp().await;
+        let repo = TursoMemoryRepo::new(db);
+        let matter = MatterId::from_raw("g-1");
+        let mut mine = item("m-2", "归属目标一", MemoryState::Active);
+        mine.belongs_to = Some(matter.clone());
+        let mut archived = item("m-1", "归属目标一，已归档", MemoryState::Archived);
+        archived.belongs_to = Some(matter.clone());
+        let mut other = item("m-3", "归属别的事", MemoryState::Active);
+        other.belongs_to = Some(MatterId::from_raw("g-2"));
+        for memory in [
+            mine,
+            archived,
+            other,
+            item("m-4", "没有归属", MemoryState::Active),
+        ] {
+            repo.put(memory, None).await.unwrap();
+        }
+
+        let stored = repo.get(&MemoryId::from_raw("m-1")).await.unwrap().unwrap();
+        assert_eq!(stored.state, MemoryState::Archived);
+        assert_eq!(stored.belongs_to, Some(matter.clone()));
+        let plain = repo.get(&MemoryId::from_raw("m-4")).await.unwrap().unwrap();
+        assert_eq!(plain.belongs_to, None);
+
+        let ids: Vec<String> = repo
+            .belonging_to(&matter)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|memory| memory.id.to_string())
+            .collect();
+        assert_eq!(ids, ["m-1", "m-2"]);
+
+        // 改归属是一次写：清空之后不再归它。
+        let mut moved = repo.get(&MemoryId::from_raw("m-2")).await.unwrap().unwrap();
+        moved.revision += 1;
+        moved.belongs_to = None;
+        repo.put(moved, Some(1)).await.unwrap();
+        assert_eq!(repo.belonging_to(&matter).await.unwrap().len(), 1);
     }
 
     /// `conventions` 只给 active + convention，按 id（创建先后）排：线索、没分类的、已遗忘的约定都不在。

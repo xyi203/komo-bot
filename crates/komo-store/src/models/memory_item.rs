@@ -55,6 +55,9 @@ pub struct MemoryItemRow {
     pub application: Option<String>,
     /// 条件文本；`NULL` = 没有。进索引输入，所以 `content_hash` 是索引输入的哈希（§9.5）。
     pub applies_when: Option<String>,
+    /// 归属的事项（`MatterId` 字符串）；`NULL` = 不属于任何事，加列之前的旧条目都是它
+    /// （`docs/goals.md` §6）。改它升 revision，所以不进索引输入。
+    pub belongs_to: Option<String>,
 }
 
 pub const SPEC: TableSpec = TableSpec {
@@ -63,7 +66,7 @@ pub const SPEC: TableSpec = TableSpec {
     columns: COLUMNS,
 };
 
-pub const DDL: &str = r#"CREATE TABLE "memory_items" ("id" TEXT NOT NULL, "revision" BIGINT NOT NULL, "content" TEXT NOT NULL, "content_hash" TEXT NOT NULL, "kind" TEXT NOT NULL, "scope_kind" TEXT NOT NULL, "scope" TEXT NOT NULL, "provenance" TEXT NOT NULL, "confirmation" TEXT NOT NULL, "state" TEXT NOT NULL, "observed_at" BIGINT NOT NULL, "valid_until" BIGINT NOT NULL, "created_at" BIGINT NOT NULL, "updated_at" BIGINT NOT NULL, "extraction" TEXT NOT NULL, "usage_count" BIGINT NOT NULL, "last_used_at" BIGINT NOT NULL, "supersedes" TEXT, "superseded_by" TEXT, "consolidated_at" BIGINT, "adopted_count" BIGINT, "last_adopted_at" BIGINT, "application" TEXT, "applies_when" TEXT, PRIMARY KEY ("id"))"#;
+pub const DDL: &str = r#"CREATE TABLE "memory_items" ("id" TEXT NOT NULL, "revision" BIGINT NOT NULL, "content" TEXT NOT NULL, "content_hash" TEXT NOT NULL, "kind" TEXT NOT NULL, "scope_kind" TEXT NOT NULL, "scope" TEXT NOT NULL, "provenance" TEXT NOT NULL, "confirmation" TEXT NOT NULL, "state" TEXT NOT NULL, "observed_at" BIGINT NOT NULL, "valid_until" BIGINT NOT NULL, "created_at" BIGINT NOT NULL, "updated_at" BIGINT NOT NULL, "extraction" TEXT NOT NULL, "usage_count" BIGINT NOT NULL, "last_used_at" BIGINT NOT NULL, "supersedes" TEXT, "superseded_by" TEXT, "consolidated_at" BIGINT, "adopted_count" BIGINT, "last_adopted_at" BIGINT, "application" TEXT, "applies_when" TEXT, "belongs_to" TEXT, PRIMARY KEY ("id"))"#;
 
 pub const COLUMNS: &[ColumnSpec] = &[
     ColumnSpec::new("id", "TEXT NOT NULL DEFAULT ''"),
@@ -90,4 +93,5 @@ pub const COLUMNS: &[ColumnSpec] = &[
     ColumnSpec::new("last_adopted_at", "BIGINT"),
     ColumnSpec::new("application", "TEXT"),
     ColumnSpec::new("applies_when", "TEXT"),
+    ColumnSpec::new("belongs_to", "TEXT"),
 ];

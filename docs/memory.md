@@ -16,7 +16,7 @@
 | §9.8 | 离线整理 | 已实现 |
 | §9.9 | 判关系时候选用编号 | 已实现 |
 | §9.10 | 按会话提取，一次调用 | 已实现（含 `used` 采纳） |
-| §9.2 / §9.4 / §9.6 归属与归档、注入分层 | 记忆归属目标或领域、结案归档（`docs/goals.md`） | 2026-10-29 认可，未实现 |
+| §9.2 / §9.4 / §9.6 归属与归档、注入分层 | 记忆归属目标或领域、结案归档（`docs/goals.md`） | 2026-10-29 认可；记忆侧（归属字段、`archived`、第 3–5 层分层、结案归档、提取建议归属）已实现（P1c / P1d），第 1 层事项组（P1b）见 `docs/goals.md` §5 |
 | 附录 A | 外部记忆仓库调研（graphiti / mem0 / OpenViking） | 2026-10-19 |
 | 附录 B | 记忆机制改进方案（原 `docs/memory-improvements.md`） | 2026-10-16 提案 |
 | 附录 C | 对照 v0.8 的差距分析（原 `docs/memory.md`） | 2026-09-24 分析 |
@@ -49,14 +49,14 @@
 | scope                     | personal、project、environment 或 agent，绑定当前操作者、稳定项目 ID、实例 ID 或某个 Agent |
 | provenance                | user_statement / tool_observation / model_inference                                   |
 | confirmation              | unconfirmed / user_confirmed                                                          |
-| state                     | candidate / active / contested / superseded / forgotten / archived（archived：2026-10-29 认可，未实现，见下文「归属与归档」） |
+| state                     | candidate / active / contested / superseded / forgotten / archived（archived 见下文「归属与归档」，已实现） |
 | evidence_refs             | JSONL 的 Session ID + event_id / seq、工具产物或 Memos 实例 / 记录 ID、时间与来源版本 |
 | observed_at / valid_until | 事实的观察时间与可选有效期，区别于入库时间                                            |
 | created_at / updated_at   | 记忆管理时间                                                                          |
 | extraction_metadata       | 提取模型、effort、提示词版本、处理来源游标                                            |
 | usage                     | 注入次数与最近注入时间；用上次数（`adopted_count`）与最近用上时间（§9.10），只度量使用情况，不增加真实性 |
 | supersedes / superseded_by | 取代了谁 / 被谁取代（id + revision）；前者挂在新条目，后者挂在每条被取代的旧条目      |
-| belongs_to                | 为哪件事记的：某个目标或领域的 id（`docs/goals.md`），可空；2026-10-29 认可，未实现     |
+| belongs_to                | 为哪件事记的：某个目标或领域的 id（`docs/goals.md`），可空；已实现（P1c）           |
 
 证据与内容版本分别保留。用户确认绑定具体 id / revision 和操作者事件；模型返回的 user_confirmed 字段没有写入权限。明确的用户原话可标为 active + user_statement + unconfirmed，展示为“自动整理自用户陈述”；模型推断默认 candidate，不作为已确认事实注入。
 
@@ -76,10 +76,10 @@
 - 改 application 或 applies_when 是内容语义变化：升 revision，证据保留，旧注入的引用失效（§9.4、§9.7）。
 - 只有用户表达了长期意图的才是 convention；"这个工单选 saas""这次用 terra 并行做"是当次要求，留在当前任务，不入库（§9.3）。
 
-**归属与归档（2026-10-29 认可，未实现：`docs/goals.md` P1c）。** 作用域说"谁看得到、在哪适用"，归属（`belongs_to`）说"为哪件事记的"：同一条记忆可以在 `project:owl` 作用域里、归属"这周把 owl 的发布观察做完"这个目标。两者并存，互不替代。
+**归属与归档（2026-10-29 认可，已实现：`docs/goals.md` P1c / P1d）。** 作用域说"谁看得到、在哪适用"，归属（`belongs_to`）说"为哪件事记的"：同一条记忆可以在 `project:owl` 作用域里、归属"这周把 owl 的发布观察做完"这个目标。两者并存，互不替代。
 
 - 归属可空。空 = 不属于任何进行中的事，加列之前的条目都是空，行为不变。
-- 写入：提取给新观察建议归属（`docs/goals.md` §7）；`komo memory add --for <事项 id>`；`komo memory classify --for <事项 id|none>` 改已有条目的归属（操作者动作，同 classify，§9.6）。只能指向存在的事项；指向 private / off 会话看不到的事项无意义，带这种会话调用时拒绝（`docs/goals.md` §2）。
+- 写入：提取给新观察建议归属（`docs/goals.md` §7）；`komo memory add --for <事项 id>`；`komo memory classify --for <事项 id|none>` 改已有条目的归属（操作者动作，同 classify，§9.6）。只能指向存在且未结案的事项（结案的先 `reopen`；否则会造出一条没来得及归档的线索）；指向 private / off 会话看不到的事项无意义，带这种会话调用时拒绝（`docs/goals.md` §2）。
 - 改归属是内容语义变化：升 revision，旧注入的引用失效（同改 application，上文）。
 - `archived`：所属的事结案后，它下面的线索转成这个状态。不注入、不进提取的候选表，`search` / `list` 默认不返回，`--include-archived` 能查到。只有结案能产生 `archived`，只有重开能把它恢复成 `active`（§9.6「结案归档」）；它不是遗忘，不留排除标记。
 
@@ -255,7 +255,7 @@ MemoryManager 对 AgentRuntime 提供三个主要入口：recall、process_compl
 
 测试：kernel 无新增（`RetrievalConfig` 默认值由 hooks 与 agent 的预算用例覆盖）；agent `resident_conventions_have_their_own_budget_and_overflow_is_counted`、`a_truncated_convention_that_passed_the_gate_still_renders_in_the_convention_group`、`the_self_block_teaches_searching_memory_and_stays_byte_stable`（句子在、同输入装配逐字相同）；store `conventions_lists_only_active_conventions_in_id_order`；runtime `a_marked_memory_query_result_is_labelled_and_cannot_be_cited`、`the_child_gets_the_gateways_data_dir_as_komo_home`；client `memory_search_lists_conventions_apart_from_clues_with_usage_and_condition`；gateway hooks `a_convention_is_injected_for_a_paraphrase_and_takes_no_top_k_slot`（换说法也带上、同段第二个 Run 不重复、线索仍按 `top_k`）、`a_matching_convention_does_not_displace_a_clue_from_top_k`、`a_new_convention_is_added_a_forgotten_one_is_rewritten_and_a_new_segment_brings_it_again`（新增的下个 Run 补上、遗忘后整块 `omit`、head 之后新段重新带）、`conventions_over_budget_fall_back_to_the_gated_path`（没命中不带、命中仍在约定组、诊断记 1）、`a_private_agent_gets_only_its_own_scopes_conventions`、`memory_off_brings_no_conventions`；gateway `tests/memory/recall.rs` `a_convention_arrives_even_when_the_wording_matches_nothing`（端到端，第一个请求是第二个的前缀），原来的 `switching_tasks_mid_session_recalls_the_new_tasks_convention` 断言的是"查日志时不带发布约定"，与新规格相反，改写并更名为 `a_convention_rides_along_on_the_first_run_and_is_not_repeated_after_a_task_switch`；`tests/memory/session_search.rs` `a_session_search_returns_only_the_scopes_its_agent_may_see`、`a_private_agent_cannot_search_another_agents_private_memory`（`MemoryManager::query` 的 `scopes` 空 = 不含 `agent:*`，所以此前 private Agent 查不到自己的私有记忆、却查得到全部共享记忆；现在只看得到自己的，点名别人的私有作用域被拒）、`a_session_whose_memory_is_off_cannot_search`、`a_session_listing_is_scoped_too`。`cargo fmt --check` 通过；`cargo test --workspace --no-fail-fast`：2415 通过、0 失败、12 忽略（上次 2397，本次净增 18）。增量 `cargo build --timings`：8.5 秒（全量测试编译之后的空跑），报告 `target/cargo-timings/cargo-timing-20261028T135712946Z-f55de822e3512fa2.html`。未装二进制、未重启 Gateway、没有用真实模型回放；`komo doctor` 的整理提示没做（doctor 没有记忆这一栏，不是顺手能加的）；没有 CLI 子进程到真 Gateway 的端到端用例（带会话的 HTTP 路径与 CLI 渲染各有测试，`KOMO_SESSION` 到 `session` 参数这一步只靠读代码）；`komo memory list` 不带查询词时也按会话筛（规格只写了 search 与带查询的 list，这里顺手同一条路，因为 list 没有查询词的写法）。
 
-**按"现在要不要用"分层（2026-10-29 认可；第 1 层已实现：`docs/goals.md` §5 P1b，其余待 P1c）。** 召回块从两组变成下面五层，前三层进块、后两层只能查：
+**按"现在要不要用"分层（2026-10-29 认可，已实现：第 1 层事项组见 `docs/goals.md` §5 P1b，第 3–5 层与 `push_unattached` 见 P1c）。** 召回块从两组变成下面五层，前三层进块、后两层只能查：
 
 | 层 | 内容 | 怎么进 | 预算 |
 |---|---|---|---|
@@ -321,15 +321,28 @@ memory_vectors 按 memory_id + memory_revision + content_hash + generation_id �
 | "以后默认换成别的" | 用新值 | 新约定按 supersedes 取代旧的，走上面的规则：旧的已确认 → 双方 contested 等用户定 |
 
 - 只有 convention 能取代 convention；reference 或模型推断与约定冲突时，`Plan::authorize` 把 supersedes 降成 contradicts（双方 contested），不让一条线索悄悄停掉用户的约定。
-- 正文相同、条件不同的是两条，不合并、不判 same。`Plan::authorize` 另有一道：模型判了 same，但新观察与已有条目的 application 或 applies_when 不同（没分类按 reference 比）时按新增处理。判关系时编号候选行带上使用方式与条件（`memory-extract/v8`，现为 `v9`）。
+- 正文相同、条件不同的是两条，不合并、不判 same。`Plan::authorize` 另有一道：模型判了 same，但新观察与已有条目的 application 或 applies_when 不同（没分类按 reference 比）时按新增处理。判关系时编号候选行带上使用方式与条件（`memory-extract/v8`，现为 `v10`）。
 - 多条约定实质冲突、无法确定哪条现行时照旧 contested、停召回；只有它会实质改变当前结果时，主模型才问用户。
 
-**结案归档（2026-10-29 认可，未实现：`docs/goals.md` P1c）。** 目标 done / drop、领域 retire 时，在同一次写里：
+**结案归档（2026-10-29 认可，已实现：`docs/goals.md` P1c）。** 目标 done / drop、领域 retire 时（事项写完之后紧接着一遍幂等的归档，见「P1c / P1d 实现记录」）：
 
 - 归属它的线索（reference 与未分类）从 active / candidate 转成 `archived`，contested 不动（等人裁的不因结案消失）。线索是为这件事攒的，事情结束了它们就不该再被推，但以后可能还要翻，所以不遗忘。
 - 归属它的约定**不动**：约定是用户的长期意图，不能因一件事结案悄悄失效。命令返回里列出这些约定，Agent 转给用户问去向——改归属到某个领域或清空（`classify --for`），或遗忘。没答之前照常注入。
 - 重开（`reopen`）时，归属它的 `archived` 条目恢复成 active。只有结案会产生 `archived`，所以"归属它的 archived"就是因它结案而归档的那些。
 - 改状态升 revision，已展示的旧行按 §9.4 失效改写。
+
+**P1c / P1d 实现记录（2026-10-29）。** 接缝：kernel `MemoryItem.belongs_to`、`MemoryState::Archived`、纯函数 `types::memory::clue_is_pushed`（分层判定，全部事项 + `push_unattached` → 推不推）、`RetrievalConfig.push_unattached`、`MatterDetail.closure`（`MatterClosure` / `ClosureConvention`，响应上新增的可选字段）；store aux.db `memory_items` 加可空列 `belongs_to`（旧行读成 NULL，DDL 常量与补列各一条）、`TursoMemoryRepo::belonging_to`；runtime `memory::belongs`（`archive_for` / `restore_for`）、`MemoryManager::add` / `classify`（`BelongsChange`）、`prepare_with` 里的分层过滤、`extract` 的事项表与 `map_matter`；gateway `http::matters::settle_memories`（done / drop / retire 之后归档、reopen 之后恢复）、`/v1/memories` 的 `include_archived` 与 `add` / `classify` 的 `belongs_to`；bin `komo memory add --for` / `classify --for <id|none>`（`--application` 可省）/ `list|search --include-archived`。
+
+定下的、规格没写的：
+- **归档与结案不在同一个 aux.db 事务里**（偏离「同一次写」）：事项与记忆是两个仓储 trait，合成一个事务要给 `MatterRepo` 开一个能带记忆写的口子，而 P1e 还在改事项表。做法是先写事项、再跑一遍幂等的归档（只动还没归档的）。结案响应不管这次动词是不是真改了状态，都按事项**当前**状态再理一遍，所以"事项写完、归档中途失败"重发同一个结案请求就补上；补上之前 `clue_is_pushed` 已经把已结案事项名下的线索挡在推送之外。
+- **只能挂到未结案的事项**：`add --for` / `classify --for` 指向已结案事项被拒（要挂先 `reopen`）；不存在的、没接事项仓储的也拒。
+- **归档的条目回到 active 的两条路**：`reopen` 恢复（恢复成 active，原来是 candidate 的也回 active，与规格一致）；操作者对它 `classify --for <未结案事项|none>` 或带 `--for` 重说同一句话。单改分类（不动归属）不让它回来；不带 `--for` 重说同一句话被拒并提示。
+- **分层读全部事项**（含已结案的，`MatterRepo::list(None, true)`），不用 P1b 的 `open_matters`：要区分"事项已结案"与"事项读不到"（后者按没有归属算，不把条目藏起来）。有搁置的目标、或 `push_unattached = false` 时召回按 `candidate_limit` 多取，筛完再按 `top_k` 截，所以被筛掉的不占名额；代价是这两种情形下召回（和开着重排时的重排短名单）比平时宽。
+- `list` 默认不列归档的：不带 `--state` 时多取再筛（先筛再截 limit）；`search` 默认只给 active，`--include-archived` 把检索状态放宽到 active + archived；`--state archived` 明确问时不受限。
+- 私有记忆批次不给事项表、`classify` / `add` 带 private / off 会话且带归属时 403（同事项接口的闸）；终端里的 `classify` 现在也带 `KOMO_SESSION`。
+- 结案回执（CLI）：事项一行、归档条数、名下仍生效的约定（`id@版本 正文 · 条件：…`，附一句怎么处理：问用户去向，`classify --for` 或 `forget`，没答之前照常注入）；reopen 只说恢复了几条。
+
+测试（单测未跑，待汇总）：kernel `a_clue_is_pushed_by_what_its_matter_is_doing_now`；store `belongs_to_round_trips_and_belonging_to_lists_only_that_matters_items`、`the_belongs_to_column_is_added_to_an_existing_memory_items_table`；runtime（`memory/tests/belongs.rs`）`a_parked_goals_clue_is_not_pushed_and_takes_no_top_k_slot`、`unattached_clues_are_withheld_when_push_unattached_is_off`、`a_convention_is_not_layered_by_its_matter`、`closing_archives_the_clues_lists_the_conventions_and_reopening_restores`、`a_closed_matters_unarchived_clue_is_not_pushed_either`、`add_for_a_matter_validates_that_it_exists_and_is_open`、`classify_for_bumps_the_revision_and_validates_the_matter`、`an_archived_clue_comes_back_only_when_it_is_rehomed`、`add_for_without_a_matter_store_is_refused`、`a_suggested_matter_number_is_validated_against_the_table`、`a_matter_number_means_nothing_without_a_table`、`extraction_sets_belongs_on_new_items_and_never_changes_an_existing_one`、`the_extraction_prompt_numbers_the_open_matters_in_their_own_namespace`，配置 `push_unattached_defaults_to_true_and_is_read_from_config`；client `a_closing_receipt_reports_the_archive_and_lists_the_conventions`；bin `memory_commands_parse_the_matter_flags`；gateway 端到端 `tests/memory/belongs.rs` 的 `closing_a_goal_reports_the_archive_and_the_conventions_and_reopening_restores`、`retiring_an_area_and_dropping_a_goal_archive_their_clues_too`、`add_for_and_classify_for_validate_the_matter_and_bump_the_revision`、`a_private_or_off_session_cannot_attach_memory_to_a_matter`。`cargo check --workspace --tests` 通过、`cargo fmt` 已跑；`cargo test` 未跑，待汇总。
 
 关联 Memos 的记忆在引用原文前重新读取并核对更新时间或内容哈希；原文改动使关联摘要待更新，删除或失去访问权限时停止把它当成当前有效证据。网络故障只能标为无法验证，不能推断原文已删除。当前不实现跨实例自动同步。
 
@@ -436,6 +449,8 @@ Memory 内容以带来源的数据进入上下文，不能成为系统指令或�
 
 > **实现状态（2026-10-19）。已落地：** 按会话空闲后整批领取（`[memory].extract_idle`，默认 10m，热重载，必须 > 0）；`kind = task` 会话与 Cron 的 Run 不调模型、标 `done`、游标推到末尾；一批一次提取调用，观察上限改为每批 `[memory].max_observations`（默认 8），证据可引批内任一 Run 的事件并按事件记 `extracted_from_run`；窗口保留全部用户行、超预算按 Run 边界切段；`task-result:` 输入渲染为「任务交回」且不能引为证据；提取与判关系合成一次调用（提取前整批召回 20 条编号放进提示词，观察可带 `relations`，`classify` 已删），提示词 `memory-extract/v6`（并入 `used`）；每批一条结构化 INFO 日志（会话、kind、Run 数、窗口字符数、跳过原因、模型交回数、落库数，字段名见 `process_batch`）。
 > **未做：** `komo.memory.extract` span（日志字段已备好）。`used` 采纳见下一段，已实现。
+
+**事项表与归属建议（P1d，已实现，提示词 `memory-extract/v10`）。** 提示词在「本批注入的记忆」之后多一节「进行中的事项」：未结案的目标与领域（含搁置的，带状态），编号 `[g0]…`，自己的命名空间，不与关系候选的 `[0]…`、注入的 `[m0]…` 混；没有事项时整节省掉。每条新观察可交回 `"belongs_to":"g0"`（也收整数 `0`），Rust 按这次调用的编号表核对：在表里就映射成事项 id 写进新条目的 `belongs_to`，越界、读不懂的当作没给——观察本身不丢。提取**不改已有条目的归属**（逐字相同走合并、关系走 `Plan`，都不碰它）；改归属是 `classify --for`（操作者动作）。私有记忆的批次（`memory = private`）不给事项表：事项是操作者本人的清单。事项表是背景，不是证据，也不授权去推进事项。
 
 **采纳（`used`，已实现）。** `usage.count` 只数曝光（注入块里有它就 +1，跨 Run 沿用也累计），不等于被用上（附录 B.3.5、B.6.2）。同一次提取调用里，提示词在「本批注入的记忆」一节列出这批 Run 注入过的条目，编号 `[m0]…`，与关系候选的 `[0]…` 分开；批里没有任何注入时不出现这一节。模型交回顶层 `"used":[{"memory":"m0","evidence":["<事件 ID>"]}]`，只在助手回复或工具调用明显依赖了它时才算（话题相关、复述都不算）。
 

@@ -18,7 +18,7 @@ use komo_kernel::protocol::http::{
     MemoryListQuery, MemoryRevisionRequest, MemorySweepRequest, RebuildIndexRequest,
     SessionListQuery, UpdateCronRequest,
 };
-use komo_kernel::types::ids::{CronJobId, MemoryId, RunId, SessionId};
+use komo_kernel::types::ids::{CronJobId, MatterId, MemoryId, RunId, SessionId};
 use komo_kernel::types::memory::{
     MEMORY_QUERY_MARKER, MemoryApplication, MemoryKind, MemoryScope, MemoryState, RetrievalMode,
 };
@@ -396,6 +396,8 @@ pub struct MemoryFilter {
     pub mode: Option<String>,
     pub scope: Option<String>,
     pub state: Option<String>,
+    /// 带上已归档的（`docs/goals.md` §6）。
+    pub include_archived: bool,
     pub limit: Option<u32>,
     /// 正文不截断、一条一行（[`render::memory_list_full`]）。
     pub full: bool,
@@ -431,9 +433,10 @@ pub async fn memory_list(client: &KomoClient, filter: MemoryFilter) -> Outcome {
         Some("contested") => Some(MemoryState::Contested),
         Some("superseded") => Some(MemoryState::Superseded),
         Some("forgotten") => Some(MemoryState::Forgotten),
+        Some("archived") => Some(MemoryState::Archived),
         Some(other) => {
             return Err(format!(
-                "不认识的状态 `{other}`：支持 candidate / active / contested / superseded / forgotten"
+                "不认识的状态 `{other}`：支持 candidate / active / contested / superseded / forgotten / archived"
             ));
         }
     };
@@ -452,6 +455,7 @@ pub async fn memory_list(client: &KomoClient, filter: MemoryFilter) -> Outcome {
             mode,
             scope,
             state,
+            include_archived: filter.include_archived,
             limit: filter.limit,
             session,
         })
@@ -487,6 +491,7 @@ pub async fn memory_add(
     scope: &str,
     application: Option<&str>,
     applies_when: Option<&str>,
+    belongs_to: Option<&str>,
 ) -> Outcome {
     let kind = parse_kind(kind)?;
     let application = application
@@ -506,6 +511,7 @@ pub async fn memory_add(
             request_key: Some(RequestKeys::fresh(time::OffsetDateTime::now_utc())),
             application,
             applies_when: applies_when.map(str::to_string),
+            belongs_to: belongs_to.map(MatterId::from_raw),
         })
         .await
         .map_err(failed)?;
@@ -523,16 +529,30 @@ fn parse_kind(raw: &str) -> Result<MemoryKind, String> {
     }
 }
 
-/// `komo memory classify`：操作者给指定 revision 定使用方式与条件（§9.3「存量分类」）。
-/// 键按 id + revision + 内容取，同一次分类重试命中幂等缓存，改了参数就是新的一次。
+/// `komo memory classify`：操作者给指定 revision 定使用方式、条件与归属（§9.3「存量分类」、
+/// `docs/goals.md` §6）。`belongs_to` 是 `none` = 清空归属。
 pub async fn memory_classify(
     client: &KomoClient,
     id: &str,
     revision: u32,
-    application: &str,
+    application: Option<&str>,
     applies_when: Option<&str>,
+    belongs_to: Option<&str>,
 ) -> Outcome {
-    let application = application.parse::<MemoryApplication>()?;
+    let application = application
+        .map(str::parse::<MemoryApplication>)
+        .transpose()?;
+    if application.is_none() && applies_when.is_none() && belongs_to.is_none() {
+        return Err("classify 要给 --application / --applies-when / --for 里的至少一个".into());
+    }
+    let clear_belongs_to = belongs_to.is_some_and(|raw| raw.eq_ignore_ascii_case("none"));
+    let belongs_to = belongs_to
+        .filter(|_| !clear_belongs_to)
+        .map(MatterId::from_raw);
+    let session = std::env::var("KOMO_SESSION")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .map(SessionId::from_raw);
     let detail = client
         .memory_classify(
             &MemoryId::from_raw(id),
@@ -540,6 +560,9 @@ pub async fn memory_classify(
                 expected_revision: revision,
                 application,
                 applies_when: applies_when.map(str::to_string),
+                belongs_to,
+                clear_belongs_to,
+                session,
                 request_key: Some(RequestKeys::fresh(time::OffsetDateTime::now_utc())),
             },
         )

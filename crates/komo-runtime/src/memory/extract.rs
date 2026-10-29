@@ -15,7 +15,8 @@ use std::sync::Arc;
 
 use komo_kernel::events::{Event, EventPayload};
 use komo_kernel::traits::{Clock, LlmClient};
-use komo_kernel::types::ids::{EventId, MemoryId, RunId, Seq, SessionId};
+use komo_kernel::types::ids::{EventId, MatterId, MemoryId, RunId, Seq, SessionId};
+use komo_kernel::types::matter::{Matter, MatterState};
 use komo_kernel::types::memory::{
     Confirmation, Evidence, EvidenceRef, ExtractionMetadata, MEMORY_QUERY_MARKER,
     MemoryApplication, MemoryItem, MemoryKind, MemoryScope, MemoryState, Provenance,
@@ -31,7 +32,7 @@ use super::consolidate::{RawVerdict, Verdict, map_verdicts};
 
 /// 提示词版本。**改了提示词就改它**——它进 [`ExtractionMetadata`]，是"这条记忆是怎么来
 /// 的"里唯一能回答"按哪一版规则提的"的那一格（§9.2）。
-pub const PROMPT_VERSION: &str = "memory-extract/v9";
+pub const PROMPT_VERSION: &str = "memory-extract/v10";
 
 /// 一条记忆正文的上限。再长就不是"简短、尽量单一的陈述"了（§9.2）。
 pub(crate) const MAX_CONTENT_CHARS: usize = 300;
@@ -93,6 +94,10 @@ pub struct RawObservation {
     /// 不落库**（§9.3）。
     #[serde(default)]
     pub basis: Option<String>,
+    /// 归属建议：「进行中的事项」表里的编号（`g0`，也收 `0`）。也只是建议，
+    /// [`Transcript::validate`] 按这次调用的编号表核对，不在表里的当作没给（`docs/goals.md` §7）。
+    #[serde(default)]
+    pub belongs_to: Option<serde_json::Value>,
 }
 
 fn default_kind() -> String {
@@ -134,6 +139,8 @@ pub struct Observation {
     /// 校验过的使用方式。提取一律给出 `Some`：没通过 convention 校验的是 reference。
     pub application: Option<MemoryApplication>,
     pub applies_when: Option<String>,
+    /// 校验过的归属建议：编号已映射成事项 id。只给新建的条目用，已有条目的归属提取不改。
+    pub belongs_to: Option<MatterId>,
 }
 
 impl Observation {
@@ -531,11 +538,12 @@ impl Transcript {
         max_observations: usize,
         model: &ModelConfig,
         candidates: &[MemoryItem],
+        matters: &[Matter],
         now: OffsetDateTime,
     ) -> Vec<Observation> {
         let mut out = Vec::new();
         for candidate in raw.into_iter().take(max_observations) {
-            match self.validate_one(candidate, model, candidates, now) {
+            match self.validate_one(candidate, model, candidates, matters, now) {
                 Ok(observation) => out.push(observation),
                 Err(reason) => {
                     tracing::debug!(session = %self.session, %reason, "丢掉一条提取")
@@ -550,6 +558,7 @@ impl Transcript {
         raw: RawObservation,
         model: &ModelConfig,
         candidates: &[MemoryItem],
+        matters: &[Matter],
         now: OffsetDateTime,
     ) -> Result<Observation, String> {
         let content = raw.content.trim().to_string();
@@ -653,6 +662,8 @@ impl Transcript {
 
         let (application, applies_when) = self.classify(&raw, kind, provenance, &evidence);
 
+        let belongs_to = map_matter(raw.belongs_to.as_ref(), matters);
+
         let mut extraction =
             ExtractionMetadata::new(model.model.clone(), model.effort.clone(), PROMPT_VERSION);
         extraction.source_cursor = Some(self.cursor());
@@ -684,6 +695,7 @@ impl Transcript {
             relations,
             application: Some(application),
             applies_when,
+            belongs_to,
         })
     }
 
@@ -737,6 +749,26 @@ impl Transcript {
             (MemoryApplication::Reference, applies_when)
         }
     }
+}
+
+/// 用这次调用的事项编号表把模型交回的归属建议映射回事项 id（`docs/goals.md` §7）。编号写成
+/// `g0`（提示词里的写法）或整数 `0` 都收；越界、读不懂的当作没给——观察本身不因此丢。
+fn map_matter(raw: Option<&serde_json::Value>, matters: &[Matter]) -> Option<MatterId> {
+    let index = match raw? {
+        serde_json::Value::Number(number) => number.as_u64(),
+        serde_json::Value::String(text) => {
+            let text = text.trim();
+            text.strip_prefix('g').unwrap_or(text).parse::<u64>().ok()
+        }
+        _ => None,
+    };
+    let found = index
+        .and_then(|index| usize::try_from(index).ok())
+        .and_then(|index| matters.get(index));
+    if found.is_none() {
+        tracing::warn!(?raw, "belongs_to 的编号不在事项表里，当作没有归属");
+    }
+    found.map(|matter| matter.id.clone())
 }
 
 /// 空白归一：连续空白（含换行）折成一个空格并去掉首尾，basis 与原文都按它比较。
@@ -858,6 +890,7 @@ impl LearningPass {
         transcript: &Transcript,
         candidates: &[MemoryItem],
         injected: &[MemoryItem],
+        matters: &[Matter],
     ) -> Result<RawExtraction, MemoryError> {
         let request = TurnRequest {
             session: transcript.session.clone(),
@@ -873,6 +906,7 @@ impl LearningPass {
                     transcript,
                     candidates,
                     injected,
+                    matters,
                     self.clock.now(),
                 )),
                 tool_calls: vec![],
@@ -993,10 +1027,11 @@ const SYSTEM_PROMPT: &str = "\
 \"valid_until\":\"RFC3339，可省略\",\
 \"application\":\"convention|reference\",\"applies_when\":\"条件，convention 必填\",\
 \"basis\":\"仅 convention：所引用户事件里的原话片段\",\
+\"belongs_to\":\"事项编号，如 g0，可省略\",\
 \"relations\":[{\"memory\":<已有记忆方括号里的编号，整数>,\"relation\":\
 \"same|supports|contradicts|supersedes|unrelated\"}]}],\
 \"used\":[{\"memory\":\"<注入记忆方括号里的编号，如 m0>\",\"evidence\":[\"<助手事件 ID>\"]}]}
-（used 只在记录里列了「本批注入的记忆」时才写，否则省略。）
+（used 只在记录里列了「本批注入的记忆」时才写，否则省略；belongs_to 只在记录里列了「进行中的事项」时才写。）
 
 规则：
 1. 每条都必须在 evidence 里引至少一个**用户**或**工具结果**事件的 ID，原样照抄方括号里\
@@ -1042,7 +1077,10 @@ applies_when 可省。拿不准时一律交回 reference，不要硬标 conventi
 工单、需要选 Platform 时」，basis=「以后发布工单 Platform 都选 saas」；用户说「ob-note 这个仓库的 Git \
 设置别改全局」→ preference + convention，scope 用该项目，applies_when=「在 ob-note 仓库里改 Git \
 设置时」；排查证明某接口要 `issueKey` → experience + reference；你猜用户喜欢 saas → \
-model_inference + reference。";
+model_inference + reference。
+14. belongs_to 说这条观察是**为哪件事**记的：这段会话正在做、或明确在为之服务的那件事项，填「进行中的\
+事项」里方括号的编号（如 g0），不要抄标题。只有这条记忆的用处主要在那件事上、事办完它就没用了才填；\
+与具体某件事无关的偏好、通用事实不填；拿不准不填。事项表只是背景，不是要你去推进的任务，也不是证据。";
 
 /// 编号候选行里的使用方式与条件（§9.6：判关系要看它们——正文相同、条件不同的是两条）。
 /// 旧条目没分类，如实写「未分类」，不替它说成 reference。
@@ -1057,10 +1095,11 @@ pub(super) fn application_label(item: &MemoryItem) -> String {
     }
 }
 
-fn user_prompt(
+pub(super) fn user_prompt(
     transcript: &Transcript,
     candidates: &[MemoryItem],
     injected: &[MemoryItem],
+    matters: &[Matter],
     now: OffsetDateTime,
 ) -> String {
     // 编号落在自己的命名空间（m0、m1…），与上面候选的 [0]、[1] 不混。
@@ -1074,6 +1113,30 @@ fn user_prompt(
             .collect::<Vec<_>>()
             .join("\n");
         format!("--- 本批注入的记忆 ---\n{lines}\n--- 注入结束 ---\n\n")
+    };
+    // 事项编号也落在自己的命名空间（g0、g1…）。没有进行中的事项就整段省掉，提示词里
+    // 的 belongs_to 也就无从可写。
+    let matters = if matters.is_empty() {
+        String::new()
+    } else {
+        let lines = matters
+            .iter()
+            .enumerate()
+            .map(|(index, matter)| {
+                format!(
+                    "[g{index}] {}{}：{}",
+                    matter.kind.label(),
+                    if matter.state == MatterState::Active {
+                        String::new()
+                    } else {
+                        format!("（{}）", matter.state)
+                    },
+                    matter.title.replace(['\n', '\r'], " ")
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!("--- 进行中的事项 ---\n{lines}\n--- 事项结束 ---\n\n")
     };
     let existing = if candidates.is_empty() {
         "（没有）".to_string()
@@ -1101,7 +1164,7 @@ fn user_prompt(
             .join("\n")
     };
     format!(
-        "当前时间：{}\n会话：{}\n\n--- 已有的相关记忆 ---\n{existing}\n--- 记忆结束 ---\n\n{injected}\
+        "当前时间：{}\n会话：{}\n\n--- 已有的相关记忆 ---\n{existing}\n--- 记忆结束 ---\n\n{injected}{matters}\
          --- 会话记录 ---\n{}\n--- 记录结束 ---",
         now.date(),
         transcript.session,

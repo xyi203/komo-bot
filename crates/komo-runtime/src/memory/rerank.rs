@@ -162,6 +162,7 @@ mod live {
             superseded_by: None,
             application: None,
             applies_when: None,
+            belongs_to: None,
         }
     }
 

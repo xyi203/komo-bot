@@ -12,8 +12,8 @@ use axum::Json;
 use axum::extract::{Path, Query, State};
 use komo_kernel::durable::SessionKind;
 use komo_kernel::protocol::http::{
-    ErrorCode, MatterActionRequest, MatterAddRequest, MatterDetail, MatterListQuery,
-    MatterListResponse, MatterShowQuery,
+    ClosureConvention, ErrorCode, MatterActionRequest, MatterAddRequest, MatterClosure,
+    MatterDetail, MatterListQuery, MatterListResponse, MatterShowQuery,
 };
 use komo_kernel::types::agent::MemoryMode;
 use komo_kernel::types::ids::{MatterId, SessionId};
@@ -65,6 +65,7 @@ pub async fn show(
         matter,
         today: today(&api),
         still_linked: Vec::new(),
+        closure: None,
     }))
 }
 
@@ -91,6 +92,7 @@ pub async fn add(
         matter,
         today: today(&api),
         still_linked: Vec::new(),
+        closure: None,
     };
     api.idempotency
         .remember(request.request_key.as_ref(), &hash, &detail);
@@ -129,14 +131,66 @@ pub async fn act(
     } else {
         Vec::new()
     };
+    let closure = settle_memories(&api, &matter, verb).await?;
     let detail = MatterDetail {
         matter,
         today: today(&api),
         still_linked,
+        closure,
     };
     api.idempotency
         .remember(request.request_key.as_ref(), &hash, &detail);
     Ok(Json(detail))
+}
+
+/// 结案归档 / 重开恢复（`memory.md` §9.6「结案归档」）：事项写完之后，按事项**现在**的状态
+/// 把它名下的记忆理一遍。看状态而不看这次动词，所以对已在目标状态上的重复请求（上一次
+/// 事项写完、归档没跑完）也会补上；归档本身幂等。结案与归档不在同一个 aux.db 事务里（事项与
+/// 记忆是两个仓储），差别见 `komo_runtime::memory::belongs` 的模块注释。
+async fn settle_memories(
+    api: &Api,
+    matter: &komo_kernel::types::matter::Matter,
+    verb: MatterVerb,
+) -> ApiResult<Option<MatterClosure>> {
+    let memories = &api.state.memories;
+    if matter.state.is_closed() {
+        let outcome = memories
+            .archive_for(&matter.id)
+            .await
+            .map_err(|error| ApiFailure::new(ErrorCode::Internal, error.to_string()))?;
+        return Ok(Some(closure_of(outcome)));
+    }
+    if verb == MatterVerb::Reopen {
+        let outcome = memories
+            .restore_for(&matter.id)
+            .await
+            .map_err(|error| ApiFailure::new(ErrorCode::Internal, error.to_string()))?;
+        if outcome.restored > 0 && memories.space().is_some() {
+            // 改了 revision，旧版本的向量失效：补齐一次。
+            if let Err(error) = memories.schedule_index() {
+                tracing::warn!(%error, "重开之后补向量没提交上，先只靠关键词命中");
+            }
+        }
+        return Ok(Some(closure_of(outcome)));
+    }
+    Ok(None)
+}
+
+fn closure_of(outcome: komo_runtime::memory::BelongsOutcome) -> MatterClosure {
+    MatterClosure {
+        archived: outcome.archived,
+        restored: outcome.restored,
+        conventions: outcome
+            .conventions
+            .into_iter()
+            .map(|item| ClosureConvention {
+                id: item.id,
+                revision: item.revision,
+                content: item.content,
+                applies_when: item.applies_when,
+            })
+            .collect(),
+    }
 }
 
 /// 带会话的写：先过闸，再看它是不是后台任务会话。
@@ -154,7 +208,7 @@ async fn caller(
 
 /// 给别人用的 Agent（`memory = private / off`）的会话拒掉（§2）；放行时答这个会话是不是
 /// 后台任务。Profile 的判断与召回同一处（`hooks::resolve`）。
-async fn gate(api: &Api, session: &SessionId) -> ApiResult<bool> {
+pub(super) async fn gate(api: &Api, session: &SessionId) -> ApiResult<bool> {
     let core = api.state.core()?;
     let record = core.session(session.as_str()).await?;
     let snapshot = api.state.snapshot();

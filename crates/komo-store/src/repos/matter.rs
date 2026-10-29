@@ -7,7 +7,7 @@
 use async_trait::async_trait;
 use komo_kernel::traits::{MatterRepo, RepoError, StoreError};
 use komo_kernel::types::ids::MatterId;
-use komo_kernel::types::matter::{Matter, MatterKind, MatterState, parse_due};
+use komo_kernel::types::matter::{Matter, MatterKind, MatterState, MatterTrigger, parse_due};
 use komo_kernel::types::memory::Evidence;
 
 use crate::db::{
@@ -94,6 +94,7 @@ impl MatterRepo for TursoMatterRepo {
                         .await
                         .map_err(map_toasty)?;
                     let evidence = encode(&matter.evidence)?;
+                    let triggers = encode(&matter.triggers)?;
                     let due = matter.due.map(|due| due.to_string());
                     match (existing, expected_revision) {
                         (None, None) => {
@@ -111,6 +112,7 @@ impl MatterRepo for TursoMatterRepo {
                                 created_at: to_ts(matter.created_at),
                                 updated_at: to_ts(matter.updated_at),
                                 closed_at: to_ts_opt(matter.closed_at),
+                                triggers: triggers,
                             })
                             .exec(ex)
                             .await
@@ -140,6 +142,7 @@ impl MatterRepo for TursoMatterRepo {
                                 .evidence(evidence)
                                 .updated_at(to_ts(matter.updated_at))
                                 .closed_at(to_ts_opt(matter.closed_at))
+                                .triggers(triggers)
                                 .exec(ex)
                                 .await
                                 .map_err(map_toasty)?;
@@ -171,6 +174,7 @@ fn matter_from_row(row: &MatterRow) -> Result<Matter, StoreError> {
             .map_err(corrupt)?,
         standard: row.standard.clone(),
         evidence: decode::<Vec<Evidence>>(&row.evidence, "事项证据")?,
+        triggers: decode::<Vec<MatterTrigger>>(&row.triggers, "事项触发器")?,
         created_at: from_ts(row.created_at),
         updated_at: from_ts(row.updated_at),
         closed_at: from_ts_opt(row.closed_at),
@@ -180,7 +184,7 @@ fn matter_from_row(row: &MatterRow) -> Result<Matter, StoreError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use komo_kernel::types::ids::{EventId, RunId, Seq, SessionId};
+    use komo_kernel::types::ids::{CronJobId, EventId, RunId, Seq, SessionId};
     use komo_kernel::types::matter::{MatterChange, NewMatter, transition};
     use komo_kernel::types::memory::{EvidenceRef, Provenance};
     use time::OffsetDateTime;
@@ -244,10 +248,30 @@ mod tests {
         repo.put(waiting.clone(), Some(1)).await.unwrap();
         assert_eq!(repo.get(&stored.id).await.unwrap(), Some(waiting.clone()));
 
-        let done = transition(&waiting, &MatterChange::Done, T0)
+        // 挂着的触发器按挂上的先后存、原样读回。
+        let linked = transition(
+            &waiting,
+            &MatterChange::Link(MatterTrigger::cron(CronJobId::from_raw("job-1"))),
+            T0,
+        )
+        .unwrap()
+        .unwrap();
+        let linked = transition(
+            &linked,
+            &MatterChange::Link(MatterTrigger::parse_monitor("sess-1:#3f2a").unwrap()),
+            T0,
+        )
+        .unwrap()
+        .unwrap();
+        repo.put(linked.clone(), Some(2)).await.unwrap();
+        let read = repo.get(&stored.id).await.unwrap().unwrap();
+        assert_eq!(read, linked);
+        assert_eq!(read.triggers.len(), 2);
+
+        let done = transition(&linked, &MatterChange::Done, T0)
             .unwrap()
             .unwrap();
-        repo.put(done.clone(), Some(2)).await.unwrap();
+        repo.put(done.clone(), Some(4)).await.unwrap();
         let read = repo.get(&stored.id).await.unwrap().unwrap();
         assert_eq!(read, done);
         assert_eq!(read.closed_at, Some(T0));

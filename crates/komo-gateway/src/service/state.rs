@@ -265,11 +265,14 @@ impl GatewayState {
         // 事项的承诺类操作与 `memory add` 读同一份事件找用户原话（`docs/goals.md` §4）。
         let matter_repo: Arc<dyn komo_kernel::traits::MatterRepo> =
             Arc::new(TursoMatterRepo::new(db.clone()));
-        let matters = Arc::new(MatterManager::new(
-            Arc::clone(&matter_repo),
-            Arc::clone(&events),
-            Arc::clone(&clock),
-        ));
+        let matters = Arc::new(
+            MatterManager::new(
+                Arc::clone(&matter_repo),
+                Arc::clone(&events),
+                Arc::clone(&clock),
+            )
+            .with_cron(Arc::clone(&cron)),
+        );
         let memories = Arc::new(MemoryManager::new(MemoryParts {
             matters: Some(matter_repo),
             config: snapshot.memory.clone(),

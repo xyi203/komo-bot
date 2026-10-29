@@ -1204,6 +1204,43 @@ mod tests {
         };
     }
 
+    /// `komo goal|area link|unlink`（docs/goals.md §8）：`--cron` 与 `--monitor` 二选一。
+    #[test]
+    fn link_commands_take_a_cron_job_or_a_monitor() {
+        for args in [
+            &["goal", "link", "g-1", "--cron", "job-1"][..],
+            &[
+                "goal",
+                "link",
+                "g-1",
+                "--monitor",
+                "sess-1:#3f2a",
+                "--revision",
+                "2",
+            ],
+            &["goal", "unlink", "g-1", "--cron", "job-1"],
+            &["area", "link", "a-1", "--monitor", "sess-1:3f2a"],
+            &["area", "unlink", "a-1", "--monitor", "sess-1:3f2a"],
+        ] {
+            let argv = std::iter::once("komo").chain(args.iter().copied());
+            assert!(Cli::try_parse_from(argv).is_ok(), "{args:?}");
+        }
+        assert!(
+            Cli::try_parse_from([
+                "komo",
+                "goal",
+                "link",
+                "g-1",
+                "--cron",
+                "job-1",
+                "--monitor",
+                "s:1"
+            ])
+            .is_err(),
+            "两种不能同时给"
+        );
+    }
+
     /// `komo cron add` 的四个必填项。
     #[test]
     fn cron_add_requires_a_schedule_and_a_prompt() {

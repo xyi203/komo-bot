@@ -301,3 +301,112 @@ async fn a_private_or_off_session_cannot_see_or_change_matters() {
     assert_eq!(status, 200, "{body}");
     assert_eq!(body["matters"].as_array().unwrap().len(), 1, "{body}");
 }
+
+/// §8：goal 挂一个真 Cron Job 与一个 monitor，show 里看得到；重复挂不升版；摘掉没挂着的
+/// 报错；done 的回应带着仍挂着的触发器，结案后不能再挂、摘，重开后还在。
+#[tokio::test]
+async fn a_goal_links_a_cron_job_and_a_monitor_and_reminds_on_close() {
+    let gateway = start(0).await;
+    let job = post(
+        &gateway,
+        "/v1/cron",
+        json!({"name": "approval-watch", "schedule": "0 9 * * *",
+               "timezone": "Asia/Shanghai", "prompt": "看审批到了没"}),
+    )
+    .await;
+    let job_id = job["id"].as_str().unwrap().to_string();
+    let goal = post(
+        &gateway,
+        "/v1/matters",
+        json!({"kind": "goal", "title": "owl 发布工单"}),
+    )
+    .await;
+    let id = goal["matter"]["id"].as_str().unwrap().to_string();
+    let link = format!("/v1/matters/{id}/link");
+
+    let cron = json!({"kind": "cron", "job": job_id});
+    let monitor = json!({"kind": "monitor", "session": "sess-1", "monitor": "3f2a"});
+    let first = post(&gateway, &link, json!({"trigger": cron})).await;
+    assert_eq!(first["matter"]["revision"], 2);
+    let second = post(&gateway, &link, json!({"trigger": monitor})).await;
+    assert_eq!(second["matter"]["revision"], 3);
+    let repeat = post(&gateway, &link, json!({"trigger": cron})).await;
+    assert_eq!(repeat["matter"]["revision"], 3, "重复挂是空操作：{repeat}");
+    let (_, shown) = gateway.get_json(&format!("/v1/matters/{id}")).await;
+    assert_eq!(shown["matter"]["triggers"], json!([cron, monitor]));
+    assert!(shown.get("still_linked").is_none(), "{shown}");
+
+    // 没有这个 Job、monitor 写得不像样：400，什么都不改。
+    let (status, body) = gateway
+        .post_json(
+            &link,
+            json!({"trigger": {"kind": "cron", "job": "no-such-job"}}),
+        )
+        .await;
+    assert_eq!(status, 400, "{body}");
+    assert!(body.to_string().contains("no-such-job"), "{body}");
+    let (status, body) = gateway
+        .post_json(
+            &link,
+            json!({"trigger": {"kind": "monitor", "session": "sess-1", "monitor": "a b"}}),
+        )
+        .await;
+    assert_eq!(status, 400, "{body}");
+
+    let unlinked = post(
+        &gateway,
+        &format!("/v1/matters/{id}/unlink"),
+        json!({"trigger": monitor}),
+    )
+    .await;
+    assert_eq!(unlinked["matter"]["triggers"], json!([cron]));
+    let (status, body) = gateway
+        .post_json(
+            &format!("/v1/matters/{id}/unlink"),
+            json!({"trigger": monitor}),
+        )
+        .await;
+    assert_eq!(status, 400, "没挂着的摘不了：{body}");
+
+    let done = post(&gateway, &format!("/v1/matters/{id}/done"), json!({})).await;
+    assert_eq!(done["still_linked"], json!([cron]), "{done}");
+    let (status, body) = gateway.post_json(&link, json!({"trigger": monitor})).await;
+    assert_eq!(status, 409, "结案的不能再挂：{body}");
+    let reopened = post(&gateway, &format!("/v1/matters/{id}/reopen"), json!({})).await;
+    assert_eq!(reopened["matter"]["triggers"], json!([cron]));
+    assert!(reopened.get("still_linked").is_none(), "{reopened}");
+}
+
+/// 领域也能挂；link 是推进，Run 里没有用户原话也行。
+#[tokio::test]
+async fn an_area_can_link_a_monitor_from_a_run_without_user_words() {
+    let gateway = start(1).await;
+    let added = post(
+        &gateway,
+        "/v1/matters",
+        json!({"kind": "area", "title": "告警值班轮换"}),
+    )
+    .await;
+    let id = added["matter"]["id"].as_str().unwrap().to_string();
+    let (session, run) = user_run(&gateway, "看一下").await;
+    // 该 Run 里有用户的话；换一个没有话的会话 id 构造不了真 Run，这里只验 link 带 session/run
+    // 照样走推进那条路（不追加证据）。
+    let linked = post(
+        &gateway,
+        &format!("/v1/matters/{id}/link"),
+        in_run(
+            json!({"kind": "area",
+                   "trigger": {"kind": "monitor", "session": session, "monitor": "9c1d"}}),
+            &session,
+            &run,
+        ),
+    )
+    .await;
+    assert_eq!(
+        linked["matter"]["triggers"].as_array().map(Vec::len),
+        Some(1)
+    );
+    assert!(linked["matter"]["evidence"].is_null(), "{linked}");
+    let retired = post(&gateway, &format!("/v1/matters/{id}/retire"), json!({})).await;
+    assert_eq!(retired["still_linked"].as_array().map(Vec::len), Some(1));
+}

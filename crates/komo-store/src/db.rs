@@ -987,6 +987,42 @@ mod tests {
         insert(&db, "after-alter".to_string()).await.unwrap();
     }
 
+    /// `triggers`（P1e）在旧形状的 matters 表上补得回来，旧行读出来是没有触发器。
+    #[tokio::test]
+    async fn the_triggers_column_is_added_to_an_existing_matters_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("aux.db");
+
+        let legacy = crate::models::matter::DDL.replace(r#""triggers" TEXT NOT NULL, "#, "");
+        assert!(!legacy.contains("triggers"), "旧形状里不该有这一列");
+        plain_build_old(&path, Some(("matters", legacy))).await;
+        plain_exec(
+            &path,
+            "INSERT INTO matters (id, revision, kind, title, state, evidence, created_at, \
+             updated_at, closed_at) VALUES ('g-old', 1, 'goal', '旧事项', 'active', '[]', 0, 0, 0)",
+        )
+        .await;
+        let before = plain_columns(&path, "matters").await;
+        assert!(
+            !before.iter().any(|name| name == "triggers"),
+            "旧形状没落盘：{before:?}"
+        );
+
+        let db = Db::connect(&path).await.unwrap();
+        let after = plain_columns(&path, "matters").await;
+        assert!(
+            after.iter().any(|name| name == "triggers"),
+            "补回来了，而且落盘：{after:?}"
+        );
+        use komo_kernel::traits::MatterRepo;
+        let old = crate::repos::matter::TursoMatterRepo::new(db)
+            .get(&komo_kernel::types::ids::MatterId::from_raw("g-old"))
+            .await
+            .unwrap()
+            .expect("旧行还在");
+        assert!(old.triggers.is_empty());
+    }
+
     /// `superseded_by` 在旧形状的 memory_items 表上补得回来（§9.8 的加列规则）。
     #[tokio::test]
     async fn the_superseded_by_column_is_added_to_an_existing_memory_items_table() {

@@ -64,6 +64,7 @@ pub async fn show(
     Ok(Json(MatterDetail {
         matter,
         today: today(&api),
+        still_linked: Vec::new(),
     }))
 }
 
@@ -89,6 +90,7 @@ pub async fn add(
     let detail = MatterDetail {
         matter,
         today: today(&api),
+        still_linked: Vec::new(),
     };
     api.idempotency
         .remember(request.request_key.as_ref(), &hash, &detail);
@@ -118,9 +120,19 @@ pub async fn act(
         .apply(&id, verb, &request, &caller)
         .await
         .map_err(failure)?;
+    // 结案时提醒还挂着的触发器：不自动删，触发器可能另有用途（§8）。
+    let still_linked = if matches!(
+        verb,
+        MatterVerb::Done | MatterVerb::Drop | MatterVerb::Retire
+    ) {
+        matter.triggers.clone()
+    } else {
+        Vec::new()
+    };
     let detail = MatterDetail {
         matter,
         today: today(&api),
+        still_linked,
     };
     api.idempotency
         .remember(request.request_key.as_ref(), &hash, &detail);

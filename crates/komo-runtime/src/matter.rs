@@ -13,11 +13,11 @@
 use std::sync::Arc;
 
 use komo_kernel::protocol::http::{MatterActionRequest, MatterAddRequest};
-use komo_kernel::traits::{Clock, MatterRepo, RepoError};
+use komo_kernel::traits::{Clock, CronRepo, MatterRepo, RepoError};
 use komo_kernel::types::ids::{MatterId, RunId, SessionId};
 use komo_kernel::types::matter::{
-    MAX_TITLE_CHARS, Matter, MatterChange, MatterError, MatterKind, MatterVerb, NewMatter,
-    transition,
+    MAX_TITLE_CHARS, Matter, MatterChange, MatterError, MatterKind, MatterTrigger, MatterVerb,
+    NewMatter, transition,
 };
 use komo_kernel::types::memory::Evidence;
 
@@ -90,6 +90,8 @@ pub struct MatterManager {
     repo: Arc<dyn MatterRepo>,
     events: Arc<dyn SessionEvents>,
     clock: Arc<dyn Clock>,
+    /// 挂 Cron Job 时查它在不在（§8）；没有就不查（只有测试里没接 cron）。
+    cron: Option<Arc<dyn CronRepo>>,
 }
 
 impl std::fmt::Debug for MatterManager {
@@ -108,7 +110,14 @@ impl MatterManager {
             repo,
             events,
             clock,
+            cron: None,
         }
+    }
+
+    /// 接上 Cron 仓储：`link --cron` 据此核对 Job 存在。
+    pub fn with_cron(mut self, cron: Arc<dyn CronRepo>) -> Self {
+        self.cron = Some(cron);
+        self
     }
 
     pub async fn list(
@@ -178,6 +187,15 @@ impl MatterManager {
         let now = self.clock.now();
         // 状态不允许的先报：比"缺原话"更说明问题。
         let changed = transition(&existing, &change, now)?;
+        // 只核对挂 Cron：Job 得存在。monitor 只查形状（transition 里），不查它还在不在跑：
+        // monitor 的登记在 Session 里，事项这一层不碰；挂在已结束的 monitor 上无害，摘掉就是。
+        if let (MatterChange::Link(MatterTrigger::Cron { job }), Some(cron)) = (&change, &self.cron)
+            && cron.get(job).await?.is_none()
+        {
+            return Err(MatterFailure::Invalid(format!(
+                "没有这个 Cron Job：{job}（`komo cron list` 看现有的）"
+            )));
+        }
         let evidence = if verb.is_commitment() {
             self.commitment_evidence(caller, verb.as_str()).await?
         } else {
@@ -242,6 +260,7 @@ fn change_of(
         ("due", request.due.is_some()),
         ("clear_due", request.clear_due),
         ("standard", request.standard.is_some()),
+        ("trigger", request.trigger.is_some()),
     ]
     .into_iter()
     .filter_map(|(name, present)| present.then_some(name))
@@ -250,6 +269,7 @@ fn change_of(
         MatterVerb::Next | MatterVerb::Resume => &["next"],
         MatterVerb::Wait => &["waiting_for"],
         MatterVerb::Edit => &["title", "due", "clear_due", "standard"],
+        MatterVerb::Link | MatterVerb::Unlink => &["trigger"],
         _ => &[],
     };
     if let Some(extra) = given.iter().find(|name| !accepted.contains(name)) {
@@ -276,6 +296,17 @@ fn change_of(
         MatterVerb::Drop => MatterChange::Drop,
         MatterVerb::Retire => MatterChange::Retire,
         MatterVerb::Reopen => MatterChange::Reopen,
+        MatterVerb::Link | MatterVerb::Unlink => {
+            let trigger = request.trigger.clone().ok_or_else(|| {
+                MatterFailure::Invalid(format!("{verb} 要给 trigger（Cron Job 或 monitor）"))
+            })?;
+            trigger.check_shape().map_err(MatterFailure::Invalid)?;
+            if verb == MatterVerb::Link {
+                MatterChange::Link(trigger)
+            } else {
+                MatterChange::Unlink(trigger)
+            }
+        }
         MatterVerb::Edit => {
             if request.due.is_some() && request.clear_due {
                 return Err(MatterFailure::Invalid(
@@ -662,5 +693,125 @@ mod tests {
             .unwrap();
         assert_eq!(again, parked);
         assert!(again.evidence.is_empty());
+    }
+
+    fn link_request(trigger: Option<MatterTrigger>) -> MatterActionRequest {
+        MatterActionRequest {
+            trigger,
+            ..MatterActionRequest::default()
+        }
+    }
+
+    /// link / unlink 是推进：Run 里没有用户原话也行，终端里更行；已挂着的再挂不升版，摘掉
+    /// 没挂着的报错，结案后都拒。
+    #[tokio::test]
+    async fn linking_is_progress_and_needs_no_user_words() {
+        let (manager, _dir) = manager().await;
+        let goal = manager
+            .add(&add_goal("发布观察"), &Caller::Operator)
+            .await
+            .unwrap();
+        let monitor = MatterTrigger::parse_monitor("sess-1:#3f2a").unwrap();
+        // 找不到用户原话的 Run（Events 只有 run-user 那一轮有话）。
+        let linked = manager
+            .apply(
+                &goal.id,
+                MatterVerb::Link,
+                &link_request(Some(monitor.clone())),
+                &in_run("run-silent"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(linked.triggers, vec![monitor.clone()]);
+        assert_eq!(linked.revision, 2);
+        assert!(linked.evidence.is_empty());
+        let again = manager
+            .apply(
+                &goal.id,
+                MatterVerb::Link,
+                &link_request(Some(monitor.clone())),
+                &Caller::Operator,
+            )
+            .await
+            .unwrap();
+        assert_eq!(again, linked);
+        let gone = manager
+            .apply(
+                &goal.id,
+                MatterVerb::Unlink,
+                &link_request(Some(monitor.clone())),
+                &Caller::Operator,
+            )
+            .await
+            .unwrap();
+        assert!(gone.triggers.is_empty());
+        assert!(
+            manager
+                .apply(
+                    &goal.id,
+                    MatterVerb::Unlink,
+                    &link_request(Some(monitor.clone())),
+                    &Caller::Operator,
+                )
+                .await
+                .is_err()
+        );
+        manager
+            .apply(
+                &goal.id,
+                MatterVerb::Done,
+                &MatterActionRequest::default(),
+                &Caller::Operator,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            manager
+                .apply(
+                    &goal.id,
+                    MatterVerb::Link,
+                    &link_request(Some(monitor)),
+                    &Caller::Operator,
+                )
+                .await,
+            Err(MatterFailure::Rule(MatterError::NotAllowed { .. }))
+        ));
+    }
+
+    /// 没给 trigger、形状不对、带了别的字段，都在读写之前就被拒。
+    #[tokio::test]
+    async fn a_link_without_a_well_formed_trigger_is_refused() {
+        let (manager, _dir) = manager().await;
+        let goal = manager
+            .add(&add_goal("发布观察"), &Caller::Operator)
+            .await
+            .unwrap();
+        let bad_monitor = MatterTrigger::Monitor {
+            session: SessionId::from_raw("sess-1"),
+            monitor: "3f 2a".into(),
+        };
+        let with_next = MatterActionRequest {
+            next: Some("x".into()),
+            trigger: Some(MatterTrigger::cron(
+                komo_kernel::types::ids::CronJobId::from_raw("job-1"),
+            )),
+            ..MatterActionRequest::default()
+        };
+        for request in [
+            link_request(None),
+            link_request(Some(bad_monitor)),
+            with_next,
+        ] {
+            assert!(
+                matches!(
+                    manager
+                        .apply(&goal.id, MatterVerb::Link, &request, &Caller::Operator)
+                        .await,
+                    Err(MatterFailure::Invalid(_))
+                ),
+                "{request:?}"
+            );
+        }
+        assert_eq!(manager.get(&goal.id).await.unwrap().revision, 1);
     }
 }

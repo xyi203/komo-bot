@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use time::Date;
 
 use crate::types::ids::{RequestKey, RunId, SessionId};
-use crate::types::matter::{Matter, MatterKind, iso_date};
+use crate::types::matter::{Matter, MatterKind, MatterTrigger, iso_date};
 
 /// `GET /v1/matters`。
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -46,6 +46,10 @@ pub struct MatterDetail {
     pub matter: Matter,
     #[serde(with = "iso_date")]
     pub today: Date,
+    /// done / drop / retire 的回应带：这条结案的事项还挂着的触发器，提醒操作者去留（不自动删，
+    /// §8）。其余操作与没有挂着的时候为空。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub still_linked: Vec<MatterTrigger>,
 }
 
 /// `POST /v1/matters`：新建，`active`。`next` / `due` 只给 goal，`standard` 只给 area。
@@ -78,6 +82,7 @@ pub struct MatterAddRequest {
 /// | `next` | `next`（必填；空 = 清空下一步） |
 /// | `wait` | `waiting_for`（必填） |
 /// | `resume` | `next`（可选） |
+/// | `link` / `unlink` | `trigger`（必填：Cron Job 或 monitor） |
 /// | `edit` | `title` / `due` / `clear_due`（goal）/ `standard`（area；空 = 清空），至少一样 |
 /// | 其余 | 无 |
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -103,6 +108,9 @@ pub struct MatterActionRequest {
     pub clear_due: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub standard: Option<String>,
+    /// `link` / `unlink` 要挂 / 摘的触发器。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger: Option<MatterTrigger>,
     /// 预期版本（`--revision N`）；不符报版本冲突。不带就按当前版本改（§4）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_revision: Option<u32>,
@@ -139,5 +147,16 @@ mod tests {
         // 只给必填字段也读得出来。
         let action: MatterActionRequest = serde_json::from_str("{}").unwrap();
         assert_eq!(action, MatterActionRequest::default());
+        // 挂触发器的请求体与没有触发器的回应：旧客户端读得懂，新字段为空时不出现。
+        let link = MatterActionRequest {
+            trigger: Some(MatterTrigger::parse_monitor("sess-1:#3f2a").unwrap()),
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&link).unwrap();
+        assert_eq!(json["trigger"]["kind"], "monitor");
+        assert_eq!(
+            serde_json::from_value::<MatterActionRequest>(json).unwrap(),
+            link
+        );
     }
 }

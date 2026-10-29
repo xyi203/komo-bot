@@ -28,6 +28,8 @@ pub struct MatterRow {
     pub updated_at: i64,
     /// `0` = 未结案。
     pub closed_at: i64,
+    /// `Vec<MatterTrigger>` 的 JSON（P1e，附加列）。
+    pub triggers: String,
 }
 
 pub const SPEC: TableSpec = TableSpec {
@@ -36,7 +38,7 @@ pub const SPEC: TableSpec = TableSpec {
     columns: COLUMNS,
 };
 
-pub const DDL: &str = r#"CREATE TABLE "matters" ("id" TEXT NOT NULL, "revision" BIGINT NOT NULL, "kind" TEXT NOT NULL, "title" TEXT NOT NULL, "state" TEXT NOT NULL, "next" TEXT, "waiting_for" TEXT, "due" TEXT, "standard" TEXT, "evidence" TEXT NOT NULL, "created_at" BIGINT NOT NULL, "updated_at" BIGINT NOT NULL, "closed_at" BIGINT NOT NULL, PRIMARY KEY ("id"))"#;
+pub const DDL: &str = r#"CREATE TABLE "matters" ("id" TEXT NOT NULL, "revision" BIGINT NOT NULL, "kind" TEXT NOT NULL, "title" TEXT NOT NULL, "state" TEXT NOT NULL, "next" TEXT, "waiting_for" TEXT, "due" TEXT, "standard" TEXT, "evidence" TEXT NOT NULL, "created_at" BIGINT NOT NULL, "updated_at" BIGINT NOT NULL, "closed_at" BIGINT NOT NULL, "triggers" TEXT NOT NULL, PRIMARY KEY ("id"))"#;
 
 pub const COLUMNS: &[ColumnSpec] = &[
     ColumnSpec::new("id", "TEXT NOT NULL DEFAULT ''"),
@@ -52,4 +54,5 @@ pub const COLUMNS: &[ColumnSpec] = &[
     ColumnSpec::new("created_at", "BIGINT NOT NULL DEFAULT 0"),
     ColumnSpec::new("updated_at", "BIGINT NOT NULL DEFAULT 0"),
     ColumnSpec::new("closed_at", "BIGINT NOT NULL DEFAULT 0"),
+    ColumnSpec::new("triggers", "TEXT NOT NULL DEFAULT '[]'"),
 ];

@@ -9,8 +9,9 @@ use komo_client::KomoClient;
 use komo_client::api::RequestKeys;
 use komo_client::render;
 use komo_kernel::protocol::http::{MatterActionRequest, MatterAddRequest, MatterListQuery};
+use komo_kernel::types::ids::CronJobId;
 use komo_kernel::types::ids::{MatterId, RunId, SessionId};
-use komo_kernel::types::matter::{MatterKind, MatterVerb, parse_due};
+use komo_kernel::types::matter::{MatterKind, MatterTrigger, MatterVerb, parse_due};
 
 use crate::commands::Outcome;
 
@@ -22,6 +23,36 @@ pub struct Target {
     /// 预期版本；不符报冲突。不带就按当前版本改。
     #[arg(long)]
     revision: Option<u32>,
+}
+
+/// 要挂 / 摘的触发器：Cron Job 或 monitor，二选一。
+#[derive(Args)]
+pub struct TriggerArg {
+    /// Cron Job ID（`komo cron list`）。
+    #[arg(long, value_name = "JOB_ID")]
+    cron: Option<String>,
+    /// monitor：挂它的会话 ID 与 monitor ID，写成 SESSION_ID:MONITOR_ID（`#` 可省）。
+    #[arg(long, value_name = "SESSION_ID:MONITOR_ID", conflicts_with = "cron")]
+    monitor: Option<String>,
+}
+
+impl TriggerArg {
+    fn into_request(self) -> Result<MatterActionRequest, String> {
+        let trigger = match (self.cron, self.monitor) {
+            (Some(job), None) => MatterTrigger::cron(CronJobId::from_raw(job.trim())),
+            (None, Some(monitor)) => MatterTrigger::parse_monitor(&monitor)?,
+            _ => {
+                return Err(
+                    "要给 --cron JOB_ID 或 --monitor SESSION_ID:MONITOR_ID 其中一个".into(),
+                );
+            }
+        };
+        trigger.check_shape()?;
+        Ok(MatterActionRequest {
+            trigger: Some(trigger),
+            ..MatterActionRequest::default()
+        })
+    }
 }
 
 #[derive(Subcommand)]
@@ -92,6 +123,20 @@ pub enum GoalCommand {
         #[arg(long)]
         no_due: bool,
     },
+    /// 挂一个触发器：Cron Job 或 monitor（未结案）；已挂着的无变化。
+    Link {
+        #[command(flatten)]
+        target: Target,
+        #[command(flatten)]
+        trigger: TriggerArg,
+    },
+    /// 摘掉一个触发器（未结案）；没挂着的报错。
+    Unlink {
+        #[command(flatten)]
+        target: Target,
+        #[command(flatten)]
+        trigger: TriggerArg,
+    },
     /// 清单：一条一行；默认只列未结案的。
     List {
         /// 带上已完成、已放弃的。
@@ -133,6 +178,20 @@ pub enum AreaCommand {
     Reopen {
         #[command(flatten)]
         target: Target,
+    },
+    /// 挂一个触发器：Cron Job 或 monitor（在管）；已挂着的无变化。
+    Link {
+        #[command(flatten)]
+        target: Target,
+        #[command(flatten)]
+        trigger: TriggerArg,
+    },
+    /// 摘掉一个触发器（在管）；没挂着的报错。
+    Unlink {
+        #[command(flatten)]
+        target: Target,
+        #[command(flatten)]
+        trigger: TriggerArg,
     },
     /// 清单：一条一行；默认只列在管的。
     List {
@@ -208,6 +267,26 @@ pub async fn goal(client: &KomoClient, action: GoalCommand) -> Outcome {
             };
             act(client, kind, target, MatterVerb::Edit, request).await
         }
+        GoalCommand::Link { target, trigger } => {
+            act(
+                client,
+                kind,
+                target,
+                MatterVerb::Link,
+                trigger.into_request()?,
+            )
+            .await
+        }
+        GoalCommand::Unlink { target, trigger } => {
+            act(
+                client,
+                kind,
+                target,
+                MatterVerb::Unlink,
+                trigger.into_request()?,
+            )
+            .await
+        }
         GoalCommand::List { all } => list(client, kind, all).await,
         GoalCommand::Show { id } => show(client, &id).await,
     }
@@ -250,6 +329,26 @@ pub async fn area(client: &KomoClient, action: AreaCommand) -> Outcome {
         }
         AreaCommand::Reopen { target } => {
             act(client, kind, target, MatterVerb::Reopen, blank()).await
+        }
+        AreaCommand::Link { target, trigger } => {
+            act(
+                client,
+                kind,
+                target,
+                MatterVerb::Link,
+                trigger.into_request()?,
+            )
+            .await
+        }
+        AreaCommand::Unlink { target, trigger } => {
+            act(
+                client,
+                kind,
+                target,
+                MatterVerb::Unlink,
+                trigger.into_request()?,
+            )
+            .await
         }
         AreaCommand::List { all } => list(client, kind, all).await,
         AreaCommand::Show { id } => show(client, &id).await,
@@ -320,4 +419,40 @@ async fn show(client: &KomoClient, id: &str) -> Outcome {
         .await
         .map_err(|e| e.to_string())?;
     Ok(render::matter_show(&detail))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_trigger_argument_becomes_one_trigger_or_an_error() {
+        let cron = TriggerArg {
+            cron: Some(" job-1 ".into()),
+            monitor: None,
+        }
+        .into_request()
+        .unwrap();
+        assert_eq!(
+            cron.trigger,
+            Some(MatterTrigger::cron(CronJobId::from_raw("job-1")))
+        );
+        let monitor = TriggerArg {
+            cron: None,
+            monitor: Some("sess-1:#3f2a".into()),
+        }
+        .into_request()
+        .unwrap();
+        assert_eq!(
+            monitor.trigger,
+            Some(MatterTrigger::parse_monitor("sess-1:3f2a").unwrap())
+        );
+        for (cron, monitor) in [(None, None), (None, Some("没有冒号")), (Some(""), None)] {
+            let arg = TriggerArg {
+                cron: cron.map(String::from),
+                monitor: monitor.map(String::from),
+            };
+            assert!(arg.into_request().is_err());
+        }
+    }
 }

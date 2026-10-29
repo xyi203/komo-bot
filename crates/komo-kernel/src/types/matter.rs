@@ -19,7 +19,7 @@ use std::str::FromStr;
 use serde::{Deserialize, Serialize};
 use time::{Date, OffsetDateTime};
 
-use super::ids::MatterId;
+use super::ids::{CronJobId, MatterId, SessionId};
 use super::memory::Evidence;
 
 // `YYYY-MM-DD`：截止日期在线上与库里的写法（只有日期，不带时刻）。
@@ -142,6 +142,77 @@ impl FromStr for MatterState {
     }
 }
 
+/// 事项挂着的一个触发器（`docs/goals.md` §8）：Cron Job，或某个会话里的 monitor。
+///
+/// 只是引用：触发器自己的生命周期不归事项管（结案不删它）。
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum MatterTrigger {
+    Cron {
+        job: CronJobId,
+    },
+    /// monitor 由「挂它的会话 + 句柄」识别（`docs/monitor.md` §5：句柄 `#id` 只在挂它的会话里
+    /// 找得到）。`monitor` 存去掉 `#` 的那串。
+    Monitor {
+        session: SessionId,
+        monitor: String,
+    },
+}
+
+/// monitor 句柄的长度上限：实际是个短号，宽一点只为不误伤。
+const MAX_MONITOR_ID_CHARS: usize = 64;
+
+impl MatterTrigger {
+    pub fn cron(job: CronJobId) -> Self {
+        MatterTrigger::Cron { job }
+    }
+
+    /// 解析 `SESSION_ID:MONITOR_ID`（`MONITOR_ID` 可带 `#`）。只查形状，不查它还在不在跑。
+    pub fn parse_monitor(raw: &str) -> Result<Self, String> {
+        let bad = || format!("monitor 要写成 SESSION_ID:MONITOR_ID，收到：{}", raw.trim());
+        let (session, monitor) = raw.trim().split_once(':').ok_or_else(bad)?;
+        let trigger = MatterTrigger::Monitor {
+            session: SessionId::from_raw(session.trim()),
+            monitor: monitor.trim().trim_start_matches('#').to_string(),
+        };
+        trigger.check_shape().map(|()| trigger)
+    }
+
+    /// 形状合格：id 非空、只含字母数字与 `-` `_`。Cron 的存在性由调用方对着 cron 仓储查。
+    pub fn check_shape(&self) -> Result<(), String> {
+        fn id_like(what: &str, raw: &str, max: usize) -> Result<(), String> {
+            let ok = !raw.is_empty()
+                && raw.chars().count() <= max
+                && raw
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+            if ok {
+                Ok(())
+            } else {
+                Err(format!("{what}不合格：{raw:?}"))
+            }
+        }
+        match self {
+            MatterTrigger::Cron { job } => id_like("Cron Job ID", job.as_str(), 64),
+            MatterTrigger::Monitor { session, monitor } => {
+                id_like("会话 ID", session.as_str(), 64)?;
+                id_like("monitor ID", monitor, MAX_MONITOR_ID_CHARS)
+            }
+        }
+    }
+}
+
+impl fmt::Display for MatterTrigger {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            MatterTrigger::Cron { job } => write!(f, "cron {job}"),
+            MatterTrigger::Monitor { session, monitor } => {
+                write!(f, "monitor {session}:#{monitor}")
+            }
+        }
+    }
+}
+
 /// 一个目标或领域（§3）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Matter {
@@ -170,6 +241,9 @@ pub struct Matter {
     /// 改承诺的那几次操作的用户原话证据，追加不改（§4「谁能改什么」）。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub evidence: Vec<Evidence>,
+    /// 挂着的触发器（§8），按挂上的先后；变了升版。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub triggers: Vec<MatterTrigger>,
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
     #[serde(with = "time::serde::rfc3339")]
@@ -230,6 +304,7 @@ impl NewMatter {
             due: self.due,
             standard: self.standard,
             evidence: Vec::new(),
+            triggers: Vec::new(),
             created_at: now,
             updated_at: now,
             closed_at: None,
@@ -250,10 +325,13 @@ pub enum MatterVerb {
     Retire,
     Reopen,
     Edit,
+    /// 挂触发器（§8）：推进类，不要用户原话。
+    Link,
+    Unlink,
 }
 
 impl MatterVerb {
-    pub const ALL: [MatterVerb; 9] = [
+    pub const ALL: [MatterVerb; 11] = [
         MatterVerb::Next,
         MatterVerb::Wait,
         MatterVerb::Resume,
@@ -263,6 +341,8 @@ impl MatterVerb {
         MatterVerb::Retire,
         MatterVerb::Reopen,
         MatterVerb::Edit,
+        MatterVerb::Link,
+        MatterVerb::Unlink,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -276,15 +356,21 @@ impl MatterVerb {
             MatterVerb::Retire => "retire",
             MatterVerb::Reopen => "reopen",
             MatterVerb::Edit => "edit",
+            MatterVerb::Link => "link",
+            MatterVerb::Unlink => "unlink",
         }
     }
 
     /// 改的是"用户要做 / 要管什么"（§4「谁能改什么」）：在 Run 里要有用户原话作证据。
-    /// next / wait / resume 是推进的进度，Agent 自己的工作，不要求原话。
+    /// next / wait / resume / link / unlink 是推进的进度，Agent 自己的工作，不要求原话。
     pub fn is_commitment(self) -> bool {
         !matches!(
             self,
-            MatterVerb::Next | MatterVerb::Wait | MatterVerb::Resume
+            MatterVerb::Next
+                | MatterVerb::Wait
+                | MatterVerb::Resume
+                | MatterVerb::Link
+                | MatterVerb::Unlink
         )
     }
 }
@@ -333,6 +419,10 @@ pub enum MatterChange {
         due: Option<Option<Date>>,
         standard: Option<Option<String>>,
     },
+    /// 挂一个触发器；已挂着的是空操作。
+    Link(MatterTrigger),
+    /// 摘一个；没挂着的报错。
+    Unlink(MatterTrigger),
 }
 
 impl MatterChange {
@@ -347,6 +437,8 @@ impl MatterChange {
             MatterChange::Retire => MatterVerb::Retire,
             MatterChange::Reopen => MatterVerb::Reopen,
             MatterChange::Edit { .. } => MatterVerb::Edit,
+            MatterChange::Link(_) => MatterVerb::Link,
+            MatterChange::Unlink(_) => MatterVerb::Unlink,
         }
     }
 }
@@ -388,7 +480,11 @@ fn rule(
         (MatterKind::Goal, MatterVerb::Drop) => (&[Active, Waiting, Parked], Some(Dropped)),
         (MatterKind::Goal, MatterVerb::Reopen) => (&[Done, Dropped], Some(Active)),
         (MatterKind::Goal, MatterVerb::Edit) => (&[Active, Waiting, Parked], None),
+        (MatterKind::Goal, MatterVerb::Link | MatterVerb::Unlink) => {
+            (&[Active, Waiting, Parked], None)
+        }
         (MatterKind::Area, MatterVerb::Edit) => (&[Active], None),
+        (MatterKind::Area, MatterVerb::Link | MatterVerb::Unlink) => (&[Active], None),
         (MatterKind::Area, MatterVerb::Retire) => (&[Active], Some(Retired)),
         (MatterKind::Area, MatterVerb::Reopen) => (&[Retired], Some(Active)),
         _ => return None,
@@ -401,6 +497,7 @@ fn rule(
 ///   错误里写着当前状态。
 /// - 已经在目标状态上（对 `parked` 再 `park`）不算起点不对：状态这一半是空操作，其余字段照改。
 /// - 什么都没变返回 `None`：不升版、不动 `updated_at`。
+/// - link / unlink 改的是 `triggers`：已挂着的再 link 是空操作，没挂着的 unlink 报错；只许未结案的。
 /// - 变了就升一版。离开 `waiting` 清空 `waiting_for`；进结案写 `closed_at`，重开清空。
 pub fn transition(
     matter: &Matter,
@@ -474,6 +571,23 @@ pub fn transition(
                 next.standard = standard.clone();
             }
         }
+        MatterChange::Link(trigger) => {
+            trigger.check_shape().map_err(MatterError::Invalid)?;
+            if !next.triggers.contains(trigger) {
+                next.triggers.push(trigger.clone());
+            }
+        }
+        MatterChange::Unlink(trigger) => {
+            let before = next.triggers.len();
+            next.triggers.retain(|have| have != trigger);
+            if next.triggers.len() == before {
+                return Err(MatterError::Invalid(format!(
+                    "{} {} 没挂着 {trigger}",
+                    matter.kind.label(),
+                    matter.id
+                )));
+            }
+        }
         MatterChange::Resume { next: None }
         | MatterChange::Park
         | MatterChange::Done
@@ -544,6 +658,10 @@ mod tests {
         matter
     }
 
+    fn cron(job: &str) -> MatterTrigger {
+        MatterTrigger::cron(CronJobId::from_raw(job))
+    }
+
     fn change_for(verb: MatterVerb) -> MatterChange {
         match verb {
             MatterVerb::Next => MatterChange::Next(Some("新的下一步".into())),
@@ -559,6 +677,8 @@ mod tests {
                 due: None,
                 standard: None,
             },
+            MatterVerb::Link => MatterChange::Link(cron("job-1")),
+            MatterVerb::Unlink => MatterChange::Unlink(cron("job-1")),
         }
     }
 
@@ -863,5 +983,117 @@ mod tests {
             vec![MatterVerb::Next, MatterVerb::Wait, MatterVerb::Resume]
         );
         assert!("frobnicate".parse::<MatterVerb>().is_err());
+    }
+
+    /// 挂触发器：先挂的在前，重复挂是空操作（不升版），挂上与摘掉都升一版。
+    #[test]
+    fn linking_appends_in_order_and_a_repeat_is_a_no_op() {
+        let monitor = MatterTrigger::parse_monitor("sess-1:#3f2a").unwrap();
+        let first = transition(
+            &goal(MatterState::Waiting),
+            &MatterChange::Link(monitor.clone()),
+            T1,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(first.triggers, vec![monitor.clone()]);
+        assert_eq!(first.revision, 2);
+        let second = transition(&first, &MatterChange::Link(cron("job-1")), T1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(second.triggers, vec![monitor.clone(), cron("job-1")]);
+        assert_eq!(
+            transition(&second, &MatterChange::Link(cron("job-1")), T1),
+            Ok(None)
+        );
+        let after = transition(&second, &MatterChange::Unlink(monitor), T1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.triggers, vec![cron("job-1")]);
+        assert_eq!(after.revision, 4);
+    }
+
+    #[test]
+    fn unlinking_a_trigger_that_is_not_linked_is_an_error() {
+        let error = transition(
+            &goal(MatterState::Active),
+            &MatterChange::Unlink(cron("job-9")),
+            T1,
+        )
+        .expect_err("没挂着的不能摘");
+        assert!(matches!(error, MatterError::Invalid(_)), "{error}");
+        assert!(error.to_string().contains("job-9"), "{error}");
+    }
+
+    /// 结案的事项不再挂、不再摘（已挂着的留着提醒，不自动删）；重开后可以。
+    #[test]
+    fn a_closed_matter_refuses_link_and_unlink_but_keeps_what_was_linked() {
+        let mut done = goal(MatterState::Done);
+        done.triggers.push(cron("job-1"));
+        for change in [
+            MatterChange::Link(cron("job-2")),
+            MatterChange::Unlink(cron("job-1")),
+        ] {
+            assert!(matches!(
+                transition(&done, &change, T1),
+                Err(MatterError::NotAllowed {
+                    state: MatterState::Done,
+                    ..
+                })
+            ));
+        }
+        let mut retired = area(MatterState::Retired);
+        retired.triggers.push(cron("job-1"));
+        assert!(matches!(
+            transition(&retired, &MatterChange::Link(cron("job-2")), T1),
+            Err(MatterError::NotAllowed { .. })
+        ));
+        let reopened = transition(&done, &MatterChange::Reopen, T1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(reopened.triggers, vec![cron("job-1")]);
+        // 领域在管时也能挂。
+        let linked = transition(
+            &area(MatterState::Active),
+            &MatterChange::Link(cron("job-1")),
+            T1,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(linked.triggers, vec![cron("job-1")]);
+    }
+
+    #[test]
+    fn a_monitor_reference_is_parsed_and_checked_for_shape() {
+        assert_eq!(
+            MatterTrigger::parse_monitor(" sess-1:3f2a ").unwrap(),
+            MatterTrigger::parse_monitor("sess-1:#3f2a").unwrap()
+        );
+        for bad in ["", "sess-1", "sess-1:", ":3f2a", "sess-1:3f 2a", "sess-1:#"] {
+            assert!(MatterTrigger::parse_monitor(bad).is_err(), "{bad:?}");
+        }
+        assert_eq!(
+            MatterTrigger::parse_monitor("sess-1:#3f2a")
+                .unwrap()
+                .to_string(),
+            "monitor sess-1:#3f2a"
+        );
+    }
+
+    #[test]
+    fn triggers_round_trip_through_json_and_an_old_row_without_them_reads_empty() {
+        let mut matter = goal(MatterState::Active);
+        assert!(
+            serde_json::to_value(&matter)
+                .unwrap()
+                .get("triggers")
+                .is_none()
+        );
+        matter.triggers = vec![cron("job-1"), MatterTrigger::parse_monitor("s:1a").unwrap()];
+        let json = serde_json::to_value(&matter).unwrap();
+        assert_eq!(json["triggers"][0]["kind"], "cron");
+        assert_eq!(json["triggers"][1]["monitor"], "1a");
+        let back: Matter = serde_json::from_value(json).unwrap();
+        assert_eq!(back, matter);
     }
 }

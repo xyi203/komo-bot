@@ -45,7 +45,7 @@
 | evidence | 改承诺的那几次操作的用户原话证据，同记忆的 `Evidence`（`EvidenceRef::Event`），追加不改 |
 | created_at / updated_at / closed_at | `closed_at` 在进 `done` / `dropped` / `retired` 时写，重开时清空 |
 
-后续片追加的列（附加式，不改已有列）：通知偏好（P2）、挂的触发器（P1e）。
+后续片追加的列（附加式，不改已有列）：挂的触发器（`triggers`，P1e，§8）、通知偏好（P2）。
 
 **超期**：`kind = goal`、state 是 `active` / `waiting` / `parked`、`due` 早于 Gateway 本地时区的今天。
 
@@ -68,9 +68,11 @@ area:  active → retired →（reopen）active
 | `komo goal done ID` / `drop ID` | 结案 | active / waiting / parked |
 | `komo goal reopen ID` | 重开回 `active` | done / dropped |
 | `komo goal edit ID [--title …] [--due …\|--no-due]` | 改标题、截止日期 | 未结案 |
+| `komo goal link ID (--cron JOB_ID \| --monitor SESSION_ID:MONITOR_ID)` / `unlink …` | 挂 / 摘触发器（§8） | 未结案 |
 | `komo goal list [--all]` / `show ID` | 清单 / 详情 | — |
 | `komo area add "名称" [--standard …]` | 新建，`active` | — |
 | `komo area edit ID [--title …] [--standard …]` | 改名称、标准 | active |
+| `komo area link ID …` / `unlink …` | 同 goal（§8） | active |
 | `komo area retire ID` / `reopen ID` | 不再管 / 重开 | active / retired |
 | `komo area list [--all]` / `show ID` | 清单 / 详情 | — |
 
@@ -84,7 +86,7 @@ area:  active → retired →（reopen）active
 | 操作 | 改的是 | Run 里（带 `KOMO_SESSION` / `KOMO_RUN`） | 终端里 |
 |---|---|---|---|
 | add、done、drop、park、retire、reopen、edit | 用户要做 / 要管什么 | 要有这个 Run 里用户说的话，作为证据追加（规则同 `memory add`，§9.3）；一句都没有就拒绝 | 直接改，不带证据 |
-| next、wait、resume | 推进的进度 | 不要求用户原话：推进是 Agent 自己的工作（它提了工单、转等待） | 直接改 |
+| next、wait、resume、link、unlink | 推进的进度 | 不要求用户原话：推进是 Agent 自己的工作（它提了工单、转等待） | 直接改 |
 
 这和 `memory add` 一样不是安全边界（bash 去掉两个变量就走终端那条路，§7 没有 Policy），分的是常态下谁在说话。后台任务会话（`kind = task`）与 Cron 的 Run 里改承诺类操作被拒：那里没有用户原话。
 
@@ -132,9 +134,20 @@ area:  active → retired →（reopen）active
 
 存量：现有记忆归属为空，行为不变（`push_unattached` 默认 `true`）。挂归属走一次性清单：Agent 按事项列出建议，操作者审过后批量 `classify --for`（同 2026-10-28 那次存量分类）。
 
-## 8. 挂触发器（P1e）
+## 8. 挂触发器（P1e，已实现）
 
 事项可挂若干 Cron Job（`CronJobId`）与 monitor（会话 + monitor id），记在事项上，`komo goal link/unlink`、`komo area link/unlink`。`wait` 时 Agent 通常顺手挂一个 monitor（盯审批、盯回复）；等到了，monitor 交回会话，Agent `resume`。事项结案时提示它挂着的触发器，不自动删（触发器可能另有用途）。通知判断（触发器跑完说不说）是 P2，在这之前触发器照它自己的 `notify` 投递。
+
+**实现记录（P1e，2026-10-29）。** 接缝：kernel `types::matter::MatterTrigger`（`Cron { job }` / `Monitor { session, monitor }`，`parse_monitor` 解析 `SESSION_ID:MONITOR_ID`、`check_shape`）、`Matter.triggers`、`MatterVerb::{Link, Unlink}` / `MatterChange::{Link, Unlink}`（并进 `transition` 与 `rule`）；协议 `MatterActionRequest.trigger`、`MatterDetail.still_linked`；store `matters.triggers`（`TEXT NOT NULL DEFAULT '[]'`，JSON 列表，附加列）；runtime `MatterManager::with_cron`（挂 Cron 时查 Job 存在）；gateway `POST /v1/matters/{id}/link|unlink`，done / drop / retire 的响应带 `still_linked`；client `render::matter_*`（show 逐条列、list 行带「触发器 N」、结案回执提醒）；bin `komo goal|area link|unlink ID (--cron JOB_ID | --monitor SESSION_ID:MONITOR_ID)`；`SELF_BLOCK` 补一句等待时挂 monitor、交回后 resume。
+
+规格没写、实现时定下的：
+- **link / unlink 是推进类**（同 next / wait / resume）：Run 里不要用户原话、不追加证据。只许未结案的事项（goal：active / waiting / parked，area：active），结案后报 409；已挂着的触发器留着，重开后仍在。
+- **重复 link 是空操作**（不升版）；**unlink 没挂着的报 400**，消息写出是哪个事项、哪个触发器。变了升一版，因为触发器进 show 与 list，也让注入按 `id@revision` 看得到变化。
+- **Cron 查存在、monitor 只查形状。** Cron Job 经 cron 仓储核对，不存在报 400；monitor 的登记在 Session 的 `komo.monitors` document 里，事项这一层不碰 durable 存储，所以只核对「会话 ID + monitor ID」是字母数字与 `-` `_`（`#` 前缀去掉），不查它是否还在跑——挂在已结束的 monitor 上无害，unlink 即可。unlink 不核对存在性（Job 删了之后仍要能摘）。
+- **`still_linked` 是新增的可选响应字段**（空则不出现），只在 done / drop / retire 的响应里有，内容与 `matter.triggers` 相同，意在让回执一眼看到「还挂着这些、没删」；CLI 回执在事项行后加一段。
+- 触发器顺序按挂上的先后；Cron 与 monitor 都是引用，结案与删事项都不删它们本身。
+
+测试：kernel `linking_appends_in_order_and_a_repeat_is_a_no_op`、`unlinking_a_trigger_that_is_not_linked_is_an_error`、`a_closed_matter_refuses_link_and_unlink_but_keeps_what_was_linked`、`a_monitor_reference_is_parsed_and_checked_for_shape`、`triggers_round_trip_through_json_and_an_old_row_without_them_reads_empty`，协议 `an_add_request_carries_the_due_date_as_iso_text`（补了 trigger 往返）；store `a_matter_round_trips_through_the_row`（补了触发器往返）、`the_triggers_column_is_added_to_an_existing_matters_table`（旧形状表补列、旧行读出为空）；runtime `linking_is_progress_and_needs_no_user_words`、`a_link_without_a_well_formed_trigger_is_refused`；gateway（`tests/memory/matters.rs`）`a_goal_links_a_cron_job_and_a_monitor_and_reminds_on_close`（挂真 Cron Job、不存在的 Job 与坏 monitor 被拒、结案提醒、重开）、`an_area_can_link_a_monitor_from_a_run_without_user_words`；client `linked_triggers_are_listed_counted_and_reminded_on_close`；bin `link_commands_take_a_cron_job_or_a_monitor`、`a_trigger_argument_becomes_one_trigger_or_an_error`；agent `the_self_block_teaches_recording_goals_and_areas_and_stays_byte_stable`（补断言）。单测未跑，待汇总；`cargo check --workspace --tests` 与 `cargo fmt` 通过。未验证：真 Agent 是否按 `SELF_BLOCK` 那句在转等待时挂 monitor；monitor 交回会话后 Agent 是否据此 resume（交回走 `docs/monitor.md` 的既有通道，事项这边没有新机制）。
 
 ## 9. 完成标准
 

@@ -120,6 +120,8 @@ fn the_self_block_teaches_recording_goals_and_areas_and_stays_byte_stable() {
     assert!(first.contains("`komo goal` / `komo area` 记下"), "{first}");
     assert!(first.contains("先放一放、办完了、不管了"), "{first}");
     assert!(first.contains("`komo goal next` 更新下一步"), "{first}");
+    assert!(first.contains("`komo goal link` 挂上"), "{first}");
+    assert!(first.contains("`komo goal resume`"), "{first}");
     assert_eq!(first, prompt_of(&with_bash));
     assert!(!prompt_of(&input(None)).contains("komo goal"));
 }

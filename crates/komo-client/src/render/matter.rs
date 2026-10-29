@@ -54,12 +54,24 @@ pub fn matter_line(matter: &Matter, today: Date) -> String {
             }
         }
     }
+    if !matter.triggers.is_empty() {
+        parts.push(format!("触发器 {}", matter.triggers.len()));
+    }
     parts.join(" · ")
 }
 
-/// 写命令的回执。
+/// 写命令的回执。结案时多带一段：还挂着的触发器没有自动删，交给操作者定去留（§8）。
 pub fn matter_changed(detail: &MatterDetail) -> String {
-    matter_line(&detail.matter, detail.today)
+    let mut out = vec![matter_line(&detail.matter, detail.today)];
+    if !detail.still_linked.is_empty() {
+        out.push(format!(
+            "仍挂着 {} 个触发器（没有自动删除；不再需要就 `komo {} unlink`，或去 `komo cron` 处理）：",
+            detail.still_linked.len(),
+            detail.matter.kind
+        ));
+        out.extend(detail.still_linked.iter().map(|t| format!("  {t}")));
+    }
+    out.join("\n")
 }
 
 /// `komo goal show` / `komo area show`。
@@ -102,6 +114,12 @@ pub fn matter_show(detail: &MatterDetail) -> String {
             matter.standard.as_deref().unwrap_or("（无）")
         )),
     }
+    if matter.triggers.is_empty() {
+        out.push("触发器  （无）".into());
+    } else {
+        out.push("触发器".into());
+        out.extend(matter.triggers.iter().map(|t| format!("  {t}")));
+    }
     let mut times = format!(
         "创建    {}   更新 {}",
         stamp(matter.created_at),
@@ -135,8 +153,8 @@ fn flat(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use komo_kernel::types::ids::MatterId;
-    use komo_kernel::types::matter::NewMatter;
+    use komo_kernel::types::ids::{CronJobId, MatterId};
+    use komo_kernel::types::matter::{MatterTrigger, NewMatter};
     use time::OffsetDateTime;
     use time::macros::{date, datetime};
 
@@ -212,6 +230,7 @@ mod tests {
         let detail = MatterDetail {
             matter: goal("g-2", MatterState::Waiting),
             today: date!(2026 - 11 - 02),
+            still_linked: Vec::new(),
         };
         let shown = matter_show(&detail);
         assert!(shown.starts_with("目标  g-2  (revision 2)"), "{shown}");
@@ -219,11 +238,46 @@ mod tests {
         assert!(shown.contains("在等    SRE 审批"), "{shown}");
         assert!(shown.contains("截止    2026-11-01"), "{shown}");
         assert!(shown.contains("证据    （无）"), "{shown}");
+        assert!(shown.contains("触发器  （无）"), "{shown}");
         let area = matter_show(&MatterDetail {
             matter: area(),
             today: date!(2026 - 11 - 02),
+            still_linked: Vec::new(),
         });
         assert!(area.contains("标准    每周一前完成"), "{area}");
         assert!(!area.contains("截止"), "{area}");
+    }
+
+    /// 挂着触发器的事项：show 逐条列，list 行只带个数；结案的回执提醒仍挂着的。
+    #[test]
+    fn linked_triggers_are_listed_counted_and_reminded_on_close() {
+        let mut matter = goal("g-3", MatterState::Done);
+        matter.triggers = vec![
+            MatterTrigger::cron(CronJobId::from_raw("job-1")),
+            MatterTrigger::parse_monitor("sess-1:#3f2a").unwrap(),
+        ];
+        let today = date!(2026 - 11 - 02);
+        let detail = MatterDetail {
+            matter: matter.clone(),
+            today,
+            still_linked: matter.triggers.clone(),
+        };
+        let shown = matter_show(&detail);
+        assert!(
+            shown.contains("触发器\n  cron job-1\n  monitor sess-1:#3f2a"),
+            "{shown}"
+        );
+        assert!(matter_line(&matter, today).ends_with(" · 触发器 2"));
+        let receipt = matter_changed(&detail);
+        let lines: Vec<&str> = receipt.lines().collect();
+        assert_eq!(lines.len(), 4, "{receipt}");
+        assert!(lines[1].contains("仍挂着 2 个触发器"), "{receipt}");
+        assert_eq!(lines[2], "  cron job-1");
+        // 没有挂着的：回执还是一行。
+        let plain = MatterDetail {
+            still_linked: Vec::new(),
+            ..detail
+        };
+        assert_eq!(matter_changed(&plain).lines().count(), 1);
     }
 }

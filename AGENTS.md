@@ -186,6 +186,9 @@ commands run, terminal output when CLI behavior changes.
   research/analysis appendices. Memory changes update this file, not a new one.
 - Observability: `docs/observability.md` — OpenTelemetry traces/metrics, logs,
   operator views. Telemetry is never a source of truth; nothing reads it back.
+- Goals and areas: `docs/goals.md` — PARA/GTD-style goals (next action,
+  waiting, parked) and areas, memory belongs-to and archive on close; spec
+  approved 2026-10-29, implemented in slices P1a–P1e.
 - Direction: `docs/roadmap-muse.md` — gaps and phases toward a Muse-style
   proactive personal agent (PARA-style goals and areas, proactivity,
   outward-action confirmation);

@@ -16,6 +16,7 @@
 | §9.8 | 离线整理 | 已实现 |
 | §9.9 | 判关系时候选用编号 | 已实现 |
 | §9.10 | 按会话提取，一次调用 | 已实现（含 `used` 采纳） |
+| §9.2 / §9.4 / §9.6 归属与归档、注入分层 | 记忆归属目标或领域、结案归档（`docs/goals.md`） | 2026-10-29 认可，未实现 |
 | 附录 A | 外部记忆仓库调研（graphiti / mem0 / OpenViking） | 2026-10-19 |
 | 附录 B | 记忆机制改进方案（原 `docs/memory-improvements.md`） | 2026-10-16 提案 |
 | 附录 C | 对照 v0.8 的差距分析（原 `docs/memory.md`） | 2026-09-24 分析 |
@@ -48,13 +49,14 @@
 | scope                     | personal、project、environment 或 agent，绑定当前操作者、稳定项目 ID、实例 ID 或某个 Agent |
 | provenance                | user_statement / tool_observation / model_inference                                   |
 | confirmation              | unconfirmed / user_confirmed                                                          |
-| state                     | candidate / active / contested / superseded / forgotten                               |
+| state                     | candidate / active / contested / superseded / forgotten / archived（archived：2026-10-29 认可，未实现，见下文「归属与归档」） |
 | evidence_refs             | JSONL 的 Session ID + event_id / seq、工具产物或 Memos 实例 / 记录 ID、时间与来源版本 |
 | observed_at / valid_until | 事实的观察时间与可选有效期，区别于入库时间                                            |
 | created_at / updated_at   | 记忆管理时间                                                                          |
 | extraction_metadata       | 提取模型、effort、提示词版本、处理来源游标                                            |
 | usage                     | 注入次数与最近注入时间；用上次数（`adopted_count`）与最近用上时间（§9.10），只度量使用情况，不增加真实性 |
 | supersedes / superseded_by | 取代了谁 / 被谁取代（id + revision）；前者挂在新条目，后者挂在每条被取代的旧条目      |
+| belongs_to                | 为哪件事记的：某个目标或领域的 id（`docs/goals.md`），可空；2026-10-29 认可，未实现     |
 
 证据与内容版本分别保留。用户确认绑定具体 id / revision 和操作者事件；模型返回的 user_confirmed 字段没有写入权限。明确的用户原话可标为 active + user_statement + unconfirmed，展示为“自动整理自用户陈述”；模型推断默认 candidate，不作为已确认事实注入。
 
@@ -73,6 +75,13 @@
 - **unconfirmed 不阻止 convention 生效**：confirmation 仍只表示用户是否复核过这一版文字。active + user_statement + convention 在 unconfirmed 时照常作为约定使用；模型不能把它改成 user_confirmed。candidate 不因带了 application 就绕过生命周期进入自动注入。
 - 改 application 或 applies_when 是内容语义变化：升 revision，证据保留，旧注入的引用失效（§9.4、§9.7）。
 - 只有用户表达了长期意图的才是 convention；"这个工单选 saas""这次用 terra 并行做"是当次要求，留在当前任务，不入库（§9.3）。
+
+**归属与归档（2026-10-29 认可，未实现：`docs/goals.md` P1c）。** 作用域说"谁看得到、在哪适用"，归属（`belongs_to`）说"为哪件事记的"：同一条记忆可以在 `project:owl` 作用域里、归属"这周把 owl 的发布观察做完"这个目标。两者并存，互不替代。
+
+- 归属可空。空 = 不属于任何进行中的事，加列之前的条目都是空，行为不变。
+- 写入：提取给新观察建议归属（`docs/goals.md` §7）；`komo memory add --for <事项 id>`；`komo memory classify --for <事项 id|none>` 改已有条目的归属（操作者动作，同 classify，§9.6）。只能指向存在的事项；指向 private / off 会话看不到的事项无意义，带这种会话调用时拒绝（`docs/goals.md` §2）。
+- 改归属是内容语义变化：升 revision，旧注入的引用失效（同改 application，上文）。
+- `archived`：所属的事结案后，它下面的线索转成这个状态。不注入、不进提取的候选表，`search` / `list` 默认不返回，`--include-archived` 能查到。只有结案能产生 `archived`，只有重开能把它恢复成 `active`（§9.6「结案归档」）；它不是遗忘，不留排除标记。
 
 **`agent:<id>` 是那个 Agent 的私有作用域（2026-10-22）。** 只有 Profile 写 `memory = "private"` 的那个 Agent 召回、提取得到它；不限作用域的召回与提取候选（`shared` 且没写 `memory_scope`）放行除 `agent:*` 之外的全部；两路检索都在排名、截断之前按作用域过滤（`scope_allowed`），一个作用域灌再多也挤不掉别的作用域的候选名额。`private` 的提取结果一律落在 `agent:<id>`，模型交回别的作用域也改写过去；`shared` 的提取交回 `agent:*` 丢弃。用途是给别人用的 Agent：别人的话只进它自己的记忆，碰不到操作者的，也不会被操作者的 Agent 召回成一条注入通道。操作者的 CLI 显式 `--scope agent:<id>` 照常读写。
 
@@ -246,6 +255,21 @@ MemoryManager 对 AgentRuntime 提供三个主要入口：recall、process_compl
 
 测试：kernel 无新增（`RetrievalConfig` 默认值由 hooks 与 agent 的预算用例覆盖）；agent `resident_conventions_have_their_own_budget_and_overflow_is_counted`、`a_truncated_convention_that_passed_the_gate_still_renders_in_the_convention_group`、`the_self_block_teaches_searching_memory_and_stays_byte_stable`（句子在、同输入装配逐字相同）；store `conventions_lists_only_active_conventions_in_id_order`；runtime `a_marked_memory_query_result_is_labelled_and_cannot_be_cited`、`the_child_gets_the_gateways_data_dir_as_komo_home`；client `memory_search_lists_conventions_apart_from_clues_with_usage_and_condition`；gateway hooks `a_convention_is_injected_for_a_paraphrase_and_takes_no_top_k_slot`（换说法也带上、同段第二个 Run 不重复、线索仍按 `top_k`）、`a_matching_convention_does_not_displace_a_clue_from_top_k`、`a_new_convention_is_added_a_forgotten_one_is_rewritten_and_a_new_segment_brings_it_again`（新增的下个 Run 补上、遗忘后整块 `omit`、head 之后新段重新带）、`conventions_over_budget_fall_back_to_the_gated_path`（没命中不带、命中仍在约定组、诊断记 1）、`a_private_agent_gets_only_its_own_scopes_conventions`、`memory_off_brings_no_conventions`；gateway `tests/memory/recall.rs` `a_convention_arrives_even_when_the_wording_matches_nothing`（端到端，第一个请求是第二个的前缀），原来的 `switching_tasks_mid_session_recalls_the_new_tasks_convention` 断言的是"查日志时不带发布约定"，与新规格相反，改写并更名为 `a_convention_rides_along_on_the_first_run_and_is_not_repeated_after_a_task_switch`；`tests/memory/session_search.rs` `a_session_search_returns_only_the_scopes_its_agent_may_see`、`a_private_agent_cannot_search_another_agents_private_memory`（`MemoryManager::query` 的 `scopes` 空 = 不含 `agent:*`，所以此前 private Agent 查不到自己的私有记忆、却查得到全部共享记忆；现在只看得到自己的，点名别人的私有作用域被拒）、`a_session_whose_memory_is_off_cannot_search`、`a_session_listing_is_scoped_too`。`cargo fmt --check` 通过；`cargo test --workspace --no-fail-fast`：2415 通过、0 失败、12 忽略（上次 2397，本次净增 18）。增量 `cargo build --timings`：8.5 秒（全量测试编译之后的空跑），报告 `target/cargo-timings/cargo-timing-20261028T135712946Z-f55de822e3512fa2.html`。未装二进制、未重启 Gateway、没有用真实模型回放；`komo doctor` 的整理提示没做（doctor 没有记忆这一栏，不是顺手能加的）；没有 CLI 子进程到真 Gateway 的端到端用例（带会话的 HTTP 路径与 CLI 渲染各有测试，`KOMO_SESSION` 到 `session` 参数这一步只靠读代码）；`komo memory list` 不带查询词时也按会话筛（规格只写了 search 与带查询的 list，这里顺手同一条路，因为 list 没有查询词的写法）。
 
+**按"现在要不要用"分层（2026-10-29 认可，未实现：`docs/goals.md` P1b、P1c）。** 召回块从两组变成下面五层，前三层进块、后两层只能查：
+
+| 层 | 内容 | 怎么进 | 预算 |
+|---|---|---|---|
+| 1 | 进行中、等待中的目标与在管的领域（`docs/goals.md` §5） | 每段全量，按 `id@revision` 去重，失效即改写 | `matter_tokens`，默认 600 |
+| 2 | 约定（active + convention） | 每段全量（上文「约定不过门槛」） | `convention_tokens`，默认 800 |
+| 3 | 线索：归属为空，或归属一件 1 层里的事 | 过门槛、`top_k` | 1500 |
+| 4 | 线索：归属一件搁置的目标 | 不推，`komo memory search` 能查到 | — |
+| 5 | archived | 只在 `--include-archived` 时出现 | — |
+
+- 第 3 层里"归属为空"的那部分受开关 `[memory.retrieval] push_unattached` 管，默认 `true`（照常推）。设成 `false` 后无归属的线索降到第 4 层，只能查。默认值等存量挂好归属、观察一段漏召回之后再改。
+- 归属搁置目标的线索不推也不归档：搁置是"先放一放"，重启时它们原样回来。
+- 约定不按归属分层：约定是长期意图，归属只决定结案时问不问它的去向（§9.6）。
+- 检索本身不变，分层在门槛之后、`top_k` 之前按归属筛：第 4、5 层的条目不占名额。
+
 **`[memory]` 热重载**（2026-10-14）：`enabled`、`model`（连同它指向的 `model.*` / 凭证）与 `retrieval` 改了就换进 `MemoryManager`，下一次提取 / 召回用新的；此前这几项在构造时定死，重载报告却说"变了"。`memory.embedding` 不在其中——换它是换向量空间（§9.5）。
 
 **附录 F 的实现与验收（2026-10-28）。** 类型与存储：`MemoryItem.application` / `applies_when`，aux.db `memory_items` 追加 `application`、`applies_when` 两列（旧行读成 NULL）；`RetrievalConfig.min_similarity` / `min_keyword_score`（默认 0，热重载）。实现处的几个定法：门槛在 RRF 之后、重排与 `top_k` 之前删人，名次按两臂完整名单融合；一臂没跑只看另一臂，门槛 0 = 该臂名单里的条目都算过；邻居检索（提取前召回、离线整理）不受门槛约束。新增测试：store `an_item_that_clears_either_arms_threshold_stays_and_the_rest_are_dropped`、`the_keyword_score_is_normalised_so_one_word_stays_below_one`、`zero_thresholds_keep_everything_the_arms_returned`、`when_the_vector_arm_did_not_run_only_the_keyword_threshold_counts`、`the_content_hash_covers_the_index_input_and_matches_the_old_one_without_a_condition`、`the_condition_is_searchable_and_both_columns_round_trip`、`the_same_content_with_another_condition_is_found_separately`、`the_application_columns_are_added_to_an_existing_memory_items_table`；agent `conventions_and_clues_render_in_two_groups`、`the_header_no_longer_tells_the_model_to_ask_before_using_unconfirmed_memories`、`both_groups_share_one_budget`；runtime `a_well_formed_convention_keeps_its_application_and_condition`、`a_convention_whose_basis_is_not_in_a_user_event_becomes_a_reference`、`a_convention_claim_without_a_preference_user_statement_and_condition_becomes_a_reference`、`an_extracted_convention_lands_with_its_condition`、`a_reference_cannot_supersede_a_convention_it_only_contests_it`、`the_same_words_with_another_condition_are_a_separate_memory`、`extraction_does_not_fold_a_convention_into_a_hand_added_reference`、`add_defaults_to_reference_and_refuses_a_malformed_convention`、`adding_the_same_words_with_a_new_application_bumps_the_revision`、`classify_writes_a_new_revision_and_keeps_evidence_and_confirmation`、`classify_refuses_a_convention_without_a_condition_or_for_a_fact`、离线 `members_with_a_different_condition_or_application_are_never_merged`、`members_with_the_same_usage_still_merge`、`a_reference_cannot_supersede_a_convention`、`the_consolidation_prompt_version_is_v2`。`cargo fmt --check` 通过；`cargo test --workspace`：2385 通过、0 失败、12 忽略（含 hooks `memory_section_is_pinned_until_the_next_head`、`recall::the_memory_block_survives_a_restart_within_one_segment`、`a_forgotten_memory_never_comes_back_into_a_turn`）；开发过程中 `tool_output::an_interrupted_attempts_partial_output_is_reported_and_then_published_with_it` 在并发负载下偶发失败一次，单跑两次均通过，与本改动无关。增量 `cargo build --timings`：7.09 秒，报告 `target/cargo-timings/cargo-timing-20261028T090408704Z-f55de822e3512fa2.html`。未装二进制、未重启 Gateway、未改写真实记忆；`classify` 路由与 CLI 只有 runtime 层测试，没有 HTTP 端到端用例。
@@ -299,6 +323,13 @@ memory_vectors 按 memory_id + memory_revision + content_hash + generation_id �
 - 只有 convention 能取代 convention；reference 或模型推断与约定冲突时，`Plan::authorize` 把 supersedes 降成 contradicts（双方 contested），不让一条线索悄悄停掉用户的约定。
 - 正文相同、条件不同的是两条，不合并、不判 same。`Plan::authorize` 另有一道：模型判了 same，但新观察与已有条目的 application 或 applies_when 不同（没分类按 reference 比）时按新增处理。判关系时编号候选行带上使用方式与条件（`memory-extract/v8`，现为 `v9`）。
 - 多条约定实质冲突、无法确定哪条现行时照旧 contested、停召回；只有它会实质改变当前结果时，主模型才问用户。
+
+**结案归档（2026-10-29 认可，未实现：`docs/goals.md` P1c）。** 目标 done / drop、领域 retire 时，在同一次写里：
+
+- 归属它的线索（reference 与未分类）从 active / candidate 转成 `archived`，contested 不动（等人裁的不因结案消失）。线索是为这件事攒的，事情结束了它们就不该再被推，但以后可能还要翻，所以不遗忘。
+- 归属它的约定**不动**：约定是用户的长期意图，不能因一件事结案悄悄失效。命令返回里列出这些约定，Agent 转给用户问去向——改归属到某个领域或清空（`classify --for`），或遗忘。没答之前照常注入。
+- 重开（`reopen`）时，归属它的 `archived` 条目恢复成 active。只有结案会产生 `archived`，所以"归属它的 archived"就是因它结案而归档的那些。
+- 改状态升 revision，已展示的旧行按 §9.4 失效改写。
 
 关联 Memos 的记忆在引用原文前重新读取并核对更新时间或内容哈希；原文改动使关联摘要待更新，删除或失去访问权限时停止把它当成当前有效证据。网络故障只能标为无法验证，不能推断原文已删除。当前不实现跨实例自动同步。
 

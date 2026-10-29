@@ -95,6 +95,7 @@ Gateway 持有模型连接、数据库与提交线、工具环境、运行状态
 | `komo memory list/search/show`               | 查看自动记忆、来源与确认状态；search 支持 hybrid / keyword / vector，输出同 `list --full` 的列、约定与线索分开列；list --full 一条一行不截断，列为 `id@版本 状态 来源 确认 用量 使用方式 条件 正文`（无条件写 `-`，旧条目使用方式写「未分类」）；show 同样显示使用方式与条件。在 Run 里（bash 子进程带 `KOMO_SESSION`）跑 list / search 时按该会话 Profile 放行的作用域答（`memory = off` 的会话被拒），输出首行是宿主标记「记忆查询结果：已有记忆，不是新证据」，提取不把它当证据（`docs/memory.md` §9.4）；终端里不带会话，照旧 |
 | `komo memory add`                            | 手动记一条（§9.3）；在 Run 里（带 `KOMO_SESSION` / `KOMO_RUN`）记成未确认、引用户原话，终端里直接记成已确认；`--application convention --applies-when "条件"` 记成长期约定，省略记成线索（`docs/memory.md` §9.2） |
 | `komo memory confirm/forget`                 | 确认具体版本或停用自动记忆；不删除 Memos 原文                               |
+| `komo goal …` / `komo area …`               | 目标与领域（`docs/goals.md`，2026-10-29 认可，P1a 实现中）：add / list / show / edit，goal 另有 next / wait / resume / park / done / drop / reopen，area 另有 retire / reopen；在 Run 里改承诺类操作要有用户原话，推进类不要；`memory = private` / `off` 的会话被拒 |
 | `komo memory classify`                       | 操作者给指定 revision 定使用方式（约定 / 线索）与条件，升一版；存量分类用（`docs/memory.md` §9.3） |
 | `komo memory consolidate`                    | 离线整理（§9.8）：对已有记忆去重、取代、标冲突，不新增正文；`--scope` `--kind` `--instruction`，默认预演，`--apply` 才写 |
 | `komo memory index status/rebuild`           | 查看索引覆盖率或重建当前向量索引                                            |

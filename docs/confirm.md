@@ -159,4 +159,6 @@ codemode 脚本里的嵌套调用经宿主执行。宿主判到"无人值守且�
 
 验证：runtime `harness/tests/confirm.rs`（批准、拒绝、到点、重启后接着等、有人值守直达、任务会话、不对外的工具）
 与 `harness/tests/codemode.rs` 的脚本内拒绝；gateway `tests/cron/confirm.rs`（真 Gateway + 真 MCP 服务器：Cron 的 Run
-出卡、投到 home、422、批准后只执行一次、拒绝后模型拿到说明、用户发起的 Run 不出卡）。
+出卡、投到 home、422、批准后只执行一次、拒绝后模型拿到说明、用户发起的 Run 不出卡）。`cargo test --workspace
+--no-fail-fast`：2506 通过、0 失败、12 忽略（最后修的两个 kernel 结论测试单独重跑通过）。结论词不收 `yes` / `no`
+别名：那是删掉的审批的写法，确认卡要写全 `approve` / `reject`。

@@ -111,12 +111,14 @@ pub const EFFORT_LEVELS: [&str; 5] = [
 
 /// §7.5 表里那一列结论词，按种类各归各的，合起来就是 `/answer` 认的这些。
 ///
-/// 顺序与 `InterventionKind::verdicts` 一致（`verify` → `blocked`），因为报错时印的就是它。
-pub const VERDICT_WORDS: [InterventionVerdict; 4] = [
+/// 顺序与 `InterventionKind::verdicts` 一致（`verify` → `blocked` → `confirm`），因为报错时印的就是它。
+pub const VERDICT_WORDS: [InterventionVerdict; 6] = [
     InterventionVerdict::Satisfied,
     InterventionVerdict::NotPerformed,
     InterventionVerdict::Resolve,
     InterventionVerdict::Abandon,
+    InterventionVerdict::Approve,
+    InterventionVerdict::Reject,
 ];
 
 /// 报错时印出来的那份词表。
@@ -147,7 +149,7 @@ pub const COMMANDS: [(&str, &str); 16] = [
     ("/status", "当前 Run 状态与待处理条数"),
     (
         "/pending",
-        "列出全部待处理事项（结果不明 / 阻塞）与各自的句柄",
+        "列出全部待处理事项（结果不明 / 阻塞 / 待确认）与各自的句柄",
     ),
     (
         "/answer",
@@ -454,16 +456,15 @@ mod tests {
         }
     }
 
-    /// `/answer` 报错时列的结论只有两类介入能答的那四个。
+    /// `/answer` 报错时列的结论是三类介入能答的那些。
     #[test]
-    fn a_bad_verdict_lists_only_the_four_answerable_words() {
-        let error = parse("/answer run-1 approve", &menu()).unwrap_err();
+    fn a_bad_verdict_lists_the_answerable_words() {
+        let error = parse("/answer run-1 maybe", &menu()).unwrap_err();
         let message = error.to_string();
         assert!(
-            message.contains("satisfied · not_performed · resolve · abandon"),
+            message.contains("satisfied · not_performed · resolve · abandon · approve · reject"),
             "{message}"
         );
-        assert!(!message.contains("reject"), "{message}");
     }
 
     #[test]

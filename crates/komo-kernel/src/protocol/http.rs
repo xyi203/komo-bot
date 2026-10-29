@@ -596,8 +596,8 @@ impl InterventionVerdict {
             }
             "resolve" | "retry" => Some(InterventionVerdict::Resolve),
             "abandon" | "cancel" => Some(InterventionVerdict::Abandon),
-            "approve" | "yes" => Some(InterventionVerdict::Approve),
-            "reject" | "no" => Some(InterventionVerdict::Reject),
+            "approve" => Some(InterventionVerdict::Approve),
+            "reject" => Some(InterventionVerdict::Reject),
             _ => None,
         }
     }
@@ -1329,9 +1329,12 @@ mod tests {
         assert!(InterventionVerdict::Resolve.allowed_for(InterventionKind::Blocked));
         assert!(!InterventionVerdict::Resolve.allowed_for(InterventionKind::Verify));
 
-        // 审批那一类已经删掉：旧的 `approve` / `reject` 不再是结论。
-        assert!(serde_json::from_str::<InterventionVerdict>(r#""approve""#).is_err());
+        // 审批那一类已经删掉（`approval` 不是种类）；`approve` / `reject` 只答对外动作确认
+        // （`docs/confirm.md`）。
         assert!(serde_json::from_str::<InterventionKind>(r#""approval""#).is_err());
+        assert!(InterventionVerdict::Approve.allowed_for(InterventionKind::Confirm));
+        assert!(!InterventionVerdict::Approve.allowed_for(InterventionKind::Blocked));
+        assert!(!InterventionVerdict::Abandon.allowed_for(InterventionKind::Confirm));
     }
 
     #[test]
@@ -1347,7 +1350,11 @@ mod tests {
         assert_eq!(
             InterventionVerdict::parse("yes"),
             None,
-            "y / yes 是审批的写法，已经删了"
+            "y / yes 是审批的写法，已经删了；确认卡要写全 approve"
+        );
+        assert_eq!(
+            InterventionVerdict::parse("Approve"),
+            Some(InterventionVerdict::Approve)
         );
         assert_eq!(InterventionVerdict::parse("maybe"), None);
         assert_eq!(InterventionKind::Verify.as_str(), "verify");

@@ -1,0 +1,124 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>主会话 · komo</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Noto+Sans:wght@400;500;600&family=Noto+Sans+SC:wght@400;500;600&family=Noto+Sans+Mono&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <svg width="0" height="0" style="position:absolute" aria-hidden="true">
+    <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
+    <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></symbol>
+    <symbol id="i-target" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="5"/><circle cx="12" cy="12" r="1"/></symbol>
+    <symbol id="i-leaf" viewBox="0 0 24 24"><path d="M11 20A7 7 0 0 1 9.8 6.1C15.5 5 17 4.48 19 2c1 2 2 4.18 2 8 0 5.5-4.78 10-10 10Z"/><path d="M2 21c0-3 1.85-5.36 5.08-6C9.5 14.52 12 13 13 12"/></symbol>
+    <symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></symbol>
+    <symbol id="i-sliders" viewBox="0 0 24 24"><path d="M20 5h-7M9 5H4M20 12h-9M7 12H4M20 19h-5M11 19H4M13 3v4M7 10v4M15 17v4"/></symbol>
+    <symbol id="i-up" viewBox="0 0 24 24"><path d="m6 11 6-6 6 6M12 19V5"/></symbol>
+    <symbol id="i-down" viewBox="0 0 24 24"><path d="m7 10 5 5 5-5"/></symbol>
+    <symbol id="i-right" viewBox="0 0 24 24"><path d="m10 7 5 5-5 5"/></symbol>
+    <symbol id="i-term" viewBox="0 0 24 24"><path d="m5 17 5-5-5-5M12 19h7"/></symbol>
+    <symbol id="i-code" viewBox="0 0 24 24"><path d="m8 7-5 5 5 5M16 7l5 5-5 5"/></symbol>
+    <symbol id="i-eye" viewBox="0 0 24 24"><path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7S2 12 2 12Z"/><circle cx="12" cy="12" r="3"/></symbol>
+    <symbol id="i-branch" viewBox="0 0 24 24"><circle cx="6" cy="5" r="2"/><circle cx="6" cy="19" r="2"/><circle cx="18" cy="7" r="2"/><path d="M6 7v10M18 9a8 8 0 0 1-8 8H8"/></symbol>
+    <symbol id="i-panel" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M15 4v16"/></symbol>
+    <symbol id="i-sidebar" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M9 4v16"/></symbol>
+    <symbol id="i-x" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></symbol>
+    <symbol id="i-plug" viewBox="0 0 24 24"><path d="M9 3v5M15 3v5M6 8h12v3a6 6 0 0 1-12 0V8ZM12 17v4"/></symbol>
+    <symbol id="i-folder" viewBox="0 0 24 24"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></symbol>
+    <symbol id="i-list" viewBox="0 0 24 24"><path d="M9 6h11M9 12h11M9 18h11M4.5 6h.01M4.5 12h.01M4.5 18h.01"/></symbol>
+    <symbol id="i-calendar" viewBox="0 0 24 24"><rect x="4" y="5" width="16" height="15" rx="2"/><path d="M4 10h16M9 3v4M15 3v4"/></symbol>
+    <symbol id="i-eye-off" viewBox="0 0 24 24"><path d="M3 3l18 18M10.6 6.1A9.6 9.6 0 0 1 12 6c6.4 0 10 6 10 6a17 17 0 0 1-3.3 3.9M6.6 7.6C3.9 9.4 2 12 2 12s3.6 6 10 6a9.4 9.4 0 0 0 4.2-1"/><path d="M9.9 9.9a3 3 0 0 0 4.2 4.2"/></symbol>
+    <symbol id="i-chat" viewBox="0 0 24 24"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></symbol>
+    <symbol id="i-archive" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="5" rx="1"/><path d="M5 9v9a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V9M10 13h4"/></symbol>
+    <symbol id="i-check" viewBox="0 0 24 24"><path d="m5 12 5 5 9-10"/></symbol>
+    <symbol id="i-copy" viewBox="0 0 24 24"><rect x="8" y="8" width="12" height="12" rx="2"/><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"/></symbol>
+    <symbol id="i-stop" viewBox="0 0 24 24"><rect x="7" y="7" width="10" height="10" rx="1.5"/></symbol>
+  </svg>
+
+  <div class="app" id="app">
+    <nav class="sidebar" id="sidebar" aria-label="导航与会话">
+      <div class="brand">
+        <svg class="mark" viewBox="0 0 28 28" aria-hidden="true">
+          <circle cx="11" cy="12" r="8" fill="#4f6b38"/>
+          <circle cx="20.5" cy="18.5" r="4.5" fill="#4f6b38" fill-opacity="0.55"/>
+          <circle cx="20" cy="7" r="2.5" fill="#4f6b38" fill-opacity="0.3"/>
+        </svg>
+        <span class="wordmark">komo</span>
+        <button class="icon-btn close-nav" id="close-nav" aria-label="收起导航"><svg class="i"><use href="#i-x"/></svg></button>
+      </div>
+      <ul class="nav">
+        <li><button class="nav-item" id="new-session"><svg class="i"><use href="#i-plus"/></svg>新对话</button></li>
+        <li><button class="nav-item" id="nav-search"><svg class="i"><use href="#i-search"/></svg>搜索<kbd>⌘K</kbd></button></li>
+        <li><a class="nav-item" href="#"><svg class="i"><use href="#i-target"/></svg>事项</a></li>
+        <li><a class="nav-item" href="#"><svg class="i"><use href="#i-leaf"/></svg>记忆</a></li>
+        <li><a class="nav-item" href="#"><svg class="i"><use href="#i-clock"/></svg>定时</a></li>
+      </ul>
+      <div class="sec">
+        <div class="sec-head">
+          <span class="sec-title">会话</span>
+          <button class="icon-btn" id="search-toggle" aria-label="搜索会话" title="搜索会话" aria-expanded="false" aria-controls="sec-search"><svg class="i"><use href="#i-search"/></svg></button>
+          <button class="icon-btn" id="view-menu-btn" aria-label="分组、排序与筛选" title="分组、排序与筛选" aria-haspopup="menu" aria-expanded="false" aria-controls="view-menu"><svg class="i"><use href="#i-sliders"/></svg></button>
+          <button class="icon-btn" id="new-session-2" data-new-in="" aria-label="新对话" title="新对话"><svg class="i"><use href="#i-plus"/></svg></button>
+        </div>
+        <div class="menu" id="view-menu" role="menu" aria-label="分组、排序与筛选" hidden></div>
+        <div class="sec-search" id="sec-search" hidden><svg class="i"><use href="#i-search"/></svg><label class="visually-hidden" for="search-input">按标题搜索会话</label><input id="search-input" type="search" placeholder="按标题搜索" autocomplete="off"></div>
+      </div>
+      <div class="groups" id="groups"></div>
+      <div class="user">
+        <span class="avatar" aria-hidden="true">Y</span>
+        <span class="who">Yi<span class="host" id="conn-text">正在连接 Gateway</span></span>
+        <span class="dot" id="conn-dot" role="img" aria-label="正在连接"></span>
+        <button class="icon-btn" aria-label="设置" title="设置"><svg class="i"><use href="#i-sliders"/></svg></button>
+      </div>
+    </nav>
+
+    <main class="main">
+      <header class="topbar">
+        <button class="icon-btn open-nav" id="open-nav" aria-label="打开导航"><svg class="i"><use href="#i-sidebar"/></svg></button>
+        <button class="title-btn"><h1 id="title">komo</h1><svg class="i"><use href="#i-down"/></svg></button>
+        <div class="top-actions">
+          <button class="icon-btn" id="fork" aria-label="分叉这段对话" title="分叉这段对话"><svg class="i"><use href="#i-branch"/></svg></button>
+          <button class="icon-btn" id="toggle-panel" aria-label="收起右栏" title="右栏" aria-controls="panel" aria-expanded="true"><svg class="i"><use href="#i-panel"/></svg></button>
+        </div>
+      </header>
+
+      <div class="body">
+        <div class="thread">
+          <div class="scroll" id="scroll">
+            <div class="column" id="transcript"></div>
+          </div>
+          <div class="composer-wrap">
+            <form class="composer" id="composer">
+              <button type="button" class="icon-btn" aria-label="添加附件" title="添加附件"><svg class="i"><use href="#i-plus"/></svg></button>
+              <label class="visually-hidden" for="input">发给 komo</label>
+              <textarea id="input" rows="1" placeholder="↵ 发送，⇧↵ 换行"></textarea>
+              <button type="button" class="send" id="stop-run" aria-label="停止这一轮" hidden><svg class="i fill"><use href="#i-stop"/></svg></button>
+              <button type="submit" class="send" id="send" aria-label="发送"><svg class="i"><use href="#i-up"/></svg></button>
+            </form>
+            <div class="under">
+              <span id="under-left" class="under-left"></span>
+              <label class="visually-hidden" for="model">模型</label>
+              <select class="pick" id="model"></select>
+              <label class="visually-hidden" for="effort">effort</label>
+              <select class="pick effort" id="effort"></select>
+              <span class="ring" id="ring" role="img"></span>
+            </div>
+          </div>
+        </div>
+        <aside class="panel" id="panel" aria-labelledby="panel-title">
+          <div class="panel-head"><h2 id="panel-title">这一段</h2><button class="icon-btn" id="close-panel" aria-label="关闭"><svg class="i"><use href="#i-x"/></svg></button></div>
+          <div id="panel-body"></div>
+        </aside>
+      </div>
+
+    </main>
+    <div class="scrim" id="scrim"></div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>

@@ -22,17 +22,17 @@ komo 是一个 Rust 个人 agent 框架：一个二进制提供交互式 LLM 聊
 
 ## Operating Context
 
-- 主形态是聊天助理：终端 TUI（`komo chat`）、Electron 桌面壳与 Web SPA（共享 React 渲染层）、以及飞书/Telegram/微信/HA 等渠道内的对话。
+- 主形态是聊天助理：终端 TUI（`komo chat`）、Web 客户端（`apps/web`，W0 原型，见 `docs/web.md`）、以及飞书/Telegram/微信/HA 等渠道内的对话。
 - gateway 作为常驻进程运行（macOS launchd 托管），承担 review / routine / dream 三个 sweep 与主动输出；主动消息经 home chat 送达。
 - 操作者通过 CLI 管理记忆、技能、cron、run ledger、权限策略等（统一走 gateway 的 `POST /api/operator`）；副作用工具走审批流（chat 内 `/approve`）。
 - 单机单用户：数据库、配置、凭证都在本地 `~/.komo` 下。
 
 ## Capabilities and Constraints
 
-- 前端：bun workspace（`apps/`），`apps/app` 为共享 React 渲染层，由 Electron（`apps/desktop`）与 Web SPA（`apps/web`）挂载；shadcn 组件 + 语义主题 token，`bun run lint` 禁止裸色值；react-query 管服务端状态、zustand 管客户端状态；对 gateway 仅走 HTTP（`HttpKomoClient`）。
+- 前端：`apps/web` 是无构建、无依赖的静态原型（HTML + 原生 JS + CSS），经 `serve.mjs` 同源代理只走 gateway 的 HTTP / SSE；颜色只引用 `styles.css` 里的语义 token。v0.8 之前的 React 渲染层与 Electron 壳已随脚手架删除。
 - 多 LLM provider（DeepSeek/Anthropic/OpenAI/Codex/OpenRouter），模型菜单按会话切换；无 key 也能启动（回复配置指引）。
 - 领域术语（`CONTEXT.md` 是术语表）：Turn / Tool Note / Turn Trace / Run Ledger / History Window / Cancel 等，界面文案应与之一致。
-- 平台判定为 web：Electron 桌面壳复用同一 web 渲染层，不引入原生设计语言。
+- 平台判定为 web：电脑上用 Web 客户端，手机先用飞书（`docs/roadmap-muse.md` §4.4）。
 
 ## Brand Commitments
 

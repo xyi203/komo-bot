@@ -193,6 +193,9 @@ commands run, terminal output when CLI behavior changes.
 - Goals and areas: `docs/goals.md` — PARA/GTD-style goals (next action,
   waiting, parked) and areas, memory belongs-to and archive on close; spec
   approved 2026-10-29, implemented in slices P1a–P1e.
+- Web client: `docs/web.md` — W0 prototype in `apps/web/` (static files, no build;
+  `node apps/web/serve.mjs`), what it reads from the Gateway, and the Gateway gaps
+  it found. Visual tokens are summarized in `DESIGN.md`.
 - Direction: `docs/roadmap-muse.md` — gaps and phases toward a Muse-style
   proactive personal agent (PARA-style goals and areas, proactivity,
   outward-action confirmation);

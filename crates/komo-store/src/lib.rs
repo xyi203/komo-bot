@@ -4,7 +4,7 @@
 //! 两个库文件、一个目录，各管各的：
 //!
 //! - **`durable.db`**（[`durable`]）：会话、提交、收件箱、任务——串行提交线，WAL，提交即 fsync。
-//! - **`aux.db`**（[`db::Db`] + toasty，[`models`] / [`repos`]）：cron、投递记录、记忆。
+//! - **`aux.db`**（[`db::Db`] + toasty，[`models`] / [`repos`]）：cron、投递记录、记忆、事项。
 //!   跨库靠预分配 ID 与请求键幂等。
 //! - **Session 目录**（[`session_dir`] / [`tool_output`]）：工具输出与产物的内容文件。
 //!   写入顺序是 §8.5 的箭头：**外置正文 → 数据库提交**，崩溃后靠对账收尾。
@@ -26,6 +26,7 @@ pub mod tool_output;
 pub use db::{Db, DbOptions, RetryConfig};
 pub use repos::cron::TursoCronRepo;
 pub use repos::deliveries::{DeliveryRecord, TursoDeliveryRepo};
+pub use repos::matter::TursoMatterRepo;
 pub use repos::memory::{TursoMemoryRepo, lexical_terms};
 pub use session_dir::SessionPaths;
 pub use tool_output::FileToolOutputStore;

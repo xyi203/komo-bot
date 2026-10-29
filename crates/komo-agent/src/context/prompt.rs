@@ -268,6 +268,9 @@ const BASH_TOOL: &str = "bash";
 /// 的排查经验，由 Agent 自己 `komo memory search`，替代宿主在 Run 中途插召回。静态文字，不
 /// 影响前缀；查到的按注入块同一套规则用（约定照做、线索先核实）。
 ///
+/// 「目标与领域」那句（2026-10-29，`docs/goals.md` §4）：事项由 Agent 在 Run 里当场记，用户在场、
+/// 上下文齐全；后台提取不建事项。静态文字，不影响前缀。
+///
 /// 末句（2026-10-15）：会话里 6 次在 Run 里重启 Gateway，8 个调用因此记成 uncertain，
 /// 最长的一条两个多小时后才收尾。
 const SELF_BLOCK: &str = "komo 自己的状态（cron、会话 / Run、记忆、介入、配置、skills、\
@@ -282,6 +285,9 @@ const SELF_BLOCK: &str = "komo 自己的状态（cron、会话 / Run、记忆、
                           注入的记忆不够用、或者报错之后想看以前的排查经验，用 \
                           `komo memory search \"关键词\"` 查；查到的按同样的规则用——约定照做，\
                           线索先核实。\
+                          用户说开始做某事、开始管某事、在等某人某事、先放一放、办完了、不管了，\
+                          就当场用 `komo goal` / `komo area` 记下（`komo goal --help`）；推进时用 \
+                          `komo goal next` 更新下一步。\
                           你自己就跑在 Gateway 里：`komo gateway restart|stop` 和会重启 \
                           Gateway 的安装脚本会打断你正在做的这件事，要跑就放在最后一步，\
                           或者交给用户自己跑。";

@@ -28,7 +28,7 @@
 - **领域与记忆作用域不合并。** 作用域说"谁看得到、在哪适用"（§9.2），归属说"为哪件事记的"（`memory.md` §9.2 归属）。"家里的设备"这个领域下的记忆可以在 `environment:nas` 作用域里，两个字段各管各的，领域不挂作用域。
 - **事项由 Agent 在 Run 里当场记，提取不建事项。** 用户说"开始做 / 在等 / 先放一放 / 办完了"时，Agent 就在这个 Run 里跑命令，用户在场、上下文齐全。后台提取不产生事项建议：离线建议需要一个确认回路，等每周回顾（P2）有了再考虑。提取只给新记忆建议归属（P1d）。
 
-## 3. 数据模型（P1a）
+## 3. 数据模型（P1a，已实现）
 
 `aux.db` 新表 `matters`（toasty，与 cron、memory 同一套：DDL 常量 + 对齐测试、写在 `with_write_retry` 的事务里、UUIDv7 字符串主键）。kernel 值类型 `Matter`。
 
@@ -49,7 +49,7 @@
 
 **超期**：`kind = goal`、state 是 `active` / `waiting` / `parked`、`due` 早于 Gateway 本地时区的今天。
 
-## 4. 状态与操作（P1a）
+## 4. 状态与操作（P1a，已实现）
 
 ```text
 goal:  active ⇄ waiting
@@ -89,6 +89,19 @@ area:  active → retired →（reopen）active
 这和 `memory add` 一样不是安全边界（bash 去掉两个变量就走终端那条路，§7 没有 Policy），分的是常态下谁在说话。后台任务会话（`kind = task`）与 Cron 的 Run 里改承诺类操作被拒：那里没有用户原话。
 
 **系统提示。** `SELF_BLOCK` 加一句静态文字：用户说开始做某事、开始管某事、在等某人某事、先放一放、办完了、不管了，就当场用 `komo goal` / `komo area` 记下；推进时更新下一步。
+
+**实现与验收（2026-10-29）。** 接缝：kernel `types::matter`（`Matter` / `MatterKind` / `MatterState` / `MatterVerb`、纯函数 `transition` 与 `Matter::is_overdue`）、`traits::MatterRepo`、`protocol::http::matter`（`MatterListQuery` / `MatterAddRequest` / `MatterActionRequest` / `MatterDetail` / `MatterListResponse`）；store `models::matter`（aux.db `matters` 表，DDL 常量与对齐测试、每列有补列子句）与 `TursoMatterRepo`（带预期版本的写在同一事务里读、比、写）；runtime `matter::MatterManager`（文字规整、按调用方要证据、读改写）；gateway `http::matters`（四条路由、private / off 闸、今天）；client `matters` / `matter` / `matter_add` / `matter_act` 与 `render::matter_*`；bin `matters.rs`（`komo goal` / `komo area`）；`SELF_BLOCK` 加一句。用户原话的口径从 `memory add` 抽成 `memory::run_user_evidence`，两边共用。
+
+规格没写、实现时定下的：
+- **已在目标状态上不算起点不对。** 对 `parked` 再 park、对 `done` 再 done、对 `active` 的目标 resume / reopen 都是空操作（原样返回、不升版、不追加证据）；只有"既不是允许的起点、也不在目标状态上"才报错。active 上 `resume --next` 只改下一步。
+- **状态不允许报 409**（`conflict`，消息写出当前状态与允许的起点）；种类不对、字段不对报 400；预期版本不符报 409 `version_conflict`；private / off 会话报 403 `denied`，读写都拦。
+- **可空字段给空串 = 清空**：`komo goal next ID ""` 清下一步，`komo area edit --standard ""` 清标准；标题与 `waiting_for` 不许空。所有文字去首尾空白、不许换行（清单与注入都是一行一条）、标题 ≤ 80 字、其余 ≤ 300 字（同记忆的 `MAX_CONTENT_CHARS`）、不像凭证。
+- **动词只认自己的字段**，带了别的报错（`park` 带 `title`）；`--due` 与 `--no-due` 互斥。CLI 在每次改动里带上 `kind`，拿领域的 id 跑 `komo goal edit` 报错而不是悄悄改了领域。
+- **今天由 Gateway 给**：每个响应带 `today`（系统时区的日历日，换算不出来退回 UTC 日期），客户端按它读超期。
+- **证据只在真改了时追加**（按引用去重）；状态没变的承诺类操作仍要先过原话这一关。Cron 的 Run 不单列：提示词不算用户原话，自然被拒。
+- 清单按创建先后（id）排，整表读出在内存里筛；不开索引。
+
+测试：kernel `every_goal_transition_follows_the_table`、`every_area_transition_follows_the_table`、`a_verb_of_the_other_kind_is_refused`、`leaving_waiting_clears_what_it_waited_for_and_closing_stamps_closed_at`、`resume_can_carry_a_new_next_step`、`an_unchanged_result_is_a_no_op`、`kind_specific_fields_are_refused_on_the_wrong_kind`、`overdue_is_read_from_the_due_date_and_today`、`a_matter_round_trips_through_json_with_an_iso_due_date`、`verbs_parse_and_split_into_commitment_and_progress`、`an_add_request_carries_the_due_date_as_iso_text`；store `a_matter_round_trips_through_the_row`、`a_stale_revision_writes_nothing`、`the_list_hides_closed_matters_unless_asked`（DDL 对齐与可补列由 `models::tests` 对全部表覆盖）；runtime `an_add_inside_a_run_cites_the_users_words`、`a_commitment_without_user_words_is_refused_but_progress_is_not`、`a_background_task_session_cannot_change_a_commitment`、`malformed_requests_are_refused`、`an_unchanged_state_returns_the_matter_as_is`；gateway 端到端（放在 `tests/memory`，少链接一个二进制）`matters::a_goal_walks_its_whole_life_over_http`（add → next → wait → resume → done → reopen，含 409 与版本冲突）、`an_area_retires_and_reopens_and_refuses_goal_verbs`、`a_run_without_user_words_can_progress_but_not_commit`、`a_private_or_off_session_cannot_see_or_change_matters`，以及 `http::matters::tests::today_is_the_local_calendar_date`；client `a_matter_list_is_one_line_per_matter`、`a_matter_detail_shows_every_field_and_the_overdue_mark`；bin `goal_and_area_commands_parse`；agent `the_self_block_teaches_recording_goals_and_areas_and_stays_byte_stable`。`cargo fmt --check` 通过；`cargo test --workspace --no-fail-fast`：2443 通过、0 失败、12 忽略。增量 `cargo build --timings`：35.33 秒，报告 `target/cargo-timings/cargo-timing-20261029T024754257Z-f55de822e3512fa2.html`。未验证：没装二进制、没在真 Gateway 上跑 CLI，Agent 是否按 `SELF_BLOCK` 那句当场记没有真模型验证；端到端用例里的 Run 原话走的是脚本化模型，不经真 bash 的 `KOMO_SESSION` / `KOMO_RUN`（那一段与 `memory add` 共用，见 `memory.md` §9.3 的 Durable Run 身份验收）。
 
 ## 5. 注入（P1b）
 

@@ -31,7 +31,7 @@ komo config check | config reload
 komo channel list|probe | channel wechat login
 komo session list|delete|purge|export SESSION_ID [-o FILE]   # export = pi v3 树形 JSONL
 komo intervention list|show|answer
-komo cron … | komo memory … | komo skills … | komo doctor
+komo cron … | komo memory … | komo goal … | komo area … | komo skills … | komo doctor
 komo update                    # swap the on-disk binary from the GitHub release (§13.6)
 ```
 

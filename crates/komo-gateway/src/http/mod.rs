@@ -10,6 +10,7 @@ pub mod config;
 pub mod cron;
 pub mod error;
 pub mod idempotency;
+pub mod matters;
 pub mod mcp;
 pub mod memories;
 pub mod v2;
@@ -63,7 +64,7 @@ pub fn router(api: Api) -> Router {
     open.merge(guarded).with_state(api)
 }
 
-/// memories、config、models、mcp 这几组路由（handler 在本目录，不碰存储模型）。
+/// memories、matters、config、models、mcp 这几组路由（handler 在本目录，不碰存储模型）。
 fn shared_routes() -> Router<Api> {
     Router::new()
         .route("/v1/memories", get(memories::list).post(memories::add))
@@ -76,6 +77,9 @@ fn shared_routes() -> Router<Api> {
         .route("/v1/memory-consolidate", post(memories::consolidate))
         .route("/v1/memory-index", get(memories::index))
         .route("/v1/memory-index/rebuild", post(memories::rebuild))
+        .route("/v1/matters", get(matters::list).post(matters::add))
+        .route("/v1/matters/{id}", get(matters::show))
+        .route("/v1/matters/{id}/{action}", post(matters::act))
         .route("/v1/models", get(config::models))
         .route("/v1/config/check", get(config::check))
         .route("/v1/config/reload", post(config::reload))

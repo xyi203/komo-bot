@@ -17,8 +17,9 @@ use komo_kernel::types::turn::{LlmError, TurnRequest};
 use komo_runtime::config::{ConfigHolder, EffortCapabilities};
 use komo_runtime::durable::harness::RetryPolicy;
 use komo_runtime::executor::ToolExecutor;
+use komo_runtime::matter::MatterManager;
 use komo_runtime::memory::{MemoryManager, MemoryParts};
-use komo_store::{Db, TursoCronRepo, TursoDeliveryRepo, TursoMemoryRepo};
+use komo_store::{Db, TursoCronRepo, TursoDeliveryRepo, TursoMatterRepo, TursoMemoryRepo};
 use time::OffsetDateTime;
 
 use crate::channels::ChannelFactory;
@@ -130,6 +131,8 @@ pub struct GatewayState {
     pub memory: Arc<dyn MemoryRepo>,
     /// §9 的那一层：召回与注入、自动积累、向量索引与代次。
     pub memories: Arc<MemoryManager>,
+    /// 目标与领域（`docs/goals.md` §4）：`/v1/matters`。
+    pub matters: Arc<MatterManager>,
     pub deliveries: Arc<TursoDeliveryRepo>,
     pub notifier: Arc<HomeNotifier>,
     pub channels: Arc<ChannelRegistry>,
@@ -259,6 +262,12 @@ impl GatewayState {
         let reranker = build_reranker(&snapshot, &config);
         // 事件与工作队列走新存储（W3c）。
         let (events, work) = super::durable::memory::seams(&durable, &config, &clock);
+        // 事项的承诺类操作与 `memory add` 读同一份事件找用户原话（`docs/goals.md` §4）。
+        let matters = Arc::new(MatterManager::new(
+            Arc::new(TursoMatterRepo::new(db.clone())),
+            Arc::clone(&events),
+            Arc::clone(&clock),
+        ));
         let memories = Arc::new(MemoryManager::new(MemoryParts {
             config: snapshot.memory.clone(),
             repo: Arc::clone(&memory),
@@ -316,6 +325,7 @@ impl GatewayState {
             cron,
             memory,
             memories,
+            matters,
             deliveries,
             reload_notice: Mutex::new(None),
             notifier,

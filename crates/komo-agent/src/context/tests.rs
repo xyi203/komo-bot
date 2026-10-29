@@ -108,3 +108,18 @@ fn the_self_block_teaches_searching_memory_and_stays_byte_stable() {
     assert_eq!(first, prompt_of(&with_bash));
     assert!(!prompt_of(&input(None)).contains("komo memory search"));
 }
+
+/// 能跑 bash 时系统提示教 Agent 当场记目标与领域（`docs/goals.md` §4）；静态文字，逐字不变。
+#[test]
+fn the_self_block_teaches_recording_goals_and_areas_and_stays_byte_stable() {
+    let with_bash = ContextInput {
+        tools: vec!["bash".into()],
+        ..input(None)
+    };
+    let first = prompt_of(&with_bash);
+    assert!(first.contains("`komo goal` / `komo area` 记下"), "{first}");
+    assert!(first.contains("先放一放、办完了、不管了"), "{first}");
+    assert!(first.contains("`komo goal next` 更新下一步"), "{first}");
+    assert_eq!(first, prompt_of(&with_bash));
+    assert!(!prompt_of(&input(None)).contains("komo goal"));
+}

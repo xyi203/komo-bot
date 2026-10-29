@@ -23,7 +23,7 @@ use komo_kernel::types::plan::PlanSource;
 use time::OffsetDateTime;
 
 use super::extract::{HANDBACK_KEY_PREFIXES, MAX_CONTENT_CHARS, Transcript, looks_like_secret};
-use super::{MemoryError, MemoryManager};
+use super::{MemoryError, MemoryManager, SessionEvents};
 
 /// 手动记下的条目在 `extraction.prompt_version` 里的标记。提取时靠它认出"这段对话里
 /// 已经手动记过的"，不再提一遍（[`is_manual`]）。v2 起带上使用方式与条件（§9.3）；v1 的
@@ -311,20 +311,7 @@ impl MemoryManager {
         run: &RunId,
         now: OffsetDateTime,
     ) -> Result<Vec<Evidence>, MemoryError> {
-        let events = self.events.events_of(session).await?;
-        let evidence: Vec<Evidence> = user_inputs(&events, run)
-            .into_iter()
-            .map(|event| Evidence {
-                reference: EvidenceRef::Event {
-                    session: session.clone(),
-                    event: event.event_id.clone(),
-                    seq: event.seq,
-                },
-                provenance: Provenance::UserStatement,
-                observed_at: now,
-                extracted_from_run: Some(run.clone()),
-            })
-            .collect();
+        let evidence = run_user_evidence(&*self.events, session, run, now).await?;
         if evidence.is_empty() {
             return Err(MemoryError::Invalid(format!(
                 "会话 {session} 的 Run {run} 里找不到用户说的话：替用户记一条要有用户原话作证据"
@@ -332,6 +319,31 @@ impl MemoryManager {
         }
         Ok(evidence)
     }
+}
+
+/// 这个 Run 里用户说的话，一条一份证据（[`user_inputs`] 的口径）；一句都没有是空表，由
+/// 调用方决定怎么拒。`memory add`（§9.3）与事项的承诺类操作（`docs/goals.md` §4）共用：
+/// 两边说的都是"Agent 在 Run 里替用户改用户的东西，凭的只能是用户原话"。
+pub async fn run_user_evidence(
+    events: &dyn SessionEvents,
+    session: &SessionId,
+    run: &RunId,
+    now: OffsetDateTime,
+) -> Result<Vec<Evidence>, MemoryError> {
+    let events = events.events_of(session).await?;
+    Ok(user_inputs(&events, run)
+        .into_iter()
+        .map(|event| Evidence {
+            reference: EvidenceRef::Event {
+                session: session.clone(),
+                event: event.event_id.clone(),
+                seq: event.seq,
+            },
+            provenance: Provenance::UserStatement,
+            observed_at: now,
+            extracted_from_run: Some(run.clone()),
+        })
+        .collect())
 }
 
 /// 这个 Run 里用户说的话：它自己受理的那句、并进它的插话（插话带着自己的 Run id，

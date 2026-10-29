@@ -19,6 +19,7 @@
 pub mod cron_firing;
 pub mod cron_job;
 pub mod delivery;
+pub mod matter;
 pub mod memory_evidence;
 pub mod memory_index_generation;
 pub mod memory_item;
@@ -29,6 +30,7 @@ pub mod session_kind;
 pub use cron_firing::CronFiringRow;
 pub use cron_job::CronJobRow;
 pub use delivery::DeliveryRow;
+pub use matter::MatterRow;
 pub use memory_evidence::MemoryEvidenceRow;
 pub use memory_index_generation::MemoryIndexGenerationRow;
 pub use memory_item::MemoryItemRow;
@@ -89,7 +91,7 @@ pub struct TableSpec {
     pub columns: &'static [ColumnSpec],
 }
 
-/// `aux.db` 里的全部表，按建表顺序：cron、投递、记忆。
+/// `aux.db` 里的全部表，按建表顺序：cron、投递、记忆、事项。
 ///
 /// 会话 / run / 工具调用 / 检查点 / 控制 outbox 那几张旧表随旧存储删除（会话与提交在
 /// `durable.db`，`komo-store::durable`）；老用户目录里的 `state.db` 不再被打开。
@@ -102,6 +104,7 @@ pub const TABLES: &[TableSpec] = &[
     memory_terms::SPEC,
     memory_vector::SPEC,
     memory_index_generation::SPEC,
+    matter::SPEC,
 ];
 
 /// 索引由 store 自己建（见模块头），新文件与旧文件走同一条路。
@@ -123,6 +126,7 @@ pub fn model_set() -> toasty::ModelSet {
         MemoryTermsRow,
         MemoryVectorRow,
         MemoryIndexGenerationRow,
+        MatterRow,
     )
 }
 

@@ -8,6 +8,7 @@ pub mod chat;
 pub mod delegate;
 pub mod digest;
 pub mod ids;
+pub mod matter;
 pub mod memory;
 pub mod model;
 pub mod monitor;
@@ -32,8 +33,8 @@ pub use delegate::{
 };
 pub use digest::{ContentHash, sha256};
 pub use ids::{
-    AttemptId, CronJobId, DeliveryId, EventId, ExecutorId, IdParseError, MemoryId, OperationId,
-    RequestKey, RunId, Seq, SessionId, ToolCallId, uuid_v7_at,
+    AttemptId, CronJobId, DeliveryId, EventId, ExecutorId, IdParseError, MatterId, MemoryId,
+    OperationId, RequestKey, RunId, Seq, SessionId, ToolCallId, uuid_v7_at,
 };
 pub use memory::{
     Confirmation, Evidence, EvidenceRef, ExtractionMetadata, Injection, MemoryItem, MemoryKind,

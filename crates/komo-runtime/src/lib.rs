@@ -7,6 +7,7 @@ pub mod embedding;
 pub mod executor;
 pub mod limits;
 pub mod llm;
+pub mod matter;
 pub mod mcp;
 pub mod mcp_auth;
 pub mod memory;

@@ -6,6 +6,7 @@
 
 mod commands;
 mod connect;
+mod matters;
 mod telemetry;
 mod update;
 
@@ -70,6 +71,16 @@ enum Command {
     Memory {
         #[command(subcommand)]
         action: MemoryCommand,
+    },
+    /// 目标：有结果、会结束的事；下一步、等待、搁置、完成 / 放弃（docs/goals.md §4）。
+    Goal {
+        #[command(subcommand)]
+        action: matters::GoalCommand,
+    },
+    /// 领域：没有终点、要维持标准的职责（docs/goals.md §4）。
+    Area {
+        #[command(subcommand)]
+        action: matters::AreaCommand,
     },
     /// 在数据目录生成一份带注释的最小 config.toml 与 .env 模板；已有 config.toml 不覆盖（§3）。
     ///
@@ -818,6 +829,8 @@ async fn operator(
                 MemoryIndexCommand::Rebuild => commands::memory_rebuild(client).await,
             },
         },
+        Command::Goal { action } => matters::goal(client, action).await,
+        Command::Area { action } => matters::area(client, action).await,
         Command::Config { action } => match action {
             ConfigCommand::Check => commands::config_check(client).await,
             ConfigCommand::Reload => commands::config_reload(client).await,
@@ -1135,6 +1148,60 @@ mod tests {
             Cli::parse_from(["komo", "init"]).command,
             Some(Command::Init)
         ));
+    }
+
+    /// `komo goal` / `komo area`（docs/goals.md §4）：每个动词都解析得出，`--due` 与
+    /// `--no-due` 只能给一个，`--revision` 跟在任何改动后面。
+    #[test]
+    fn goal_and_area_commands_parse() {
+        for args in [
+            &[
+                "goal",
+                "add",
+                "发布观察",
+                "--next",
+                "看 5xx",
+                "--due",
+                "2026-11-01",
+            ][..],
+            &["goal", "next", "g-1", "提工单", "--revision", "3"],
+            &["goal", "wait", "g-1", "SRE 审批"],
+            &["goal", "resume", "g-1", "--next", "看意见"],
+            &["goal", "park", "g-1"],
+            &["goal", "done", "g-1"],
+            &["goal", "drop", "g-1"],
+            &["goal", "reopen", "g-1"],
+            &["goal", "edit", "g-1", "--title", "新标题", "--no-due"],
+            &["goal", "list", "--all"],
+            &["goal", "show", "g-1"],
+            &["area", "add", "值班轮换", "--standard", "每周一前"],
+            &["area", "edit", "a-1", "--standard", "每周一 10 点前"],
+            &["area", "retire", "a-1"],
+            &["area", "reopen", "a-1"],
+            &["area", "list"],
+            &["area", "show", "a-1"],
+        ] {
+            let argv = std::iter::once("komo").chain(args.iter().copied());
+            assert!(Cli::try_parse_from(argv).is_ok(), "{args:?}");
+        }
+        assert!(
+            Cli::try_parse_from([
+                "komo",
+                "goal",
+                "edit",
+                "g-1",
+                "--due",
+                "2026-11-01",
+                "--no-due"
+            ])
+            .is_err()
+        );
+        let Some(Command::Goal {
+            action: matters::GoalCommand::Done { .. },
+        }) = Cli::parse_from(["komo", "goal", "done", "g-1", "--revision", "2"]).command
+        else {
+            panic!("解析不出 goal done");
+        };
     }
 
     /// `komo cron add` 的四个必填项。

@@ -20,6 +20,8 @@
 //! | `POST /v1/memories/{id}/restore` | [`MemoryRevisionRequest`] | [`MemoryDetail`] |
 //! | `POST /v1/memory-sweep` | [`MemorySweepRequest`] | [`MemorySweepResponse`] |
 //! | `POST /v1/memory-consolidate` | [`MemoryConsolidateRequest`] | [`MemoryConsolidateResponse`] |
+//! | `POST /v1/matters` | [`MatterAddRequest`] | [`MatterDetail`] |
+//! | `POST /v1/matters/{id}/{action}` | [`MatterActionRequest`] | [`MatterDetail`] |
 //! | `GET /v1/models` | — | [`ModelsResponse`] |
 //! | `GET /v1/config/check` | — | [`ConfigCheckResponse`] |
 //! | `POST /v1/config/reload` | — | [`ConfigReloadResponse`]，失败走 [`ErrorBody`] |
@@ -33,6 +35,10 @@ use time::OffsetDateTime;
 #[path = "session.rs"]
 pub mod session;
 pub use session::*;
+
+#[path = "matter.rs"]
+pub mod matter;
+pub use matter::*;
 
 use super::config::{ConfigIssue, KeyPath, SourceFile};
 use crate::cron::{CronFiring, CronJob, JobStatus, NotifyPolicy, OverlapPolicy};

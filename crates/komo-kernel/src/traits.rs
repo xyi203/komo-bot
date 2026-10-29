@@ -18,7 +18,8 @@ use time::OffsetDateTime;
 use crate::cron::{CronFiring, CronJob, JobStatus, ZoneError, ZoneResolution};
 use crate::protocol::{InboundAck, InboundMessage};
 use crate::types::chat::{Delivery, DeliveryTarget, Outbound};
-use crate::types::ids::{CronJobId, MemoryId};
+use crate::types::ids::{CronJobId, MatterId, MemoryId};
+use crate::types::matter::{Matter, MatterKind};
 use crate::types::memory::{MemoryItem, RecallQuery, RecallResult};
 use crate::types::model::{EmbeddingSpace, InputKind, TokenUsage, Vector};
 use crate::types::plan::{ExecutionPlan, Replay};
@@ -359,6 +360,31 @@ pub trait MemoryRepo: Send + Sync {
     async fn index_status(&self) -> Result<crate::protocol::http::MemoryIndexStatus, RepoError>;
 }
 
+// ---------------------------------------------------------------- 目标与领域
+
+/// 事项（目标与领域，`docs/goals.md` §3）的读写。状态怎么走在
+/// [`crate::types::matter::transition`]，这里只管存取与版本。
+#[async_trait]
+pub trait MatterRepo: Send + Sync {
+    async fn get(&self, id: &MatterId) -> Result<Option<Matter>, RepoError>;
+
+    /// 按创建先后（id）列出。`include_closed = false` 只给未结案的。
+    async fn list(
+        &self,
+        kind: Option<MatterKind>,
+        include_closed: bool,
+    ) -> Result<Vec<Matter>, RepoError>;
+
+    /// `expected_revision = None`：新建（id 已在就报错）。`Some(n)`：库里那一行的
+    /// revision 必须是 `n`，否则 [`RepoError::VersionConflict`]，什么都不写；对上了就
+    /// 整行换成 `matter`（revision 由调用方算好）。
+    async fn put(
+        &self,
+        matter: Matter,
+        expected_revision: Option<u32>,
+    ) -> Result<Matter, RepoError>;
+}
+
 // ---------------------------------------------------------------- 模型
 
 /// 主模型、记忆模型是**同一个 trait 的两个实例**；loop 测试用脚本化回合。
@@ -623,6 +649,7 @@ mod tests {
         assert_object_safe::<dyn OutputWriter>();
         assert_object_safe::<dyn CronRepo>();
         assert_object_safe::<dyn MemoryRepo>();
+        assert_object_safe::<dyn MatterRepo>();
         assert_object_safe::<dyn LlmClient>();
         assert_object_safe::<dyn TurnDriver>();
         assert_object_safe::<dyn EmbeddingClient>();

@@ -25,6 +25,9 @@ use time::OffsetDateTime;
 
 use crate::tui::app::{intervention_kind_text, status_text, verdicts_text, wait_text};
 
+mod matter;
+pub use matter::{matter_changed, matter_line, matter_list, matter_show};
+
 /// 状态那一格：`Waiting` 时把**理由**接上（§8.4）。
 ///
 /// 状态与理由是**两个维度**：状态说"能不能跑"，理由说"在等谁、等到什么时候"。清单与

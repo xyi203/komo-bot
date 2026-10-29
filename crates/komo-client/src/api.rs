@@ -8,7 +8,10 @@
 //! "同一次操作"是调用方才知道的事。[`RequestKeys`] 是给调用方用的构造器，不是默认值。
 
 use komo_kernel::protocol::http::*;
-use komo_kernel::types::ids::{CronJobId, MemoryId, RequestKey, RunId, SessionId, uuid_v7_at};
+use komo_kernel::types::ids::{
+    CronJobId, MatterId, MemoryId, RequestKey, RunId, SessionId, uuid_v7_at,
+};
+use komo_kernel::types::matter::MatterVerb;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
@@ -667,6 +670,50 @@ impl KomoClient {
         request: &RebuildIndexRequest,
     ) -> ClientResult<RebuildIndexResponse> {
         self.post("/v1/memory-index/rebuild", request).await
+    }
+
+    // ---- /v1/matters ----
+
+    /// 目标与领域的清单（`docs/goals.md` §4）。默认只列未结案的。
+    pub async fn matters(&self, query: &MatterListQuery) -> ClientResult<MatterListResponse> {
+        let mut params: Vec<(&str, String)> = Vec::new();
+        if let Some(kind) = &query.kind {
+            params.push(("kind", kind.as_str().to_string()));
+        }
+        if query.all {
+            params.push(("all", "true".into()));
+        }
+        if let Some(session) = &query.session {
+            params.push(("session", session.to_string()));
+        }
+        self.get_with("/v1/matters", &params).await
+    }
+
+    pub async fn matter(
+        &self,
+        matter: &MatterId,
+        session: Option<&SessionId>,
+    ) -> ClientResult<MatterDetail> {
+        let params: Vec<(&str, String)> = session
+            .map(|session| ("session", session.to_string()))
+            .into_iter()
+            .collect();
+        self.get_with(&format!("/v1/matters/{matter}"), &params)
+            .await
+    }
+
+    pub async fn matter_add(&self, request: &MatterAddRequest) -> ClientResult<MatterDetail> {
+        self.post("/v1/matters", request).await
+    }
+
+    pub async fn matter_act(
+        &self,
+        matter: &MatterId,
+        verb: MatterVerb,
+        request: &MatterActionRequest,
+    ) -> ClientResult<MatterDetail> {
+        self.post(&format!("/v1/matters/{matter}/{verb}"), request)
+            .await
     }
 
     // ---- /v1/models、/v1/config ----

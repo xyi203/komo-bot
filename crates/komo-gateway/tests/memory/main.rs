@@ -33,6 +33,7 @@ mod extraction;
 mod governance;
 mod index;
 mod inspect;
+mod matters;
 mod recall;
 mod session_search;
 mod startup;

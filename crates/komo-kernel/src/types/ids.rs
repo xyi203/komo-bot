@@ -111,6 +111,10 @@ id_type!(
     MemoryId
 );
 id_type!(
+    /// 一个目标或领域（`docs/goals.md` §3）；内容版本另见 `revision`。
+    MatterId
+);
+id_type!(
     /// 一次操作（计划的 `operation_id`，§7.2）。
     OperationId
 );

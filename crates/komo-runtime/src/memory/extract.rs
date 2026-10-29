@@ -34,7 +34,7 @@ use super::consolidate::{RawVerdict, Verdict, map_verdicts};
 pub const PROMPT_VERSION: &str = "memory-extract/v9";
 
 /// 一条记忆正文的上限。再长就不是"简短、尽量单一的陈述"了（§9.2）。
-pub(super) const MAX_CONTENT_CHARS: usize = 300;
+pub(crate) const MAX_CONTENT_CHARS: usize = 300;
 /// 会话窗口里每次工具调用的参数最多留几个字符——够看出读的是哪个文件、跑的是哪条命令。
 const MAX_CALL_ARGUMENT_CHARS: usize = 200;
 /// 交给记忆模型的会话窗口上限（字符）。
@@ -807,7 +807,7 @@ fn parse_time(raw: &str) -> Option<OffsetDateTime> {
 }
 
 /// 粗筛"看起来像凭证"的正文。宁可丢掉一条记忆，也不把一把密钥存成长期事实（§9.3）。
-pub(super) fn looks_like_secret(text: &str) -> bool {
+pub(crate) fn looks_like_secret(text: &str) -> bool {
     let lower = text.to_lowercase();
     const MARKERS: [&str; 6] = [
         "sk-",

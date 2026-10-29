@@ -162,3 +162,26 @@ codemode 脚本里的嵌套调用经宿主执行。宿主判到"无人值守且�
 出卡、投到 home、422、批准后只执行一次、拒绝后模型拿到说明、用户发起的 Run 不出卡）。`cargo test --workspace
 --no-fail-fast`：2506 通过、0 失败、12 忽略（最后修的两个 kernel 结论测试单独重跑通过）。结论词不收 `yes` / `no`
 别名：那是删掉的审批的写法，确认卡要写全 `approve` / `reject`。
+
+## 11. 真实实例验收（2026-10-29，本机 Gateway，`f3d51c86` 的 release 二进制）
+
+本机配置给 `devops-mcp-prod`（提单、流转、审批、Apollo 变更与重启、变量与白名单申请）和 `cloudflare`（`execute`）
+写了 `outward`，留着。验收借一个无害的只读工具 `prometheus-saas-dev-cluster` 的 `health_check` 临时声明为对外，
+用 `komo cron run` 手动触发 Cron Job，验完删掉临时声明与 Job。`home_chat` 没配，卡只在 `komo intervention list`
+里（`config check` 对三台服务器各报一条 warn，如预期）。
+
+- **批准**：Run 7084 停在 `confirm`，清单出现句柄 7092（`待确认`，可答 `approve / reject`），`show` 印出调用、参数
+  与截止时刻；`komo intervention answer 7092 approve` 后工具只执行一次，结果回到 Run，模型据此作答。
+- **拒绝**：Run 7099 的卡答 `reject`，工具没执行，模型拿到"操作者拒绝了这次 … 调用，没有执行"并照实报告。
+- **有人值守**：HTTP 会话里同一句话（Run 7115）直接执行，不出卡。
+- **codemode 里的拒绝生效，但暴露了一个缺口**（Run 7056）：工具是默认的 `exposure = codemode`，模型在脚本里调，
+  被拒并提示"请在顶层直接调用"；模型回答"这个工具没有作为顶层工具开放给我"，没有去顶层调，Run 以"没查成"收尾。
+  §7 / D5 依赖的"顶层同名调用照常执行"在权限上成立（`docs/mcp.md` §3），但模型的工具表里没有它的 schema，实际不会
+  去调。所以**对 codemode 暴露的对外工具，无人值守的 Run 现在是"永远不执行"而不是"等确认"**——安全的一侧，但不是
+  本规格要的行为。临时改成 `tool_exposure = { health_check = "direct" }` 后上面三条才走通。怎么补待定（见下）。
+
+待定：codemode 暴露的对外工具在无人值守的 Run 里怎么出卡。候选：
+1. 无人值守的 Run 里把 codemode 暴露的对外工具直接声明给模型（只多出对外的那几个 schema；Cron 与任务会话整条都是
+   无人值守，前缀缓存不受影响，对话会话里的 monitor / 任务回报那一轮会换一次工具表）；
+2. 让操作者把对外工具写成 `tool_exposure = "direct"`（不改代码，但每次请求都带这些 schema）；
+3. 脚本里的对外调用不拒，改成发卡、脚本拿到"已发卡、批准后后台执行"，结果像任务回报那样回到会话（改动最大）。

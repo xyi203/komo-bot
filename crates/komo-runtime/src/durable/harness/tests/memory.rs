@@ -124,6 +124,7 @@ async fn bash_input_run_finds_user_evidence_without_changing_output_paths() {
             request_key: None,
             application: None,
             applies_when: None,
+            belongs_to: None,
         };
         let (item, created) = memory.add(&request).await.unwrap();
         assert!(created);

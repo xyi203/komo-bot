@@ -43,7 +43,7 @@ pub use matter::*;
 use super::config::{ConfigIssue, KeyPath, SourceFile};
 use crate::cron::{CronFiring, CronJob, JobStatus, NotifyPolicy, OverlapPolicy};
 use crate::types::chat::PeerId;
-use crate::types::ids::{CronJobId, MemoryId, RequestKey, RunId, Seq, SessionId};
+use crate::types::ids::{CronJobId, MatterId, MemoryId, RequestKey, RunId, Seq, SessionId};
 use crate::types::memory::{
     MemoryApplication, MemoryItem, MemoryKind, MemoryScope, MemoryState, RetrievalMode,
 };
@@ -313,12 +313,12 @@ pub struct SubmitRunRequest {
     /// `text` 是一条 shell 命令，**不经模型直接跑**（TUI 的 `!`）。命令照样走 `bash`
     /// 工具与执行器，调用与结果记进会话，下一轮模型看得见。只有 HTTP 这一个入口——聊天
     /// 渠道没有，拿到 bot 对话权限不等于拿到这台机器的 shell。
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[serde(default, skip_serializing_if = "is_false")]
     pub shell: bool,
     /// **插话**（§6）：会话里有 Run 正在跑时，这句话不排到它后面，而是由它在下一次请求
     /// 模型之前并进去。TUI 发；没轮上（那条 Run 已经在给最终回答、停在等待上、模型不同）
     /// 就照常排队。
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[serde(default, skip_serializing_if = "is_false")]
     pub interject: bool,
 }
 
@@ -800,6 +800,10 @@ pub struct CronDeleteResponse {
 
 // ---- /v1/memories ----
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemoryListQuery {
     /// **query string 里是一行文本**（`personal` / `project:<id>` / `environment:<id>` / `agent:<id>`），
@@ -822,6 +826,9 @@ pub struct MemoryListQuery {
     pub mode: Option<RetrievalMode>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<u32>,
+    /// 带上已归档的（`docs/goals.md` §6）。默认不带；`state = archived` 明确问时不受它限制。
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub include_archived: bool,
     /// 在 Run 里跑的 CLI 带上自己的会话（`KOMO_SESSION`）：Gateway 按这个会话的 Profile 放行
     /// 作用域，与自动召回同一处判断（§9.4「Agent 主动查」）；`memory = off` 的会话被拒。
     /// 不带 = 操作者终端，不按会话限制。
@@ -898,6 +905,9 @@ pub struct MemoryAddRequest {
     pub application: Option<MemoryApplication>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub applies_when: Option<String>,
+    /// 为哪件事记的（`komo memory add --for`）：事项必须存在且未结案。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub belongs_to: Option<MatterId>,
 }
 
 /// `POST /v1/memories/{id}/classify`：操作者给指定 revision 定使用方式与条件（§9.3
@@ -905,10 +915,23 @@ pub struct MemoryAddRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemoryClassifyRequest {
     pub expected_revision: u32,
-    pub application: MemoryApplication,
+    /// 省略 = 沿用现有使用方式（只改归属时不给）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub application: Option<MemoryApplication>,
     /// 省略 = 沿用现有条件。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub applies_when: Option<String>,
+    /// 改挂到这件事项（`classify --for <id>`）：必须存在且未结案。与 `clear_belongs_to` 互斥；
+    /// 两者都不给 = 不动归属。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub belongs_to: Option<MatterId>,
+    /// 清空归属（`classify --for none`）。
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub clear_belongs_to: bool,
+    /// 在 Run 里跑的 CLI 带上自己的会话：改归属要过 `memory = private / off` 的闸
+    /// （`docs/goals.md` §2）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<SessionId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_key: Option<RequestKey>,
 }

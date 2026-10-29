@@ -528,8 +528,8 @@ pub fn memory_list(response: &MemoryListResponse) -> String {
 
 /// `komo memory list --full`：一条一行、制表符分隔、正文不截断，给模型一次读完。
 ///
-/// 列是 `id@版本  状态  来源  确认  用量  使用方式  条件  正文`（没有条件写 `-`，旧条目的使用方式写
-/// `未分类`）；没有表头和对齐空格，正文里的换行与制表符压成空格，
+/// 列是 `id@版本  状态  来源  确认  用量  使用方式  条件  归属  正文`（没有条件、没有归属写 `-`，旧
+/// 条目的使用方式写 `未分类`）；没有表头和对齐空格，正文里的换行与制表符压成空格，
 /// 所以"一行一条"始终成立。
 pub fn memory_list_full(response: &MemoryListResponse) -> String {
     let mut out = degraded_notice(response);
@@ -589,7 +589,7 @@ fn full_line(item: &MemoryItem) -> String {
         .collect::<Vec<_>>()
         .join(" ");
     format!(
-        "{}@{}\t{}\t{}\t{}\t注入 {} 次 · 用上 {} 次\t{}\t{}\t{}",
+        "{}@{}\t{}\t{}\t{}\t注入 {} 次 · 用上 {} 次\t{}\t{}\t{}\t{}",
         item.id,
         item.revision,
         memory_state(item.state),
@@ -599,6 +599,9 @@ fn full_line(item: &MemoryItem) -> String {
         item.usage.adopted_count,
         application_text(item),
         item.applies_when.as_deref().unwrap_or("-"),
+        item.belongs_to
+            .as_ref()
+            .map_or_else(|| "-".to_string(), ToString::to_string),
         content
     )
 }
@@ -654,6 +657,9 @@ pub fn memory_show(item: &MemoryItem) -> String {
             stamp(item.updated_at)
         ),
     ];
+    if let Some(matter) = &item.belongs_to {
+        out.push(format!("归属    {matter}"));
+    }
     if let Some(until) = item.valid_until {
         out.push(format!("有效期  至 {}", stamp(until)));
     }
@@ -728,6 +734,7 @@ fn memory_state(state: MemoryState) -> &'static str {
         MemoryState::Contested => "有冲突",
         MemoryState::Superseded => "被取代",
         MemoryState::Forgotten => "已停用",
+        MemoryState::Archived => "已归档",
     }
 }
 

@@ -24,6 +24,7 @@
 //! ——向量在事务外算好，交给仓储的是一个 [`RecallQuery::query_vector`]。
 
 mod add;
+mod belongs;
 mod consolidate;
 pub mod durable;
 mod extract;
@@ -48,17 +49,19 @@ use komo_kernel::traits::{
     SystemOne,
 };
 use komo_kernel::types::agent::MemoryMode;
-use komo_kernel::types::ids::{MemoryId, RunId, Seq, SessionId};
+use komo_kernel::types::ids::{MatterId, MemoryId, RunId, Seq, SessionId};
+use komo_kernel::types::matter::MatterState;
 use komo_kernel::types::memory::{
     Injection, MemoryItem, MemoryScope, MemoryState, MemoryWork, RecallDiagnostics, RecallQuery,
-    RecallResult, RetrievalMode, scope_allowed,
+    RecallResult, RetrievalMode, clue_is_pushed, scope_allowed,
 };
 use komo_kernel::types::model::{EmbeddingSpace, InputKind, ModelConfig, Vector};
 use komo_kernel::types::turn::{LlmError, MemoryUse};
 use komo_store::repos::memory::{GenerationRecord, IndexCandidate};
 use time::OffsetDateTime;
 
-pub use add::run_user_evidence;
+pub use add::{BelongsChange, run_user_evidence};
+pub use belongs::BelongsOutcome;
 pub use consolidate::{Relation, Verdict};
 pub use extract::Transcript;
 pub use extract::{Observation, PROMPT_VERSION, RawObservation, SaidBy};
@@ -139,6 +142,9 @@ pub trait MemoryCatalog: Send + Sync {
     /// （§9.4「约定不过门槛」）。
     async fn conventions(&self) -> Result<Vec<MemoryItem>, RepoError>;
 
+    /// 归属某件事项的全部条目（任何状态），按创建先后（结案归档与重开恢复，`docs/goals.md` §6）。
+    async fn belonging_to(&self, matter: &MatterId) -> Result<Vec<MemoryItem>, RepoError>;
+
     async fn find_by_content(
         &self,
         scope: &MemoryScope,
@@ -209,6 +215,10 @@ impl MemoryCatalog for komo_store::TursoMemoryRepo {
 
     async fn conventions(&self) -> Result<Vec<MemoryItem>, RepoError> {
         komo_store::TursoMemoryRepo::conventions(self).await
+    }
+
+    async fn belonging_to(&self, matter: &MatterId) -> Result<Vec<MemoryItem>, RepoError> {
+        komo_store::TursoMemoryRepo::belonging_to(self, matter).await
     }
 
     async fn find_by_content(
@@ -539,6 +549,21 @@ impl MemoryManager {
         }
     }
 
+    /// 全部事项（含搁置与已结案的），按分层判归属用（[`clue_is_pushed`]）。读不出来当作没有，
+    /// 同 [`Self::open_matters`]。
+    async fn all_matters(&self) -> Vec<komo_kernel::types::matter::Matter> {
+        let Some(matters) = &self.matters else {
+            return Vec::new();
+        };
+        match matters.list(None, true).await {
+            Ok(list) => list,
+            Err(error) => {
+                tracing::warn!(%error, "事项这一次没读成，按归属分层时当作没有");
+                Vec::new()
+            }
+        }
+    }
+
     /// 当前这一份。**取出就放锁**：下面的召回与模型请求都要 await。
     fn live(&self) -> Live {
         self.live.read().expect("记忆配置槽").clone()
@@ -817,6 +842,14 @@ impl MemoryManager {
         } else {
             Vec::new()
         };
+        let retrieval = self.retrieval();
+        // 按归属分层（§9.4）：线索归属一件搁置的事、或没有归属而 `push_unattached` 关着时不推。
+        // 这些条目不占 `top_k` 的名额，所以有可能被筛掉时要多取，筛完再截。
+        let matters = self.all_matters().await;
+        let layering = !retrieval.push_unattached
+            || matters
+                .iter()
+                .any(|matter| matter.state == MatterState::Parked);
         let mut items = self.revalidate(carried, now).await;
         // 带过来的旧注入也要落在**现在**放行的作用域里：模式或作用域改过、或者那一条本来
         // 就不该被这个 Agent 看见（别的 Agent 的私有记忆）的，掉出去重新召回。
@@ -827,7 +860,11 @@ impl MemoryManager {
             let mut query = self.query(text, None);
             query.scopes = scopes.to_vec();
             // 约定不占 `top_k`：它们若也排进了名单，之后要被去掉，多取几条把名额补回来。
-            query.top_k = (query.top_k + conventions.len() as u32).min(query.candidate_limit);
+            query.top_k = if layering {
+                query.candidate_limit
+            } else {
+                (query.top_k + conventions.len() as u32).min(query.candidate_limit)
+            };
             diagnostics.mode = Some(query.mode);
             match self.search(query).await {
                 Ok(result) => {
@@ -862,7 +899,6 @@ impl MemoryManager {
                 .iter()
                 .any(|use_| use_.memory == item.id && use_.revision == item.revision)
         };
-        let retrieval = self.retrieval();
         let mut resident = stale::mark_missing_paths(conventions.clone(), home.as_deref());
         resident.retain(unshown);
         // 先单独渲染一遍常驻约定，看预算放下了哪几条：没放下的约定回到门槛那条路（过了门槛
@@ -886,6 +922,14 @@ impl MemoryManager {
         let mut items = stale::mark_missing_paths(items, home.as_deref());
         // 名额只被线索占：约定从召回结果里去掉之后再按 `top_k` 截，已展示的照旧占着名额。
         items.retain(|item| !exempt.contains(&&item.id));
+        items.retain(|item| {
+            item.is_convention()
+                || clue_is_pushed(
+                    item.belongs_to.as_ref(),
+                    &matters,
+                    retrieval.push_unattached,
+                )
+        });
         items.truncate(retrieval.top_k as usize);
         items.retain(unshown);
         let mut injection = (self.render)(
@@ -1372,7 +1416,15 @@ impl MemoryManager {
                             injected.push(item);
                         }
                     }
-                    let raw = pass.extract(&transcript, &candidates, &injected).await?;
+                    // 事项表：操作者本人的清单，私有记忆的批次（给别人用的 Agent）看不到。
+                    let matters = if confined.is_some() {
+                        Vec::new()
+                    } else {
+                        self.open_matters().await
+                    };
+                    let raw = pass
+                        .extract(&transcript, &candidates, &injected, &matters)
+                        .await?;
                     record.observations += raw.observations.len();
                     let adopted = transcript.validate_used(raw.used, &injected);
                     let observations = transcript.validate(
@@ -1380,6 +1432,7 @@ impl MemoryManager {
                         live.max_observations,
                         &live.model,
                         &candidates,
+                        &matters,
                         self.clock.now(),
                     );
                     if observations.is_empty() {

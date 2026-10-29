@@ -597,6 +597,9 @@ impl KomoClient {
         if let Some(limit) = query.limit {
             params.push(("limit", limit.to_string()));
         }
+        if query.include_archived {
+            params.push(("include_archived", "true".into()));
+        }
         if let Some(session) = &query.session {
             params.push(("session", session.to_string()));
         }

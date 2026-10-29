@@ -119,16 +119,18 @@ area:  active → retired →（reopen）active
 - 不带的会话：`memory = off`、`memory = private`、fork 沿用父的块（同约定）。
 - 召回块的 entry 结构、`data.uses` 不变，事项与记忆的 `id@revision` 共用一个去重集合（两种 id 不会撞）。
 
-## 6. 记忆归属与结案归档（P1c）
+## 6. 记忆归属与结案归档（P1c，已实现）
 
-规格在 `memory.md`：§9.2 归属字段 `belongs_to`、`archived` 状态，§9.4 注入分层与 `push_unattached`，§9.6 结案时线索归档、约定问一次。这里只列与事项相接的两处：
+规格在 `memory.md`：§9.2 归属字段 `belongs_to`、`archived` 状态，§9.4 注入分层与 `push_unattached`，§9.6 结案时线索归档、约定问一次（实现记录与偏离也在 §9.6：归档紧跟在事项写之后、不同一个事务）。这里只列与事项相接的两处：
 
-- `komo goal done/drop`、`komo area retire` 返回时带上：转为 `archived` 的线索条数，以及挂在它下面、仍在生效的约定清单（`id@版本 正文 条件`）。Agent 把约定清单转给用户问去向；去向由操作者定（`komo memory classify --for <事项|none>` 或 `forget`），没答之前照常注入。
+- `komo goal done/drop`、`komo area retire` 返回时带上（`MatterDetail.closure`，响应上新增的可选字段）：转为 `archived` 的线索条数，以及挂在它下面、仍在生效的约定清单（`id@版本 正文 条件`）。Agent 把约定清单转给用户问去向；去向由操作者定（`komo memory classify --for <事项|none>` 或 `forget`），没答之前照常注入。
 - `komo goal reopen`、`komo area reopen` 把因它结案而归档的线索恢复成 `active`（只恢复因结案归档的，见 `memory.md` §9.6）。
 
-## 7. 提取（P1d）
+## 7. 提取（P1d，已实现）
 
 提取窗口之外多给一张"进行中的事项"表（同注入组的清单，带编号，规则同 §9.9 的候选编号）。模型对每条新观察可交回一个事项编号作为归属建议；Rust 校验编号在表里，落库时写进 `belongs_to`。不交回 = 无归属。已有记忆的归属不由提取改：那是 `classify`（操作者动作，§9.6）。提示词升版。
+
+提示词 `memory-extract/v10`，事项表编号为 `g0…`（自己的命名空间）；私有记忆的批次不给事项表。
 
 存量：现有记忆归属为空，行为不变（`push_unattached` 默认 `true`）。挂归属走一次性清单：Agent 按事项列出建议，操作者审过后批量 `classify --for`（同 2026-10-28 那次存量分类）。
 

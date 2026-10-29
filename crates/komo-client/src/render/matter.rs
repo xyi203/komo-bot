@@ -57,9 +57,42 @@ pub fn matter_line(matter: &Matter, today: Date) -> String {
     parts.join(" · ")
 }
 
-/// 写命令的回执。
+/// 写命令的回执。结案时多几行：归档了几条线索，以及名下仍在生效的约定——约定不因结案失效，
+/// 由 Agent 转给用户问去向（`docs/goals.md` §6）。
 pub fn matter_changed(detail: &MatterDetail) -> String {
-    matter_line(&detail.matter, detail.today)
+    let mut out = vec![matter_line(&detail.matter, detail.today)];
+    if let Some(closure) = &detail.closure {
+        if closure.restored > 0 {
+            out.push(format!("恢复了 {} 条归档的线索", closure.restored));
+        }
+        if detail.matter.state.is_closed() {
+            out.push(format!(
+                "归档了 {} 条线索（`komo memory list --include-archived` 查得到）",
+                closure.archived
+            ));
+        }
+        if !closure.conventions.is_empty() {
+            out.push(format!(
+                "名下还有 {} 条约定仍在生效，问用户它们去哪：改挂到某个领域或清空 \
+                 `komo memory classify <id> --revision <版本> --for <事项|none>`，或 `komo memory forget`；\
+                 没答之前照常注入",
+                closure.conventions.len()
+            ));
+            for convention in &closure.conventions {
+                let mut line = format!(
+                    "- {}@{} {}",
+                    convention.id,
+                    convention.revision,
+                    flat(&convention.content)
+                );
+                if let Some(when) = &convention.applies_when {
+                    line.push_str(&format!(" · 条件：{}", flat(when)));
+                }
+                out.push(line);
+            }
+        }
+    }
+    out.join("\n")
 }
 
 /// `komo goal show` / `komo area show`。
@@ -207,9 +240,59 @@ mod tests {
         );
     }
 
+    /// 结案回执：先是事项那一行，再是归档条数，最后列出名下仍生效的约定（`id@版本 正文 · 条件`）
+    /// 让 Agent 转给用户问去向；重开只说恢复了几条。
+    #[test]
+    fn a_closing_receipt_reports_the_archive_and_lists_the_conventions() {
+        use komo_kernel::protocol::http::{ClosureConvention, MatterClosure};
+        use komo_kernel::types::ids::MemoryId;
+
+        let mut done = goal("g-1", MatterState::Done);
+        done.closed_at = Some(T0);
+        let receipt = matter_changed(&MatterDetail {
+            matter: done.clone(),
+            today: date!(2026 - 11 - 02),
+            closure: Some(MatterClosure {
+                archived: 3,
+                restored: 0,
+                conventions: vec![ClosureConvention {
+                    id: MemoryId::from_raw("m-9"),
+                    revision: 2,
+                    content: "发布观察先看 5xx".into(),
+                    applies_when: Some("发布观察时".into()),
+                }],
+            }),
+        });
+        let lines: Vec<&str> = receipt.lines().collect();
+        assert!(lines[0].starts_with("g-1@1 done "), "{receipt}");
+        assert!(lines[1].starts_with("归档了 3 条线索"), "{receipt}");
+        assert!(lines[2].contains("名下还有 1 条约定仍在生效"), "{receipt}");
+        assert_eq!(lines[3], "- m-9@2 发布观察先看 5xx · 条件：发布观察时");
+
+        let reopened = matter_changed(&MatterDetail {
+            matter: goal("g-1", MatterState::Active),
+            today: date!(2026 - 11 - 02),
+            closure: Some(MatterClosure {
+                restored: 2,
+                ..MatterClosure::default()
+            }),
+        });
+        assert!(reopened.contains("恢复了 2 条归档的线索"), "{reopened}");
+        assert!(!reopened.contains("归档了"), "{reopened}");
+
+        // 没有 closure（推进类动作）就只有那一行。
+        let plain = matter_changed(&MatterDetail {
+            matter: done,
+            today: date!(2026 - 11 - 02),
+            closure: None,
+        });
+        assert_eq!(plain.lines().count(), 1);
+    }
+
     #[test]
     fn a_matter_detail_shows_every_field_and_the_overdue_mark() {
         let detail = MatterDetail {
+            closure: None,
             matter: goal("g-2", MatterState::Waiting),
             today: date!(2026 - 11 - 02),
         };
@@ -220,6 +303,7 @@ mod tests {
         assert!(shown.contains("截止    2026-11-01"), "{shown}");
         assert!(shown.contains("证据    （无）"), "{shown}");
         let area = matter_show(&MatterDetail {
+            closure: None,
             matter: area(),
             today: date!(2026 - 11 - 02),
         });

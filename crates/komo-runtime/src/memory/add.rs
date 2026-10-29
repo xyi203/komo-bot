@@ -14,7 +14,8 @@ use std::collections::BTreeSet;
 
 use komo_kernel::events::{Event, EventPayload};
 use komo_kernel::protocol::http::MemoryAddRequest;
-use komo_kernel::types::ids::{MemoryId, RunId, SessionId};
+use komo_kernel::traits::RepoError;
+use komo_kernel::types::ids::{MatterId, MemoryId, RunId, SessionId};
 use komo_kernel::types::memory::{
     Confirmation, Evidence, EvidenceRef, ExtractionMetadata, MemoryApplication, MemoryItem,
     MemoryKind, MemoryState, MemoryUsage, Provenance,
@@ -73,7 +74,33 @@ pub(super) fn checked_usage(
     Ok(when.map(str::to_string))
 }
 
+/// `classify` 对归属的处理：`--for <id>` / `--for none` / 没给。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BelongsChange {
+    Keep,
+    Clear,
+    Set(MatterId),
+}
+
 impl MemoryManager {
+    /// 归属只能指向存在且未结案的事项：结案的那件事名下的线索会被归档，再往上挂就是造出一条
+    /// 还没来得及归档的（`docs/goals.md` §6）；要挂先 `reopen`。
+    async fn open_matter(&self, id: &MatterId) -> Result<(), MemoryError> {
+        let Some(matters) = &self.matters else {
+            return Err(MemoryError::Invalid(
+                "这台 Gateway 没接目标与领域，没有事项可挂".into(),
+            ));
+        };
+        match matters.get(id).await? {
+            None => Err(MemoryError::Invalid(format!("没有事项 {id}"))),
+            Some(matter) if matter.state.is_closed() => Err(MemoryError::Invalid(format!(
+                "事项 {id} 已经{}：先 reopen 再挂，或不挂归属",
+                matter.state
+            ))),
+            Some(_) => Ok(()),
+        }
+    }
+
     /// 手动记一条。返回记下的那条，以及它是不是新建的（`false` = 库里已有逐字相同的
     /// 一条，这次只补了证据或确认）。
     pub async fn add(&self, request: &MemoryAddRequest) -> Result<(MemoryItem, bool), MemoryError> {
@@ -103,6 +130,10 @@ impl MemoryManager {
             request.application,
             request.applies_when.as_deref(),
         )?;
+
+        if let Some(matter) = &request.belongs_to {
+            self.open_matter(matter).await?;
+        }
 
         let now = self.clock.now();
         let (evidence, confirmation) = match (&request.session, &request.run) {
@@ -134,13 +165,29 @@ impl MemoryManager {
                 }
                 // 已经被取代的旧答案：用户又说了一遍，算一条新的主张。
                 MemoryState::Superseded => {}
-                MemoryState::Active | MemoryState::Candidate | MemoryState::Contested => {
+                // 随事项结案归档的：用户又说了一遍，要么这次给了新的归属（挂回活的事），要么
+                // 该先把事项重开——不悄悄让它回到无归属的推送里。
+                MemoryState::Archived if request.belongs_to.is_none() => {
+                    return Err(MemoryError::Invalid(format!(
+                        "这一条随事项结案归档了（{}@{}）：要用它，reopen 那件事，或 \
+                         `komo memory classify {} --for <事项>`",
+                        existing.id, existing.revision, existing.id
+                    )));
+                }
+                MemoryState::Active
+                | MemoryState::Candidate
+                | MemoryState::Contested
+                | MemoryState::Archived => {
                     let item = self
                         .reinforce(
                             existing,
                             evidence,
                             confirmation,
-                            (request.application, applies_when),
+                            (
+                                request.application,
+                                applies_when,
+                                request.belongs_to.clone(),
+                            ),
                             now,
                         )
                         .await?;
@@ -169,6 +216,7 @@ impl MemoryManager {
             superseded_by: None,
             application: Some(request.application.unwrap_or(MemoryApplication::Reference)),
             applies_when,
+            belongs_to: request.belongs_to.clone(),
         };
         Ok((self.repo.put(item, None).await?, true))
     }
@@ -178,13 +226,18 @@ impl MemoryManager {
     ///
     /// 这次带的使用方式或条件与它不同时升一版改过来（§9.3）；没带 `--application` 就
     /// 不动它的分类——省略只代表"新建时记成 reference"，不能让一次普通的重复 add 把已有
-    /// 的约定降级。
+    /// 的约定降级。归属同理：没带 `--for` 不动它；带了且不同就改过来、升一版（归档的随之回到
+    /// active，用户已经把它挂回一件活的事）。
     async fn reinforce(
         &self,
         existing: MemoryItem,
         evidence: Vec<Evidence>,
         confirmation: Confirmation,
-        (application, applies_when): (Option<MemoryApplication>, Option<String>),
+        (application, applies_when, belongs_to): (
+            Option<MemoryApplication>,
+            Option<String>,
+            Option<MatterId>,
+        ),
         now: OffsetDateTime,
     ) -> Result<MemoryItem, MemoryError> {
         let mut merged = existing.clone();
@@ -192,13 +245,20 @@ impl MemoryManager {
         let new_when = applies_when
             .clone()
             .or_else(|| existing.applies_when.clone());
+        let rehomed = belongs_to.is_some() && belongs_to != existing.belongs_to;
         let reclassified = (application.is_some() && application != existing.application)
             || (applies_when.is_some() && applies_when != existing.applies_when);
-        if reclassified {
+        if reclassified || rehomed {
             // 沿用的条件也要过 convention 的规则：已有条目没条件、这次只改成 convention 时拒绝。
             checked_usage(existing.kind, new_application, new_when.as_deref())?;
             merged.application = new_application;
             merged.applies_when = new_when;
+            if rehomed {
+                merged.belongs_to = belongs_to;
+                if merged.state == MemoryState::Archived {
+                    merged.state = MemoryState::Active;
+                }
+            }
             merged.revision = existing.revision + 1;
         }
         for evidence in evidence {
@@ -229,31 +289,41 @@ impl MemoryManager {
         Ok(item)
     }
 
-    /// 操作者给指定 revision 定使用方式与条件（§9.3「存量分类」）。
+    /// 操作者给指定 revision 定使用方式、条件与归属（§9.3「存量分类」、`docs/goals.md` §6）。
     ///
-    /// 写成新 revision，证据与确认原样保留（"改 application 或 applies_when 是内容语义变化"，
-    /// §9.2，所以旧注入的引用随版本失效）；规则同 `add`。与 confirm 同属操作者动作，
-    /// Agent 不替用户执行——那一条靠系统提示，不是硬边界（§9.6）。`applies_when` 省略 =
-    /// 沿用现有条件。分类没变时不升版。
+    /// 写成新 revision，证据与确认原样保留（"改 application、applies_when 或归属是内容语义
+    /// 变化"，§9.2，所以旧注入的引用随版本失效）；规则同 `add`。与 confirm 同属操作者动作，
+    /// Agent 不替用户执行——那一条靠系统提示，不是硬边界（§9.6）。`application` 省略 = 沿用现
+    /// 有分类（只改归属时），`applies_when` 省略 = 沿用现有条件，`belongs` 为 `Keep` = 不动归属。
+    /// 什么都没变时不升版。
+    ///
+    /// 随事项结案归档的条目只有改挂到一件进行中的事、或清空归属时才回到 active：那是操作者
+    /// 在说"它还有用"；单改分类不改变它是归档的这件事。
     pub async fn classify(
         &self,
         id: &MemoryId,
         expected_revision: u32,
-        application: MemoryApplication,
+        application: Option<MemoryApplication>,
         applies_when: Option<&str>,
+        belongs: BelongsChange,
     ) -> Result<MemoryItem, MemoryError> {
         if !self.enabled() {
             return Err(MemoryError::Disabled);
         }
-        let existing =
-            self.repo
-                .get(id)
-                .await?
-                .ok_or_else(|| komo_kernel::traits::RepoError::NotFound {
-                    what: format!("记忆 {id}"),
-                })?;
+        if application.is_none() && applies_when.is_none() && belongs == BelongsChange::Keep {
+            return Err(MemoryError::Invalid(
+                "classify 要给 application / applies_when / 归属（--for）里的至少一个".into(),
+            ));
+        }
+        let existing = self
+            .repo
+            .get(id)
+            .await?
+            .ok_or_else(|| RepoError::NotFound {
+                what: format!("记忆 {id}"),
+            })?;
         if existing.revision != expected_revision {
-            return Err(komo_kernel::traits::RepoError::VersionConflict {
+            return Err(RepoError::VersionConflict {
                 expected: expected_revision,
                 actual: existing.revision,
             }
@@ -268,16 +338,32 @@ impl MemoryManager {
                 existing.state
             )));
         }
+        if let BelongsChange::Set(matter) = &belongs {
+            self.open_matter(matter).await?;
+        }
         // 省略的条件沿用现有的；两者合起来要满足 convention 的规则。
         let when = checked_usage(existing.kind, None, applies_when)?
             .or_else(|| existing.applies_when.clone());
-        checked_usage(existing.kind, Some(application), when.as_deref())?;
-        if existing.application == Some(application) && existing.applies_when == when {
+        let next_application = application.or(existing.application);
+        checked_usage(existing.kind, next_application, when.as_deref())?;
+        let next_belongs = match &belongs {
+            BelongsChange::Keep => existing.belongs_to.clone(),
+            BelongsChange::Clear => None,
+            BelongsChange::Set(matter) => Some(matter.clone()),
+        };
+        if existing.application == next_application
+            && existing.applies_when == when
+            && existing.belongs_to == next_belongs
+        {
             return Ok(existing);
         }
         let mut next = existing.clone();
-        next.application = Some(application);
+        next.application = next_application;
         next.applies_when = when;
+        if existing.state == MemoryState::Archived && belongs != BelongsChange::Keep {
+            next.state = MemoryState::Active;
+        }
+        next.belongs_to = next_belongs;
         next.revision = existing.revision + 1;
         next.updated_at = self.clock.now();
         Ok(self.repo.put(next, Some(existing.revision)).await?)

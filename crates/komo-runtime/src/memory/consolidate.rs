@@ -424,6 +424,8 @@ impl<'a> Consolidator<'a> {
             superseded_by: None,
             application: observation.application,
             applies_when: observation.applies_when.clone(),
+            // 只有新建的条目带提取的归属建议；已有条目走 merge，不改它们的归属（`docs/goals.md` §7）。
+            belongs_to: observation.belongs_to.clone(),
         };
         Ok(self.manager.repo.put(item, None).await?)
     }

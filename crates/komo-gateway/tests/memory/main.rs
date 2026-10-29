@@ -29,6 +29,7 @@
 
 mod harness;
 
+mod belongs;
 mod extraction;
 mod governance;
 mod index;
@@ -121,6 +122,7 @@ fn scoped_with(
         superseded_by: None,
         application: None,
         applies_when: None,
+        belongs_to: None,
     }
 }
 

@@ -292,9 +292,12 @@ enum MemoryCommand {
         /// 只看这个作用域：personal / project:<id> / environment:<id> / agent:<id>。
         #[arg(long)]
         scope: Option<String>,
-        /// 只看这个状态：candidate / active / contested / superseded / forgotten。
+        /// 只看这个状态：candidate / active / contested / superseded / forgotten / archived。
         #[arg(long)]
         state: Option<String>,
+        /// 带上随事项结案归档的条目（默认不列；`--state archived` 明确问时不受限）。
+        #[arg(long)]
+        include_archived: bool,
         /// 最多列多少条。
         #[arg(long)]
         limit: Option<u32>,
@@ -315,6 +318,9 @@ enum MemoryCommand {
         /// 只看这个状态。**明确写出来才查得到 contested**（§9.6）。
         #[arg(long)]
         state: Option<String>,
+        /// 把随事项结案归档的条目也查出来（默认不带）。
+        #[arg(long)]
+        include_archived: bool,
         #[arg(long)]
         limit: Option<u32>,
     },
@@ -341,20 +347,28 @@ enum MemoryCommand {
         /// 约定适用的条件，一句能独立理解的话，如「创建发布工单、需要选 Platform 时」。
         #[arg(long)]
         applies_when: Option<String>,
+        /// 为哪件事记的：目标或领域的 ID（`komo goal list` / `komo area list`）；必须存在且未结案。
+        #[arg(long = "for")]
+        belongs_to: Option<String>,
     },
-    /// 操作者给指定 revision 定使用方式（约定 / 线索）与条件，写成新 revision；证据与确认不变。
+    /// 操作者给指定 revision 定使用方式（约定 / 线索）、条件与归属，写成新 revision；证据与确认不变。
     Classify {
         /// 记忆 ID。
         memory_id: String,
         /// 预期 revision。
         #[arg(long)]
         revision: u32,
-        /// 使用方式：convention / reference。convention 只给 preference，且要有条件。
+        /// 使用方式：convention / reference。convention 只给 preference，且要有条件；
+        /// 省略 = 沿用现有分类（只改归属时）。
         #[arg(long)]
-        application: String,
+        application: Option<String>,
         /// 条件；省略 = 沿用现有条件。
         #[arg(long)]
         applies_when: Option<String>,
+        /// 改挂到这件事项（ID，必须存在且未结案），或 `none` 清空归属。归档的条目改挂到进行中
+        /// 的事或清空归属后回到生效。
+        #[arg(long = "for")]
+        belongs_to: Option<String>,
     },
     /// 操作者确认指定 revision。
     Confirm {
@@ -730,6 +744,7 @@ async fn operator(
             MemoryCommand::List {
                 scope,
                 state,
+                include_archived,
                 limit,
                 full,
             } => {
@@ -740,6 +755,7 @@ async fn operator(
                         mode: None,
                         scope,
                         state,
+                        include_archived,
                         limit,
                         full,
                         search: false,
@@ -752,6 +768,7 @@ async fn operator(
                 mode,
                 scope,
                 state,
+                include_archived,
                 limit,
             } => {
                 commands::memory_list(
@@ -761,6 +778,7 @@ async fn operator(
                         mode,
                         scope,
                         state,
+                        include_archived,
                         limit,
                         full: false,
                         search: true,
@@ -775,6 +793,7 @@ async fn operator(
                 scope,
                 application,
                 applies_when,
+                belongs_to,
             } => {
                 commands::memory_add(
                     client,
@@ -783,6 +802,7 @@ async fn operator(
                     &scope,
                     application.as_deref(),
                     applies_when.as_deref(),
+                    belongs_to.as_deref(),
                 )
                 .await
             }
@@ -791,13 +811,15 @@ async fn operator(
                 revision,
                 application,
                 applies_when,
+                belongs_to,
             } => {
                 commands::memory_classify(
                     client,
                     &memory_id,
                     revision,
-                    &application,
+                    application.as_deref(),
                     applies_when.as_deref(),
+                    belongs_to.as_deref(),
                 )
                 .await
             }
@@ -1148,6 +1170,50 @@ mod tests {
             Cli::parse_from(["komo", "init"]).command,
             Some(Command::Init)
         ));
+    }
+
+    /// `komo memory add --for` / `classify --for`（`--application` 可省）、`list` / `search` 的
+    /// `--include-archived`（docs/goals.md §6）。
+    #[test]
+    fn memory_commands_parse_the_matter_flags() {
+        for args in [
+            &["memory", "add", "一条线索", "--for", "g-1"][..],
+            &[
+                "memory",
+                "classify",
+                "m-1",
+                "--revision",
+                "1",
+                "--for",
+                "g-1",
+            ],
+            &[
+                "memory",
+                "classify",
+                "m-1",
+                "--revision",
+                "1",
+                "--for",
+                "none",
+            ],
+            &[
+                "memory",
+                "classify",
+                "m-1",
+                "--revision",
+                "1",
+                "--application",
+                "reference",
+                "--for",
+                "a-1",
+            ],
+            &["memory", "list", "--include-archived", "--full"],
+            &["memory", "search", "发布", "--include-archived"],
+            &["memory", "list", "--state", "archived"],
+        ] {
+            let argv = std::iter::once("komo").chain(args.iter().copied());
+            assert!(Cli::try_parse_from(argv).is_ok(), "{args:?}");
+        }
     }
 
     /// `komo goal` / `komo area`（docs/goals.md §4）：每个动词都解析得出，`--due` 与

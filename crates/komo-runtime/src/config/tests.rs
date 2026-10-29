@@ -201,6 +201,23 @@ fn an_omitted_memory_model_inherits_the_whole_main_model_including_effort() {
     assert_eq!(loaded.snapshot.memory.model, loaded.snapshot.model);
 }
 
+/// §9.4「按"现在要不要用"分层」：`[memory.retrieval] push_unattached` 默认 `true`，写 `false`
+/// 读得出来。
+#[test]
+fn push_unattached_defaults_to_true_and_is_read_from_config() {
+    let fixture = Fixture::valid();
+    let loaded = load_config(&fixture.options()).unwrap();
+    assert!(loaded.snapshot.memory.retrieval.push_unattached);
+
+    let text = Fixture::config_text("chat-a", "medium");
+    write(
+        &fixture.sources().config,
+        &format!("{text}\n[memory.retrieval]\npush_unattached = false\n"),
+    );
+    let loaded = load_config(&fixture.options()).unwrap();
+    assert!(!loaded.snapshot.memory.retrieval.push_unattached);
+}
+
 /// §9.10：`[memory]` 的提取节奏有默认值，也读得出 `extract_idle` / `max_observations`；
 /// 写成 0 或看不懂的单位，要么校验报键名，要么加载失败。
 #[test]

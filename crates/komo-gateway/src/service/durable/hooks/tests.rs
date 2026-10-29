@@ -460,6 +460,7 @@ fn seeded_memory(id: &str, content: &str) -> MemoryItem {
         superseded_by: None,
         application: None,
         applies_when: None,
+        belongs_to: None,
     }
 }
 

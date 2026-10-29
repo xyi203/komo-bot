@@ -19,8 +19,8 @@ use komo_kernel::protocol::http::{
     MemorySweepRequest, MemorySweepResponse, RebuildIndexRequest, RebuildIndexResponse,
 };
 use komo_kernel::types::ids::{MemoryId, SessionId};
-use komo_kernel::types::memory::{MemoryScope, scope_allowed};
-use komo_runtime::memory::MemoryError;
+use komo_kernel::types::memory::{MemoryScope, MemoryState, scope_allowed};
+use komo_runtime::memory::{BelongsChange, MemoryError};
 
 use super::Api;
 use super::error::{ApiFailure, ApiResult};
@@ -52,15 +52,23 @@ pub async fn list(
 
     if text.trim().is_empty() {
         // 库存清单。这条路不碰 embedding，所以没配向量模型也列得出来。
+        let limit = query.limit.map(|n| n as usize).unwrap_or(LIST_LIMIT);
+        // 已归档的默认不列（`docs/goals.md` §6）；明确问 `state = archived` 或带
+        // `include_archived` 才有。要先筛再截，否则归档的占着名额、列出来的比 limit 少。
+        let hide_archived = !query.include_archived && query.state.is_none();
         let mut items = memories
             .catalog()
             .list(
                 query.scope.clone(),
                 query.state,
-                query.limit.map(|n| n as usize).unwrap_or(LIST_LIMIT),
+                if hide_archived { usize::MAX } else { limit },
             )
             .await
             .map_err(ApiFailure::from)?;
+        if hide_archived {
+            items.retain(|item| item.state != MemoryState::Archived);
+            items.truncate(limit);
+        }
         if let Some(allowed) = &allowed {
             items.retain(|item| scope_allowed(allowed, &item.scope));
         }
@@ -86,6 +94,9 @@ pub async fn list(
     // 明确指定状态 = 明确 search：`contested` 暂停自动召回，但用户要查得到（§9.6）。
     if let Some(state) = query.state {
         recall.include_states = vec![state];
+    } else if query.include_archived {
+        // 默认的检索只给 active；归档的是另一个状态，要明说才带上。
+        recall.include_states = vec![MemoryState::Active, MemoryState::Archived];
     }
 
     let result = memories.search(recall).await.map_err(memory_failure)?;
@@ -179,6 +190,13 @@ pub async fn add(
             "会话 {session} 是后台任务：任务正文不是用户原话，不能替用户记；把要记的交回主会话"
         )));
     }
+    // 归属指向的是操作者本人的事项：给别人用的 Agent（memory = private / off）的会话不能挂
+    // （`docs/goals.md` §2，同事项接口的闸）。
+    if request.belongs_to.is_some()
+        && let Some(session) = &request.session
+    {
+        super::matters::gate(&api, session).await?;
+    }
     let (memory, created) = api
         .state
         .memories
@@ -212,6 +230,21 @@ pub async fn classify(
     {
         return Ok(Json(previous));
     }
+    let belongs = match (&request.belongs_to, request.clear_belongs_to) {
+        (Some(_), true) => {
+            return Err(ApiFailure::invalid(
+                "belongs_to 与 clear_belongs_to 只能给一个：`--for` 要么是事项 ID，要么是 none",
+            ));
+        }
+        (Some(matter), false) => BelongsChange::Set(matter.clone()),
+        (None, true) => BelongsChange::Clear,
+        (None, false) => BelongsChange::Keep,
+    };
+    if belongs != BelongsChange::Keep
+        && let Some(session) = &request.session
+    {
+        super::matters::gate(&api, session).await?;
+    }
     let item = api
         .state
         .memories
@@ -220,6 +253,7 @@ pub async fn classify(
             request.expected_revision,
             request.application,
             request.applies_when.as_deref(),
+            belongs,
         )
         .await
         .map_err(memory_failure)?;

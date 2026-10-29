@@ -37,6 +37,8 @@ use super::*;
 
 const NOW: OffsetDateTime = datetime!(2026-09-17 08:00:00 UTC);
 
+mod belongs;
+
 // ---------------------------------------------------------------- 替身
 
 #[derive(Debug, Clone, Copy)]
@@ -278,6 +280,7 @@ fn memory_config(enabled: bool, mode: RetrievalMode) -> MemoryConfig {
             rerank_shortlist: 20,
             min_similarity: 0.0,
             min_keyword_score: 0.0,
+            push_unattached: true,
         },
         consolidate: Default::default(),
         extract_idle_secs: 600,
@@ -605,6 +608,7 @@ async fn a_paraphrase_still_recalls_the_same_preference_and_keeps_its_provenance
                 superseded_by: None,
                 application: None,
                 applies_when: None,
+                belongs_to: None,
             },
             None,
         )
@@ -1345,7 +1349,7 @@ fn an_observation_that_cites_only_the_assistant_is_dropped() {
     )
     .unwrap();
 
-    let observations = transcript.validate(raw, 8, &model("memory-model", None), &[], NOW);
+    let observations = transcript.validate(raw, 8, &model("memory-model", None), &[], &[], NOW);
     assert_eq!(observations.len(), 1, "只有引得出真实用户消息的那一条留下");
     assert_eq!(observations[0].content, "空调设 26 度");
     assert_eq!(observations[0].provenance, Provenance::UserStatement);
@@ -1369,7 +1373,7 @@ fn a_claim_of_user_speech_without_a_user_event_is_demoted_to_an_inference() {
     )
     .unwrap();
 
-    let observations = transcript.validate(raw, 8, &model("memory-model", None), &[], NOW);
+    let observations = transcript.validate(raw, 8, &model("memory-model", None), &[], &[], NOW);
     assert_eq!(observations.len(), 2);
     assert_eq!(
         observations[0].provenance,
@@ -1434,7 +1438,7 @@ fn a_batch_yields_at_most_the_configured_observations() {
         })
         .collect();
 
-    let observations = transcript.validate(raw, 5, &model("memory-model", None), &[], NOW);
+    let observations = transcript.validate(raw, 5, &model("memory-model", None), &[], &[], NOW);
     assert_eq!(observations.len(), 5);
     assert_eq!(observations[4].content, "偏好 4", "按模型给的顺序留前面的");
 }
@@ -1453,7 +1457,7 @@ fn a_failed_run_yields_no_experience() {
     )
     .unwrap();
 
-    let failed = transcript.validate(raw, 8, &model("memory-model", None), &[], NOW);
+    let failed = transcript.validate(raw, 8, &model("memory-model", None), &[], &[], NOW);
     assert_eq!(failed.len(), 1, "失败的 Run 整理不出成功经验");
     assert_eq!(
         failed[0].kind,
@@ -1479,7 +1483,7 @@ fn anything_that_looks_like_a_credential_is_dropped() {
     )
     .unwrap();
 
-    let observations = transcript.validate(raw, 8, &model("memory-model", None), &[], NOW);
+    let observations = transcript.validate(raw, 8, &model("memory-model", None), &[], &[], NOW);
     assert_eq!(observations.len(), 1);
     assert_eq!(observations[0].content, "备份放在 NAS 的 /srv/backup");
 }
@@ -1771,7 +1775,7 @@ fn a_task_result_input_cannot_be_cited_as_a_user_statement() {
     )
     .unwrap();
 
-    let observations = transcript.validate(raw, 8, &model("memory-model", None), &[], NOW);
+    let observations = transcript.validate(raw, 8, &model("memory-model", None), &[], &[], NOW);
     assert!(observations.is_empty(), "{observations:?}");
 }
 
@@ -1810,7 +1814,7 @@ fn a_marked_memory_query_result_is_labelled_and_cannot_be_cited() {
                  "said_by":"tool_observation","evidence":["{event}"]}}]"#
         ))
         .unwrap();
-        transcript.validate(raw, 8, &model("memory-model", None), &[], NOW)
+        transcript.validate(raw, 8, &model("memory-model", None), &[], &[], NOW)
     };
     assert!(cite("evt-2").is_empty(), "记忆查询不能当证据");
     assert_eq!(cite("evt-3").len(), 1, "普通工具结果照常能引");
@@ -1838,7 +1842,7 @@ fn monitor_and_background_command_inputs_cannot_be_cited_as_user_statements() {
                  "said_by":"user_statement","evidence":["evt-2"]}]"#,
         )
         .unwrap();
-        let observations = transcript.validate(raw, 8, &model("memory-model", None), &[], NOW);
+        let observations = transcript.validate(raw, 8, &model("memory-model", None), &[], &[], NOW);
         assert!(observations.is_empty(), "{key}: {observations:?}");
     }
 }
@@ -2624,6 +2628,7 @@ fn memory(id: &str, content: &str) -> komo_kernel::types::memory::MemoryItem {
         superseded_by: None,
         application: None,
         applies_when: None,
+        belongs_to: None,
     }
 }
 
@@ -3207,6 +3212,7 @@ fn add_request(content: &str, kind: MemoryKind, in_run: Option<&str>) -> MemoryA
         request_key: None,
         application: None,
         applies_when: None,
+        belongs_to: None,
     }
 }
 
@@ -3886,7 +3892,7 @@ fn raw_convention(extra: &str) -> Vec<RawObservation> {
 }
 
 fn validated(raw: Vec<RawObservation>) -> Vec<extract::Observation> {
-    transcript(&convention_events()).validate(raw, 8, &model("memory-model", None), &[], NOW)
+    transcript(&convention_events()).validate(raw, 8, &model("memory-model", None), &[], &[], NOW)
 }
 
 /// 合格的 convention：kind、来源、条件、basis 原话都对得上，落库带条件。basis 不落库。
@@ -3902,7 +3908,7 @@ fn a_well_formed_convention_keeps_its_application_and_condition() {
         observations[0].applies_when.as_deref(),
         Some("创建发布工单、需要选 Platform 时")
     );
-    assert_eq!(extract::PROMPT_VERSION, "memory-extract/v9");
+    assert_eq!(extract::PROMPT_VERSION, "memory-extract/v10");
 }
 
 /// basis 不在所引的任何用户事件里（编的一句原话，或只在工具结果里出现）→ 降为 reference，
@@ -4022,7 +4028,7 @@ async fn an_extracted_convention_lands_with_its_condition() {
         Some("创建发布工单、需要选 Platform 时")
     );
     assert_eq!(stored[0].confirmation, Confirmation::Unconfirmed);
-    assert_eq!(stored[0].extraction.prompt_version, "memory-extract/v9");
+    assert_eq!(stored[0].extraction.prompt_version, "memory-extract/v10");
 }
 
 fn convention_memory(id: &str) -> MemoryItem {
@@ -4236,8 +4242,9 @@ async fn classify_writes_a_new_revision_and_keeps_evidence_and_confirmation() {
         .classify(
             &confirmed.id,
             confirmed.revision,
-            MemoryApplication::Convention,
+            Some(MemoryApplication::Convention),
             Some("写汇报时"),
+            BelongsChange::Keep,
         )
         .await
         .unwrap();
@@ -4262,8 +4269,9 @@ async fn classify_writes_a_new_revision_and_keeps_evidence_and_confirmation() {
         .classify(
             &classified.id,
             classified.revision,
-            MemoryApplication::Convention,
+            Some(MemoryApplication::Convention),
             None,
+            BelongsChange::Keep,
         )
         .await
         .unwrap();
@@ -4273,8 +4281,9 @@ async fn classify_writes_a_new_revision_and_keeps_evidence_and_confirmation() {
         .classify(
             &classified.id,
             confirmed.revision,
-            MemoryApplication::Reference,
+            Some(MemoryApplication::Reference),
             None,
+            BelongsChange::Keep,
         )
         .await;
     assert!(
@@ -4304,7 +4313,13 @@ async fn classify_refuses_a_convention_without_a_condition_or_for_a_fact() {
     assert!(matches!(
         harness
             .manager
-            .classify(&pref.id, pref.revision, MemoryApplication::Convention, None)
+            .classify(
+                &pref.id,
+                pref.revision,
+                Some(MemoryApplication::Convention),
+                None,
+                BelongsChange::Keep
+            )
             .await,
         Err(MemoryError::Invalid(_))
     ));
@@ -4314,8 +4329,9 @@ async fn classify_refuses_a_convention_without_a_condition_or_for_a_fact() {
             .classify(
                 &fact.id,
                 fact.revision,
-                MemoryApplication::Convention,
-                Some("订会议室时")
+                Some(MemoryApplication::Convention),
+                Some("订会议室时"),
+                BelongsChange::Keep
             )
             .await,
         Err(MemoryError::Invalid(_))

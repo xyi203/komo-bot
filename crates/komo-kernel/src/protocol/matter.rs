@@ -8,7 +8,7 @@
 use serde::{Deserialize, Serialize};
 use time::Date;
 
-use crate::types::ids::{RequestKey, RunId, SessionId};
+use crate::types::ids::{MemoryId, RequestKey, RunId, SessionId};
 use crate::types::matter::{Matter, MatterKind, iso_date};
 
 /// `GET /v1/matters`。
@@ -46,6 +46,36 @@ pub struct MatterDetail {
     pub matter: Matter,
     #[serde(with = "iso_date")]
     pub today: Date,
+    /// 只在这次操作是结案（done / drop / retire）或重开时带：这件事下面的记忆怎么处理了
+    /// （`docs/goals.md` §6）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub closure: Option<MatterClosure>,
+}
+
+/// 结案时它名下的记忆怎么处理了（`memory.md` §9.6「结案归档」）。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MatterClosure {
+    /// 这次转成 `archived` 的线索条数。
+    #[serde(default)]
+    pub archived: u32,
+    /// 归属它、仍在生效的约定：不因结案悄悄失效，由操作者定去向（`classify --for` 或 `forget`），
+    /// 没答之前照常注入。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conventions: Vec<ClosureConvention>,
+    /// 这次顺带把归档的线索恢复成 `active` 了几条（只在 reopen 时有）。
+    #[serde(default)]
+    pub restored: u32,
+}
+
+/// 结案时列出的一条约定。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClosureConvention {
+    pub id: MemoryId,
+    pub revision: u32,
+    pub content: String,
+    /// `applies_when`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub applies_when: Option<String>,
 }
 
 /// `POST /v1/matters`：新建，`active`。`next` / `due` 只给 goal，`standard` 只给 area。

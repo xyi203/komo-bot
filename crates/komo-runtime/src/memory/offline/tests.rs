@@ -322,6 +322,7 @@ impl Seed {
             superseded_by: None,
             application: self.application,
             applies_when: self.applies_when,
+            belongs_to: None,
         }
     }
 }
@@ -642,6 +643,7 @@ async fn rereadable_never_touches_confirmed_or_preference_and_a_forgotten_source
         relations: vec![],
         application: None,
         applies_when: None,
+        belongs_to: None,
     };
     Consolidator::new(&rig.manager)
         .apply(&[observation])

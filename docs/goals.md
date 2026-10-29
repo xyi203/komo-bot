@@ -172,3 +172,15 @@ area:  active → retired →（reopen）active
 - P1e：说"工单提了，等审批"，目标转 `waiting` 并挂上 monitor，审批通过后回到 `active`。
 
 **汇总验收（2026-10-29，P1b–P1e 合并后）。** 三片并发实现、合并回同一分支后统一跑 `cargo test --workspace --no-fail-fast`：2489 通过、2 失败、12 忽略。两条失败都是片与片之间的断言没对齐，已修：kernel `verbs_parse_and_split_into_commitment_and_progress`（P1e 把 link / unlink 加成推进类，P1a 的断言只列了三个）；runtime `push_unattached_defaults_to_true_and_is_read_from_config`（夹具里已有 `[memory.retrieval]`，测试又追加一个同名表，改成插进原表）。修后两条单跑通过；合入 main 后全量重跑 `cargo test --workspace`：2491 通过、0 失败、12 忽略。合并还引入了一个两边单测都抓不到的问题：P1b 与 P1c 在 `prepare_with` 里各绑了一个 `matters`，后绑的（本块要带的事项）遮住了分层用的全量事项，于是本段已展示过的事项名下的线索在 `push_unattached = false` 时会被当成无归属挡掉；P1b 那个改名为 `matter_group`，补回归 `memory::tests::belongs::a_shown_matters_clues_are_still_pushed`（通过）。`cargo fmt --check` 通过。未装二进制、未在真实会话里验证 Agent 会不会当场记事项、挂 monitor 与转等待。
+
+**真实会话验收（2026-10-29，本机 Gateway，`9162ae2d` 的 release 二进制）。** 会话经 HTTP（`POST /v1/sessions/{id}/runs`）发话，不经渠道；Agent、模型、召回、bash 与 monitor 都是真的。逐条对照 §9 / `roadmap-muse.md` P1 的完成标准：
+
+- 「这周把 P1 真实会话验收做完、截止周日」→ Agent 当场 `komo goal add --due 2026-11-01`，证据是这句原话（会话 `01a1863a-17bc-71e9-a9a5-3a98eb3df6f8`）。
+- 「下一步先验证等待和 monitor」→ `komo goal next`。
+- 「卡在等审批，文件出现就转回进行中」→ Agent 先 `goal wait`，再挂 monitor（#6847，盯文件，`resume_after_restart`），再 `goal link --monitor`；文件放出后约 25 秒，monitor 事件回到会话，Agent `goal resume`，目标回到 active、下一步保留。
+- 另开会话问「在做哪些事、在管哪些事」，不跑命令也答得出这个目标及其下一步、截止（来自事项组注入）；同一会话一句话建领域，带标准。
+- 「先放一放」→ `goal park`；再开会话问同样的话，目标不再出现，它名下的线索过了两臂门槛也没注入（第 4 层），名下的约定照常注入（第 2 层，规格如此）。
+- 「搞定了」→ `goal done`：名下线索转 `archived`，`memory search` 默认搜不到、`--include-archived` 搜得到；名下约定被列出来问去向；挂着的 monitor 被提醒。Agent 把两件事都转问了用户。
+- `push_unattached = false`（热重载）时，一条过了两臂门槛的无归属线索不再注入；改回 `true` 对照，同一问题带上了它。配置已还原。
+
+观察：Agent 每次动事项前先跑一次 `komo goal --help` / `komo area --help` 看子命令，多一轮工具调用，不影响结果。未验证：提取对新记忆建议归属（这几段会话还没触发提取）；飞书渠道入口（与 HTTP 走同一条 Run 路径，只差渠道投递）。验收用的目标留作 done，领域已 retire，两条测试记忆已 forget。

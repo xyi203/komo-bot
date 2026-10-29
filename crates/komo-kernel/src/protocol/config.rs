@@ -268,6 +268,10 @@ pub struct RetrievalConfig {
     /// `max_tokens` 互相挤占；超出的按创建先后截断，截掉的回到门槛那条路。
     #[serde(default = "default_convention_tokens")]
     pub convention_tokens: u32,
+    /// 事项组的 token 预算（`docs/goals.md` §5）：进行中的目标与领域每段全量带，超出的按更新
+    /// 时间从旧到新截掉。
+    #[serde(default = "default_matter_tokens")]
+    pub matter_tokens: u32,
     /// 把融合后的短名单交给判断后端重排（§9.4）。默认关：开着就要发一次外部请求。
     #[serde(default)]
     pub rerank: bool,
@@ -301,6 +305,9 @@ fn default_max_tokens() -> u32 {
 fn default_convention_tokens() -> u32 {
     800
 }
+fn default_matter_tokens() -> u32 {
+    600
+}
 
 impl Default for RetrievalConfig {
     fn default() -> Self {
@@ -310,6 +317,7 @@ impl Default for RetrievalConfig {
             top_k: default_top_k(),
             max_tokens: default_max_tokens(),
             convention_tokens: default_convention_tokens(),
+            matter_tokens: default_matter_tokens(),
             rerank: false,
             rerank_shortlist: default_rerank_shortlist(),
             min_similarity: 0.0,

@@ -467,7 +467,7 @@ async fn learn_with(gateway: &TestGateway, llm: ScriptedLlm) {
         events,
         work,
         clock: Arc::clone(&state.clock),
-        render: komo_agent::context::memory::render_run,
+        render: komo_agent::context::memory::render_block,
     });
     // 直接用这一台新的消费队列——它读写的是**同一个 durable.db 与 aux.db**。
     past_extract_idle().await;

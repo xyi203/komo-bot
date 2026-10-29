@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use super::ids::SubmissionId;
 use super::records::EntryRecord;
+use crate::types::matter::MatterUse;
 use crate::types::memory::RecallDiagnostics;
 use crate::types::turn::MemoryUse;
 
@@ -28,6 +29,9 @@ pub struct RecallData {
     /// 块里展示的条目与版本；筛空时为空。
     #[serde(default)]
     pub uses: Vec<MemoryUse>,
+    /// 块里的事项组展示着哪些事项的哪一版（`docs/goals.md` §5）。旧 entry 没有这一项，读作空。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub matters: Vec<MatterUse>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recall: Option<RecallDiagnostics>,
     /// 召回时刻（毫秒）。
@@ -42,5 +46,29 @@ impl RecallData {
             return None;
         }
         serde_json::from_value(entry.data.clone()?).ok()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 加事项组之前落下的召回记录没有 `matters`：读作空，写回时也不多出这一项。
+    #[test]
+    fn an_old_recall_entry_without_matters_still_parses() {
+        let data: RecallData = serde_json::from_value(serde_json::json!({
+            "submission": 7,
+            "uses": [{"memory": "m-1", "revision": 2}],
+            "at": 5,
+        }))
+        .unwrap();
+        assert!(data.matters.is_empty());
+        assert_eq!(data.uses.len(), 1);
+        assert!(
+            serde_json::to_value(&data)
+                .unwrap()
+                .get("matters")
+                .is_none()
+        );
     }
 }

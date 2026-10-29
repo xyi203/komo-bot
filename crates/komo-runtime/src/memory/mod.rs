@@ -49,6 +49,7 @@ use komo_kernel::traits::{
 };
 use komo_kernel::types::agent::MemoryMode;
 use komo_kernel::types::ids::{MemoryId, RunId, Seq, SessionId};
+use komo_kernel::types::matter::{Matter, MatterUse};
 use komo_kernel::types::memory::{
     Injection, MemoryItem, MemoryScope, MemoryState, MemoryWork, RecallDiagnostics, RecallQuery,
     RecallResult, RetrievalMode, scope_allowed,
@@ -56,7 +57,7 @@ use komo_kernel::types::memory::{
 use komo_kernel::types::model::{EmbeddingSpace, InputKind, ModelConfig, Vector};
 use komo_kernel::types::turn::{LlmError, MemoryUse};
 use komo_store::repos::memory::{GenerationRecord, IndexCandidate};
-use time::OffsetDateTime;
+use time::{Date, Month, OffsetDateTime};
 
 pub use add::run_user_evidence;
 pub use consolidate::{Relation, Verdict};
@@ -333,9 +334,25 @@ pub struct PassReport {
 /// Gateway 装配 [`MemoryParts`] 时把它递进来。`fn` 指针而不是 trait：只有一个实现，也
 /// 不必为了传一份渲染逻辑就让 `MemoryManager` 认识 `dyn` 对象——runtime 不依赖 agent。
 ///
-/// 参数依次是：不过门槛的常驻约定、过了门槛的召回结果、召回结果的 token 预算、约定组的 token
-/// 预算（§9.4「约定不过门槛」）。
-pub type RenderInjection = fn(&[MemoryItem], &[MemoryItem], u32, u32) -> Injection;
+/// 参数依次是：不过门槛的常驻约定、过了门槛的召回结果、此刻该带的事项（`docs/goals.md` §5）、
+/// Gateway 本地的今天（读"已超期"）、召回结果的 token 预算、约定组的 token 预算（§9.4「约定不过
+/// 门槛」）、事项组的 token 预算。
+pub type RenderInjection =
+    fn(&[MemoryItem], &[MemoryItem], &[Matter], Date, u32, u32, u32) -> Injection;
+
+/// Gateway 本地时区的今天（`docs/goals.md` §3「超期」）。时区走系统的；换算不出来退回 UTC 的日期。
+/// 与 `komo-gateway` 的 `http::matters` 读同一个口径。
+fn local_today(now: OffsetDateTime) -> Date {
+    jiff::Timestamp::from_second(now.unix_timestamp())
+        .ok()
+        .map(|ts| ts.to_zoned(jiff::tz::TimeZone::system()).date())
+        .and_then(|day| {
+            let month = Month::try_from(u8::try_from(day.month()).ok()?).ok()?;
+            Date::from_calendar_date(i32::from(day.year()), month, u8::try_from(day.day()).ok()?)
+                .ok()
+        })
+        .unwrap_or_else(|| now.date())
+}
 
 /// 装配一台 MemoryManager 要的东西。
 pub struct MemoryParts {
@@ -779,13 +796,17 @@ impl MemoryManager {
         carried: &[MemoryUse],
         scopes: &[MemoryScope],
     ) -> Injection {
-        self.prepare_with(run, text, carried, &[], scopes, false)
+        self.prepare_with(run, text, carried, &[], scopes, false, None)
             .await
     }
 
     /// 一个 Run 的召回块（§9.4「按 Run 召回」）：召回、过门槛、选 `top_k`，再去掉这一段上下文里
     /// 已经展示过的 `id@revision`（`shown`），剩下的才渲染。空出来的名额不拿排名更低的补——
     /// 选中的就是这次相关的，已展示的那几条本来就在模型眼前。
+    ///
+    /// 事项（`docs/goals.md` §5）：`shown_matters` 是 `Some` 才带事项组——此刻 active / waiting 的目标与
+    /// active 的领域，减去已展示的 `id@revision`，不过门槛、不占 `top_k`，花 `matter_tokens`。
+    /// `None` 是这个会话不该看到事项（`memory = private`）。
     ///
     /// 约定（active + convention）另走一路：放行作用域里的全部约定减去已展示的，不过门槛、不占
     /// `top_k`，花自己的预算 `convention_tokens`（§9.4「约定不过门槛」）。
@@ -795,10 +816,32 @@ impl MemoryManager {
         text: &str,
         shown: &[MemoryUse],
         scopes: &[MemoryScope],
+        shown_matters: Option<&[MatterUse]>,
     ) -> Injection {
-        self.prepare_with(run, text, &[], shown, scopes, true).await
+        self.prepare_with(run, text, &[], shown, scopes, true, shown_matters)
+            .await
     }
 
+    /// 召回块里还展示着的事项版本里，哪些现在仍该展示（版本没变、仍是 active / waiting 的目标或
+    /// active 的领域）。搁置、结案、删除、改过版本的都掉出去，由调用方改写旧块。
+    pub async fn revalidate_matters(&self, uses: &[MatterUse]) -> Vec<MatterUse> {
+        if uses.is_empty() {
+            return Vec::new();
+        }
+        let open = self.open_matters().await;
+        uses.iter()
+            .filter(|use_| {
+                open.iter().any(|matter| {
+                    matter.is_injectable()
+                        && matter.id == use_.matter
+                        && matter.revision == use_.revision
+                })
+            })
+            .cloned()
+            .collect()
+    }
+
+    #[allow(clippy::too_many_arguments)]
     async fn prepare_with(
         &self,
         run: &RunId,
@@ -807,6 +850,7 @@ impl MemoryManager {
         shown: &[MemoryUse],
         scopes: &[MemoryScope],
         with_conventions: bool,
+        shown_matters: Option<&[MatterUse]>,
     ) -> Injection {
         if !self.enabled() {
             return Injection::default();
@@ -863,6 +907,16 @@ impl MemoryManager {
                 .any(|use_| use_.memory == item.id && use_.revision == item.revision)
         };
         let retrieval = self.retrieval();
+        let matters: Vec<Matter> = match shown_matters {
+            Some(shown) => self
+                .open_matters()
+                .await
+                .into_iter()
+                .filter(|matter| matter.is_injectable() && !shown.contains(&matter.as_use()))
+                .collect(),
+            None => Vec::new(),
+        };
+        let today = local_today(now);
         let mut resident = stale::mark_missing_paths(conventions.clone(), home.as_deref());
         resident.retain(unshown);
         // 先单独渲染一遍常驻约定，看预算放下了哪几条：没放下的约定回到门槛那条路（过了门槛
@@ -870,8 +924,11 @@ impl MemoryManager {
         let kept = (self.render)(
             &resident,
             &[],
+            &[],
+            today,
             retrieval.max_tokens,
             retrieval.convention_tokens,
+            0,
         )
         .uses;
         let over_budget = resident.len() - kept.len();
@@ -891,9 +948,16 @@ impl MemoryManager {
         let mut injection = (self.render)(
             &resident,
             &items,
+            &matters,
+            today,
             retrieval.max_tokens,
             retrieval.convention_tokens,
+            retrieval.matter_tokens,
         );
+        diagnostics.matters_over_budget = injection
+            .diagnostics
+            .as_ref()
+            .and_then(|rendered| rendered.matters_over_budget);
         diagnostics.dropped_by_budget = Some(
             items
                 .len()

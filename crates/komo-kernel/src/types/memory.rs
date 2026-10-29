@@ -473,6 +473,10 @@ pub struct RecallDiagnostics {
     /// 回到门槛那条路，过了门槛仍会渲染在约定组里。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conventions_over_budget: Option<u32>,
+    /// 事项组因 `matter_tokens` 预算放不下、被截掉的条数（`docs/goals.md` §5）。截掉的不回落
+    /// 到任何检索路。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub matters_over_budget: Option<u32>,
     /// 留下的候选的两臂分数（§9.4）。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub arm_scores: Vec<ArmScore>,
@@ -501,6 +505,9 @@ pub struct Injection {
     pub text: Option<String>,
     /// 注入了哪些条目的哪个版本——**审计证据**，resume 时重新核对（§9.7）。
     pub uses: Vec<super::turn::MemoryUse>,
+    /// 事项组展示了哪些事项的哪一版（`docs/goals.md` §5）；与 `uses` 分开记。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub matter_uses: Vec<super::matter::MatterUse>,
     /// 召回诊断。**不参与相等**：同一块沿用时它变（`reused_pin`），不该被当成换了一块。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub diagnostics: Option<RecallDiagnostics>,
@@ -508,7 +515,7 @@ pub struct Injection {
 
 impl PartialEq for Injection {
     fn eq(&self, other: &Self) -> bool {
-        self.text == other.text && self.uses == other.uses
+        self.text == other.text && self.uses == other.uses && self.matter_uses == other.matter_uses
     }
 }
 

@@ -942,7 +942,9 @@ impl MemoryManager {
                 .iter()
                 .any(|use_| use_.memory == item.id && use_.revision == item.revision)
         };
-        let matters: Vec<Matter> = match shown_matters {
+        // 这一块要带的事项（第 1 层）：可注入且本段没展示过的。与上面分层用的全量 `matters`
+        // 分开——分层要认得已展示的、搁置的和已结案的事项。
+        let matter_group: Vec<Matter> = match shown_matters {
             Some(shown) => self
                 .open_matters()
                 .await
@@ -991,7 +993,7 @@ impl MemoryManager {
         let mut injection = (self.render)(
             &resident,
             &items,
-            &matters,
+            &matter_group,
             today,
             retrieval.max_tokens,
             retrieval.convention_tokens,

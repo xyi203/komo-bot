@@ -1138,6 +1138,8 @@ top_k = 8
 max_tokens = 1500
 # 约定组（active + convention）不过门槛、不占 top_k，另有一份 token 预算；超出的按创建先后截掉，回到门槛那条路。
 convention_tokens = 800
+# 事项组（进行中 / 等待中的目标与在管的领域，docs/goals.md §5）同样不过门槛，另有一份预算；超出的从最久没更新的截掉。
+matter_tokens = 600
 # 没有归属的线索要不要推（docs/memory.md §9.4 分层）；false 时它们只能 komo memory search 查到。存量挂好归属之前保持 true。
 push_unattached = true
 # 相关度门槛（docs/memory.md §9.4）：过任一道才留下；0 = 不启用（默认）。

@@ -209,11 +209,13 @@ fn push_unattached_defaults_to_true_and_is_read_from_config() {
     let loaded = load_config(&fixture.options()).unwrap();
     assert!(loaded.snapshot.memory.retrieval.push_unattached);
 
-    let text = Fixture::config_text("chat-a", "medium");
-    write(
-        &fixture.sources().config,
-        &format!("{text}\n[memory.retrieval]\npush_unattached = false\n"),
+    // 夹具里已经有 `[memory.retrieval]`，再写一个同名表是重复键：把键插进原表。
+    let text = Fixture::config_text("chat-a", "medium").replacen(
+        "[memory.retrieval]\n",
+        "[memory.retrieval]\npush_unattached = false\n",
+        1,
     );
+    write(&fixture.sources().config, &text);
     let loaded = load_config(&fixture.options()).unwrap();
     assert!(!loaded.snapshot.memory.retrieval.push_unattached);
 }

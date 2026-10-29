@@ -166,6 +166,33 @@ async fn unattached_clues_are_withheld_when_push_unattached_is_off() {
     assert!(!pushed.contains(&free.id), "{pushed:?}");
 }
 
+/// 事项组在本段已展示过（这一块不再带它），它名下的线索照样按"进行中"推：分层看的是全部
+/// 事项，不是这一块要带的那几件（合并 P1b / P1c 时曾把两者混成同一个变量）。
+#[tokio::test]
+async fn a_shown_matters_clues_are_still_pushed() {
+    let rig = rig(8, false).await;
+    let goal = rig
+        .matter("g-active", MatterKind::Goal, MatterState::Active)
+        .await;
+    let attached = rig.clue("空调 目标的线索", Some("g-active")).await;
+
+    let pushed: Vec<MemoryId> = rig
+        .manager
+        .recall_for_run(
+            &RunId::from_raw("run-2"),
+            "空调",
+            &[],
+            &[],
+            Some(&[goal.as_use()]),
+        )
+        .await
+        .uses
+        .into_iter()
+        .map(|use_| use_.memory)
+        .collect();
+    assert!(pushed.contains(&attached.id), "{pushed:?}");
+}
+
 /// 约定不按归属分层：归属搁置的目标、`push_unattached` 关着，约定照常进每个 Run。
 #[tokio::test]
 async fn a_convention_is_not_layered_by_its_matter() {

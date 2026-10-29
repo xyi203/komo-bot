@@ -1007,7 +1007,13 @@ mod tests {
             .collect();
         assert_eq!(
             progress,
-            vec![MatterVerb::Next, MatterVerb::Wait, MatterVerb::Resume]
+            vec![
+                MatterVerb::Next,
+                MatterVerb::Wait,
+                MatterVerb::Resume,
+                MatterVerb::Link,
+                MatterVerb::Unlink
+            ]
         );
         assert!("frobnicate".parse::<MatterVerb>().is_err());
     }

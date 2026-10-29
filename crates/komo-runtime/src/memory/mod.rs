@@ -44,7 +44,8 @@ use komo_kernel::protocol::http::{
     IndexState, MemoryIndexStatus, MemorySweepRequest, MemorySweepResponse,
 };
 use komo_kernel::traits::{
-    Clock, EmbedError, EmbeddingClient, LlmClient, MemoryRepo, RepoError, StoreError, SystemOne,
+    Clock, EmbedError, EmbeddingClient, LlmClient, MatterRepo, MemoryRepo, RepoError, StoreError,
+    SystemOne,
 };
 use komo_kernel::types::agent::MemoryMode;
 use komo_kernel::types::ids::{MemoryId, RunId, Seq, SessionId};
@@ -352,6 +353,9 @@ pub struct MemoryParts {
     pub clock: Arc<dyn Clock>,
     /// 召回结果怎样渲染成注入段；Gateway 装配时给 `komo_agent::context::memory::render`。
     pub render: RenderInjection,
+    /// 目标与领域（`docs/goals.md`）：召回块的事项组（P1b）与按归属分层（P1c）都读它。
+    /// `None` = 没接事项（只测记忆的替身），当作一件事都没有。
+    pub matters: Option<Arc<dyn MatterRepo>>,
 }
 
 /// 记忆重排用的判断后端（§9.4）。
@@ -394,6 +398,7 @@ pub struct MemoryManager {
     clock: Arc<dyn Clock>,
     /// 召回结果 → 注入段（`komo-agent::context::memory::render`，§13.2）。
     render: RenderInjection,
+    matters: Option<Arc<dyn MatterRepo>>,
     /// 每个会话**当前这一段对话**注入的那一块（§9.4）。
     ///
     /// 为什么要它：注入段在 system 消息里，而服务端的前缀缓存按**最长公共前缀**命中。
@@ -511,10 +516,26 @@ impl MemoryManager {
             work: parts.work,
             clock: parts.clock,
             render: parts.render,
+            matters: parts.matters,
             pins: Mutex::new(BTreeMap::new()),
             indexing: Mutex::new(IndexSchedule::default()),
             index_wake: tokio::sync::Notify::new(),
             reported: Mutex::new(BTreeSet::new()),
+        }
+    }
+
+    /// 未结案的目标与领域（`docs/goals.md`），按创建先后。读不出来只记 warn、当作没有：
+    /// 召回块少一组不该拦住这一轮。
+    pub(crate) async fn open_matters(&self) -> Vec<komo_kernel::types::matter::Matter> {
+        let Some(matters) = &self.matters else {
+            return Vec::new();
+        };
+        match matters.list(None, false).await {
+            Ok(list) => list,
+            Err(error) => {
+                tracing::warn!(%error, "事项这一次没读成，当作没有");
+                Vec::new()
+            }
         }
     }
 

@@ -453,6 +453,7 @@ async fn learn_with(gateway: &TestGateway, llm: ScriptedLlm) {
         &state.clock,
     );
     let manager = MemoryManager::new(MemoryParts {
+        matters: None,
         config: snapshot.memory.clone(),
         repo,
         catalog,

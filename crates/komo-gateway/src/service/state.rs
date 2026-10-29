@@ -263,12 +263,15 @@ impl GatewayState {
         // 事件与工作队列走新存储（W3c）。
         let (events, work) = super::durable::memory::seams(&durable, &config, &clock);
         // 事项的承诺类操作与 `memory add` 读同一份事件找用户原话（`docs/goals.md` §4）。
+        let matter_repo: Arc<dyn komo_kernel::traits::MatterRepo> =
+            Arc::new(TursoMatterRepo::new(db.clone()));
         let matters = Arc::new(MatterManager::new(
-            Arc::new(TursoMatterRepo::new(db.clone())),
+            Arc::clone(&matter_repo),
             Arc::clone(&events),
             Arc::clone(&clock),
         ));
         let memories = Arc::new(MemoryManager::new(MemoryParts {
+            matters: Some(matter_repo),
             config: snapshot.memory.clone(),
             repo: Arc::clone(&memory),
             catalog: Arc::new(TursoMemoryRepo::new(db.clone())),

@@ -412,6 +412,7 @@ impl HarnessBuilder {
             work: Arc::clone(&work) as Arc<dyn MemoryWorkLog>,
             clock: Arc::new(FixedClock),
             render: test_render,
+            matters: None,
         }));
         Harness {
             manager,

@@ -173,6 +173,7 @@ impl Rig {
         let clock = TestClock(Arc::new(Mutex::new(LATER)));
         let client = wrap(&repo, llm.clone());
         let manager = Arc::new(MemoryManager::new(MemoryParts {
+            matters: None,
             config: MemoryConfig {
                 enabled: true,
                 model: model(),

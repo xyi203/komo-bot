@@ -61,6 +61,7 @@ async fn bash_input_run_finds_user_evidence_without_changing_output_paths() {
     ));
     let clock: Arc<dyn Clock> = Arc::new(WallClock);
     let memory = MemoryManager::new(MemoryParts {
+        matters: None,
         config: MemoryConfig {
             enabled: true,
             model: model_config(),

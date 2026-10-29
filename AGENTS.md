@@ -92,7 +92,11 @@ depends on `agent`; `client` knows only protocol types.
   (§8.1, §8.3).
 - **There is no Policy and no approval** (§7, removed 2026-10-11). What the
   model asks, komo executes once the tool's own `prepare` and the capability
-  surface accept it; `Tool::execute` takes the `ExecutionPlan`. Nothing
+  surface accept it; `Tool::execute` takes the `ExecutionPlan`. One exception
+  (`docs/confirm.md`): a Run started by a trigger (cron, monitor, task result,
+  task session) calling a tool declared `outward` waits in the `confirm`
+  checkpoint for the operator's `approve` / `reject` — no rule table, no
+  "always allow". Nothing
   migrates from the old store (§8): old `sessions/*/events.jsonl` and
   `state.db*` stay on disk, unread.
 - **The only hard limit lives in the tools:** `write`/`edit` refuse komo's own

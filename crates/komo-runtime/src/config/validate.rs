@@ -517,8 +517,23 @@ fn check_compaction(snapshot: &ConfigSnapshot, issues: &mut Vec<ConfigIssue>) {
 /// `[mcp.servers.<name>]`（`docs/mcp.md`）：名字要进工具名（`mcp__<name>__<tool>`），只能是
 /// 字母、数字、`_`、`-`；`read_only` / `outward` 写了白名单之外的工具是笔误，不会生效。
 fn check_mcp(snapshot: &ConfigSnapshot, issues: &mut Vec<ConfigIssue>) {
+    // 确认卡（`docs/confirm.md` §6）：Cron 起的 Run 没有来源对端，卡只能投 home chat。
+    let has_home = [
+        &snapshot.channels.feishu,
+        &snapshot.channels.telegram,
+        &snapshot.channels.wechat,
+    ]
+    .iter()
+    .any(|channel| channel.enabled && channel.home_chat.is_some());
     for (name, server) in &snapshot.mcp {
         let key = format!("mcp.servers.{name}");
+        if !server.outward.is_empty() && !has_home {
+            issues.push(warning(
+                &format!("{key}.outward"),
+                "声明了对外工具，但没有渠道配 home_chat：Cron 起的 Run 要确认时卡投不到人，\
+                 只能在 `komo intervention list` 里看到，到点不答就不执行",
+            ));
+        }
         if name.is_empty()
             || !name
                 .chars()
@@ -767,6 +782,25 @@ mod tests {
             "{}",
             issues[0].message
         );
+    }
+
+    #[test]
+    fn outward_tools_without_any_home_chat_are_a_warning() {
+        let mut snapshot = snapshot_fixture();
+        let mut server = mcp_server(None, vec![]);
+        server.outward = vec!["push".into()];
+        snapshot.mcp.insert("gh".into(), server);
+        assert!(
+            keys(&validate(&snapshot)).is_empty(),
+            "the fixture has a home chat"
+        );
+
+        snapshot.channels.feishu.home_chat = None;
+        snapshot.channels.telegram.home_chat = None;
+        snapshot.channels.wechat.home_chat = None;
+        let issues = validate(&snapshot);
+        assert_eq!(keys(&issues), vec!["mcp.servers.gh.outward"]);
+        assert_eq!(issues[0].severity, IssueSeverity::Warning);
     }
 
     #[test]

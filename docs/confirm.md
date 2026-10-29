@@ -1,6 +1,7 @@
 # 对外动作确认（P3）
 
-> 状态：草案（2026-10-29），待操作者认可。方向已在 [`roadmap-muse.md`](roadmap-muse.md) §4.1 拍板，这里定做法。
+> 状态：2026-10-29 认可（D1–D6 按建议），同日实现（P3a–P3c）；与本文写法不一致的地方见 §10。
+> 方向已在 [`roadmap-muse.md`](roadmap-muse.md) §4.1 拍板，这里定做法。
 > 不带文件名的章节号指 [`komo_bot.md`](komo_bot.md)。
 
 ## 1. 要解决什么
@@ -20,7 +21,7 @@
 - 不做按钮卡片。现在的飞书 / Telegram 都没有卡片回调（删审批时一起删了），先用文字卡 + `/answer`，
   按钮留给 P4。
 
-## 2. 决定（待认可）
+## 2. 决定（2026-10-29 认可）
 
 | # | 问题 | 建议 | 理由 |
 |---|---|---|---|
@@ -136,3 +137,26 @@ codemode 脚本里的嵌套调用经宿主执行。宿主判到"无人值守且�
 | P3a | `attended` 判定与 `ToolEnv.source`；`Tool::outward`、MCP `outward` 配置；`Checkpoint::Confirm` 与等待、超时、拒绝 | kernel `traits` / `types::tool` / `protocol::config`；runtime `durable/harness/tool.rs`、`tools/mcp.rs`、config |
 | P3b | `InterventionKind::Confirm`、列表、回答写 `komo.confirm` 与 entry、投递与卡正文、`/answer` 与 CLI | kernel `protocol::http`；gateway `service/durable/interventions.rs`、`dispatcher.rs`、render；client；bin |
 | P3c | codemode 嵌套调用的拒绝；`doctor` / `config check` 的 home chat 报警；文档（§7、§7.5、§11.4、`mcp.md`） | runtime codemode 宿主；gateway config；docs |
+
+## 10. 实现记录（2026-10-29）
+
+分片照 §9 做完：P3a `910cc196`，P3b `072ae7b8`，P3c 随文档一起提交。和上文写法不一样的地方：
+
+- **时限的键**是 `[execution] confirm_timeout_mins`（默认 1440），不另开 `[confirm]` 表；进入等待时按当时的
+  配置算出截止时刻存进 checkpoint，之后改配置不影响已经在等的卡。
+- **`outward` 的匹配**：原名或任一模式匹配就算对外，不需要 `tool_exposure` 那样"字面最长的赢"（它只是是 / 否）。
+- **`ToolEnv.source` 没改**。按 §3 填成 `Cron` 会同时打开 `task` 工具里"Cron 的 Run 不能派后台任务"那条一直
+  没生效的拒绝，是另一处行为变化，另议。判定只在工具任务里用（`harness/confirm.rs::attended`）。
+- **聊天输入**：`chat.input` 一律算有人值守——能进到 Agent 的聊天消息本来就只来自 `allow_from` / `allow_tenant`
+  的操作者（§11.2）。
+- **答复的记录**只写 `komo.confirm` document（conversation 级，key = 工具任务 ID，`{verdict, by, at}`），不另追加
+  entry：外部往正在跑的 conversation 里插 entry 会打乱 Run 的上下文。document 不随任务退役，purge 时随会话删。
+- **卡的正文**没有"事项"那一行（Cron Job 与目标 / 领域的挂接要读 aux.db，放到 P4 一起做）；时限写成"N 小时内"，
+  不写具体时刻（不依赖时区）。
+- **轮询**：`confirm` 阶段在进程内每 5 秒读一次 `komo.confirm`（同 `probe` 的间隔），不每拍提交 checkpoint。
+- **`config check` / `doctor`**：`outward` 写了 `tools` 白名单之外的名字（且没有模式能匹配上）报 warn；有服务器
+  声明了对外工具、却没有任何 enabled 渠道配 `home_chat` 时也报 warn。
+
+验证：runtime `harness/tests/confirm.rs`（批准、拒绝、到点、重启后接着等、有人值守直达、任务会话、不对外的工具）
+与 `harness/tests/codemode.rs` 的脚本内拒绝；gateway `tests/cron/confirm.rs`（真 Gateway + 真 MCP 服务器：Cron 的 Run
+出卡、投到 home、422、批准后只执行一次、拒绝后模型拿到说明、用户发起的 Run 不出卡）。

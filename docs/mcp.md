@@ -38,6 +38,7 @@ tools            = ["lookup"]          # 白名单；省略 = 服务器列出的
 description      = "内部文档检索"      # 系统提示里这台服务器的那一行（§3）
 exposure         = "codemode"          # 默认；direct / hidden（§3）
 tool_exposure    = { lookup = "direct", "delete_*" = "hidden" }
+outward          = ["publish_*"]       # 对外工具：无人值守的 Run 调它先确认（docs/confirm.md）
 ```
 
 - `command` 与 `url` 恰好写一个；`args` / `env` 只配 `command`，`bearer_token_env` 只配 `url`。
@@ -45,8 +46,10 @@ tool_exposure    = { lookup = "direct", "delete_*" = "hidden" }
   `LANG`、`TMPDIR`、`SHELL`，再加 `env` 列出的变量。HTTP 的 token 同理。
 - 整段**热重载即生效**（`ConfigSnapshot.mcp`，2026-10-17 起；之前在 `start_only` 里、要重启）：
   增删改服务器不用 `komo gateway restart`，见 §2.3。
-- 校验：服务器名只能是字母、数字、`_`、`-`（它要进工具名）；`read_only` 写了 `tools` 白名单
-  之外的名字是警告。
+- 校验：服务器名只能是字母、数字、`_`、`-`（它要进工具名）；`read_only` / `outward` 写了 `tools`
+  白名单之外的名字是警告；声明了 `outward` 却没有渠道配 `home_chat` 也是警告（确认卡投不到人）。
+- `outward`（2026-10-29）：原名或带 `*` 的模式，任一匹配就算对外。同 `read_only`，只信操作者的声明，
+  不信服务器自报。codemode 脚本里在无人值守的 Run 中调它直接被拒，要到顶层调（`docs/confirm.md` §7）。
 
 ### 2.1 OAuth（2026-10-14）
 

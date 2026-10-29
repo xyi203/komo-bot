@@ -440,6 +440,8 @@ project_files = false              # 省略 = true
 
 没有第三层。委派、派任务、追问、更新计划、MCP 调用、codemode、Memory 内部变更都走同一条路。cron 命令 Job 不再在 `cron add` 时签授权（§10.1）。
 
+**例外只有一条（2026-10-29，[`docs/confirm.md`](confirm.md)）**：由触发器起的 Run（Cron、monitor 事件、任务回报，或任务会话里的 Run）调一个**声明为对外**的工具（`Tool::outward`；MCP 由操作者在服务器配置里写 `outward = [...]`），`prepare` 之后先停在 `confirm` 阶段，发一张确认卡，操作者答 `approve` 才执行，`reject` 或到点（`[execution] confirm_timeout_mins`，默认 24 小时）就不执行、结果交给模型。操作者自己发起的 Run 不受影响；bash 不在内（它能对外，这里挡不住，§7.3）。这不是规则表：没有"总是允许"，一张卡只管那一次调用。
+
 `policy.toml` 不再读：文件还在时 `komo config check` 与 Gateway 启动日志**报一句**"policy.toml 已不再使用，可以删掉"——与 start-only 键同一条规则（§3），报出来，不静默忽略。
 
 ### 7.2 唯一的硬限制：不写 komo 自己的状态
@@ -466,6 +468,8 @@ project_files = false              # 省略 = true
 
 - **子进程探不出是否结束**：工具任务的 `probe` 阶段每轮自动重探，不必等人（§8.7）。
 - **blob 引用损坏**（被引用的 `output.json` / stdout / stderr 读不到或对不上，§8.9）：该工具任务写成 **faulted**（pi-durable spec §10.1"用户代码只让自己那个单元失败"），run 的输入 `unanswered`，原因写明缺哪个文件。
+
+**待确认的对外调用（2026-10-29）** 也在这份清单里：`kind = confirm`，句柄 = 停在 `confirm` 阶段的工具任务 ID，结论 `approve` / `reject`，答复写进 conversation 级 document `komo.confirm`（谁、什么时候、什么结论），由 `ConfirmIndex` 同样按提交订阅维护（`docs/confirm.md` §6）。
 
 **清单是 faulted 任务的派生视图，不是另一张表**：`GET /v1/interventions` / `komo intervention list | show | answer` / TUI 的待处理清单 / 聊天里的 `/pending` 与 `/answer`（§11.3）都读它。协议冻结，映射为：faulted terminal 任务 → `Blocked`，句柄 = 任务 ID，问题 = fault 原因，**可答的结论只有 `abandon`**（其余 422）；`abandon` 记在 Session 级 document `komo.interventions.ack`（`{abandoned: [任务 ID]}`），重复答复回原结论，未知句柄 404；清单由 `FaultIndex`（开库时接提交订阅，首次用时全扫 terminal 任务一次，TODO：任务表没有结局索引）提供。**不再有"我说它发生了"这种结论**：没有 `satisfied` / `not_performed` / `resolve`——结果不明本来就交给模型判断（§8.6）。
 
@@ -948,7 +952,7 @@ TELEGRAM_BOT_TOKEN=...
 
 - `Notifier::deliver` 先在 `deliveries` 表写一行（目标、内容引用、状态 `pending`），再发送，成功后标 `sent`。重启后 `pending` 的行补发，按 `DeliveryId` 幂等。
 - **补发在就绪之后跑，而且同一时刻只跑一趟。** 就绪（§3 第 4 步）不等它：它是网络 I/O，一条一个平台往返，积压多少就等多久。三个入口——渠道起来时按平台冲刷、启动时整体冲刷、微信入站前按会话冲刷——共用一把锁：两趟并发地在同一批 `pending` 行上跑，同一行会被送两次（发送在结算之前）。
-- **待处理 Intervention（§7.5）的投递目标**：Run 的来源会话，**加上** home chat（若不同）。两处都能回答，第二个答复得到"已决定"。来源是 Cron 或已断开的 TUI 时只有 home chat。结果不明、阻塞两类共用这一条——"需要人判断"不该因为种类不同而有不同的到达率。
+- **待处理 Intervention（§7.5）的投递目标**（确认卡同此，2026-10-29）：Run 的来源会话，**加上** home chat（若不同）。两处都能回答，第二个答复得到"已决定"。来源是 Cron 或已断开的 TUI 时只有 home chat。结果不明、阻塞两类共用这一条——"需要人判断"不该因为种类不同而有不同的到达率。
   补充一条（2026-09-19 实现并按线上反馈收窄）：**屏幕前有人在看这个会话时（HTTP 的 SSE 订阅在）不投 home chat**。TUI / HTTP 来源的 Run 没有 chat 对端，照上面那句它只剩 home chat 一个出口，而那条卡片是一次网络往返（实测几秒到几十秒），人正盯着屏幕的时候它只会晚到、答完还多一条回写。判据是**客户端订阅数**（`EventHub::watch` 的守卫，HTTP SSE 处理器持有），不是广播的订阅者总数——Run 的看客自己也订阅同一个广播。人走掉之后仍挂着的介入由周期（与审计补写同一拍）补投，投过的不重复：§10 的"不能因为无人值守就没人知道它在等"没有被这条放松。
 - home chat 解析：只看配置——每个 enabled 渠道的 `home_chat`（§11.2），没有运行时覆盖；一个都没配时返回错误给调用方，**不静默丢弃**。多个渠道都配了时的默认顺序是**飞书 > Telegram > WeChat**：前两者能通过 API 对任意已加入的会话主动推送，微信不能（下一条）。
 - **WeChat 的平台约束**：DM 回推依赖回复令牌 `context_token`——每条入站消息自带一个，SDK 按 `user_id` 存在**进程内存**里，源码里没有过期逻辑，唯一的失效路径是会话过期（`errcode -14`）清空整张表；真正挡住主动推送的是**进程重启即全丢**，不是令牌到期。没有令牌时 `send` 直接返回 `NoContext`，不会联网去补——这就是 `Deferred` 的精确触发条件（按错误**变体**匹配，不按字符串）。因此进程启动后用户没发过消息时**无法主动推送**。对应处理：该渠道的 `deliver` 在没有令牌时把行留在 `pending` 并返回 `Deferred`；用户下一条消息到达时 Dispatcher 先冲刷该会话的 `pending` 投递（§11.1 第 4 步），再处理新消息。介入通知因此不会丢，只会晚到；`home_chat` 里排在它前面的飞书或 Telegram 会先送到。待验证：服务端是否接受跨进程的旧 `context_token`——若接受，把每个 `user_id` 的最新令牌持久化到 state.db 即可让重启后的主动推送直接成功，`Deferred` 退化为「这台机器从没收过这个人的消息」一种情形。另：SDK 的 `message_type` / `message_state` 枚举没有 unknown 兜底，服务端多一个值就整批反序列化失败并无限退避重试，渠道会静默卡死——komo 的 wechat 渠道把连续 N 次 JSON 错误升级为 home chat 告警。

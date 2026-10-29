@@ -286,11 +286,12 @@ impl GenerationTask {
             }
             Err(HookError::Failed(message)) => return Err(TaskError::new(message)),
         };
+        let attended = super::confirm::attended(&setup.tools.env, rt).await?;
         let mut drafts = plan_system_entries(
             &entries,
             &view,
             &setup.sections,
-            &setup.tools.definitions(),
+            &setup.tools.definitions_for(attended),
             rt.now()?,
         );
         // 系统段之外追加的上下文（记忆召回块与它的遗忘改写，`docs/memory.md` §9.4）。

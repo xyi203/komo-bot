@@ -182,12 +182,19 @@ impl ToolSet {
     /// 交给模型的工具声明：按能力面的顺序、只列直接声明（`exposure = direct`）且真有实现的。
     /// 没有 `bash` 时 `edit` / `write` 的 `then_run` 参数一并摘掉（同 `ToolExecutor`）。
     pub fn definitions(&self) -> Vec<ToolDefinition> {
+        self.definitions_for(true)
+    }
+
+    /// 同 [`Self::definitions`]，无人值守的 Run（`attended = false`）再加上只在脚本里调的对外工具：
+    /// 脚本里调它们会被拒（等不了确认，`docs/confirm.md` §7），模型得在顶层调，而工具表里没有的
+    /// 名字模型不会去调。
+    pub fn definitions_for(&self, attended: bool) -> Vec<ToolDefinition> {
         let commands = self.can_run_commands();
         self.surface
             .names()
             .iter()
             .filter_map(|name| self.tools.get(name))
-            .filter(|tool| tool.exposure() == ToolExposure::Direct)
+            .filter(|tool| tool.exposure() == ToolExposure::Direct || (!attended && tool.outward()))
             .map(|tool| {
                 let mut definition = tool.definition();
                 if !commands

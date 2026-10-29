@@ -214,3 +214,42 @@ async fn a_tool_not_declared_outward_runs_in_an_unattended_run() {
     assert_eq!(bash.runs(), 1);
     engine.close().await.unwrap();
 }
+
+/// 第一次请求里模型看得见的工具名（system entry 回放出的工具表）。
+fn declared(world: &World) -> Vec<String> {
+    crate::llm::replay_system(&world.script.requests()[0])
+        .tools
+        .into_iter()
+        .map(|tool| tool.name)
+        .collect()
+}
+
+/// 只在脚本里调的对外工具：无人值守的 Run 把它声明给模型（脚本里调会被拒，得在顶层调），
+/// 有人值守的 Run 照旧不声明。
+#[tokio::test(start_paused = true)]
+async fn a_codemode_only_outward_tool_is_declared_only_to_unattended_runs() {
+    for cron in [true, false] {
+        let world = World::new();
+        let send = Arc::new(TestTool {
+            codemode_only: true,
+            ..TestTool::writer("send", &world.log).outward()
+        });
+        let quiet = Arc::new(TestTool {
+            codemode_only: true,
+            ..TestTool::writer("quiet", &world.log)
+        });
+        world.tools(vec![send, quiet]);
+        world.script.reply("ok");
+        let engine = world.open().await;
+        let id = if cron {
+            submit_cron(&world, &engine).await
+        } else {
+            world.submit(&engine, "hi").await
+        };
+        world.harness.wait(&engine, id).await.unwrap();
+        let names = declared(&world);
+        assert_eq!(names.contains(&"send".to_owned()), cron, "{names:?}");
+        assert!(!names.contains(&"quiet".to_owned()), "{names:?}");
+        engine.close().await.unwrap();
+    }
+}

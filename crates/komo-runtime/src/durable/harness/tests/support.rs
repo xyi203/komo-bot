@@ -526,6 +526,8 @@ pub struct TestTool {
     pub input_runs: Mutex<Vec<Option<komo_kernel::types::ids::RunId>>>,
     /// `Tool::outward`（`docs/confirm.md`）。
     pub outward: bool,
+    /// `Tool::exposure` 是 `Codemode`（只在脚本里调，不声明给模型）。
+    pub codemode_only: bool,
     pub log: Log,
 }
 
@@ -551,6 +553,7 @@ impl TestTool {
             prepares: AtomicUsize::new(0),
             input_runs: Mutex::new(Vec::new()),
             outward: false,
+            codemode_only: false,
             log: log.clone(),
         }
     }
@@ -717,6 +720,14 @@ impl Tool for TestTool {
 
     fn outward(&self) -> bool {
         self.outward
+    }
+
+    fn exposure(&self) -> komo_kernel::types::tool::ToolExposure {
+        if self.codemode_only {
+            komo_kernel::types::tool::ToolExposure::Codemode
+        } else {
+            komo_kernel::types::tool::ToolExposure::Direct
+        }
     }
 }
 

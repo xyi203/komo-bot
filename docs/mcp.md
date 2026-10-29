@@ -49,7 +49,8 @@ outward          = ["publish_*"]       # 对外工具：无人值守的 Run 调�
 - 校验：服务器名只能是字母、数字、`_`、`-`（它要进工具名）；`read_only` / `outward` 写了 `tools`
   白名单之外的名字是警告；声明了 `outward` 却没有渠道配 `home_chat` 也是警告（确认卡投不到人）。
 - `outward`（2026-10-29）：原名或带 `*` 的模式，任一匹配就算对外。同 `read_only`，只信操作者的声明，
-  不信服务器自报。codemode 脚本里在无人值守的 Run 中调它直接被拒，要到顶层调（`docs/confirm.md` §7）。
+  不信服务器自报。codemode 脚本里在无人值守的 Run 中调它直接被拒，要到顶层调；所以无人值守的 Run 把
+  `codemode` 暴露的对外工具也声明给模型（`docs/confirm.md` §7）。
 
 ### 2.1 OAuth（2026-10-14）
 

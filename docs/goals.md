@@ -119,6 +119,16 @@ area:  active → retired →（reopen）active
 - 不带的会话：`memory = off`、`memory = private`、fork 沿用父的块（同约定）。
 - 召回块的 entry 结构、`data.uses` 不变，事项与记忆的 `id@revision` 共用一个去重集合（两种 id 不会撞）。
 
+**实现记录（P1b，2026-10-29）。**
+
+- **接缝。** 渲染函数指针 `RenderInjection` 多收三个参数：此刻该带的事项、Gateway 本地今天（读"已超期"）、`matter_tokens`；实现是 `komo_agent::context::memory::render_block`，旧的 `render_run`（4 参）留作无事项的薄封装。`MemoryManager::recall_for_run` 多一个 `shown_matters: Option<&[MatterUse]>`：`None` = 不带事项（`memory = private`），`Some` = 带，减去其中已展示的；事项只经 `open_matters()` 读。`revalidate_matters` 是事项版的 `revalidate`（版本没变、仍是 active / waiting 目标或 active 领域才算活）。
+- **使用记录。** 事项与记忆分开存，没有共用 id 类型：`MatterUse { matter, revision }`（kernel `types::matter`），`Injection.matter_uses` 与 `RecallData.matters`（`#[serde(default, skip_serializing_if = "Vec::is_empty")]`，旧 entry 读成空、写回不多出字段）。"共用去重集合"落在行的收尾上：事项行也以 `· id@revision〕` 收尾（没有别的字段时是 `〔id@revision〕`），`without` / `shown_uses` 的认行方式扩成 `without_all` / `shown_matters`，事项组标题与记忆两组一样，空了就连标题去掉。
+- **失效。** gateway `hooks/recall.rs` 每轮请求前连记忆一起核对，事项失效走同一条 `komo.memory.revoke`（`revoked` 里多一个 `matters` 列表）。超期是读出来的、不升版，所以截止日期过了那一天已展示的旧块不会改写，下一段才读到"已超期"。
+- **预算与诊断。** `[memory.retrieval] matter_tokens`（默认 600，随 `retrieval` 热重载，同 `convention_tokens`）；超出按更新时间从旧到新截，截不下的那条起后面更旧的也不再放；显示顺序目标在前、领域在后各按创建先后。`RecallDiagnostics.matters_over_budget`，`komo run inspect` 召回行显示"事项超出预算 N 条"。`memory.enabled = false` 时整个召回不跑，事项也不带（事项组借记忆的召回块出场）。
+- **没做。** `komo init` 的注释与 `komo_bot.md` 的配置样例没有补 `matter_tokens`；超期读的今天在 runtime 里与 gateway `http/matters.rs` 各有一份同口径的小函数。
+
+测试（单测未跑，待汇总）：agent `matter_lines_carry_next_due_waiting_and_standard_and_come_before_conventions`、`a_bare_matter_still_ends_in_its_id_and_revision`、`matter_overflow_drops_the_oldest_updated_first_and_is_counted`、`without_all_drops_matter_lines_and_the_group_they_empty`；kernel `an_old_recall_entry_without_matters_still_parses`；gateway hooks `a_matter_shows_on_the_first_run_and_is_not_repeated_in_the_segment`、`parking_rewrites_the_old_block_and_a_new_revision_arrives_on_the_next_run`（搁置与改下一步）、`closing_one_of_several_matters_rewrites_the_block_without_that_line`、`waiting_goals_and_areas_are_injected_with_their_own_fields`、`private_and_off_sessions_get_no_matters`、`matters_over_budget_are_cut_and_counted`。`cargo check --workspace --tests` 与 `cargo fmt` 通过。
+
 ## 6. 记忆归属与结案归档（P1c）
 
 规格在 `memory.md`：§9.2 归属字段 `belongs_to`、`archived` 状态，§9.4 注入分层与 `push_unattached`，§9.6 结案时线索归档、约定问一次。这里只列与事项相接的两处：

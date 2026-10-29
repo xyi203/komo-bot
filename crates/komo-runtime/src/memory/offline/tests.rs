@@ -12,6 +12,7 @@ use komo_kernel::protocol::http::{
 use komo_kernel::test_support::ScriptedLlm;
 use komo_kernel::traits::{Clock, LlmClient, MemoryRepo};
 use komo_kernel::types::ids::{EventId, MemoryId, Seq, SessionId};
+use komo_kernel::types::matter::{Date, Matter};
 use komo_kernel::types::memory::{
     Confirmation, Evidence, EvidenceRef, ExtractionMetadata, Injection, MemoryApplication,
     MemoryItem, MemoryKind, MemoryScope, MemoryState, Provenance, RetrievalMode,
@@ -140,7 +141,15 @@ fn model() -> ModelConfig {
     }
 }
 
-fn render(_: &[MemoryItem], _: &[MemoryItem], _: u32, _: u32) -> Injection {
+fn render(
+    _: &[MemoryItem],
+    _: &[MemoryItem],
+    _: &[Matter],
+    _: Date,
+    _: u32,
+    _: u32,
+    _: u32,
+) -> Injection {
     Injection::default()
 }
 

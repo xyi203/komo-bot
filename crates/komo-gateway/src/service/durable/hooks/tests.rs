@@ -13,9 +13,11 @@ use komo_kernel::durable::{
     Content, ContextEdit, ContextView, ConversationId, EditAction, EntryId, EntryRecord, Message,
     Sections, SubmissionId, SystemMessage, TaskId, derive_context,
 };
+use komo_kernel::protocol::matter::{MatterActionRequest, MatterAddRequest};
 use komo_kernel::traits::{OutputWriter, Tool};
 use komo_kernel::types::delegate::DelegateContract;
 use komo_kernel::types::ids::MemoryId;
+use komo_kernel::types::matter::{Matter, MatterKind, MatterVerb};
 use komo_kernel::types::memory::{
     Confirmation, ExtractionMetadata, MemoryItem, MemoryKind, MemoryScope, MemoryState,
     MemoryUsage, Provenance,
@@ -29,6 +31,7 @@ use komo_runtime::durable::harness::{
     AgentHooks, ContextRequest, HookError, OrchestrationHooks, SubmissionDraft, TaskDoc,
 };
 use komo_runtime::durable::{ConversationOwnership, EntryDraft};
+use komo_runtime::matter::Caller;
 
 use super::GatewayHooks;
 use crate::service::durable::agent_doc::{self, AgentDoc};
@@ -990,6 +993,235 @@ async fn memory_off_brings_no_conventions() {
     };
     transcript.input("你好");
     assert!(transcript.ask(&hooks, 1).await.is_empty());
+}
+
+// ---------------------------------------------------------------- 事项组（`docs/goals.md` §5）
+
+async fn add_goal(state: &crate::service::state::GatewayState, title: &str, next: &str) -> Matter {
+    state
+        .matters
+        .add(
+            &MatterAddRequest {
+                kind: MatterKind::Goal,
+                title: title.into(),
+                next: Some(next.into()),
+                due: None,
+                standard: None,
+                session: None,
+                run: None,
+                request_key: None,
+            },
+            &Caller::Operator,
+        )
+        .await
+        .unwrap()
+}
+
+async fn act(
+    state: &crate::service::state::GatewayState,
+    matter: &Matter,
+    verb: MatterVerb,
+    request: MatterActionRequest,
+) -> Matter {
+    state
+        .matters
+        .apply(&matter.id, verb, &request, &Caller::Operator)
+        .await
+        .unwrap()
+}
+
+async fn fresh_transcript(world: &World) -> Transcript {
+    Transcript {
+        conversation: world.conversation(Some(agent("assistant"))).await,
+        entries: Vec::new(),
+    }
+}
+
+/// 进行中的目标第一个 Run 就带上（不过门槛，用户这句话与它一个字都不沾），同一段里第二个 Run
+/// 不重复：只落一条没有 `model` 的记录。
+#[tokio::test]
+async fn a_matter_shows_on_the_first_run_and_is_not_repeated_in_the_segment() {
+    let world = World::new(&config_with("", KEYWORD_MEMORY), finisher()).await;
+    let state = world.gateway.state();
+    let goal = add_goal(state, "把 owl 发布观察做完", "看 AB 组的 5xx").await;
+    let hooks = world.hooks();
+    let mut transcript = fresh_transcript(&world).await;
+
+    transcript.input("你好");
+    let drafts = transcript.ask(&hooks, 1).await;
+    let text = model_text(&drafts[0]);
+    assert!(text.contains("你在做和在管的事"), "{text}");
+    assert!(
+        text.contains(&format!("下一步：看 AB 组的 5xx · {}@1〕", goal.id)),
+        "{text}"
+    );
+    assert_eq!(
+        drafts[0].data.as_ref().unwrap()["matters"][0]["revision"],
+        1
+    );
+    transcript.push(drafts.into_iter().next().unwrap());
+
+    transcript.input("再聊一句");
+    let drafts = transcript.ask(&hooks, 2).await;
+    assert_eq!(drafts.len(), 1, "{drafts:?}");
+    assert!(drafts[0].model.is_none(), "{drafts:?}");
+}
+
+/// 搁置后旧块被改写（只剩它一条就整块 `omit`）；改了下一步则旧版本失效、新版本在下一个 Run 补上。
+#[tokio::test]
+async fn parking_rewrites_the_old_block_and_a_new_revision_arrives_on_the_next_run() {
+    let world = World::new(&config_with("", KEYWORD_MEMORY), finisher()).await;
+    let state = world.gateway.state();
+    let first = add_goal(state, "把 owl 发布观察做完", "看 AB 组的 5xx").await;
+    let second = add_goal(state, "整理周报模板", "先列大纲").await;
+    let hooks = world.hooks();
+    let mut transcript = fresh_transcript(&world).await;
+    transcript.input("你好");
+    let drafts = transcript.ask(&hooks, 1).await;
+    transcript.push(drafts.into_iter().next().unwrap());
+    let block = transcript.entries[1].id;
+
+    // 搁置第二个、改第一个的下一步：旧块里两行都失效，整块去掉。
+    act(state, &second, MatterVerb::Park, Default::default()).await;
+    let moved = act(
+        state,
+        &first,
+        MatterVerb::Next,
+        MatterActionRequest {
+            next: Some("对一下 CI 的耗时".into()),
+            ..Default::default()
+        },
+    )
+    .await;
+    transcript.input("接着说");
+    let drafts = transcript.ask(&hooks, 2).await;
+    assert_eq!(drafts.len(), 2, "{drafts:?}");
+    assert_eq!(drafts[0].kind, MEMORY_REVOKE_ENTRY_KIND);
+    assert_eq!(drafts[0].edits, vec![ContextEdit::omit(block)]);
+    let text = model_text(&drafts[1]);
+    assert!(
+        text.contains("对一下 CI 的耗时")
+            && text.contains(&format!("{}@{}〕", moved.id, moved.revision)),
+        "{text}"
+    );
+    assert!(!text.contains("整理周报模板"), "搁置的不带：{text}");
+    transcript.push(drafts.into_iter().next().unwrap());
+    assert!(!joined(&transcript.view()).contains("看 AB 组的 5xx"));
+}
+
+/// 只失效一条时旧块改写成少一行的视图，其余事项行不动；结案的事项同样掉出去。
+#[tokio::test]
+async fn closing_one_of_several_matters_rewrites_the_block_without_that_line() {
+    let world = World::new(&config_with("", KEYWORD_MEMORY), finisher()).await;
+    let state = world.gateway.state();
+    let first = add_goal(state, "把 owl 发布观察做完", "看 AB 组的 5xx").await;
+    add_goal(state, "整理周报模板", "先列大纲").await;
+    let hooks = world.hooks();
+    let mut transcript = fresh_transcript(&world).await;
+    transcript.input("你好");
+    let drafts = transcript.ask(&hooks, 1).await;
+    transcript.push(drafts.into_iter().next().unwrap());
+
+    act(state, &first, MatterVerb::Done, Default::default()).await;
+    let drafts = transcript.ask(&hooks, 1).await;
+    assert_eq!(drafts.len(), 1, "{drafts:?}");
+    assert_eq!(drafts[0].kind, MEMORY_REVOKE_ENTRY_KIND);
+    transcript.push(drafts.into_iter().next().unwrap());
+    let view = joined(&transcript.view());
+    assert!(
+        !view.contains("owl 发布观察") && view.contains("整理周报模板"),
+        "{view}"
+    );
+}
+
+/// 等待中的目标带"在等"；领域带"标准"；进行中的领域也带。
+#[tokio::test]
+async fn waiting_goals_and_areas_are_injected_with_their_own_fields() {
+    let world = World::new(&config_with("", KEYWORD_MEMORY), finisher()).await;
+    let state = world.gateway.state();
+    let goal = add_goal(state, "owl 发布工单", "催审批").await;
+    act(
+        state,
+        &goal,
+        MatterVerb::Wait,
+        MatterActionRequest {
+            waiting_for: Some("SRE 审批".into()),
+            ..Default::default()
+        },
+    )
+    .await;
+    state
+        .matters
+        .add(
+            &MatterAddRequest {
+                kind: MatterKind::Area,
+                title: "告警值班轮换".into(),
+                next: None,
+                due: None,
+                standard: Some("每周一前完成".into()),
+                session: None,
+                run: None,
+                request_key: None,
+            },
+            &Caller::Operator,
+        )
+        .await
+        .unwrap();
+    let hooks = world.hooks();
+    let mut transcript = fresh_transcript(&world).await;
+    transcript.input("你好");
+    let text = model_text(&transcript.ask(&hooks, 1).await[0]);
+    assert!(
+        text.contains("目标（等待中）：owl 发布工单〔在等：SRE 审批"),
+        "{text}"
+    );
+    assert!(
+        text.contains("领域：告警值班轮换〔标准：每周一前完成"),
+        "{text}"
+    );
+}
+
+/// `memory = private` 与 `off` 的会话不带事项；共享的会话带。
+#[tokio::test]
+async fn private_and_off_sessions_get_no_matters() {
+    for mode in ["private", "off"] {
+        let world = World::new(
+            &config_with(&format!("memory = \"{mode}\""), KEYWORD_MEMORY),
+            finisher(),
+        )
+        .await;
+        add_goal(world.gateway.state(), "把 owl 发布观察做完", "看 5xx").await;
+        let hooks = world.hooks();
+        let mut transcript = fresh_transcript(&world).await;
+        transcript.input("你好");
+        let drafts = transcript.ask(&hooks, 1).await;
+        assert!(
+            drafts.iter().all(|draft| draft.model.is_none()),
+            "{mode}：{drafts:?}"
+        );
+    }
+}
+
+/// 超出 `matter_tokens` 的按更新时间从旧到新截掉，数量记在召回记录里；截掉的不回落到检索。
+#[tokio::test]
+async fn matters_over_budget_are_cut_and_counted() {
+    // 抬头约 47 个字符，一行（带 36 位的 id）约 50：120 只放得下一条。
+    let config =
+        "[memory]\nenabled = true\n\n[memory.retrieval]\nmode = \"keyword\"\nmatter_tokens = 120\n";
+    let world = World::new(&config_with("", config), finisher()).await;
+    let state = world.gateway.state();
+    add_goal(state, "目标甲", "一").await;
+    add_goal(state, "目标乙", "二").await;
+    let hooks = world.hooks();
+    let mut transcript = fresh_transcript(&world).await;
+    transcript.input("你好");
+    let drafts = transcript.ask(&hooks, 1).await;
+    let text = model_text(&drafts[0]);
+    assert_eq!(text.matches("- 目标：").count(), 1, "{text}");
+    assert_eq!(
+        drafts[0].data.as_ref().unwrap()["recall"]["matters_over_budget"],
+        1
+    );
 }
 
 /// skills 目录行同样钉住（W4b）：展示过之后注册表变了（多了 skill、重载），已展示的那份原样不动，

@@ -266,6 +266,9 @@ fn recall_line(recall: &RecallDiagnostics) -> String {
     if let Some(over) = recall.conventions_over_budget.filter(|over| *over > 0) {
         cells.push(format!("约定超出预算 {over} 条"));
     }
+    if let Some(over) = recall.matters_over_budget.filter(|over| *over > 0) {
+        cells.push(format!("事项超出预算 {over} 条"));
+    }
     cells.join(" · ")
 }
 

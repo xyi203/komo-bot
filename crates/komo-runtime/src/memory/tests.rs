@@ -274,6 +274,7 @@ fn memory_config(enabled: bool, mode: RetrievalMode) -> MemoryConfig {
             top_k: 8,
             max_tokens: 1500,
             convention_tokens: 800,
+            matter_tokens: 600,
             rerank: false,
             rerank_shortlist: 20,
             min_similarity: 0.0,
@@ -291,8 +292,11 @@ fn memory_config(enabled: bool, mode: RetrievalMode) -> MemoryConfig {
 fn test_render(
     resident: &[MemoryItem],
     items: &[MemoryItem],
+    _matters: &[Matter],
+    _today: Date,
     _max_tokens: u32,
     _convention_tokens: u32,
+    _matter_tokens: u32,
 ) -> Injection {
     let items: Vec<MemoryItem> = resident.iter().chain(items).cloned().collect();
     if items.is_empty() {
@@ -310,6 +314,7 @@ fn test_render(
     Injection {
         text: Some(lines.join("\n")),
         uses,
+        matter_uses: Vec::new(),
         diagnostics: None,
     }
 }

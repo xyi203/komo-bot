@@ -290,6 +290,7 @@ fn inspected_detail() -> RunDetail {
         candidates_after_fusion: Some(8),
         dropped_by_budget: Some(2),
         conventions_over_budget: None,
+        matters_over_budget: None,
         arm_scores: vec![],
         dropped_by_threshold: None,
         reused_pin: false,

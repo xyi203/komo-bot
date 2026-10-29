@@ -17,7 +17,9 @@ use std::fmt;
 use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
-use time::{Date, OffsetDateTime};
+// 渲染函数（`komo-agent`，不依赖 `time`）要在签名里写出日期类型。
+pub use time::Date;
+use time::OffsetDateTime;
 
 use super::ids::MatterId;
 use super::memory::Evidence;
@@ -189,6 +191,31 @@ impl Matter {
         self.kind == MatterKind::Goal
             && !self.state.is_closed()
             && self.due.is_some_and(|due| due < today)
+    }
+}
+
+/// 召回块里展示着某个事项的哪一版（`id@revision`，`docs/goals.md` §5）。与记忆的
+/// [`MemoryUse`](super::turn::MemoryUse) 分开存：两种 id 不会撞，但去重与失效各查各的仓储。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MatterUse {
+    pub matter: MatterId,
+    pub revision: u32,
+}
+
+impl Matter {
+    /// 这一版此刻该不该进召回块（§5）：goal 的 `active` / `waiting`，area 的 `active`。
+    pub fn is_injectable(&self) -> bool {
+        match self.kind {
+            MatterKind::Goal => matches!(self.state, MatterState::Active | MatterState::Waiting),
+            MatterKind::Area => self.state == MatterState::Active,
+        }
+    }
+
+    pub fn as_use(&self) -> MatterUse {
+        MatterUse {
+            matter: self.id.clone(),
+            revision: self.revision,
+        }
     }
 }
 

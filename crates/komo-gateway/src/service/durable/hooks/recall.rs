@@ -11,6 +11,9 @@
 //!    用户消息；选定的条目去掉本段已展示的，剩下的渲染成一条带 `komoOrigin = memory` 的 user 消息。
 //!    一条不剩（或召回失败）也落一条**没有 `model`** 的记录：不进上下文，只让之后知道召回过。
 //!
+//! 召回块最前面的事项组（`docs/goals.md` §5）走同一套：已展示的 `id@revision` 记在 `RecallData.matters`，
+//! 每轮请求前连同记忆一起核对、改写；`memory = private` 的会话不带事项。
+//!
 //! fork 任务什么都不做：它的上下文接着父的（连父的召回块），首请求要与父的上一次逐字节同前缀。
 //!
 //! [`AgentHooks::context_entries`]: komo_runtime::durable::harness::AgentHooks::context_entries
@@ -18,7 +21,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use komo_agent::context::memory::{shown_uses, without};
+use komo_agent::context::memory::{shown_matters, shown_uses, without_all};
 use komo_kernel::durable::recall::{
     MEMORY_ORIGIN, MEMORY_RECALL_ENTRY_KIND, MEMORY_REVOKE_ENTRY_KIND, RecallData,
 };
@@ -26,6 +29,8 @@ use komo_kernel::durable::{
     Content, ContentBlock, ContextEdit, EntryId, EntryRecord, HOST_ORIGIN_KEY, Message,
     UserMessage, legacy_ids,
 };
+use komo_kernel::types::agent::MemoryMode;
+use komo_kernel::types::matter::MatterUse;
 use komo_kernel::types::memory::scope_allowed;
 use komo_kernel::types::turn::MemoryUse;
 use komo_runtime::durable::EntryDraft;
@@ -42,6 +47,7 @@ struct Shown {
     message: UserMessage,
     text: String,
     uses: Vec<MemoryUse>,
+    matters: Vec<MatterUse>,
 }
 
 pub(super) async fn entries(
@@ -62,7 +68,9 @@ pub(super) async fn entries(
 
     let blocks = shown_blocks(&records, &request);
     let mut shown: Vec<MemoryUse> = blocks.iter().flat_map(|b| b.uses.clone()).collect();
-    if !shown.is_empty() {
+    let mut shown_matter_uses: Vec<MatterUse> =
+        blocks.iter().flat_map(|b| b.matters.clone()).collect();
+    if !shown.is_empty() || !shown_matter_uses.is_empty() {
         let now = state.clock.now();
         let alive: Vec<MemoryUse> = state
             .memories
@@ -79,10 +87,13 @@ pub(super) async fn entries(
                 revision: item.revision,
             })
             .collect();
-        if let Some(revoke) = revoke(&blocks, &alive) {
+        // 事项（`docs/goals.md` §5）：版本变了、搁置、结案、删除都算失效，走同一条改写路径。
+        let alive_matters = state.memories.revalidate_matters(&shown_matter_uses).await;
+        if let Some(revoke) = revoke(&blocks, &alive, &alive_matters) {
             out.push(revoke);
         }
         shown = alive;
+        shown_matter_uses = alive_matters;
     }
 
     let (Some(run), Some(scopes)) = (request.run, scopes) else {
@@ -94,11 +105,19 @@ pub(super) async fn entries(
     let text = latest_user_text(&request.view.messages).unwrap_or_default();
     let injection = state
         .memories
-        .recall_for_run(&legacy_ids::run_id(run), &text, &shown, &scopes)
+        .recall_for_run(
+            &legacy_ids::run_id(run),
+            &text,
+            &shown,
+            &scopes,
+            // 事项不分作用域：私有记忆的 Agent 不带（`memory = private`，`docs/goals.md` §5）。
+            (resolved.profile.memory != MemoryMode::Private).then_some(&shown_matter_uses[..]),
+        )
         .await;
     let data = RecallData {
         submission: run,
         uses: injection.uses,
+        matters: injection.matter_uses,
         recall: injection.diagnostics,
         at: request.now,
     };
@@ -133,18 +152,24 @@ fn shown_blocks(
             };
             let text = content_text(&message.content);
             let uses = shown_uses(&text, &data.uses);
-            (!uses.is_empty()).then(|| Shown {
+            let matters = shown_matters(&text, &data.matters);
+            (!uses.is_empty() || !matters.is_empty()).then(|| Shown {
                 entry: *id,
                 message: message.clone(),
                 text,
                 uses,
+                matters,
             })
         })
         .collect()
 }
 
 /// 有失效的条目就交回一条改写旧块的 write entry（只带 `edits`）。
-fn revoke(blocks: &[Shown], alive: &[MemoryUse]) -> Option<EntryDraft> {
+fn revoke(
+    blocks: &[Shown],
+    alive: &[MemoryUse],
+    alive_matters: &[MatterUse],
+) -> Option<EntryDraft> {
     let mut edits = Vec::new();
     let mut revoked = Vec::new();
     for block in blocks {
@@ -154,10 +179,16 @@ fn revoke(blocks: &[Shown], alive: &[MemoryUse]) -> Option<EntryDraft> {
             .filter(|use_| !alive.contains(use_))
             .cloned()
             .collect();
-        if dead.is_empty() {
+        let dead_matters: Vec<MatterUse> = block
+            .matters
+            .iter()
+            .filter(|use_| !alive_matters.contains(use_))
+            .cloned()
+            .collect();
+        if dead.is_empty() && dead_matters.is_empty() {
             continue;
         }
-        edits.push(match without(&block.text, &dead) {
+        edits.push(match without_all(&block.text, &dead, &dead_matters) {
             Some(text) => ContextEdit::replace(
                 block.entry,
                 vec![Message::User(UserMessage {
@@ -167,7 +198,7 @@ fn revoke(blocks: &[Shown], alive: &[MemoryUse]) -> Option<EntryDraft> {
             ),
             None => ContextEdit::omit(block.entry),
         });
-        revoked.push(json!({ "entry": block.entry, "uses": dead }));
+        revoked.push(json!({ "entry": block.entry, "uses": dead, "matters": dead_matters }));
     }
     if edits.is_empty() {
         return None;

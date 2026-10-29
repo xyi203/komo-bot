@@ -84,7 +84,7 @@ async fn bash_input_run_finds_user_evidence_without_changing_output_paths() {
             Arc::new(|_| (MemoryMode::Shared, "test".into())),
         )),
         clock,
-        render: |_, _, _, _| Default::default(),
+        render: |_, _, _, _, _, _, _| Default::default(),
     });
     let command = "printf '%s\\n%s\\n' \"$KOMO_SESSION\" \"$KOMO_RUN\" > identity";
     for kind in ["bash", "codemode", "then_run"] {

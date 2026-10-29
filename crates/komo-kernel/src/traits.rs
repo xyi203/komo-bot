@@ -473,6 +473,12 @@ pub trait Tool: Send + Sync {
     fn namespace(&self) -> Option<ToolNamespace> {
         None
     }
+
+    /// 这个工具会不会替用户对外做事（发消息、提单、改线上配置，`docs/confirm.md`）。无人值守
+    /// 的 Run 调对外工具要先等操作者确认。默认 `false`：现有内置工具都不对外，bash 也不在内。
+    fn outward(&self) -> bool {
+        false
+    }
 }
 
 // ---------------------------------------------------------------- 监听

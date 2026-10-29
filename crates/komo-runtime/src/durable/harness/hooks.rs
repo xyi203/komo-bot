@@ -121,8 +121,11 @@ pub struct ToolEnv {
     /// 用户插话的旗子（`docs/monitor.md` §8）：gateway 在用户往忙着的对话会话里插话时举起它，前台
     /// 的长 `bash` 提前转后台。`None` = 没人会举（任务会话、cron、测试替身）；嵌套调用不用它。
     pub interjected: Option<InterjectSignal>,
-    /// 对话会话里直接受理的 Run（`bash` 拒绝 10 秒以上的 `sleep`）。
+    /// 对话会话里直接受理的 Run（`bash` 拒绝 10 秒以上的 `sleep`）。不是的（任务会话、cron）
+    /// 一律无人值守：调对外工具要先确认（`docs/confirm.md` §3）。
     pub conversation: bool,
+    /// 无人值守的 Run 调对外工具时，确认卡等多久（`[execution] confirm_timeout_mins`）。
+    pub confirm_timeout: Duration,
     /// 这个 Session 的工具输出目录（`tool-output/{conversation}/{tool_task}/{attempt}/`）。
     pub outputs: Arc<dyn ToolOutputStore>,
     /// 图片引用 → 字节（组请求时读回，§3.5）。

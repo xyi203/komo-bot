@@ -6,6 +6,7 @@ mod support;
 
 mod codemode;
 mod compaction;
+mod confirm;
 mod generation;
 mod inbox;
 mod memory;

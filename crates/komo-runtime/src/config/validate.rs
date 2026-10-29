@@ -8,7 +8,7 @@
 //! （装填时空值不入表），所以校验函数拿不到、也不需要凭证的值。
 
 use komo_kernel::protocol::config::{
-    ChannelConfig, ConfigIssue, ConfigSnapshot, IssueSeverity, KeyPath,
+    ChannelConfig, ConfigIssue, ConfigSnapshot, IssueSeverity, KeyPath, glob_matches,
 };
 use komo_kernel::types::agent::MemoryMode;
 use komo_kernel::types::chat::{ChannelPlatform, PeerId};
@@ -515,7 +515,7 @@ fn check_compaction(snapshot: &ConfigSnapshot, issues: &mut Vec<ConfigIssue>) {
 }
 
 /// `[mcp.servers.<name>]`（`docs/mcp.md`）：名字要进工具名（`mcp__<name>__<tool>`），只能是
-/// 字母、数字、`_`、`-`；`read_only` 写了白名单之外的工具是笔误，不会生效。
+/// 字母、数字、`_`、`-`；`read_only` / `outward` 写了白名单之外的工具是笔误，不会生效。
 fn check_mcp(snapshot: &ConfigSnapshot, issues: &mut Vec<ConfigIssue>) {
     for (name, server) in &snapshot.mcp {
         let key = format!("mcp.servers.{name}");
@@ -535,6 +535,16 @@ fn check_mcp(snapshot: &ConfigSnapshot, issues: &mut Vec<ConfigIssue>) {
                     issues.push(warning(
                         &format!("{key}.read_only"),
                         format!("`{tool}` 不在 tools 里，这条只读声明不会生效"),
+                    ));
+                }
+            }
+            for pattern in &server.outward {
+                if !tools.iter().any(|tool| {
+                    tool == pattern || (pattern.contains('*') && glob_matches(pattern, tool))
+                }) {
+                    issues.push(warning(
+                        &format!("{key}.outward"),
+                        format!("`{pattern}` 没匹配上 tools 里的任何工具，这条对外声明不会生效"),
                     ));
                 }
             }
@@ -731,6 +741,7 @@ mod tests {
             description: None,
             exposure: Default::default(),
             tool_exposure: Default::default(),
+            outward: vec![],
         }
     }
 
@@ -741,6 +752,21 @@ mod tests {
             .mcp
             .insert("my server".into(), mcp_server(None, vec![]));
         assert_eq!(keys(&validate(&snapshot)), vec!["mcp.servers.my server"]);
+    }
+
+    #[test]
+    fn an_outward_pattern_matching_no_allowed_tool_is_a_warning() {
+        let mut snapshot = snapshot_fixture();
+        let mut server = mcp_server(Some(vec!["search", "push_branch"]), vec![]);
+        server.outward = vec!["push_*".into(), "delete".into()];
+        snapshot.mcp.insert("gh".into(), server);
+        let issues = validate(&snapshot);
+        assert_eq!(keys(&issues), vec!["mcp.servers.gh.outward"]);
+        assert!(
+            issues[0].message.contains("`delete`"),
+            "{}",
+            issues[0].message
+        );
     }
 
     #[test]

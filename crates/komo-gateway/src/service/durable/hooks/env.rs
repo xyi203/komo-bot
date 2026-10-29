@@ -143,6 +143,7 @@ pub(crate) fn build(
         // 用户插话的旗子：只有对话会话会转后台，也只有它们会被插话顶到。
         interjected: conversation.then(|| state.durable.interjection(resolved.conversation)),
         conversation,
+        confirm_timeout: Duration::from_secs(config.execution.confirm_timeout_mins * 60),
         outputs,
         images: Some(Arc::new(SessionImages {
             paths: session_paths,

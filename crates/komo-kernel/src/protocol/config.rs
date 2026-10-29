@@ -95,6 +95,10 @@ pub struct McpServerConfig {
     /// 按工具覆盖 `exposure`：键是服务器上的工具原名，或带 `*` 的模式。
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub tool_exposure: BTreeMap<String, McpExposure>,
+    /// 操作者认定为"对外"的工具（原名或带 `*` 的模式）：无人值守的 Run 调它先发确认卡
+    /// （`docs/confirm.md`）。同 `read_only`，不信服务器自报。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub outward: Vec<String>,
 }
 
 /// MCP 工具给模型的方式（照 pi 的 `exposure`，没有 `deferred`：komo 没有 `tool_search`）。
@@ -134,6 +138,13 @@ impl McpServerConfig {
             })
             .map(|(_, exposure)| *exposure)
             .unwrap_or(self.exposure)
+    }
+
+    /// 这个工具（服务器上的原名）是否声明为对外：`outward` 里有原名，或有一条模式匹配它。
+    pub fn outward_of(&self, tool: &str) -> bool {
+        self.outward.iter().any(|pattern| {
+            pattern == tool || (pattern.contains('*') && glob_matches(pattern, tool))
+        })
     }
 }
 
@@ -482,6 +493,9 @@ pub struct ExecutionConfig {
     pub decay_head_bytes: usize,
     #[serde(default = "default_decay_tail_bytes")]
     pub decay_tail_bytes: usize,
+    /// 无人值守的 Run 调对外工具时，确认卡等多久（分钟，`docs/confirm.md` §5）。到点不执行。
+    #[serde(default = "default_confirm_timeout_mins")]
+    pub confirm_timeout_mins: u64,
 }
 
 impl ExecutionConfig {
@@ -529,6 +543,13 @@ fn default_call_timeout_secs() -> u64 {
 
 pub const DEFAULT_DETACH_AFTER_SECS: u64 = 120;
 
+/// 24 小时，同 monitor 的上限。
+pub const DEFAULT_CONFIRM_TIMEOUT_MINS: u64 = 1440;
+
+fn default_confirm_timeout_mins() -> u64 {
+    DEFAULT_CONFIRM_TIMEOUT_MINS
+}
+
 fn default_detach_after_secs() -> u64 {
     DEFAULT_DETACH_AFTER_SECS
 }
@@ -552,6 +573,7 @@ impl Default for ExecutionConfig {
             decay_full_sends: DEFAULT_DECAY_FULL_SENDS,
             decay_head_bytes: DEFAULT_DECAY_HEAD_BYTES,
             decay_tail_bytes: DEFAULT_DECAY_TAIL_BYTES,
+            confirm_timeout_mins: DEFAULT_CONFIRM_TIMEOUT_MINS,
         }
     }
 }
@@ -935,6 +957,7 @@ mod tests {
             description: None,
             exposure: McpExposure::default(),
             tool_exposure: BTreeMap::new(),
+            outward: vec![],
         };
         let empty = snapshot();
         let mut one = snapshot();
@@ -1015,6 +1038,26 @@ mod tests {
 
     /// `tool_exposure`：原名最优先；模式里字面部分最长的赢；都不中就是服务器的 `exposure`。
     #[test]
+    fn outward_matches_exact_names_and_patterns() {
+        let server = McpServerConfig {
+            transport: McpTransport::Stdio {
+                command: "x".into(),
+                args: vec![],
+                env: vec![],
+            },
+            tools: None,
+            read_only: vec![],
+            description: None,
+            exposure: McpExposure::Codemode,
+            tool_exposure: BTreeMap::new(),
+            outward: vec!["issue_transit".into(), "apollo_*".into()],
+        };
+        assert!(server.outward_of("issue_transit"));
+        assert!(server.outward_of("apollo_apply_change"));
+        assert!(!server.outward_of("issue_get_info"));
+    }
+
+    #[test]
     fn tool_exposure_prefers_exact_names_then_the_most_specific_pattern() {
         let mut server = McpServerConfig {
             transport: McpTransport::Stdio {
@@ -1027,6 +1070,7 @@ mod tests {
             description: None,
             exposure: McpExposure::Direct,
             tool_exposure: BTreeMap::new(),
+            outward: vec![],
         };
         server
             .tool_exposure

@@ -12,7 +12,11 @@
 //! { "phase": "execute", "arguments": {…}, "plan": {…ExecutionPlan…}, "replay": "safe", "attempt": 1 }
 //! { "phase": "probe", …同 execute…, "child": { "pid": 4242, "pgid": 4242, "startedAt": 1761206400000 },
 //!   "until": 1761206405000 }
+//! { "phase": "confirm", "arguments": {…}, "plan": {…}, "replay": "unsafe", "askedAt": …, "deadline": … }
 //! ```
+//!
+//! `confirm`（`docs/confirm.md`）：无人值守的 Run 调对外工具，`prepare` 之后先停在这里等操作者答复
+//! （`confirm.rs`），批准了才提交意图；拒绝或到点按没执行收尾。
 //!
 //! # effect sandwich
 //!
@@ -70,6 +74,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::TOOL_KIND;
 use super::codemode as script;
+use super::confirm::{self, ConfirmVerdict};
 use super::entries::{self, TOOL_RESULT};
 use super::hooks::{HarnessDeps, HookError, ToolEnv, ToolSet};
 use super::live::{self, SlotStatus};
@@ -148,6 +153,16 @@ pub enum Checkpoint {
         child: ChildRef,
         /// 下一次探测的时刻（`Line` 时钟，毫秒）。
         until: i64,
+    },
+    /// 无人值守的 Run 调对外工具：计划已定、没执行，等操作者答复（`docs/confirm.md` §5）。重启后
+    /// 接着等，不执行也不重发卡。
+    Confirm {
+        arguments: Value,
+        plan: Box<ExecutionPlan>,
+        replay: Replay,
+        /// 进入等待的时刻与截止时刻（`Line` 时钟，毫秒）；到点还没答就不执行。
+        asked_at: i64,
+        deadline: i64,
     },
     /// 编排调用（`task` / `monitor` / `monitor_stop`，见 [`orchestration`]）的效果已经提交，
     /// 只差落结果（或接着起 / 停进程）。`step` 的形状归 `orchestration::Step`。
@@ -528,6 +543,37 @@ impl ToolTask {
         if orchestration::handles(&plan.operation) {
             return orchestration::call(self, rt, &set, &call, input.assistant()?, plan).await;
         }
+        // 无人值守的 Run 调对外工具：先等操作者确认（`docs/confirm.md`）。脚本跑在 worker 的墙钟里，
+        // 等不了一张卡，直接拒，让模型到顶层调。
+        if tool.outward() && !confirm::attended(&set.env, rt).await? {
+            if call.nested.is_some() {
+                let message = confirm::not_in_scripts(&call.name);
+                return self.settle_unrun(rt, &set, &call, message).await;
+            }
+            let asked_at = rt.now()?;
+            let checkpoint = Checkpoint::Confirm {
+                arguments: call.arguments.clone(),
+                replay: plan.recovery.replay(),
+                plan: Box::new(plan),
+                asked_at,
+                deadline: asked_at + set.env.confirm_timeout.as_millis() as i64,
+            };
+            rt.commit_next(running(encode(&checkpoint))).await?;
+            return Ok(());
+        }
+        self.begin(rt, &set, &call, tool, plan).await
+    }
+
+    /// 提交意图（槽位 running + checkpoint execute，同一次提交），然后执行第一次尝试。
+    async fn begin(
+        &self,
+        rt: &TaskRuntime,
+        set: &ToolSet,
+        call: &Call,
+        tool: Arc<dyn Tool>,
+        plan: ExecutionPlan,
+    ) -> Result<(), TaskError> {
+        let conversation = rt.conversation();
         let replay = plan.recovery.replay();
         let checkpoint = Checkpoint::Execute {
             arguments: call.arguments.clone(),
@@ -550,7 +596,57 @@ impl ToolTask {
             })
         })
         .await?;
-        self.run(rt, &set, &call, tool, plan, 1, None).await
+        self.run(rt, set, call, tool, plan, 1, None).await
+    }
+
+    // ------------------------------------------------------------------ confirm
+
+    /// `confirm` 阶段：每拍读一次 `komo.confirm`，直到有答复或到点。批准了按当前工具集执行（等的
+    /// 时候工具可能被移走）；拒绝、到点都按没执行收尾，结果交给模型。取消时 `sleep_until` 拒绝，
+    /// 由 abort handler 收尾。
+    async fn confirm(
+        &self,
+        task: &RunningTask,
+        rt: &TaskRuntime,
+        plan: ExecutionPlan,
+        asked_at: i64,
+        deadline: i64,
+    ) -> Result<(), TaskError> {
+        let input = parse_input(task)?;
+        let call = self.read_call(rt, &input).await?;
+        let interval = self.deps.settings().probe_interval.as_millis() as i64;
+        let answer = loop {
+            if let Some(answer) = confirm::answer(rt).await? {
+                break Some(answer);
+            }
+            let now = rt.now()?;
+            if now >= deadline {
+                break None;
+            }
+            rt.sleep_until((now + interval).min(deadline)).await?;
+        };
+        let set = self.tools(rt.conversation()).await?;
+        match answer.map(|answer| answer.verdict) {
+            Some(ConfirmVerdict::Approve) => {
+                let Some(tool) = set.get(&call.name).cloned() else {
+                    let message = format!(
+                        "操作者批准了，但这次运行的工具集里已经没有 {}，没有执行。",
+                        call.name
+                    );
+                    return self.settle_unrun(rt, &set, &call, message).await;
+                };
+                self.begin(rt, &set, &call, tool, plan).await
+            }
+            Some(ConfirmVerdict::Reject) => {
+                let message = confirm::rejected(&call.name);
+                self.settle_unrun(rt, &set, &call, message).await
+            }
+            None => {
+                let minutes = (deadline - asked_at) / 60_000;
+                let message = confirm::timed_out(&call.name, minutes);
+                self.settle_unrun(rt, &set, &call, message).await
+            }
+        }
     }
 
     /// 没有执行的调用的结论（工具不认识、参数准备不出来、被拒）：落盘的是失败结果，不是
@@ -1057,6 +1153,12 @@ impl TaskKind for ToolTask {
                 self.probe(task, rt, arguments, *plan, replay, attempt, child, until)
                     .await
             }
+            Checkpoint::Confirm {
+                plan,
+                asked_at,
+                deadline,
+                ..
+            } => self.confirm(task, rt, *plan, asked_at, deadline).await,
             Checkpoint::Orchestrate { step } => {
                 let input = parse_input(task)?;
                 let call = self.read_call(rt, &input).await?;

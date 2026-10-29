@@ -192,6 +192,7 @@ pub(super) struct ExecutionSection {
     pub decay_full_sends: Option<u32>,
     pub decay_head_bytes: Option<usize>,
     pub decay_tail_bytes: Option<usize>,
+    pub confirm_timeout_mins: Option<u64>,
 }
 
 impl ExecutionSection {
@@ -207,6 +208,9 @@ impl ExecutionSection {
             decay_full_sends: self.decay_full_sends.unwrap_or(base.decay_full_sends),
             decay_head_bytes: self.decay_head_bytes.unwrap_or(base.decay_head_bytes),
             decay_tail_bytes: self.decay_tail_bytes.unwrap_or(base.decay_tail_bytes),
+            confirm_timeout_mins: self
+                .confirm_timeout_mins
+                .unwrap_or(base.confirm_timeout_mins),
         }
     }
 }
@@ -324,6 +328,8 @@ pub(super) struct McpServerSection {
     pub exposure: McpExposure,
     #[serde(default)]
     pub tool_exposure: BTreeMap<String, McpExposure>,
+    #[serde(default)]
+    pub outward: Vec<String>,
 }
 
 impl McpServerSection {
@@ -368,6 +374,7 @@ impl McpServerSection {
                 .filter(|text| !text.is_empty()),
             exposure: self.exposure,
             tool_exposure: self.tool_exposure,
+            outward: self.outward,
         })
     }
 }

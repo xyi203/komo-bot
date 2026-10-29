@@ -1143,3 +1143,37 @@ async fn a_safe_nested_call_reruns_after_probe_and_clears_the_old_attempts_progr
     assert!(world.live().await.nested_tools.is_none());
     engine.close().await.unwrap();
 }
+
+/// `docs/confirm.md` §7：无人值守的 Run 里，脚本调对外工具直接被拒（脚本等不了确认），提示到顶层调；
+/// 那个工具一次也没执行。
+#[tokio::test]
+async fn an_outward_sub_call_in_an_unattended_run_is_refused_without_running() {
+    let world = World::new();
+    let send = Arc::new(TestTool {
+        outward: true,
+        ..mcp_writer("send", &world.log)
+    });
+    setup(&world, vec![send.clone()]);
+    script_round(
+        &world,
+        "try:\n    tools.send(to='x')\nexcept ToolError as e:\n    text('refused: ' + str(e))",
+    );
+    let engine = world.open().await;
+    let id = world
+        .harness
+        .submit(
+            &engine,
+            CONV,
+            SubmissionDraft::input("tick")
+                .with_entry(super::super::InputEntry::new("cron.input", None)),
+        )
+        .await
+        .unwrap();
+    world.harness.wait(&engine, id).await.unwrap();
+
+    let (status, view) = only_result(&world).await;
+    assert_eq!(status, "completed");
+    assert!(view.contains("请在顶层直接调用 send"), "{view}");
+    assert_eq!(send.runs(), 0);
+    engine.close().await.unwrap();
+}

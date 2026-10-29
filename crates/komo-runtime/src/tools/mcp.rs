@@ -34,6 +34,8 @@ pub struct McpTool {
     definition: ToolDefinition,
     read_only: bool,
     exposure: ToolExposure,
+    /// 操作者在 `outward` 里声明的（`docs/confirm.md` §4）。
+    outward: bool,
 }
 
 impl McpTool {
@@ -44,6 +46,7 @@ impl McpTool {
         name: String,
         read_only: bool,
         exposure: ToolExposure,
+        outward: bool,
     ) -> Self {
         let description = remote
             .description
@@ -62,6 +65,7 @@ impl McpTool {
             definition,
             read_only,
             exposure,
+            outward,
         }
     }
 }
@@ -87,6 +91,10 @@ impl Tool for McpTool {
 
     fn namespace(&self) -> Option<ToolNamespace> {
         Some(self.server.namespace())
+    }
+
+    fn outward(&self) -> bool {
+        self.outward
     }
 
     async fn prepare(

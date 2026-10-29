@@ -1159,6 +1159,7 @@ impl McpHub {
                     tool_name,
                     read_only,
                     exposure,
+                    config.outward_of(&remote.name),
                 )));
             }
         }
@@ -1201,6 +1202,7 @@ mod tests {
             description: None,
             exposure: Default::default(),
             tool_exposure: Default::default(),
+            outward: vec![],
         };
         let (kept, missing) = select(&config, &listed);
         assert_eq!(
@@ -1282,6 +1284,7 @@ for line in sys.stdin:
                 description: None,
                 exposure: McpExposure::Codemode,
                 tool_exposure: BTreeMap::new(),
+                outward: vec![],
             }
         }
 

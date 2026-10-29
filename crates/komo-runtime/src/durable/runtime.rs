@@ -12,7 +12,7 @@ use komo_kernel::durable::storage::EntryQuery;
 use komo_kernel::durable::task::{NextTaskState, RunningTask, memo_of, put_memo};
 use komo_kernel::durable::{
     ContextView, ConversationId, Cursor, DocumentAddress, DocumentRecord, EntryId, EntryRecord,
-    ScanOrder, TaskId, TaskRecord, TaskState,
+    ScanOrder, SubmissionId, SubmissionRecord, TaskId, TaskRecord, TaskState,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -147,6 +147,19 @@ impl TaskRuntime {
         self.sched
             .line
             .read_on_line(move || Box::pin(async move { Ok(sched.storage.task(id).await?) }))
+            .await
+    }
+
+    /// 已提交的 submission 记录。
+    pub async fn submission(
+        &self,
+        id: SubmissionId,
+    ) -> Result<Option<SubmissionRecord>, DurableError> {
+        self.check()?;
+        let sched = self.sched.clone();
+        self.sched
+            .line
+            .read_on_line(move || Box::pin(async move { Ok(sched.storage.submission(id).await?) }))
             .await
     }
 

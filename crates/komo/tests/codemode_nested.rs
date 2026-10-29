@@ -223,6 +223,7 @@ impl World {
             detach_after: None,
             interjected: None,
             conversation: true,
+            confirm_timeout: std::time::Duration::from_secs(60),
             outputs: Arc::new(MemOutputStore::new()),
             images: None,
         };

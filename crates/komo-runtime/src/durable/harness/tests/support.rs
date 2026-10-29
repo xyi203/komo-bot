@@ -524,6 +524,8 @@ pub struct TestTool {
     pub runs: AtomicUsize,
     pub prepares: AtomicUsize,
     pub input_runs: Mutex<Vec<Option<komo_kernel::types::ids::RunId>>>,
+    /// `Tool::outward`（`docs/confirm.md`）。
+    pub outward: bool,
     pub log: Log,
 }
 
@@ -548,6 +550,7 @@ impl TestTool {
             runs: AtomicUsize::new(0),
             prepares: AtomicUsize::new(0),
             input_runs: Mutex::new(Vec::new()),
+            outward: false,
             log: log.clone(),
         }
     }
@@ -606,6 +609,11 @@ impl TestTool {
 
     pub fn hanging_first_prepares(self, prepares: usize) -> Self {
         self.hang_prepares.store(prepares, Ordering::SeqCst);
+        self
+    }
+
+    pub fn outward(mut self) -> Self {
+        self.outward = true;
         self
     }
 
@@ -705,6 +713,10 @@ impl Tool for TestTool {
 
     fn replay(&self) -> Replay {
         *self.replay.lock().unwrap()
+    }
+
+    fn outward(&self) -> bool {
+        self.outward
     }
 }
 
@@ -903,6 +915,7 @@ impl TestHooks {
             detach_after: None,
             interjected: None,
             conversation: true,
+            confirm_timeout: std::time::Duration::from_secs(60),
             outputs,
             images: None,
         };
@@ -945,6 +958,11 @@ impl TestHooks {
 
     pub fn set_tools(&self, tools: Vec<Arc<dyn Tool>>) {
         self.state.lock().unwrap().tools = tools;
+    }
+
+    /// `ToolEnv::conversation`：`false` = 任务会话或 cron 会话。
+    pub fn set_conversation(&self, conversation: bool) {
+        self.state.lock().unwrap().env.conversation = conversation;
     }
 
     pub fn set_cwd(&self, cwd: PathBuf) {

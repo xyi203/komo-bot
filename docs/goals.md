@@ -183,4 +183,10 @@ area:  active → retired →（reopen）active
 - 「搞定了」→ `goal done`：名下线索转 `archived`，`memory search` 默认搜不到、`--include-archived` 搜得到；名下约定被列出来问去向；挂着的 monitor 被提醒。Agent 把两件事都转问了用户。
 - `push_unattached = false`（热重载）时，一条过了两臂门槛的无归属线索不再注入；改回 `true` 对照，同一问题带上了它。配置已还原。
 
-观察：Agent 每次动事项前先跑一次 `komo goal --help` / `komo area --help` 看子命令，多一轮工具调用，不影响结果。未验证：提取对新记忆建议归属（这几段会话还没触发提取）；飞书渠道入口（与 HTTP 走同一条 Run 路径，只差渠道投递）。验收用的目标留作 done，领域已 retire，两条测试记忆已 forget。
+观察：Agent 每次动事项前先跑一次 `komo goal --help` / `komo area --help` 看子命令，多一轮工具调用，不影响结果。验收用的目标留作 done，领域已 retire，测试记忆已 forget。
+
+提取建议归属（同日补验）：新开会话让 Agent 记一个目标，同一会话里再说一句与它相关的偏好、不让 Agent 当场记；会话空闲满 `extract_idle`（10 分钟）后，后台提取（`memory-extract/v10`）落了一条线索，`belongs_to` 正是这个目标。另一段会话里建的领域在提取前已 retire，那段提取出的两条记忆没有归属——提取只给未结案的事项，符合 §7。
+
+存量归属：此时库里生效的 5 条记忆是两条通用约定（发布工单默认 saas、授权内直接继续）、两条工具知识（devops-mcp 的 `issueKey`、glab 的 `--hostname`）和一条 git 习惯，按 PARA 都是资料，不属于任何目标或领域，不批量挂。由此 `push_unattached = false` 之后 `issueKey`、glab 两条线索不再主动推，只能 search，改默认前要先看这个代价。
+
+未验证：飞书渠道入口（与 HTTP 走同一条 Run 路径，只差渠道收发）。

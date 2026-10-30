@@ -97,6 +97,10 @@ fn shared_routes() -> Router<Api> {
             "/v1/config/embedding-models/{alias}",
             put(config::put_embedding_model).delete(config::delete_embedding_model),
         )
+        .route(
+            "/v1/config/provider-groups/{name}",
+            put(config::put_provider_group),
+        )
         .route("/v1/config/default-model", put(config::put_default_model))
         .route("/v1/config/settings", get(config::settings))
         .route("/v1/config/settings/{key}", put(config::put_setting))

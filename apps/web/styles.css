@@ -553,7 +553,8 @@ button.live-line:hover .label { text-decoration: underline; text-underline-offse
 .input { height: 36px; }
 .input.mono { font-family: var(--mono); font-size: var(--fs-label); }
 .mform textarea:focus, .input:focus, .select:focus { outline: 0; box-shadow: var(--ring-strong); }
-.mform .select { width: 100%; }
+.mform .select { width: 100%; height: 36px; } /* 和同一行的输入框一样高 */
+.two > div > .hint { margin-top: 6px; }
 .two { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
 .seg { margin: 14px 0 0; padding: 0; border: 0; }
 .seg legend.lbl { margin: 0 0 6px; padding: 0; }
@@ -703,6 +704,12 @@ button.live-line:hover .label { text-decoration: underline; text-underline-offse
 .pact { display: flex; align-items: center; gap: 12px; flex: none; }
 .pact .danger-link { margin: 0; }
 .pcard-url { margin: 2px 0 0; color: var(--muted); font-size: var(--fs-small); overflow-wrap: anywhere; }
+/* 组卡里的一个 provider：细框围起来，名字比组名小一号 */
+.pblock { margin-top: 12px; padding: 12px 14px; border-radius: 10px; box-shadow: var(--ring); }
+.pblock.editing { box-shadow: var(--ring-control); }
+.pblock-head { display: flex; align-items: center; gap: 12px; min-height: 28px; }
+.bname { font-weight: 600; }
+.pblock + .add-model { margin-top: 10px; }
 .pms { margin-top: 10px; border-top: 1px solid var(--rule); }
 .pm { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 4px 12px; padding: 10px 0; border-bottom: 1px solid var(--rule); }
 .pm:last-child { border-bottom: 0; }
@@ -719,7 +726,7 @@ button.live-line:hover .label { text-decoration: underline; text-underline-offse
 .pm-new { margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--rule); }
 .add-card { display: flex; align-items: center; justify-content: center; gap: 6px; width: 100%; height: 48px; border: 1px dashed var(--control); border-radius: var(--radius-card); background: none; color: var(--muted); font: inherit; cursor: pointer; transition: background-color var(--t) ease, color var(--t) ease; }
 .add-card:hover { background: var(--hover-on-white); color: var(--text); }
-.cfg-form { max-width: 640px; padding: 4px 0 2px; }
+.cfg-form { padding: 4px 0 2px; }
 .cfg-form .lbl:first-child, .cfg-form .two:first-child .lbl { margin-top: 8px; }
 /* 配置：一项一张卡，左边名字与一句说明，右边控件 */
 .scard { margin-bottom: 12px; padding: 16px 20px; box-shadow: var(--lift); border-radius: var(--radius-card); background: var(--surface); }

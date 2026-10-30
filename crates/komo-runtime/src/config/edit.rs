@@ -84,6 +84,7 @@ pub fn models_view(
             let auth = str_of(t, "auth");
             providers.push(ProviderEntry {
                 id: id.to_string(),
+                group: str_of(t, "group"),
                 base_url: str_of(t, "base_url"),
                 api_backend: str_of(t, "api_backend"),
                 key_set: auth.is_some() || env_key.as_deref().is_some_and(|k| secrets.has(k)),
@@ -271,6 +272,7 @@ fn default_env_key(id: &str) -> String {
 /// 一个 provider 要写的东西（`ProviderUpsertRequest` 去掉版本）。
 #[derive(Debug, Clone, Default)]
 pub struct ProviderFields<'a> {
+    pub group: Option<&'a str>,
     pub base_url: Option<&'a str>,
     pub api_backend: Option<&'a str>,
     pub env_key: Option<&'a str>,
@@ -289,6 +291,7 @@ pub fn upsert_provider(
     fields: &ProviderFields<'_>,
 ) -> Result<(String, Option<String>), EditError> {
     check_name("provider", id)?;
+    let group = line("group", fields.group)?;
     let base_url = line("base_url", fields.base_url)?;
     let api_backend = line("api_backend", fields.api_backend)?;
     let auth = line("auth", fields.auth)?;
@@ -312,6 +315,7 @@ pub fn upsert_provider(
 
     let mut doc = parse(config_text)?;
     let table = table_mut(&mut doc, "model_providers", id);
+    set_or_remove(table, "group", group);
     set_or_remove(table, "base_url", base_url);
     set_or_remove(table, "api_backend", api_backend);
     set_or_remove(table, "auth", auth);
@@ -553,6 +557,34 @@ fn replace_str(table: &mut Table, key: &str, to: &str) {
         *slot = to.into();
         *slot.decor_mut() = decor;
     }
+}
+
+/// 给一组改名：`group` 等于旧名的 provider，以及没写 `group`、自成一组且 id 就是旧名的那个，
+/// 一起改写成新名。组只是设置页的排法，运行时不读。
+pub fn rename_provider_group(config_text: &str, from: &str, to: &str) -> Result<String, EditError> {
+    let to = line("组名", Some(to))?.ok_or_else(|| EditError::Invalid("组名不能为空".into()))?;
+    let mut doc = parse(config_text)?;
+    let mut found = false;
+    if let Some(providers) = doc.get_mut("model_providers").and_then(Item::as_table_mut) {
+        for (id, item) in providers.iter_mut() {
+            let Some(table) = item.as_table_mut() else {
+                continue;
+            };
+            let group = str_of(table, "group");
+            if group.as_deref() == Some(from) || (group.is_none() && id.get() == from) {
+                found = true;
+                if table.contains_key("group") {
+                    replace_str(table, "group", &to);
+                } else {
+                    table.insert("group", value(to.as_str()));
+                }
+            }
+        }
+    }
+    if !found {
+        return Err(EditError::NotFound(format!("provider 组 `{from}`")));
+    }
+    Ok(doc.to_string())
 }
 
 /// 给 provider 改名：表搬到新名字下，挂在它上面的模型（`model_provider`）一并改指新名字。
@@ -950,6 +982,52 @@ default = "magpie-sol"
 
         let unset = models_view(CONFIG, &secrets(&[]), "v".into(), "c".into(), "e".into()).unwrap();
         assert!(!unset.providers[0].key_set);
+    }
+
+    /// 组只是 provider 上的一个 `group` 键：写 provider 时带上，改组名时同组的一起改；
+    /// 没写 `group` 的自成一组，组名就是它的 id。
+    #[test]
+    fn provider_groups_are_a_key_and_rename_together() {
+        let (config, _) = upsert_provider(
+            CONFIG,
+            "",
+            "magpie-embed",
+            &ProviderFields {
+                group: Some("Magpie"),
+                base_url: Some("http://127.0.0.1:11434"),
+                api_backend: Some("ollama_embeddings"),
+                ..ProviderFields::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            config.contains("[model_providers.magpie-embed]\ngroup = \"Magpie\""),
+            "{config}"
+        );
+        let view = models_view(&config, &secrets(&[]), "v".into(), "c".into(), "e".into()).unwrap();
+        let groups: Vec<_> = view
+            .providers
+            .iter()
+            .map(|p| (p.id.as_str(), p.group.as_deref()))
+            .collect();
+        assert_eq!(groups, [("magpie", None), ("magpie-embed", Some("Magpie"))]);
+
+        // 没写 group 的 magpie 自成一组 "magpie"：改这一组就给它写上 group
+        let config = rename_provider_group(&config, "magpie", "Magpie").unwrap();
+        let config = rename_provider_group(&config, "Magpie", "代理").unwrap();
+        assert_eq!(config.matches("group = \"代理\"").count(), 2, "{config}");
+        assert!(
+            config.contains("# 本机代理\n[model_providers.magpie]"),
+            "注释留着：{config}"
+        );
+        assert!(matches!(
+            rename_provider_group(&config, "nope", "x"),
+            Err(EditError::NotFound(_))
+        ));
+        assert!(matches!(
+            rename_provider_group(&config, "代理", " "),
+            Err(EditError::Invalid(_))
+        ));
     }
 
     /// 改名搬的是整张表：位置、上方注释跟着走，引用它的地方一并改，撞名与改错类型被拒。

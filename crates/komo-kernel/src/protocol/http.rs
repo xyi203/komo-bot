@@ -39,6 +39,7 @@
 //! | `PUT /v1/config/embedding-models/{alias}` | [`EmbeddingUpsertRequest`] | [`ConfigEditResponse`] |
 //! | `DELETE /v1/config/embedding-models/{alias}` | [`ConfigVersionRequest`] | [`ConfigEditResponse`] |
 //! | `GET /v1/mcp` | — | [`McpServersResponse`] |
+//! | `PUT /v1/config/provider-groups/{name}` | [`ProviderGroupRequest`] | [`ConfigEditResponse`] |
 //! | `GET /v1/channels` | — | [`ChannelsResponse`] |
 //! | `POST /v1/channels/{id}/probe` | — | [`ChannelProbeResponse`] |
 //!
@@ -1330,6 +1331,9 @@ pub struct EmbeddingModelEntry {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderEntry {
     pub id: String,
+    /// 设置页的分组（`group`）；没写就自成一组，组名是 `id`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1374,6 +1378,9 @@ pub struct ProviderUpsertRequest {
     /// 改名：先把这一项搬到这个新名字下，再按其余字段写。省略或同名 = 不改名。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rename: Option<String>,
+    /// 设置页的分组；省略 = 没有组（自成一组）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1394,6 +1401,7 @@ impl std::fmt::Debug for ProviderUpsertRequest {
         f.debug_struct("ProviderUpsertRequest")
             .field("version", &self.version)
             .field("rename", &self.rename)
+            .field("group", &self.group)
             .field("base_url", &self.base_url)
             .field("api_backend", &self.api_backend)
             .field("env_key", &self.env_key)
@@ -1465,6 +1473,13 @@ pub struct ModelUpsertRequest {
 pub struct DefaultModelRequest {
     pub version: String,
     pub alias: String,
+}
+
+/// `PUT /v1/config/provider-groups/{name}`：给一组改名（组里每个 provider 的 `group` 一起改）。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderGroupRequest {
+    pub version: String,
+    pub rename: String,
 }
 
 /// 删除只带版本。

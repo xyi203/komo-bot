@@ -105,6 +105,9 @@ pub(super) struct ModelProviderSection {
     /// 凭证来源不是 `.env` 变量（目前只有 `"chatgpt"`，§13.3）；与 `api_key_env` 互斥，
     /// 校验阶段判。
     pub auth: Option<String>,
+    /// 设置页把同组的 provider 排在一张卡里（比如同一家的对话与向量两个端点）；运行时不读。
+    #[allow(dead_code)]
+    pub group: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

@@ -8,7 +8,7 @@ use komo_kernel::protocol::http::{
     ConfigCheckResponse, ConfigEditResponse, ConfigEnvResponse, ConfigModelsResponse,
     ConfigReloadResponse, ConfigSettingsResponse, ConfigVersionRequest, DefaultModelRequest,
     EmbeddingUpsertRequest, EnvSetRequest, ErrorCode, ModelMenuEntry, ModelUpsertRequest,
-    ModelsResponse, ProviderUpsertRequest, SettingRequest,
+    ModelsResponse, ProviderGroupRequest, ProviderUpsertRequest, SettingRequest,
 };
 use komo_kernel::types::model::{CatalogModel, ModelConfig};
 use komo_runtime::config::{EditError, EmbeddingFields, ModelFields, ProviderFields};
@@ -135,6 +135,7 @@ pub async fn put_provider(
 ) -> ApiResult<Json<ConfigEditResponse>> {
     edit(&api, &request.version, |config, env| {
         let fields = ProviderFields {
+            group: request.group.as_deref(),
             base_url: request.base_url.as_deref(),
             api_backend: request.api_backend.as_deref(),
             env_key: request.env_key.as_deref(),
@@ -148,6 +149,25 @@ pub async fn put_provider(
         };
         let (config, env) = komo_runtime::config::upsert_provider(&config, env, id, &fields)?;
         Ok((Some(config), env))
+    })
+    .await
+}
+
+/// `PUT /v1/config/provider-groups/{name}`：给一组改名。
+pub async fn put_provider_group(
+    State(api): State<Api>,
+    Path(name): Path<String>,
+    Json(request): Json<ProviderGroupRequest>,
+) -> ApiResult<Json<ConfigEditResponse>> {
+    edit(&api, &request.version, |config, _| {
+        Ok((
+            Some(komo_runtime::config::rename_provider_group(
+                config,
+                &name,
+                &request.rename,
+            )?),
+            None,
+        ))
     })
     .await
 }

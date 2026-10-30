@@ -1205,9 +1205,9 @@ const LOADERS = {
   },
   async inbox(P) { P.items = (await api("/v1/interventions")).interventions; S.inbox = P.items; },
   async settings(P) {
-    const [health, config, index, cfg, settings, env, mcp] = await Promise.allSettled([api("/healthz"), api("/v1/config/check"), api("/v1/memory-index"), api("/v1/config/models"), api("/v1/config/settings"), api("/v1/config/env"), api("/v1/mcp")]);
+    const [health, config, index, cfg, settings, env, mcp, channels] = await Promise.allSettled([api("/healthz"), api("/v1/config/check"), api("/v1/memory-index"), api("/v1/config/models"), api("/v1/config/settings"), api("/v1/config/env"), api("/v1/mcp"), api("/v1/channels")]);
     const v = (r) => (r.status === "fulfilled" ? r.value : { error: r.reason?.message || "没取到" });
-    P.data = { health: v(health), config: v(config), index: v(index), cfg: v(cfg), settings: v(settings), env: v(env), mcp: v(mcp) };
+    P.data = { health: v(health), config: v(config), index: v(index), cfg: v(cfg), settings: v(settings), env: v(env), mcp: v(mcp), channels: v(channels) };
   },
 };
 async function openPage(page, id = null) {
@@ -2096,11 +2096,45 @@ function gatewaySection(P) {
     ["遥测", h.telemetry?.endpoint ? `${esc(h.telemetry.endpoint)} · ${h.telemetry.last_error ? `<span class="bad">出错：${esc(h.telemetry.last_error)}</span>` : h.telemetry.last_ok_at ? `正常，最近一次 ${ago(h.telemetry.last_ok_at)}` : "还没导出过"}` : `<span class="muted">没配</span>`],
   ])}</div>`;
 }
-function channelsSection() {
-  return secHead("渠道", "飞书、Telegram、微信。谁能说话、哪个会话收主动消息，在配置文件里设；凭证见环境变量一节。") + `<div class="set-panel"><p class="set-line muted">渠道的连接状态 Gateway 还没有接口可查；在终端里用 <code>komo channel list</code> 与 <code>komo channel probe</code>。</p></div>`;
+const CHANNEL_NAME = { feishu: "飞书", telegram: "Telegram", wechat: "微信" };
+// Gateway 只看得见插件进程这一层；平台长连接掉了由插件自己往 home 告警
+function channelState(c) {
+  if (!c.enabled) return `<span class="muted">未启用</span>`;
+  if (c.state === "running") return `<span class="kstate ok"><i class="kdot"></i>在跑${c.since ? ` <span class="num">${elapsed(c.since)}</span>` : ""}</span>`;
+  if (c.state === "retrying") return `<span class="kstate warn"><i class="kdot"></i>退出了，正在重试（第 <span class="num">${c.restarts}</span> 次）</span>`;
+  if (c.state === "failed") return `<span class="kstate bad"><i class="kdot"></i>起不来</span>`;
+  return `<span class="kstate warn"><i class="kdot"></i>启用了但没起</span>`;
+}
+function channelsSection(P) {
+  const R = P.data.channels;
+  if (R?.error && /404/.test(R.error)) return secHead("渠道", "") + `<div class="set-panel"><p class="set-line muted">在跑的 Gateway 还没有渠道状态的接口；装上新版后这里显示每个渠道在不在跑。终端里可用 <code>komo channel list</code> 与 <code>komo channel probe</code>。</p></div>`;
+  if (!R || R.error) return secHead("渠道", "") + errLine(R);
+  const cards = R.channels.map((c) => {
+    const probing = P.busy === `probe:${c.channel}`, pr = P.result.probe?.[c.channel];
+    const facts = [
+      `<span class="num">${c.allow_from}</span> 人可下指令${c.allow_tenant ? "，同组织的也行" : ""}`,
+      c.home_chat ? `主动消息发到 <span class="mono">${esc(c.home_chat)}</span>` : "没设主动消息的去处",
+    ];
+    return `<section class="scard"><div class="scard-row"><div class="scard-text"><h4>${esc(CHANNEL_NAME[c.channel] || c.channel)}${c.custom_plugin ? `<span class="tag">自定义插件</span>` : ""}</h4>
+        <p>${channelState(c)}${c.enabled ? `<span class="sep">·</span>${facts.join('<span class="sep">·</span>')}` : ""}</p></div>
+      <div class="scard-ctl">${c.enabled ? btn(probing ? "正在探测" : "探测", `data-pg-act="channel-probe" data-id="${esc(c.channel)}" ${probing ? "disabled" : ""}`, "sm") : ""}</div></div>
+      ${c.outbound_only ? `<p class="hint">allow_from 是空的：只出不进，没人能通过它下指令。</p>` : ""}
+      ${c.detail && c.state !== "running" ? `<p class="hint bad">${esc(c.detail)}</p>` : ""}
+      ${pr ? `<p class="hint${pr.ok ? "" : " bad"}">${pr.ok ? "探测通过：" : "探测没通过："}${esc(pr.message)}</p>` : ""}</section>`;
+  }).join("");
+  return secHead("渠道", "每个渠道是一个插件进程。谁能说话、主动消息发到哪，在配置文件里设；凭证见环境变量一节。", btn("刷新", "data-pg-reload", "sm")) + cards;
 }
 async function settingsAct(act, el) {
   const P = S.pg.settings;
+  if (act === "channel-probe") {
+    // 探测另起一个插件进程问平台，可能要几秒；结果记在那个渠道的卡片上
+    const id = el.dataset.id;
+    P.busy = `probe:${id}`; render();
+    try { (P.result.probe ||= {})[id] = await api(`/v1/channels/${encodeURIComponent(id)}/probe`, { method: "POST", body: "{}" }); }
+    catch (err) { (P.result.probe ||= {})[id] = { ok: false, message: err.message }; }
+    P.busy = ""; render();
+    return;
+  }
   const key = { "config-reload": "reload", "config-check": "check", "index-rebuild": "rebuild", "mcp-reconnect": "mcp" }[act];
   P.busy = key; render();
   try {

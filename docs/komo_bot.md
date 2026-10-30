@@ -163,6 +163,14 @@ Gateway 对数据目录持有进程锁。多个 CLI 同时启动时，只允许�
 - `GET /v1/config/models` 加 `embeddings`：每个 `type = "embedding"` 的模型项（alias、`model`、协议、`base_url`、`model_provider`、凭证变量名与在不在、`dimensions`），和 `memory_embedding`（`[memory] embedding` 指的 alias）。（最初只读，2026-10-30 同日开放写，见下一段。）
 - **实现（2026-10-30）。** kernel `protocol::http` 的 `McpServersResponse` / `McpServerView` / `McpTransportKind` / `McpToolView`，`ConfigModelsResponse` 加 `embeddings`（`EmbeddingModelEntry`）与 `memory_embedding`；runtime `McpConnection` 在 `adopt` 时记下挑过的工具（`listed`，交出工具不清空），`McpConnection::view` / `McpHub::views`；`config::edit::models_view` 列出 embedding 模型项（凭证变量名没写就继承 provider）；gateway `http::mcp::list`。测试：runtime `mcp::tests::views_list_the_selected_tools_with_their_flags`（白名单外不列、实际 exposure / 对外 / 只读、交出工具后清单还在、连不上的为空且带原因），`config::edit::tests` 的视图那条加了 embedding。另在临时数据目录起前台 Gateway，配一台演示 stdio 服务器（四个工具：只读、直出、对外、不挂各一）、一台起不来的、一台要 OAuth 的，经 Web 看了表、两种详情、单台重连，桌面与手机各截了图；没碰真实的 `~/.komo`。`cargo test --workspace`：2527 通过、0 失败、12 忽略；`cargo fmt --check` 通过。已装到本机，7777 上的 `GET /v1/mcp` 能读到。
 
+**Web 看渠道状态（2026-10-30，认可）。** 渠道拆成插件进程后，"在不在跑"只有 Gateway 知道，CLI 的 `channel list` 只读配置。补两个端点，设置页渠道一节用它们：
+
+- `GET /v1/channels`：配置里的每个渠道（官方三个加 `[channels.<id>]` 自定义的），配置摘要——启用没有、是否配了 `plugin.command`、`allow_from` 人数、`allow_tenant`、`home_chat`、只出不进——加上监督器记下的运行状态：`running`（插件进程在跑；握手与平台长连接在插件里，掉了由插件往 home 告警）、`retrying`（退出了，退避重建中，带退出原因与重建次数）、`failed`（重建之前就失败：缺凭证、缺插件、Dispatcher 没接上）、`off`（没启用）；带进入这个状态的时间。凭证、插件命令不给。不等、不探测。
+- `POST /v1/channels/{id}/probe`：和 `komo channel probe` 同一条核对（另起插件进程、不起消费循环），交回 `{ok, message}`；30 秒没结果算没通过；配置里没有这个渠道 404。
+- Web 渠道一节一个渠道一张卡：名字、状态（在跑多久 / 第几次重试 / 起不来 / 未启用）、可下指令的人数与主动消息去处，退出原因与只出不进的提醒写在卡里；启用的渠道有"探测"，结果写在卡底。节头"刷新"重读。
+- 重载重启一个渠道时状态从头记（重建次数清零）；停掉的渠道不在监督器的表里，视图按配置报 `off`。
+- **实现（2026-10-30）。** kernel `protocol::http` 的 `ChannelsResponse` / `ChannelView` / `ChannelRunState` / `ChannelProbeResponse`；gateway `ChannelSupervisor` 加 `health`（起、退出、重建失败、停各记一笔，停掉等任务收完再清）与 `factory`，`http::channels::{list, probe}`。测试 `service::channels::tests::the_channel_view_reports_why_a_plugin_keeps_exiting`（一启动就退出的渠道报 `retrying`、原因与次数，没启用的报 `off`，探测不存在的渠道 404）。另在 demo 数据目录配了一个自定义渠道（测试插件 `komo-channel-fixture`），经 Web 看到"在跑"、只出不进提醒与探测通过。
+
 **从 Web 加改向量模型（2026-10-30，认可；同日改为不分组）。** 模型一节能添加、编辑、删除 embedding 模型项，并选记忆用哪个。向量模型不单开一组：provider 就是组，provider 有类型——协议是 `ollama_embeddings` / `embeddings` 的是嵌入组（不另存类型键，由协议看出），组里的模型是向量模型、协议与端点继承组；没挂 provider 的向量模型各自成一组。名字后标"向量"。后端接口仍分两组，因为两类模型项的键不同。组名能改：provider 的 `PUT` 与向量模型的 `PUT` 都可带 `rename`，先把表搬到新名字下（位置与上方注释跟着走），再按其余字段写；provider 改名同步改所有 `model_provider`，向量模型改名同步改 `[memory] embedding`，撞名 409、新名字不合规 400。completion 的 alias 被默认模型、记忆、Agent 到处引用，不在这里改名。仍是同一套写法（`version`、先校验后落盘、原子写、重载、失败写回原文）：
 
 - `PUT /v1/config/embedding-models/{alias}`：整份写这几个键——`type = "embedding"`、`model`（必填）、`api_backend`（`ollama_embeddings` / `embeddings`）、`base_url`、`model_provider`、`env_key`（原来写的是旧拼法 `api_key_env` 就沿用它）、`dimensions`；没给的删掉，表里别的键（`revision`、前缀等）与注释不动。带 `api_key` 只写 `.env`：没写 `env_key` 时变量名用 `<ALIAS 大写>_API_KEY`。同名的模型项不是 embedding 就 400；校验不过 422（例如凭证变量没有值）。
@@ -1087,6 +1095,8 @@ CLI 通过 HTTP 发命令，通过 SSE 观察运行。Gateway 内部采用函数
 | DELETE /v1/config/embedding-models/{alias} | 删 embedding 模型项；记忆在用 409 |
 | GET /v1/mcp                      | 每台 MCP 服务器此刻的状态、传输方式与最近一次握手列出的工具；不等握手、不重连（§3「Web 看 MCP 服务器与向量模型」） |
 | POST /v1/mcp/reconnect           | 点名的 MCP 服务器（空 = 全部）断开重连，等握手完交回各自状态；名字不在配置里 400（`docs/mcp.md` §2.5） |
+| GET /v1/channels                 | 每个配置里的渠道：配置摘要加插件进程的运行状态（在跑 / 重试中 / 起不来 / 未启用）、进入时间、退出原因与重建次数（§3「Web 看渠道状态」） |
+| POST /v1/channels/{id}/probe     | 与 `komo channel probe` 同一条连通性核对，交回 `{ok, message}`；不起消费循环 |
 | GET /v1/home-session             | 操作者的 home session（§11.2）                 |
 
 除最小健康检查外统一认证。创建会话、提交输入、介入答复、Cron 与 Memory 变更都支持幂等请求键；同一键对应不同内容则拒绝。创建会话的请求键与正文哈希持久保存，同键同内容重发返回原会话，同键不同内容返回 409 `request_key_conflict`，重启后仍有效。

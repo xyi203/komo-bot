@@ -6,6 +6,7 @@
 //!
 //! **除 `GET /healthz` 外统一认证**，由 [`crate::auth`] 的 layer 一次性挡住。
 
+pub mod channels;
 pub mod config;
 pub mod cron;
 pub mod error;
@@ -101,6 +102,8 @@ fn shared_routes() -> Router<Api> {
         .route("/v1/config/settings/{key}", put(config::put_setting))
         .route("/v1/config/env", get(config::env).put(config::put_env))
         .route("/v1/config/env/{name}", delete(config::delete_env))
+        .route("/v1/channels", get(channels::list))
+        .route("/v1/channels/{id}/probe", post(channels::probe))
         .route("/v1/mcp", get(mcp::list))
         .route("/v1/mcp/reconnect", post(mcp::reconnect))
 }

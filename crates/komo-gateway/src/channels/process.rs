@@ -5,7 +5,10 @@ use komo_channel::{
     ChannelContext, Descriptor, Initialize, PROTOCOL_VERSION, SendRequest, rpc::Rpc,
 };
 use komo_kernel::{
-    protocol::{InboundMessage, config::ConfigSnapshot},
+    protocol::{
+        InboundMessage,
+        config::{ChannelPlugin, ConfigSnapshot},
+    },
     traits::{Channel, ChannelError, DeliverError, Inbound, Shutdown},
     types::chat::{ChannelPeer, ChannelPlatform, Outbound},
 };
@@ -46,6 +49,19 @@ fn executable(platform: &ChannelPlatform) -> Result<PathBuf, String> {
     }
 }
 
+/// 插件能拿到哪些凭证由宿主定：官方渠道固定的那几个，加上 `plugin.env` 授权的。插件 describe
+/// 里写的只是它要什么；换了 `plugin.command` 的官方渠道同样受这份清单约束。
+fn granted_credentials(platform: &ChannelPlatform, plugin: Option<&ChannelPlugin>) -> Vec<String> {
+    let mut names: Vec<String> = komo_runtime::config::channel_credentials(platform.clone())
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    if let Some(plugin) = plugin {
+        names.extend(plugin.env.iter().cloned());
+    }
+    names
+}
+
 pub async fn login(home: &Path, platform: ChannelPlatform) -> Result<String, String> {
     let (settings, secrets) =
         komo_runtime::config::channel_login_config(home, &platform).map_err(|e| e.to_string())?;
@@ -75,14 +91,7 @@ pub async fn login(home: &Path, platform: ChannelPlatform) -> Result<String, Str
             command.env(name, value);
         }
     }
-    let mut names = komo_runtime::config::channel_credentials(platform.clone())
-        .iter()
-        .map(|s| s.to_string())
-        .collect::<Vec<_>>();
-    if let Some(plugin) = plugin {
-        names.extend(plugin.env.iter().cloned());
-    }
-    for name in names {
+    for name in granted_credentials(&platform, plugin) {
         if let Some(value) = secrets.get(&name) {
             command.env(name, value);
         }
@@ -229,21 +238,15 @@ impl ProcessChannel {
         if descriptor.channel != self.platform || descriptor.version != PROTOCOL_VERSION {
             return Err("渠道插件标识或协议版本不匹配".into());
         }
-        if matches!(self.platform, ChannelPlatform::Custom(_)) {
-            let allowed = self
-                .context
-                .config
-                .plugin
-                .as_ref()
-                .map(|p| p.env.as_slice())
-                .unwrap_or_default();
-            if descriptor
-                .credentials
-                .iter()
-                .any(|name| !allowed.contains(name))
-            {
-                return Err("插件请求了未在 plugin.env 声明的凭证".into());
-            }
+        let granted = granted_credentials(&self.platform, self.context.config.plugin.as_ref());
+        if let Some(name) = descriptor
+            .credentials
+            .iter()
+            .find(|name| !granted.contains(name))
+        {
+            return Err(format!(
+                "插件请求了未授权的凭证 {name}：渠道自带的之外要写进 plugin.env"
+            ));
         }
         let secrets =
             komo_channel::Secrets::from_pairs(descriptor.credentials.iter().filter_map(|name| {
@@ -482,6 +485,44 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(inbox.count.load(Ordering::SeqCst), 1);
+    }
+    #[tokio::test]
+    async fn an_official_channel_behind_a_custom_command_gets_only_its_granted_credentials() {
+        let inbox = Arc::new(Inbox::default());
+        let mut snapshot = crate::service::test_support::sample_snapshot();
+        let command = std::env::current_exe()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("komo-channel-fixture");
+        // 冒充 telegram 的插件要 FIXTURE_TOKEN：不在 telegram 自带的凭证里，也没写进 plugin.env
+        snapshot.channels.telegram = ChannelConfig {
+            enabled: true,
+            plugin: Some(ChannelPlugin {
+                command,
+                args: vec!["--channel".into(), "telegram".into()],
+                env: vec![],
+            }),
+            ..Default::default()
+        };
+        let built = ProcessFactory(ChannelPlatform::Telegram)
+            .build(
+                &snapshot,
+                &Secrets::from_pairs([("FIXTURE_TOKEN", "secret")]),
+            )
+            .unwrap()
+            .unwrap();
+        let error = tokio::time::timeout(
+            Duration::from_secs(5),
+            built.channel.serve(inbox.clone(), Shutdown::new()),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert!(error.message.contains("FIXTURE_TOKEN"), "{error}");
+        assert_eq!(inbox.count.load(Ordering::SeqCst), 0);
     }
     #[tokio::test]
     async fn a_plugin_cannot_impersonate_the_authenticated_api_entrypoint() {

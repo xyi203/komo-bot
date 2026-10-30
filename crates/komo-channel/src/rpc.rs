@@ -28,8 +28,11 @@ pub struct Frame {
     pub error: Option<String>,
 }
 type Pending = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, String>>>>>;
+type Outgoing = (Vec<u8>, oneshot::Sender<Result<(), String>>);
 struct Inner {
-    writer: tokio::sync::Mutex<Box<dyn AsyncWrite + Unpin + Send>>,
+    // Only the writer task touches the byte stream, so a caller dropped mid-write can never
+    // leave half a frame behind: a timeout or cancellation costs one call, not the connection.
+    out: mpsc::Sender<Outgoing>,
     pending: Pending,
     next: AtomicU64,
     reader: tokio::task::AbortHandle,
@@ -37,18 +40,25 @@ struct Inner {
 }
 impl Drop for Inner {
     fn drop(&mut self) {
+        // The writer ends on its own once `out` is dropped, after the queued frames.
         self.reader.abort();
     }
 }
 #[derive(Clone)]
 pub struct Rpc(Arc<Inner>);
 
-struct CallGuard {
-    rpc: Rpc,
-    id: u64,
-    completed: bool,
+fn fail_pending(closed: &AtomicBool, pending: &Pending) {
+    closed.store(true, Ordering::Release);
+    for (_, reply) in pending.lock().expect("RPC pending").drain() {
+        let _ = reply.send(Err("渠道插件连接已关闭".into()));
+    }
 }
-impl Drop for CallGuard {
+
+struct CallGuard<'a> {
+    rpc: &'a Rpc,
+    id: u64,
+}
+impl Drop for CallGuard<'_> {
     fn drop(&mut self) {
         self.rpc
             .0
@@ -56,22 +66,39 @@ impl Drop for CallGuard {
             .lock()
             .expect("RPC pending")
             .remove(&self.id);
-        // Cancellation can interrupt a frame write; never reuse that byte stream.
-        if !self.completed {
-            self.rpc.close();
-        }
     }
 }
 
 impl Rpc {
-    pub fn connect<R, W>(mut reader: R, writer: W) -> (Self, mpsc::Receiver<Frame>)
+    pub fn connect<R, W>(mut reader: R, mut writer: W) -> (Self, mpsc::Receiver<Frame>)
     where
         R: AsyncRead + Unpin + Send + 'static,
         W: AsyncWrite + Unpin + Send + 'static,
     {
         let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
-        let waiting = pending.clone();
         let closed = Arc::new(AtomicBool::new(false));
+        let (out, mut queue) = mpsc::channel::<Outgoing>(64);
+        {
+            let (pending, closed) = (pending.clone(), closed.clone());
+            tokio::spawn(async move {
+                while let Some((bytes, done)) = queue.recv().await {
+                    let written = async {
+                        writer.write_u32(bytes.len() as u32).await?;
+                        writer.write_all(&bytes).await?;
+                        writer.flush().await
+                    }
+                    .await
+                    .map_err(|e| e.to_string());
+                    let failed = written.is_err();
+                    let _ = done.send(written);
+                    if failed {
+                        break;
+                    }
+                }
+                fail_pending(&closed, &pending);
+            });
+        }
+        let waiting = pending.clone();
         let reader_closed = closed.clone();
         let (tx, rx) = mpsc::channel(64);
         let task = tokio::spawn(async move {
@@ -100,14 +127,11 @@ impl Rpc {
                     });
                 }
             }
-            reader_closed.store(true, Ordering::Release);
-            for (_, reply) in waiting.lock().expect("RPC pending").drain() {
-                let _ = reply.send(Err("渠道插件连接已关闭".into()));
-            }
+            fail_pending(&reader_closed, &waiting);
         });
         (
             Self(Arc::new(Inner {
-                writer: tokio::sync::Mutex::new(Box::new(writer)),
+                out,
                 pending,
                 next: AtomicU64::new(1),
                 reader: task.abort_handle(),
@@ -117,23 +141,25 @@ impl Rpc {
         )
     }
     pub fn close(&self) {
-        self.0.closed.store(true, Ordering::Release);
         self.0.reader.abort();
-        for (_, reply) in self.0.pending.lock().expect("RPC pending").drain() {
-            let _ = reply.send(Err("渠道插件连接已关闭".into()));
-        }
+        fail_pending(&self.0.closed, &self.0.pending);
     }
+    /// Returns once the frame is on the wire. Dropping this future early leaves the frame
+    /// to the writer task, whole.
     async fn write(&self, frame: &Frame) -> Result<(), String> {
         let bytes = serde_json::to_vec(frame).map_err(|e| e.to_string())?;
         if bytes.len() > MAX_FRAME {
             return Err("渠道 RPC 帧超过 1 MiB".into());
         }
-        let mut out = self.0.writer.lock().await;
-        out.write_u32(bytes.len() as u32)
+        let (done, written) = oneshot::channel();
+        self.0
+            .out
+            .send((bytes, done))
             .await
-            .map_err(|e| e.to_string())?;
-        out.write_all(&bytes).await.map_err(|e| e.to_string())?;
-        out.flush().await.map_err(|e| e.to_string())
+            .map_err(|_| "渠道插件连接已关闭".to_string())?;
+        written
+            .await
+            .map_err(|_| "渠道插件连接已关闭".to_string())?
     }
     pub async fn call<T: Serialize, R: DeserializeOwned>(
         &self,
@@ -158,22 +184,14 @@ impl Rpc {
             }
             pending.insert(id, tx);
         }
-        let mut guard = CallGuard {
-            rpc: self.clone(),
-            id,
-            completed: false,
-        };
-        let result = tokio::time::timeout(TIMEOUT, async {
-            self.write(&frame).await.map_err(|error| {
-                self.close();
-                error
-            })?;
+        // A late reply to a call that timed out finds no entry and is dropped.
+        let _guard = CallGuard { rpc: self, id };
+        let value = tokio::time::timeout(TIMEOUT, async {
+            self.write(&frame).await?;
             rx.await.map_err(|_| "渠道插件未返回回执".to_string())?
         })
         .await
-        .map_err(|_| format!("渠道 RPC {method} 超时"));
-        guard.completed = result.is_ok();
-        let value = result??;
+        .map_err(|_| format!("渠道 RPC {method} 超时"))??;
         serde_json::from_value(value).map_err(|e| e.to_string())
     }
     pub async fn reply(&self, id: u64, value: Result<Value, String>) -> Result<(), String> {

@@ -131,3 +131,33 @@ async fn a_child_crash_fails_the_pending_send_without_waiting_for_timeout() {
     .unwrap();
     assert!(result.is_err());
 }
+#[tokio::test]
+async fn a_cancelled_call_costs_that_call_and_keeps_the_connection() {
+    let (_child, rpc, mut incoming) = connect().await;
+    initialize(&rpc).await;
+    let _: Value = rpc.call("start", &()).await.unwrap();
+    let callback = incoming.recv().await.unwrap();
+    rpc.reply(
+        callback.id,
+        Ok(serde_json::to_value(InboundAck::Ignored).unwrap()),
+    )
+    .await
+    .unwrap();
+    let send = |text: &str| SendRequest {
+        delivery_id: format!("delivery-{text}"),
+        peer: ChannelPeer::new(ChannelPlatform::parse("fixture").unwrap(), "chat"),
+        outbound: Outbound::Text { text: text.into() },
+    };
+    // 调用方放弃等待（超时或取消）只丢这一次调用，后面的照常收发
+    let slow = send("slow");
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            rpc.call::<_, SendOutcome>("send", &slow)
+        )
+        .await
+        .is_err()
+    );
+    let outcome: SendOutcome = rpc.call("send", &send("after")).await.unwrap();
+    assert_eq!(outcome, SendOutcome::Sent);
+}

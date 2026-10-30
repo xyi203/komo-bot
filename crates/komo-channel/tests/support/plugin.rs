@@ -14,8 +14,15 @@ use komo_kernel::{
 use std::{sync::Arc, time::Duration};
 
 struct Fixture;
+/// `--channel <id>` lets a test pose as an official channel behind `plugin.command`.
 fn platform() -> ChannelPlatform {
-    ChannelPlatform::parse("fixture").unwrap()
+    let args: Vec<String> = std::env::args().collect();
+    let id = args
+        .iter()
+        .position(|arg| arg == "--channel")
+        .and_then(|i| args.get(i + 1))
+        .map_or("fixture", String::as_str);
+    ChannelPlatform::parse(id).unwrap()
 }
 #[async_trait]
 impl ChannelFactory for Fixture {
@@ -92,6 +99,9 @@ impl ChannelSender for Fixture {
     async fn send(&self, _: &ChannelPeer, message: Outbound) -> Result<SendOutcome, DeliverError> {
         if matches!(message, Outbound::Text { ref text } if text == "crash") {
             std::process::exit(23);
+        }
+        if matches!(message, Outbound::Text { ref text } if text == "slow") {
+            tokio::time::sleep(Duration::from_secs(2)).await;
         }
         Ok(SendOutcome::Sent)
     }

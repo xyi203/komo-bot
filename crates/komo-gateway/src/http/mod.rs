@@ -97,10 +97,7 @@ fn shared_routes() -> Router<Api> {
             "/v1/config/embedding-models/{alias}",
             put(config::put_embedding_model).delete(config::delete_embedding_model),
         )
-        .route(
-            "/v1/config/provider-groups/{name}",
-            put(config::put_provider_group),
-        )
+        .route("/v1/config/provider-models", post(config::provider_models))
         .route("/v1/config/default-model", put(config::put_default_model))
         .route("/v1/config/settings", get(config::settings))
         .route("/v1/config/settings/{key}", put(config::put_setting))
@@ -110,6 +107,7 @@ fn shared_routes() -> Router<Api> {
         .route("/v1/channels/{id}/probe", post(channels::probe))
         .route("/v1/mcp", get(mcp::list))
         .route("/v1/mcp/reconnect", post(mcp::reconnect))
+        .route("/v1/mcp/disconnect", post(mcp::disconnect))
 }
 
 /// `GET /healthz`：最小健康检查与**实例标识**。

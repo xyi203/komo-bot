@@ -1,4 +1,4 @@
-//! `GET /v1/mcp`（`docs/mcp.md` §2.6）与 `POST /v1/mcp/reconnect`（§2.5）。
+//! `GET /v1/mcp`（`docs/mcp.md` §2.6）、`POST /v1/mcp/reconnect`（§2.5）与 `POST /v1/mcp/disconnect`。
 
 use axum::Json;
 use axum::extract::State;
@@ -23,6 +23,19 @@ pub async fn reconnect(
     let servers = api
         .state
         .reconnect_mcp(&request.servers)
+        .await
+        .map_err(ApiFailure::invalid)?;
+    Ok(Json(McpReconnectResponse { servers }))
+}
+
+/// 点名的服务器断开（空 = 全部），停到人重连为止；名字不在配置里 400，一台也不动。
+pub async fn disconnect(
+    State(api): State<Api>,
+    Json(request): Json<McpReconnectRequest>,
+) -> ApiResult<Json<McpReconnectResponse>> {
+    let servers = api
+        .state
+        .disconnect_mcp(&request.servers)
         .await
         .map_err(ApiFailure::invalid)?;
     Ok(Json(McpReconnectResponse { servers }))

@@ -8,10 +8,11 @@ use komo_kernel::protocol::http::{
     ConfigCheckResponse, ConfigEditResponse, ConfigEnvResponse, ConfigModelsResponse,
     ConfigReloadResponse, ConfigSettingsResponse, ConfigVersionRequest, DefaultModelRequest,
     EmbeddingUpsertRequest, EnvSetRequest, ErrorCode, ModelMenuEntry, ModelUpsertRequest,
-    ModelsResponse, ProviderGroupRequest, ProviderUpsertRequest, SettingRequest,
+    ModelsResponse, ProviderModelsRequest, ProviderModelsResponse, ProviderUpsertRequest,
+    SettingRequest,
 };
 use komo_kernel::types::model::{CatalogModel, ModelConfig};
-use komo_runtime::config::{EditError, EmbeddingFields, ModelFields, ProviderFields};
+use komo_runtime::config::{CatalogRow, EditError, EmbeddingFields, ModelFields, ProviderFields};
 
 use super::Api;
 use super::error::{ApiFailure, ApiResult};
@@ -135,7 +136,7 @@ pub async fn put_provider(
 ) -> ApiResult<Json<ConfigEditResponse>> {
     edit(&api, &request.version, |config, env| {
         let fields = ProviderFields {
-            group: request.group.as_deref(),
+            name: request.name.as_deref(),
             base_url: request.base_url.as_deref(),
             api_backend: request.api_backend.as_deref(),
             env_key: request.env_key.as_deref(),
@@ -147,29 +148,107 @@ pub async fn put_provider(
             Some(to) => (komo_runtime::config::rename_provider(config, &id, to)?, to),
             None => (config.to_string(), id.as_str()),
         };
-        let (config, env) = komo_runtime::config::upsert_provider(&config, env, id, &fields)?;
+        let (mut config, env) = komo_runtime::config::upsert_provider(&config, env, id, &fields)?;
+        if let Some(models) = &request.models {
+            let rows: Vec<CatalogRow<'_>> = models
+                .iter()
+                .map(|m| CatalogRow {
+                    alias: &m.alias,
+                    model: &m.model,
+                    name: m.name.as_deref(),
+                    context_window: m.context_window,
+                    effort: m.effort.as_deref(),
+                    efforts: m.efforts.as_deref(),
+                    dimensions: m.dimensions,
+                })
+                .collect();
+            config = komo_runtime::config::set_provider_models(&config, id, &rows)?;
+        }
         Ok((Some(config), env))
     })
     .await
 }
 
-/// `PUT /v1/config/provider-groups/{name}`：给一组改名。
-pub async fn put_provider_group(
+/// `POST /v1/config/provider-models`：设置页的"获取可用模型"。端点、协议、key 用请求里的，
+/// 没给就用 `provider` 那一项的；什么都不写。
+pub async fn provider_models(
     State(api): State<Api>,
-    Path(name): Path<String>,
-    Json(request): Json<ProviderGroupRequest>,
-) -> ApiResult<Json<ConfigEditResponse>> {
-    edit(&api, &request.version, |config, _| {
-        Ok((
-            Some(komo_runtime::config::rename_provider_group(
-                config,
-                &name,
-                &request.rename,
-            )?),
-            None,
-        ))
-    })
-    .await
+    Json(request): Json<ProviderModelsRequest>,
+) -> ApiResult<Json<ProviderModelsResponse>> {
+    const PROBE_KEY: &str = "KOMO_PROVIDER_MODELS_KEY";
+    let existing = match &request.provider {
+        Some(id) => {
+            let (config, env) = api.state.config.read_texts().map_err(io_failure)?;
+            view(&api, &config, &env)?
+                .providers
+                .into_iter()
+                .find(|p| p.id == *id)
+        }
+        None => None,
+    };
+    let pick = |given: &Option<String>, stored: Option<&String>| {
+        given
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(str::to_string)
+            .or_else(|| stored.cloned())
+    };
+    let base_url = pick(
+        &request.base_url,
+        existing.as_ref().and_then(|p| p.base_url.as_ref()),
+    )
+    .ok_or_else(|| ApiFailure::invalid("先填 API 地址"))?;
+    let backend = pick(
+        &request.api_backend,
+        existing.as_ref().and_then(|p| p.api_backend.as_ref()),
+    )
+    .ok_or_else(|| ApiFailure::invalid("先选 API 协议"))?;
+    // 表单里刚粘的 key 只进这一次请求用的凭证表，不碰 `.env`
+    let typed = request
+        .api_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|k| !k.is_empty());
+    let (secrets, key_env) = match typed {
+        Some(key) => (
+            std::sync::Arc::new(komo_runtime::config::Secrets::from_pairs([(
+                PROBE_KEY, key,
+            )])),
+            PROBE_KEY.to_string(),
+        ),
+        None => (
+            api.state.config.secrets(),
+            pick(
+                &request.env_key,
+                existing.as_ref().and_then(|p| p.env_key.as_ref()),
+            )
+            .unwrap_or_default(),
+        ),
+    };
+    let factory = komo_runtime::llm::LlmFactory::new(secrets, api.state.caps.clone())
+        .with_chatgpt_credentials_path(komo_runtime::llm::codex_auth::credentials_path(
+            &api.state.snapshot().start_only.data_dir,
+        ));
+    let config = ModelConfig {
+        provider: backend.to_ascii_lowercase(),
+        base_url: base_url.trim_end_matches('/').to_string(),
+        model: String::new(),
+        api_key_env: key_env,
+        auth: if typed.is_some() {
+            None
+        } else {
+            existing.and_then(|p| p.auth)
+        },
+        effort: None,
+        efforts: None,
+        timeout_secs: 10,
+        context_window: None,
+    };
+    let models = komo_runtime::llm::list_models(&factory, &config)
+        .await
+        .map_err(|e| ApiFailure::invalid(format!("没取到模型列表：{e}")))?;
+    Ok(Json(ProviderModelsResponse { models }))
 }
 
 /// `DELETE /v1/config/model-providers/{id}`
@@ -219,6 +298,7 @@ pub async fn put_embedding_model(
     edit(&api, &request.version, |config, env| {
         let fields = EmbeddingFields {
             model: &request.model,
+            name: request.name.as_deref(),
             provider: request.provider.as_deref(),
             api_backend: request.api_backend.as_deref(),
             base_url: request.base_url.as_deref(),

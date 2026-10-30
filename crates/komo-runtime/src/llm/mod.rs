@@ -37,7 +37,7 @@ pub use model_stream::{
     ModelStream, PROVIDER_BLOCKS, RequestOptions, SystemState, load_image, replay_system,
     usage_json, usage_of,
 };
-pub use models::{ProbeError, probe_context_window};
+pub use models::{ProbeError, list_models, probe_context_window};
 pub use responses::{Credential, OpenAiResponsesLlm};
 pub use routing_stream::RoutingStream;
 pub use transport::{HttpTransport, ReqwestTransport, TransportError};

@@ -1013,6 +1013,7 @@ fn mcp_server_lines(servers: &[McpServerStatus]) -> Vec<String> {
                 McpServerState::Connected => "已连上",
                 McpServerState::NeedsAuth => "要登录",
                 McpServerState::Failed => "失败",
+                McpServerState::Disconnected => "已断开",
             };
             match &server.detail {
                 Some(detail) => format!("  {:<12} {state}  {detail}", server.name),

@@ -189,6 +189,10 @@ Web 设置页要一张服务器表，而不是"点重连才看得到状态"。`G
 `adopt` 时记下，重连连上时换成新的那份；没连上过就是空的。命令、参数、URL 与变量名不返回（`docs/komo_bot.md`
 §3「Web 看 MCP 服务器与向量模型」）。
 
+### 2.7 手动断开：`POST /v1/mcp/disconnect`（2026-10-30）
+
+设置页的服务器详情里"断开连接"。请求同重连（`{"servers": [...]}`，空 = 全部；名字不在配置里 400，一台也不动），交回断开后的状态。断开 = 放掉会话（stdio 子进程在最后一个在途调用返回后退出），停在新状态 `disconnected`：后台不再隔一阵重连，调用也不当场重连，直接报"已手动断开，这次调用没有执行"并指出怎么重连。工具名照旧挂着（下一条 Run 还看得见，调了得到那句原因），不撤下——撤下要动已受理 Run 的工具面。重连（`POST /v1/mcp/reconnect` 或 `komo mcp reconnect`）把它带回正常的连接流程。只在内存里，不写配置：Gateway 重启、或配置重载换掉这台服务器后照常连上；要长期不用就从配置里删掉。`McpServerState` 多一个 `disconnected`（CLI 的 `komo mcp` 列表写"已断开"）。测试 `mcp::tests::disconnect_stays_down_until_reconnected`。
+
 ## 3. 暴露方式（2026-10-14，照 pi）
 
 MCP 工具默认**不声明给模型**，只在 codemode 脚本里调：一台服务器几十个工具的 schema 每次请求都带，

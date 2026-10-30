@@ -163,7 +163,13 @@ Gateway 对数据目录持有进程锁。多个 CLI 同时启动时，只允许�
 - `GET /v1/config/models` 加 `embeddings`：每个 `type = "embedding"` 的模型项（alias、`model`、协议、`base_url`、`model_provider`、凭证变量名与在不在、`dimensions`），和 `memory_embedding`（`[memory] embedding` 指的 alias）。（最初只读，2026-10-30 同日开放写，见下一段。）
 - **实现（2026-10-30）。** kernel `protocol::http` 的 `McpServersResponse` / `McpServerView` / `McpTransportKind` / `McpToolView`，`ConfigModelsResponse` 加 `embeddings`（`EmbeddingModelEntry`）与 `memory_embedding`；runtime `McpConnection` 在 `adopt` 时记下挑过的工具（`listed`，交出工具不清空），`McpConnection::view` / `McpHub::views`；`config::edit::models_view` 列出 embedding 模型项（凭证变量名没写就继承 provider）；gateway `http::mcp::list`。测试：runtime `mcp::tests::views_list_the_selected_tools_with_their_flags`（白名单外不列、实际 exposure / 对外 / 只读、交出工具后清单还在、连不上的为空且带原因），`config::edit::tests` 的视图那条加了 embedding。另在临时数据目录起前台 Gateway，配一台演示 stdio 服务器（四个工具：只读、直出、对外、不挂各一）、一台起不来的、一台要 OAuth 的，经 Web 看了表、两种详情、单台重连，桌面与手机各截了图；没碰真实的 `~/.komo`。`cargo test --workspace`：2527 通过、0 失败、12 忽略；`cargo fmt --check` 通过。已装到本机，7777 上的 `GET /v1/mcp` 能读到。
 
-**provider 组（2026-10-30，认可）。** 同一家常有两个端点（对话一个协议、嵌入另一个协议），设置页要把它们排在一起。`[model_providers.<id>]` 加一个可选键 `group`（字符串）：只给设置页分组，运行时、校验、热重载都不读它；没写的 provider 自成一组，组名就是它的 id。provider 的 `PUT` 带 `group`（整份写，省略即删）；`PUT /v1/config/provider-groups/{name}` 给一组改名，`group` 等于旧名的与没写 `group`、id 就是旧名的那个一起写成新名（所以给自成一组的改名就是给它写上 `group`），组名不能空、不能有换行，没有这组 404。组没有单独的存储，所以没有"空组"：新建组就是带着组名建它的第一个 provider，组里最后一个 provider 删掉组就没了。实现：runtime `config::edit::rename_provider_group`，`ProviderFields` / `ProviderEntry` / `ProviderUpsertRequest` 加 `group`，`ModelProviderSection` 认 `group`（不算不认识的键）；测试 `provider_groups_are_a_key_and_rename_together`。在 demo 数据目录经 Web 建了一组（对话 + 嵌入两个 provider，嵌入那个里加向量模型）、改组名、给自成一组的改组名、再在编辑里清掉所属组，核对了配置文件，配置检查没有多出"不认识的键"。
+**provider 表单与模型目录（2026-10-30，认可；替换同日的"provider 组"）。** 设置页按参考设计改：一个 provider 一张卡，卡头是它的显示名称；不再有"组"这一层（同日试过的 `group` 键撤掉，从没进过真实配置）。
+
+- `[model_providers.<id>]` 加可选键 `name`（显示名称），只给设置页用，运行时不读；没写就显示 id。embedding 模型项也认 `name`。
+- 新建 provider 先选"第三方模型提供商"（预设：OpenAI、Anthropic、OpenRouter、Google Gemini，选了填好 ID、显示名称、地址、协议与凭证变量名）或"自定义模型 API"（空表）。字段一列排开：Provider ID、显示名称、API 地址、API 协议（对话三种与嵌入两种放在一个下拉里，选了嵌入协议就是嵌入 provider，不另设"类型"）、API 密钥；凭证变量名与请求时限收在"更多设置"。挂着模型时协议不能在对话与嵌入之间换。新建时 ID 已存在就拦下，不覆盖。
+- 表单下面是这个 provider 的**整份模型目录**：一行一个模型（模型 ID、显示名称，› 展开 alias 与窗口 / 默认 effort / 可选档位，嵌入的是维数），可加可删。保存时 provider 的 `PUT` 带 `models`，同一次编辑里写：每行按 alias 增改（alias 没填就由模型 ID 换成合法字符得出），原来挂在它上面、同一类、不在目录里的删掉，删时照常过引用守卫（默认模型、记忆、Agent 用着的整次保存被拒）；别的 provider 的 alias 不让抢，同一 alias 写两次 400。不带 `models` 就不动模型。
+- "获取可用模型"：`POST /v1/config/provider-models` 用表单里的地址、协议与 key（没填 key 就用凭证变量或那个 provider 已有的凭证，含 `auth = "chatgpt"`）问 provider 的模型列表——OpenAI 兼容与 Anthropic 是 `GET {base_url}/models`（Anthropic 带 `x-api-key` 与版本头），Ollama 是 `GET {base_url}/api/tags`——交回 id 列表，10 秒上限；表单里刚输入的 key 只进这一次请求，不写 `.env`。结果在目录上方列成可点的标签，点一下加进目录或移出，可筛选。
+- 实现：runtime `config::edit::{set_provider_models, CatalogRow}`、`llm::list_models`（与窗口探测共用请求构造，加了两种嵌入协议），`ProviderFields` / `ProviderEntry` / `ProviderUpsertRequest` / `EmbeddingFields` 加 `name`，`ProviderUpsertRequest` 加 `models`；gateway `http::config::provider_models`。测试 `a_provider_carries_a_display_name_and_its_whole_catalog`、`model_ids_come_from_each_vendors_list_shape`。在 demo 数据目录经 Web 走了预设填充、切自定义清空、自定义 provider 带两行目录保存、编辑时删一行保存（模型随之删除）、对本机 Ollama"获取可用模型"，核对了配置文件。
 
 **Web 看渠道状态（2026-10-30，认可）。** 渠道拆成插件进程后，"在不在跑"只有 Gateway 知道，CLI 的 `channel list` 只读配置。补两个端点，设置页渠道一节用它们：
 
@@ -1083,8 +1089,8 @@ CLI 通过 HTTP 发命令，通过 SSE 观察运行。Gateway 内部采用函数
 | GET /v1/config/check             | 当前配置的校验结果（与热重载同一个函数）       |
 | POST /v1/config/reload           | 热重载；校验不过 422 并保留原配置               |
 | GET /v1/config/models            | 文件里写着的 provider、completion 模型与默认模型，另列只读的 embedding 模型；每个 provider 带凭证在不在，不带值；带 `version`（§3「从 Web 改模型配置」） |
-| PUT /v1/config/model-providers/{id} | 新建或整份改一个 provider（含 `group`）；可带 API key（只写 `.env`）；可带 `rename` 改名（同步改挂在它上面的模型）；带 `version`，对不上 409，校验不过 422 不落盘 |
-| PUT /v1/config/provider-groups/{name} | 给一组 provider 改名：`group` 等于旧名的、以及没写 `group` 且 id 就是旧名的，一起写成新名；没有这组 404 |
+| PUT /v1/config/model-providers/{id} | 新建或整份改一个 provider（含显示名称 `name`）；可带 API key（只写 `.env`）；可带 `rename` 改名（同步改挂在它上面的模型）；可带 `models` 整份写它的模型目录（目录外的同类模型删掉，引用守卫照常）；带 `version`，对不上 409，校验不过 422 不落盘 |
+| POST /v1/config/provider-models | 用给的地址、协议、key（或已有 provider 的）问 provider 有哪些模型，交回 id 列表；不写任何东西 |
 | DELETE /v1/config/model-providers/{id} | 删 provider；还有模型引用它 409 |
 | PUT /v1/config/models/{alias}    | 新建或整份改一个 completion 模型 |
 | DELETE /v1/config/models/{alias} | 删模型；是默认模型或被 `[memory] model`、Agent 引用 409 |
@@ -1098,6 +1104,7 @@ CLI 通过 HTTP 发命令，通过 SSE 观察运行。Gateway 内部采用函数
 | DELETE /v1/config/embedding-models/{alias} | 删 embedding 模型项；记忆在用 409 |
 | GET /v1/mcp                      | 每台 MCP 服务器此刻的状态、传输方式与最近一次握手列出的工具；不等握手、不重连（§3「Web 看 MCP 服务器与向量模型」） |
 | POST /v1/mcp/reconnect           | 点名的 MCP 服务器（空 = 全部）断开重连，等握手完交回各自状态；名字不在配置里 400（`docs/mcp.md` §2.5） |
+| POST /v1/mcp/disconnect          | 点名的 MCP 服务器（空 = 全部）手动断开，停到重连为止：后台不再连，调用报"已手动断开"；只在内存里，重启后照常连（`docs/mcp.md` §2.7） |
 | GET /v1/channels                 | 每个配置里的渠道：配置摘要加插件进程的运行状态（在跑 / 重试中 / 起不来 / 未启用）、进入时间、退出原因与重建次数（§3「Web 看渠道状态」） |
 | POST /v1/channels/{id}/probe     | 与 `komo channel probe` 同一条连通性核对，交回 `{ok, message}`；不起消费循环 |
 | GET /v1/home-session             | 操作者的 home session（§11.2）                 |
@@ -1143,7 +1150,7 @@ Axum 已提供 SSE 响应；toasty 的 turso 驱动提供连接与事务，MVCC 
 | 配置                    | 职责 |
 | ----------------------- | ---- |
 | `model_providers.<name>` | 一组可复用的 `base_url`、`api_backend`、`env_key` 与超时默认值 |
-| `model_providers.<name>.group` | 可选，设置页把同组的 provider 排在一张卡里（比如同一家的对话与嵌入两个端点）；运行时不读，没写就自成一组 |
+| `model_providers.<name>.name` | 可选，设置页显示的名字；运行时不读，没写就显示 id |
 | `model.<alias>`          | 一项模型；`type = "completion"` 或 `"embedding"`，可覆盖 provider 的任一连接字段 |
 | `auth`                   | 凭证不走 `.env` 变量，走另一种机制；目前只有 `"chatgpt"`（ChatGPT 账号 OAuth，给 Codex 模型用）。与 `env_key` 互斥，只允许 `api_backend = "responses"`（下方单独一段） |
 | `models.default`         | 默认对话模型 alias；Session / Cron 的 `model` 参数也使用 alias |

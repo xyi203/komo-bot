@@ -84,7 +84,7 @@ pub fn models_view(
             let auth = str_of(t, "auth");
             providers.push(ProviderEntry {
                 id: id.to_string(),
-                group: str_of(t, "group"),
+                name: str_of(t, "name"),
                 base_url: str_of(t, "base_url"),
                 api_backend: str_of(t, "api_backend"),
                 key_set: auth.is_some() || env_key.as_deref().is_some_and(|k| secrets.has(k)),
@@ -156,6 +156,7 @@ fn embedding_entry(
     EmbeddingModelEntry {
         alias: alias.to_string(),
         model: str_of(t, "model").unwrap_or_default(),
+        name: str_of(t, "name"),
         api_backend: str_of(t, "api_backend")
             .or_else(|| parent.and_then(|p| p.api_backend.clone())),
         base_url: str_of(t, "base_url").or_else(|| parent.and_then(|p| p.base_url.clone())),
@@ -272,7 +273,7 @@ fn default_env_key(id: &str) -> String {
 /// 一个 provider 要写的东西（`ProviderUpsertRequest` 去掉版本）。
 #[derive(Debug, Clone, Default)]
 pub struct ProviderFields<'a> {
-    pub group: Option<&'a str>,
+    pub name: Option<&'a str>,
     pub base_url: Option<&'a str>,
     pub api_backend: Option<&'a str>,
     pub env_key: Option<&'a str>,
@@ -291,7 +292,7 @@ pub fn upsert_provider(
     fields: &ProviderFields<'_>,
 ) -> Result<(String, Option<String>), EditError> {
     check_name("provider", id)?;
-    let group = line("group", fields.group)?;
+    let name = line("name", fields.name)?;
     let base_url = line("base_url", fields.base_url)?;
     let api_backend = line("api_backend", fields.api_backend)?;
     let auth = line("auth", fields.auth)?;
@@ -315,7 +316,7 @@ pub fn upsert_provider(
 
     let mut doc = parse(config_text)?;
     let table = table_mut(&mut doc, "model_providers", id);
-    set_or_remove(table, "group", group);
+    set_or_remove(table, "name", name);
     set_or_remove(table, "base_url", base_url);
     set_or_remove(table, "api_backend", api_backend);
     set_or_remove(table, "auth", auth);
@@ -439,6 +440,7 @@ pub fn upsert_model(
 #[derive(Debug, Clone, Default)]
 pub struct EmbeddingFields<'a> {
     pub model: &'a str,
+    pub name: Option<&'a str>,
     pub provider: Option<&'a str>,
     pub api_backend: Option<&'a str>,
     pub base_url: Option<&'a str>,
@@ -473,6 +475,7 @@ pub fn upsert_embedding_model(
             crate::embedding::OPENAI_COMPATIBLE
         )));
     }
+    let name = line("name", fields.name)?;
     let base_url = line("base_url", fields.base_url)?;
     let mut env_key = line("env_key", fields.env_key)?;
     if let Some(key) = &env_key {
@@ -504,6 +507,7 @@ pub fn upsert_embedding_model(
     table["type"] = value("embedding");
     set_or_remove(table, "model_provider", provider);
     table["model"] = value(model);
+    set_or_remove(table, "name", name);
     set_or_remove(table, "api_backend", api_backend);
     set_or_remove(table, "base_url", base_url);
     let spelling = if table.contains_key("api_key_env") && !table.contains_key("env_key") {
@@ -559,32 +563,112 @@ fn replace_str(table: &mut Table, key: &str, to: &str) {
     }
 }
 
-/// 给一组改名：`group` 等于旧名的 provider，以及没写 `group`、自成一组且 id 就是旧名的那个，
-/// 一起改写成新名。组只是设置页的排法，运行时不读。
-pub fn rename_provider_group(config_text: &str, from: &str, to: &str) -> Result<String, EditError> {
-    let to = line("组名", Some(to))?.ok_or_else(|| EditError::Invalid("组名不能为空".into()))?;
-    let mut doc = parse(config_text)?;
-    let mut found = false;
-    if let Some(providers) = doc.get_mut("model_providers").and_then(Item::as_table_mut) {
-        for (id, item) in providers.iter_mut() {
-            let Some(table) = item.as_table_mut() else {
-                continue;
-            };
-            let group = str_of(table, "group");
-            if group.as_deref() == Some(from) || (group.is_none() && id.get() == from) {
-                found = true;
-                if table.contains_key("group") {
-                    replace_str(table, "group", &to);
-                } else {
-                    table.insert("group", value(to.as_str()));
-                }
-            }
+/// provider 表单模型目录里的一行（`ProviderModelRequest`）。
+#[derive(Debug, Clone, Default)]
+pub struct CatalogRow<'a> {
+    pub alias: &'a str,
+    pub model: &'a str,
+    pub name: Option<&'a str>,
+    pub context_window: Option<u64>,
+    pub effort: Option<&'a str>,
+    pub efforts: Option<&'a [String]>,
+    pub dimensions: Option<u64>,
+}
+
+/// 把 provider 的模型目录写成整份：每一行按 alias 增改（对话 provider 写 completion，嵌入
+/// provider——协议是向量那两种——写 embedding），原来挂在它上面、同一类、不在目录里的删掉，
+/// 删的时候照常过引用守卫（默认模型、记忆、Agent 用着的删不掉）。别的 provider 的 alias
+/// 不让抢；挂在它上面的另一类模型（旧配置里对话 provider 下的向量模型）不动。
+pub fn set_provider_models(
+    config_text: &str,
+    provider: &str,
+    rows: &[CatalogRow<'_>],
+) -> Result<String, EditError> {
+    let doc = parse(config_text)?;
+    let Some(table) = sub_table(&doc, "model_providers", provider) else {
+        return Err(EditError::NotFound(format!("provider `{provider}`")));
+    };
+    let embedding = str_of(table, "api_backend").is_some_and(|backend| {
+        [
+            crate::embedding::OLLAMA,
+            crate::embedding::OPENAI_COMPATIBLE,
+        ]
+        .contains(&backend.as_str())
+    });
+    let kind = if embedding { "embedding" } else { "completion" };
+    let mut seen = std::collections::BTreeSet::new();
+    for row in rows {
+        if !seen.insert(row.alias) {
+            return Err(EditError::Invalid(format!(
+                "模型目录里 `{}` 写了两次",
+                row.alias
+            )));
+        }
+        if let Some(existing) = sub_table(&doc, "model", row.alias)
+            && let Some(owner) = str_of(existing, "model_provider")
+            && owner != provider
+        {
+            return Err(EditError::InUse(format!(
+                "`{}` 已经是 provider `{owner}` 的模型，换个名字",
+                row.alias
+            )));
         }
     }
-    if !found {
-        return Err(EditError::NotFound(format!("provider 组 `{from}`")));
+    let stale: Vec<String> = doc
+        .get("model")
+        .and_then(Item::as_table)
+        .map(|models| {
+            models
+                .iter()
+                .filter_map(|(alias, item)| {
+                    let t = item.as_table()?;
+                    (str_of(t, "model_provider").as_deref() == Some(provider)
+                        && str_of(t, "type").as_deref() == Some(kind)
+                        && !seen.contains(alias))
+                    .then(|| alias.to_string())
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut text = config_text.to_string();
+    for row in rows {
+        text = if embedding {
+            upsert_embedding_model(
+                &text,
+                "",
+                row.alias,
+                &EmbeddingFields {
+                    model: row.model,
+                    name: row.name,
+                    provider: Some(provider),
+                    dimensions: row.dimensions,
+                    ..EmbeddingFields::default()
+                },
+            )?
+            .0
+        } else {
+            upsert_model(
+                &text,
+                row.alias,
+                &ModelFields {
+                    provider,
+                    model: row.model,
+                    name: row.name,
+                    effort: row.effort,
+                    efforts: row.efforts,
+                    context_window: row.context_window,
+                },
+            )?
+        };
     }
-    Ok(doc.to_string())
+    for alias in stale {
+        text = if embedding {
+            remove_embedding_model(&text, &alias)?
+        } else {
+            remove_model(&text, &alias)?
+        };
+    }
+    Ok(text)
 }
 
 /// 给 provider 改名：表搬到新名字下，挂在它上面的模型（`model_provider`）一并改指新名字。
@@ -984,50 +1068,88 @@ default = "magpie-sol"
         assert!(!unset.providers[0].key_set);
     }
 
-    /// 组只是 provider 上的一个 `group` 键：写 provider 时带上，改组名时同组的一起改；
-    /// 没写 `group` 的自成一组，组名就是它的 id。
+    /// 显示名称只是 provider 上的 `name`；模型目录整份写：增改每一行，删掉目录外原来挂着的
+    /// 同类模型（引用守卫照常），别的 provider 的 alias 抢不到，嵌入 provider 写 embedding。
     #[test]
-    fn provider_groups_are_a_key_and_rename_together() {
+    fn a_provider_carries_a_display_name_and_its_whole_catalog() {
         let (config, _) = upsert_provider(
             CONFIG,
             "",
-            "magpie-embed",
+            "magpie",
             &ProviderFields {
-                group: Some("Magpie"),
+                name: Some("Magpie 代理"),
+                base_url: Some("http://127.0.0.1:3425/v1"),
+                api_backend: Some("responses"),
+                env_key: Some("MAGPIE_API_KEY"),
+                timeout_secs: Some(600),
+                ..ProviderFields::default()
+            },
+        )
+        .unwrap();
+        assert!(config.contains("name = \"Magpie 代理\""), "{config}");
+        let view = models_view(&config, &secrets(&[]), "v".into(), "c".into(), "e".into()).unwrap();
+        assert_eq!(view.providers[0].name.as_deref(), Some("Magpie 代理"));
+
+        let row = |alias, model| CatalogRow {
+            alias,
+            model,
+            ..CatalogRow::default()
+        };
+        // magpie-sol 是默认模型：目录里去掉它就删不掉
+        assert!(matches!(
+            set_provider_models(&config, "magpie", &[row("opus", "claude/opus")]),
+            Err(EditError::InUse(_))
+        ));
+        let config = set_provider_models(
+            &config,
+            "magpie",
+            &[
+                CatalogRow {
+                    name: Some("Sol 新"),
+                    ..row("magpie-sol", "codex/gpt-6.1-sol")
+                },
+                row("opus", "claude/opus"),
+            ],
+        )
+        .unwrap();
+        assert!(config.contains("[model.opus]"), "{config}");
+        assert!(config.contains("name = \"Sol 新\""), "{config}");
+        let config =
+            set_provider_models(&config, "magpie", &[row("magpie-sol", "codex/gpt-6.1-sol")])
+                .unwrap();
+        assert!(!config.contains("[model.opus]"), "目录外的删掉：{config}");
+        assert!(
+            config.contains("[model.embedding]"),
+            "没挂这个 provider 的不动"
+        );
+        assert!(matches!(
+            set_provider_models(&config, "magpie", &[row("a", "x"), row("a", "y")]),
+            Err(EditError::Invalid(_))
+        ));
+
+        let (config, _) = upsert_provider(
+            &config,
+            "",
+            "ollama",
+            &ProviderFields {
                 base_url: Some("http://127.0.0.1:11434"),
                 api_backend: Some("ollama_embeddings"),
                 ..ProviderFields::default()
             },
         )
         .unwrap();
-        assert!(
-            config.contains("[model_providers.magpie-embed]\ngroup = \"Magpie\""),
-            "{config}"
-        );
+        assert!(matches!(
+            set_provider_models(&config, "ollama", &[row("magpie-sol", "x")]),
+            Err(EditError::InUse(_))
+        ));
+        let config = set_provider_models(&config, "ollama", &[row("bge", "bge-m3")]).unwrap();
         let view = models_view(&config, &secrets(&[]), "v".into(), "c".into(), "e".into()).unwrap();
-        let groups: Vec<_> = view
-            .providers
-            .iter()
-            .map(|p| (p.id.as_str(), p.group.as_deref()))
-            .collect();
-        assert_eq!(groups, [("magpie", None), ("magpie-embed", Some("Magpie"))]);
-
-        // 没写 group 的 magpie 自成一组 "magpie"：改这一组就给它写上 group
-        let config = rename_provider_group(&config, "magpie", "Magpie").unwrap();
-        let config = rename_provider_group(&config, "Magpie", "代理").unwrap();
-        assert_eq!(config.matches("group = \"代理\"").count(), 2, "{config}");
         assert!(
-            config.contains("# 本机代理\n[model_providers.magpie]"),
-            "注释留着：{config}"
+            view.embeddings
+                .iter()
+                .any(|e| e.alias == "bge" && e.provider.as_deref() == Some("ollama")),
+            "嵌入 provider 写的是 embedding"
         );
-        assert!(matches!(
-            rename_provider_group(&config, "nope", "x"),
-            Err(EditError::NotFound(_))
-        ));
-        assert!(matches!(
-            rename_provider_group(&config, "代理", " "),
-            Err(EditError::Invalid(_))
-        ));
     }
 
     /// 改名搬的是整张表：位置、上方注释跟着走，引用它的地方一并改，撞名与改错类型被拒。

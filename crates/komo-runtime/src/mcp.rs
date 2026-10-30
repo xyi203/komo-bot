@@ -347,6 +347,9 @@ enum Link {
     /// 已从配置移除（[`McpConnection::close`]）。hub 手里的会话放掉了，在途调用握着的那份
     /// 用完才断开。
     Closed,
+    /// 人手动断开（[`McpConnection::disconnect`]）。和 `Failed` 不同：后台不再连，用到时也不
+    /// 当场连，直到人点重连（或 Gateway 重启）。会话同样放掉，在途调用用完才断。
+    Disconnected,
 }
 
 /// 调用没成的两种情况：确定没到服务器（没连上、凭证被拒），或发出去之后断了——后一种
@@ -524,6 +527,29 @@ impl McpConnection {
         self.closed.load(Ordering::SeqCst)
     }
 
+    /// 人要求断开：放掉会话（stdio 子进程在最后一个在途调用返回后退出），停在
+    /// [`Link::Disconnected`]，后台不再连、用到时也不连。正在连的那次连完才拿得到锁，连完照样
+    /// 断开。交回断开后的状态。
+    async fn disconnect(&self) -> McpServerStatus {
+        {
+            let mut link = self.link.lock().await;
+            if !self.is_closed() {
+                tracing::info!(server = %self.name, "MCP 服务器按要求断开");
+                *link = Link::Disconnected;
+            }
+        }
+        // 第一次还没连出结果就被断开：状态别一直报"连接中"
+        self.settled.send_replace(true);
+        self.status()
+    }
+
+    fn disconnected_message(&self) -> String {
+        format!(
+            "MCP 服务器 {} 已手动断开，这次调用没有执行；在设置页或用 `komo mcp reconnect {}` 重连",
+            self.name, self.name
+        )
+    }
+
     fn removed_message(&self) -> String {
         format!("MCP 服务器 {} 已从配置移除，它的工具不能再调", self.name)
     }
@@ -588,6 +614,7 @@ impl McpConnection {
             Link::Connecting => Err(reconnecting()),
             Link::NeedsAuth { .. } => Err(self.login_hint()),
             Link::Closed => Err(self.removed_message()),
+            Link::Disconnected => Err(self.disconnected_message()),
             Link::Failed(error) => Err(format!(
                 "MCP 服务器 {} 连接失败（{error}），这次调用没有执行",
                 self.name
@@ -608,6 +635,7 @@ impl McpConnection {
                     Link::NeedsAuth { .. } => (McpServerState::NeedsAuth, Some(self.login_hint())),
                     Link::Failed(error) => (McpServerState::Failed, Some(error.clone())),
                     Link::Closed => (McpServerState::Failed, Some(self.removed_message())),
+                    Link::Disconnected => (McpServerState::Disconnected, None),
                 },
             }
         };
@@ -784,7 +812,7 @@ impl McpConnection {
             Link::Connecting | Link::Failed(_) => true,
             Link::Connected(server) => server.is_closed(),
             Link::NeedsAuth { tokens } => self.stored_tokens() != *tokens,
-            Link::Closed => false,
+            Link::Closed | Link::Disconnected => false,
         };
         // 等锁的时候被移除了：不再连。
         if self.is_closed() {
@@ -799,6 +827,7 @@ impl McpConnection {
             Link::NeedsAuth { .. } => Err(self.login_hint()),
             Link::Failed(error) => Err(format!("MCP 服务器 {} 连不上：{error}", self.name)),
             Link::Closed => Err(self.removed_message()),
+            Link::Disconnected => Err(self.disconnected_message()),
             // `connect_into` 总会写一个结果，走不到这里；真走到了也只是这次调用报错。
             Link::Connecting => Err(format!("MCP 服务器 {} 还在连", self.name)),
         }
@@ -1051,6 +1080,24 @@ impl McpHub {
     /// 结果，交回各自此刻的状态。新连上的工具照常由 [`Self::new_tools`] 交出去。点了配置里没有的
     /// 名字就一台也不动，交回 `Err`。
     pub async fn reconnect(&self, names: &[String]) -> Result<Vec<McpServerStatus>, String> {
+        let chosen = self.chosen(names)?;
+        Ok(
+            futures_util::future::join_all(chosen.iter().map(|connection| connection.reconnect()))
+                .await,
+        )
+    }
+
+    /// 点名的几台（不点名就是全部）断开，停到人重连为止；交回断开后的状态。名字的规矩同
+    /// [`Self::reconnect`]。工具还挂着，调用报"已手动断开"。
+    pub async fn disconnect(&self, names: &[String]) -> Result<Vec<McpServerStatus>, String> {
+        let chosen = self.chosen(names)?;
+        Ok(
+            futures_util::future::join_all(chosen.iter().map(|connection| connection.disconnect()))
+                .await,
+        )
+    }
+
+    fn chosen(&self, names: &[String]) -> Result<Vec<Arc<McpConnection>>, String> {
         let connections = self.connections();
         let unknown: Vec<&str> = names
             .iter()
@@ -1063,14 +1110,10 @@ impl McpHub {
                 unknown.join("、")
             ));
         }
-        let chosen: Vec<Arc<McpConnection>> = connections
+        Ok(connections
             .into_iter()
             .filter(|c| names.is_empty() || names.iter().any(|name| name == c.name()))
-            .collect();
-        Ok(
-            futures_util::future::join_all(chosen.iter().map(|connection| connection.reconnect()))
-                .await,
-        )
+            .collect())
     }
 
     /// 受理 Run 时先等还在连的服务器（照 pi 的 `waitForDirectServers`）：只等有工具挂得上、
@@ -1793,6 +1836,54 @@ for line in sys.stdin:
                 .unwrap(),
         );
         assert!(connection.call("echo", JsonObject::new()).await.is_ok());
+    }
+
+    /// 手动断开：子进程退掉，状态报"已断开"，调用报原因且不当场重连；点名的才断，点错名字
+    /// 一台也不动；重连之后恢复。
+    #[tokio::test]
+    async fn disconnect_stays_down_until_reconnected() {
+        let fixture = Fixture::new();
+        let hub = fixture
+            .hub(&[
+                ("demo", fixture.server("a", &[])),
+                ("other", fixture.server("b", &[])),
+            ])
+            .await;
+        let pid = fixture.pid("a").await;
+        std::fs::remove_file(fixture.prefix("a").with_extension("pid")).unwrap();
+        assert!(hub.disconnect(&["nope".into()]).await.is_err());
+
+        let statuses = hub.disconnect(&["demo".into()]).await.unwrap();
+        assert_eq!(statuses.len(), 1);
+        assert_eq!(statuses[0].state, McpServerState::Disconnected);
+        wait_exit(pid).await;
+        let connection =
+            |name: &str| Arc::clone(hub.connections().iter().find(|c| c.name() == name).unwrap());
+        let Err(CallError::NotSent(error)) =
+            connection("demo").call("echo", JsonObject::new()).await
+        else {
+            panic!("断开的服务器调用应当没发出去");
+        };
+        assert!(error.contains("手动断开"), "{error}");
+        assert!(
+            !fixture.prefix("a").with_extension("pid").exists(),
+            "调用不当场重连"
+        );
+        assert!(
+            connection("other")
+                .call("echo", JsonObject::new())
+                .await
+                .is_ok()
+        );
+
+        let statuses = hub.reconnect(&["demo".into()]).await.unwrap();
+        assert_eq!(statuses[0].state, McpServerState::Connected);
+        assert!(
+            connection("demo")
+                .call("echo", JsonObject::new())
+                .await
+                .is_ok()
+        );
     }
 
     /// 设置页的服务器表（`GET /v1/mcp`）：连上的列出按 `tools` 挑过的工具，带实际 exposure、

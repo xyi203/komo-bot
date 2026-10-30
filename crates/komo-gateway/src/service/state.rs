@@ -434,6 +434,14 @@ impl GatewayState {
 
     /// `komo mcp reconnect`（`docs/mcp.md` §2.5）：点名的服务器（空 = 全部）断开重连，等到有结果；
     /// 新连上的工具挂进执行器，从下一条 Run 起可用。点了配置里没有的名字交回 `Err`，一台也不动。
+    /// 手动断开点名的 MCP 服务器（空 = 全部）；工具还挂着，调用报"已手动断开"。
+    pub async fn disconnect_mcp(
+        &self,
+        servers: &[String],
+    ) -> Result<Vec<komo_kernel::protocol::http::McpServerStatus>, String> {
+        self.mcp.disconnect(servers).await
+    }
+
     pub async fn reconnect_mcp(
         &self,
         servers: &[String],

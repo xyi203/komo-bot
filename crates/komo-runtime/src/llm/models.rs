@@ -53,6 +53,51 @@ pub async fn probe_context_window(
     Ok(window_of(&body, &config.model))
 }
 
+/// 设置页的"获取可用模型"：问 provider 有哪些模型，交回 id（按它给的顺序）。和窗口探测走
+/// 同一个请求；Ollama 问 `/api/tags`。
+pub async fn list_models(
+    factory: &LlmFactory,
+    config: &ModelConfig,
+) -> Result<Vec<String>, ProbeError> {
+    let request = build_request(factory, config).await?;
+    let response = factory
+        .transport
+        .get(request)
+        .await
+        .map_err(|e| ProbeError(format!("请求模型列表失败：{e}")))?;
+    let status = response.status;
+    let text = response
+        .text()
+        .await
+        .map_err(|e| ProbeError(format!("读取模型列表失败：{e}")))?;
+    if !(200..300).contains(&status) {
+        let excerpt: String = text.chars().take(BODY_EXCERPT_CHARS).collect();
+        return Err(ProbeError(format!("模型列表返回 {status}：{excerpt}")));
+    }
+    let body: Value =
+        serde_json::from_str(&text).map_err(|e| ProbeError(format!("模型列表不是 JSON：{e}")))?;
+    Ok(ids_of(&body))
+}
+
+/// OpenAI / Anthropic 是 `data[].id`，Codex 是 `models[].slug`，Ollama 是 `models[].name`。
+fn ids_of(body: &Value) -> Vec<String> {
+    let Some(list) = body
+        .get("data")
+        .or_else(|| body.get("models"))
+        .and_then(Value::as_array)
+    else {
+        return Vec::new();
+    };
+    list.iter()
+        .filter_map(|entry| {
+            ["id", "slug", "name"]
+                .iter()
+                .find_map(|k| entry.get(k).and_then(Value::as_str))
+                .map(str::to_string)
+        })
+        .collect()
+}
+
 async fn build_request(
     factory: &LlmFactory,
     config: &ModelConfig,
@@ -85,7 +130,7 @@ async fn build_request(
             }
             Ok(request)
         }
-        CHAT_COMPLETIONS => {
+        CHAT_COMPLETIONS | crate::embedding::OPENAI_COMPATIBLE => {
             reject_auth(config)?;
             let key = factory.secrets.get(&config.api_key_env).map(str::to_string);
             Ok(HttpRequest::get(format!("{base}/models"))
@@ -101,6 +146,12 @@ async fn build_request(
                 request = request.with_header("x-api-key", key);
             }
             Ok(request)
+        }
+        crate::embedding::OLLAMA => {
+            let key = factory.secrets.get(&config.api_key_env).map(str::to_string);
+            Ok(HttpRequest::get(format!("{base}/api/tags"))
+                .with_key(key)
+                .with_timeout(timeout))
         }
         other => Err(ProbeError(format!("不认识 api_backend `{other}`"))),
     }
@@ -133,6 +184,17 @@ fn window_of(body: &Value, model: &str) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn model_ids_come_from_each_vendors_list_shape() {
+        let openai = serde_json::json!({ "data": [{ "id": "gpt-6" }, { "id": "gpt-6-mini" }] });
+        let codex = serde_json::json!({ "models": [{ "slug": "gpt-6.1-sol" }] });
+        let ollama = serde_json::json!({ "models": [{ "name": "qwen3-embedding:0.6b" }] });
+        assert_eq!(super::ids_of(&openai), ["gpt-6", "gpt-6-mini"]);
+        assert_eq!(super::ids_of(&codex), ["gpt-6.1-sol"]);
+        assert_eq!(super::ids_of(&ollama), ["qwen3-embedding:0.6b"]);
+        assert!(super::ids_of(&serde_json::json!({})).is_empty());
+    }
+
     use std::sync::Arc;
 
     use super::super::transport::testing::{Reply, ScriptedTransport};

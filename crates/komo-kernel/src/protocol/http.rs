@@ -39,7 +39,8 @@
 //! | `PUT /v1/config/embedding-models/{alias}` | [`EmbeddingUpsertRequest`] | [`ConfigEditResponse`] |
 //! | `DELETE /v1/config/embedding-models/{alias}` | [`ConfigVersionRequest`] | [`ConfigEditResponse`] |
 //! | `GET /v1/mcp` | — | [`McpServersResponse`] |
-//! | `PUT /v1/config/provider-groups/{name}` | [`ProviderGroupRequest`] | [`ConfigEditResponse`] |
+//! | `POST /v1/config/provider-models` | [`ProviderModelsRequest`] | [`ProviderModelsResponse`] |
+//! | `POST /v1/mcp/disconnect` | [`McpReconnectRequest`] | [`McpReconnectResponse`] |
 //! | `GET /v1/channels` | — | [`ChannelsResponse`] |
 //! | `POST /v1/channels/{id}/probe` | — | [`ChannelProbeResponse`] |
 //!
@@ -1313,6 +1314,9 @@ pub struct ConfigModelsResponse {
 pub struct EmbeddingModelEntry {
     pub alias: String,
     pub model: String,
+    /// 显示名（`name`）；没写就显示 alias。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1331,9 +1335,9 @@ pub struct EmbeddingModelEntry {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderEntry {
     pub id: String,
-    /// 设置页的分组（`group`）；没写就自成一组，组名是 `id`。
+    /// 设置页显示的名字（`name`）；没写就显示 `id`。
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub group: Option<String>,
+    pub name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1378,9 +1382,9 @@ pub struct ProviderUpsertRequest {
     /// 改名：先把这一项搬到这个新名字下，再按其余字段写。省略或同名 = 不改名。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rename: Option<String>,
-    /// 设置页的分组；省略 = 没有组（自成一组）。
+    /// 显示名称；省略 = 不写（显示 id）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub group: Option<String>,
+    pub name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1391,6 +1395,10 @@ pub struct ProviderUpsertRequest {
     pub auth: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_secs: Option<u64>,
+    /// 这个 provider 的整份模型目录：给了就按它增改、删掉目录外原来挂在它上面的同类模型
+    /// （对话 provider 管 completion，嵌入 provider 管 embedding）；省略 = 不动模型。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub models: Option<Vec<ProviderModelRequest>>,
     /// 要写进 `.env` 的 key。省略 = 不动现有的值。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key: Option<String>,
@@ -1401,7 +1409,8 @@ impl std::fmt::Debug for ProviderUpsertRequest {
         f.debug_struct("ProviderUpsertRequest")
             .field("version", &self.version)
             .field("rename", &self.rename)
-            .field("group", &self.group)
+            .field("name", &self.name)
+            .field("models", &self.models)
             .field("base_url", &self.base_url)
             .field("api_backend", &self.api_backend)
             .field("env_key", &self.env_key)
@@ -1421,6 +1430,8 @@ pub struct EmbeddingUpsertRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rename: Option<String>,
     pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1475,11 +1486,57 @@ pub struct DefaultModelRequest {
     pub alias: String,
 }
 
-/// `PUT /v1/config/provider-groups/{name}`：给一组改名（组里每个 provider 的 `group` 一起改）。
+/// provider 表单模型目录里的一行。`alias` 是 `[model.<alias>]` 的名字，`model` 是上游 id。
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ProviderGroupRequest {
-    pub version: String,
-    pub rename: String,
+pub struct ProviderModelRequest {
+    pub alias: String,
+    pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub efforts: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dimensions: Option<u64>,
+}
+
+/// `POST /v1/config/provider-models`：问一个（还没存的、或已有的）provider 有哪些模型。
+/// 端点、协议取请求里的，没给就取 `provider` 那一项；key 取请求里的 `api_key`，没给就按
+/// `env_key`（或那一项的凭证变量）从 `.env` 读。`Debug` 不印 key。
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderModelsRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_backend: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub env_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
+}
+
+impl std::fmt::Debug for ProviderModelsRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProviderModelsRequest")
+            .field("provider", &self.provider)
+            .field("base_url", &self.base_url)
+            .field("api_backend", &self.api_backend)
+            .field("env_key", &self.env_key)
+            .field("api_key", &self.api_key.as_ref().map(|_| "<set>"))
+            .finish()
+    }
+}
+
+/// provider 报上来的模型 id，按它给的顺序。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderModelsResponse {
+    #[serde(default)]
+    pub models: Vec<String>,
 }
 
 /// 删除只带版本。
@@ -1602,6 +1659,7 @@ pub struct McpReconnectRequest {
     pub servers: Vec<String>,
 }
 
+/// `POST /v1/mcp/disconnect` 也用这两个：点名的几台（空 = 全部）断开，交回断开后的状态。
 /// 重连等握手：每台服务器连完之后的状态。
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct McpReconnectResponse {
@@ -1664,6 +1722,8 @@ pub enum McpServerState {
     Connected,
     NeedsAuth,
     Failed,
+    /// 操作者手动断开（`POST /v1/mcp/disconnect`）：重连之前不自动再连，调它的工具报错。
+    Disconnected,
 }
 
 /// `GET /v1/channels`：每个配置里的渠道，配置摘要加上 Gateway 看得见的运行状态。凭证与

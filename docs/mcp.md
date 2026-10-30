@@ -181,6 +181,14 @@ mtime、`komo config reload`、`SIGHUP`）的变化键有 `mcp` / `mcp.*` 时，
   隔一阵再连（§2.2）；同一台同一时刻只有一个后台重连在跑。
 - instructions 仍只记第一次连上时的（§2.2），重连不换。
 
+### 2.6 查看：`GET /v1/mcp`（2026-10-30）
+
+Web 设置页要一张服务器表，而不是"点重连才看得到状态"。`GET /v1/mcp` 读 `McpHub` 此刻的状态，**不等握手、
+不重连**（`McpHub::views`）：每台的状态与原因、传输方式、是否 OAuth、`description`、服务器级 exposure，和
+最近一次握手列出、按 `tools` 挑过的工具（每个的实际 exposure、`outward`、`read_only`）。工具清单在
+`adopt` 时记下，重连连上时换成新的那份；没连上过就是空的。命令、参数、URL 与变量名不返回（`docs/komo_bot.md`
+§3「Web 看 MCP 服务器与向量模型」）。
+
 ## 3. 暴露方式（2026-10-14，照 pi）
 
 MCP 工具默认**不声明给模型**，只在 codemode 脚本里调：一台服务器几十个工具的 schema 每次请求都带，

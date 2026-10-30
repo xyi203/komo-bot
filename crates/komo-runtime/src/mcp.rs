@@ -28,7 +28,9 @@ use std::time::{Duration, Instant};
 use komo_kernel::traits::Tool;
 
 use komo_kernel::protocol::config::{McpExposure, McpServerConfig, McpTransport};
-use komo_kernel::protocol::http::{McpServerState, McpServerStatus};
+use komo_kernel::protocol::http::{
+    McpServerState, McpServerStatus, McpServerView, McpToolView, McpTransportKind,
+};
 use komo_kernel::types::tool::{ToolExposure, ToolNamespace};
 use rmcp::ServiceExt;
 use rmcp::model::{CallToolRequestParams, CallToolResult, JsonObject};
@@ -370,6 +372,9 @@ pub struct McpConnection {
     /// 最近一次连上时列出、还没交给 [`McpHub::new_tools`] 的工具。交出去就清空：同一次连接的
     /// 告警（名字太长、撞名）只记一次。
     pending: Mutex<Vec<rmcp::model::Tool>>,
+    /// 最近一次连上时按 `tools` 挑过的工具，给 `GET /v1/mcp` 看（`docs/mcp.md` §2.6）。与
+    /// `pending` 不同，交出工具不清空它。
+    listed: Mutex<Vec<McpToolView>>,
     /// 已从配置移除。不进锁：重连可能握着锁好几秒，移除不该等它。
     closed: AtomicBool,
     /// 后台正隔一阵再连（[`McpConnection::retry_while_failed`]）：同一时刻只有一个。
@@ -415,6 +420,7 @@ impl McpConnection {
                 instructions: None,
             }),
             pending: Mutex::new(Vec::new()),
+            listed: Mutex::new(Vec::new()),
             closed: AtomicBool::new(false),
             retrying: AtomicBool::new(false),
             settled: tokio::sync::watch::Sender::new(false),
@@ -612,6 +618,24 @@ impl McpConnection {
         }
     }
 
+    /// 设置页看的样子：状态，加传输方式与最近一次握手列出的工具。不等锁，同 [`Self::status`]。
+    pub fn view(&self) -> McpServerView {
+        let status = self.status();
+        McpServerView {
+            name: status.name,
+            state: status.state,
+            detail: status.detail,
+            transport: match self.config.transport {
+                McpTransport::Stdio { .. } => McpTransportKind::Stdio,
+                McpTransport::Http { .. } => McpTransportKind::Http,
+            },
+            oauth: self.is_oauth(),
+            description: self.config.description.clone(),
+            exposure: self.config.exposure,
+            tools: self.listed.lock().expect("MCP 工具清单").clone(),
+        }
+    }
+
     pub fn namespace(&self) -> ToolNamespace {
         self.namespace.lock().expect("MCP namespace").clone()
     }
@@ -727,6 +751,24 @@ impl McpConnection {
             namespace.instructions = connected.instructions.clone();
         }
         drop(namespace);
+        *self.listed.lock().expect("MCP 工具清单") = selected
+            .iter()
+            .map(|tool| McpToolView {
+                name: tool.name.to_string(),
+                description: tool
+                    .description
+                    .as_deref()
+                    .and_then(|text| text.lines().map(str::trim).find(|line| !line.is_empty()))
+                    .map(str::to_string),
+                exposure: self.config.exposure_of(&tool.name),
+                outward: self.config.outward_of(&tool.name),
+                read_only: self
+                    .config
+                    .read_only
+                    .iter()
+                    .any(|name| name == tool.name.as_ref()),
+            })
+            .collect();
         *self.pending.lock().expect("MCP 待挂工具") = connected.tools.clone();
         tracing::info!(server = %self.name, tools = count, "MCP 服务器已连上");
     }
@@ -932,6 +974,14 @@ impl McpHub {
         self.connections()
             .iter()
             .map(|connection| connection.status())
+            .collect()
+    }
+
+    /// 每台服务器给设置页看的样子（`GET /v1/mcp`），不等握手、不重连。
+    pub fn views(&self) -> Vec<McpServerView> {
+        self.connections()
+            .iter()
+            .map(|connection| connection.view())
             .collect()
     }
 
@@ -1743,6 +1793,43 @@ for line in sys.stdin:
                 .unwrap(),
         );
         assert!(connection.call("echo", JsonObject::new()).await.is_ok());
+    }
+
+    /// 设置页的服务器表（`GET /v1/mcp`）：连上的列出按 `tools` 挑过的工具，带实际 exposure、
+    /// 对外与只读；交出工具不清空它。连不上的工具为空、带原因。
+    #[tokio::test]
+    async fn views_list_the_selected_tools_with_their_flags() {
+        let fixture = Fixture::new();
+        let mut demo = fixture.server("a", &["echo"]);
+        demo.description = Some("演示".into());
+        demo.tools = Some(vec!["echo".into()]);
+        demo.outward = vec!["ec*".into()];
+        demo.tool_exposure = BTreeMap::from([("echo".to_string(), McpExposure::Direct)]);
+        let hub = fixture
+            .hub(&[("demo", demo), ("broken", fixture.broken())])
+            .await;
+        assert_eq!(hub.new_tools().len(), 1);
+
+        let views = hub.views();
+        let demo = views.iter().find(|view| view.name == "demo").unwrap();
+        assert_eq!(demo.state, McpServerState::Connected);
+        assert_eq!(demo.transport, McpTransportKind::Stdio);
+        assert_eq!(demo.description.as_deref(), Some("演示"));
+        assert_eq!(
+            demo.tools,
+            vec![McpToolView {
+                name: "echo".into(),
+                description: None,
+                exposure: McpExposure::Direct,
+                outward: true,
+                read_only: true,
+            }],
+            "白名单外的 slow 不列；交出工具之后清单还在"
+        );
+        let broken = views.iter().find(|view| view.name == "broken").unwrap();
+        assert_eq!(broken.state, McpServerState::Failed);
+        assert!(broken.tools.is_empty());
+        assert!(broken.detail.is_some());
     }
 
     /// 被接续的 Run 用的那条路：按名字认出服务器、等它，连上的工具交回来；还在连的、连不上的

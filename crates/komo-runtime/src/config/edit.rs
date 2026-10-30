@@ -9,7 +9,8 @@
 use std::collections::BTreeMap;
 
 use komo_kernel::protocol::http::{
-    ConfigEnvResponse, ConfigModelEntry, ConfigModelsResponse, EnvVarEntry, ProviderEntry,
+    ConfigEnvResponse, ConfigModelEntry, ConfigModelsResponse, EmbeddingModelEntry, EnvVarEntry,
+    ProviderEntry,
 };
 use komo_kernel::types::chat::ChannelPlatform;
 use komo_kernel::types::digest::ContentHash;
@@ -93,9 +94,14 @@ pub fn models_view(
         }
     }
     let mut models = Vec::new();
+    let mut embeddings = Vec::new();
     if let Some(table) = doc.get("model").and_then(Item::as_table) {
         for (alias, item) in table.iter() {
             let Some(t) = item.as_table() else { continue };
+            if str_of(t, "type").as_deref() == Some("embedding") {
+                embeddings.push(embedding_entry(alias, t, &providers, secrets));
+                continue;
+            }
             if str_of(t, "type").as_deref() != Some("completion") {
                 continue;
             }
@@ -124,7 +130,39 @@ pub fn models_view(
         default,
         config_path,
         env_path,
+        embeddings,
+        memory_embedding: sub_table_value(&doc, "memory", "embedding"),
     })
+}
+
+/// 一个 embedding 模型项。凭证变量名没写就继承它挂的 provider；两边都没有的（本机端点）算就绪。
+fn embedding_entry(
+    alias: &str,
+    t: &Table,
+    providers: &[ProviderEntry],
+    secrets: &Secrets,
+) -> EmbeddingModelEntry {
+    let provider = str_of(t, "model_provider");
+    let parent = provider
+        .as_deref()
+        .and_then(|id| providers.iter().find(|p| p.id == id));
+    let env_key = env_key_of(t).or_else(|| parent.and_then(|p| p.env_key.clone()));
+    let key_set = match (&env_key, parent) {
+        (Some(key), _) => secrets.has(key),
+        (None, Some(p)) => p.key_set,
+        (None, None) => true,
+    };
+    EmbeddingModelEntry {
+        alias: alias.to_string(),
+        model: str_of(t, "model").unwrap_or_default(),
+        api_backend: str_of(t, "api_backend")
+            .or_else(|| parent.and_then(|p| p.api_backend.clone())),
+        base_url: str_of(t, "base_url").or_else(|| parent.and_then(|p| p.base_url.clone())),
+        provider,
+        env_key,
+        key_set,
+        dimensions: int_of(t, "dimensions"),
+    }
 }
 
 fn sub_table_value(doc: &DocumentMut, section: &str, key: &str) -> Option<String> {
@@ -699,9 +737,21 @@ default = "magpie-sol"
         assert_eq!(p.env_key.as_deref(), Some("MAGPIE_API_KEY"));
         assert!(p.key_set);
         assert_eq!(p.timeout_secs, Some(600));
-        assert_eq!(view.models.len(), 1, "embedding 不在这里");
+        assert_eq!(view.models.len(), 1, "embedding 不混进 completion");
         assert_eq!(view.models[0].alias, "magpie-sol");
         assert_eq!(view.default.as_deref(), Some("magpie-sol"));
+        assert_eq!(
+            view.embeddings,
+            vec![EmbeddingModelEntry {
+                alias: "embedding".into(),
+                model: "qwen3-embedding:0.6b".into(),
+                api_backend: Some("ollama_embeddings".into()),
+                base_url: Some("http://127.0.0.1:11434".into()),
+                key_set: true,
+                ..EmbeddingModelEntry::default()
+            }],
+            "没写凭证变量的本机端点算就绪"
+        );
         assert!(!serde_json::to_string(&view).unwrap().contains("sk-secret"));
 
         let unset = models_view(CONFIG, &secrets(&[]), "v".into(), "c".into(), "e".into()).unwrap();

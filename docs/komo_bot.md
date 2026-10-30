@@ -156,6 +156,13 @@ Gateway 对数据目录持有进程锁。多个 CLI 同时启动时，只允许�
 - Web 不显示两份文件的路径：设置页说"配置""环境变量"，不说它们在磁盘上的哪儿。
 - **实现（2026-10-29）。** kernel `protocol::http` 的 `ConfigSettingsResponse` / `ConfigSetting` / `SettingKind` / `SettingRequest` / `ConfigEnvResponse` / `EnvVarEntry` / `EnvSetRequest` / `EnvAssignment`，`ConfigEditResponse` 加 `settings` 与 `env`；`EnvAssignment` 与 `ProviderUpsertRequest` 的 `Debug` 不印值。runtime 新增 `config::settings`（白名单表、`settings_view`、`set_setting`），`config::edit` 加 `env_view`、`set_env_values`、`remove_env_value`（引用方：provider / 模型的凭证变量、MCP 的 `bearer_token_env` 与 `env`、启用渠道的 `channel_credentials`）；gateway `http::config` 加五个 handler，仍走同一个 `edit`。测试：runtime `config::settings::tests` 四条（视图与选项、就地写且注释还在、清掉删行且没写的不建节、类型 / 范围 / 选项 / 白名单外被拒）、`config::edit::tests` 新增两条（列名字与缺的引用且不出值、批量设与删的守卫）；gateway `service::tests::settings_and_env_vars_are_edited_through_the_gateway_without_values_leaking`。另在临时数据目录起前台 Gateway，经 Web 走了一遍：粘贴整段 `.env` 拆成两行一次保存、删在用的被拒、删没人用的、切开关、改下拉、存数字、越界数字被拒；核对了两份文件，`.env` 仍 0600，之后两份文件还原。`cargo test --workspace`：2526 通过、0 失败、12 忽略；`cargo fmt --check` 通过。没装二进制。
 
+**Web 看 MCP 服务器与向量模型（2026-10-30，认可）。** 两样此前在设置页看不到的东西补上，都只读：
+
+- `GET /v1/mcp`：每台配置过的 MCP 服务器**此刻**的样子，不等握手、不触发重连（`McpHub` 手里的状态）：名字、状态与原因（同 `McpServerStatus`）、传输方式（`stdio` / `http`）、是否走 OAuth、`description`、服务器级的 `exposure`，以及**最近一次握手**列出、按 `tools` 白名单挑过的工具——每个带一行说明、实际的 exposure（`tool_exposure` 覆盖后的）、是否声明为对外（`outward`）与只读（`read_only`）。从没连上过的服务器工具清单为空。命令行、参数、URL 与凭证变量名不返回：设置页不讲东西在哪儿配。
+- Web 的 MCP 一节是一张服务器表（服务器 / 方式 / 状态），点一行进详情：状态与工具数、说明、工具清单、"重连这台"（`POST /v1/mcp/reconnect` 点名这一台）；要登录的给出 `komo auth mcp login <名字>`。增删改服务器仍在配置文件里。
+- `GET /v1/config/models` 加 `embeddings`：每个 `type = "embedding"` 的模型项（alias、`model`、协议、`base_url`、`model_provider`、凭证变量名与在不在、`dimensions`），和 `memory_embedding`（`[memory] embedding` 指的 alias）。只读：换向量模型要重建记忆索引、重新校准相关度门槛（§9.4），仍在文件里改。
+- **实现（2026-10-30）。** kernel `protocol::http` 的 `McpServersResponse` / `McpServerView` / `McpTransportKind` / `McpToolView`，`ConfigModelsResponse` 加 `embeddings`（`EmbeddingModelEntry`）与 `memory_embedding`；runtime `McpConnection` 在 `adopt` 时记下挑过的工具（`listed`，交出工具不清空），`McpConnection::view` / `McpHub::views`；`config::edit::models_view` 列出 embedding 模型项（凭证变量名没写就继承 provider）；gateway `http::mcp::list`。测试：runtime `mcp::tests::views_list_the_selected_tools_with_their_flags`（白名单外不列、实际 exposure / 对外 / 只读、交出工具后清单还在、连不上的为空且带原因），`config::edit::tests` 的视图那条加了 embedding。另在临时数据目录起前台 Gateway，配一台演示 stdio 服务器（四个工具：只读、直出、对外、不挂各一）、一台起不来的、一台要 OAuth 的，经 Web 看了表、两种详情、单台重连，桌面与手机各截了图；没碰真实的 `~/.komo`。`cargo test --workspace`：2527 通过、0 失败、12 忽略；`cargo fmt --check` 通过。没装二进制。
+
 
 Fedora 使用 systemd 管理，Mac 使用 launchd；服务管理器运行前台形式的 Gateway。**单元名是全局的（`komo-gateway.service` / `dev.komo.gateway`），只有默认数据目录 `~/.komo` 拥有它。** 别的 `KOMO_HOME` 走 `komo gateway` / `stop` / `restart` 会被**拒绝**并告诉你去前台跑 `KOMO_HOME=… komo gateway --foreground`：那条路会把单元文件改写成指向这个数据目录，现役服务随即被换掉——2026-09-21 实测过一次，`KOMO_HOME=/tmp/… komo config check` 经 `connect_or_start` 起服务，把现役单元换成了一份 debug 构建 + 沙箱数据目录。`komo gateway status` 会印出单元实际在服务哪个数据目录，与当前 `KOMO_HOME` 不一致时明说。**单元文件只设 `KOMO_HOME`（与可选的 `KOMO_LISTEN`）和 `PATH`，不加载 `.env`、不含任何凭证**。`PATH` 取自写单元的那个进程（操作者的 CLI），单元在每次 start / restart 时重写，`PATH` 随之刷新；写单元的进程没有 `PATH` 或为空就不写这一项，不编默认值。写它的原因（2026-09-24）：`bash` 工具的子进程继承 Gateway 的环境，而 launchd / systemd 默认只给 `/usr/bin:/bin:/usr/sbin:/sbin`——实测一次会话里 `komo`（`~/.cargo/bin`）与 `rg`（`/opt/homebrew/bin`）都是 `command not found`，白白耗掉几轮。`PATH` 不是凭证，下面几条理由都不适用于它。凭证不进单元的理由：launchd 没有 `EnvironmentFile` 的等价物，只能把值抄进 plist，那是把密钥复制到第二个文件；走进程环境还会让 `.env` 的热重载失效，并让每个子进程与日志都可能看到它。`.env` 由 Gateway 自己读成 `Secrets`（§3 热重载覆盖它），需要凭证的 Python 模块按**变量名**声明（§5.3），Gateway 在起子进程时按名注入。Mac 若后续需要操作用户桌面应用，应按登录用户的执行环境配置。后台服务不会让睡眠中的电脑继续执行任务。[Fedora systemd](https://fedoraproject.org/wiki/Packaging:Systemd) · [Apple launchd](https://developer.apple.com/library/archive/documentation/MacOSX/Conceptual/BPSystemStartup/Chapters/CreatingLaunchdJobs.html)
 
@@ -1057,7 +1064,7 @@ CLI 通过 HTTP 发命令，通过 SSE 观察运行。Gateway 内部采用函数
 | GET /v1/models                   | completion alias 菜单：显示名、上游 model、provider、协议、上下文与 effort 档位 |
 | GET /v1/config/check             | 当前配置的校验结果（与热重载同一个函数）       |
 | POST /v1/config/reload           | 热重载；校验不过 422 并保留原配置               |
-| GET /v1/config/models            | 文件里写着的 provider、completion 模型与默认模型；每个 provider 带凭证在不在，不带值；带 `version`（§3「从 Web 改模型配置」） |
+| GET /v1/config/models            | 文件里写着的 provider、completion 模型与默认模型，另列只读的 embedding 模型；每个 provider 带凭证在不在，不带值；带 `version`（§3「从 Web 改模型配置」） |
 | PUT /v1/config/model-providers/{id} | 新建或整份改一个 provider；可带 API key（只写 `.env`）；带 `version`，对不上 409，校验不过 422 不落盘 |
 | DELETE /v1/config/model-providers/{id} | 删 provider；还有模型引用它 409 |
 | PUT /v1/config/models/{alias}    | 新建或整份改一个 completion 模型 |
@@ -1068,6 +1075,7 @@ CLI 通过 HTTP 发命令，通过 SSE 观察运行。Gateway 内部采用函数
 | GET /v1/config/env               | `.env` 里的变量名与配置引用却缺的名字：在不在文件、有没有值、谁在用；不返回任何值 |
 | PUT /v1/config/env               | 一次设一批变量（只写 `.env`）|
 | DELETE /v1/config/env/{name}     | 删一个变量；还被引用 409 |
+| GET /v1/mcp                      | 每台 MCP 服务器此刻的状态、传输方式与最近一次握手列出的工具；不等握手、不重连（§3「Web 看 MCP 服务器与向量模型」） |
 | POST /v1/mcp/reconnect           | 点名的 MCP 服务器（空 = 全部）断开重连，等握手完交回各自状态；名字不在配置里 400（`docs/mcp.md` §2.5） |
 | GET /v1/home-session             | 操作者的 home session（§11.2）                 |
 

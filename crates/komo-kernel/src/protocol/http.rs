@@ -36,6 +36,7 @@
 //! | `GET /v1/config/env` | — | [`ConfigEnvResponse`] |
 //! | `PUT /v1/config/env` | [`EnvSetRequest`] | [`ConfigEditResponse`] |
 //! | `DELETE /v1/config/env/{name}` | [`ConfigVersionRequest`] | [`ConfigEditResponse`] |
+//! | `GET /v1/mcp` | — | [`McpServersResponse`] |
 //!
 //! `confirm` 与 `forget` 都返回**整条**记忆而不是一个 `{ok:true}`：它们带着预期
 //! revision 来，回去的那条才说得清现在是第几版（§9.6 的幂等就是靠这个比出来的）。
@@ -51,7 +52,7 @@ pub use session::*;
 pub mod matter;
 pub use matter::*;
 
-use super::config::{ConfigIssue, KeyPath, SourceFile};
+use super::config::{ConfigIssue, KeyPath, McpExposure, SourceFile};
 use crate::cron::{CronFiring, CronJob, JobStatus, NotifyPolicy, OverlapPolicy};
 use crate::types::chat::PeerId;
 use crate::types::ids::{CronJobId, MatterId, MemoryId, RequestKey, RunId, Seq, SessionId};
@@ -1294,6 +1295,31 @@ pub struct ConfigModelsResponse {
     /// 两个文件的路径，给"去文件里改"的提示用。
     pub config_path: String,
     pub env_path: String,
+    /// `type = "embedding"` 的模型项，只读（换它要重建索引，§3「Web 看 MCP 服务器与向量模型」）。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub embeddings: Vec<EmbeddingModelEntry>,
+    /// `[memory] embedding` 指的 alias。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_embedding: Option<String>,
+}
+
+/// 一个 embedding 模型项，文件里写着的样子。凭证只报在不在。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EmbeddingModelEntry {
+    pub alias: String,
+    pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_backend: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub env_key: Option<String>,
+    /// `env_key` 有非空值（没写 `env_key` 的本机端点也算就绪）。
+    pub key_set: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dimensions: Option<u64>,
 }
 
 /// 一个 `[model_providers.<id>]`。
@@ -1518,6 +1544,53 @@ pub struct McpReconnectRequest {
 pub struct McpReconnectResponse {
     #[serde(default)]
     pub servers: Vec<McpServerStatus>,
+}
+
+/// `GET /v1/mcp`：每台 MCP 服务器此刻的样子（`docs/mcp.md` §2.6）。不等握手、不重连。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpServersResponse {
+    #[serde(default)]
+    pub servers: Vec<McpServerView>,
+}
+
+/// 一台服务器：状态之外，再带传输方式与最近一次握手列出的工具。命令、URL、变量名不给。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpServerView {
+    pub name: String,
+    pub state: McpServerState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    pub transport: McpTransportKind,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub oauth: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    pub exposure: McpExposure,
+    /// 最近一次握手列出、按 `tools` 白名单挑过的；没连上过就是空的。
+    #[serde(default)]
+    pub tools: Vec<McpToolView>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum McpTransportKind {
+    Stdio,
+    Http,
+}
+
+/// 服务器上的一个工具（原名）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpToolView {
+    pub name: String,
+    /// 服务器给的说明，只取第一行。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// `tool_exposure` 覆盖之后的实际值。
+    pub exposure: McpExposure,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub outward: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub read_only: bool,
 }
 
 /// 照 pi 的 `connecting / connected / needs-auth / failed`。

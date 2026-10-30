@@ -995,7 +995,7 @@ function renderMemDetail() {
     ["版本", `第 <span class="num">${m.revision}</span> 版 · ${unconfirmed ? "未确认" : "已确认"}`],
     ["带上", m.usage?.count ? `<span class="num">${m.usage.count}</span> 次 · 最近 <span class="num">${ago(m.usage.last_used_at)}</span>` : `<span class="num">0</span> 次`],
     ["用上", `<span class="num">${m.usage?.adopted_count || 0}</span> 次${m.usage?.last_adopted_at ? ` · 最近 <span class="num">${ago(m.usage.last_adopted_at)}</span>` : ""}`],
-    ["记下", `<span class="num">${day(m.created_at)}</span> · ${esc(m.extraction?.model || "")}${m.extraction?.prompt_version ? ` · ${esc(m.extraction.prompt_version)}` : ""}`],
+    ["记下", `<span class="num">${day(m.created_at)}</span> · <span class="mono">${esc(m.extraction?.model || "")}</span>${m.extraction?.prompt_version ? ` · <span class="mono">${esc(m.extraction.prompt_version)}</span>` : ""}`],
     ["归属", matter ? `<a class="ev-link" href="#/matters/${matter.id}">${esc(matter.title)}</a>${matter.closed_at ? `<span class="muted">（已结案）</span>` : ""}` : m.belongs_to ? `<span class="muted">事项已不在</span>` : `<span class="muted">—</span>`],
   ];
   if (m.valid_until) kv.push(["有效到", `<span class="num">${day(m.valid_until)}</span>`]);
@@ -1133,9 +1133,9 @@ const LOADERS = {
   },
   async inbox(P) { P.items = (await api("/v1/interventions")).interventions; S.inbox = P.items; },
   async settings(P) {
-    const [health, config, index, cfg, settings, env] = await Promise.allSettled([api("/healthz"), api("/v1/config/check"), api("/v1/memory-index"), api("/v1/config/models"), api("/v1/config/settings"), api("/v1/config/env")]);
+    const [health, config, index, cfg, settings, env, mcp] = await Promise.allSettled([api("/healthz"), api("/v1/config/check"), api("/v1/memory-index"), api("/v1/config/models"), api("/v1/config/settings"), api("/v1/config/env"), api("/v1/mcp")]);
     const v = (r) => (r.status === "fulfilled" ? r.value : { error: r.reason?.message || "没取到" });
-    P.data = { health: v(health), config: v(config), index: v(index), cfg: v(cfg), settings: v(settings), env: v(env) };
+    P.data = { health: v(health), config: v(config), index: v(index), cfg: v(cfg), settings: v(settings), env: v(env), mcp: v(mcp) };
   },
 };
 async function openPage(page, id = null) {
@@ -1505,7 +1505,7 @@ function cronDetail(P) {
     <h3 class="sub-h">跑什么</h3>
     ${j.command != null ? `<pre class="code-block">${esc(j.command)}</pre>` : `<p class="detail-body">${esc(j.prompt)}</p>`}
     ${kvBlock([
-      j.workdir ? ["目录", `<span class="num">${esc(j.workdir)}</span>`] : null,
+      j.workdir ? ["目录", `<span class="mono">${esc(j.workdir)}</span>`] : null,
       ["下一次", j.status === "active" && cronNext(j) ? `<span class="num">${whenText(cronNext(j))}</span>` : `<span class="muted">—</span>`],
       ["上一次", last ? `<span class="pill${FIRING_PILL[last.status] ?? ""}">${FIRING[last.status] || last.status}</span> <span class="num">${whenText(last.scheduled_at)}</span>${last.session ? ` · <a class="ev-link" href="#/s/${last.session}">${lastSession ? esc(titleOf(lastSession)) : "那次的会话"}</a>` : ""}${last.error ? `<div class="muted">${esc(last.error)}</div>` : ""}` : `<span class="muted">还没跑过</span>`],
       ["投递", NOTIFY[j.notify] || j.notify],
@@ -1576,7 +1576,7 @@ function renderInbox() {
       <p class="detail-text">${esc(x.question)}</p>
       ${failLine(P)}
       <div class="actions">${verdicts}</div>${abandonAsk}
-      ${kvBlock([["会话", s ? `<a class="ev-link" href="#/s/${x.session}">${esc(titleOf(s))}${icon("right")}</a>` : `<span class="muted">${esc(x.session)}</span>`], ["停下", `<span class="num">${ago(x.created_at)}</span>`], ["句柄", `<span class="num">${esc(x.handle)}</span>`]])}
+      ${kvBlock([["会话", s ? `<a class="ev-link" href="#/s/${x.session}">${esc(titleOf(s))}${icon("right")}</a>` : `<span class="muted">${esc(x.session)}</span>`], ["停下", `<span class="num">${ago(x.created_at)}</span>`], ["句柄", `<span class="mono">${esc(x.handle)}</span>`]])}
       <p class="hint">答复只对这一次有效，没有"以后都允许"。</p></div>`;
   }
   finishDetail("inbox", html);
@@ -1644,7 +1644,7 @@ function openSettings(section = null) {
 function settingsSection(k) {
   const P = S.pg.settings;
   if (P.selected === k) return;
-  P.selected = k; P.edit = null; P.confirm = null; P.fail = ""; P.result.edit = null;
+  P.selected = k; P.edit = null; P.confirm = null; P.fail = ""; P.result.edit = null; P.mcpSel = null;
   $("settings-body").scrollTop = 0; render();
 }
 const secHead = (title, desc, right = "") => `<div class="set-head"><div><h3>${title}</h3><p>${desc}</p></div>${right}</div>`;
@@ -1653,7 +1653,7 @@ const secHead = (title, desc, right = "") => `<div class="set-head"><div><h3>${t
 function keyLine(p) {
   if (p.auth) return `<span class="kstate ok"><i class="kdot"></i>凭证来自 ${esc(p.auth)} 登录</span>`;
   if (!p.env_key) return `<span class="kstate warn"><i class="kdot"></i>没写凭证变量</span>`;
-  return p.key_set ? `<span class="kstate ok"><i class="kdot"></i><span class="num">${esc(p.env_key)}</span> 已设置</span>` : `<span class="kstate warn"><i class="kdot"></i>缺 <span class="num">${esc(p.env_key)}</span></span>`;
+  return p.key_set ? `<span class="kstate ok"><i class="kdot"></i><span class="mono">${esc(p.env_key)}</span> 已设置</span>` : `<span class="kstate warn"><i class="kdot"></i>缺 <span class="mono">${esc(p.env_key)}</span></span>`;
 }
 function providerForm(P, p) {
   const isNew = !p, busy = P.busy ? "disabled" : "";
@@ -1664,7 +1664,7 @@ function providerForm(P, p) {
       <div><label class="lbl" for="pf-url">Base URL</label><input class="input" id="pf-url" name="base_url" value="${esc(p?.base_url || "")}" placeholder="https://api.example.com/v1"></div></div>
     ${p?.auth ? `<p class="hint">凭证来自 ${esc(p.auth)} 登录，不走 API key。</p><input type="hidden" name="auth" value="${esc(p.auth)}">`
       : `<label class="lbl" for="pf-key">API key</label><input class="input" id="pf-key" name="api_key" type="password" autocomplete="new-password" placeholder="${p ? (p.key_set ? "已设置；留空不改" : "还没设置") : "粘贴 key"}">
-      <p class="hint">存成环境变量${p?.env_key ? ` <span class="num">${esc(p.env_key)}</span>` : "，名字默认是 <code>名字大写_API_KEY</code>"}，不进配置。</p>`}
+      <p class="hint">存成环境变量${p?.env_key ? ` <span class="mono">${esc(p.env_key)}</span>` : "，名字默认是 <code>名字大写_API_KEY</code>"}，不进配置。</p>`}
     <details class="adv" ${p?.timeout_secs || (p?.env_key && !isNew) ? "" : ""}><summary>更多设置</summary>
       ${p?.auth ? "" : `<label class="lbl" for="pf-env">凭证变量名</label><input class="input" id="pf-env" name="env_key" value="${esc(p?.env_key || "")}" placeholder="留空：有 key 时用 名字大写_API_KEY">`}
       <label class="lbl" for="pf-timeout">请求时限（秒）</label><input class="input" id="pf-timeout" name="timeout_secs" type="number" min="1" value="${p?.timeout_secs ?? ""}" placeholder="默认 120"></details>
@@ -1695,7 +1695,7 @@ function modelRow(P, m, def) {
   const win = m.context_window || menu?.context_window;
   return `<li class="pm${editing ? " editing" : ""}">
     <div class="pm-main"><span class="pm-name">${esc(m.name || m.alias)}${m.alias === def ? `<span class="pill">默认</span>` : ""}</span>
-      <span class="pm-sub"><span class="num">${esc(m.alias)}</span><span class="sep">·</span><span class="num">${esc(m.model)}</span>${win ? `<span class="sep">·</span><span class="num">${kTokens(win)}</span> 窗口` : ""}${m.effort ? `<span class="sep">·</span>effort ${esc(m.effort)}` : ""}</span></div>
+      <span class="pm-sub"><span class="mono">${esc(m.alias)}</span><span class="sep">·</span><span class="mono">${esc(m.model)}</span>${win ? `<span class="sep">·</span><span class="num">${kTokens(win)}</span> 窗口` : ""}${m.effort ? `<span class="sep">·</span>effort ${esc(m.effort)}` : ""}</span></div>
     ${m.standalone ? "" : `<span class="pm-act"><button class="text-btn quiet" data-cfg="edit-model" data-id="${esc(m.alias)}">编辑</button><button class="text-btn quiet danger-link" data-cfg="del-model" data-id="${esc(m.alias)}">删除</button></span>`}
     ${editing ? modelForm(P, m) : ""}
     ${delAsk(P, "model", m.alias, `删掉之后菜单里没有它；已经开始的请求用的是开始时那份配置，不受影响。`)}</li>`;
@@ -1713,7 +1713,7 @@ function modelsSection(P) {
     return `<section class="pcard${editing ? " editing" : ""}">
       <header class="pcard-head"><div class="pcard-title"><span class="pname">${esc(p.id)}</span><span class="tag">${esc((BACKENDS.find(([v]) => v === p.api_backend) || [0, p.api_backend || "协议没写"])[1])}</span>${keyLine(p)}</div>
         ${editing ? "" : `<span class="pact">${btn("编辑", `data-cfg="edit-provider" data-id="${esc(p.id)}"`, "sm")}<button class="text-btn quiet danger-link" data-cfg="del-provider" data-id="${esc(p.id)}">删除</button></span>`}</header>
-      ${p.base_url && !editing ? `<p class="pcard-url num">${esc(p.base_url)}</p>` : ""}
+      ${p.base_url && !editing ? `<p class="pcard-url mono">${esc(p.base_url)}</p>` : ""}
       ${editing ? providerForm(P, p) : ""}
       ${delAsk(P, "provider", p.id, mine.length ? `还有 ${mine.length} 个模型挂在它上面，Gateway 会拒绝；先删掉或改挂别的 provider。` : `删掉 provider ${esc(p.id)}；它的 API key 留在环境变量里。`)}
       <ul class="pms">${mine.map((m) => modelRow(P, m, def)).join("") || `<li class="pm empty">还没有模型挂在它上面。</li>`}</ul>
@@ -1723,10 +1723,20 @@ function modelsSection(P) {
   const loose = completions.filter((m) => m.standalone);
   const looseCard = loose.length ? `<section class="pcard"><header class="pcard-head"><div class="pcard-title"><span class="pname">独立模型</span><span class="muted small">端点直接写在模型项里，没挂 provider</span></div></header>
       <ul class="pms">${loose.map((m) => modelRow(P, m, def)).join("")}</ul><p class="hint">这几个只能在配置文件里改。</p></section>` : "";
+  const embedCard = (C.embeddings || []).length ? `<section class="pcard"><header class="pcard-head"><div class="pcard-title"><span class="pname">向量模型</span><span class="muted small">记忆检索用它把文字变成向量</span></div></header>
+      <ul class="pms">${C.embeddings.map((e) => embeddingRow(e, C.memory_embedding)).join("")}</ul>
+      <p class="hint">换向量模型要重建记忆索引、重新校准相关度门槛，所以在配置文件里改；改完到 <button class="text-btn" data-set-sec="index">记忆索引</button> 重建。</p></section>` : "";
   const addProvider = P.edit?.kind === "new-provider"
     ? `<section class="pcard editing"><header class="pcard-head"><div class="pcard-title"><span class="pname">添加 provider</span></div></header>${providerForm(P, null)}</section>`
     : `<button class="add-card" data-cfg="new-provider">${icon("plus")}添加 provider</button>`;
-  return secHead("模型", "改完马上生效：校验通过才保存，随后热重载。", completions.length ? defaultPick : "") + editNotice(P) + cards + looseCard + addProvider;
+  return secHead("模型", "改完马上生效：校验通过才保存，随后热重载。", completions.length ? defaultPick : "") + editNotice(P) + cards + looseCard + embedCard + addProvider;
+}
+const EMBED_BACKENDS = { ollama_embeddings: "Ollama", embeddings: "OpenAI 兼容" };
+function embeddingRow(e, used) {
+  const key = !e.env_key ? "" : e.key_set ? `<span class="kstate ok"><i class="kdot"></i><span class="mono">${esc(e.env_key)}</span> 已设置</span>` : `<span class="kstate warn"><i class="kdot"></i>缺 <span class="mono">${esc(e.env_key)}</span></span>`;
+  const sub = [`<span class="mono">${esc(e.alias)}</span>`, esc(EMBED_BACKENDS[e.api_backend] || e.api_backend || "协议没写"), e.base_url ? `<span class="mono">${esc(e.base_url)}</span>` : "", e.dimensions ? `<span class="num">${e.dimensions}</span> 维` : ""].filter(Boolean);
+  return `<li class="pm"><div class="pm-main"><span class="pm-name"><span class="mono">${esc(e.model)}</span>${e.alias === used ? `<span class="pill">记忆在用</span>` : ""}</span>
+    <span class="pm-sub">${sub.join('<span class="sep">·</span>')}</span></div>${key}</li>`;
 }
 // 写完之后的一句回执；409 时给"重新读取"
 function editNotice(P) {
@@ -1828,7 +1838,7 @@ function configSection(P) {
     <div class="scard-row"><div class="scard-text"><h4>${issues.length ? `配置有 <span class="num">${issues.length}</span> 条提醒` : "配置检查通过"}</h4>
       <p>生效的配置装于 <span class="num">${day(cfg.loaded_at)} ${clock(new Date(cfg.loaded_at))}</span>${stale ? `，<span class="bad">之后文件改过，还没装上</span>` : ""}。</p></div>
       <div class="scard-ctl">${btn(P.busy === "reload" ? "正在加载" : "重新加载", `data-pg-act="config-reload" ${busy("reload")}`, "sm")}${btn("重新检查", `data-pg-act="config-check" ${busy("check")}`, "sm")}</div></div>
-    ${issues.length ? `<ul class="evs">${issues.map((x) => `<li class="ev"><span class="ev-line"><span class="pill${x.severity === "error" ? " bad" : " wait"}">${x.severity === "error" ? "错误" : "提醒"}</span><span class="num">${esc(x.key)}</span></span><span>${esc(x.message)}</span></li>`).join("")}</ul>` : ""}
+    ${issues.length ? `<ul class="evs">${issues.map((x) => `<li class="ev"><span class="ev-line"><span class="pill${x.severity === "error" ? " bad" : " wait"}">${x.severity === "error" ? "错误" : "提醒"}</span><span class="mono">${esc(x.key)}</span></span><span>${esc(x.message)}</span></li>`).join("")}</ul>` : ""}
     ${reload ? `<div class="notice">${reload.error ? `<p class="bad">没装上：${esc(reload.error)}</p>` : `<p>${reload.changed.length ? `装上了，变了 ${reload.changed.length} 个键：<span class="num">${reload.changed.map(esc).join("、")}</span>` : "装上了，没有键变化"}。</p>
       ${reload.start_only.length ? `<p class="bad">其中 <span class="num">${reload.start_only.map(esc).join("、")}</span> 只在启动时生效，要重启 Gateway（<code>komo gateway restart</code>）。</p>` : ""}`}</div>` : ""}</section>`;
   const rows = !X || X.error ? errLine(X) : X.settings.map((x) => {
@@ -1869,7 +1879,7 @@ function envSection(P) {
     const editing = P.edit?.kind === "env" && P.edit.id === v.name;
     const state = v.set ? `<span class="kstate ok"><i class="kdot"></i>已设置</span>` : `<span class="kstate warn"><i class="kdot"></i>${v.in_file ? "是空的" : "缺"}</span>`;
     return `<li class="envrow${editing ? " editing" : ""}">
-      <div class="env-main"><span class="env-name num">${esc(v.name)}</span>${state}${v.used_by.length ? `<span class="env-use">${v.used_by.map(esc).join("、")} 在用</span>` : ""}</div>
+      <div class="env-main"><span class="env-name mono">${esc(v.name)}</span>${state}${v.used_by.length ? `<span class="env-use">${v.used_by.map(esc).join("、")} 在用</span>` : ""}</div>
       ${editing ? "" : `<span class="pm-act"><button class="text-btn quiet" data-cfg="edit-env" data-id="${esc(v.name)}">${v.in_file ? "改值" : "设置"}</button>${v.in_file ? `<button class="icon-btn danger-icon" data-cfg="del-env" data-id="${esc(v.name)}" aria-label="删掉 ${esc(v.name)}" title="删掉">${icon("trash")}</button>` : ""}</span>`}
       ${editing ? `<form class="env-one" id="cfg-env-one" data-name="${esc(v.name)}"><input class="input num" id="env-one" name="value" type="password" autocomplete="new-password" required placeholder="${v.set ? "新值，会替换现在的" : "值"}">${btn(P.busy ? "正在保存" : "保存", `type="submit" ${dis}`, "sm primary")}${btn("取消", 'type="button" data-cfg="cancel"', "sm")}${failLine(P)}</form>` : ""}
       ${delAsk(P, "env", v.name, v.used_by.length ? `${v.used_by.map(esc).join("、")} 还在用它，Gateway 会拒绝。` : `删掉之后，读它的地方拿不到值。`)}</li>`;
@@ -1877,7 +1887,7 @@ function envSection(P) {
   const adding = P.edit?.kind === "env-new";
   const form = adding ? `<form class="envform" id="cfg-env-form">
       ${P.envRows.map((r, i) => `<div class="kvpair">
-        <label class="kv-k" for="envn-${i}">名字</label><input class="input num" id="envn-${i}" data-env-name="${i}" value="${esc(r.name)}" placeholder="MY_API_KEY" autocomplete="off" spellcheck="false">
+        <label class="kv-k" for="envn-${i}">名字</label><input class="input mono" id="envn-${i}" data-env-name="${i}" value="${esc(r.name)}" placeholder="MY_API_KEY" autocomplete="off" spellcheck="false">
         <button type="button" class="icon-btn danger-icon" data-cfg="env-row-del" data-row="${i}" aria-label="去掉这一行">${icon("trash")}</button>
         <label class="kv-k" for="envv-${i}">值</label><input class="input num" id="envv-${i}" data-env-value="${i}" type="password" value="${esc(r.value)}" placeholder="值" autocomplete="new-password"></div>`).join("")}
       <div class="kv-more">${btn(`${icon("plus")}添加`, 'type="button" data-cfg="env-row-add"', "sm")}<span class="muted">或把 .env 的内容整段粘贴到名字框里。</span></div>
@@ -1893,39 +1903,66 @@ function indexSection(P) {
   if (ix.error) return secHead("记忆索引", "") + errLine(ix);
   return secHead("记忆索引", "记忆检索的向量部分；索引不可用时检索按关键词降级。") + `<div class="set-panel">${kvBlock([
       ["向量", `${esc(ix.space?.model || "")} · ${esc(ix.space?.provider || "")}`],
-      ["端点", `<span class="num">${esc(ix.space?.endpoint || "")}</span>`],
+      ["端点", `<span class="mono">${esc(ix.space?.endpoint || "")}</span>`],
       ["状态", `${{ ready: "就绪", building: "正在建", stale: "要重建", unavailable: "不可用" }[ix.state] || esc(ix.state)} · 已索引 <span class="num">${ix.indexed} / ${ix.total}</span> 条生效的`],
       ix.errors?.length ? ["错误", `<span class="bad">${ix.errors.map(esc).join("；")}</span>`] : null,
     ])}
     ${R.rebuild ? `<div class="notice"><p>${R.rebuild.error ? `<span class="bad">没提交：${esc(R.rebuild.error)}</span>` : R.rebuild.accepted ? `已提交重建（代次 <span class="num">${esc(R.rebuild.generation)}</span>），后台跑完前检索按关键词降级。` : "已经有一次重建在跑，没有再起一个。"}</p></div>` : ""}
     <div class="actions">${btn(P.busy === "rebuild" ? "正在提交" : "重建索引", `data-pg-act="index-rebuild" ${P.busy === "rebuild" ? "disabled" : ""}`)}</div></div>`;
 }
+const MCP_EXPOSURE = { codemode: "脚本里调", direct: "直接给模型", hidden: "不挂" };
+function mcpStateLine(x) {
+  if (x.state === "connected") return `<span class="kstate ok"><i class="kdot"></i>已连上</span>`;
+  if (x.state === "connecting") return `<span class="kstate"><span class="spinner sm" aria-hidden="true"></span>连接中</span>`;
+  if (x.state === "needs_auth") return `<span class="kstate warn"><i class="kdot"></i>要登录</span>`;
+  return `<span class="kstate bad"><i class="kdot"></i>${MCP_STATE[x.state] || esc(x.state)}</span>`;
+}
+const mcpWay = (x) => (x.transport === "http" ? "远程" : "本机进程") + (x.oauth ? `<span class="tag">OAuth</span>` : "");
 function mcpSection(P) {
-  const mcp = P.result.mcp;
-  return secHead("MCP", "外部工具服务器，在配置文件里配；默认只在 codemode 里调。") + `<div class="set-panel">${mcp ? (mcp.error ? `<p class="form-err">没连上：${esc(mcp.error)}</p>` : `<ul class="evs">${mcp.servers.map((x) => `<li class="ev"><span class="ev-line"><span class="num">${esc(x.name)}</span><span class="pill${x.state === "connected" ? "" : x.state === "failed" ? " bad" : " wait"}">${MCP_STATE[x.state] || esc(x.state)}</span></span>${x.detail ? `<span class="muted">${esc(x.detail)}</span>` : ""}</li>`).join("") || `<li class="ev muted">没有配 MCP 服务器。</li>`}</ul>`) : `<p class="set-line muted">Gateway 平时不报 MCP 的连接状态；重连会等握手，然后列出每台的状态。</p>`}
-    <div class="actions">${btn(P.busy === "mcp" ? "正在重连" : "重连全部 MCP", `data-pg-act="mcp-reconnect" ${P.busy === "mcp" ? "disabled" : ""}`)}</div></div>`;
+  const R = P.data.mcp, busy = P.busy === "mcp";
+  // 404 = 在跑的 Gateway 早于 GET /v1/mcp：说清楚，别只甩一个状态码
+  if (R?.error && /404/.test(R.error)) return secHead("MCP", "") + `<div class="set-panel"><p class="set-line muted">在跑的 Gateway 还没有服务器列表的接口；装上新版后这里列出每台服务器和它的工具。</p></div>`;
+  if (!R || R.error) return secHead("MCP", "") + errLine(R);
+  const failed = P.result.mcp?.error ? `<p class="form-err">重连没成：${esc(P.result.mcp.error)}</p>` : "";
+  const x = P.mcpSel && R.servers.find((s) => s.name === P.mcpSel);
+  if (x) {
+    const tools = x.tools || [];
+    const count = x.state === "connected" ? `<span class="sep">·</span><span class="num">${tools.length}</span> 个工具` : "";
+    const exposure = (t) => (t.exposure === x.exposure ? "" : `<span class="tag">${MCP_EXPOSURE[t.exposure] || esc(t.exposure)}</span>`);
+    return `<div class="set-head"><div><button type="button" class="text-btn quiet back-link" data-mcp-back>${icon("left")}全部服务器</button></div></div>
+      <section class="scard"><div class="scard-row"><div class="scard-text"><h4 class="mono">${esc(x.name)}</h4><p>${mcpStateLine(x)}${count}<span class="sep">·</span>${mcpWay(x)}<span class="sep">·</span>工具默认${MCP_EXPOSURE[x.exposure] || esc(x.exposure)}</p></div>
+        <div class="scard-ctl">${btn(busy ? "正在重连" : "重连", `data-pg-act="mcp-reconnect" data-id="${esc(x.name)}" ${busy ? "disabled" : ""}`, "sm")}</div></div>
+        ${x.description ? `<p class="mcp-desc">${esc(x.description)}</p>` : ""}
+        ${x.state === "needs_auth" ? `<p class="hint">在终端跑 <code>komo auth mcp login ${esc(x.name)}</code>，登录完下一次调用自动连上。</p>` : x.detail ? `<p class="hint bad">${esc(x.detail)}</p>` : ""}
+        ${failed}</section>
+      ${tools.length ? `<ul class="envlist">${tools.map((t) => `<li class="envrow"><div class="env-main"><span class="env-name mono">${esc(t.name)}</span>${exposure(t)}${t.outward ? `<span class="pill wait">对外</span>` : ""}${t.read_only ? `<span class="pill">只读</span>` : ""}${t.description ? `<span class="env-use">${esc(t.description)}</span>` : ""}</div></li>`).join("")}</ul>`
+        : `<p class="set-line muted">${x.state === "connected" ? "这台服务器没有列出工具。" : "连上之后这里列出它的工具。"}</p>`}`;
+  }
+  const rows = R.servers.map((s) => `<button type="button" class="mcp-row" data-mcp-sel="${esc(s.name)}"><span class="mcp-name mono">${esc(s.name)}</span><span class="mcp-way">${mcpWay(s)}</span><span class="mcp-tools num">${s.state === "connected" ? (s.tools || []).length : "—"}</span><span class="mcp-st">${mcpStateLine(s)}</span>${icon("right")}</button>`).join("");
+  return secHead("MCP", "外部工具服务器。增删改在配置文件里；这里看连没连上、有哪些工具。", R.servers.length ? btn(busy ? "正在重连" : "重连全部", `data-pg-act="mcp-reconnect" ${busy ? "disabled" : ""}`, "sm") : "") + failed
+    + (R.servers.length ? `<div class="mcp-table"><div class="mcp-head"><span>服务器</span><span>方式</span><span>工具</span><span>状态</span><span></span></div>${rows}</div>` : `<div class="set-panel"><p class="set-line muted">没有配 MCP 服务器。</p></div>`);
 }
 function gatewaySection(P) {
   const h = P.data.health;
   return secHead("Gateway", "唯一持有状态的进程；Web、TUI、CLI 都是它的客户端。") + `<div class="set-panel">${h.error ? errLine(h) : kvBlock([
     ["版本", `<span class="num">${esc(h.version)}</span> · 协议 <span class="num">${h.protocol_version}</span>`],
     ["启动于", `<span class="num">${day(h.started_at)} ${clock(new Date(h.started_at))}</span>`],
-    ["实例", `<span class="num">${esc(h.instance_id)}</span>`],
-    ["数据目录", `<span class="num">${esc(h.data_dir)}</span>`],
+    ["实例", `<span class="mono">${esc(h.instance_id)}</span>`],
+    ["数据目录", `<span class="mono">${esc(h.data_dir)}</span>`],
     ["遥测", h.telemetry?.endpoint ? `${esc(h.telemetry.endpoint)} · ${h.telemetry.last_error ? `<span class="bad">出错：${esc(h.telemetry.last_error)}</span>` : h.telemetry.last_ok_at ? `正常，最近一次 ${ago(h.telemetry.last_ok_at)}` : "还没导出过"}` : `<span class="muted">没配</span>`],
   ])}</div>`;
 }
 function channelsSection() {
   return secHead("渠道", "飞书、Telegram、微信。谁能说话、哪个会话收主动消息，在配置文件里设；凭证见环境变量一节。") + `<div class="set-panel"><p class="set-line muted">渠道的连接状态 Gateway 还没有接口可查；在终端里用 <code>komo channel list</code> 与 <code>komo channel probe</code>。</p></div>`;
 }
-async function settingsAct(act) {
+async function settingsAct(act, el) {
   const P = S.pg.settings;
   const key = { "config-reload": "reload", "config-check": "check", "index-rebuild": "rebuild", "mcp-reconnect": "mcp" }[act];
   P.busy = key; render();
   try {
     if (act === "config-reload") P.result.reload = await api("/v1/config/reload", { method: "POST", body: "{}" });
     if (act === "index-rebuild") P.result.rebuild = await api("/v1/memory-index/rebuild", { method: "POST", body: JSON.stringify({}) });
-    if (act === "mcp-reconnect") P.result.mcp = await api("/v1/mcp/reconnect", { method: "POST", body: JSON.stringify({ servers: [] }) });
+    if (act === "mcp-reconnect") P.result.mcp = await api("/v1/mcp/reconnect", { method: "POST", body: JSON.stringify({ servers: el?.dataset.id ? [el.dataset.id] : [] }) });
     await LOADERS.settings(P);
   } catch (err) { P.result[key] = { error: err.message }; }
   P.busy = ""; render();
@@ -2016,6 +2053,9 @@ document.addEventListener("click", (ev) => {
   if (t.closest("#settings-close")) { $("settings").close(); return; }
   const sec = t.closest("[data-set-sec]");
   if (sec) { settingsSection(sec.dataset.setSec); return; }
+  const mcpSel = t.closest("[data-mcp-sel]");
+  if (mcpSel) { S.pg.settings.mcpSel = mcpSel.dataset.mcpSel; $("settings-body").scrollTop = 0; render(); return; }
+  if (t.closest("[data-mcp-back]")) { S.pg.settings.mcpSel = null; render(); return; }
   if (t.closest("[data-pg-close]")) { closeDetail(S.page); return; }
   if (t.closest("[data-pg-reload]")) { reloadPage(t.closest("#settings") ? "settings" : S.page); return; }
   const addBtn = t.closest("#matters-add");
@@ -2128,7 +2168,7 @@ function pageAct(el) {
   if (a.startsWith("cron-")) return cronAct(a);
   if (a === "answer") return inboxAnswer(el.dataset.verdict, !!el.dataset.sure);
   if (a === "config-check") { P.busy = "check"; render(); return LOADERS.settings(P).then(() => { P.busy = ""; render(); }); }
-  return settingsAct(a);
+  return settingsAct(a, el);
 }
 function matterFormSubmit(form) {
   const m = S.pg.matters.items.find((x) => x.id === S.pg.matters.selected), f = new FormData(form), verb = form.dataset.verb;

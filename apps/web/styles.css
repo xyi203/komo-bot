@@ -107,10 +107,28 @@ svg.i { width: 16px; height: 16px; flex: none; fill: none; stroke: currentColor;
 .session:hover { background: var(--hover); }
 .session[aria-current="true"] { background: var(--active); font-weight: 500; }
 .session .name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.session .when { color: var(--muted); font-size: var(--fs-small); }
 .session.child { padding-left: 28px; position: relative; color: var(--muted); }
 .session.child::before { content: ""; position: absolute; left: 14px; top: 8px; width: 8px; height: 9px; border-left: 1px solid var(--control); border-bottom: 1px solid var(--control); border-bottom-left-radius: 4px; }
 .session .tag { color: var(--faint); font-size: var(--fs-small); }
+
+/* 行尾的"…"：悬停、键盘聚焦或菜单开着时才出现；触屏没有悬停，一直显示 */
+.srow { position: relative; }
+.srow:hover > .session, .srow.menu-open > .session { background: var(--hover); padding-right: 36px; }
+.srow > .session[aria-current="true"] { background: var(--active); }
+.sess-more { position: absolute; top: 5px; right: 4px; display: grid; place-items: center; width: 24px; height: 24px; padding: 0; border: 0; border-radius: 6px; background: none; color: var(--muted); cursor: pointer; opacity: 0; }
+.srow:hover .sess-more, .srow.menu-open .sess-more, .sess-more:focus-visible { opacity: 1; }
+.sess-more:hover, .srow.menu-open .sess-more { background: var(--active); color: var(--text); }
+.sess-more .i { width: 16px; height: 16px; }
+@media (hover: none) { .sess-more { opacity: 1; } .srow > .session { padding-right: 36px; } }
+.session.renaming { cursor: default; background: var(--hover); }
+.sess-rename { flex: 1; min-width: 0; height: 26px; padding: 0 6px; border: 0; border-radius: 4px; background: var(--surface); box-shadow: 0 0 0 2px var(--focus); font: inherit; color: var(--text); outline: 0; }
+.sess-menu { position: fixed; top: 0; left: 0; right: auto; width: 220px; }
+.menu-item kbd { margin-left: auto; color: var(--faint); font: inherit; font-size: var(--fs-small); }
+.menu-item.danger, .menu-item.danger > .i { color: var(--negative); }
+.menu-confirm { padding: 8px 8px 6px; }
+.menu-confirm p { margin: 0 0 10px; color: var(--muted); font-size: var(--fs-label); line-height: 20px; }
+.menu-confirm .actions { display: flex; gap: 8px; }
+.menu-err { margin: 6px 8px 4px; color: var(--negative); font-size: var(--fs-label); line-height: 20px; }
 
 .user { display: flex; align-items: center; gap: 8px; height: 52px; padding: 0 8px 0 16px; border-top: 1px solid var(--border); }
 .avatar { display: grid; place-items: center; width: 24px; height: 24px; border-radius: 50%; background: var(--accent-pale); color: var(--accent); font-size: var(--fs-small); font-weight: 600; }
@@ -334,7 +352,6 @@ button.live-line:hover .label { text-decoration: underline; text-underline-offse
 .chev .i { width: 12px; height: 12px; stroke-width: 2; transition: transform var(--t) ease; }
 .chev[aria-expanded="true"] .i { transform: rotate(90deg); }
 .session.parent .dot { margin-left: 6px; }
-.session.parent .when { margin-left: auto; padding-left: 8px; }
 
 /* 收起时的"N 个子任务"，和子会话用同一条树状连线 */
 .kids-toggle {
@@ -706,7 +723,6 @@ button.live-line:hover .label { text-decoration: underline; text-underline-offse
 .pm-new { margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--rule); }
 .add-card { display: flex; align-items: center; justify-content: center; gap: 6px; width: 100%; height: 48px; border: 1px dashed var(--control); border-radius: var(--radius-card); background: none; color: var(--muted); font: inherit; cursor: pointer; transition: background-color var(--t) ease, color var(--t) ease; }
 .add-card:hover { background: var(--hover-on-white); color: var(--text); }
-.add-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; }
 .cfg-form { max-width: 640px; padding: 4px 0 2px; }
 .cfg-form .lbl:first-child, .cfg-form .two:first-child .lbl { margin-top: 8px; }
 /* 配置：一项一张卡，左边名字与一句说明，右边控件 */

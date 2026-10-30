@@ -142,7 +142,11 @@ pub async fn put_provider(
             timeout_secs: request.timeout_secs,
             api_key: request.api_key.as_deref(),
         };
-        let (config, env) = komo_runtime::config::upsert_provider(config, env, &id, &fields)?;
+        let (config, id) = match request.rename.as_deref().filter(|to| *to != id) {
+            Some(to) => (komo_runtime::config::rename_provider(config, &id, to)?, to),
+            None => (config.to_string(), id.as_str()),
+        };
+        let (config, env) = komo_runtime::config::upsert_provider(&config, env, id, &fields)?;
         Ok((Some(config), env))
     })
     .await
@@ -202,8 +206,15 @@ pub async fn put_embedding_model(
             dimensions: request.dimensions,
             api_key: request.api_key.as_deref(),
         };
+        let (config, alias) = match request.rename.as_deref().filter(|to| *to != alias) {
+            Some(to) => (
+                komo_runtime::config::rename_embedding_model(config, &alias, to)?,
+                to,
+            ),
+            None => (config.to_string(), alias.as_str()),
+        };
         let (config, env) =
-            komo_runtime::config::upsert_embedding_model(config, env, &alias, &fields)?;
+            komo_runtime::config::upsert_embedding_model(&config, env, alias, &fields)?;
         Ok((Some(config), env))
     })
     .await

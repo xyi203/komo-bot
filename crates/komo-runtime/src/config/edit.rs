@@ -522,6 +522,88 @@ pub fn upsert_embedding_model(
     Ok((doc.to_string(), env))
 }
 
+/// 把 `[section.from]` 搬到 `[section.to]`：整张表连同它的位置与上方注释一起走。
+fn move_sub_table(
+    doc: &mut DocumentMut,
+    section: &str,
+    what: &str,
+    from: &str,
+    to: &str,
+) -> Result<(), EditError> {
+    let Some(parent) = doc.get_mut(section).and_then(Item::as_table_mut) else {
+        return Err(EditError::NotFound(format!("{what} `{from}`")));
+    };
+    if parent.get(from).and_then(Item::as_table).is_none() {
+        return Err(EditError::NotFound(format!("{what} `{from}`")));
+    }
+    if parent.contains_key(to) {
+        return Err(EditError::InUse(format!(
+            "已经有叫 `{to}` 的{what}，换个名字"
+        )));
+    }
+    let item = parent.remove(from).expect("刚确认过有这一项");
+    parent.insert(to, item);
+    Ok(())
+}
+
+/// 把 `table.key` 的字符串值换掉，行尾注释留着。
+fn replace_str(table: &mut Table, key: &str, to: &str) {
+    if let Some(slot) = table.get_mut(key).and_then(Item::as_value_mut) {
+        let decor = slot.decor().clone();
+        *slot = to.into();
+        *slot.decor_mut() = decor;
+    }
+}
+
+/// 给 provider 改名：表搬到新名字下，挂在它上面的模型（`model_provider`）一并改指新名字。
+/// 凭证变量名不跟着改——`.env` 里的值还在原来的名字下。
+pub fn rename_provider(config_text: &str, from: &str, to: &str) -> Result<String, EditError> {
+    check_name("provider", to)?;
+    let mut doc = parse(config_text)?;
+    if from == to {
+        return Ok(doc.to_string());
+    }
+    move_sub_table(&mut doc, "model_providers", "provider", from, to)?;
+    if let Some(models) = doc.get_mut("model").and_then(Item::as_table_mut) {
+        for (_, item) in models.iter_mut() {
+            if let Some(model) = item.as_table_mut()
+                && str_of(model, "model_provider").as_deref() == Some(from)
+            {
+                replace_str(model, "model_provider", to);
+            }
+        }
+    }
+    Ok(doc.to_string())
+}
+
+/// 给向量模型改名；`[memory] embedding` 指着它就一并改。只认 embedding 项：completion 的
+/// alias 被默认模型、记忆、Agent 到处引用，不在这里改。
+pub fn rename_embedding_model(
+    config_text: &str,
+    from: &str,
+    to: &str,
+) -> Result<String, EditError> {
+    check_name("模型", to)?;
+    let mut doc = parse(config_text)?;
+    if from == to {
+        return Ok(doc.to_string());
+    }
+    match sub_table(&doc, "model", from) {
+        None => return Err(EditError::NotFound(format!("向量模型 `{from}`"))),
+        Some(t) if str_of(t, "type").as_deref() != Some("embedding") => {
+            return Err(EditError::InUse(format!("`{from}` 不是向量模型")));
+        }
+        Some(_) => {}
+    }
+    move_sub_table(&mut doc, "model", "模型", from, to)?;
+    if sub_table_value(&doc, "memory", "embedding").as_deref() == Some(from)
+        && let Some(memory) = doc.get_mut("memory").and_then(Item::as_table_mut)
+    {
+        replace_str(memory, "embedding", to);
+    }
+    Ok(doc.to_string())
+}
+
 /// 删 embedding 模型项；记忆正用着它就不删。
 pub fn remove_embedding_model(config_text: &str, alias: &str) -> Result<String, EditError> {
     let mut doc = parse(config_text)?;
@@ -868,6 +950,48 @@ default = "magpie-sol"
 
         let unset = models_view(CONFIG, &secrets(&[]), "v".into(), "c".into(), "e".into()).unwrap();
         assert!(!unset.providers[0].key_set);
+    }
+
+    /// 改名搬的是整张表：位置、上方注释跟着走，引用它的地方一并改，撞名与改错类型被拒。
+    #[test]
+    fn renaming_moves_the_table_and_its_references() {
+        let config = rename_provider(CONFIG, "magpie", "proxy").unwrap();
+        assert!(
+            config.contains("# 本机代理\n[model_providers.proxy]\nbase_url"),
+            "注释与位置跟着走：{config}"
+        );
+        assert!(config.contains("# 大上下文会被掐断\ntimeout_secs = 600"));
+        assert!(config.contains("model_provider = \"proxy\""), "{config}");
+        assert!(!config.contains("magpie\""), "旧名字不留：{config}");
+        assert!(
+            config.find("[model_providers.proxy]") < config.find("[model.\"magpie-sol\"]"),
+            "还在原来的位置"
+        );
+        assert!(matches!(
+            rename_provider(CONFIG, "nope", "x"),
+            Err(EditError::NotFound(_))
+        ));
+        let two = format!("{CONFIG}\n[model_providers.other]\nbase_url = \"http://x\"\n");
+        assert!(matches!(
+            rename_provider(&two, "magpie", "other"),
+            Err(EditError::InUse(_))
+        ));
+        assert!(matches!(
+            rename_provider(CONFIG, "magpie", "bad name"),
+            Err(EditError::Invalid(_))
+        ));
+
+        let used = format!("{CONFIG}\n[memory]\nembedding = \"embedding\" # 检索用\n");
+        let config = rename_embedding_model(&used, "embedding", "local").unwrap();
+        assert!(config.contains("[model.local]"), "{config}");
+        assert!(
+            config.contains("embedding = \"local\" # 检索用"),
+            "记忆的引用跟着改、行尾注释留着：{config}"
+        );
+        assert!(matches!(
+            rename_embedding_model(CONFIG, "magpie-sol", "x"),
+            Err(EditError::InUse(_))
+        ));
     }
 
     /// 向量模型自成一组：整份写表单上的键、别的键原样留着，key 只进 `.env`；

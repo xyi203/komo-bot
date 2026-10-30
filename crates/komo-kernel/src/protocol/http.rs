@@ -1369,6 +1369,9 @@ pub struct ConfigModelEntry {
 #[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderUpsertRequest {
     pub version: String,
+    /// 改名：先把这一项搬到这个新名字下，再按其余字段写。省略或同名 = 不改名。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rename: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1388,6 +1391,7 @@ impl std::fmt::Debug for ProviderUpsertRequest {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ProviderUpsertRequest")
             .field("version", &self.version)
+            .field("rename", &self.rename)
             .field("base_url", &self.base_url)
             .field("api_backend", &self.api_backend)
             .field("env_key", &self.env_key)
@@ -1403,6 +1407,9 @@ impl std::fmt::Debug for ProviderUpsertRequest {
 #[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EmbeddingUpsertRequest {
     pub version: String,
+    /// 改名：先把这一项搬到这个新名字下，再按其余字段写。省略或同名 = 不改名。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rename: Option<String>,
     pub model: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
@@ -1423,6 +1430,7 @@ impl std::fmt::Debug for EmbeddingUpsertRequest {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("EmbeddingUpsertRequest")
             .field("version", &self.version)
+            .field("rename", &self.rename)
             .field("model", &self.model)
             .field("provider", &self.provider)
             .field("api_backend", &self.api_backend)

@@ -36,6 +36,8 @@
 //! | `GET /v1/config/env` | — | [`ConfigEnvResponse`] |
 //! | `PUT /v1/config/env` | [`EnvSetRequest`] | [`ConfigEditResponse`] |
 //! | `DELETE /v1/config/env/{name}` | [`ConfigVersionRequest`] | [`ConfigEditResponse`] |
+//! | `PUT /v1/config/embedding-models/{alias}` | [`EmbeddingUpsertRequest`] | [`ConfigEditResponse`] |
+//! | `DELETE /v1/config/embedding-models/{alias}` | [`ConfigVersionRequest`] | [`ConfigEditResponse`] |
 //! | `GET /v1/mcp` | — | [`McpServersResponse`] |
 //!
 //! `confirm` 与 `forget` 都返回**整条**记忆而不是一个 `{ok:true}`：它们带着预期
@@ -1391,6 +1393,42 @@ impl std::fmt::Debug for ProviderUpsertRequest {
             .field("env_key", &self.env_key)
             .field("auth", &self.auth)
             .field("timeout_secs", &self.timeout_secs)
+            .field("api_key", &self.api_key.as_ref().map(|_| "<set>"))
+            .finish()
+    }
+}
+
+/// `PUT /v1/config/embedding-models/{alias}`：整份写这个 embedding 模型项的几个键，表里别的键
+/// （`revision`、前缀等）与注释不动（§3「从 Web 加改向量模型」）。`Debug` 不印 `api_key` 的值。
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EmbeddingUpsertRequest {
+    pub version: String,
+    pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_backend: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub env_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dimensions: Option<u64>,
+    /// 要写进 `.env` 的 key。省略 = 不动现有的值。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
+}
+
+impl std::fmt::Debug for EmbeddingUpsertRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EmbeddingUpsertRequest")
+            .field("version", &self.version)
+            .field("model", &self.model)
+            .field("provider", &self.provider)
+            .field("api_backend", &self.api_backend)
+            .field("base_url", &self.base_url)
+            .field("env_key", &self.env_key)
+            .field("dimensions", &self.dimensions)
             .field("api_key", &self.api_key.as_ref().map(|_| "<set>"))
             .finish()
     }

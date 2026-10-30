@@ -404,7 +404,7 @@ pub fn upsert_model(
         && str_of(existing, "type").as_deref() != Some("completion")
     {
         return Err(EditError::InUse(format!(
-            "`{alias}` 不是 completion 模型（embedding 之类在文件里改）"
+            "`{alias}` 不是 completion 模型（向量模型走 embedding 那一组）"
         )));
     }
     let table = table_mut(&mut doc, "model", alias);
@@ -431,6 +431,118 @@ pub fn upsert_model(
     Ok(doc.to_string())
 }
 
+/// 一个 embedding 模型项要写的东西（`EmbeddingUpsertRequest` 去掉版本）。
+#[derive(Debug, Clone, Default)]
+pub struct EmbeddingFields<'a> {
+    pub model: &'a str,
+    pub provider: Option<&'a str>,
+    pub api_backend: Option<&'a str>,
+    pub base_url: Option<&'a str>,
+    pub env_key: Option<&'a str>,
+    pub dimensions: Option<u64>,
+    pub api_key: Option<&'a str>,
+}
+
+/// 新建或整份改 `type = "embedding"` 的 `[model.<alias>]` 这几个键；给了 `api_key` 就同时改
+/// `.env`。`revision`、前缀这些键不在表单上，原样留着。
+pub fn upsert_embedding_model(
+    config_text: &str,
+    env_text: &str,
+    alias: &str,
+    fields: &EmbeddingFields<'_>,
+) -> Result<(String, Option<String>), EditError> {
+    check_name("模型", alias)?;
+    let model = line("model", Some(fields.model))?
+        .ok_or_else(|| EditError::Invalid("要写上游的模型 id（`model`）".into()))?;
+    let provider = line("model_provider", fields.provider)?;
+    let api_backend = line("api_backend", fields.api_backend)?;
+    if let Some(backend) = &api_backend
+        && ![
+            crate::embedding::OLLAMA,
+            crate::embedding::OPENAI_COMPATIBLE,
+        ]
+        .contains(&backend.as_str())
+    {
+        return Err(EditError::Invalid(format!(
+            "向量协议只认 `{}` 与 `{}`，不认 `{backend}`",
+            crate::embedding::OLLAMA,
+            crate::embedding::OPENAI_COMPATIBLE
+        )));
+    }
+    let base_url = line("base_url", fields.base_url)?;
+    let mut env_key = line("env_key", fields.env_key)?;
+    if let Some(key) = &env_key {
+        check_env_name(key)?;
+    }
+    let api_key = fields
+        .api_key
+        .map(str::trim)
+        .filter(|k| !k.is_empty())
+        .map(str::to_string);
+    if api_key.is_some() && env_key.is_none() {
+        env_key = Some(default_env_key(alias));
+    }
+
+    let mut doc = parse(config_text)?;
+    if let Some(id) = &provider
+        && sub_table(&doc, "model_providers", id).is_none()
+    {
+        return Err(EditError::NotFound(format!("provider `{id}`")));
+    }
+    if let Some(existing) = sub_table(&doc, "model", alias)
+        && str_of(existing, "type").as_deref() != Some("embedding")
+    {
+        return Err(EditError::InUse(format!(
+            "`{alias}` 已经是一个 completion 模型，换个名字"
+        )));
+    }
+    let table = table_mut(&mut doc, "model", alias);
+    table["type"] = value("embedding");
+    set_or_remove(table, "model_provider", provider);
+    table["model"] = value(model);
+    set_or_remove(table, "api_backend", api_backend);
+    set_or_remove(table, "base_url", base_url);
+    let spelling = if table.contains_key("api_key_env") && !table.contains_key("env_key") {
+        "api_key_env"
+    } else {
+        "env_key"
+    };
+    table.remove(if spelling == "env_key" {
+        "api_key_env"
+    } else {
+        "env_key"
+    });
+    set_or_remove(table, spelling, env_key.clone());
+    set_or_remove_int(table, "dimensions", fields.dimensions)?;
+
+    let env = match (api_key, env_key) {
+        (Some(key), Some(name)) => Some(set_env_value(env_text, &name, &key)?),
+        _ => None,
+    };
+    Ok((doc.to_string(), env))
+}
+
+/// 删 embedding 模型项；记忆正用着它就不删。
+pub fn remove_embedding_model(config_text: &str, alias: &str) -> Result<String, EditError> {
+    let mut doc = parse(config_text)?;
+    let Some(existing) = sub_table(&doc, "model", alias) else {
+        return Err(EditError::NotFound(format!("向量模型 `{alias}`")));
+    };
+    if str_of(existing, "type").as_deref() != Some("embedding") {
+        return Err(EditError::InUse(format!("`{alias}` 不是向量模型")));
+    }
+    if sub_table_value(&doc, "memory", "embedding").as_deref() == Some(alias) {
+        return Err(EditError::InUse(format!(
+            "记忆正用着 `{alias}`（[memory] embedding）；先让记忆换一个向量模型"
+        )));
+    }
+    doc["model"]
+        .as_table_mut()
+        .expect("刚确认过有这一项")
+        .remove(alias);
+    Ok(doc.to_string())
+}
+
 /// 删 completion 模型；是默认模型、或被记忆、某个 Agent 指着就不删。
 pub fn remove_model(config_text: &str, alias: &str) -> Result<String, EditError> {
     let mut doc = parse(config_text)?;
@@ -439,7 +551,7 @@ pub fn remove_model(config_text: &str, alias: &str) -> Result<String, EditError>
     };
     if str_of(existing, "type").as_deref() != Some("completion") {
         return Err(EditError::InUse(format!(
-            "`{alias}` 不是 completion 模型（embedding 之类在文件里改）"
+            "`{alias}` 不是 completion 模型（向量模型走 embedding 那一组）"
         )));
     }
     let mut users = Vec::new();
@@ -756,6 +868,116 @@ default = "magpie-sol"
 
         let unset = models_view(CONFIG, &secrets(&[]), "v".into(), "c".into(), "e".into()).unwrap();
         assert!(!unset.providers[0].key_set);
+    }
+
+    /// 向量模型自成一组：整份写表单上的键、别的键原样留着，key 只进 `.env`；
+    /// 记忆在用的删不掉，与 completion 那一组互不越界。
+    #[test]
+    fn an_embedding_model_is_written_whole_and_guarded() {
+        let text = CONFIG.replace(
+            "model = \"qwen3-embedding:0.6b\"\n",
+            "model = \"qwen3-embedding:0.6b\"\nrevision = \"r1\" # 权重版本\n",
+        ) + "\n[memory]\nembedding = \"embedding\"\n";
+        let (config, env) = upsert_embedding_model(
+            &text,
+            "OTHER=1\n",
+            "embedding",
+            &EmbeddingFields {
+                model: "qwen3-embedding:4b",
+                api_backend: Some("ollama_embeddings"),
+                base_url: Some("http://127.0.0.1:11434"),
+                dimensions: Some(1024),
+                api_key: Some("sk-embed"),
+                ..EmbeddingFields::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            config.contains("model = \"qwen3-embedding:4b\""),
+            "{config}"
+        );
+        assert!(config.contains("dimensions = 1024"), "{config}");
+        assert!(
+            config.contains("revision = \"r1\" # 权重版本"),
+            "表单外的键与注释留着"
+        );
+        assert!(
+            config.contains("env_key = \"EMBEDDING_API_KEY\""),
+            "{config}"
+        );
+        assert!(!config.contains("sk-embed"));
+        assert_eq!(
+            env.as_deref(),
+            Some("OTHER=1\nEMBEDDING_API_KEY='sk-embed'\n")
+        );
+
+        let (config, env) = upsert_embedding_model(
+            &config,
+            "",
+            "remote",
+            &EmbeddingFields {
+                model: "text-embedding-3-small",
+                provider: Some("magpie"),
+                api_backend: Some("embeddings"),
+                ..EmbeddingFields::default()
+            },
+        )
+        .unwrap();
+        assert!(env.is_none(), "没给 key 就不动 .env");
+        assert!(
+            config.contains("[model.remote]\ntype = \"embedding\"\nmodel_provider = \"magpie\""),
+            "{config}"
+        );
+
+        let refused = |fields: EmbeddingFields<'_>, alias: &str| {
+            upsert_embedding_model(&config, "", alias, &fields).unwrap_err()
+        };
+        assert!(matches!(
+            refused(
+                EmbeddingFields {
+                    model: "m",
+                    api_backend: Some("responses"),
+                    ..EmbeddingFields::default()
+                },
+                "x"
+            ),
+            EditError::Invalid(_)
+        ));
+        assert!(matches!(
+            refused(
+                EmbeddingFields {
+                    model: "m",
+                    provider: Some("nope"),
+                    ..EmbeddingFields::default()
+                },
+                "x"
+            ),
+            EditError::NotFound(_)
+        ));
+        assert!(matches!(
+            refused(
+                EmbeddingFields {
+                    model: "m",
+                    ..EmbeddingFields::default()
+                },
+                "magpie-sol"
+            ),
+            EditError::InUse(_)
+        ));
+        assert!(matches!(
+            remove_embedding_model(&config, "embedding"),
+            Err(EditError::InUse(_))
+        ));
+        assert!(matches!(
+            remove_embedding_model(&config, "magpie-sol"),
+            Err(EditError::InUse(_))
+        ));
+        let config = remove_embedding_model(&config, "remote").unwrap();
+        assert!(!config.contains("[model.remote]"), "{config}");
+        assert!(matches!(
+            remove_embedding_model(&config, "remote"),
+            Err(EditError::NotFound(_))
+        ));
     }
 
     #[test]

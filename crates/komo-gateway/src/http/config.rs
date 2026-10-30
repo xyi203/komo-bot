@@ -7,11 +7,11 @@ use axum::extract::{Path, State};
 use komo_kernel::protocol::http::{
     ConfigCheckResponse, ConfigEditResponse, ConfigEnvResponse, ConfigModelsResponse,
     ConfigReloadResponse, ConfigSettingsResponse, ConfigVersionRequest, DefaultModelRequest,
-    EnvSetRequest, ErrorCode, ModelMenuEntry, ModelUpsertRequest, ModelsResponse,
-    ProviderUpsertRequest, SettingRequest,
+    EmbeddingUpsertRequest, EnvSetRequest, ErrorCode, ModelMenuEntry, ModelUpsertRequest,
+    ModelsResponse, ProviderUpsertRequest, SettingRequest,
 };
 use komo_kernel::types::model::{CatalogModel, ModelConfig};
-use komo_runtime::config::{EditError, ModelFields, ProviderFields};
+use komo_runtime::config::{EditError, EmbeddingFields, ModelFields, ProviderFields};
 
 use super::Api;
 use super::error::{ApiFailure, ApiResult};
@@ -180,6 +180,46 @@ pub async fn put_model(
         };
         Ok((
             Some(komo_runtime::config::upsert_model(config, &alias, &fields)?),
+            None,
+        ))
+    })
+    .await
+}
+
+/// `PUT /v1/config/embedding-models/{alias}`
+pub async fn put_embedding_model(
+    State(api): State<Api>,
+    Path(alias): Path<String>,
+    Json(request): Json<EmbeddingUpsertRequest>,
+) -> ApiResult<Json<ConfigEditResponse>> {
+    edit(&api, &request.version, |config, env| {
+        let fields = EmbeddingFields {
+            model: &request.model,
+            provider: request.provider.as_deref(),
+            api_backend: request.api_backend.as_deref(),
+            base_url: request.base_url.as_deref(),
+            env_key: request.env_key.as_deref(),
+            dimensions: request.dimensions,
+            api_key: request.api_key.as_deref(),
+        };
+        let (config, env) =
+            komo_runtime::config::upsert_embedding_model(config, env, &alias, &fields)?;
+        Ok((Some(config), env))
+    })
+    .await
+}
+
+/// `DELETE /v1/config/embedding-models/{alias}`
+pub async fn delete_embedding_model(
+    State(api): State<Api>,
+    Path(alias): Path<String>,
+    Json(request): Json<ConfigVersionRequest>,
+) -> ApiResult<Json<ConfigEditResponse>> {
+    edit(&api, &request.version, |config, _| {
+        Ok((
+            Some(komo_runtime::config::remove_embedding_model(
+                config, &alias,
+            )?),
             None,
         ))
     })

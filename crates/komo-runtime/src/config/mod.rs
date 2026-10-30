@@ -29,9 +29,9 @@ use komo_kernel::protocol::config::{ConfigIssue, ConfigSnapshot, IssueSeverity, 
 use time::OffsetDateTime;
 
 pub use edit::{
-    EditError, ModelFields, ProviderFields, config_version, env_view, models_view,
-    remove_env_value, remove_model, remove_provider, set_default_model, set_env_value,
-    set_env_values, upsert_model, upsert_provider,
+    EditError, EmbeddingFields, ModelFields, ProviderFields, config_version, env_view, models_view,
+    remove_embedding_model, remove_env_value, remove_model, remove_provider, set_default_model,
+    set_env_value, set_env_values, upsert_embedding_model, upsert_model, upsert_provider,
 };
 pub use effort::{EffortCapabilities, EffortProblem, EffortSupport};
 pub use env::{HomeError, KOMO_HOME, KOMO_LISTEN, Secrets, secrets_from_text, user_home};

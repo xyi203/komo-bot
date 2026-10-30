@@ -1723,4 +1723,54 @@ async fn settings_and_env_vars_are_edited_through_the_gateway_without_values_lea
         .await;
     assert_eq!(status, 200, "{body}");
     assert!(!env_file().contains("WEB_TOKEN"));
+
+    // 向量模型（§3「从 Web 加改向量模型」）：带 key 新建，key 只进 .env；视图里列出、
+    // 成了 memory.embedding 的选项；删得掉
+    let version = edit(&body).models.version;
+    let (status, body) = gateway
+        .request(
+            reqwest::Method::PUT,
+            "/v1/config/embedding-models/web-embed",
+            Some(serde_json::json!({
+                "version": version,
+                "model": "qwen3-embedding:4b",
+                "api_backend": "ollama_embeddings",
+                "base_url": "http://127.0.0.1:11434",
+                "api_key": "tok-embed-secret"
+            })),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert!(!body.contains("tok-embed-secret"), "响应里没有值：{body}");
+    assert!(env_file().contains("WEB_EMBED_API_KEY='tok-embed-secret'"));
+    let after = edit(&body);
+    let added = after
+        .models
+        .embeddings
+        .iter()
+        .find(|e| e.alias == "web-embed")
+        .expect("视图里有它");
+    assert!(added.key_set);
+    let choice = after
+        .settings
+        .settings
+        .iter()
+        .find(|s| s.key == "memory.embedding")
+        .unwrap();
+    assert!(choice.options.contains(&"web-embed".to_string()));
+    let (status, body) = gateway
+        .request(
+            reqwest::Method::DELETE,
+            "/v1/config/embedding-models/web-embed",
+            Some(serde_json::json!({ "version": after.models.version })),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert!(
+        edit(&body)
+            .models
+            .embeddings
+            .iter()
+            .all(|e| e.alias != "web-embed")
+    );
 }

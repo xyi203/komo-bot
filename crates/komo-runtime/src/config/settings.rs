@@ -19,6 +19,8 @@ enum Options {
     Agents,
     /// 文件里 completion 类的 `[model.*]`。
     CompletionModels,
+    /// 文件里 embedding 类的 `[model.*]`。
+    EmbeddingModels,
 }
 
 struct Spec {
@@ -63,6 +65,12 @@ const SETTINGS: &[Spec] = &[
         "memory.model",
         SettingKind::Choice,
         Options::CompletionModels,
+    ),
+    // 换它要重启 Gateway 才生效（向量后端只在启动后探测装上，§9.5）；Web 写完会说。
+    spec(
+        "memory.embedding",
+        SettingKind::Choice,
+        Options::EmbeddingModels,
     ),
     spec(
         "memory.retrieval.mode",
@@ -127,11 +135,16 @@ fn options_of(doc: &DocumentMut, options: Options) -> Vec<String> {
         Options::Agents => table_keys(doc, "agents")
             .map(|(k, _)| k.to_string())
             .collect(),
-        Options::CompletionModels => table_keys(doc, "model")
-            .filter(|(_, t)| t.get("type").and_then(Item::as_str) == Some("completion"))
-            .map(|(k, _)| k.to_string())
-            .collect(),
+        Options::CompletionModels => models_of_type(doc, "completion"),
+        Options::EmbeddingModels => models_of_type(doc, "embedding"),
     }
+}
+
+fn models_of_type(doc: &DocumentMut, kind: &str) -> Vec<String> {
+    table_keys(doc, "model")
+        .filter(|(_, t)| t.get("type").and_then(Item::as_str) == Some(kind))
+        .map(|(k, _)| k.to_string())
+        .collect()
 }
 
 /// 生效值从**当前快照**读：文件改了还没装上时，两者会不一样，这正是要让人看见的。
@@ -143,6 +156,8 @@ fn effective(key: &str, snapshot: &ConfigSnapshot, doc: &DocumentMut) -> Option<
         "memory.model" => lookup(doc, "memory.model")
             .or_else(|| lookup(doc, "models.default"))
             .and_then(to_json)?,
+        // 快照里也是展开后的模型；后端换没换上要看重启，这里只报文件里指的是谁。
+        "memory.embedding" => lookup(doc, "memory.embedding").and_then(to_json)?,
         "memory.retrieval.mode" => serde_json::to_value(snapshot.memory.retrieval.mode).ok()?,
         "compaction.enabled" => Value::Bool(snapshot.compaction.enabled),
         "execution.model_result_bytes" => Value::from(snapshot.execution.model_result_bytes),
@@ -287,6 +302,9 @@ enabled = true # 开着
         assert_eq!(model.value, None, "没写");
         assert_eq!(model.effective, Some(Value::from("sol")), "跟默认模型");
         assert_eq!(model.options, ["sol"], "embedding 不是选项");
+        let embedding = get(&v, "memory.embedding");
+        assert_eq!(embedding.options, ["embedding"], "只列向量模型");
+        assert_eq!(embedding.value, None);
         assert_eq!(get(&v, "memory.enabled").value, Some(Value::Bool(true)));
         assert_eq!(get(&v, "execution.model_result_bytes").max, Some(30 * 1024));
     }

@@ -528,6 +528,7 @@ button.live-line:hover .label { text-decoration: underline; text-underline-offse
 .ev-link:hover { text-decoration: underline; text-underline-offset: 3px; }
 .ev-link .i { width: 12px; height: 12px; }
 .hint { margin: 10px 0 0; color: var(--muted); font-size: var(--fs-label); line-height: 20px; }
+.hint.lead-hint { margin: 4px 0 12px; }
 .hint.chain { margin-top: 12px; }
 
 .detail-h { margin: 0; flex: 1; font-size: 16px; line-height: 24px; font-weight: 600; }
@@ -696,6 +697,7 @@ button.live-line:hover .label { text-decoration: underline; text-underline-offse
 .pm-main { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
 .pm-name { display: inline-flex; align-items: center; gap: 8px; font-weight: 500; }
 .pm-name .pill { height: 18px; font-size: 11px; }
+.pm-name .tag { height: 18px; padding: 0 6px; font-size: 11px; font-weight: 400; }
 .pm-sub { color: var(--muted); font-size: var(--fs-small); overflow-wrap: anywhere; }
 .pm-act { display: flex; gap: 12px; }
 .pm > .cfg-form, .pm > .danger { grid-column: 1 / -1; }
@@ -704,6 +706,7 @@ button.live-line:hover .label { text-decoration: underline; text-underline-offse
 .pm-new { margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--rule); }
 .add-card { display: flex; align-items: center; justify-content: center; gap: 6px; width: 100%; height: 48px; border: 1px dashed var(--control); border-radius: var(--radius-card); background: none; color: var(--muted); font: inherit; cursor: pointer; transition: background-color var(--t) ease, color var(--t) ease; }
 .add-card:hover { background: var(--hover-on-white); color: var(--text); }
+.add-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; }
 .cfg-form { max-width: 640px; padding: 4px 0 2px; }
 .cfg-form .lbl:first-child, .cfg-form .two:first-child .lbl { margin-top: 8px; }
 /* 配置：一项一张卡，左边名字与一句说明，右边控件 */

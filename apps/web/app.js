@@ -1672,17 +1672,37 @@ function providerForm(P, p) {
     ${failLine(P)}
     <div class="actions">${btn(P.busy ? "正在保存" : isNew ? "添加" : "保存", `type="submit" ${busy}`, "primary")}${btn("取消", 'type="button" data-cfg="cancel"')}</div></form>`;
 }
-function modelForm(P, m, providerId) {
+// 对话模型与向量模型共用一张表，类型决定显示哪组字段（新建时可切换，只切 hidden，不重绘，免得丢掉已填的）。
+// 不挂 provider 的只能是向量模型：端点与 key 写在模型项里。
+function modelForm(P, m, providerId, kind) {
   const C = P.data.cfg, isNew = !m, busy = P.busy ? "disabled" : "";
-  return `<form class="mform cfg-form" id="cfg-model-form" data-alias="${esc(m?.alias || "")}">
+  const pid = m ? m.provider || "" : providerId, loose = !pid;
+  const type = loose ? "embedding" : m ? kind : P.edit?.type || "completion";
+  const parent = C.providers.find((p) => p.id === pid);
+  // 视图里继承来的值不回填：留空就接着继承 provider 的，改了 provider 也跟着变
+  const own = (k) => (m?.[k] && m[k] !== parent?.[k] ? m[k] : "");
+  const backend = EMBED_BACKENDS[m?.api_backend] ? m.api_backend : "ollama_embeddings";
+  const only = (t, html) => `<div data-only="${t}" ${type === t ? "" : "hidden"}>${html}</div>`;
+  const providerPick = `<div><label class="lbl" for="mf2-provider">Provider</label><select class="select" id="mf2-provider" name="provider">${C.providers.map((p) => `<option value="${esc(p.id)}" ${p.id === pid ? "selected" : ""}>${esc(p.id)}</option>`).join("")}</select></div>`;
+  return `<form class="mform cfg-form" id="cfg-model-form" data-alias="${esc(m?.alias || "")}" data-type="${type}">
+    ${isNew && !loose ? `<label class="lbl" for="mf2-type">类型</label><select class="select" id="mf2-type" name="type"><option value="completion" ${type === "completion" ? "selected" : ""}>对话</option><option value="embedding" ${type === "embedding" ? "selected" : ""}>向量（记忆检索用）</option></select>` : ""}
+    ${isNew && loose ? `<p class="hint">不挂 provider 的只能是向量模型；对话模型先建 provider 再挂上去。</p>` : ""}
     <div class="two">${isNew ? `<div><label class="lbl" for="mf2-alias">名字（alias）</label><input class="input" id="mf2-alias" name="alias" required pattern="[A-Za-z0-9._-]+" maxlength="64" placeholder="例：ds-chat"></div>` : ""}
-      <div><label class="lbl" for="mf2-name">显示名</label><input class="input" id="mf2-name" name="name" value="${esc(m?.name || "")}" placeholder="菜单里显示的名字"></div>
-      ${isNew ? "" : `<div><label class="lbl" for="mf2-provider">Provider</label><select class="select" id="mf2-provider" name="provider">${C.providers.map((p) => `<option value="${esc(p.id)}" ${p.id === (m?.provider || providerId) ? "selected" : ""}>${esc(p.id)}</option>`).join("")}</select></div>`}</div>
-    ${isNew ? `<input type="hidden" name="provider" value="${esc(providerId)}">` : ""}
-    <label class="lbl" for="mf2-model">上游模型 id</label><input class="input" id="mf2-model" name="model" required value="${esc(m?.model || "")}" placeholder="例：deepseek-chat">
-    <div class="two"><div><label class="lbl" for="mf2-window">上下文窗口（token）</label><input class="input" id="mf2-window" name="context_window" type="number" min="1" value="${m?.context_window ?? ""}" placeholder="留空：问 provider"></div>
-      <div><label class="lbl" for="mf2-effort">默认 effort</label><input class="input" id="mf2-effort" name="effort" value="${esc(m?.effort || "")}" placeholder="留空：provider 默认"></div></div>
-    <label class="lbl" for="mf2-efforts">可选的 effort 档位（逗号分隔，可不填）</label><input class="input" id="mf2-efforts" name="efforts" value="${esc((m?.efforts || []).join(", "))}" placeholder="low, medium, high">
+      <div><label class="lbl" for="mf2-model">上游模型 id</label><input class="input mono" id="mf2-model" name="model" required value="${esc(m?.model || "")}" placeholder="例：deepseek-chat"></div>
+      ${isNew || loose ? "" : providerPick}</div>
+    ${isNew && !loose ? `<input type="hidden" name="provider" value="${esc(pid)}">` : ""}
+    ${only("completion", `<div class="two"><div><label class="lbl" for="mf2-name">显示名</label><input class="input" id="mf2-name" name="name" value="${esc(m?.name || "")}" placeholder="菜单里显示的名字"></div>
+        <div><label class="lbl" for="mf2-window">上下文窗口（token）</label><input class="input" id="mf2-window" name="context_window" type="number" min="1" value="${m?.context_window ?? ""}" placeholder="留空：问 provider"></div></div>
+      <div class="two"><div><label class="lbl" for="mf2-effort">默认 effort</label><input class="input" id="mf2-effort" name="effort" value="${esc(m?.effort || "")}" placeholder="留空：provider 默认"></div>
+        <div><label class="lbl" for="mf2-efforts">可选的 effort 档位</label><input class="input" id="mf2-efforts" name="efforts" value="${esc((m?.efforts || []).join(", "))}" placeholder="low, medium, high"></div></div>`)}
+    ${only("embedding", `<div class="two"><div><label class="lbl" for="mf2-backend">向量协议</label><select class="select" id="mf2-backend" name="api_backend">${Object.entries(EMBED_BACKENDS).map(([v, n]) => `<option value="${v}" ${v === backend ? "selected" : ""}>${n}</option>`).join("")}</select></div>
+        <div><label class="lbl" for="mf2-dim">维数</label><input class="input" id="mf2-dim" name="dimensions" type="number" min="1" value="${m?.dimensions ?? ""}" placeholder="留空：用模型返回的"></div></div>
+      ${loose ? `<div class="two"><div><label class="lbl" for="mf2-url">Base URL</label><input class="input" id="mf2-url" name="base_url" value="${esc(m?.base_url || "")}" placeholder="http://127.0.0.1:11434"></div>
+        <div><label class="lbl" for="mf2-key">API key</label><input class="input" id="mf2-key" name="api_key" type="password" autocomplete="new-password" placeholder="${m ? (m.key_set ? "已设置；留空不改" : "还没设置") : "本机端点不验 key 也要填一个值"}"></div></div>
+        <p class="hint">key 存成环境变量${m?.env_key ? ` <span class="mono">${esc(m.env_key)}</span>` : "，名字默认是 <code>名字大写_API_KEY</code>"}，不进配置。</p>` : ""}
+      <details class="adv"><summary>更多设置</summary><div class="two">
+        ${loose ? "" : `<div><label class="lbl" for="mf2-url">Base URL</label><input class="input" id="mf2-url" name="base_url" value="${esc(own("base_url"))}" placeholder="留空：用 ${esc(pid)} 的"></div>`}
+        <div><label class="lbl" for="mf2-env">凭证变量名</label><input class="input mono" id="mf2-env" name="env_key" value="${esc(loose ? m?.env_key || "" : own("env_key"))}" placeholder="${loose ? "名字大写_API_KEY" : `留空：用 ${esc(pid)} 的`}"></div></div></details>`)}
     ${failLine(P)}
     <div class="actions">${btn(P.busy ? "正在保存" : isNew ? "添加" : "保存", `type="submit" ${busy}`, "primary")}${btn("取消", 'type="button" data-cfg="cancel"')}</div></form>`;
 }
@@ -1698,69 +1718,54 @@ function modelRow(P, m, def) {
     <div class="pm-main"><span class="pm-name">${esc(m.name || m.alias)}${m.alias === def ? `<span class="pill">默认</span>` : ""}</span>
       <span class="pm-sub"><span class="mono">${esc(m.alias)}</span><span class="sep">·</span><span class="mono">${esc(m.model)}</span>${win ? `<span class="sep">·</span><span class="num">${kTokens(win)}</span> 窗口` : ""}${m.effort ? `<span class="sep">·</span>effort ${esc(m.effort)}` : ""}</span></div>
     ${m.standalone ? "" : `<span class="pm-act"><button class="text-btn quiet" data-cfg="edit-model" data-id="${esc(m.alias)}">编辑</button><button class="text-btn quiet danger-link" data-cfg="del-model" data-id="${esc(m.alias)}">删除</button></span>`}
-    ${editing ? modelForm(P, m) : ""}
+    ${editing ? modelForm(P, m, m.provider, "completion") : ""}
     ${delAsk(P, "model", m.alias, `删掉之后菜单里没有它；已经开始的请求用的是开始时那份配置，不受影响。`)}</li>`;
 }
 function modelsSection(P) {
   const C = P.data.cfg;
   if (!C || C.error) return secHead("模型", "") + errLine(C);
-  const def = C.default;
-  const completions = C.models;
+  const def = C.default, used = C.memory_embedding;
+  const completions = C.models, embeds = C.embeddings || [];
   const defaultPick = `<label class="def-pick"><span>默认模型</span><select class="select" id="cfg-default" ${P.busy ? "disabled" : ""}>${completions.map((m) => `<option value="${esc(m.alias)}" ${m.alias === def ? "selected" : ""}>${esc(m.name || m.alias)}</option>`).join("")}</select></label>`;
+  const adding = (pid) => P.edit?.kind === "new-model" && P.edit.provider === pid;
+  const addBtn = (pid, text) => `<button class="text-btn quiet add-model" data-cfg="new-model" data-provider="${esc(pid)}">${icon("plus")}${text}</button>`;
   const cards = C.providers.map((p) => {
-    const mine = completions.filter((m) => m.provider === p.id);
+    const mine = completions.filter((m) => m.provider === p.id), vecs = embeds.filter((e) => e.provider === p.id);
     const editing = P.edit?.kind === "provider" && P.edit.id === p.id;
-    const adding = P.edit?.kind === "new-model" && P.edit.provider === p.id;
+    const n = mine.length + vecs.length;
     return `<section class="pcard${editing ? " editing" : ""}">
       <header class="pcard-head"><div class="pcard-title"><span class="pname">${esc(p.id)}</span><span class="tag">${esc((BACKENDS.find(([v]) => v === p.api_backend) || [0, p.api_backend || "协议没写"])[1])}</span>${keyLine(p)}</div>
         ${editing ? "" : `<span class="pact">${btn("编辑", `data-cfg="edit-provider" data-id="${esc(p.id)}"`, "sm")}<button class="text-btn quiet danger-link" data-cfg="del-provider" data-id="${esc(p.id)}">删除</button></span>`}</header>
       ${p.base_url && !editing ? `<p class="pcard-url mono">${esc(p.base_url)}</p>` : ""}
       ${editing ? providerForm(P, p) : ""}
-      ${delAsk(P, "provider", p.id, mine.length ? `还有 ${mine.length} 个模型挂在它上面，Gateway 会拒绝；先删掉或改挂别的 provider。` : `删掉 provider ${esc(p.id)}；它的 API key 留在环境变量里。`)}
-      <ul class="pms">${mine.map((m) => modelRow(P, m, def)).join("") || `<li class="pm empty">还没有模型挂在它上面。</li>`}</ul>
-      ${adding ? `<div class="pm-new">${modelForm(P, null, p.id)}</div>` : `<button class="text-btn quiet add-model" data-cfg="new-model" data-provider="${esc(p.id)}">${icon("plus")}添加模型</button>`}
+      ${delAsk(P, "provider", p.id, n ? `还有 ${n} 个模型挂在它上面，Gateway 会拒绝；先删掉或改挂别的 provider。` : `删掉 provider ${esc(p.id)}；它的 API key 留在环境变量里。`)}
+      <ul class="pms">${mine.map((m) => modelRow(P, m, def)).join("")}${vecs.map((e) => embeddingRow(P, e, used)).join("") || (n ? "" : `<li class="pm empty">还没有模型挂在它上面。</li>`)}</ul>
+      ${adding(p.id) ? `<div class="pm-new">${modelForm(P, null, p.id)}</div>` : addBtn(p.id, "添加模型")}
     </section>`;
   }).join("");
-  const loose = completions.filter((m) => m.standalone);
-  const looseCard = loose.length ? `<section class="pcard"><header class="pcard-head"><div class="pcard-title"><span class="pname">独立模型</span><span class="muted small">端点直接写在模型项里，没挂 provider</span></div></header>
-      <ul class="pms">${loose.map((m) => modelRow(P, m, def)).join("")}</ul><p class="hint">这几个只能在配置文件里改。</p></section>` : "";
-  const embeds = C.embeddings || [], addingEmbed = P.edit?.kind === "new-embed";
-  const embedCard = `<section class="pcard${addingEmbed ? " editing" : ""}"><header class="pcard-head"><div class="pcard-title"><span class="pname">向量模型</span><span class="muted small">记忆检索用它把文字变成向量</span></div></header>
-      <ul class="pms">${embeds.map((e) => embeddingRow(P, e, C.memory_embedding)).join("") || `<li class="pm empty">还没有向量模型；没有它记忆只能按关键词检索。</li>`}</ul>
-      ${addingEmbed ? `<div class="pm-new">${embedForm(P, null)}</div>` : `<button class="text-btn quiet add-model" data-cfg="new-embed">${icon("plus")}添加向量模型</button>`}</section>`;
+  const looseChat = completions.filter((m) => m.standalone), looseVec = embeds.filter((e) => !e.provider);
+  const looseCard = looseChat.length || looseVec.length || adding("")
+    ? `<section class="pcard${adding("") ? " editing" : ""}"><header class="pcard-head"><div class="pcard-title"><span class="pname">独立模型</span><span class="muted small">端点直接写在模型项里，没挂 provider</span></div></header>
+      <ul class="pms">${looseChat.map((m) => modelRow(P, m, def)).join("")}${looseVec.map((e) => embeddingRow(P, e, used)).join("")}</ul>
+      ${looseChat.length ? `<p class="hint">这里的对话模型只能在配置文件里改。</p>` : ""}
+      ${adding("") ? `<div class="pm-new">${modelForm(P, null, "")}</div>` : addBtn("", "添加向量模型")}</section>` : "";
   const addProvider = P.edit?.kind === "new-provider"
     ? `<section class="pcard editing"><header class="pcard-head"><div class="pcard-title"><span class="pname">添加 provider</span></div></header>${providerForm(P, null)}</section>`
-    : `<button class="add-card" data-cfg="new-provider">${icon("plus")}添加 provider</button>`;
-  return secHead("模型", "改完马上生效：校验通过才保存，随后热重载。", completions.length ? defaultPick : "") + editNotice(P) + cards + looseCard + embedCard + addProvider;
+    : `<div class="add-cards"><button class="add-card" data-cfg="new-provider">${icon("plus")}添加 provider</button>${looseCard ? "" : `<button class="add-card" data-cfg="new-model" data-provider="">${icon("plus")}添加独立的向量模型</button>`}</div>`;
+  const noVec = embeds.length ? "" : `<p class="hint lead-hint">还没有向量模型：记忆只能按关键词检索。在 provider 里"添加模型"选类型"向量"，或添加一个独立的。</p>`;
+  return secHead("模型", "改完马上生效：校验通过才保存，随后热重载。", completions.length ? defaultPick : "") + editNotice(P) + noVec + cards + looseCard + addProvider;
 }
 const EMBED_BACKENDS = { ollama_embeddings: "Ollama", embeddings: "OpenAI 兼容" };
+// 向量模型和对话模型同一种行，名字后面一个"向量"标记；记忆在用的再标一个
 function embeddingRow(P, e, used) {
-  const editing = P.edit?.kind === "embed" && P.edit.id === e.alias;
-  const key = !e.env_key ? "" : e.key_set ? `<span class="kstate ok"><i class="kdot"></i><span class="mono">${esc(e.env_key)}</span> 已设置</span>` : `<span class="kstate warn"><i class="kdot"></i>缺 <span class="mono">${esc(e.env_key)}</span></span>`;
-  const sub = [`<span class="mono">${esc(e.alias)}</span>`, esc(EMBED_BACKENDS[e.api_backend] || e.api_backend || "协议没写"), e.provider ? `挂在 ${esc(e.provider)}` : "", e.base_url ? `<span class="mono">${esc(e.base_url)}</span>` : "", e.dimensions ? `<span class="num">${e.dimensions}</span> 维` : ""].filter(Boolean);
-  const inUse = e.alias === used;
-  return `<li class="pm${editing ? " editing" : ""}"><div class="pm-main"><span class="pm-name"><span class="mono">${esc(e.model)}</span>${inUse ? `<span class="pill">记忆在用</span>` : ""}</span>
-    <span class="pm-sub">${sub.join('<span class="sep">·</span>')}${key ? `<span class="sep">·</span>${key}` : ""}</span></div>
+  const editing = P.edit?.kind === "embed" && P.edit.id === e.alias, inUse = e.alias === used;
+  const key = e.provider || !e.env_key ? "" : e.key_set ? `<span class="kstate ok"><i class="kdot"></i><span class="mono">${esc(e.env_key)}</span> 已设置</span>` : `<span class="kstate warn"><i class="kdot"></i>缺 <span class="mono">${esc(e.env_key)}</span></span>`;
+  const sub = [`<span class="mono">${esc(e.model)}</span>`, esc(EMBED_BACKENDS[e.api_backend] || e.api_backend || "协议没写"), e.dimensions ? `<span class="num">${e.dimensions}</span> 维` : "", !e.provider && e.base_url ? `<span class="mono">${esc(e.base_url)}</span>` : "", key].filter(Boolean);
+  return `<li class="pm${editing ? " editing" : ""}"><div class="pm-main"><span class="pm-name">${esc(e.alias)}<span class="tag">向量</span>${inUse ? `<span class="pill">记忆在用</span>` : ""}</span>
+    <span class="pm-sub">${sub.join('<span class="sep">·</span>')}</span></div>
     ${editing ? "" : `<span class="pm-act">${inUse ? "" : `<button class="text-btn quiet" data-cfg="use-embed" data-id="${esc(e.alias)}">让记忆用它</button>`}<button class="text-btn quiet" data-cfg="edit-embed" data-id="${esc(e.alias)}">编辑</button><button class="text-btn quiet danger-link" data-cfg="del-embed" data-id="${esc(e.alias)}">删除</button></span>`}
-    ${editing ? embedForm(P, e) : ""}
+    ${editing ? modelForm(P, e, e.provider || "", "embedding") : ""}
     ${delAsk(P, "embed", e.alias, inUse ? "记忆正用着它，Gateway 会拒绝；先让记忆换一个向量模型。" : `删掉向量模型 ${esc(e.alias)}；它的 key 留在环境变量里。`)}</li>`;
-}
-function embedForm(P, e) {
-  const C = P.data.cfg, isNew = !e, busy = P.busy ? "disabled" : "";
-  const backend = e?.api_backend || "ollama_embeddings";
-  return `<form class="mform cfg-form" id="cfg-embed-form" data-alias="${esc(e?.alias || "")}">
-    <div class="two">${isNew ? `<div><label class="lbl" for="ef-alias">名字（alias）</label><input class="input" id="ef-alias" name="alias" required pattern="[A-Za-z0-9._-]+" maxlength="64" placeholder="例：embedding"></div>` : ""}
-      <div><label class="lbl" for="ef-model">上游 id</label><input class="input mono" id="ef-model" name="model" required value="${esc(e?.model || "")}" placeholder="例：qwen3-embedding:0.6b"></div></div>
-    <div class="two"><div><label class="lbl" for="ef-backend">协议</label><select class="select" id="ef-backend" name="api_backend">${Object.entries(EMBED_BACKENDS).map(([v, n]) => `<option value="${v}" ${v === backend ? "selected" : ""}>${n}</option>`).join("")}</select></div>
-      <div><label class="lbl" for="ef-url">Base URL</label><input class="input" id="ef-url" name="base_url" value="${esc(e?.provider ? "" : e?.base_url || "")}" placeholder="http://127.0.0.1:11434"></div></div>
-    <label class="lbl" for="ef-key">API key</label><input class="input" id="ef-key" name="api_key" type="password" autocomplete="new-password" placeholder="${e ? (e.key_set ? "已设置；留空不改" : "还没设置") : "本机端点不验 key 也要填一个值"}">
-    <p class="hint">存成环境变量${e?.env_key ? ` <span class="mono">${esc(e.env_key)}</span>` : "，名字默认是 <code>名字大写_API_KEY</code>"}，不进配置。</p>
-    <details class="adv"><summary>更多设置</summary>
-      <label class="lbl" for="ef-provider">挂到 provider</label><select class="select" id="ef-provider" name="provider"><option value="">不挂（端点与 key 写在这里）</option>${C.providers.map((p) => `<option value="${esc(p.id)}" ${p.id === e?.provider ? "selected" : ""}>${esc(p.id)}（继承它的端点与 key）</option>`).join("")}</select>
-      <div class="two"><div><label class="lbl" for="ef-env">凭证变量名</label><input class="input mono" id="ef-env" name="env_key" value="${esc(e?.env_key || "")}" placeholder="名字大写_API_KEY"></div>
-        <div><label class="lbl" for="ef-dim">维数</label><input class="input" id="ef-dim" name="dimensions" type="number" min="1" value="${e?.dimensions ?? ""}" placeholder="留空：用模型返回的"></div></div></details>
-    ${failLine(P)}
-    <div class="actions">${btn(P.busy ? "正在保存" : isNew ? "添加" : "保存", `type="submit" ${busy}`, "primary")}${btn("取消", 'type="button" data-cfg="cancel"')}</div></form>`;
 }
 // 写完之后的一句回执；409 时给"重新读取"
 function editNotice(P) {
@@ -1796,9 +1801,8 @@ function cfgAct(el) {
   if (a === "reread") { P.result.edit = null; reloadPage("settings"); return; }
   if (a === "new-provider") { P.edit = { kind: "new-provider" }; P.confirm = null; render(); setTimeout(() => $("pf-id")?.focus()); return; }
   if (a === "edit-provider") { P.edit = { kind: "provider", id }; P.confirm = null; render(); return; }
-  if (a === "new-model") { P.edit = { kind: "new-model", provider: el.dataset.provider }; P.confirm = null; render(); setTimeout(() => $("mf2-alias")?.focus()); return; }
+  if (a === "new-model") { P.edit = { kind: "new-model", provider: el.dataset.provider, type: "completion" }; P.confirm = null; render(); setTimeout(() => $("mf2-alias")?.focus()); return; }
   if (a === "edit-model") { P.edit = { kind: "model", id }; P.confirm = null; render(); return; }
-  if (a === "new-embed") { P.edit = { kind: "new-embed" }; P.confirm = null; render(); setTimeout(() => $("ef-alias")?.focus()); return; }
   if (a === "edit-embed") { P.edit = { kind: "embed", id }; P.confirm = null; render(); return; }
   // 在模型一节点的：出错写在这一节顶上的回执里（confirm 让 cfgSend 这么做），不落到配置一节的卡片
   if (a === "use-embed") { P.confirm = { kind: "use-embed", id }; return cfgSend("PUT", "/v1/config/settings/memory.embedding", { value: id }, `记忆改用 ${esc(id)}`, EMBED_RESTART); }
@@ -1830,7 +1834,7 @@ function cfgSubmit(form) {
     const body = { api_backend: v("api_backend"), base_url: v("base_url") || undefined, env_key: v("env_key") || undefined, auth: v("auth") || undefined, timeout_secs: num("timeout_secs"), api_key: v("api_key") || undefined };
     return cfgSend("PUT", `/v1/config/model-providers/${encodeURIComponent(id)}`, body, form.dataset.id ? `保存了 provider ${esc(id)}` : `添加了 provider ${esc(id)}`);
   }
-  if (form.id === "cfg-embed-form") {
+  if (form.id === "cfg-model-form" && form.dataset.type === "embedding") {
     const alias = form.dataset.alias || v("alias");
     const body = { model: v("model"), api_backend: v("api_backend"), provider: v("provider") || undefined, base_url: v("base_url") || undefined, env_key: v("env_key") || undefined, dimensions: num("dimensions"), api_key: v("api_key") || undefined };
     const inUse = alias === S.pg.settings.data.cfg?.memory_embedding;
@@ -2223,7 +2227,7 @@ function matterFormSubmit(form) {
 document.addEventListener("submit", (ev) => {
   if (ev.target.id === "matter-form") { ev.preventDefault(); matterFormSubmit(ev.target); }
   if (ev.target.id === "matter-new") { ev.preventDefault(); matterCreate(ev.target); }
-  if (/^cfg-(provider-form|model-form|embed-form|setting-num|env-one|env-form)$/.test(ev.target.id)) { ev.preventDefault(); cfgSubmit(ev.target); }
+  if (/^cfg-(provider-form|model-form|setting-num|env-one|env-form)$/.test(ev.target.id)) { ev.preventDefault(); cfgSubmit(ev.target); }
   if (ev.target.id === "mem-form") { ev.preventDefault(); memAdd(ev.target); }
   if (ev.target.id === "classify-form") { ev.preventDefault(); memClassify(S.mem.selected, "convention", new FormData(ev.target).get("applies_when").trim()); }
 });
@@ -2233,6 +2237,12 @@ document.addEventListener("change", (ev) => {
     ev.target.form.querySelectorAll("[data-for]").forEach((d) => { d.hidden = d.dataset.for !== ev.target.value; });
   }
   if (ev.target.dataset?.setting) { settingSend(ev.target.dataset.setting, ev.target.value === "" ? null : ev.target.value); return; }
+  if (ev.target.id === "mf2-type") {
+    const f = ev.target.form, t = ev.target.value;
+    f.dataset.type = t; f.querySelectorAll("[data-only]").forEach((d) => { d.hidden = d.dataset.only !== t; });
+    if (S.pg.settings.edit) S.pg.settings.edit.type = t;
+    return;
+  }
   if (ev.target.id === "cfg-default") { cfgSend("PUT", "/v1/config/default-model", { alias: ev.target.value }, `默认模型改成了 ${esc(ev.target.value)}`); return; }
   if (ev.target.id === "mem-scope") { S.mem.scope = ev.target.value; S.mem.selected = null; render(); }
   if (ev.target.name === "application" && ev.target.form?.id === "mem-form") {

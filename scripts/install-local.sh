@@ -4,7 +4,7 @@
 #   scripts/install-local.sh [--prefix DIR] [--no-restart]
 #
 # 一条命令做完以前要模型摸索好几轮的事：
-#   1. cargo build --release --locked -p komo。在 git worktree 里跑时默认共用主检出的
+#   1. cargo build --release --locked -p komo && cargo build --release --locked -p komo-channel --features feishu,telegram,wechat。在 git worktree 里跑时默认共用主检出的
 #      target/（CARGO_TARGET_DIR 没设才这样），依赖不用每个 worktree 冷编一遍。共用 target/ 时
 #      cargo 可能把别的 worktree 编出来的 workspace crate 当成现成的复用（docs/storage-durable.md
 #      §13.3），装上去的就不是这份源码。所以 target/ 里记一个 `.install-local-root` 戳，上一次
@@ -55,13 +55,13 @@ fi
 stamp="${CARGO_TARGET_DIR}/.install-local-root"
 if [ "$(cat "${stamp}" 2>/dev/null || true)" != "${root}" ]; then
   echo "==> ${CARGO_TARGET_DIR} 上次不是 ${root} 编的，touch crate 入口，避免复用别处的产物"
-  touch "${root}"/crates/*/src/lib.rs "${root}/crates/komo/src/main.rs"
+  touch "${root}"/crates/*/src/lib.rs "${root}/crates/komo/src/main.rs" "${root}"/crates/komo-channel/src/bin/*.rs
 fi
 
 echo "==> 编译 $(git -C "${root}" log -1 --format='%h %s' 2>/dev/null | cut -c1-72)"
 echo "    target: ${CARGO_TARGET_DIR}"
 started=$(date +%s)
-(cd "${root}" && cargo build --release --locked -p komo)
+(cd "${root}" && cargo build --release --locked -p komo && cargo build --release --locked -p komo-channel --features feishu,telegram,wechat)
 mkdir -p "${CARGO_TARGET_DIR}"
 printf '%s' "${root}" > "${stamp}"
 built="${CARGO_TARGET_DIR}/release/komo"
@@ -74,6 +74,23 @@ backup=""
 if [ -e "${target}" ]; then
   cp -p "${target}" "${target}.bak"
   backup="（旧的在 ${target}.bak）"
+fi
+# Stage all plugins first. The version link switches the complete plugin set in one rename.
+plugin_version="${version##* }"
+plugin_generation="${plugin_version}-local-$$"
+plugin_root="${prefix}/komo-plugins"
+mkdir -p "${plugin_root}/${plugin_generation}"
+for channel in feishu telegram wechat; do
+  plugin="${CARGO_TARGET_DIR}/release/komo-channel-${channel}"
+  "${plugin}" --version >/dev/null
+  cp "${plugin}" "${plugin_root}/${plugin_generation}/komo-channel-${channel}"
+  chmod +x "${plugin_root}/${plugin_generation}/komo-channel-${channel}"
+done
+ln -s "${plugin_generation}" "${plugin_root}/${plugin_version}.new-$$"
+if [ "$(uname -s)" = Darwin ]; then
+  mv -fh "${plugin_root}/${plugin_version}.new-$$" "${plugin_root}/${plugin_version}"
+else
+  mv -fT "${plugin_root}/${plugin_version}.new-$$" "${plugin_root}/${plugin_version}"
 fi
 cp "${built}" "${target}.new"
 chmod +x "${target}.new"

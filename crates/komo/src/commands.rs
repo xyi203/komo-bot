@@ -763,12 +763,8 @@ pub fn init(home: &Path) -> Outcome {
 pub fn channel_list(home: &Path) -> Outcome {
     let loaded = load_config(&LoadOptions::at(home)).map_err(failed)?;
     let mut lines = Vec::new();
-    for platform in [
-        komo_kernel::types::chat::ChannelPlatform::Feishu,
-        komo_kernel::types::chat::ChannelPlatform::Telegram,
-        komo_kernel::types::chat::ChannelPlatform::Wechat,
-    ] {
-        let Some(config) = loaded.snapshot.channels.get(platform) else {
+    for platform in loaded.snapshot.channels.platforms() {
+        let Some(config) = loaded.snapshot.channels.get(platform.clone()) else {
             continue;
         };
         let mut line = format!(
@@ -796,12 +792,12 @@ pub fn channel_list(home: &Path) -> Outcome {
 pub async fn channel_probe(home: &Path) -> Outcome {
     let loaded = load_config(&LoadOptions::at(home)).map_err(failed)?;
     let mut lines = Vec::new();
-    for factory in channels::factories() {
+    for factory in channels::factories(&loaded.snapshot) {
         let platform = factory.platform();
         let enabled = loaded
             .snapshot
             .channels
-            .get(platform)
+            .get(platform.clone())
             .is_some_and(|config| config.enabled);
         if !enabled {
             lines.push(format!("{platform:<9} 未启用"));

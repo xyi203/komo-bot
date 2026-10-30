@@ -18,7 +18,7 @@
 
 use std::path::{Path, PathBuf};
 
-use komo_kernel::protocol::config::ConfigSnapshot;
+use crate::ChannelContext;
 use komo_kernel::types::chat::ChannelPlatform;
 use komo_kernel::types::digest::ContentHash;
 use komo_kernel::types::tool::{image_extension, image_mime};
@@ -41,10 +41,9 @@ impl ImageInbox {
     }
 
     /// `{workspaces_dir}/inbox/{平台}`。
-    pub fn for_platform(snapshot: &ConfigSnapshot, platform: ChannelPlatform) -> Self {
+    pub fn for_platform(snapshot: &ChannelContext, platform: ChannelPlatform) -> Self {
         Self::new(
             snapshot
-                .paths
                 .workspaces_dir
                 .join("inbox")
                 .join(platform.to_string()),
@@ -155,8 +154,8 @@ mod tests {
 
     #[test]
     fn the_inbox_lives_in_the_workspace() {
-        let mut snapshot = crate::service::test_support::sample_snapshot();
-        snapshot.paths.workspaces_dir = PathBuf::from("/w");
+        let mut snapshot = crate::test_context();
+        snapshot.workspaces_dir = PathBuf::from("/w");
         assert_eq!(
             ImageInbox::for_platform(&snapshot, ChannelPlatform::Feishu).dir(),
             Path::new("/w/inbox/feishu")

@@ -11,43 +11,55 @@ use serde::{Deserialize, Deserializer, Serialize};
 use super::ids::{DeliveryId, RunId, SessionId};
 
 /// 三个聊天渠道，加上 TUI / CLI 走的 HTTP API。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ChannelPlatform {
     Feishu,
     Telegram,
     Wechat,
-    /// TUI / CLI 的 HTTP 入口，与聊天渠道走同一个 Dispatcher（§11.1）。
     Api,
+    Custom(String),
 }
-
 impl ChannelPlatform {
-    pub fn as_str(self) -> &'static str {
+    pub fn as_str(&self) -> &str {
         match self {
-            ChannelPlatform::Feishu => "feishu",
-            ChannelPlatform::Telegram => "telegram",
-            ChannelPlatform::Wechat => "wechat",
-            ChannelPlatform::Api => "api",
+            Self::Feishu => "feishu",
+            Self::Telegram => "telegram",
+            Self::Wechat => "wechat",
+            Self::Api => "api",
+            Self::Custom(id) => id,
         }
     }
-
-    /// 微信只有 DM，且进程启动后用户没发过消息就无法主动推送（§11.4）。
-    pub fn supports_unsolicited_push(self) -> bool {
-        !matches!(self, ChannelPlatform::Wechat)
+    pub fn supports_unsolicited_push(&self) -> bool {
+        !matches!(self, Self::Wechat)
     }
-
-    /// [`ChannelPlatform::as_str`] 的反过来：认不出的词是 `None`，不是别的渠道。
-    ///
-    /// 给 [`ChannelPeer::parse`] 用——`runs.peer` 存的就是 `{platform}:{chat_id}`
-    /// （`Display` 那份），重启后要把它解回来（`docs/background-tasks.md`）。
     pub fn parse(raw: &str) -> Option<Self> {
-        match raw {
-            "feishu" => Some(ChannelPlatform::Feishu),
-            "telegram" => Some(ChannelPlatform::Telegram),
-            "wechat" => Some(ChannelPlatform::Wechat),
-            "api" => Some(ChannelPlatform::Api),
-            _ => None,
-        }
+        Some(match raw {
+            "feishu" => Self::Feishu,
+            "telegram" => Self::Telegram,
+            "wechat" => Self::Wechat,
+            "api" => Self::Api,
+            _ if !raw.is_empty()
+                && raw.len() <= 64
+                && raw.as_bytes()[0].is_ascii_lowercase()
+                && raw.bytes().all(|c| {
+                    c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'_' || c == b'-'
+                }) =>
+            {
+                Self::Custom(raw.into())
+            }
+            _ => return None,
+        })
+    }
+}
+impl Serialize for ChannelPlatform {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+impl<'de> Deserialize<'de> for ChannelPlatform {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = String::deserialize(deserializer)?;
+        Self::parse(&raw).ok_or_else(|| serde::de::Error::custom("invalid channel id"))
     }
 }
 
@@ -194,7 +206,7 @@ impl Principal {
     pub fn platform(&self) -> ChannelPlatform {
         match self {
             Principal::Operator { platform, .. } | Principal::Stranger { platform, .. } => {
-                *platform
+                platform.clone()
             }
         }
     }
@@ -303,6 +315,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_custom_channel_peer_round_trips_without_a_registered_plugin() {
+        let peer = ChannelPeer::parse("discord:chat#topic").unwrap();
+        let stored = serde_json::to_string(&peer).unwrap();
+        assert_eq!(serde_json::from_str::<ChannelPeer>(&stored).unwrap(), peer);
+        assert_eq!(peer.to_string(), "discord:chat#topic");
+        for invalid in ["api alias:chat", "../escape:chat", "UpperCase:chat"] {
+            assert!(ChannelPeer::parse(invalid).is_none());
+        }
+    }
+
+    #[test]
     fn a_peer_renders_as_platform_colon_chat_id() {
         let peer = ChannelPeer::new(ChannelPlatform::Feishu, "oc_xxx");
         assert_eq!(peer.to_string(), "feishu:oc_xxx");
@@ -364,7 +387,7 @@ mod tests {
 
     #[test]
     fn parse_rejects_an_unknown_platform_or_a_missing_chat_id() {
-        assert_eq!(ChannelPeer::parse("carrier-pigeon:oc_xxx"), None);
+        assert_eq!(ChannelPeer::parse("invalid channel:oc_xxx"), None);
         assert_eq!(ChannelPeer::parse("feishu:"), None);
         assert_eq!(ChannelPeer::parse("feishu"), None);
     }

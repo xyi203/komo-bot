@@ -12,7 +12,7 @@ use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
-use crate::render::telegram::RenderedMessage;
+use crate::telegram::render::RenderedMessage;
 
 /// 官方端点。
 const DEFAULT_ENDPOINT: &str = "https://api.telegram.org";

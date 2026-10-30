@@ -4,7 +4,7 @@
 
 本文定义一个全新项目。Komo 是程序名称；架构只依据本文的需求与约束。
 
-v0.8 相对 v0.7 的变化：状态数据库改为 Turso + toasty（§8.2；2026-10-25 起会话存储整个换成 pi-durable 的提交模型，见下）；工程结构改为七个 crate（2026-09-22 抽出 `komo-agent`），编译预算列为验收项（§13.4）；飞书 / Telegram / WeChat 聊天入口与 TUI 进入首版，需要人判断的事主要在聊天里回答（§11）；新增 Skills（§5.6）；补齐 trait 清单（§13.5）；渠道的身份匹配（谁是操作者、哪个会话是 home chat）只放 config.toml / .env，不进数据库（§11.2）；配置热重载，改 config.toml / .env 不重启 Gateway（§3）。全新实现，不迁移旧代码与旧数据。
+v0.8 相对 v0.7 的变化：状态数据库改为 Turso + toasty（§8.2；2026-10-25 起会话存储整个换成 pi-durable 的提交模型，见下）；工程结构为八个 crate（2026-09-22 抽出 `komo-agent`，2026-10-30 抽出 `komo-channel`），编译预算列为验收项（§13.4）；飞书 / Telegram / WeChat 聊天入口与 TUI 进入首版，需要人判断的事主要在聊天里回答（§11）；新增 Skills（§5.6）；补齐 trait 清单（§13.5）；渠道的身份匹配（谁是操作者、哪个会话是 home chat）只放 config.toml / .env，不进数据库（§11.2）；配置热重载，改 config.toml / .env 不重启 Gateway（§3）。全新实现，不迁移旧代码与旧数据。
 
 2026-10-25：存储与 agent loop 整套采用 pi-durable 的提交模型（`docs/storage-durable.md`）：`durable.db` 是唯一权威（entry 不可变、task / submission / document、一条提交线、effect sandwich），events.jsonl 退成导出格式，会话树用 fork 表达，loop 按 pi 的钩子组织、跑在 Task 引擎上（§6、§8）。不迁移旧数据：旧 `sessions/*/events.jsonl` 与 `state.db*` 原地留着，新版本不读。§6、§8 与下文凡写到存储的地方都按新存储；被替换的旧机制已在 v0.8 存储重写中移除。
 
@@ -30,7 +30,7 @@ v0.8 相对 v0.7 的变化：状态数据库改为 Turso + toasty（§8.2；2026
 | 主动记录 | 用户明确要求保存的内容写入现有 Memos，原文以 Memos 为准                                          |
 | 记忆检索 | 关键词与向量混合检索，索引保存在本机，可重建                                                     |
 | 模型配置 | 主模型、记忆整理模型、记忆向量模型分别配置；统一提供 effort 并按模型能力校验                     |
-| 聊天入口 | 飞书、Telegram、WeChat 首版都在，复用 Gateway 的会话、运行与介入接口；每个渠道一个 feature       |
+| 聊天入口 | 飞书、Telegram、WeChat 首版都在，复用 Gateway 的会话、运行与介入接口；每个渠道一个独立进程插件   |
 | 工程结构 | 七个 crate 按依赖重量与变更频率划分；冷编与增量编译时间是验收项                                  |
 
 代码优化、HA、网页搜索、记事是工具组合的使用场景，不成为专用的 Rust 工具或 Runtime 业务类型。
@@ -104,7 +104,7 @@ Gateway 持有模型连接、数据库与提交线、工具环境、运行状态
 | `komo config reload`                         | 让 Gateway 立即重载配置（等价于文件保存后的自动重载或 `SIGHUP`）；校验失败则保留旧配置并返回错误 |
 | `komo mcp reconnect [SERVER...]`             | 让 Gateway 断开重连 MCP 服务器（不点名 = 全部），等握手完报各自状态；新连上的工具从下一条 Run 起可用，不用重启 Gateway（`docs/mcp.md` §2.5） |
 | `komo channel list/probe`                    | 渠道清单与连通性核对（飞书 tenant token、Telegram `getMe`、微信凭证文件）；不经 Gateway |
-| `komo channel wechat login`                  | 终端显示二维码完成微信登录，凭证写入数据目录                                |
+| `komo channel login <渠道>`（兼容 `channel wechat login`） | 终端显示二维码完成微信登录，凭证写入数据目录                                |
 | `komo auth codex login`                      | ChatGPT 账号 OAuth 设备码登录（Codex 模型走 `auth = "chatgpt"`，§13.3）；不经 Gateway，凭证写入 `<数据目录>/codex/auth.json`（同微信登录的先例） |
 | `komo auth codex status`                     | 账号、邮箱、套餐与凭证过期时间；**不打印 token**；不经 Gateway               |
 | `komo auth mcp login SERVER`                 | `oauth = true` 的 MCP 服务器：浏览器授权码 + PKCE，回调听 `127.0.0.1` 随机端口；不经 Gateway，凭证写入 `<数据目录>/mcp/<SERVER>/credentials.json`（`docs/mcp.md` §2.1） |
@@ -843,7 +843,7 @@ HTTP API (TUI / CLI) ──┘      1. request_key 去重（durable：submission
 
 - `request_key`：飞书是 `feishu:{event_id}`（`header.event_id`，消息事件与卡片回调同一个字段；官方对 2.0 事件的去重建议就是「通过事件结构中的 `event_id` 字段判断事件唯一性」），Telegram 是 `telegram:{update_id}`（long polling 重投的单位是整个 `Update`，`offset` 未推进就原样再取一次，普通消息与 `callback_query` 因此共用这一个键），WeChat 是 `wechat:{from_user_id}:{client_id}`——iLink 的 wire 消息**没有 `msg_id`**，字段只有 `from_user_id` / `to_user_id` / `client_id` / `create_time_ms` / `message_type` / `message_state` / `context_token` / `item_list`，唯一的逐消息标识是 `client_id`（**发送方**微信客户端生成的 UUID，不是服务端投递 id），所以加 `from_user_id` 前缀，`client_id` 为空时回退到 `(from, 内容哈希, 60s 窗口)`；微信的重投有两个来源——拉取游标只活在进程内存里、重启从空游标开始，以及服务端回了消息却回空游标时 SDK 把同一批原样再交一次——所以微信的去重是必需的，不是以防万一。飞书 / Telegram 不带 `chat_id` 前缀：两个 id 在单个应用 / 单个 bot 内已唯一，而 Telegram inline 模式的按钮回调根本没有 chat，硬拼会逼出占位值。三个平台都是至少一次投递（飞书官方原话「即使成功接收，仍会收到重复消息」；未在 3 秒内响应会按 15s / 5min / 1h / 6h 重推最多 4 次，ws 长连接同样有超时重推），重发命中同一 Run；**命令也去重**——重发的 `/approve` 不会批准两次。这正是 §8.5 请求键的语义，不另做 inbox 表。
 - **去重键只管平台重投，不管用户连点**：两次真实点击带着两个不同的 `event_id` / `update_id`，是两条合法输入。挡住它的是介入答复本身的幂等（§11.3：已决定的返回原决定）。两层分开，不要用组合键去兼职。
-- 飞书 ws 在独立线程上跑 openlark 的运行时，事件通过 channel 交给 tokio 侧的 `Channel::serve`；ack 在 Dispatcher 返回 `InboundAck` 之后发，不是收到就 ack。
+- 飞书 ws 在飞书插件的独立线程上跑 openlark 的运行时，事件通过 channel 交给 tokio 侧的 `Channel::serve`；ack 在 Dispatcher 返回 `InboundAck` 之后发，不是收到就 ack。
 - 渠道交给 Dispatcher 的是 `InboundMessage { peer: ChannelPeer, is_private, sender, text, request_key }`，**不是 Session ID**。哪个会话属于 Dispatcher 与存储。
 
 ### 11.2 身份与会话
@@ -960,7 +960,7 @@ TELEGRAM_BOT_TOKEN=...
 
 ### 11.5 渠道实现的约束
 
-每个渠道一个 **feature 门控的模块**，SDK 依赖只在该 feature 下进入构建；渠道模块只能依赖 kernel 的类型和 `Inbound` / `Notifier` 两个 trait（§13.5），不能碰 runtime。`cargo tree -d` 有新重复版本时必须在 PR 里按渠道归因。`komo channel list | probe` 对每个已配置渠道做一次连通性核对（飞书拿 tenant token、Telegram `getMe`、微信检查凭证文件），`komo doctor` 汇总。
+**2026-10-30：三个官方渠道全部拆成独立进程插件**，所有渠道代码统一在 `komo-channel` crate：公共模块提供协议、runner 与共享收件箱，`feishu` / `telegram` / `wechat` feature 模块持有各平台 SDK、渲染与登录，分别产出同名插件程序。Gateway 对该 crate 关闭平台 feature；插件 crate 不依赖 runtime / store / Gateway。Gateway 只有通用进程宿主，经私有管道双向 RPC 接 Dispatcher 和投递账。新渠道声明命令与凭证即可接入，无须修改核心枚举、CLI 或工厂清单。旧配置、peer 与微信凭证文件保持兼容；完整协议、生命周期和分发见 [`channel-plugins.md`](channel-plugins.md)。`cargo tree -d` 的重复版本继续按插件归因。
 
 ## 12. 数据目录与记录习惯
 
@@ -1043,7 +1043,7 @@ CLI 通过 HTTP 发命令，通过 SSE 观察运行。Gateway 内部采用函数
 
 除最小健康检查外统一认证。创建会话、提交输入、介入答复、Cron 与 Memory 变更都支持幂等请求键；同一键对应不同内容则拒绝。创建会话的请求键与正文哈希持久保存，同键同内容重发返回原会话，同键不同内容返回 409 `request_key_conflict`，重启后仍有效。
 
-聊天渠道不经 HTTP：它们在 Gateway 进程内通过 `Inbound` / `Notifier`（§13.5）调用与这些接口相同的函数，Dispatcher 是两边共用的入口（§11.1）。
+聊天渠道不经 HTTP：它们在 插件通过私有管道 RPC 接入宿主的 `Inbound` / 发送口（§11.5），宿主调用与这些接口相同的函数，Dispatcher 是两边共用的入口（§11.1）。
 
 SSE 事件带递增序号（`Seq = (记录 ID << 12) | k`），断线后按游标补读：补读与直播是同一个投影函数，读的是 `durable.db` 里已提交的 entry / submission（§8.8）；内存通知仅提示有新数据。CLI 退出或连接中断不取消后台运行，取消通过明确操作发起。
 
@@ -1066,9 +1066,9 @@ SSE 事件带递增序号（`Seq = (记录 ID << 12) | k`），断线后按游�
 | 日志                  | tracing                                                                  |
 | Cron                  | 支持指定五字段语义及时区的 Rust 调度库，落地时做语义验证                 |
 | TUI                   | ratatui + crossterm（不进备用屏：视口只占底下几行，正文交给终端回滚区），Markdown 用 pulldown-cmark；仅 komo-client |
-| 飞书                  | openlark，仅 `websocket` 特性；事件自己解析，回复走 reqwest（feature `feishu`）           |
+| 飞书                  | openlark，仅 `websocket` 特性；事件自己解析，回复走 reqwest（komo-channel 的 feature `feishu`）           |
 | Telegram              | reqwest 手写 Bot API 长轮询，无 SDK                                                      |
-| WeChat                | wechatbot（iLink，DM）；feature `wechat`                                                 |
+| WeChat                | wechatbot（iLink，DM）；komo-channel 的 feature `wechat`                                                 |
 | TLS                   | reqwest `rustls-no-provider` + rustls `ring`，启动时安装 provider；不引入 aws-lc          |
 
 Axum 已提供 SSE 响应；toasty 的 turso 驱动提供连接与事务，MVCC 冲突重试由 komo 自己包（§8.2）。实现时锁定实际依赖版本并验证 Fedora/macOS 构建。[Axum SSE](https://docs.rs/axum/latest/axum/response/sse/index.html) · [toasty](https://docs.rs/toasty)
@@ -1308,9 +1308,14 @@ komo-agent     Agent 的身份、能力与上下文装配（`docs/bot.md` 批次
                deps: kernel, serde_json, tracing。
 
 komo-gateway   axum 路由（§13.1）、SSE、认证、进程锁与发现文件、launchd/systemd 集成、
-               Dispatcher、`service/durable/`（`DurableCore`：引擎 + harness + 钩子装配、会话与树服务、feed / watch / lifecycle / interventions / cron / memory 接线）、`http/v2/`、飞书 / Telegram / WeChat 渠道、Notifier 实现、deliveries、介入通知渲染。
+               Dispatcher、`service/durable/`（`DurableCore`：引擎 + harness + 钩子装配、会话与树服务、feed / watch / lifecycle / interventions / cron / memory 接线）、`http/v2/`、通用渠道进程宿主、Notifier 实现、deliveries；平台渲染归各插件。
                组装 runtime 与 agent（两者互不依赖）。
-               deps: kernel, runtime, agent, axum, tower-http, reqwest, openlark(feature "feishu"), wechatbot(feature "wechat")
+               deps: kernel, runtime, agent, channel (no platform features), axum, tower-http, reqwest
+
+komo-channel   公共渠道契约、私有管道 RPC、进程 runner、共享图片收件箱；
+               feishu / telegram / wechat feature 模块包含各平台 SDK、渲染与登录，
+               产出三个独立插件可执行文件。只依赖 kernel，不依赖 runtime / store / Gateway。
+               Gateway 使用公共部分，构建时不开平台 feature。
 
 komo-client    HTTP + SSE 客户端、发现文件读取、ratatui 聊天 TUI（视口 + 终端回滚区，
                含介入清单、Markdown 渲染）、操作子命令的输出渲染。
@@ -1348,7 +1353,7 @@ kernel ← client ────────────────────�
 | `sha2` | `0.10` | openlark-core 用 0.10；选 0.11 会把 `digest` / `block-buffer` / `crypto-common` / `cpufeatures` 一起劈成两份 |
 | `croner` | `default-features = false`（W2 确认无 chrono 时的时刻表达） | kernel 已有 `time`，不要第二套日期时间库；croner 4 默认特性拉进 chrono + derive_builder / darling / strum |
 | `grep` + `ignore` | `0.4`，`default-features = false`；仅 komo-runtime（`rg` 工具） | 内嵌 ripgrep 的搜索与遍历，不起子进程：外部 `rg` 要么没装、要么各家版本不同，而遍历规则（隐藏文件、`.gitignore`、覆盖 glob）本来就该用这套实现。默认特性集是空的，写出来是钉住两件事：**不开 `pcre2`**（"正则语法 = Rust regex"是对模型可见的契约）与不引 SIMD 的 `avx-accel`。带进来的 13 个包（`globset`、`walkdir`、`termcolor`、`crossbeam-deque`、`encoding_rs_io`、`memmap2`、`bstr` 等）全是纯 Rust、无 C 工具链，且没有新的重复版本（2026-09-21 对 `cargo tree -d` 核过） |
-| `jiff` | `0.2`，默认特性（系统 tzdb + 系统时区）；komo-runtime、komo-client 与 komo-gateway | runtime：cron 的 `ZoneResolver`（IANA 区名 → 偏移，§10）。client：CLI 的时刻一律印成本机墙钟 + 偏移（`2026-09-25 14:00:00 +08:00`），偏移按每个时刻各自取，夏令时两侧不同。gateway：飞书话题上下文里每条消息的 `HH:MM`（§11.3，本机时区）；不用 `time` 的 `local-offset`，它只能取"现在"的偏移，且在多线程进程里拒绝返回。kernel 仍只用 `time` |
+| `jiff` | `0.2`，默认特性（系统 tzdb + 系统时区）；komo-runtime、komo-client、komo-gateway 与 komo-channel 的飞书模块 | runtime：cron 的 `ZoneResolver`（IANA 区名 → 偏移，§10）。client：CLI 的时刻一律印成本机墙钟 + 偏移（`2026-09-25 14:00:00 +08:00`），偏移按每个时刻各自取，夏令时两侧不同。gateway：目标/领域接口的本地日期；飞书插件：话题上下文里每条消息的 `HH:MM`（§11.3，本机时区）；不用 `time` 的 `local-offset`，它只能取"现在"的偏移，且在多线程进程里拒绝返回。kernel 仍只用 `time` |
 | `arc-swap` | 默认；仅 komo-runtime（`config`） | §3 热重载的唯一 `Arc<ConfigSnapshot>` 原子替换 |
 | `serde_ignored` | `0.1`，默认；仅 komo-runtime（`config`） | §3 的「不认识的键只警告」：包住 `toml::Deserializer`，把每个被忽略的键路径交给回调。只依赖 `serde`，不进别的 crate 的图 |
 | 判断后端（TypeSafe「System One」） | **不新增依赖**：走已有的 `reqwest`（`rustls-no-provider`）+ 同一个 ring provider；凭证只从 `.env` 的 `TYPESAFE_API_KEY` 读 | §9.4 的可选重排用它。默认关；开着时才会发请求，且会把候选记忆的正文（截到 200 字符）发给第三方端点 |
@@ -1361,8 +1366,8 @@ kernel ← client ────────────────────�
 | `flate2` / `tar` | `flate2` 显式 `default-features = false, features = ["rust_backend"]`（miniz_oxide），`tar 0.4` | 仅 bin：`komo update` 解发布包（§13.6）。两者都是纯 Rust（不带 C 工具链），且**不进 gateway / runtime 的图**——它们谁也不更新自己；`rust_backend` 写死是不跟上游默认后端变 |
 | `ratatui` + `crossterm` + `pulldown-cmark` | 仅 komo-client | 在 client 支线上，与 gateway 并行编译 |
 | `syntect` / `two-face`（代码高亮） | 可选，按编译预算实测再定 | 纯 UI 增强，不是需求 |
-| `openlark` | 仅 gateway，feature `feishu`（默认开），`default-features = false, features = ["websocket"]` | 只要 ws 长连接；事件负载用 `register_raw` 拿原始 JSON、自己的宽容 serde 结构解析。带来 `prost 0.13`（turso 同步引擎用 0.14）和一份 `tokio-tungstenite` 重复——接受，不再自己额外引入 tungstenite |
-| `wechatbot` | 仅 gateway，feature `wechat`（默认开）；**`[patch.crates-io]` 指向 `vendor/wechatbot`**（0.4.0 原样复制，只改 `Cargo.toml` 一行：reqwest `0.12` 默认特性 → `0.13`，`default-features = false, features = ["json", "rustls-no-provider", "http2", "charset"]`） | 上游所有发布版本都写 `reqwest = { version = "0.12", features = ["json"] }`，默认特性开着 = native-tls = openssl-sys，自己一个 feature 都没有；cargo 特性只加不减，工作区里无论怎么声明都关不掉。patch 后复用 komo `main` 装的同一个 ring provider，openssl / native-tls / hyper-tls 整条 C 构建链消失，**构建不再依赖任何系统库**（Fedora 不必 `openssl-devel`，Mac 不必 `brew install openssl@3`），且 reqwest 只剩 0.13 一份（wechatbot 用到的 reqwest API 面极小，0.13 全保留；2026-09-16 实测默认特性全量构建通过）。不选 vendored openssl：OpenSSL 3.6.3、1210 个 .c，`make depend` / `install_dev` 串行，估 2–3 分钟且在 wechat 关键路径起点，会取代 turso 链成为新关键路径。升级 wechatbot = 重新复制 + 重打这一行，见 `vendor/README.md` |
+| `openlark` | 仅 komo-channel，feature `feishu`（默认关闭），`default-features = false, features = ["websocket"]` | 只要 ws 长连接；事件负载用 `register_raw` 拿原始 JSON、自己的宽容 serde 结构解析。带来 `prost 0.13`（turso 同步引擎用 0.14）和一份 `tokio-tungstenite` 重复——接受，不再自己额外引入 tungstenite |
+| `wechatbot` | 仅 komo-channel，feature `wechat`（默认关闭）；**`[patch.crates-io]` 指向 `vendor/wechatbot`**（0.4.0 原样复制，只改 `Cargo.toml` 一行：reqwest `0.12` 默认特性 → `0.13`，`default-features = false, features = ["json", "rustls-no-provider", "http2", "charset"]`） | 上游所有发布版本都写 `reqwest = { version = "0.12", features = ["json"] }`，默认特性开着 = native-tls = openssl-sys，自己一个 feature 都没有；cargo 特性只加不减，工作区里无论怎么声明都关不掉。patch 后复用 komo `main` 装的同一个 ring provider，openssl / native-tls / hyper-tls 整条 C 构建链消失，**构建不再依赖任何系统库**（Fedora 不必 `openssl-devel`，Mac 不必 `brew install openssl@3`），且 reqwest 只剩 0.13 一份（wechatbot 用到的 reqwest API 面极小，0.13 全保留；2026-09-16 实测默认特性全量构建通过）。不选 vendored openssl：OpenSSL 3.6.3、1210 个 .c，`make depend` / `install_dev` 串行，估 2–3 分钟且在 wechat 关键路径起点，会取代 turso 链成为新关键路径。升级 wechatbot = 重新复制 + 重打这一行，见 `vendor/README.md` |
 | `qrcode` | `default-features = false`；微信登录二维码渲染为终端字符 | 不需要 `image` |
 | `libc` | `0.2`，仅 komo-runtime 的 unix 目标 | Gateway 起来时 `setrlimit` 抬能开的文件数（`limits.rs`，launchd 默认软上限 256，子进程跑 `cargo test` 不够）；codemode worker 的内存看门狗读 RSS（macOS `proc_pid_rusage`、Linux `/proc/<pid>/statm` 的页大小）。原本就被 tokio 等拉进依赖树，不新增包、不新增重复版本。（2026-10-15 之前还用于 codemode 的 Linux 沙箱：Landlock / seccomp 的系统调用号，随沙箱删除。） |
 | `monty` / `monty-types` / `monty-fs` | `=1.1.0`（精确钉版本）；仅 komo-runtime | codemode 的脚本引擎（`docs/codemode.md` §2）：pydantic 的 Python 子集解释器，语言层没有文件 / 网络 / 子进程。精确钉：快照格式与 `monty_types::unstable`（JSON 转换用的节点访问器）没有兼容保证，升级必须重跑回放集。**不用 `monty-alloc`**：它要占 `#[global_allocator]`，与 turso 的 `mimalloc` 冲突（`the #[global_allocator] in this crate conflicts with global allocator in: turso`），内存限制改用 Monty 的 `max_memory` 软限 + 宿主的 RSS 看门狗。`monty-fs`（只读文件挂载，`=1.1.0`，同样精确钉；带进 `cap-std` 一族）。没用 `monty-pool`（进程池）。带进来约 76 个新包（ruff 解析栈、`unicode_names2` 等），新增重复版本见下 |
@@ -1371,7 +1376,7 @@ kernel ← client ────────────────────�
 | **不引入** | image | — |
 | `tantivy` / `zstd-sys`（经 `turso` 默认特性 `fts`） | **已做**：工作区的 `turso` 写 `default-features = false, features = ["mimalloc"]`；`toasty-driver-turso` 0.11 起上游自己对 `turso` 关了默认特性，原先 `vendor/toasty-driver-turso` 那份补丁（只改 manifest 里 `turso` 那几行）已删 | 实测（2026-09-16）：冷编 71.5s → 64.2s，编译单元 577 → 515，单元耗时总和 −36s CPU，`tantivy` / `zstd` / `lz4_flex` 从依赖树消失，少一条 C 工具链。墙钟只省 7s 是因为它们与 `aws-lc-sys` 并行、不在关键路径。功能零损失：turso 的 FTS 是索引方法，MVCC 直接拒绝。升级 toasty 时核对驱动对 `turso` 的版本与特性，CI 用 `cargo tree -e features -i turso` 断言只剩 `mimalloc`；见 `vendor/README.md` |
 
-三个渠道各自一个 feature，默认全开。feature 的用处不是裁功能，是让 `cargo tree -d` 能按渠道归因重复版本，以及某家 SDK 坏掉时能单独关掉它继续构建。`cargo tree -d` 进入 CI：出现新的重复版本要有理由。
+所有渠道集中在 `komo-channel`，三个平台 feature 默认关闭。先 `cargo build -p komo` 构建核心，再 `cargo build -p komo-channel --features feishu,telegram,wechat` 构建三个插件；发布和本地安装也分两次调用，避免 Cargo feature 合并。`openlark` 只在 `feishu` 下启用，`wechatbot` / `qrcode` 只在 `wechat` 下启用。`cargo tree -p komo --edges normal` 不得出现它们；`cargo tree -d` 继续按渠道 feature 归因。
 
 编码规则：
 
@@ -1429,7 +1434,7 @@ codegen-units = 16
 | `LlmClient` / `TurnDriver` | 每种协议一个适配器（runtime） | 脚本化 driver | 记忆模型、标题 / 摘要等**辅助模型调用**（一次往返）；只有 harness 的 loop 走 `ModelStream` |
 | `EmbeddingClient` | OpenAI-compatible / Ollama（runtime） | 固定向量 | 空间指纹与维度校验要在无网络下测 |
 | `Tool` | 6 个（runtime） | — | §4 已定；executor 只认 trait |
-| `Channel` / `Inbound` / `Notifier` | 飞书、Telegram、WeChat、HTTP API、SSE（gateway） | 内存渠道 | 首版就有三个真实现；介入通知的渲染是各渠道实现的事 |
+| `Channel` / `Inbound` / `Notifier` | 飞书、Telegram、WeChat（komo-channel 插件）；HTTP API、SSE（gateway） | 内存渠道 | 首版就有三个真实现；介入通知的渲染是各渠道实现的事 |
 | `Clock` | 系统时钟 | 可拨时钟 | Cron 到期、`valid_until`、重试退避全部依赖时间 |
 | `ZoneResolver` | tzdb 实现（runtime，W3 选 crate） | `ScriptedZoneResolver`（可编脚本的假时区）/ `FixedOffsetZone`（降级） | §10 的夏令时两条规则要在无 tzdb 下测；kernel 不带时区数据库 |
 
@@ -1541,11 +1546,11 @@ pub trait Clock: Send + Sync {
 
 ### 13.6 安装与升级
 
-发布产物由 `.github/workflows/release.yml` 在 `v*` 标签上构建，四个平台各一个包：`komo-darwin-arm64.tar.gz`、`komo-darwin-amd64.tar.gz`、`komo-linux-amd64.tar.gz`、`komo-linux-arm64.tar.gz`，外加一份共用的 `SHA256SUMS`（`sha256sum` 的默认两列格式）。**包内只有一个成员 `komo`**。linux 包在 Ubuntu 22.04 上原生构建（ring 与 mimalloc 编 C，不走交叉编译），glibc 下限因此是 2.35；darwin 两个架构都在 arm64 runner 上出。
+发布产物由 `.github/workflows/release.yml` 在 `v*` 标签上构建，四个平台各一个包：`komo-darwin-arm64.tar.gz`、`komo-darwin-amd64.tar.gz`、`komo-linux-amd64.tar.gz`、`komo-linux-arm64.tar.gz`，外加一份共用的 `SHA256SUMS`（`sha256sum` 的默认两列格式）。**包内有 `komo`、`komo-channel-feishu`、`komo-channel-telegram`、`komo-channel-wechat` 四个普通文件**。linux 包在 Ubuntu 22.04 上原生构建（ring 与 mimalloc 编 C，不走交叉编译），glibc 下限因此是 2.35；darwin 两个架构都在 arm64 runner 上出。
 
 装与升级是同一条约定的两个入口：`scripts/install.sh`（`curl -fsSL …/main/scripts/install.sh | bash`，认平台 → 问 `releases/latest` 或 `KOMO_VERSION` → 下包与 `SHA256SUMS` → `shasum`/`sha256sum` 核对 → `tar -xzf` → 落到 `komo.new` 再 `mv -f`；默认装到 `~/.local/bin`，不用 sudo，`--prefix` / `KOMO_INSTALL_DIR` 可改——2026-09-24 起，原来是 `/usr/local/bin`）和 `komo update`（§3，用 Rust 自己走一遍同一套名字与校验，`crates/komo/src/update.rs`）。仓库名、资产名、校验和文件名三处必须一致：那两个文件加这里。
 
-`komo update` 的顺序是**下载 → 校验 sha256 → 解包 → 试跑 `--version` → 同目录 `rename`**。三条不变量：
+`komo update` 的顺序是**下载 → 校验 sha256 → 白名单解出四个普通文件 → 逐个试跑 `--version` → 准备版本化插件集合 → 同目录 `rename` 主程序**。插件放在主程序同级 `komo-plugins/<版本>/` 的原子切换目录链接下，旧版本集合保留；协议和安装细节见 `channel-plugins.md`。三条不变量：
 
 1. **换上去是最后一步，而且是一次 `rename`**。中途任何一步失败（校验和不对、包坏了、试跑不过），现在装着的那个 komo 一个字节都没动；临时文件与目标同目录，跨文件系统的 rename 会退化成复制。自我更新唯一不可接受的结局不是"没更新成"，是"更新成一个跑不起来的东西"。
 2. **试跑要求新二进制自报的版本就是标签版本**。glibc 太旧、架构不对、包被改过都在这一步挡下来。这条同时把发布流程绑住了：标签与 `[workspace.package].version` 不一致的包会被拒收，所以 `release.yml` 里那个 `guard` 作业是这条不变量的另一半，不是可选项。
@@ -1553,11 +1558,15 @@ pub trait Clock: Send + Sync {
 
 只报告，不降级：装着的比最新发布新（源码构建的开发机、或者刚回滚过）时只说一句"发布的比它旧"，什么都不做。
 
-**从本地源码装**是第三个入口：`scripts/install-local.sh [--prefix DIR] [--no-restart]`——`cargo build --release --locked -p komo` → 试跑 `--version` → 复制成 `komo.new` 再 `mv -f`（旧的留 `komo.bak`）→ `komo gateway restart`。与 `komo update` 的第 3 条不变量不同，它**替操作者重启**：会跑它的人就是在本机改 komo 的人，装完不重启等于没装（实测会话里每次"本地重新安装"都以手动重启收尾）；在 komo 的 bash 工具里跑时重启照常推迟到这条命令的结果记进会话之后，声明了 `resume_after_restart` 的监听重启后自动重挂（`docs/monitor.md` §5）。在 git worktree 里跑、且没设 `CARGO_TARGET_DIR` 时共用主检出的 `target/`：实测（2026-10-14）在新 worktree 里冷编 release 用了 659 秒，而依赖本来可以共用。
+**从本地源码装**是第三个入口：`scripts/install-local.sh [--prefix DIR] [--no-restart]`——`cargo build --release --locked -p komo`、再 `cargo build --release --locked -p komo-channel --features feishu,telegram,wechat` → 试跑四份 `--version` → 准备版本化插件集合 → 复制成 `komo.new` 再 `mv -f`（旧的留 `komo.bak`）→ `komo gateway restart`。与 `komo update` 的第 3 条不变量不同，它**替操作者重启**：会跑它的人就是在本机改 komo 的人，装完不重启等于没装（实测会话里每次"本地重新安装"都以手动重启收尾）；在 komo 的 bash 工具里跑时重启照常推迟到这条命令的结果记进会话之后，声明了 `resume_after_restart` 的监听重启后自动重挂（`docs/monitor.md` §5）。在 git worktree 里跑、且没设 `CARGO_TARGET_DIR` 时共用主检出的 `target/`：实测（2026-10-14）在新 worktree 里冷编 release 用了 659 秒，而依赖本来可以共用。
 
 已核实（2026-09-20，本机 macOS arm64）：`install.sh --prefix` 走真实 `v0.0.2` 发布包，核对与安装都通过，包内成员名就是 `komo`；`komo update` 打真实 `api.github.com`，正确判定"发布的比它旧"并停在原地；`update.rs` 的下载 → 校验 → 解包三段用真实 `v0.0.2` 资产生跑过一遍——`SHA256SUMS` 认得、GNU tar 打的包解得出来（50318240 字节，与 `install.sh` 装出来的那份一致），试跑按预期拒收了标签对不上的那个包（`v0.0.2` 的二进制自报 `0.1.0+00b23c6`，正是上面第 2 条要挡的形状）。发布流程自身（四平台构建 + 校验和 + provenance + 发布）要等 v0.8 的第一个 `v*` 标签才会真跑一次。
 
 ## 14. 实现顺序与验收
+
+**2026-10-30 渠道插件拆分验证（本机 macOS）**：渠道全部集中到 `komo-channel`，产出三个独立插件程序；Gateway 只依赖默认关闭平台 feature 的公共协议。`cargo test --workspace --offline --config build.incremental=false`：**2516 passed / 0 failed / 12 ignored**（35 个测试目标，保留既有跳过项）。包括真实 fixture 子进程的双向调用、崩溃、协议不兼容、宿主来源校验、并发重载不产生双消费者，以及自定义渠道配置、凭证指纹和登录引导。`cargo tree -p komo --edges normal` 不含 openlark / wechatbot / qrcode；Cargo.lock 外部包版本集合没有增删。CLI 的 `channel --help`、主程序版本和三个插件的 `--describe` 已本地运行，未连接真实平台。收尾修正插件连接错误的分类后，宿主桥接 2 项回归再次通过；最终核心构建无警告。
+
+构建账：关闭增量缓存，分别运行 `cargo build -p komo --timings --offline --config build.incremental=false` 与 `cargo build -p komo-channel --features feishu,telegram,wechat --timings --offline --config build.incremental=false`；最后核心增量 **24.96s**，插件正常依赖图构建 **70.7s**。报告分别为 `target/cargo-timings/cargo-timing-20261030T031918358Z-cad003b0e67e15b9.html`、`target/cargo-timings/cargo-timing-20261030T031047585Z-cad003b0e67e15b9.html`。这些结果复用了第三方缓存，**不是冷编基线，不据此认定 60s 预算通过**。完整安装、Linux 分发和三个真实账号的收发仍需真机验收；本轮没有安装、发布或重启运行中的 Gateway。
 
 **TUI 空闲 CPU 验收（2026-10-21）**：`next_stream` 原先每次等待都 clone 连接状态的 `watch::Receiver`，只推进临时副本的已读版本；SSE 连上后，同一次状态变化会反复唤醒驱动并重绘。现在帧与状态在 `SseHandle::next` 中等待，句柄持有状态游标，并以 `borrow_and_update` 消费变化。回归测试：`tui::tests::idle_sse_state_is_consumed_once` 在修复前失败、修复后通过（收到一次已连接后，两次被时钟取消的等待均保持挂起）；`sse::tests::updates_deliver_reconnections_frames_and_the_end` 覆盖连接、重连、恢复、事件帧和订阅结束。`cargo test --workspace`：2096 通过、8 忽略、0 失败。隔离假 Gateway 的空会话、120×40 PTY、各测 3 秒：已安装 release 为 2.77 秒 CPU / 3.015 秒墙钟（91.9%），修复后的 dev 构建为 0.03 秒 CPU / 3.000 秒墙钟（1.0%）。真实会话的旧进程尚未更新。增量 `cargo build --timings`：7.73 秒，只重编 `komo-client` 与 `komo`；报告在 `target/cargo-timings/cargo-timing-20261021T020540806Z-cad003b0e67e15b9.html`。
 

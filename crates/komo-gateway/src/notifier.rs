@@ -146,6 +146,7 @@ mod tests {
 
     fn channel(chat: &str) -> ChannelConfig {
         ChannelConfig {
+            plugin: None,
             enabled: true,
             allow_from: vec![PeerId::new("ou_op")],
             allow_tenant: false,
@@ -156,6 +157,7 @@ mod tests {
     #[test]
     fn home_chats_come_in_feishu_telegram_wechat_order() {
         let snapshot = snapshot_with(ChannelsConfig {
+            extra: Default::default(),
             feishu: channel("oc_x"),
             telegram: channel("123"),
             wechat: channel("wxid_x"),

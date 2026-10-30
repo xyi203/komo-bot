@@ -4,6 +4,54 @@ use super::testing::{Fixture, SECRET_VALUE, write};
 use super::*;
 
 #[test]
+fn an_external_channel_loads_without_core_registration_and_tracks_its_credential() {
+    let fixture = Fixture::valid();
+    let text = format!(
+        "{}\n[channels.discord]\nenabled = true\nallow_from = [\"operator\"]\nhome_chat = \"home\"\n[channels.discord.plugin]\ncommand = \"/opt/komo-channel-discord\"\nenv = [\"DISCORD_BOT_TOKEN\"]\n",
+        Fixture::config_text("chat-a", "medium")
+    );
+    write(&fixture.sources().config, &text);
+    write(
+        &fixture.sources().env,
+        &format!("{}DISCORD_BOT_TOKEN=first\n", Fixture::env_text()),
+    );
+    let loaded = load_config(&fixture.options()).unwrap();
+    assert!(loaded.issues.is_empty(), "{:?}", loaded.issues);
+    let platform = komo_kernel::types::chat::ChannelPlatform::parse("discord").unwrap();
+    assert!(loaded.snapshot.channels.get(platform).unwrap().enabled);
+    let before = loaded.snapshot.credentials["DISCORD_BOT_TOKEN"].clone();
+    write(
+        &fixture.sources().env,
+        &format!("{}DISCORD_BOT_TOKEN=second\n", Fixture::env_text()),
+    );
+    let after = load_config(&fixture.options()).unwrap();
+    assert_ne!(before, after.snapshot.credentials["DISCORD_BOT_TOKEN"]);
+    assert!(
+        loaded
+            .snapshot
+            .diff(&after.snapshot)
+            .iter()
+            .any(|key| key.as_str() == "credentials.DISCORD_BOT_TOKEN")
+    );
+}
+
+#[test]
+fn channel_login_can_bootstrap_before_model_configuration_is_valid() {
+    let fixture = Fixture::valid();
+    write(
+        &fixture.sources().config,
+        "[channels.wechat]\nenabled = true\n",
+    );
+    let (plugin, _) = channel_login_config(
+        fixture.sources().config.parent().unwrap(),
+        &komo_kernel::types::chat::ChannelPlatform::Wechat,
+    )
+    .unwrap();
+    assert!(plugin.is_none());
+    assert!(load_config(&fixture.options()).is_err());
+}
+
+#[test]
 fn a_valid_directory_loads_into_a_snapshot() {
     let fixture = Fixture::valid();
     let loaded = load_config(&fixture.options()).unwrap();

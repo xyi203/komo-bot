@@ -21,8 +21,8 @@ use komo_kernel::types::chat::{ChannelPeer, ChannelPlatform, Outbound};
 use komo_kernel::types::ids::RunId;
 
 use super::api::{FeishuApi, FeishuError};
-use crate::channels::{ChannelSender, SendOutcome};
-use crate::render::feishu::{self, RenderedMessage};
+use crate::feishu::render::{self as feishu, RenderedMessage};
+use crate::{ChannelSender, SendOutcome};
 
 /// Run 回复卡片的账最多记多少条。同时在跑的聊天 Run 远少于这个数；挤出去的那条只是
 /// 终态退化成发文本。

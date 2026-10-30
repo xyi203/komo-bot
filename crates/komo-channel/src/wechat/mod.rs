@@ -31,6 +31,8 @@
 //! 它不知道 Session 是什么，也不读环境变量——凭证路径由 [`WeChatFactory`] 从配置快照的
 //! 数据目录算出来传进构造函数。
 
+pub mod render;
+
 pub mod inbound;
 pub mod login;
 pub mod send;
@@ -43,20 +45,22 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::ChannelContext;
 use async_trait::async_trait;
 
+use crate::Secrets;
 use komo_kernel::protocol::InboundAck;
-use komo_kernel::protocol::config::{ChannelConfig, ConfigSnapshot};
+use komo_kernel::protocol::config::ChannelConfig;
 use komo_kernel::traits::{Channel, ChannelError, Inbound, Shutdown};
 use komo_kernel::types::chat::{ChannelPeer, ChannelPlatform};
-use komo_runtime::config::Secrets;
 use wechatbot::cdn::CdnClient;
 use wechatbot::error::WeChatBotError;
 use wechatbot::protocol::ILinkClient;
-use wechatbot::types::{Credentials, WireMessage};
+use wechatbot::types::Credentials;
+pub use wechatbot::types::WireMessage;
 
-use crate::channels::inbox::{ImageInbox, SavedImage};
-use crate::channels::{BuiltChannel, ChannelFactory, ChannelSender};
+use crate::inbox::{ImageInbox, SavedImage};
+use crate::{BuiltChannel, ChannelFactory, ChannelSender};
 
 pub use login::{LoginError, LoginOptions, LoginStep, credentials_path, login, login_with};
 pub use send::{Auth, ContextTokens, WeChatSender};
@@ -93,10 +97,7 @@ pub const SESSION_EXPIRED_HINT: &str = "微信会话已过期（errcode -14）�
 /// `HomeNotifier::deliver_home` 上。
 ///
 /// **告警不能挡住拉取**：实现要么很快返回，要么自己 spawn。
-#[async_trait]
-pub trait AlertSink: Send + Sync {
-    async fn alert(&self, text: String);
-}
+pub use crate::AlertSink;
 
 /// `komo channel probe` 的连通性核对（§11.5）。
 ///
@@ -201,7 +202,7 @@ impl WeChatChannel {
         self
     }
 
-    /// 接上图片收件箱（[`crate::channels::inbox`]）。
+    /// 接上图片收件箱（[`crate::inbox`]）。
     pub fn with_inbox(mut self, inbox: Option<ImageInbox>) -> Self {
         self.inbox = inbox;
         self
@@ -529,8 +530,8 @@ impl WeChatFactory {
     ///
     /// **不在 `.env` 里**：微信的凭证是 `komo channel wechat login` 写出来的一个文件，
     /// 不是一个变量（§11.2 的 dotenv 注释说的就是这件事）。
-    pub fn credentials_path(snapshot: &ConfigSnapshot) -> PathBuf {
-        login::credentials_path(&snapshot.start_only.data_dir)
+    pub fn credentials_path(snapshot: &ChannelContext) -> PathBuf {
+        login::credentials_path(&snapshot.data_dir)
     }
 }
 
@@ -547,10 +548,10 @@ impl ChannelFactory for WeChatFactory {
     /// 起不来。文件**存在却读不出来**才是错误——那是一个要人去看的坏文件。
     fn build(
         &self,
-        snapshot: &ConfigSnapshot,
+        snapshot: &ChannelContext,
         _secrets: &Secrets,
     ) -> Result<Option<BuiltChannel>, ChannelError> {
-        let config = snapshot.channels.wechat.clone();
+        let config = snapshot.config.clone();
         if !config.enabled {
             return Ok(None);
         }
@@ -580,7 +581,7 @@ impl ChannelFactory for WeChatFactory {
     /// `komo channel probe`：`notify_start` + `notify_stop`（§11.5）。**不消费消息**。
     async fn probe(
         &self,
-        snapshot: &ConfigSnapshot,
+        snapshot: &ChannelContext,
         _secrets: &Secrets,
     ) -> Result<String, ChannelError> {
         probe(&Self::credentials_path(snapshot)).await
@@ -958,8 +959,8 @@ mod tests {
     #[test]
     fn the_factory_builds_only_when_enabled_and_logged_in() {
         let home = tempfile::tempdir().expect("临时目录");
-        let mut snapshot = crate::service::test_support::sample_snapshot();
-        snapshot.start_only.data_dir = home.path().to_path_buf();
+        let mut snapshot = crate::test_context();
+        snapshot.data_dir = home.path().to_path_buf();
         let secrets = Secrets::new();
         let factory = WeChatFactory::new();
 
@@ -972,7 +973,8 @@ mod tests {
         );
 
         // enabled 但还没扫过码。
-        snapshot.channels.wechat = ChannelConfig {
+        snapshot.config = ChannelConfig {
+            plugin: None,
             enabled: true,
             allow_from: vec![PeerId::new("wxid_op")],
             allow_tenant: false,
@@ -1011,9 +1013,10 @@ mod tests {
     #[test]
     fn a_corrupt_credentials_file_is_an_error_not_a_silent_none() {
         let home = tempfile::tempdir().expect("临时目录");
-        let mut snapshot = crate::service::test_support::sample_snapshot();
-        snapshot.start_only.data_dir = home.path().to_path_buf();
-        snapshot.channels.wechat = ChannelConfig {
+        let mut snapshot = crate::test_context();
+        snapshot.data_dir = home.path().to_path_buf();
+        snapshot.config = ChannelConfig {
+            plugin: None,
             enabled: true,
             ..ChannelConfig::default()
         };
@@ -1088,5 +1091,25 @@ mod live {
                 println!("probe 失败: {message}");
             }
         }
+    }
+}
+
+/// Interactive login remains outside the Gateway and writes only platform credentials.
+pub fn login_main() {
+    let Some(home) = std::env::args_os().nth(2) else {
+        eprintln!("login requires the komo data directory");
+        std::process::exit(2)
+    };
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("login runtime");
+    if let Err(error) = runtime.block_on(login(
+        &credentials_path(Path::new(&home)),
+        &mut std::io::stderr(),
+    )) {
+        eprintln!("{error}");
+        std::process::exit(1);
     }
 }

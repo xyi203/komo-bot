@@ -13,8 +13,8 @@ use komo_kernel::traits::DeliverError;
 use komo_kernel::types::chat::{ChannelPeer, ChannelPlatform, Outbound, PeerId};
 
 use super::api::{BotApi, TelegramError};
-use crate::channels::{ChannelSender, SendOutcome};
-use crate::render::telegram::{self, RenderedMessage};
+use crate::telegram::render::{self as telegram, RenderedMessage};
+use crate::{ChannelSender, SendOutcome};
 
 pub struct TelegramSender {
     api: Arc<BotApi>,

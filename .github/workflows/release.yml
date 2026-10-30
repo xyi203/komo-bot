@@ -67,17 +67,21 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Build
-        run: cargo build --release --locked --target ${{ matrix.target }}
+        run: |
+          cargo build --release --locked -p komo --target ${{ matrix.target }}
+          cargo build --release --locked -p komo-channel --features feishu,telegram,wechat --target ${{ matrix.target }}
 
-      # 资产名与包内成员名是发布约定的一部分：komo-<os>-<arch>.tar.gz 里只有一个 komo。
+      # 发布包包含主程序和三个独立渠道插件，安装器与 updater 一起验证、安装。
       # scripts/install.sh 与 crates/komo/src/update.rs 按这两个名字取。
       - name: Package
         run: |
           set -euo pipefail
           mkdir -p dist
-          cp "target/${{ matrix.target }}/release/komo" "dist/komo"
-          tar -czf "dist/komo-${{ matrix.asset_suffix }}.tar.gz" -C dist komo
-          rm -f dist/komo
+          for binary in komo komo-channel-feishu komo-channel-telegram komo-channel-wechat; do
+            cp "target/${{ matrix.target }}/release/${binary}" "dist/${binary}"
+          done
+          tar -czf "dist/komo-${{ matrix.asset_suffix }}.tar.gz" -C dist komo komo-channel-feishu komo-channel-telegram komo-channel-wechat
+          rm -f dist/komo dist/komo-channel-*
           ls -lh dist
 
       - name: Upload package

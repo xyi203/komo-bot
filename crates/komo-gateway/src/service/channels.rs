@@ -9,18 +9,84 @@ use std::sync::Arc;
 use komo_kernel::traits::Shutdown;
 use komo_kernel::types::chat::ChannelPlatform;
 
-use crate::channels::{ChannelFactory, ChannelSender};
+use crate::channels::ChannelFactory;
 
 use super::state::GatewayState;
 
 /// 一个起着的渠道。
 struct Running {
     shutdown: Shutdown,
+    task: tokio::task::JoinHandle<()>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::service::test_support::harness::{
+        FixedFactory, GatewayBuilder, MemSender, eventually, telegram_config,
+    };
+    use async_trait::async_trait;
+    use komo_kernel::traits::{Channel, ChannelError, Inbound};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Default)]
+    struct Consumers {
+        active: AtomicUsize,
+        maximum: AtomicUsize,
+    }
+    struct Active<'a>(&'a AtomicUsize);
+    impl Drop for Active<'_> {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+    #[async_trait]
+    impl Channel for Consumers {
+        fn name(&self) -> &'static str {
+            "counting"
+        }
+        async fn serve(&self, _: Arc<dyn Inbound>, stop: Shutdown) -> Result<(), ChannelError> {
+            let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            let _guard = Active(&self.active);
+            self.maximum.fetch_max(active, Ordering::SeqCst);
+            while !stop.is_cancelled() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            Ok(())
+        }
+    }
+    #[tokio::test]
+    async fn concurrent_reloads_wait_for_the_old_consumer_before_starting_another() {
+        let consumers = Arc::new(Consumers::default());
+        let sender = MemSender::new(ChannelPlatform::Telegram);
+        let factory = FixedFactory::new(ChannelPlatform::Telegram, consumers.clone(), sender);
+        let mut gateway = GatewayBuilder::new(&telegram_config("111"))
+            .factory(factory)
+            .start()
+            .await;
+        eventually("one consumer", || {
+            consumers.active.load(Ordering::SeqCst) == 1
+        })
+        .await;
+        let state = gateway.state();
+        tokio::join!(
+            state.supervisor.restart(state, ChannelPlatform::Telegram),
+            state.supervisor.restart(state, ChannelPlatform::Telegram)
+        );
+        eventually("one replacement", || {
+            consumers.active.load(Ordering::SeqCst) == 1
+        })
+        .await;
+        assert_eq!(consumers.maximum.load(Ordering::SeqCst), 1);
+        gateway.stop().await;
+        assert_eq!(consumers.active.load(Ordering::SeqCst), 0);
+    }
 }
 
 /// 渠道的起停。
 pub struct ChannelSupervisor {
     factories: Vec<Arc<dyn ChannelFactory>>,
+    lifecycle: tokio::sync::Mutex<()>,
     running: tokio::sync::Mutex<BTreeMap<ChannelPlatform, Running>>,
 }
 
@@ -34,8 +100,13 @@ impl ChannelSupervisor {
     pub fn new(factories: Vec<Arc<dyn ChannelFactory>>) -> Self {
         ChannelSupervisor {
             factories,
+            lifecycle: tokio::sync::Mutex::new(()),
             running: tokio::sync::Mutex::new(BTreeMap::new()),
         }
+    }
+
+    pub async fn platforms(&self) -> Vec<ChannelPlatform> {
+        self.running.lock().await.keys().cloned().collect()
     }
 
     pub fn factories(&self) -> &[Arc<dyn ChannelFactory>] {
@@ -44,20 +115,41 @@ impl ChannelSupervisor {
 
     /// 起全部配置里 enabled 的渠道。
     pub async fn start_all(&self, state: &Arc<GatewayState>) {
-        for factory in &self.factories {
-            self.start(state, factory.platform()).await;
+        let mut platforms = self
+            .factories
+            .iter()
+            .map(|f| f.platform())
+            .collect::<Vec<_>>();
+        platforms.extend(
+            state
+                .snapshot()
+                .channels
+                .extra
+                .keys()
+                .filter_map(|id| ChannelPlatform::parse(id)),
+        );
+        platforms.sort();
+        platforms.dedup();
+        for platform in platforms {
+            self.start(state, platform).await;
         }
     }
 
     /// 起一个。已经起着就先停掉。
     pub async fn start(&self, state: &Arc<GatewayState>, platform: ChannelPlatform) {
-        let Some(factory) = self
+        // HTTP reload and the file watcher can overlap; never leave an untracked consumer.
+        let _lifecycle = self.lifecycle.lock().await;
+        self.stop_locked(state, platform.clone()).await;
+        self.start_locked(state, platform).await;
+    }
+
+    async fn start_locked(&self, state: &Arc<GatewayState>, platform: ChannelPlatform) {
+        let factory = self
             .factories
             .iter()
             .find(|factory| factory.platform() == platform)
-        else {
-            return;
-        };
+            .cloned()
+            .unwrap_or_else(|| crate::channels::process_factory(platform.clone()));
         let snapshot = state.snapshot();
         let secrets = state.config.secrets();
         let built = match factory.build(&snapshot, &secrets) {
@@ -79,61 +171,87 @@ impl ChannelSupervisor {
         };
 
         let shutdown = Shutdown::new();
-        state
-            .channels
-            .register(Arc::clone(&built.sender) as Arc<dyn ChannelSender>);
-        self.running.lock().await.insert(
-            platform,
-            Running {
-                shutdown: shutdown.clone(),
-            },
-        );
-
-        // 这个平台**此刻**才有了发送口：把它名下还没送到的投递补发掉（§11.4「重启后
-        // pending 的行补发，按 DeliveryId 幂等」）。热重载重启某个渠道之后同样走这里。
-        //
-        // **在后台跑**：补发是网络 I/O，一条一个平台往返，而这里在 `start_all` 里，
-        // 也就压在 "Gateway 就绪" 之前、并且压在这条渠道**开始收消息**之前。晚几十毫秒
-        // 没有代价——那几行是已经写好的投递记录，按 `DeliveryId` 结算，重来一次也不会
-        // 重复发（`DeliveryLog` 的补发锁保证两趟不并发）。
-        {
-            let state = Arc::clone(state);
-            tokio::spawn(async move {
-                let flushed = state.notifier.flush_platform(platform).await;
-                if flushed > 0 {
-                    tracing::info!(%platform, flushed, "渠道起来后补发了积压的投递");
+        let stop = shutdown.clone();
+        let owner = state.clone();
+        let id = platform.clone();
+        let task = tokio::spawn(async move {
+            let mut built = built;
+            let mut delay = std::time::Duration::from_secs(1);
+            loop {
+                owner.channels.register(Arc::clone(&built.sender));
+                {
+                    let state = owner.clone();
+                    let platform = id.clone();
+                    tokio::spawn(async move {
+                        state.notifier.flush_platform(platform).await;
+                    });
                 }
-            });
-        }
-
-        let channel = Arc::clone(&built.channel);
-        tokio::spawn(async move {
-            let name = channel.name();
-            tracing::info!(channel = name, "渠道开始服务");
-            if let Err(error) = channel.serve(inbound, shutdown).await {
-                tracing::warn!(channel = name, %error, "渠道退出了");
+                let result = built.channel.serve(inbound.clone(), stop.clone()).await;
+                owner.channels.remove(id.clone());
+                if stop.is_cancelled() {
+                    break;
+                }
+                tracing::warn!(platform=%id, ?result, "渠道退出，退避后重启");
+                // Rebuild against the current snapshot, including credentials written by login.
+                loop {
+                    for _ in 0..delay.as_millis().div_ceil(50) {
+                        if stop.is_cancelled() {
+                            return;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    }
+                    if stop.is_cancelled() {
+                        return;
+                    }
+                    match factory.build(&owner.snapshot(), &owner.config.secrets()) {
+                        Ok(Some(next)) => {
+                            built = next;
+                            break;
+                        }
+                        Ok(None) => return,
+                        Err(error) => tracing::warn!(platform=%id, %error,"渠道重建失败"),
+                    }
+                    delay = (delay * 2).min(std::time::Duration::from_secs(60));
+                }
+                delay = (delay * 2).min(std::time::Duration::from_secs(60));
             }
         });
+        self.running
+            .lock()
+            .await
+            .insert(platform, Running { shutdown, task });
     }
 
     /// 停一个：撤掉发送口，按下它自己的令牌。
     pub async fn stop(&self, state: &Arc<GatewayState>, platform: ChannelPlatform) {
-        if let Some(running) = self.running.lock().await.remove(&platform) {
+        let _lifecycle = self.lifecycle.lock().await;
+        self.stop_locked(state, platform).await;
+    }
+
+    async fn stop_locked(&self, state: &Arc<GatewayState>, platform: ChannelPlatform) {
+        state.channels.remove(platform.clone());
+        let running = self.running.lock().await.remove(&platform);
+        if let Some(mut running) = running {
             running.shutdown.cancel();
+            if tokio::time::timeout(std::time::Duration::from_secs(12), &mut running.task)
+                .await
+                .is_err()
+            {
+                running.task.abort();
+                let _ = running.task.await;
+            }
         }
-        state.channels.remove(platform);
     }
 
     /// 停掉再起一个。
     pub async fn restart(&self, state: &Arc<GatewayState>, platform: ChannelPlatform) {
         tracing::info!(%platform, "配置变了，重启这个渠道");
-        self.stop(state, platform).await;
         self.start(state, platform).await;
     }
 
     /// 全停（停机时）。
     pub async fn stop_all(&self, state: &Arc<GatewayState>) {
-        let platforms: Vec<ChannelPlatform> = self.running.lock().await.keys().copied().collect();
+        let platforms: Vec<ChannelPlatform> = self.running.lock().await.keys().cloned().collect();
         for platform in platforms {
             self.stop(state, platform).await;
         }

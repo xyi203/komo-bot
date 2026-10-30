@@ -9,7 +9,6 @@ pub mod http;
 pub mod lock;
 pub mod notifier;
 pub mod reload;
-pub mod render;
 pub mod service;
 pub mod sse;
 pub mod telemetry;

@@ -221,7 +221,7 @@ impl MemSender {
 #[async_trait]
 impl ChannelSender for MemSender {
     fn platform(&self) -> ChannelPlatform {
-        self.platform
+        self.platform.clone()
     }
 
     async fn send(&self, peer: &ChannelPeer, msg: Outbound) -> Result<SendOutcome, DeliverError> {
@@ -293,7 +293,7 @@ impl FixedFactory {
 #[async_trait]
 impl ChannelFactory for FixedFactory {
     fn platform(&self) -> ChannelPlatform {
-        self.platform
+        self.platform.clone()
     }
 
     fn build(
@@ -303,7 +303,7 @@ impl ChannelFactory for FixedFactory {
     ) -> Result<Option<BuiltChannel>, ChannelError> {
         if !snapshot
             .channels
-            .get(self.platform)
+            .get(self.platform.clone())
             .is_some_and(|channel| channel.enabled)
         {
             return Ok(None);

@@ -18,8 +18,13 @@ use tokio::io::AsyncWriteExt;
 
 /// 发布仓库；`scripts/install.sh` 的默认值必须与它一致。
 const REPO: &str = "xyi203/komo-bot";
-/// 发布包里唯一的成员。
+/// 主程序成员名；同一包另含下面列出的三个渠道插件。
 const BINARY: &str = "komo";
+const PLUGINS: [&str; 3] = [
+    "komo-channel-feishu",
+    "komo-channel-telegram",
+    "komo-channel-wechat",
+];
 /// 所有资产共用一份校验和，格式就是 `sha256sum` 的输出。
 const SUMS: &str = "SHA256SUMS";
 /// 连上 GitHub 的时限。**不设整体超时**：包二十来兆，链路慢的时候整体超时会把一次正常
@@ -105,15 +110,19 @@ async fn install(
     let outcome = stage(client, release, asset, tag, &archive, &staged).await;
     let _ = std::fs::remove_file(&archive);
     match outcome {
-        Ok(()) => std::fs::rename(&staged, dest).map_err(|error| {
-            format!(
-                "换不上去（{} → {}）：{error}。看看 {} 你能不能写",
-                staged.display(),
-                dest.display(),
-                directory.display()
-            )
-        }),
+        Ok(()) => {
+            install_plugins(&staged, directory, tag)?;
+            std::fs::rename(&staged, dest).map_err(|error| {
+                format!(
+                    "换不上去（{} → {}）：{error}。看看 {} 你能不能写",
+                    staged.display(),
+                    dest.display(),
+                    directory.display()
+                )
+            })
+        }
         Err(error) => {
+            let _ = std::fs::remove_dir_all(staged.with_extension("plugins"));
             let _ = std::fs::remove_file(&staged);
             Err(error)
         }
@@ -142,7 +151,35 @@ async fn stage(
 
     extract(archive, staged)?;
     set_executable(staged)?;
-    probe(staged, tag)
+    probe(staged, tag)?;
+    for name in PLUGINS {
+        let path = staged.with_extension("plugins").join(name);
+        set_executable(&path)?;
+        probe(&path, tag)?;
+    }
+    Ok(())
+}
+
+fn install_plugins(staged: &Path, directory: &Path, tag: &str) -> Result<(), String> {
+    let version = tag.strip_prefix('v').unwrap_or(tag);
+    let root = directory.join("komo-plugins");
+    std::fs::create_dir_all(&root).map_err(|e| e.to_string())?;
+    let generation = format!(
+        "{version}-update-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| e.to_string())?
+            .as_nanos()
+    );
+    std::fs::rename(staged.with_extension("plugins"), root.join(&generation))
+        .map_err(|e| e.to_string())?;
+    let link = root.join(format!("{version}.new-{}", std::process::id()));
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&generation, &link).map_err(|e| e.to_string())?;
+    #[cfg(not(unix))]
+    return Err("渠道发布包仅支持 macOS / Linux".into());
+    std::fs::rename(link, root.join(version)).map_err(|e| e.to_string())
 }
 
 // ---------------------------------------------------------------- GitHub
@@ -331,31 +368,39 @@ fn sum_for(sums: &str, asset: &str) -> Option<String> {
     })
 }
 
-/// 从发布包里取出 `komo`。**只认这一个名字**：发布包是我们自己打的
-/// （`tar -C dist komo`），按包里的路径往任意位置解包等于把发布包变成一条写任意文件的
-/// 路。
+/// 只解出四个明确命名的普通文件；拒绝重复成员和符号链接。
+/// 不按包内路径直接 unpack，避免把更新器变成任意路径写入口。
 fn extract(archive: &Path, into: &Path) -> Result<(), String> {
-    let file = std::fs::File::open(archive)
-        .map_err(|error| format!("读不了 {}：{error}", archive.display()))?;
+    let file = std::fs::File::open(archive).map_err(|e| e.to_string())?;
     let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(file));
-    let entries = archive
-        .entries()
-        .map_err(|error| format!("发布包读不动：{error}"))?;
-    for entry in entries {
-        let mut entry = entry.map_err(|error| format!("发布包坏了：{error}"))?;
-        let path = entry
-            .path()
-            .map_err(|error| format!("发布包里的路径读不出来：{error}"))?;
-        if path != Path::new(BINARY) {
+    let plugins = into.with_extension("plugins");
+    std::fs::create_dir(&plugins).map_err(|e| e.to_string())?;
+    let mut found = std::collections::BTreeSet::new();
+    for entry in archive.entries().map_err(|e| e.to_string())? {
+        let mut entry = entry.map_err(|e| e.to_string())?;
+        let path = entry.path().map_err(|e| e.to_string())?.into_owned();
+        let name = path.to_str().ok_or("发布包包含非法文件名")?;
+        if name != BINARY && !PLUGINS.contains(&name) {
             continue;
         }
-        let mut out = std::fs::File::create(into)
-            .map_err(|error| format!("建不了 {}：{error}", into.display()))?;
-        std::io::copy(&mut entry, &mut out)
-            .map_err(|error| format!("解包到 {} 失败：{error}", into.display()))?;
-        return Ok(());
+        if !entry.header().entry_type().is_file() || !found.insert(name.to_owned()) {
+            return Err(format!("发布包成员 {name} 不是唯一的普通文件"));
+        }
+        let target = if name == BINARY {
+            into.to_path_buf()
+        } else {
+            plugins.join(name)
+        };
+        let mut out = std::fs::File::create(&target).map_err(|e| e.to_string())?;
+        std::io::copy(&mut entry, &mut out).map_err(|e| e.to_string())?;
+        out.sync_all().map_err(|e| e.to_string())?;
     }
-    Err(format!("发布包里没有 {BINARY}"))
+    for name in std::iter::once(BINARY).chain(PLUGINS) {
+        if !found.contains(name) {
+            return Err(format!("发布包里没有 {name}"));
+        }
+    }
+    Ok(())
 }
 
 fn set_executable(path: &Path) -> Result<(), String> {
@@ -388,7 +433,7 @@ fn probe(staged: &Path, tag: &str) -> Result<(), String> {
         ));
     }
     let wanted = tag.strip_prefix('v').unwrap_or(tag);
-    if !printed.contains(wanted) {
+    if printed.split_whitespace().last() != Some(wanted) {
         return Err(format!(
             "下下来的那份报的是「{printed}」，不是这一版的 {tag}——发布包与标签对不上，没有换上去"
         ));
@@ -493,7 +538,7 @@ mod tests {
         }
     }
 
-    /// 一份"发布包"：一个 tar.gz，里面只有一个名叫 `komo` 的可执行文件。
+    /// 发布包夹具包含主程序与三个插件，均使用可控版本的测试程序。
     fn release_archive(binary: &str) -> Vec<u8> {
         let encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
         let mut builder = tar::Builder::new(encoder);
@@ -501,9 +546,11 @@ mod tests {
         header.set_size(binary.len() as u64);
         header.set_mode(0o755);
         header.set_cksum();
-        builder
-            .append_data(&mut header, BINARY, binary.as_bytes())
-            .expect("打包");
+        for name in std::iter::once(BINARY).chain(PLUGINS) {
+            builder
+                .append_data(&mut header, name, binary.as_bytes())
+                .expect("打包");
+        }
         builder.into_inner().expect("收尾").finish().expect("压缩")
     }
 

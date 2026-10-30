@@ -947,3 +947,6 @@ button.live-line:hover .label { text-decoration: underline; text-underline-offse
 .padv { margin-top: 16px; padding-top: 12px; border-top: 1px solid var(--rule); }
 .padv > summary { font-weight: 500; }
 .ppanel .cat-head { margin-top: 16px; }
+.seg-tabs.sm { margin-top: 0; }
+.seg-tabs.sm .seg-tab { height: 30px; padding: 0 14px; font-size: var(--fs-label); }
+.seg-tab:disabled { cursor: not-allowed; opacity: 0.6; }

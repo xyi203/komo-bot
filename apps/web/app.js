@@ -1831,7 +1831,9 @@ function providerForm(P, p) {
   const presets = isNew && E.tab === "preset" ? `<div class="preset-grid">${PRESETS.map((x) => `<button type="button" class="preset" aria-pressed="${E.preset === x.key}" data-cfg="pf-preset" data-id="${x.key}"><b>${x.label}</b><span>${esc(backendName(x.api_backend))}</span></button>`).join("")}</div>` : "";
   if (isNew && E.tab === "preset" && !E.preset) return `<form class="mform cfg-form pform" id="cfg-provider-form">${tabs}${presets}<div class="actions">${btn("取消", 'type="button" data-cfg="cancel"')}</div></form>`;
   const field = (id, label, input, hint = "") => `<label class="lbl" for="${id}">${label}</label>${input}${hint ? `<p class="hint">${hint}</p>` : ""}`;
-  const protocol = `<select class="select half" id="pf-backend" name="api_backend" ${used ? "disabled" : ""}><optgroup label="对话">${ALL_BACKENDS.slice(0, 3).map(([k, n]) => `<option value="${k}" ${k === v.api_backend ? "selected" : ""}>${n}</option>`).join("")}</optgroup><optgroup label="嵌入（记忆检索用）">${ALL_BACKENDS.slice(3).map(([k, n]) => `<option value="${k}" ${k === v.api_backend ? "selected" : ""}>${n}</option>`).join("")}</optgroup></select>`;
+  // 协议下拉只列这个类型的；类型在面板顶上单独切（挂着模型时两样都锁住）
+  const protocol = `<select class="select half" id="pf-backend" name="api_backend" ${used ? "disabled" : ""}>${ALL_BACKENDS.filter(([k]) => !!EMBED_BACKENDS[k] === (kind === "embedding")).map(([k, n]) => `<option value="${k}" ${k === v.api_backend ? "selected" : ""}>${n}</option>`).join("")}</select>`;
+  const kindPick = `<label class="lbl">类型</label><div class="seg-tabs sm" role="radiogroup" aria-label="类型">${[["completion", "对话"], ["embedding", "嵌入（记忆检索用）"]].map(([k, n]) => `<button type="button" class="seg-tab" role="radio" aria-checked="${kind === k}" aria-selected="${kind === k}" data-cfg="pf-kind" data-id="${k}" ${used ? "disabled" : ""}>${n}</button>`).join("")}</div>${used ? `<p class="hint">挂着模型时不能改类型；要改先把模型目录清空保存。</p>` : ""}`;
   const key = p?.auth ? `<p class="hint">凭证来自 ${esc(p.auth)} 登录，不走 API 密钥。</p><input type="hidden" name="auth" value="${esc(p.auth)}">`
     : field("pf-key", "API 密钥", `<input class="input" id="pf-key" name="api_key" type="password" autocomplete="new-password" value="${esc(v.api_key)}" placeholder="${p?.key_set ? "留空使用已保存的凭据" : "输入 API 密钥"}">`, "存成环境变量，不进配置。");
   const rowMore = (r, i) => kind === "embedding"
@@ -1859,12 +1861,13 @@ function providerForm(P, p) {
   return `<form class="mform cfg-form pform" id="cfg-provider-form" data-id="${esc(p?.id || "")}">
     ${tabs}${presets}
     ${title}
+    ${kindPick}
     ${key}
     <details class="adv padv" id="pf-adv" ${advOpen ? "open" : ""}><summary>自定义设置</summary>
     ${field("pf-id", "Provider ID", `<input class="input" id="pf-id" name="pid" required pattern="[A-Za-z][A-Za-z0-9._-]*" maxlength="64" value="${esc(v.pid)}" placeholder="acme-gateway">`, isNew ? "以字母开头，模型靠它找到这个 provider，也用来派生凭证变量名。" : "改了会把挂在它上面的模型一并改过去。")}
     ${field("pf-name", "显示名称", `<input class="input" id="pf-name" name="name" maxlength="64" value="${esc(v.name)}" placeholder="显示名称">`)}
     ${field("pf-url", "API 地址", `<input class="input" id="pf-url" name="base_url" value="${esc(v.base_url)}" placeholder="https://gateway.example/v1">`)}
-    ${field("pf-backend", "API 协议", protocol, used ? "挂着模型时不能在对话与嵌入之间换。" : "")}
+    ${field("pf-backend", "API 协议", protocol)}
     <div class="two">
       <div>${field("pf-env", "凭证变量名", `<input class="input mono" id="pf-env" name="env_key" value="${esc(v.env_key)}" placeholder="留空：ID 大写_API_KEY">`)}</div>
       <div>${field("pf-timeout", "请求时限（秒）", `<input class="input" id="pf-timeout" name="timeout_secs" type="number" min="1" value="${esc(v.timeout_secs)}" placeholder="默认 120">`)}</div></div>
@@ -2012,6 +2015,16 @@ function providerFormAct(a, id) {
   syncProviderForm();
   // 从预设切到自定义：预设填进去的值清掉，从空表开始
   if (a === "pf-tab" && E.tab !== id) { E.tab = id; E.preset = null; E.fetched = null; E.v = providerDraft(P, null).v; }
+  // 换类型：协议换成那一类里最可能的一个（11434 端口是 Ollama），地址、密钥、目录里的模型 id 都留着
+  // 预设的同一家常要对话、嵌入两个提供商：切到嵌入时 ID 与名称跟着加后缀，免得和对话那个撞上
+  if (a === "pf-kind") {
+    const now = EMBED_BACKENDS[E.v.api_backend] ? "embedding" : "completion", x = PRESETS.find((p) => p.key === E.preset);
+    if (now !== id) {
+      E.v.api_backend = id === "embedding" ? (/:11434\b/.test(E.v.base_url) ? "ollama_embeddings" : "embeddings") : x?.api_backend || "chat_completions";
+      if (x && id === "embedding" && E.v.pid === x.id) Object.assign(E.v, { pid: `${x.id}-embed`, name: `${x.label} 嵌入` });
+      if (x && id === "completion" && E.v.pid === `${x.id}-embed`) Object.assign(E.v, { pid: x.id, name: x.label });
+    }
+  }
   if (a === "pf-preset") {
     const x = PRESETS.find((p) => p.key === id);
     E.preset = id;

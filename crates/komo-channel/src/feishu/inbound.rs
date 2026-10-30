@@ -10,7 +10,7 @@
 //! Dispatcher**。
 //!
 //! 收文本、图片与富文本（`post`）。图片不在这里下载：[`accept`] 先做完准入，渠道再去
-//! 开放平台拉图、存进收件箱（[`crate::channels::inbox`]），最后 [`Accepted::into_inbound`]
+//! 开放平台拉图、存进收件箱（[`crate::inbox`]），最后 [`Accepted::into_inbound`]
 //! 把路径写进正文——群里没 @机器人 的图片因此一次都不会被下载。
 //!
 //! 解析一律宽容：`#[serde(default)]` 到底，认不出的事件类型返回 `None` 而不是错误。
@@ -24,7 +24,7 @@ use komo_kernel::protocol::InboundMessage;
 use komo_kernel::types::chat::{ChannelPeer, ChannelPlatform, PeerId};
 use komo_kernel::types::ids::RequestKey;
 
-use crate::channels::inbox::{self, SavedImage};
+use crate::inbox::{self, SavedImage};
 
 /// 去重键：`feishu:{event_id}`。
 ///

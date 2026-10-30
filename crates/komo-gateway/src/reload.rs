@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use komo_kernel::protocol::config::KeyPath;
 use komo_kernel::protocol::http::{ConfigReloadResponse, McpServerStatus};
-use komo_kernel::types::chat::{ChannelPlatform, Outbound};
+use komo_kernel::types::chat::Outbound;
 use komo_runtime::config::ConfigError;
 
 use crate::http::error::ApiFailure;
@@ -124,13 +124,40 @@ async fn apply(state: &Arc<GatewayState>, changed: &[KeyPath]) -> Vec<McpServerS
     }) {
         state.refresh_reranker();
     }
-    for platform in [
-        ChannelPlatform::Feishu,
-        ChannelPlatform::Telegram,
-        ChannelPlatform::Wechat,
-    ] {
-        let prefix = format!("channels.{platform}.");
-        if changed.iter().any(|key| key.as_str().starts_with(&prefix)) {
+    let mut platforms = state.snapshot().channels.platforms();
+    platforms.extend(state.supervisor.platforms().await);
+    platforms.sort();
+    platforms.dedup();
+    for platform in platforms {
+        let key = format!("channels.{platform}");
+        let prefix = format!("{key}.");
+        let channel = state.snapshot().channels.get(platform.clone()).cloned();
+        let credentials_changed = channel
+            .as_ref()
+            .and_then(|c| c.plugin.as_ref())
+            .is_some_and(|p| {
+                p.env.iter().any(|name| {
+                    changed
+                        .iter()
+                        .any(|key| key.as_str() == format!("credentials.{name}"))
+                })
+            });
+        let legacy_credentials_changed =
+            komo_runtime::config::channel_credentials(platform.clone())
+                .iter()
+                .any(|name| {
+                    changed
+                        .iter()
+                        .any(|key| key.as_str() == format!("credentials.{name}"))
+                });
+        if credentials_changed
+            || legacy_credentials_changed
+            || changed.iter().any(|changed| {
+                changed.as_str() == "channels"
+                    || changed.as_str() == key
+                    || changed.as_str().starts_with(&prefix)
+            })
+        {
             state.restart_channel(platform).await;
         }
     }

@@ -2662,6 +2662,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "komo-channel"
+version = "0.8.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "bytes",
+ "futures-util",
+ "jiff",
+ "komo-channel",
+ "komo-kernel",
+ "openlark",
+ "qrcode",
+ "reqwest",
+ "rustls",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+ "time",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+ "wechatbot",
+]
+
+[[package]]
 name = "komo-client"
 version = "0.8.0"
 dependencies = [
@@ -2695,13 +2722,12 @@ dependencies = [
  "futures-util",
  "jiff",
  "komo-agent",
+ "komo-channel",
  "komo-client",
  "komo-gateway",
  "komo-kernel",
  "komo-runtime",
  "komo-store",
- "openlark",
- "qrcode",
  "reqwest",
  "rustls",
  "serde",
@@ -2714,7 +2740,6 @@ dependencies = [
  "tower-http 0.7.1",
  "tracing",
  "uuid",
- "wechatbot",
 ]
 
 [[package]]

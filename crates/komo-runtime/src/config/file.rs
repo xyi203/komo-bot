@@ -35,7 +35,7 @@ pub fn channel_credentials(platform: ChannelPlatform) -> &'static [&'static str]
     match platform {
         ChannelPlatform::Feishu => &["FEISHU_APP_ID", "FEISHU_APP_SECRET"],
         ChannelPlatform::Telegram => &["TELEGRAM_BOT_TOKEN"],
-        ChannelPlatform::Wechat | ChannelPlatform::Api => &[],
+        ChannelPlatform::Wechat | ChannelPlatform::Api | ChannelPlatform::Custom(_) => &[],
     }
 }
 
@@ -431,6 +431,8 @@ impl TypesafeSection {
 
 #[derive(Debug, Default, Deserialize)]
 pub(super) struct ChannelsSection {
+    #[serde(flatten)]
+    pub extra: std::collections::BTreeMap<String, ChannelSection>,
     #[serde(default)]
     pub feishu: ChannelSection,
     #[serde(default)]
@@ -441,6 +443,8 @@ pub(super) struct ChannelsSection {
 
 #[derive(Debug, Default, Deserialize)]
 pub(super) struct ChannelSection {
+    #[serde(default)]
+    pub plugin: Option<komo_kernel::protocol::config::ChannelPlugin>,
     #[serde(default)]
     pub enabled: bool,
     #[serde(default)]
@@ -453,6 +457,7 @@ pub(super) struct ChannelSection {
 impl ChannelSection {
     fn into_channel(self) -> ChannelConfig {
         ChannelConfig {
+            plugin: self.plugin,
             enabled: self.enabled,
             allow_from: self.allow_from,
             allow_tenant: self.allow_tenant,
@@ -704,6 +709,12 @@ pub(super) fn assemble(
     };
 
     let channels = ChannelsConfig {
+        extra: file
+            .channels
+            .extra
+            .into_iter()
+            .map(|(id, c)| (id, c.into_channel()))
+            .collect(),
         feishu: file.channels.feishu.into_channel(),
         telegram: file.channels.telegram.into_channel(),
         wechat: file.channels.wechat.into_channel(),
@@ -877,13 +888,19 @@ fn credential_fingerprints(
         .filter(|model| model.common().auth.is_none())
         .map(|model| model.common().api_key_env.clone())
         .collect();
-    for platform in [
-        ChannelPlatform::Feishu,
-        ChannelPlatform::Telegram,
-        ChannelPlatform::Wechat,
-    ] {
-        if channels.get(platform).is_some_and(|c| c.enabled) {
-            names.extend(channel_credentials(platform).iter().map(|s| s.to_string()));
+    for platform in channels.platforms() {
+        if channels.get(platform.clone()).is_some_and(|c| c.enabled) {
+            names.extend(
+                channel_credentials(platform.clone())
+                    .iter()
+                    .map(|s| s.to_string()),
+            );
+            if let Some(plugin) = channels
+                .get(platform.clone())
+                .and_then(|c| c.plugin.as_ref())
+            {
+                names.extend(plugin.env.iter().cloned());
+            }
         }
     }
     names.sort();

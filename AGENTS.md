@@ -28,7 +28,7 @@ komo                           # start Gateway if needed, new session, TUI
 komo resume SESSION_ID
 komo gateway [--foreground] | gateway status|stop|restart
 komo config check | config reload
-komo channel list|probe | channel wechat login
+komo channel list|probe | channel login CHANNEL  # wechat login remains an alias
 komo session list|delete|purge|export SESSION_ID [-o FILE]   # export = pi v3 树形 JSONL
 komo intervention list|show|answer
 komo cron … | komo memory … | komo goal … | komo area … | komo skills … | komo doctor
@@ -43,7 +43,7 @@ The full command table is §3 of the design.
 komo-kernel    value types, `durable/` (entry · conversation · task · submission ·
                document records, context derivation, fork, Task state machine,
                compaction logic, `Storage` trait + in-memory impl + conformance,
-               `pi_tree` / `legacy_events` projections), cron math, wire protocol, ALL traits. No tokio, no I/O.
+               `pi_tree` / `legacy_events` projections), cron math, wire protocol, core traits. No tokio, no I/O.
                lib.rs is module declarations only.
 komo-store     `durable/`: `Line` (the single commit line), Turso `Storage`, DDL,
                blob writes, id high-water mark — raw `turso`, no toasty.
@@ -62,8 +62,12 @@ komo-agent     AgentProfile → 能力面选择 · skills 发现与目录 · 编
                值类型（AgentProfile/AgentSurface）留在 kernel。
 komo-gateway   axum routes (`http/v2`) · `service/durable` (DurableCore: hooks,
                sessions/tree, feed, lifecycle) · SSE · auth · lock/discovery ·
-               launchd/systemd · Dispatcher · channels/{feishu,telegram,wechat} (feature-gated) ·
+               launchd/systemd · Dispatcher · generic channel process host ·
                Notifier · deliveries · intervention rendering · config reload.
+komo-channel  Shared protocol, runner and image inbox, plus feature-gated
+               feishu/telegram/wechat modules and their standalone plugin binaries.
+               Depends on kernel; no runtime, store or Gateway dependency.
+               Gateway selects no platform features; build the core and plugins separately.
 komo-client    HTTP + SSE client · discovery · ratatui TUI · command output.
                Depends on kernel only.
 komo (bin)     clap dispatch only (incl. the hidden `__codemode-worker`, whose
@@ -71,7 +75,9 @@ komo (bin)     clap dispatch only (incl. the hidden `__codemode-worker`, whose
 ```
 
 Dependencies point downward only: `kernel ← store ← runtime ← gateway`,
-`kernel ← agent ← gateway`, and `kernel ← client`, meeting in the bin.
+`kernel ← agent ← gateway`, and `kernel ← client`, meeting in the bin. Channel plugins are a separate branch:
+`kernel ← channel`; Gateway uses its common protocol with platform features disabled.
+Build plugins separately with `-p komo-channel --features feishu,telegram,wechat`.
 `gateway` never sees toasty or ratatui; `runtime` never sees axum and never
 depends on `agent`; `client` knows only protocol types.
 
@@ -138,7 +144,8 @@ depends on `agent`; `client` knows only protocol types.
 - **The release convention is one string in three places** (§13.6): the repo
   name, `komo-<os>-<arch>.tar.gz`, and `SHA256SUMS` appear in
   `.github/workflows/release.yml`, `scripts/install.sh`, and
-  `crates/komo/src/update.rs` — change one, change all three. The tag must
+  `crates/komo/src/update.rs` — change one, change all three. The archive contains `komo` and all three `komo-channel-*` executables; install
+  and update prepare a versioned plugin set before swapping the main binary. The tag must
   equal `[workspace.package].version`, or `komo update` refuses the package.
 - **Config hot-reloads** (§3): one `Arc<ConfigSnapshot>` swapped atomically;
   readers read the current snapshot per use (every phase resolves Agent/model by
@@ -193,6 +200,8 @@ commands run, terminal output when CLI behavior changes.
 - Goals and areas: `docs/goals.md` — PARA/GTD-style goals (next action,
   waiting, parked) and areas, memory belongs-to and archive on close; spec
   approved 2026-10-29, implemented in slices P1a–P1e.
+- Channels: `docs/channel-plugins.md` — standalone official plugins, the private-pipe
+  protocol, dynamic channel registration and bundle installation.
 - Web client: `docs/web.md` — W0 prototype in `apps/web/` (static files, no build;
   `node apps/web/serve.mjs`), what it reads from the Gateway, and the Gateway gaps
   it found. Visual tokens are summarized in `DESIGN.md`.

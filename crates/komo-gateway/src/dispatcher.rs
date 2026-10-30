@@ -126,19 +126,19 @@ impl Dispatcher {
     /// 当前快照（§3 第 2 步、§11.2）。
     pub(crate) fn principal(&self, msg: &InboundMessage) -> Principal {
         let snapshot = self.state.snapshot();
-        let operator = match snapshot.channels.get(msg.peer.platform) {
+        let operator = match snapshot.channels.get(msg.peer.platform.clone()) {
             Some(channel) => channel.admits(&msg.sender, msg.same_org),
             // HTTP / TUI 的入口自己有认证（§13.1 的 Bearer），到这里就是操作者。
             None => msg.peer.platform == ChannelPlatform::Api,
         };
         if operator {
             Principal::Operator {
-                platform: msg.peer.platform,
+                platform: msg.peer.platform.clone(),
                 id: msg.sender.clone(),
             }
         } else {
             Principal::Stranger {
-                platform: msg.peer.platform,
+                platform: msg.peer.platform.clone(),
                 id: msg.sender.clone(),
             }
         }
@@ -330,6 +330,15 @@ impl Dispatcher {
 
 #[async_trait]
 impl Inbound for Dispatcher {
+    async fn alert(&self, text: String) -> Result<(), GatewayError> {
+        self.state
+            .notifier
+            .deliver_home(komo_kernel::types::chat::Outbound::Text { text })
+            .await
+            .map(|_| ())
+            .map_err(|e| GatewayError::Internal(e.to_string()))
+    }
+
     async fn handle(&self, msg: InboundMessage) -> Result<InboundAck, GatewayError> {
         // ① 去重：平台重投命中同一个键（命令用；普通文本的去重是持久的，在请求键上）。
         if let Some(ack) = self.recall(&msg.request_key) {
@@ -468,7 +477,7 @@ pub(crate) fn with_context(msg: &InboundMessage) -> String {
 
 /// 抄进 `home_chat` 的那个串：不带话题，那一项只认会话本身。
 pub(crate) fn config_chat(msg: &InboundMessage) -> ChannelPeer {
-    ChannelPeer::new(msg.peer.platform, msg.peer.chat_id.as_str())
+    ChannelPeer::new(msg.peer.platform.clone(), msg.peer.chat_id.as_str())
 }
 
 /// 决定时刻，按本地可读的样子。

@@ -192,9 +192,21 @@ pub enum McpTransport {
     },
 }
 
+/// Explicit external plugin command; omitted official channels use sibling binaries.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChannelPlugin {
+    pub command: PathBuf,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub env: Vec<String>,
+}
+
 /// 一个聊天渠道的行为键（§11.2）。凭证在 .env，不在这里。
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChannelConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plugin: Option<ChannelPlugin>,
     #[serde(default)]
     pub enabled: bool,
     /// 操作者的平台 id。**为空 = 只出不进**：还能作 home chat 收投递，但没人能通过它
@@ -237,6 +249,8 @@ pub struct ChannelsConfig {
     pub telegram: ChannelConfig,
     #[serde(default)]
     pub wechat: ChannelConfig,
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, ChannelConfig>,
 }
 
 impl ChannelsConfig {
@@ -246,21 +260,36 @@ impl ChannelsConfig {
             ChannelPlatform::Telegram => Some(&self.telegram),
             ChannelPlatform::Wechat => Some(&self.wechat),
             ChannelPlatform::Api => None,
+            ChannelPlatform::Custom(ref id) => self.extra.get(id),
         }
+    }
+
+    pub fn platforms(&self) -> Vec<ChannelPlatform> {
+        let mut platforms = vec![
+            ChannelPlatform::Feishu,
+            ChannelPlatform::Telegram,
+            ChannelPlatform::Wechat,
+        ];
+        platforms.extend(
+            self.extra
+                .keys()
+                .filter_map(|id| ChannelPlatform::parse(id)),
+        );
+        platforms
     }
 
     /// home chat 的候选，按 §11.4 的默认顺序：**飞书 > Telegram > WeChat**。前两者能
     /// 对任意已加入的会话主动推送，微信不能。
     pub fn home_chats(&self) -> Vec<(ChannelPlatform, PeerId)> {
-        [
-            (ChannelPlatform::Feishu, &self.feishu),
-            (ChannelPlatform::Telegram, &self.telegram),
-            (ChannelPlatform::Wechat, &self.wechat),
-        ]
-        .into_iter()
-        .filter(|(_, c)| c.enabled)
-        .filter_map(|(platform, c)| c.home_chat.clone().map(|chat| (platform, chat)))
-        .collect()
+        self.platforms()
+            .into_iter()
+            .filter_map(|platform| {
+                self.get(platform.clone())
+                    .filter(|c| c.enabled)
+                    .and_then(|c| c.home_chat.clone())
+                    .map(|chat| (platform, chat))
+            })
+            .collect()
     }
 }
 
@@ -861,7 +890,9 @@ mod tests {
             },
             typesafe: TypesafeConfig::default(),
             channels: ChannelsConfig {
+                extra: Default::default(),
                 feishu: ChannelConfig {
+                    plugin: None,
                     enabled: true,
                     allow_from: vec![PeerId::new("ou_xxx")],
                     allow_tenant: false,
@@ -975,12 +1006,14 @@ mod tests {
     fn home_chat_candidates_follow_feishu_then_telegram_then_wechat() {
         let mut snapshot = snapshot();
         snapshot.channels.telegram = ChannelConfig {
+            plugin: None,
             enabled: true,
             allow_from: vec![PeerId::new("123")],
             allow_tenant: false,
             home_chat: Some(PeerId::new("123")),
         };
         snapshot.channels.wechat = ChannelConfig {
+            plugin: None,
             enabled: true,
             allow_from: vec![PeerId::new("wxid_x")],
             allow_tenant: false,
@@ -1005,6 +1038,7 @@ mod tests {
     #[test]
     fn an_enabled_channel_with_an_empty_allow_list_is_outbound_only() {
         let channel = ChannelConfig {
+            plugin: None,
             enabled: true,
             allow_from: vec![],
             allow_tenant: false,
@@ -1017,6 +1051,7 @@ mod tests {
     #[test]
     fn allow_tenant_admits_a_verified_same_org_sender_only() {
         let channel = ChannelConfig {
+            plugin: None,
             enabled: true,
             allow_tenant: true,
             ..ChannelConfig::default()
@@ -1027,6 +1062,7 @@ mod tests {
         assert!(!channel.is_outbound_only(), "靠租户进来的人也能下指令");
 
         let closed = ChannelConfig {
+            plugin: None,
             enabled: true,
             ..ChannelConfig::default()
         };

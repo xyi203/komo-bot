@@ -594,6 +594,12 @@ pub trait Channel: Send + Sync {
 /// Gateway 交给渠道的**唯一入口**。渠道不知道 Session 是什么。
 #[async_trait]
 pub trait Inbound: Send + Sync {
+    /// Platform health notifications use the host's configured home destinations.
+    async fn alert(&self, _text: String) -> Result<(), GatewayError> {
+        Err(GatewayError::InvalidRequest(
+            "这个宿主不接收渠道告警".into(),
+        ))
+    }
     async fn handle(&self, msg: InboundMessage) -> Result<InboundAck, GatewayError>;
 }
 

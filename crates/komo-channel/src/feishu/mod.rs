@@ -22,6 +22,8 @@
 //! 卡片按钮回调（`card.action.trigger`）随审批卡片一起删掉了（§7，2026-10-11）：komo 发
 //! 出去的卡片上没有按钮，平台还推来的回调落进"不处理这个事件类型"。
 
+pub mod render;
+
 pub mod api;
 pub mod inbound;
 pub mod names;
@@ -36,18 +38,19 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::ChannelContext;
 use async_trait::async_trait;
 use tokio::sync::mpsc;
 
+use crate::Secrets;
 use komo_kernel::protocol::InboundAck;
-use komo_kernel::protocol::config::{ChannelConfig, ConfigSnapshot};
+use komo_kernel::protocol::config::ChannelConfig;
 use komo_kernel::traits::{Channel, ChannelError, Inbound, Shutdown};
 use komo_kernel::types::chat::{ChannelPeer, ChannelPlatform};
 use komo_kernel::types::ids::RunId;
-use komo_runtime::config::Secrets;
 
-use crate::channels::inbox::{ImageInbox, SavedImage};
-use crate::channels::{BuiltChannel, ChannelFactory, ChannelSender};
+use crate::inbox::{ImageInbox, SavedImage};
+use crate::{BuiltChannel, ChannelFactory, ChannelSender};
 
 pub use api::{BotIdentity, FeishuApi, FeishuError, TokenProbe};
 pub use send::FeishuSender;
@@ -167,7 +170,7 @@ impl FeishuChannel {
         }
     }
 
-    /// 接上图片收件箱（[`crate::channels::inbox`]）。
+    /// 接上图片收件箱（[`crate::inbox`]）。
     pub fn with_inbox(mut self, inbox: Option<ImageInbox>) -> Self {
         self.inbox = inbox;
         self
@@ -464,6 +467,9 @@ impl FeishuFactory {
 
 #[async_trait]
 impl ChannelFactory for FeishuFactory {
+    fn credentials(&self) -> &'static [&'static str] {
+        &[APP_ID_KEY, APP_SECRET_KEY]
+    }
     fn platform(&self) -> ChannelPlatform {
         ChannelPlatform::Feishu
     }
@@ -475,10 +481,10 @@ impl ChannelFactory for FeishuFactory {
     /// gateway 起不来。
     fn build(
         &self,
-        snapshot: &ConfigSnapshot,
+        snapshot: &ChannelContext,
         secrets: &Secrets,
     ) -> Result<Option<BuiltChannel>, ChannelError> {
-        let config = snapshot.channels.feishu.clone();
+        let config = snapshot.config.clone();
         if !config.enabled {
             return Ok(None);
         }
@@ -507,7 +513,7 @@ impl ChannelFactory for FeishuFactory {
     /// 事 token 已经答完了。
     async fn probe(
         &self,
-        _snapshot: &ConfigSnapshot,
+        _snapshot: &ChannelContext,
         secrets: &Secrets,
     ) -> Result<String, ChannelError> {
         if !secrets.has(APP_ID_KEY) || !secrets.has(APP_SECRET_KEY) {
@@ -1425,9 +1431,9 @@ mod tests {
 
     // ---------------------------------------------------------------- 工厂
 
-    fn snapshot_with(enabled: bool) -> ConfigSnapshot {
-        let mut snapshot = crate::service::test_support::sample_snapshot();
-        snapshot.channels.feishu = ChannelConfig {
+    fn snapshot_with(enabled: bool) -> ChannelContext {
+        let mut snapshot = crate::test_context();
+        snapshot.config = ChannelConfig {
             enabled,
             ..ChannelConfig::default()
         };
@@ -1480,7 +1486,7 @@ mod tests {
     fn a_built_channel_keeps_the_config_snapshot_it_was_built_with() {
         let factory = FeishuFactory::new();
         let mut snapshot = snapshot_with(true);
-        snapshot.channels.feishu.home_chat = Some(komo_kernel::types::chat::PeerId::new("oc_g"));
+        snapshot.config.home_chat = Some(komo_kernel::types::chat::PeerId::new("oc_g"));
         let built = factory.build(&snapshot, &credentials()).unwrap().unwrap();
         // 渠道**不拿**它做准入判定（见 `inbound` 的模块注释），但热重载要靠它判断
         // "这个渠道的配置变了没有"。

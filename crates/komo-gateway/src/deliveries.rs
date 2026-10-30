@@ -115,7 +115,10 @@ impl DeliveryLog {
             komo.delivery.attempt = u64::from(record.attempts) + 1,
             komo.delivery.outcome = tracing::field::Empty,
         );
-        let unavailable = self.channels.get(record.target.peer.platform).is_none();
+        let unavailable = self
+            .channels
+            .get(record.target.peer.platform.clone())
+            .is_none();
         let result = self.attempt(record).instrument(span.clone()).await;
         let outcome = match &result {
             Ok(delivery) if delivery.state == DeliveryState::Sent => "sent",
@@ -138,8 +141,8 @@ impl DeliveryLog {
     }
 
     async fn attempt(&self, record: &DeliveryRecord) -> Result<Delivery, DeliverError> {
-        let platform = record.target.peer.platform;
-        let Some(sender) = self.channels.get(platform) else {
+        let platform = record.target.peer.platform.clone();
+        let Some(sender) = self.channels.get(platform.clone()) else {
             // 渠道此刻不在（没起来、或者被重载停掉了）：留在 pending，下一次冲刷再试。
             self.settle(
                 &record.id,
@@ -154,7 +157,11 @@ impl DeliveryLog {
         };
 
         match sender
-            .send(&record.target.peer, record.outbound.clone())
+            .send_delivery(
+                record.id.as_str(),
+                &record.target.peer,
+                record.outbound.clone(),
+            )
             .await
         {
             Ok(SendOutcome::Sent) => {

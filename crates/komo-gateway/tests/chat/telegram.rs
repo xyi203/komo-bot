@@ -7,13 +7,13 @@ use komo_kernel::protocol::config::ChannelConfig;
 use komo_kernel::traits::Channel;
 use komo_kernel::types::chat::ChannelPlatform;
 
+use komo_channel::telegram::TelegramChannel;
 use komo_gateway::channels::ChannelSender;
-use komo_gateway::channels::telegram::TelegramChannel;
 
 use crate::harness::{
     FakeLlm, FixedFactory, GatewayBuilder, TestGateway, eventually, telegram_config,
 };
-use komo_gateway::channels::telegram::fake::{Behavior, FakeBotApi, text_update};
+use komo_channel::telegram::fake::{Behavior, FakeBotApi, text_update};
 
 /// 一台起着的 Gateway + 它背后的假 Bot API。渠道是**真的**：`TelegramChannel::serve`
 /// 在长轮询，回执与主动投递都真的发到假服务端上。
@@ -113,10 +113,7 @@ async fn a_group_message_only_counts_when_it_names_the_bot() {
         222,
         "supergroup",
         111,
-        &format!(
-            "@{} 看一下日志",
-            komo_gateway::channels::telegram::fake::BOT_USERNAME
-        ),
+        &format!("@{} 看一下日志", komo_channel::telegram::fake::BOT_USERNAME),
     ));
 
     let gateway_sessions = || async { wired.gateway.origins().await };
@@ -151,10 +148,7 @@ async fn an_unregistered_group_is_answered_when_it_names_the_bot() {
             333,
             "supergroup",
             111,
-            &format!(
-                "@{} 在吗",
-                komo_gateway::channels::telegram::fake::BOT_USERNAME
-            ),
+            &format!("@{} 在吗", komo_channel::telegram::fake::BOT_USERNAME),
         )],
     )
     .await;

@@ -101,7 +101,9 @@ pub fn snapshot_fixture() -> ConfigSnapshot {
         },
         typesafe: TypesafeConfig::default(),
         channels: ChannelsConfig {
+            extra: Default::default(),
             feishu: ChannelConfig {
+                plugin: None,
                 enabled: true,
                 allow_from: vec![PeerId::new("ou_operator")],
                 allow_tenant: false,

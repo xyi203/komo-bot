@@ -74,6 +74,37 @@ pub struct Loaded {
     pub sources: Sources,
 }
 
+/// Login bootstraps channel credentials, so unrelated model validation must not block it.
+pub fn channel_login_config(
+    home: &Path,
+    platform: &komo_kernel::types::chat::ChannelPlatform,
+) -> Result<
+    (
+        Option<komo_kernel::protocol::config::ChannelPlugin>,
+        Secrets,
+    ),
+    ConfigError,
+> {
+    let sources = Sources::under(home);
+    let secrets = env::load_secrets(&sources.env).map_err(|error| ConfigError::Io {
+        path: sources.env.clone(),
+        message: error.to_string(),
+    })?;
+    if !sources.config.exists() {
+        return Ok((None, secrets));
+    }
+    let (file, _) = read_config(&sources.config)?;
+    use komo_kernel::types::chat::ChannelPlatform;
+    let plugin = match platform {
+        ChannelPlatform::Feishu => file.channels.feishu.plugin,
+        ChannelPlatform::Telegram => file.channels.telegram.plugin,
+        ChannelPlatform::Wechat => file.channels.wechat.plugin,
+        ChannelPlatform::Custom(id) => file.channels.extra.get(id).and_then(|c| c.plugin.clone()),
+        ChannelPlatform::Api => None,
+    };
+    Ok((plugin, secrets))
+}
+
 /// 解析两个文件并校验。
 ///
 /// 相对路径按**配置文件所在目录**解析（§12）。`KOMO_HOME` 是唯一直接读的环境变量；

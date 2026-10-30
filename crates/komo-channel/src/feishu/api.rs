@@ -481,7 +481,7 @@ impl FeishuApi {
     ///
     /// 只对 `interactive` 消息有效，只覆盖 14 天内发出的消息，单条 5 QPS，且更新前后的
     /// `config.update_multi` 都必须为 `true`（spike callbacks.md 3d——后一条由
-    /// [`crate::render::feishu`] 保证）。
+    /// [`crate::feishu::render`] 保证）。
     pub async fn patch_message(&self, message_id: &str, content: &str) -> Result<(), FeishuError> {
         let token = self.tenant_token().await?;
         self.call::<Value>(

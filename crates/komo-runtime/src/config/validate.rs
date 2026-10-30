@@ -632,12 +632,22 @@ fn check_agents(snapshot: &ConfigSnapshot, issues: &mut Vec<ConfigIssue>) {
 }
 
 fn check_channels(snapshot: &ConfigSnapshot, issues: &mut Vec<ConfigIssue>) {
-    for platform in [
-        ChannelPlatform::Feishu,
-        ChannelPlatform::Telegram,
-        ChannelPlatform::Wechat,
-    ] {
-        let Some(channel) = snapshot.channels.get(platform) else {
+    for (id, channel) in &snapshot.channels.extra {
+        if !matches!(ChannelPlatform::parse(id), Some(ChannelPlatform::Custom(_))) {
+            issues.push(error(
+                &format!("channels.{id}"),
+                "渠道名称无效或为宿主保留名称",
+            ));
+        }
+        if channel.enabled && channel.plugin.is_none() {
+            issues.push(error(
+                &format!("channels.{id}.plugin"),
+                "外部渠道必须配置 plugin.command",
+            ));
+        }
+    }
+    for platform in snapshot.channels.platforms() {
+        let Some(channel) = snapshot.channels.get(platform.clone()) else {
             continue;
         };
         let key = format!("channels.{platform}");
@@ -652,8 +662,16 @@ fn check_channel(
     snapshot: &ConfigSnapshot,
     issues: &mut Vec<ConfigIssue>,
 ) {
+    if let Some(plugin) = &channel.plugin {
+        if !plugin.command.is_absolute() {
+            issues.push(error(
+                &format!("{key}.plugin.command"),
+                "插件命令必须是绝对路径",
+            ));
+        }
+    }
     for (index, peer) in channel.allow_from.iter().enumerate() {
-        if let Err(message) = check_peer_id(platform, peer) {
+        if let Err(message) = check_peer_id(platform.clone(), peer) {
             issues.push(error(
                 &format!("{key}.allow_from"),
                 format!("[{index}] {message}"),
@@ -661,7 +679,12 @@ fn check_channel(
         }
     }
 
-    if channel.allow_tenant && platform != ChannelPlatform::Feishu {
+    if channel.allow_tenant
+        && !matches!(
+            platform,
+            ChannelPlatform::Feishu | ChannelPlatform::Custom(_)
+        )
+    {
         issues.push(error(
             &format!("{key}.allow_tenant"),
             "只有飞书能判断是不是同一家企业",
@@ -669,7 +692,7 @@ fn check_channel(
     }
 
     if let Some(home) = &channel.home_chat {
-        if let Err(message) = check_peer_id(platform, home) {
+        if let Err(message) = check_peer_id(platform.clone(), home) {
             issues.push(error(&format!("{key}.home_chat"), message));
         }
         // §11.2：home_chat 所属渠道必须 enabled 且有凭证。
@@ -682,7 +705,22 @@ fn check_channel(
     }
 
     if channel.enabled {
-        for var in channel_credentials(platform) {
+        if let Some(plugin) = &channel.plugin {
+            for var in &plugin.env {
+                if var.is_empty() || !var.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+                    issues.push(error(
+                        &format!("{key}.plugin.env"),
+                        "凭证变量名只能包含字母、数字和下划线",
+                    ));
+                } else if !snapshot.credentials.contains_key(var) {
+                    issues.push(error(
+                        &format!("{key}.plugin.env"),
+                        format!(".env 里没有 `{var}`"),
+                    ));
+                }
+            }
+        }
+        for var in channel_credentials(platform.clone()) {
             if !snapshot.credentials.contains_key(*var) {
                 issues.push(error(
                     &format!("{key}.enabled"),
@@ -729,7 +767,7 @@ fn check_peer_id(platform: ChannelPlatform, peer: &PeerId) -> Result<(), String>
             .map(|_| ())
             .map_err(|_| format!("`{raw}` 不是 Telegram 的整数 id")),
         // iLink 的 from：只要求是一个没有空白的字符串。
-        ChannelPlatform::Wechat | ChannelPlatform::Api => Ok(()),
+        ChannelPlatform::Wechat | ChannelPlatform::Api | ChannelPlatform::Custom(_) => Ok(()),
     }
 }
 

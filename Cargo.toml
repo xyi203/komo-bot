@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/komo-channel",
     "crates/komo-kernel",
     "crates/komo-agent",
     "crates/komo-store",
@@ -22,6 +23,7 @@ license = "MIT"
 [workspace.dependencies]
 # 内部 crate，依赖只向下：kernel ← store ← runtime ← gateway；kernel ← agent ← gateway；
 # kernel ← client。
+komo-channel = { path = "crates/komo-channel", default-features = false }
 komo-kernel = { path = "crates/komo-kernel" }
 komo-agent = { path = "crates/komo-agent" }
 komo-store = { path = "crates/komo-store" }
@@ -77,12 +79,12 @@ tower-http = { version = "0.7.1", default-features = false, features = [
 # §13.4：仅 bin。
 clap = { version = "4.6.7", features = ["derive"] }
 
-# §13.4：仅 gateway，feature `feishu`（默认开）。只要 ws 长连接；事件负载用
+# §13.4：仅 komo-channel 的 feishu feature。只要 ws 长连接；事件负载用
 # register_raw 拿原始 JSON 自己解析。
 openlark = { version = "0.21.0", default-features = false, features = [
     "websocket",
 ] }
-# §13.4：仅 gateway，feature `wechat`（默认开）。它 pin reqwest 0.12 + native-tls，
+# §13.4：仅 komo-channel 的 wechat feature。它 pin reqwest 0.12 + native-tls，
 # 带来一份 reqwest / hyper 重复——接受。Linux 下不 vendored openssl。
 wechatbot = "0.4.0"
 # §13.4：微信登录二维码渲染为终端字符，不需要 `image`。

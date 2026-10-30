@@ -14,8 +14,8 @@
 
 use std::sync::Arc;
 
+use komo_channel::feishu::{FeishuChannel, FeishuSender, inbound as feishu_inbound};
 use komo_gateway::channels::ChannelSender;
-use komo_gateway::channels::feishu::{FeishuChannel, FeishuSender, inbound as feishu_inbound};
 use komo_gateway::service::test_support::Gate;
 use komo_kernel::protocol::{InboundAck, InboundMessage};
 use komo_kernel::types::chat::{ChannelPeer, ChannelPlatform};
@@ -24,7 +24,7 @@ use crate::harness::{
     FakeLlm, FixedFactory, GatewayBuilder, TestGateway, call_round, config_toml, eventually,
     feishu_block, text_round,
 };
-use komo_gateway::channels::feishu::fake::{
+use komo_channel::feishu::fake::{
     BOT_OPEN_ID, Behavior, FakeOpenApi, text_event, text_event_from_tenant, text_event_replying,
 };
 use komo_kernel::types::ids::{RunId, SessionId};
@@ -472,7 +472,7 @@ impl Tenant {
 
 #[tokio::test]
 async fn a_colleague_in_an_internal_group_is_an_operator_with_allow_tenant() {
-    use komo_gateway::channels::feishu::fake::APP_TENANT;
+    use komo_channel::feishu::fake::APP_TENANT;
     let wired = wire_tenant(true, &[]).await;
 
     let ack = wired
@@ -511,7 +511,7 @@ async fn an_external_tenant_sender_is_rejected_even_with_allow_tenant() {
 
 #[tokio::test]
 async fn a_colleague_in_an_external_group_is_rejected_even_with_allow_tenant() {
-    use komo_gateway::channels::feishu::fake::APP_TENANT;
+    use komo_channel::feishu::fake::APP_TENANT;
     let wired = wire_tenant(true, &["oc_ext"]).await;
     let ack = wired
         .say("T4", "oc_ext", "ou_colleague", APP_TENANT, "你好")
@@ -522,7 +522,7 @@ async fn a_colleague_in_an_external_group_is_rejected_even_with_allow_tenant() {
 
 #[tokio::test]
 async fn a_colleague_is_rejected_when_allow_tenant_is_off() {
-    use komo_gateway::channels::feishu::fake::APP_TENANT;
+    use komo_channel::feishu::fake::APP_TENANT;
     let wired = wire_tenant(false, &[]).await;
     let ack = wired
         .say("T5", "oc_group", "ou_colleague", APP_TENANT, "你好")

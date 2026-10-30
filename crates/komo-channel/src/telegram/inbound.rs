@@ -9,7 +9,7 @@
 //! 不认识平台，所以只能是渠道做。群里没 @机器人 的消息 `Ignored`，**不进 Dispatcher**。
 //!
 //! 收文字与图片（`photo`，或 `image/*` 的 `document`）。图片不在这里下载：[`accept`] 先做完
-//! 准入，渠道再去拉图、存进收件箱（[`crate::channels::inbox`]），最后
+//! 准入，渠道再去拉图、存进收件箱（[`crate::inbox`]），最后
 //! [`Accepted::into_inbound`] 把路径写进正文。
 
 use komo_kernel::protocol::InboundMessage;
@@ -17,7 +17,7 @@ use komo_kernel::types::chat::{ChannelPeer, ChannelPlatform, PeerId};
 use komo_kernel::types::ids::RequestKey;
 
 use super::api::{BotIdentity, Message};
-use crate::channels::inbox::{self, SavedImage};
+use crate::inbox::{self, SavedImage};
 
 /// 去重键：`telegram:{update_id}`。
 ///

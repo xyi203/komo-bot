@@ -27,8 +27,8 @@ use wechatbot::error::WeChatBotError;
 use wechatbot::protocol::{ILinkClient, build_text_message};
 use wechatbot::types::{Credentials, WireMessage};
 
-use crate::channels::{ChannelSender, SendOutcome};
-use crate::render::wechat;
+use crate::wechat::render as wechat;
+use crate::{ChannelSender, SendOutcome};
 
 /// 进程内最多记多少个人的回复令牌。
 ///

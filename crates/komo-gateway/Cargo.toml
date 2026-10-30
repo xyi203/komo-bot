@@ -8,8 +8,9 @@ license.workspace = true
 # §13.4：gateway 看不到 toasty 类型（store 只通过 runtime 的构造函数暴露），也看不到 ratatui。
 [dependencies]
 komo-kernel = { workspace = true }
+komo-channel = { workspace = true }
 komo-runtime = { workspace = true }
-# 飞书话题上下文里每条消息的 `HH:MM`（本机时区，§13.4）。
+# 目标/领域 HTTP 接口按本机时区解释日期（§13.4）。
 jiff = { workspace = true }
 komo-agent = { workspace = true }
 # 只用 store 的构造函数与 repo 类型（Db / Coordinator / Turso*Repo / RecoveryStore），不碰 toasty 类型。
@@ -18,9 +19,6 @@ axum = { workspace = true }
 tower-http = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "signal", "fs"] }
 reqwest = { workspace = true }
-openlark = { workspace = true, optional = true }
-wechatbot = { workspace = true, optional = true }
-qrcode = { workspace = true, optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }
@@ -38,12 +36,8 @@ tempfile = { workspace = true, optional = true }
 rustls = { workspace = true, optional = true }
 
 [features]
-# §13.4：三个渠道各自一个 feature，默认全开。feature 的用处不是裁功能，是让
-# `cargo tree -d` 能按渠道归因重复版本，以及某家 SDK 坏掉时能单独关掉它继续构建。
-default = ["feishu", "telegram", "wechat"]
-feishu = ["dep:openlark"]
-telegram = []
-wechat = ["dep:wechatbot", "dep:qrcode"]
+# Platform features belong to komo-channel. Gateway production selects none.
+default = []
 # W5：集成测试（`tests/recovery`）要的故障注入口。只开这个 feature 时编进来的是
 # `service::test_support` 里的注入表，生产构建里那张表根本不存在。
 test-support = [
@@ -56,6 +50,7 @@ test-support = [
 
 
 [dev-dependencies]
+komo-channel = { workspace = true, features = ["test-support", "feishu", "telegram", "wechat"] }
 # 自依赖：只给 test / bench 目标打开 `test-support`，`cargo test -p komo-gateway` 因此
 # 不必带 `--features`，而 `cargo build` 仍然看不到注入口。
 komo-gateway = { path = ".", features = ["test-support"] }

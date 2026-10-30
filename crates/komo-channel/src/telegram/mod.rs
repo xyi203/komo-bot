@@ -14,6 +14,8 @@
 //! 渠道只依赖 kernel 的类型与 `Channel` / `Inbound` 两个 trait（§11.5）：它不知道
 //! Session 是什么，也不读环境变量——token 由接线在构造时传进来。
 
+pub mod render;
+
 pub mod api;
 pub mod inbound;
 pub mod send;
@@ -32,7 +34,7 @@ use komo_kernel::traits::{Channel, ChannelError, Inbound, Shutdown};
 
 pub use api::{BotApi, BotIdentity, TelegramError};
 
-use crate::channels::inbox::{ImageInbox, SavedImage};
+use crate::inbox::{ImageInbox, SavedImage};
 pub use send::TelegramSender;
 
 use api::Update;
@@ -98,7 +100,7 @@ impl TelegramChannel {
         }
     }
 
-    /// 接上图片收件箱（[`crate::channels::inbox`]）。
+    /// 接上图片收件箱（[`crate::inbox`]）。
     pub fn with_inbox(mut self, inbox: Option<ImageInbox>) -> Self {
         self.inbox = inbox;
         self
@@ -682,3 +684,74 @@ mod tests {
         assert!(identity.is_bot);
     }
 }
+
+use crate::{BuiltChannel, ChannelContext, ChannelFactory, ChannelSender, Secrets, token};
+/// Telegram：长轮询 + `getMe`（§11.5）。
+#[derive(Debug, Default)]
+pub struct TelegramFactory {
+    http: reqwest::Client,
+}
+
+impl TelegramFactory {
+    pub fn new() -> Self {
+        TelegramFactory {
+            http: reqwest::Client::new(),
+        }
+    }
+}
+
+#[async_trait]
+impl ChannelFactory for TelegramFactory {
+    fn credentials(&self) -> &'static [&'static str] {
+        &["TELEGRAM_BOT_TOKEN"]
+    }
+    fn platform(&self) -> ChannelPlatform {
+        ChannelPlatform::Telegram
+    }
+
+    fn build(
+        &self,
+        snapshot: &ChannelContext,
+        secrets: &Secrets,
+    ) -> Result<Option<BuiltChannel>, ChannelError> {
+        let Some(config) = Some(&snapshot.config) else {
+            return Ok(None);
+        };
+        if !config.enabled {
+            return Ok(None);
+        }
+        let token = token(secrets, "TELEGRAM_BOT_TOKEN", "telegram")?;
+        let channel = Arc::new(
+            TelegramChannel::new(token, config.clone(), self.http.clone()).with_inbox(Some(
+                ImageInbox::for_platform(snapshot, ChannelPlatform::Telegram),
+            )),
+        );
+        let sender = channel.sender() as Arc<dyn ChannelSender>;
+        Ok(Some(BuiltChannel {
+            channel: channel as Arc<dyn Channel>,
+            sender,
+        }))
+    }
+
+    async fn probe(
+        &self,
+        _snapshot: &ChannelContext,
+        secrets: &Secrets,
+    ) -> Result<String, ChannelError> {
+        let token = token(secrets, "TELEGRAM_BOT_TOKEN", "telegram")?;
+        probe(&token, self.http.clone())
+            .await
+            .map(|identity| {
+                format!(
+                    "getMe 通过：@{}",
+                    identity.username.as_deref().unwrap_or("（没有用户名）")
+                )
+            })
+            .map_err(|error| ChannelError {
+                channel: "telegram".into(),
+                message: error.to_string(),
+            })
+    }
+}
+
+use komo_kernel::types::chat::ChannelPlatform;

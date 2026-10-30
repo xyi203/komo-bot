@@ -1,0 +1,59 @@
+[package]
+name = "komo-channel"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+komo-kernel = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "signal", "io-std", "io-util", "fs"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+rustls = { workspace = true }
+thiserror = { workspace = true }
+bytes = { workspace = true }
+time = { workspace = true }
+uuid = { workspace = true }
+futures-util = { workspace = true }
+reqwest = { workspace = true, optional = true }
+openlark = { workspace = true, optional = true }
+jiff = { workspace = true, optional = true }
+wechatbot = { workspace = true, optional = true }
+qrcode = { workspace = true, optional = true }
+axum = { workspace = true, optional = true }
+
+[features]
+default = []
+feishu = ["dep:openlark", "dep:reqwest", "dep:jiff"]
+telegram = ["dep:reqwest"]
+wechat = ["dep:wechatbot", "dep:qrcode", "dep:reqwest"]
+test-support = ["dep:axum"]
+
+[[bin]]
+name = "komo-channel-feishu"
+path = "src/bin/feishu.rs"
+required-features = ["feishu"]
+
+[[bin]]
+name = "komo-channel-telegram"
+path = "src/bin/telegram.rs"
+required-features = ["telegram"]
+
+[[bin]]
+name = "komo-channel-wechat"
+path = "src/bin/wechat.rs"
+required-features = ["wechat"]
+
+[[bin]]
+name = "komo-channel-fixture"
+path = "tests/support/plugin.rs"
+required-features = ["test-support"]
+
+[dev-dependencies]
+komo-channel = { path = ".", features = ["test-support", "feishu", "telegram", "wechat"] }
+tempfile = { workspace = true }
+axum = { workspace = true }

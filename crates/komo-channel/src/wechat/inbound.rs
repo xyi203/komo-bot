@@ -8,10 +8,10 @@
 //! 微信这一列比另外两个简单，因为它**只有 DM**（§11.2）：没有群、没有 @提及要剥，
 //! `is_private` 恒为 `true`，会话 id 就是对方的 `from_user_id`。留下的只有两件事：
 //!
-//! 1. **只处理文本与图片**。图片由渠道先存成本地文件（[`crate::channels::inbox`]），
+//! 1. **只处理文本与图片**。图片由渠道先存成本地文件（[`crate::inbox`]），
 //!    正文里只写路径；语音 / 文件 / 视频一律 `None`（不进 Dispatcher）。
 //! 2. **去重键**。`wechat:{from_user_id}:{client_id}`，`client_id` 为空时回退到
-//!    `(from, 内容哈希, 60s 窗口)`——两者都住在 [`crate::render::wechat`] 里，因为它们
+//!    `(from, 内容哈希, 60s 窗口)`——两者都住在 [`crate::wechat::render`] 里，因为它们
 //!    是纯函数，要能在没有 SDK 的情况下逐字断言。
 
 use komo_kernel::protocol::InboundMessage;
@@ -19,8 +19,8 @@ use komo_kernel::types::chat::{ChannelPeer, ChannelPlatform, PeerId};
 use komo_kernel::types::ids::RequestKey;
 use wechatbot::types::{ContentType, ImageItem, IncomingMessage, MessageType, WireMessage};
 
-use crate::channels::inbox::{self, SavedImage};
-use crate::render::wechat;
+use crate::inbox::{self, SavedImage};
+use crate::wechat::render as wechat;
 
 /// 这条 wire 消息的去重键（§11.1）。
 ///

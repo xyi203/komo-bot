@@ -933,3 +933,17 @@ button.live-line:hover .label { text-decoration: underline; text-underline-offse
 .fchip[aria-pressed="true"] { background: var(--active); }
 .fchip .i { width: 12px; height: 12px; }
 @media (max-width: 600px) { .pform .select.half { width: 100%; } .catrow-main { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) 32px 32px; } }
+
+/* 模型一节：一个提供商一行，编辑时卡里展开灰底面板 */
+.pcard.prow { padding: 14px 16px; }
+.prow .pcard-head { min-height: 36px; }
+.prow .pname { font-size: 15px; font-weight: 500; }
+.sdot { width: 8px; height: 8px; border-radius: 50%; background: #c98a12; flex: none; }
+.sdot.ok { background: #2fb36b; }
+.ppanel { margin-top: 12px; padding: 4px 18px 18px; border-radius: 12px; background: var(--ground); }
+.ppanel .cfg-form { padding-top: 0; }
+.ppanel-title { display: flex; align-items: baseline; gap: 10px; margin-top: 14px; }
+.ppanel-title .muted { font-size: var(--fs-label); }
+.padv { margin-top: 16px; padding-top: 12px; border-top: 1px solid var(--rule); }
+.padv > summary { font-weight: 500; }
+.ppanel .cat-head { margin-top: 16px; }

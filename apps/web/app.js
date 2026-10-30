@@ -1784,12 +1784,6 @@ function settingsSection(k) {
 }
 const secHead = (title, desc, right = "") => `<div class="set-head"><div><h3>${title}</h3><p>${desc}</p></div>${right}</div>`;
 
-// —— 模型：provider 一张卡，卡里是挂在它上面的模型 ——
-function keyLine(p) {
-  if (p.auth) return `<span class="kstate ok"><i class="kdot"></i>凭证来自 ${esc(p.auth)} 登录</span>`;
-  if (!p.env_key) return `<span class="kstate warn"><i class="kdot"></i>没写凭证变量</span>`;
-  return p.key_set ? `<span class="kstate ok"><i class="kdot"></i><span class="mono">${esc(p.env_key)}</span> 已设置</span>` : `<span class="kstate warn"><i class="kdot"></i>缺 <span class="mono">${esc(p.env_key)}</span></span>`;
-}
 // provider 就是一组。类型（普通 / 嵌入）由协议看出来：嵌入组的协议是向量那两种，组里挂的都是向量模型。
 const EMBED_BACKENDS = { ollama_embeddings: "Ollama", embeddings: "OpenAI 兼容" };
 const kindOf = (p) => (EMBED_BACKENDS[p?.api_backend] ? "embedding" : "completion");
@@ -1839,7 +1833,7 @@ function providerForm(P, p) {
   const field = (id, label, input, hint = "") => `<label class="lbl" for="${id}">${label}</label>${input}${hint ? `<p class="hint">${hint}</p>` : ""}`;
   const protocol = `<select class="select half" id="pf-backend" name="api_backend" ${used ? "disabled" : ""}><optgroup label="对话">${ALL_BACKENDS.slice(0, 3).map(([k, n]) => `<option value="${k}" ${k === v.api_backend ? "selected" : ""}>${n}</option>`).join("")}</optgroup><optgroup label="嵌入（记忆检索用）">${ALL_BACKENDS.slice(3).map(([k, n]) => `<option value="${k}" ${k === v.api_backend ? "selected" : ""}>${n}</option>`).join("")}</optgroup></select>`;
   const key = p?.auth ? `<p class="hint">凭证来自 ${esc(p.auth)} 登录，不走 API 密钥。</p><input type="hidden" name="auth" value="${esc(p.auth)}">`
-    : field("pf-key", "API 密钥", `<input class="input" id="pf-key" name="api_key" type="password" autocomplete="new-password" value="${esc(v.api_key)}" placeholder="${p?.key_set ? "已设置；留空不改" : "输入 API 密钥"}">`, "存成环境变量，不进配置。");
+    : field("pf-key", "API 密钥", `<input class="input" id="pf-key" name="api_key" type="password" autocomplete="new-password" value="${esc(v.api_key)}" placeholder="${p?.key_set ? "留空使用已保存的凭据" : "输入 API 密钥"}">`, "存成环境变量，不进配置。");
   const rowMore = (r, i) => kind === "embedding"
     ? `<div class="catrow-more"><div>${field(`cm-a-${i}`, "名字（alias）", `<input class="input mono" id="cm-a-${i}" data-row="${i}" data-field="alias" value="${esc(r.alias || "")}" placeholder="${esc(aliasOf(r.model || "") || "自动")}">`)}</div>
         <div>${field(`cm-d-${i}`, "维数", `<input class="input" id="cm-d-${i}" type="number" min="1" data-row="${i}" data-field="dimensions" value="${esc(r.dimensions ?? "")}" placeholder="模型返回的">`)}</div></div>`
@@ -1858,16 +1852,23 @@ function providerForm(P, p) {
   const fetched = !F ? "" : F.error ? `<p class="hint bad">${esc(F.error)}</p>`
     : `<div class="fetched"><input class="input" id="pf-filter" value="${esc(E.filter || "")}" placeholder="在 ${F.models.length} 个模型里筛选" aria-label="筛选模型">
       <div class="fchips">${F.models.filter((m) => !q || m.toLowerCase().includes(q)).slice(0, 200).map((m) => `<button type="button" class="fchip" aria-pressed="${have.has(m)}" data-cfg="cat-pick" data-id="${esc(m)}">${have.has(m) ? icon("check") : ""}${esc(m)}</button>`).join("") || `<span class="muted small">没有匹配的模型</span>`}</div></div>`;
+  // 不是预设的地址（自定义接口）就把"自定义设置"默认展开；手动开合过就按人点的
+  const custom = isNew ? E.tab === "custom" : !PRESETS.some((x) => x.base_url === v.base_url);
+  const advOpen = E.advOpen ?? custom;
+  const title = isNew && E.tab === "custom" ? "" : `<div class="ppanel-title"><span class="pname">${esc(v.name || v.pid)}</span>${v.name && v.pid ? `<span class="muted">${esc(v.pid)}</span>` : ""}</div>`;
   return `<form class="mform cfg-form pform" id="cfg-provider-form" data-id="${esc(p?.id || "")}">
     ${tabs}${presets}
+    ${title}
+    ${key}
+    <details class="adv padv" id="pf-adv" ${advOpen ? "open" : ""}><summary>自定义设置</summary>
     ${field("pf-id", "Provider ID", `<input class="input" id="pf-id" name="pid" required pattern="[A-Za-z][A-Za-z0-9._-]*" maxlength="64" value="${esc(v.pid)}" placeholder="acme-gateway">`, isNew ? "以字母开头，模型靠它找到这个 provider，也用来派生凭证变量名。" : "改了会把挂在它上面的模型一并改过去。")}
     ${field("pf-name", "显示名称", `<input class="input" id="pf-name" name="name" maxlength="64" value="${esc(v.name)}" placeholder="显示名称">`)}
     ${field("pf-url", "API 地址", `<input class="input" id="pf-url" name="base_url" value="${esc(v.base_url)}" placeholder="https://gateway.example/v1">`)}
     ${field("pf-backend", "API 协议", protocol, used ? "挂着模型时不能在对话与嵌入之间换。" : "")}
-    ${key}
-    <details class="adv"><summary>更多设置</summary><div class="two">
+    <div class="two">
       <div>${field("pf-env", "凭证变量名", `<input class="input mono" id="pf-env" name="env_key" value="${esc(v.env_key)}" placeholder="留空：ID 大写_API_KEY">`)}</div>
-      <div>${field("pf-timeout", "请求时限（秒）", `<input class="input" id="pf-timeout" name="timeout_secs" type="number" min="1" value="${esc(v.timeout_secs)}" placeholder="默认 120">`)}</div></div></details>
+      <div>${field("pf-timeout", "请求时限（秒）", `<input class="input" id="pf-timeout" name="timeout_secs" type="number" min="1" value="${esc(v.timeout_secs)}" placeholder="默认 120">`)}</div></div>
+    </details>
     <div class="cat-head"><h5>模型目录<span class="muted small">${kind === "embedding" ? "嵌入模型" : "对话模型"}</span></h5><button type="button" class="text-btn quiet" data-cfg="cat-fetch" ${E.fetching ? "disabled" : ""}>${E.fetching ? "正在获取…" : "获取可用模型"}</button></div>
     ${fetched}
     <div class="catlist">${rows || `<p class="muted small">还没有模型。</p>`}</div>
@@ -1919,76 +1920,39 @@ function delAsk(P, kind, id, used) {
   if (!(P.confirm && P.confirm.kind === kind && P.confirm.id === id)) return "";
   return `<div class="danger"><p>${used}</p><div class="actions">${btn(`删掉 ${esc(id)}`, `data-cfg="del-${kind}-sure" data-id="${esc(id)}" ${P.busy ? "disabled" : ""}`, "danger-btn")}${btn("取消", 'data-cfg="cancel"')}</div></div>`;
 }
-function modelRow(P, m, def) {
-  const editing = P.edit?.kind === "model" && P.edit.id === m.alias;
-  const menu = (S.models || []).find((x) => x.id === m.alias);
-  const win = m.context_window || menu?.context_window;
-  return `<li class="pm${editing ? " editing" : ""}">
-    <div class="pm-main"><span class="pm-name">${esc(m.name || m.alias)}${m.alias === def ? `<span class="pill">默认</span>` : ""}</span>
-      <span class="pm-sub"><span class="mono">${esc(m.alias)}</span><span class="sep">·</span><span class="mono">${esc(m.model)}</span>${win ? `<span class="sep">·</span><span class="num">${kTokens(win)}</span> 窗口` : ""}${m.effort ? `<span class="sep">·</span>effort ${esc(m.effort)}` : ""}</span></div>
-    ${m.standalone ? "" : `<span class="pm-act"><button class="text-btn quiet" data-cfg="edit-model" data-id="${esc(m.alias)}">编辑</button><button class="text-btn quiet danger-link" data-cfg="del-model" data-id="${esc(m.alias)}">删除</button></span>`}
-    ${editing ? modelForm(P, m, m.provider, "completion") : ""}
-    ${delAsk(P, "model", m.alias, `删掉之后菜单里没有它；已经开始的请求用的是开始时那份配置，不受影响。`)}</li>`;
-}
-const keyState = (env, set) => (!env ? "" : set ? `<span class="kstate ok"><i class="kdot"></i><span class="mono">${esc(env)}</span> 已设置</span>` : `<span class="kstate warn"><i class="kdot"></i>缺 <span class="mono">${esc(env)}</span></span>`);
 const embedTag = `<span class="tag">嵌入</span>`;
-const useEmbed = (e, inUse) => (inUse ? "" : `<button class="text-btn quiet" data-cfg="use-embed" data-id="${esc(e.alias)}">让记忆用它</button>`);
 const delEmbed = (P, e, inUse) => delAsk(P, "embed", e.alias, inUse ? "记忆正用着它，Gateway 会拒绝；先让记忆换一个向量模型。" : `删掉向量模型 ${esc(e.alias)}；它的 key 留在环境变量里。`);
+// 一个 provider 一行：名称、标签（嵌入 / 自定义）、凭证状态点、编辑 / 删除；编辑时在卡里展开灰底面板
+const keyDot = (ok, title) => `<span class="sdot${ok ? " ok" : ""}" role="img" aria-label="${esc(title)}" title="${esc(title)}"></span>`;
+const providerDot = (p) => keyDot(p.key_set, p.auth ? `凭证来自 ${p.auth} 登录` : p.key_set ? `${p.env_key} 已设置` : p.env_key ? `缺 ${p.env_key}` : "没写凭证变量");
 function modelsSection(P) {
   const C = P.data.cfg;
   if (!C || C.error) return secHead("模型", "") + errLine(C);
   const def = C.default, used = C.memory_embedding;
   const completions = C.models, embeds = C.embeddings || [];
   const defaultPick = `<label class="def-pick"><span>默认模型</span><select class="select" id="cfg-default" ${P.busy ? "disabled" : ""}>${completions.map((m) => `<option value="${esc(m.alias)}" ${m.alias === def ? "selected" : ""}>${esc(m.name || m.alias)}</option>`).join("")}</select></label>`;
-  // 一个 provider 一张卡：卡头是显示名称（没写就是 id），下面端点，再下面挂着的模型
+  const row = (open, title, actions, body) => `<section class="pcard prow${open ? " open" : ""}"><header class="pcard-head"><div class="pcard-title">${title}</div>${open ? "" : `<span class="pact">${actions}</span>`}</header>${body}</section>`;
   const cards = C.providers.map((p) => {
-    const kind = kindOf(p);
-    const mine = completions.filter((m) => m.provider === p.id), vecs = embeds.filter((e) => e.provider === p.id);
     const editing = P.edit?.kind === "provider" && P.edit.id === p.id;
-    const adding = P.edit?.kind === "new-model" && P.edit.provider === p.id;
-    const n = mine.length + vecs.length;
-    return `<section class="pcard${editing ? " editing" : ""}">
-      <header class="pcard-head"><div class="pcard-title"><span class="pname">${esc(p.name || p.id)}</span>${p.name ? `<span class="mono muted small">${esc(p.id)}</span>` : ""}${kind === "embedding" ? embedTag : ""}<span class="tag">${esc(backendName(p.api_backend))}</span>${keyLine(p)}</div>
-        ${editing ? "" : `<span class="pact">${btn("编辑", `data-cfg="edit-provider" data-id="${esc(p.id)}"`, "sm")}<button class="text-btn quiet danger-link" data-cfg="del-provider" data-id="${esc(p.id)}">删除</button></span>`}</header>
-      ${p.base_url && !editing ? `<p class="pcard-url mono">${esc(p.base_url)}</p>` : ""}
-      ${editing ? providerForm(P, p) : `
-      ${delAsk(P, "provider", p.id, n ? `还有 ${n} 个模型挂在它上面，Gateway 会拒绝；先删掉或改挂别的 provider。` : `删掉 provider ${esc(p.id)}；它的 API key 留在环境变量里。`)}
-      <ul class="pms">${mine.map((m) => modelRow(P, m, def)).join("")}${vecs.map((e) => embeddingRow(P, e, used)).join("") || (n ? "" : `<li class="pm empty">还没有模型挂在它上面。</li>`)}</ul>
-      ${adding ? `<div class="pm-new">${modelForm(P, null, p.id, kind)}</div>` : `<button class="text-btn quiet add-model" data-cfg="new-model" data-provider="${esc(p.id)}">${icon("plus")}添加模型</button>`}`}
-    </section>`;
+    const n = completions.filter((m) => m.provider === p.id).length + embeds.filter((e) => e.provider === p.id).length;
+    const custom = !PRESETS.some((x) => x.base_url === p.base_url);
+    return row(editing, `<span class="pname">${esc(p.name || p.id)}</span>${kindOf(p) === "embedding" ? embedTag : ""}${custom ? `<span class="tag">自定义</span>` : ""}${providerDot(p)}`,
+      `${btn("编辑", `data-cfg="edit-provider" data-id="${esc(p.id)}"`, "sm")}<button class="text-btn quiet danger-link" data-cfg="del-provider" data-id="${esc(p.id)}">删除</button>`,
+      editing ? `<div class="ppanel">${providerForm(P, p)}</div>` : delAsk(P, "provider", p.id, n ? `还有 ${n} 个模型挂在它上面，Gateway 会拒绝；先在编辑里把模型目录清空，或改挂别的 provider。` : `删掉 provider ${esc(p.id)}；它的 API 密钥留在环境变量里。`));
   }).join("");
-  // 没挂 provider 的：每个各自一张卡
-  const looseVec = embeds.filter((e) => !e.provider).map((e) => looseEmbedGroup(P, e, used)).join("");
-  const looseChat = completions.filter((m) => m.standalone).map((m) => `<section class="pcard"><header class="pcard-head"><div class="pcard-title"><span class="pname">${esc(m.alias)}</span><span class="muted small">端点写在模型项里，只能在配置文件里改</span></div></header>
-      <ul class="pms">${modelRow(P, m, def)}</ul></section>`).join("");
+  // 没挂 provider 的：向量模型各自一行（端点写在模型项里），对话模型只读
+  const looseVec = embeds.filter((e) => !e.provider).map((e) => {
+    const editing = P.edit?.kind === "embed" && P.edit.id === e.alias, inUse = e.alias === used;
+    return row(editing, `<span class="pname">${esc(e.name || e.alias)}</span>${embedTag}<span class="tag">自定义</span>${inUse ? `<span class="pill">记忆在用</span>` : ""}${keyDot(e.key_set, e.key_set ? `${e.env_key || "凭证"} 已设置` : `缺 ${e.env_key}`)}`,
+      `${btn("编辑", `data-cfg="edit-embed" data-id="${esc(e.alias)}"`, "sm")}<button class="text-btn quiet danger-link" data-cfg="del-embed" data-id="${esc(e.alias)}">删除</button>`,
+      editing ? `<div class="ppanel">${modelForm(P, e, "", "embedding")}</div>` : delEmbed(P, e, inUse));
+  }).join("");
+  const looseChat = completions.filter((m) => m.standalone).map((m) => row(false, `<span class="pname">${esc(m.name || m.alias)}</span><span class="tag">自定义</span>`, `<span class="muted small">只能在配置文件里改</span>`, "")).join("");
   const addProvider = P.edit?.kind === "new-provider"
-    ? `<section class="pcard editing"><header class="pcard-head"><div class="pcard-title"><span class="pname">添加 provider</span></div></header>${providerForm(P, null)}</section>`
-    : `<button class="add-card" data-cfg="new-provider">${icon("plus")}添加 provider</button>`;
-  const noVec = embeds.length ? "" : `<p class="hint lead-hint">还没有向量模型：记忆只能按关键词检索。添加一个协议选"嵌入"的 provider，再在它的模型目录里加模型。</p>`;
-  return secHead("模型", "改完马上生效：校验通过才保存，随后热重载。", completions.length ? defaultPick : "") + editNotice(P) + noVec + cards + looseVec + looseChat + addProvider;
-}
-// 组里的一行向量模型；名字后面标"向量"，记忆在用的再标一个
-function embeddingRow(P, e, used) {
-  const editing = P.edit?.kind === "embed" && P.edit.id === e.alias, inUse = e.alias === used;
-  const sub = [`<span class="mono">${esc(e.model)}</span>`, esc(backendName(e.api_backend)), e.dimensions ? `<span class="num">${e.dimensions}</span> 维` : ""].filter(Boolean);
-  return `<li class="pm${editing ? " editing" : ""}"><div class="pm-main"><span class="pm-name">${esc(e.alias)}<span class="tag">向量</span>${inUse ? `<span class="pill">记忆在用</span>` : ""}</span>
-    <span class="pm-sub">${sub.join('<span class="sep">·</span>')}</span></div>
-    ${editing ? "" : `<span class="pm-act">${useEmbed(e, inUse)}<button class="text-btn quiet" data-cfg="edit-embed" data-id="${esc(e.alias)}">编辑</button><button class="text-btn quiet danger-link" data-cfg="del-embed" data-id="${esc(e.alias)}">删除</button></span>`}
-    ${editing ? modelForm(P, e, e.provider || "", "embedding") : ""}
-    ${delEmbed(P, e, inUse)}</li>`;
-}
-// 自成一组的向量模型：组头就是它（名字、协议、凭证、端点），组里一行是上游模型
-function looseEmbedGroup(P, e, used) {
-  const editing = P.edit?.kind === "embed" && P.edit.id === e.alias, inUse = e.alias === used;
-  return `<section class="pcard${editing ? " editing" : ""}">
-    <header class="pcard-head"><div class="pcard-title"><span class="pname">${esc(e.alias)}</span>${embedTag}<span class="tag">${esc(backendName(e.api_backend))}</span>${keyState(e.env_key, e.key_set)}</div>
-      ${editing ? "" : `<span class="pact">${btn("编辑", `data-cfg="edit-embed" data-id="${esc(e.alias)}"`, "sm")}<button class="text-btn quiet danger-link" data-cfg="del-embed" data-id="${esc(e.alias)}">删除</button></span>`}</header>
-    ${e.base_url && !editing ? `<p class="pcard-url mono">${esc(e.base_url)}</p>` : ""}
-    ${editing ? modelForm(P, e, "", "embedding") : ""}
-    ${delEmbed(P, e, inUse)}
-    <ul class="pms"><li class="pm"><div class="pm-main"><span class="pm-name"><span class="mono">${esc(e.model)}</span>${inUse ? `<span class="pill">记忆在用</span>` : ""}</span>
-      <span class="pm-sub">${e.dimensions ? `<span class="num">${e.dimensions}</span> 维` : "维数用模型返回的"}</span></div>
-      <span class="pm-act">${useEmbed(e, inUse)}</span></li></ul></section>`;
+    ? `<section class="pcard prow open"><header class="pcard-head"><div class="pcard-title"><span class="pname">添加模型提供商</span></div></header><div class="ppanel">${providerForm(P, null)}</div></section>`
+    : `<button class="add-card" data-cfg="new-provider">${icon("plus")}添加模型提供商</button>`;
+  const noVec = embeds.length ? "" : `<p class="hint lead-hint">还没有向量模型：记忆只能按关键词检索。添加一个协议选"嵌入"的提供商，再在它的模型目录里加模型。</p>`;
+  return secHead("模型", "填入各提供商的 API 密钥即可使用其模型；改完马上生效。", completions.length ? defaultPick : "") + editNotice(P) + noVec + cards + looseVec + looseChat + addProvider;
 }
 // 写完之后的一句回执；409 时给"重新读取"
 function editNotice(P) {
@@ -2525,6 +2489,8 @@ $("input").addEventListener("keydown", (ev) => {
 });
 $("input").addEventListener("input", (ev) => { ev.target.style.height = "auto"; ev.target.style.height = ev.target.scrollHeight + "px"; renderComposer(); });
 $("model").addEventListener("change", fillEfforts);
+// "自定义设置"开合记下来，重绘（加行、换协议）时不弹回去
+document.addEventListener("toggle", (ev) => { if (ev.target.id === "pf-adv" && S.pg.settings.edit) S.pg.settings.edit.advOpen = ev.target.open; }, true);
 // 筛选"获取可用模型"的结果：只藏不重绘，免得输入框丢焦点
 document.addEventListener("input", (ev) => {
   if (ev.target.id !== "pf-filter") return;

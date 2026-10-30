@@ -36,6 +36,11 @@
     <symbol id="i-archive" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="5" rx="1"/><path d="M5 9v9a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V9M10 13h4"/></symbol>
     <symbol id="i-check" viewBox="0 0 24 24"><path d="m5 12 5 5 9-10"/></symbol>
     <symbol id="i-copy" viewBox="0 0 24 24"><rect x="8" y="8" width="12" height="12" rx="2"/><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"/></symbol>
+    <symbol id="i-left" viewBox="0 0 24 24"><path d="m14 7-5 5 5 5"/></symbol>
+    <symbol id="i-inbox" viewBox="0 0 24 24"><path d="M4 13h4l1.5 3h5L16 13h4"/><path d="M5.5 5h13L21 13v5a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-5z"/></symbol>
+    <symbol id="i-gear" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></symbol>
+    <symbol id="i-key" viewBox="0 0 24 24"><circle cx="8" cy="15" r="4"/><path d="m10.8 12.2 8.7-8.7M17 6l3 3M14.5 8.5l2 2"/></symbol>
+    <symbol id="i-trash" viewBox="0 0 24 24"><path d="M4 7h16M10 11v6M14 11v6M6 7l1 13h10l1-13M9 7V4h6v3"/></symbol>
     <symbol id="i-stop" viewBox="0 0 24 24"><rect x="7" y="7" width="10" height="10" rx="1.5"/></symbol>
   </svg>
 
@@ -53,9 +58,10 @@
       <ul class="nav">
         <li><button class="nav-item" id="new-session"><svg class="i"><use href="#i-plus"/></svg>新对话</button></li>
         <li><button class="nav-item" id="nav-search"><svg class="i"><use href="#i-search"/></svg>搜索<kbd>⌘K</kbd></button></li>
-        <li><a class="nav-item" href="#"><svg class="i"><use href="#i-target"/></svg>事项</a></li>
-        <li><a class="nav-item" href="#"><svg class="i"><use href="#i-leaf"/></svg>记忆</a></li>
-        <li><a class="nav-item" href="#"><svg class="i"><use href="#i-clock"/></svg>定时</a></li>
+        <li><a class="nav-item" href="#/inbox" data-nav="inbox"><svg class="i"><use href="#i-inbox"/></svg>待处理<span class="nav-count num" id="inbox-count" hidden></span></a></li>
+        <li><a class="nav-item" href="#/matters" data-nav="matters"><svg class="i"><use href="#i-target"/></svg>事项</a></li>
+        <li><a class="nav-item" href="#/memory" data-nav="memory"><svg class="i"><use href="#i-leaf"/></svg>记忆</a></li>
+        <li><a class="nav-item" href="#/cron" data-nav="cron"><svg class="i"><use href="#i-clock"/></svg>定时</a></li>
       </ul>
       <div class="sec">
         <div class="sec-head">
@@ -72,13 +78,71 @@
         <span class="avatar" aria-hidden="true">Y</span>
         <span class="who">Yi<span class="host" id="conn-text">正在连接 Gateway</span></span>
         <span class="dot" id="conn-dot" role="img" aria-label="正在连接"></span>
-        <button class="icon-btn" aria-label="设置" title="设置"><svg class="i"><use href="#i-sliders"/></svg></button>
+        <button class="icon-btn" id="open-settings" aria-label="设置" title="设置" aria-haspopup="dialog" aria-controls="settings"><svg class="i"><use href="#i-gear"/></svg></button>
       </div>
     </nav>
 
     <main class="main">
+      <section class="page" id="mem" aria-labelledby="mem-title" hidden>
+        <header class="page-head">
+          <button class="icon-btn open-nav" data-open-nav aria-label="打开导航"><svg class="i"><use href="#i-sidebar"/></svg></button>
+          <div class="page-title"><h1 id="mem-title">记忆</h1><p class="page-finding" id="mem-finding"></p></div>
+          <button class="btn" id="mem-add" type="button"><svg class="i"><use href="#i-plus"/></svg>记一条</button>
+        </header>
+        <section class="ladder" id="mem-ladder" aria-label="攒下的记忆"></section>
+        <div class="page-body">
+          <section class="page-list" aria-labelledby="mem-list-title">
+            <div class="list-head">
+              <h2 id="mem-list-title" class="num"></h2>
+              <div class="list-tools">
+                <div class="field-search"><svg class="i"><use href="#i-search"/></svg><label class="visually-hidden" for="mem-query">检索记忆</label><input id="mem-query" type="search" placeholder="检索记忆" autocomplete="off"></div>
+                <label class="visually-hidden" for="mem-scope">作用域</label>
+                <select class="select" id="mem-scope"></select>
+              </div>
+            </div>
+            <div id="mem-rows"></div>
+            <p class="index-line" id="mem-index"></p>
+          </section>
+          <aside class="page-detail" id="mem-detail" aria-label="这条记忆"></aside>
+        </div>
+      </section>
+
+      <section class="page" id="pg-matters" aria-labelledby="matters-title" hidden>
+        <header class="page-head">
+          <button class="icon-btn open-nav" data-open-nav aria-label="打开导航"><svg class="i"><use href="#i-sidebar"/></svg></button>
+          <div class="page-title"><h1 id="matters-title">事项</h1><p class="page-finding" id="matters-finding"></p></div>
+          <button class="btn" id="matters-add" type="button"><svg class="i"><use href="#i-plus"/></svg>新建</button>
+        </header>
+        <div class="page-body" id="matters-body">
+          <section class="page-list" id="matters-list" aria-label="事项清单"></section>
+          <aside class="page-detail" id="matters-detail" aria-label="详情"></aside>
+        </div>
+      </section>
+
+      <section class="page" id="pg-cron" aria-labelledby="cron-title" hidden>
+        <header class="page-head">
+          <button class="icon-btn open-nav" data-open-nav aria-label="打开导航"><svg class="i"><use href="#i-sidebar"/></svg></button>
+          <div class="page-title"><h1 id="cron-title">定时</h1><p class="page-finding" id="cron-finding"></p></div>
+        </header>
+        <div class="page-body" id="cron-body">
+          <section class="page-list" id="cron-list" aria-label="定时清单"></section>
+          <aside class="page-detail" id="cron-detail" aria-label="详情"></aside>
+        </div>
+      </section>
+
+      <section class="page" id="pg-inbox" aria-labelledby="inbox-title" hidden>
+        <header class="page-head">
+          <button class="icon-btn open-nav" data-open-nav aria-label="打开导航"><svg class="i"><use href="#i-sidebar"/></svg></button>
+          <div class="page-title"><h1 id="inbox-title">待处理</h1><p class="page-finding" id="inbox-finding"></p></div>
+        </header>
+        <div class="page-body" id="inbox-body">
+          <section class="page-list" id="inbox-list" aria-label="待处理清单"></section>
+          <aside class="page-detail" id="inbox-detail" aria-label="详情"></aside>
+        </div>
+      </section>
+
       <header class="topbar">
-        <button class="icon-btn open-nav" id="open-nav" aria-label="打开导航"><svg class="i"><use href="#i-sidebar"/></svg></button>
+        <button class="icon-btn open-nav" id="open-nav" data-open-nav aria-label="打开导航"><svg class="i"><use href="#i-sidebar"/></svg></button>
         <button class="title-btn"><h1 id="title">komo</h1><svg class="i"><use href="#i-down"/></svg></button>
         <div class="top-actions">
           <button class="icon-btn" id="fork" aria-label="分叉这段对话" title="分叉这段对话"><svg class="i"><use href="#i-branch"/></svg></button>
@@ -114,10 +178,20 @@
           <div id="panel-body"></div>
         </aside>
       </div>
-
     </main>
     <div class="scrim" id="scrim"></div>
   </div>
+
+  <!-- 设置是弹窗，不是页：开着它底下的会话或页面照旧。尺寸固定，换节只换右边的内容，长了在右边滚 -->
+  <dialog class="sdlg" id="settings" aria-labelledby="settings-title" tabindex="-1">
+    <div class="sdlg-side">
+      <h2 id="settings-title">设置</h2>
+      <nav class="set-nav" id="settings-nav" aria-label="设置分节"></nav>
+      <p class="sdlg-status" id="settings-finding"></p>
+    </div>
+    <div class="sdlg-main" id="settings-body"></div>
+    <button class="icon-btn sdlg-x" id="settings-close" aria-label="关闭设置"><svg class="i"><use href="#i-x"/></svg></button>
+  </dialog>
 
   <script src="app.js"></script>
 </body>

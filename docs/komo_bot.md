@@ -138,6 +138,25 @@ Gateway 对数据目录持有进程锁。多个 CLI 同时启动时，只允许�
 
 重载事件带新旧快照的差异（键名，不带值，凭证更不带）写进 Gateway 日志；`komo doctor` 显示当前生效配置的加载时间与来源文件 mtime，两者不一致就是"文件改了但没装上"，把上一次校验错误一并印出来。
 
+**从 Web 改模型配置（2026-10-29，认可）。** 文件仍是唯一的配置权威，Web 客户端改的也是同一个文件：Gateway 代写 `config.toml` 与 `.env`，写完走上面同一个重载函数。先只开放模型这一组——`[model_providers.<id>]`、completion 类的 `[model.<alias>]` 与 `[models] default`；Agent、渠道（§11.2 的身份名单）、MCP、记忆等其余各节仍只能编辑文件。
+
+- **读**：`GET /v1/config/models` 返回文件里写着的 provider 与模型（不是展开后的快照：看到的就是要改的），每个 provider 带"凭证在不在"（`env_key` 指向的变量在当前 `.env` / 进程环境里有没有值、`auth = "chatgpt"` 不用变量），**不返回任何凭证值**；另带一个 `version`（`config.toml` 与 `.env` 内容的哈希）。
+- **写**：provider 与模型的增、改、删，改默认模型。每次写都带读到的 `version`，文件此刻的哈希对不上（有人在编辑器里改过、或另一个窗口先写了）就 409，什么都不写。
+- **先校验后落盘**：Gateway 用 `toml_edit` 在原文上改（注释、空行、键序原样保留），把改后的文本连同 `.env` 交给与加载**同一个**解析 + 校验函数；有错误就 422 带问题清单，文件一个字节不动。通过后原子写（同目录临时文件 → fsync → rename → fsync 目录），`.env` 保持 0600，然后调用重载；重载若仍失败（两次之间文件被外部改了）就把两份文件写回改前的内容并报错。同一时刻只有一个写在进行。
+- **API key 只写进 `.env`**：provider 表单里填的 key 写成 `env_key` 指向的那一行（provider 没写 `env_key` 时用 `<ID 大写，非字母数字换成 _>_API_KEY` 并写回 provider），值用单引号原样保存（含单引号或换行的拒绝）；留空 = 不动现有的值。`config.toml` 里不出现凭证，日志、重载报告、响应都只出键名。
+- **删除有守卫**：还有模型引用的 provider、作为 `[models] default` 的模型、被 `[memory] model` 或某个 Agent 的 `model` 指着的模型，删除 409 并列出引用方。
+- 这几条接口与 `confirm` / `classify` 一样是操作者那一侧（回环 + bearer），不是对 Agent 的硬边界（§7 没有 Policy）。
+- **实现（2026-10-29）。** kernel `protocol::http` 的 `ConfigModelsResponse` / `ProviderEntry` / `ConfigModelEntry` / `ProviderUpsertRequest` / `ModelUpsertRequest` / `DefaultModelRequest` / `ConfigVersionRequest` / `ConfigEditResponse`；runtime `config::edit`（纯文本进、纯文本出：`models_view`、`upsert_provider`、`remove_provider`、`upsert_model`、`remove_model`、`set_default_model`、`set_env_value`、`config_version`）、`config::check_candidate`（与 `load_config` 共用 `assemble_checked`，不碰磁盘）、`env::secrets_from_text`、`ConfigHolder::{edit_lock, read_texts, check_texts, write_texts}`；gateway `http::config` 的六个 handler 共用一个 `edit`（锁 → 比版本 → 改 → 校验 → 原子写 → `reload::reload`，重载失败写回原文）。provider 表单的 `api_backend` 下拉只给 `responses` / `chat_completions` / `anthropic_messages`。测试：runtime `config::edit::tests` 十条（保留注释与键序、凭证只进 `.env`、变量名推导与旧拼法、`auth` 与 key 互斥、引用守卫、`.env` 就地替换与单引号原样）、`holder::tests::edited_texts_are_checked_before_they_touch_the_disk`（校验不碰文件、写后重载、`.env` 仍 0600）；gateway `service::tests::model_settings_are_edited_through_the_gateway_and_reloaded`（读 → 建 provider → 挂模型 → 改默认逐步热装上，旧版本 409、校验不过 422 且文件不动、在用的删不掉、响应里没有凭证值）。另在临时数据目录起一个前台 Gateway，经 Web 设置页真实走了一遍添加 provider（带 key）、添加模型、改默认、删默认模型被拒，核对了两份文件；没有碰真实的 `~/.komo`。`cargo test --workspace`：2519 通过、0 失败、12 忽略；`cargo fmt --check` 通过；`cargo tree -d` 里 toml 一族没有多出版本。未做：没装二进制、正在跑的 Gateway 还是旧版本，所以 5180 那份网页的模型一节在装上之前读不到。
+
+**从 Web 改常用设置与环境变量（2026-10-29，认可）。** 同一套写法（带 `version`、先校验后落盘、原子写、重载、失败写回原文、同一把锁）再开放两组：
+
+- **常用设置**：一张写死的白名单，一项一个键，其余键仍只在文件里改。`default_agent`（选一个已有的 `[agents.*]`）、`[memory] enabled`、`[memory] model`（选一个 completion 模型；不写 = 跟默认模型）、`[memory.retrieval] mode`（`hybrid` / `keyword` / `vector`）、`[compaction] enabled`、`[execution] model_result_bytes`（1–30720，上限见 §8.6 的投影）、`[execution] call_timeout_secs`、`[execution] confirm_timeout_mins`。`GET /v1/config/settings` 每项给：种类（开关 / 整数 / 选项）、文件里写的值（没写为空）、当前生效的值（从快照读；`memory.model` 没写时是默认模型的 alias）、选项或范围。`PUT /v1/config/settings/{key}` 带 `value`，`null` = 删掉这一行回到默认；键不在白名单 404，类型、范围、选项不对 400。只改这一行，节不存在就建上。
+- **环境变量**：`GET /v1/config/env` 按 `.env` 里的顺序列出变量名，再补上配置引用了、文件里却没有的名字（provider / 模型的 `env_key`、MCP 的 `bearer_token_env` 与 `env`、启用渠道的凭证名）。每个名字带：在不在文件里、当前有没有非空值（`.env` 或进程环境）、谁在用它。**任何值都不返回**——`.env` 是凭证文件，值只进不出。`PUT /v1/config/env` 一次设一批 `{name, value}`：名字只用大写字母、数字与 `_` 且不以数字开头（与 provider 的 `env_key` 同一条规则），值非空、不含单引号与换行，已有的行就地换掉、没有的追加；`DELETE /v1/config/env/{name}` 删掉那一行，还被配置引用的 409 并说出引用方，文件里没有的 404。
+- 所有写接口（含模型那一组）都回同一个 `ConfigEditResponse`：模型、常用设置、环境变量三份视图（共用一个新 `version`）加重载报告，客户端不用再分别重读。
+- Web 不显示两份文件的路径：设置页说"配置""环境变量"，不说它们在磁盘上的哪儿。
+- **实现（2026-10-29）。** kernel `protocol::http` 的 `ConfigSettingsResponse` / `ConfigSetting` / `SettingKind` / `SettingRequest` / `ConfigEnvResponse` / `EnvVarEntry` / `EnvSetRequest` / `EnvAssignment`，`ConfigEditResponse` 加 `settings` 与 `env`；`EnvAssignment` 与 `ProviderUpsertRequest` 的 `Debug` 不印值。runtime 新增 `config::settings`（白名单表、`settings_view`、`set_setting`），`config::edit` 加 `env_view`、`set_env_values`、`remove_env_value`（引用方：provider / 模型的凭证变量、MCP 的 `bearer_token_env` 与 `env`、启用渠道的 `channel_credentials`）；gateway `http::config` 加五个 handler，仍走同一个 `edit`。测试：runtime `config::settings::tests` 四条（视图与选项、就地写且注释还在、清掉删行且没写的不建节、类型 / 范围 / 选项 / 白名单外被拒）、`config::edit::tests` 新增两条（列名字与缺的引用且不出值、批量设与删的守卫）；gateway `service::tests::settings_and_env_vars_are_edited_through_the_gateway_without_values_leaking`。另在临时数据目录起前台 Gateway，经 Web 走了一遍：粘贴整段 `.env` 拆成两行一次保存、删在用的被拒、删没人用的、切开关、改下拉、存数字、越界数字被拒；核对了两份文件，`.env` 仍 0600，之后两份文件还原。`cargo test --workspace`：2526 通过、0 失败、12 忽略；`cargo fmt --check` 通过。没装二进制。
+
+
 Fedora 使用 systemd 管理，Mac 使用 launchd；服务管理器运行前台形式的 Gateway。**单元名是全局的（`komo-gateway.service` / `dev.komo.gateway`），只有默认数据目录 `~/.komo` 拥有它。** 别的 `KOMO_HOME` 走 `komo gateway` / `stop` / `restart` 会被**拒绝**并告诉你去前台跑 `KOMO_HOME=… komo gateway --foreground`：那条路会把单元文件改写成指向这个数据目录，现役服务随即被换掉——2026-09-21 实测过一次，`KOMO_HOME=/tmp/… komo config check` 经 `connect_or_start` 起服务，把现役单元换成了一份 debug 构建 + 沙箱数据目录。`komo gateway status` 会印出单元实际在服务哪个数据目录，与当前 `KOMO_HOME` 不一致时明说。**单元文件只设 `KOMO_HOME`（与可选的 `KOMO_LISTEN`）和 `PATH`，不加载 `.env`、不含任何凭证**。`PATH` 取自写单元的那个进程（操作者的 CLI），单元在每次 start / restart 时重写，`PATH` 随之刷新；写单元的进程没有 `PATH` 或为空就不写这一项，不编默认值。写它的原因（2026-09-24）：`bash` 工具的子进程继承 Gateway 的环境，而 launchd / systemd 默认只给 `/usr/bin:/bin:/usr/sbin:/sbin`——实测一次会话里 `komo`（`~/.cargo/bin`）与 `rg`（`/opt/homebrew/bin`）都是 `command not found`，白白耗掉几轮。`PATH` 不是凭证，下面几条理由都不适用于它。凭证不进单元的理由：launchd 没有 `EnvironmentFile` 的等价物，只能把值抄进 plist，那是把密钥复制到第二个文件；走进程环境还会让 `.env` 的热重载失效，并让每个子进程与日志都可能看到它。`.env` 由 Gateway 自己读成 `Secrets`（§3 热重载覆盖它），需要凭证的 Python 模块按**变量名**声明（§5.3），Gateway 在起子进程时按名注入。Mac 若后续需要操作用户桌面应用，应按登录用户的执行环境配置。后台服务不会让睡眠中的电脑继续执行任务。[Fedora systemd](https://fedoraproject.org/wiki/Packaging:Systemd) · [Apple launchd](https://developer.apple.com/library/archive/documentation/MacOSX/Conceptual/BPSystemStartup/Chapters/CreatingLaunchdJobs.html)
 
 **在 Gateway 里重启自己**（2026-10-13）。`bash` 工具的子进程带着 `KOMO_RUN`，`komo gateway stop` / `restart` 见到它就不当场做：同步做等于让 Gateway 停掉正在跑这条命令的自己——停机要等手上的调用收尾，那个调用正等着 Gateway 停下，互相等到服务管理器动手杀，这次调用的结果永远落不了盘；新 Gateway 起来时这条命令还在等它就绪，恢复扫描看见"上一代的子进程还活着"，把这条 Run 停在等人上（实测：TUI 里 `!komo gateway restart` 转了两分钟，事件订阅报 `error decoding response body`）。现在交给这条命令之外的人在它结束之后做：launchd 下起一个**自己进程组**的 `komo gateway <stop|restart> --after-pid <pid>`（`bootout` 不连它一起带走），等发起的命令退出再留 1.5 秒让结果落盘、Run 收尾，输出写 `logs/gateway-restart.log`；systemd 下后台进程躲不过 `stop`（同一个 cgroup），所以先按当前环境重写单元，再用 `systemd-run --user --on-active=2` 挂一次 `systemctl --user <verb>`。命令本身立刻返回一句"等它结束之后再重启"。`--after-pid` 是隐藏参数，只给那个后台进程用。只认 `bash`：`python` 的子进程没有 `KOMO_RUN`。systemd 这一支没有在真机上跑过（§14）。
@@ -1038,6 +1057,17 @@ CLI 通过 HTTP 发命令，通过 SSE 观察运行。Gateway 内部采用函数
 | GET /v1/models                   | completion alias 菜单：显示名、上游 model、provider、协议、上下文与 effort 档位 |
 | GET /v1/config/check             | 当前配置的校验结果（与热重载同一个函数）       |
 | POST /v1/config/reload           | 热重载；校验不过 422 并保留原配置               |
+| GET /v1/config/models            | 文件里写着的 provider、completion 模型与默认模型；每个 provider 带凭证在不在，不带值；带 `version`（§3「从 Web 改模型配置」） |
+| PUT /v1/config/model-providers/{id} | 新建或整份改一个 provider；可带 API key（只写 `.env`）；带 `version`，对不上 409，校验不过 422 不落盘 |
+| DELETE /v1/config/model-providers/{id} | 删 provider；还有模型引用它 409 |
+| PUT /v1/config/models/{alias}    | 新建或整份改一个 completion 模型 |
+| DELETE /v1/config/models/{alias} | 删模型；是默认模型或被 `[memory] model`、Agent 引用 409 |
+| PUT /v1/config/default-model     | 改 `[models] default` |
+| GET /v1/config/settings          | 常用设置白名单：每项的种类、文件里写的值、生效值、选项或范围；带 `version`（§3「从 Web 改常用设置与环境变量」） |
+| PUT /v1/config/settings/{key}    | 改一项常用设置，`value: null` 删掉回默认；不在白名单 404 |
+| GET /v1/config/env               | `.env` 里的变量名与配置引用却缺的名字：在不在文件、有没有值、谁在用；不返回任何值 |
+| PUT /v1/config/env               | 一次设一批变量（只写 `.env`）|
+| DELETE /v1/config/env/{name}     | 删一个变量；还被引用 409 |
 | POST /v1/mcp/reconnect           | 点名的 MCP 服务器（空 = 全部）断开重连，等握手完交回各自状态；名字不在配置里 400（`docs/mcp.md` §2.5） |
 | GET /v1/home-session             | 操作者的 home session（§11.2）                 |
 
@@ -1350,6 +1380,7 @@ kernel ← client ────────────────────�
 | `grep` + `ignore` | `0.4`，`default-features = false`；仅 komo-runtime（`rg` 工具） | 内嵌 ripgrep 的搜索与遍历，不起子进程：外部 `rg` 要么没装、要么各家版本不同，而遍历规则（隐藏文件、`.gitignore`、覆盖 glob）本来就该用这套实现。默认特性集是空的，写出来是钉住两件事：**不开 `pcre2`**（"正则语法 = Rust regex"是对模型可见的契约）与不引 SIMD 的 `avx-accel`。带进来的 13 个包（`globset`、`walkdir`、`termcolor`、`crossbeam-deque`、`encoding_rs_io`、`memmap2`、`bstr` 等）全是纯 Rust、无 C 工具链，且没有新的重复版本（2026-09-21 对 `cargo tree -d` 核过） |
 | `jiff` | `0.2`，默认特性（系统 tzdb + 系统时区）；komo-runtime、komo-client 与 komo-gateway | runtime：cron 的 `ZoneResolver`（IANA 区名 → 偏移，§10）。client：CLI 的时刻一律印成本机墙钟 + 偏移（`2026-09-25 14:00:00 +08:00`），偏移按每个时刻各自取，夏令时两侧不同。gateway：飞书话题上下文里每条消息的 `HH:MM`（§11.3，本机时区）；不用 `time` 的 `local-offset`，它只能取"现在"的偏移，且在多线程进程里拒绝返回。kernel 仍只用 `time` |
 | `arc-swap` | 默认；仅 komo-runtime（`config`） | §3 热重载的唯一 `Arc<ConfigSnapshot>` 原子替换 |
+| `toml_edit` | `0.25`，默认特性；仅 komo-runtime（`config::edit`） | §3「从 Web 改模型配置」：在 `config.toml` 原文上改并保留注释与键序。与 `toml 1.1` 共用 `toml_parser` / `toml_datetime` / `toml_writer`，不多出重复版本 |
 | `serde_ignored` | `0.1`，默认；仅 komo-runtime（`config`） | §3 的「不认识的键只警告」：包住 `toml::Deserializer`，把每个被忽略的键路径交给回调。只依赖 `serde`，不进别的 crate 的图 |
 | 判断后端（TypeSafe「System One」） | **不新增依赖**：走已有的 `reqwest`（`rustls-no-provider`）+ 同一个 ring provider；凭证只从 `.env` 的 `TYPESAFE_API_KEY` 读 | §9.4 的可选重排用它。默认关；开着时才会发请求，且会把候选记忆的正文（截到 200 字符）发给第三方端点 |
 | `tracing-subscriber` / `rustls`（**dev-only**） | 仅 komo-runtime 的 `[dev-dependencies]` | 前者用来抓 §47/§48 的行内指标做断言，后者让真机验收测试自己装一次 crypto provider（装 provider 是进程的事，见上面 `reqwest` 行）。**不进发布构建** |

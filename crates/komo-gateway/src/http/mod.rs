@@ -18,7 +18,7 @@ pub mod v2;
 use std::sync::Arc;
 
 use axum::Json;
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post, put};
 use axum::{Router, extract::State};
 use komo_kernel::protocol::PROTOCOL_VERSION;
 use komo_kernel::protocol::http::{HealthResponse, SessionSummary};
@@ -83,6 +83,20 @@ fn shared_routes() -> Router<Api> {
         .route("/v1/models", get(config::models))
         .route("/v1/config/check", get(config::check))
         .route("/v1/config/reload", post(config::reload))
+        .route("/v1/config/models", get(config::model_settings))
+        .route(
+            "/v1/config/model-providers/{id}",
+            put(config::put_provider).delete(config::delete_provider),
+        )
+        .route(
+            "/v1/config/models/{alias}",
+            put(config::put_model).delete(config::delete_model),
+        )
+        .route("/v1/config/default-model", put(config::put_default_model))
+        .route("/v1/config/settings", get(config::settings))
+        .route("/v1/config/settings/{key}", put(config::put_setting))
+        .route("/v1/config/env", get(config::env).put(config::put_env))
+        .route("/v1/config/env/{name}", delete(config::delete_env))
         .route("/v1/mcp/reconnect", post(mcp::reconnect))
 }
 

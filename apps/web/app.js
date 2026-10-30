@@ -43,6 +43,8 @@ const S = {
   navOpen: new Set(JSON.parse(localStorage.getItem("komo.navOpen") || "[]")), // 展开了子任务的父会话
   open: new Set(),        // 展开着的折叠（按稳定 id）
   stream: "idle",         // idle | live | retrying
+  page: "session",        // session | memory
+  mem: { status: "idle", error: "", bucket: "live", scope: "", query: "", hits: null, degraded: "", selected: null, index: null, mode: null, busy: "", fail: "", confirmForget: false, classify: false },
 };
 const newView = (id) => ({
   id, status: "loading", error: "", items: [], turns: new Map(), calls: new Map(), runs: new Map(), stats: { output: 0, input: 0, cache: 0, steps: 0 },
@@ -224,10 +226,11 @@ function apply(v, e) {
 async function boot() {
   S.boot = "loading"; render();
   try {
-    const [health, sessions, home, models, matters, memories] = await Promise.all([
+    const [health, sessions, home, models, matters, memories, inbox] = await Promise.all([
       api("/healthz"), api("/v1/sessions?all=1"), api("/v1/home-session"), api("/v1/models"),
-      api("/v1/matters"), api("/v1/memories"),
+      api("/v1/matters"), api("/v1/memories"), api("/v1/interventions").catch(() => null),
     ]);
+    S.inbox = inbox ? inbox.interventions : null;
     Object.assign(S, {
       health, sessions: sessions.sessions, homeId: home.session, models: models.models, matters: matters.matters,
       boot: "ready", lastGood: new Date(),
@@ -236,7 +239,10 @@ async function boot() {
     fillModels();
     render();
     loadTaskDetails();
-    openSession(routeSession() || S.homeId);
+    const sec = routeSettings(), r = routePage();
+    if (r) openPage(r.page, r.id);
+    else openSession(routeSession() || S.homeId);
+    if (sec) openSettings(sec);
   } catch (err) {
     S.boot = "error"; S.bootError = err.message; render();
   }
@@ -250,6 +256,7 @@ async function loadTaskDetails() {
 let source = null;
 async function openSession(id) {
   if (source) { source.close(); source = null; }
+  S.page = "session";
   S.current = id;
   S.view = newView(id);
   const parent = S.sessions.find((x) => x.session === id)?.home;
@@ -297,9 +304,10 @@ function refreshSide(e) {
   if (/^run\.(completed|failed|cancelled)$/.test(e.type) && S.view) loadTree(S.view);
   clearTimeout(sideTimer);
   sideTimer = setTimeout(async () => {
-    const [sessions, matters] = await Promise.allSettled([api("/v1/sessions?all=1"), api("/v1/matters")]);
+    const [sessions, matters, inbox] = await Promise.allSettled([api("/v1/sessions?all=1"), api("/v1/matters"), api("/v1/interventions")]);
     if (sessions.status === "fulfilled") S.sessions = sessions.value.sessions;
     if (matters.status === "fulfilled") S.matters = matters.value.matters;
+    if (inbox.status === "fulfilled") S.inbox = inbox.value.interventions;
     loadTaskDetails();
   }, 400);
 }
@@ -366,7 +374,7 @@ const passes = (s) => S.filter === "all" || (S.filter === "archived" ? archived(
 function sessionBtn(s, child = false, flat = false) {
   const live = running(s.session) ? `<span class="dot" role="img" aria-label="运行中"></span>` : "";
   const tag = archived(s) && S.filter !== "archived" ? `<span class="tag">已归档</span>` : flat && s.kind === "task" ? `<span class="tag">子任务</span>` : "";
-  return `<li><button class="session${child ? " child" : ""}${archived(s) ? " is-archived" : ""}" data-session="${s.session}" ${s.session === S.current ? 'aria-current="true"' : ""} title="${esc(titleOf(s))}">
+  return `<li><button class="session${child ? " child" : ""}${archived(s) ? " is-archived" : ""}" data-session="${s.session}" ${S.page === "session" && s.session === S.current ? 'aria-current="true"' : ""} title="${esc(titleOf(s))}">
     <span class="name">${esc(titleOf(s))}</span>${tag}${live}<span class="when num">${ago(s.updated_at)}</span></button></li>`;
 }
 const kidsOf = (s) => S.sessions.filter((k) => k.kind === "task" && k.home === s.session && passes(k)).sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
@@ -377,7 +385,7 @@ function withChildren(s) {
   const open = S.navOpen.has(s.session);
   const live = kids.filter((k) => running(k.session)).length;
   const own = running(s.session) ? `<span class="dot" role="img" aria-label="运行中"></span>` : "";
-  const row = `<li><div class="session parent${archived(s) ? " is-archived" : ""}" data-session="${s.session}" ${s.session === S.current ? 'aria-current="true"' : ""}>
+  const row = `<li><div class="session parent${archived(s) ? " is-archived" : ""}" data-session="${s.session}" ${S.page === "session" && s.session === S.current ? 'aria-current="true"' : ""}>
       <button class="sname" title="${esc(titleOf(s))}">${esc(titleOf(s))}</button>
       <button class="chev" data-kids="${s.session}" aria-expanded="${open}" aria-label="${open ? "收起" : "展开"} ${kids.length} 个子任务">${icon("right")}</button>
       ${own}<span class="when num">${ago(s.updated_at)}</span></div></li>`;
@@ -743,11 +751,12 @@ function renderPanel() {
     return;
   }
   const v = S.view;
-  const stateName = { active: "进行中", waiting: "等待中", parked: "搁置", managed: "在管" };
+  const stateName = { active: "进行中", waiting: "在等", parked: "搁置" };
   const matters = S.matters.length
-    ? S.matters.map((m) => `<div class="row">${icon(m.kind === "area" ? "clock" : "target")}<div class="main-t"><div class="line1"><span class="what">${esc(m.title)}</span><span class="pill${m.state === "waiting" ? " wait" : ""}">${esc(stateName[m.state] || m.state)}</span></div>
-        ${m.next || m.waiting_on ? `<div class="line2 one">${esc(m.waiting_on ? `在等 ${m.waiting_on}` : `下一步 ${m.next}`)}</div>` : ""}</div></div>`).join("")
+    ? S.matters.map((m) => `<div class="row">${icon(m.kind === "area" ? "clock" : "target")}<div class="main-t"><div class="line1"><span class="what">${esc(m.title)}</span>${m.kind === "goal" ? `<span class="pill${m.state === "waiting" ? " wait" : ""}">${esc(stateName[m.state] || m.state)}</span>` : ""}</div>
+        ${m.next || m.waiting_for || m.standard ? `<div class="line2 one">${esc(m.waiting_for ? `在等 ${m.waiting_for}` : m.next ? `下一步 ${m.next}` : `标准 ${m.standard}`)}</div>` : ""}</div></div>`).join("")
     : empty("没有进行中的目标或在管的领域。");
+  const mattersFoot = `<a class="card-foot" href="#/matters">全部事项</a>`;
 
   const uses = v?.recall || [];
   const activeCount = [...S.memories.values()].filter((m) => m.state === "active").length;
@@ -757,7 +766,7 @@ function renderPanel() {
         return `<div class="row"><span class="mote ${m?.application === "convention" ? "full" : "ring"}" aria-hidden="true"></span><div class="main-t">${m ? esc(m.content) : esc(u.memory)}
           <div class="line2">${m ? `${m.application === "convention" ? "约定" : "线索"} · 用过 ${m.usage?.count ?? 0} 次 · v${u.revision}` : "库里已经没有这条"}</div></div></div>`;
       }).join("")
-    : empty(v?.status === "loading" ? "正在读这段对话。" : "最近这一轮没有带上记忆。")) + `<a class="card-foot" href="#">全部 ${activeCount} 条生效的记忆</a>`;
+    : empty(v?.status === "loading" ? "正在读这段对话。" : "最近这一轮没有带上记忆。")) + `<a class="card-foot" href="#/memory">全部 ${activeCount} 条生效的记忆</a>`;
 
   const ctx = contextCard(v);
 
@@ -778,12 +787,1150 @@ function renderPanel() {
     <p class="empty-line">渠道和 MCP 的连接状态，Gateway 还没有接口可查。</p>`;
 
   $("panel-body").innerHTML =
-    card("c-matters", "在做的事", S.matters.length, matters) +
+    card("c-matters", "在做的事", S.matters.length, matters + mattersFoot) +
     card("c-memory", "带上的记忆", uses.length, memory) +
     card("c-context", "上下文", ctx.value, ctx.body, false) +
     card("c-bg", "在后台", runningKids.length ? `${runningKids.length} 个在跑` : kids.length, bg) +
     card("c-conn", "连接", h.telemetry?.last_error ? "有问题" : "正常", conn, false);
 }
+
+/* ---------- 记忆页 ----------
+   一屏回答：komo 现在把哪些关于我的事带进对话，哪些等我过目。
+   上面是"在场光阶"：每条记忆一个光点，按离 prompt 的远近分四档，兼作筛选；下面列表 + 详情。
+   列表是库存（GET /v1/memories，带归档的），检索走同一接口带 query（混合检索，降级如实写）。 */
+const RUNGS = [
+  ["always", "每次都带", "约定", (m) => m.state === "active" && m.application === "convention"],
+  ["relevant", "相关才带", "线索", (m) => m.state === "active" && m.application !== "convention"],
+  ["paused", "暂停", "候选与有争议", (m) => m.state === "candidate" || m.state === "contested"],
+  ["out", "不再带", "已不生效", (m) => ["forgotten", "superseded", "archived"].includes(m.state)],
+];
+const rungOf = (m) => RUNGS.find((r) => r[3](m))?.[0];
+const inBucket = (m, b) => (b === "live" ? m.state === "active" : rungOf(m) === b);
+const STATE_NAME = { active: "生效", candidate: "候选", contested: "有争议", superseded: "被取代", forgotten: "已遗忘", archived: "已归档" };
+const KIND_NAME = { preference: "偏好", fact: "事实", experience: "经验" };
+const PROV_NAME = { user_statement: "用户原话", tool_observation: "工具观察", model_inference: "模型推断" };
+const useName = (m) => (m.application === "convention" ? "约定" : m.application === "reference" ? "线索" : "线索（未分类）");
+const scopeKey = (s) => (s.kind === "personal" ? "personal" : `${s.kind}:${s.project_id || s.instance_id || s.agent_id || ""}`);
+const scopeName = (s) => (s.kind === "personal" ? "个人" : s.kind === "project" ? s.project_id : s.kind === "environment" ? `环境 ${s.instance_id}` : `Agent ${s.agent_id}`);
+const moteClass = (m) => (m.state === "active" ? (m.application === "convention" ? "full" : "ring") : m.state === "contested" ? "alert" : m.state === "candidate" ? "pale" : "off");
+const day = (iso) => { const d = new Date(iso); return `${d.getMonth() + 1}月${d.getDate()}日`; };
+const memList = () => [...S.memories.values()];
+
+async function openMemory(id = null) {
+  if (source) { source.close(); source = null; }
+  S.page = "memory";
+  const M = S.mem;
+  M.selected = id; M.confirmForget = false; M.classify = false; M.fail = "";
+  if (id && S.memories.get(id)) M.bucket = inBucket(S.memories.get(id), "live") ? "live" : rungOf(S.memories.get(id));
+  setMemHash();
+  render();
+  M.status = "loading"; render();
+  try {
+    const [list, index, all] = await Promise.all([api("/v1/memories?include_archived=true&limit=500"), api("/v1/memory-index").catch(() => null), api("/v1/matters?all=true").catch(() => null)]);
+    if (all) S.allMatters = all.matters;
+    S.memories = new Map(list.memories.map((m) => [m.id, m]));
+    M.index = index; M.status = "ready"; S.lastGood = new Date();
+    if (M.selected && !S.memories.has(M.selected)) M.selected = null;
+    if (M.selected) M.bucket = inBucket(S.memories.get(M.selected), "live") ? "live" : rungOf(S.memories.get(M.selected));
+  } catch (err) {
+    M.status = "error"; M.error = err.message;
+  }
+  render();
+}
+function setMemHash() {
+  const want = S.mem.selected ? `#/memory/${S.mem.selected}` : "#/memory";
+  if (location.hash !== want) history.replaceState(null, "", want);
+}
+function memRows() {
+  const M = S.mem;
+  let rows = M.hits ?? memList().filter((m) => inBucket(m, M.bucket));
+  if (M.scope) rows = rows.filter((m) => scopeKey(m.scope) === M.scope);
+  if (M.hits) return rows; // 检索结果保持检索的排序
+  // 在起作用的：约定在前，再按带上次数；不再带的：最近变动的在前
+  return rows.sort((a, b) =>
+    M.bucket === "out" ? new Date(b.updated_at) - new Date(a.updated_at)
+      : (b.application === "convention") - (a.application === "convention") || (b.usage?.count || 0) - (a.usage?.count || 0));
+}
+function memFinding() {
+  const all = memList();
+  const contested = all.filter((m) => m.state === "contested").length;
+  const candidate = all.filter((m) => m.state === "candidate").length;
+  const live = all.filter((m) => m.state === "active");
+  const unseen = live.filter((m) => m.confirmation !== "user_confirmed").length;
+  if (contested) return `${contested} 条有冲突，暂停带上，等你定哪条算数。`;
+  if (candidate) return `${candidate} 条候选还没进召回，等你看。`;
+  if (!live.length) return "现在没有生效的记忆：对话空闲后，komo 会从里面整理。";
+  if (!unseen) return `在起作用的 ${live.length} 条你都确认过。`;
+  return unseen === live.length ? `在起作用的 ${live.length} 条都还没过目。` : `在起作用的 ${live.length} 条里，${unseen} 条还没过目。`;
+}
+/* 攒下的记忆：横轴是记下的日子（跨度超过 60 天按周并），一天一格，格里一个点是一条记忆。
+   颜色是在场程度（同光阶），点的面积按带进对话的次数（开方）；格内从左下往上排，在起作用的在下面。
+   图例就是筛选：选中一档时其余点淡下去，列表跟着换。 */
+const VIZ_CELL = 22;
+function memChart(all, M, width) {
+  if (!all.length) return `<p class="empty-frame">还没有记忆：对话空闲一会儿后，komo 会从里面整理出偏好、事实和经验。</p>`;
+  const today = ymd(new Date());
+  const first = all.reduce((a, m) => (ymd(new Date(m.created_at)) < a ? ymd(new Date(m.created_at)) : a), today);
+  const spanDays = dayDiff(today, first) + 1, bin = spanDays > 60 ? 7 : 1;
+  const nCols = Math.max(1, Math.ceil(spanDays / bin));
+  const padL = 4, padR = 4, axisH = 26, W = Math.max(280, width);
+  const colW = (W - padL - padR) / nCols;
+  const per = Math.max(1, Math.min(4, Math.floor((colW - 6) / VIZ_CELL))); // 每格最多四列，往上堆成柱
+  const maxUse = Math.max(1, ...all.map((m) => m.usage?.count || 0));
+  const rank = { always: 0, relevant: 1, paused: 2, out: 3 };
+  const cols = Array.from({ length: nCols }, () => []);
+  for (const m of all) cols[Math.min(nCols - 1, Math.floor(dayDiff(ymd(new Date(m.created_at)), first) / bin))].push(m);
+  for (const c of cols) c.sort((a, b) => rank[rungOf(a)] - rank[rungOf(b)] || (b.usage?.count || 0) - (a.usage?.count || 0));
+  const rows = Math.max(1, ...cols.map((c) => Math.ceil(c.length / per)));
+  const H = 26 + rows * VIZ_CELL + axisH, base = H - axisH;
+  const lit = (m) => !M.hits && (M.bucket === "live" ? m.state === "active" : rungOf(m) === M.bucket);
+  const dots = cols.map((c, ci) => {
+    const x0 = padL + ci * colW + (colW - Math.min(c.length, per) * VIZ_CELL) / 2;
+    return c.map((m, i) => {
+      const cx = x0 + (i % per) * VIZ_CELL + VIZ_CELL / 2, cy = base - Math.floor(i / per) * VIZ_CELL - VIZ_CELL / 2 - 2;
+      const r = 3.5 + 5.5 * Math.sqrt((m.usage?.count || 0) / maxUse);
+      const k = moteClass(m);
+      return `<circle class="vz ${k}${lit(m) ? "" : " dim"}${m.id === M.selected ? " sel" : ""}" cx="${cx.toFixed(1)}" cy="${cy.toFixed(1)}" r="${r.toFixed(1)}" data-mem="${m.id}"><title>${esc(m.content)}（${STATE_NAME[m.state]}，带上 ${m.usage?.count || 0} 次）</title></circle>`;
+    }).join("");
+  }).join("");
+  const tops = cols.map((c, ci) => (c.length ? `<text class="tally" x="${(padL + (ci + 0.5) * colW).toFixed(1)}" y="${(base - Math.ceil(c.length / per) * VIZ_CELL - 8).toFixed(1)}" text-anchor="middle">+${c.length}</text>` : "")).join("");
+  const step = Math.ceil(nCols / Math.max(2, Math.floor(W / 84)));
+  const labels = cols.map((_, ci) => {
+    if (ci % step && ci !== nCols - 1) return "";
+    const d = new Date(`${first}T00:00:00`); d.setDate(d.getDate() + ci * bin);
+    const text = ci === nCols - 1 && bin === 1 ? "今天" : `${d.getMonth() + 1}月${d.getDate()}日${bin > 1 ? "那周" : ""}`;
+    return `<text x="${(padL + (ci + 0.5) * colW).toFixed(1)}" y="${H - 8}" text-anchor="middle">${text}</text>`;
+  }).join("");
+  const seams = cols.map((_, ci) => (ci ? `<line x1="${(padL + ci * colW).toFixed(1)}" x2="${(padL + ci * colW).toFixed(1)}" y1="8" y2="${base}" class="seam"/>` : "")).join("");
+  return `<svg class="viz" viewBox="0 0 ${W} ${H}" width="${W}" height="${H}" role="img" aria-label="${all.length} 条记忆按记下的日子排开">
+    ${seams}<line x1="0" x2="${W}" y1="${base}" y2="${base}" class="axis"/>${dots}${tops}${labels}</svg>`;
+}
+function renderLadder() {
+  const M = S.mem, all = memList(), el = $("mem-ladder");
+  const loading = M.status !== "ready";
+  const tabs = RUNGS.map(([key, label, sub, test]) => {
+    const n = all.filter(test).length;
+    const on = !M.hits && (M.bucket === key || (M.bucket === "live" && (key === "always" || key === "relevant")));
+    const sw = { always: "full", relevant: "ring", paused: "pale", out: "off" }[key];
+    return `<button class="rung" role="tab" aria-selected="${on}" data-rung="${key}" title="${sub}" ${loading ? "disabled" : ""}>
+      <span class="mote ${sw}" aria-hidden="true"></span><span class="rung-label">${label}</span><span class="rung-val num${n ? "" : " zero"}">${loading ? "—" : n}</span></button>`;
+  }).join("");
+  const width = Math.round((el.clientWidth || 1000) - 2 * 20);
+  el.innerHTML = `<div class="viz-head"><div><h2 class="viz-title">攒下的记忆</h2><p class="viz-note">一个点一条记忆，按记下的日子排；点越大，带进对话的次数越多。</p></div>
+      <div class="rungs" role="tablist" aria-label="按离对话的远近筛选">${tabs}</div></div>
+    ${loading ? `<div class="viz-sk"><span class="skeleton" style="width:100%;height:96px"></span></div>` : memChart(all, M, width)}`;
+}
+function rowAction(m) {
+  if (m.state === "forgotten") return `<button class="text-btn" data-mem-act="restore" data-id="${m.id}">恢复</button>`;
+  if (m.state !== "active" && m.state !== "candidate" && m.state !== "contested") return `<span class="muted">—</span>`;
+  if (m.confirmation === "user_confirmed") return `<span class="confirmed">${icon("check")}已确认</span>`;
+  return `<button class="btn ghost sm" data-mem-act="confirm" data-id="${m.id}" title="确认第 ${m.revision} 版的文字">确认</button>`;
+}
+function renderMemRows() {
+  const M = S.mem;
+  if (M.status === "error") {
+    $("mem-rows").innerHTML = `<div class="block-error"><p>记忆没取到：${esc(M.error)}。</p><button class="text-btn" data-mem-reload>重试</button></div>`;
+    return;
+  }
+  if (M.status !== "ready") { $("mem-rows").innerHTML = skeletonRows(5, "sk-row mrow-sk"); return; }
+  const rows = memRows();
+  const head = `<div class="mhead" aria-hidden="true"><span></span><span>内容</span><span class="r">带上 / 用上</span><span class="r">最近带上</span><span></span></div>`;
+  const none = M.hits ? "没有检索到相关的记忆。" : { live: "现在没有生效的记忆。", always: "还没有约定：你说「以后都…」「默认…」这类话时，komo 会记成约定。", relevant: "没有生效的线索。", paused: "没有候选或有争议的记忆。", out: "没有遗忘、被取代或归档的记忆。" }[M.bucket];
+  $("mem-rows").innerHTML = rows.length
+    ? head + `<ul class="mrows">${rows.map((m) => {
+        const sub = [useName(m), m.application === "convention" && m.applies_when ? m.applies_when : null, scopeName(m.scope), m.state !== "active" ? STATE_NAME[m.state] : null].filter(Boolean);
+        return `<li class="mrow${m.id === M.selected ? " on" : ""}">
+          <span class="mote ${moteClass(m)}" aria-hidden="true"></span>
+          <button class="mrow-main" data-mem="${m.id}" ${m.id === M.selected ? 'aria-current="true"' : ""}><span class="mtext">${esc(m.content)}</span><span class="msub">${sub.map(esc).join('<span class="sep">·</span>')}</span></button>
+          <span class="mnum num r">${m.usage?.count || 0}<small>${m.usage?.adopted_count ? `用上 ${m.usage.adopted_count}` : "用上 0"}</small></span>
+          <span class="mwhen num r">${m.usage?.last_used_at ? ago(m.usage.last_used_at) : `<span class="muted">—</span>`}</span>
+          <span class="mact">${rowAction(m)}</span></li>`;
+      }).join("")}</ul>`
+    : `<p class="empty-frame">${none}</p>`;
+}
+function evidenceRow(e) {
+  const r = e.reference || {};
+  const when = `${day(e.observed_at)} ${clock(new Date(e.observed_at))}`;
+  if (r.kind === "event") {
+    const s = S.sessions.find((x) => x.session === r.session);
+    return `<li class="ev"><span class="ev-what">${esc(PROV_NAME[e.provenance] || e.provenance)}<span class="sep">·</span><span class="num">${when}</span></span>
+      ${s ? `<a class="ev-link" href="#/s/${r.session}">${esc(titleOf(s))}${icon("right")}</a>` : `<span class="muted">会话已不在列表里</span>`}</li>`;
+  }
+  return `<li class="ev"><span class="ev-what">Memos 记录<span class="sep">·</span><span class="num">${when}</span></span><span class="muted">${esc(r.instance)} / ${esc(r.record_id)}</span></li>`;
+}
+function addForm() {
+  const scopes = new Map([["personal", "个人"]]);
+  for (const m of memList()) scopes.set(scopeKey(m.scope), scopeName(m.scope));
+  return `<form class="mform" id="mem-form">
+    <div class="detail-top"><h2 class="detail-h">记一条</h2><button type="button" class="icon-btn" data-mem-close aria-label="关闭">${icon("x")}</button></div>
+    <p class="hint">你在这里记的算你亲口说的，直接记成已确认。</p>
+    <label class="lbl" for="f-content">内容</label>
+    <textarea id="f-content" name="content" rows="3" maxlength="300" required placeholder="一句话，单一的一件事"></textarea>
+    <div class="two">
+      <div><label class="lbl" for="f-kind">种类</label><select class="select" id="f-kind" name="kind"><option value="preference">偏好</option><option value="fact">事实</option><option value="experience">经验</option></select></div>
+      <div><label class="lbl" for="f-scope">作用域</label><select class="select" id="f-scope" name="scope">${[...scopes].map(([k, n]) => `<option value="${esc(k)}">${esc(n)}</option>`).join("")}</select></div>
+    </div>
+    <fieldset class="seg"><legend class="lbl">怎么用</legend>
+      <label><input type="radio" name="application" value="reference" checked>线索：查找与判断时参考</label>
+      <label><input type="radio" name="application" value="convention">约定：条件成立就照做</label>
+    </fieldset>
+    <div id="f-when-wrap" hidden><label class="lbl" for="f-when">什么时候适用</label><input class="input" id="f-when" name="applies_when" placeholder="例：创建发布工单、需要选 Platform 时"></div>
+    ${S.mem.fail ? `<p class="form-err">${esc(S.mem.fail)}</p>` : ""}
+    <div class="actions"><button class="btn primary" type="submit" ${S.mem.busy ? "disabled" : ""}>${S.mem.busy ? "正在记" : "记下"}</button><button class="btn" type="button" data-mem-close>取消</button></div>
+  </form>`;
+}
+function renderMemDetail() {
+  const M = S.mem, el = $("mem-detail");
+  if (M.selected === "new") { el.innerHTML = addForm(); return; }
+  const m = M.selected && S.memories.get(M.selected);
+  if (M.status !== "ready" && !m) { el.innerHTML = M.status === "error" ? "" : `<div class="detail-pad">${skeletonRows(4, "sk-row in-card")}</div>`; return; }
+  if (!m) { el.innerHTML = `<p class="empty-frame">选一条，看它从哪来、带上过几次。</p>`; return; }
+  const live = m.state === "active" || m.state === "candidate" || m.state === "contested";
+  const unconfirmed = m.confirmation !== "user_confirmed";
+  const matter = m.belongs_to && (S.allMatters || S.matters).find((x) => x.id === m.belongs_to);
+  const kv = [
+    ["作用域", esc(scopeName(m.scope))],
+    ["种类", esc(KIND_NAME[m.kind] || m.kind)],
+    ["来源", `${esc(PROV_NAME[m.provenance] || m.provenance)}${m.provenance === "user_statement" && unconfirmed ? "，自动整理" : ""}`],
+    ["版本", `第 <span class="num">${m.revision}</span> 版 · ${unconfirmed ? "未确认" : "已确认"}`],
+    ["带上", m.usage?.count ? `<span class="num">${m.usage.count}</span> 次 · 最近 <span class="num">${ago(m.usage.last_used_at)}</span>` : `<span class="num">0</span> 次`],
+    ["用上", `<span class="num">${m.usage?.adopted_count || 0}</span> 次${m.usage?.last_adopted_at ? ` · 最近 <span class="num">${ago(m.usage.last_adopted_at)}</span>` : ""}`],
+    ["记下", `<span class="num">${day(m.created_at)}</span> · ${esc(m.extraction?.model || "")}${m.extraction?.prompt_version ? ` · ${esc(m.extraction.prompt_version)}` : ""}`],
+    ["归属", matter ? `<a class="ev-link" href="#/matters/${matter.id}">${esc(matter.title)}</a>${matter.closed_at ? `<span class="muted">（已结案）</span>` : ""}` : m.belongs_to ? `<span class="muted">事项已不在</span>` : `<span class="muted">—</span>`],
+  ];
+  if (m.valid_until) kv.push(["有效到", `<span class="num">${day(m.valid_until)}</span>`]);
+  const link = (ref, verb) => ref ? `${verb} <a class="ev-link" href="#/memory/${ref.memory}">${S.memories.has(ref.memory) ? esc(S.memories.get(ref.memory).content.slice(0, 24)) + "…" : "另一条"}</a>` : "";
+  const chain = [link(m.supersedes, "取代了"), link(m.superseded_by, "被这条取代：")].filter(Boolean).join("<br>");
+  const ev = m.evidence || [];
+  const classifyTo = m.application === "convention" ? "reference" : "convention";
+  const classify = M.classify
+    ? `<form class="mform inline" id="classify-form">
+        <label class="lbl" for="c-when">什么时候适用</label>
+        <input class="input" id="c-when" name="applies_when" required value="${esc(m.applies_when || "")}" placeholder="例：创建发布工单、需要选 Platform 时">
+        <div class="actions"><button class="btn primary" type="submit" ${M.busy ? "disabled" : ""}>改成约定</button><button class="btn" type="button" data-mem-act="classify-cancel">取消</button></div></form>`
+    : "";
+  const forget = M.confirmForget
+    ? `<div class="danger"><p>遗忘后这条不再带进对话，同一来源也不会再被整理出来。原对话不删。</p>
+        <div class="actions"><button class="btn danger-btn" data-mem-act="forget" data-id="${m.id}" ${M.busy ? "disabled" : ""}>遗忘第 ${m.revision} 版</button><button class="btn" data-mem-act="forget-cancel">取消</button></div></div>`
+    : "";
+  const acts = live
+    ? `<div class="actions">
+        ${unconfirmed ? `<button class="btn primary" data-mem-act="confirm" data-id="${m.id}" ${M.busy ? "disabled" : ""}>确认第 ${m.revision} 版</button>` : ""}
+        ${m.state === "active" && !M.classify ? (classifyTo === "convention" && m.kind !== "preference" ? "" : `<button class="btn" data-mem-act="${classifyTo === "convention" ? "classify-open" : "classify-ref"}" data-id="${m.id}" ${M.busy ? "disabled" : ""}>改成${classifyTo === "convention" ? "约定" : "线索"}</button>`) : ""}
+      </div>
+      ${classify}
+      ${M.confirmForget ? forget : `<button class="text-btn danger-link" data-mem-act="forget-ask">遗忘这条</button>`}`
+    : m.state === "forgotten"
+      ? `<div class="actions"><button class="btn primary" data-mem-act="restore" data-id="${m.id}" ${M.busy ? "disabled" : ""}>恢复</button></div>`
+      : `<p class="hint">${m.state === "archived" ? "所属的事结案后归档；重开那件事时恢复。" : "被新的一条取代，不再带上。"}</p>`;
+  el.innerHTML = `<div class="detail-pad">
+    <div class="detail-top"><button class="icon-btn back" data-mem-close aria-label="回到列表">${icon("left")}</button>
+      <span class="detail-kind"><span class="mote ${moteClass(m)}" aria-hidden="true"></span>${esc(useName(m))}</span>
+      <span class="pill${m.state === "contested" ? " bad" : m.state === "active" ? "" : " off"}">${STATE_NAME[m.state] || m.state}</span></div>
+    <p class="detail-text">${esc(m.content)}</p>
+    ${m.applies_when ? `<p class="detail-when"><span class="muted">适用于</span>${esc(m.applies_when)}</p>` : ""}
+    ${M.fail ? `<p class="form-err">${esc(M.fail)}</p>` : ""}
+    ${acts}
+    <dl class="kv">${kv.map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join("")}</dl>
+    ${chain ? `<p class="hint chain">${chain}</p>` : ""}
+    <h3 class="sub-h">证据 <span class="num muted">${ev.length}</span></h3>
+    ${ev.length ? `<ul class="evs">${ev.map(evidenceRow).join("")}</ul>` : `<p class="hint">没有事件证据：这条是你在终端或这里亲手记的。</p>`}
+  </div>`;
+}
+function renderMemory() {
+  const M = S.mem;
+  $("mem-finding").textContent = M.status === "ready" ? memFinding() : M.status === "error" ? "记忆没取到。" : " ";
+  renderLadder();
+  const n = M.status === "ready" ? memRows().length : null;
+  const title = M.hits ? `检索「${M.query}」` : { live: "在起作用", always: "每次都带", relevant: "相关才带", paused: "暂停", out: "不再带" }[M.bucket];
+  $("mem-list-title").innerHTML = `${esc(title)}${n == null ? "" : ` <span class="muted">${n} 条</span>`}`;
+  const scopes = new Map();
+  for (const m of memList()) scopes.set(scopeKey(m.scope), scopeName(m.scope));
+  $("mem-scope").innerHTML = `<option value="">全部作用域</option>` + [...scopes].sort((a, b) => (a[0] === "personal" ? -1 : b[0] === "personal" ? 1 : a[1].localeCompare(b[1]))).map(([k, nme]) => `<option value="${esc(k)}" ${k === M.scope ? "selected" : ""}>${esc(nme)}</option>`).join("");
+  renderMemRows();
+  // 详情：宽屏常驻右侧，默认选中列表第一条；窄屏是推进去的一层
+  if (wide() && M.status === "ready" && !M.selected && memRows().length) M.selected = memRows()[0].id;
+  renderMemDetail();
+  app.classList.toggle("detail-open", !!M.selected);
+  const ix = M.index;
+  $("mem-index").innerHTML = M.degraded
+    ? `检索降级了：${esc(M.degraded)}`
+    : ix ? `检索用关键词 + 向量 · ${esc(ix.space?.model || "")} · 已索引 <span class="num">${ix.indexed} / ${ix.total}</span> 条生效的${ix.state !== "ready" ? ` · 索引${ix.state === "building" ? "正在建" : "不可用"}` : ""}` : "";
+}
+async function memAct(act, id) {
+  const M = S.mem, m = S.memories.get(id);
+  if (!m) return;
+  const path = { confirm: "confirm", forget: "forget", restore: "restore" }[act];
+  M.busy = act; M.fail = ""; render();
+  try {
+    const r = await api(`/v1/memories/${id}/${path}`, { method: "POST", body: JSON.stringify({ expected_revision: m.revision, request_key: `web:${act}:${id}:${m.revision}` }) });
+    S.memories.set(id, r.memory);
+    M.confirmForget = false;
+  } catch (err) { M.fail = `没${{ confirm: "确认", forget: "遗忘", restore: "恢复" }[act]}成：${err.message}`; }
+  M.busy = ""; render();
+}
+async function memClassify(id, application, appliesWhen) {
+  const M = S.mem, m = S.memories.get(id);
+  M.busy = "classify"; M.fail = ""; render();
+  const body = { expected_revision: m.revision, application, request_key: `web:classify:${id}:${m.revision}:${application}` };
+  if (appliesWhen) body.applies_when = appliesWhen;
+  try { const r = await api(`/v1/memories/${id}/classify`, { method: "POST", body: JSON.stringify(body) }); S.memories.set(id, r.memory); M.classify = false; }
+  catch (err) { M.fail = `没改成：${err.message}`; }
+  M.busy = ""; render();
+}
+async function memAdd(form) {
+  const M = S.mem, f = new FormData(form);
+  const key = f.get("scope"), [kind, ...rest] = key.split(":");
+  const scope = kind === "personal" ? { kind } : { kind, [{ project: "project_id", environment: "instance_id", agent: "agent_id" }[kind]]: rest.join(":") };
+  const body = { content: f.get("content").trim(), kind: f.get("kind"), scope, application: f.get("application"), request_key: `web:add:${crypto.randomUUID()}` };
+  if (body.application === "convention") body.applies_when = String(f.get("applies_when") || "").trim();
+  M.busy = "add"; M.fail = ""; render();
+  try {
+    const r = await api("/v1/memories", { method: "POST", body: JSON.stringify(body) });
+    S.memories.set(r.memory.id, r.memory);
+    M.bucket = "live"; M.hits = null; M.selected = r.memory.id; setMemHash();
+  } catch (err) { M.fail = `没记下：${err.message}`; }
+  M.busy = ""; render();
+}
+let memSearchTimer = null;
+function memSearch(q) {
+  const M = S.mem;
+  M.query = q;
+  clearTimeout(memSearchTimer);
+  if (!q) { M.hits = null; M.degraded = ""; render(); return; }
+  memSearchTimer = setTimeout(async () => {
+    try {
+      const r = await api(`/v1/memories?query=${encodeURIComponent(q)}&include_archived=true&limit=30`);
+      if (M.query !== q) return;
+      for (const m of r.memories) S.memories.set(m.id, m);
+      M.hits = r.memories; M.degraded = r.degraded ? r.degraded_reason || "原因没有给出" : "";
+    } catch (err) { M.hits = []; M.degraded = err.message; }
+    render();
+  }, 250);
+}
+
+/* ---------- 页面框架：记忆之外的四页共用 ----------
+   每页一个状态块：st（idle | loading | ready | error）、selected（选中的 id，"new" = 新建表单）、
+   form（详情里展开的那张小表单）、busy / fail（写操作进行中 / 失败原因）、notice（写完之后的一句回执）。 */
+const PAGES = { memory: "mem", matters: "pg-matters", cron: "pg-cron", inbox: "pg-inbox" };
+const PAGE_NAME = { memory: "记忆", matters: "事项", cron: "定时", inbox: "待处理" };
+const routePage = () => { const m = location.hash.match(/^#\/(memory|matters|cron|inbox)(?:\/([\w-]+))?/); return m ? { page: m[1], id: m[2] || null } : null; };
+// 设置是弹窗，平时不占地址；#/settings[/节] 只当入口用，打开后地址换回底下那一页
+const routeSettings = () => { const m = location.hash.match(/^#\/settings(?:\/(\w+))?/); return m ? m[1] || "models" : null; };
+const pageState = () => ({ st: "idle", error: "", selected: null, form: null, busy: "", fail: "", notice: null, confirm: null });
+S.pg = { matters: { ...pageState(), items: [], today: null, showClosed: false }, cron: { ...pageState(), jobs: [], status: new Map() }, inbox: { ...pageState(), items: [] }, settings: { ...pageState(), data: {}, result: {}, edit: null } };
+const LOADERS = {
+  async matters(P) {
+    const [list, mems, cron] = await Promise.all([api("/v1/matters?all=true"), api("/v1/memories?include_archived=true&limit=500").catch(() => null), api("/v1/cron").catch(() => null)]);
+    P.items = list.matters; P.today = list.today; S.allMatters = list.matters;
+    if (mems) S.memories = new Map(mems.memories.map((m) => [m.id, m]));
+    if (cron) { S.pg.cron.jobs = cron.jobs; S.pg.cron.status = new Map(cron.status.map((x) => [x.job, x])); }
+  },
+  async cron(P) {
+    const [list, all] = await Promise.all([api("/v1/cron"), api("/v1/matters?all=true").catch(() => null)]);
+    P.jobs = list.jobs; P.status = new Map(list.status.map((x) => [x.job, x]));
+    if (all) S.allMatters = all.matters;
+  },
+  async inbox(P) { P.items = (await api("/v1/interventions")).interventions; S.inbox = P.items; },
+  async settings(P) {
+    const [health, config, index, cfg, settings, env] = await Promise.allSettled([api("/healthz"), api("/v1/config/check"), api("/v1/memory-index"), api("/v1/config/models"), api("/v1/config/settings"), api("/v1/config/env")]);
+    const v = (r) => (r.status === "fulfilled" ? r.value : { error: r.reason?.message || "没取到" });
+    P.data = { health: v(health), config: v(config), index: v(index), cfg: v(cfg), settings: v(settings), env: v(env) };
+  },
+};
+async function openPage(page, id = null) {
+  if (page === "memory") return openMemory(id);
+  if (source) { source.close(); source = null; }
+  S.page = page;
+  const P = S.pg[page];
+  P.selected = id; P.form = null; P.fail = ""; P.notice = null; P.confirm = null;
+  setPageHash();
+  P.st = "loading"; render();
+  await reloadPage(page);
+}
+async function reloadPage(page) {
+  const P = S.pg[page];
+  try { await LOADERS[page](P); P.st = "ready"; S.lastGood = new Date(); }
+  catch (err) { P.st = "error"; P.error = err.message; }
+  render();
+}
+function setPageHash() {
+  if (S.page === "memory") return setMemHash();
+  const id = S.pg[S.page]?.selected;
+  const want = id && id !== "new" ? `#/${S.page}/${id}` : `#/${S.page}`;
+  if (location.hash !== want) history.replaceState(null, "", want);
+}
+function selectIn(page, id) {
+  const P = S.pg[page];
+  if (!wide()) { P.listScroll = $(PAGES[page]).scrollTop; $(PAGES[page]).scrollTop = 0; }
+  P.selected = id; P.form = null; P.fail = ""; P.notice = null; P.confirm = null;
+  setPageHash(); render();
+}
+function closeDetail(page) {
+  const P = S.pg[page];
+  P.selected = null; P.form = null; P.fail = ""; P.notice = null; P.confirm = null;
+  setPageHash(); render();
+  if (!wide()) requestAnimationFrame(() => requestAnimationFrame(() => { $(PAGES[page]).scrollTop = P.listScroll || 0; }));
+}
+// 列表块与详情块的公共外壳：出错留在块里，加载是放平的灰条
+function listShell(P, body) {
+  if (P.st === "error") return `<div class="block-error"><p>没取到：${esc(P.error)}。</p><button class="text-btn" data-pg-reload>重试</button></div>`;
+  if (P.st !== "ready") return skeletonRows(5, "sk-row mrow-sk");
+  return body();
+}
+function detailTop(label, pill, pillClass = "") {
+  return `<div class="detail-top"><button class="icon-btn back" data-pg-close aria-label="回到列表">${icon("left")}</button>
+    <span class="detail-kind">${label}</span>${pill ? `<span class="pill${pillClass}">${pill}</span>` : ""}</div>`;
+}
+const failLine = (P) => (P.fail ? `<p class="form-err">${esc(P.fail)}</p>` : "");
+const kvBlock = (rows) => `<dl class="kv">${rows.filter(Boolean).map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join("")}</dl>`;
+const btn = (label, attrs, cls = "") => `<button class="btn${cls ? ` ${cls}` : ""}" ${attrs}>${label}</button>`;
+function finishDetail(page, html) {
+  const P = S.pg[page];
+  $(`${page}-detail`).innerHTML = html;
+  app.classList.toggle("detail-open", !!P.selected);
+}
+function renderNavCounts() {
+  const n = S.inbox?.length || 0;
+  $("inbox-count").hidden = !n;
+  $("inbox-count").textContent = n;
+}
+const ymd = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+const dayDiff = (a, b) => Math.round((Date.parse(`${a}T00:00:00Z`) - Date.parse(`${b}T00:00:00Z`)) / 86400000);
+const ymdShort = (s) => { const [, m, d] = s.split("-").map(Number); return `${m}月${d}日`; };
+
+/* ---------- 事项：目标与领域 ----------
+   一屏回答：我现在在做什么、在等什么、哪件超期了。目标按超期 → 截止近 → 新建先后排；
+   每行右边是为它记的记忆，光点与记忆页同一套。 */
+const MATTER_STATE = { active: "在做", waiting: "在等", parked: "搁置", done: "完成", dropped: "放弃", retired: "不再管" };
+const closedState = (m) => ["done", "dropped", "retired"].includes(m.state);
+function dueOf(m, today) {
+  if (!m.due) return null;
+  if (closedState(m) || !today) return { text: ymdShort(m.due), sub: "", bad: false };
+  const d = dayDiff(m.due, today);
+  return { text: ymdShort(m.due), sub: d < 0 ? `超期 ${-d} 天` : d === 0 ? "今天到期" : d === 1 ? "明天到期" : `还有 ${d} 天`, bad: d < 0 };
+}
+const memoriesOf = (id) => memList().filter((x) => x.belongs_to === id);
+function matterFinding(P) {
+  const open = P.items.filter((m) => !closedState(m));
+  const goals = open.filter((m) => m.kind === "goal" && m.state !== "parked"), areas = open.filter((m) => m.kind === "area");
+  const late = goals.filter((m) => dueOf(m, P.today)?.bad);
+  const waiting = goals.filter((m) => m.state === "waiting");
+  if (late.length) return late.length === 1 ? `「${late[0].title}」超期 ${-dayDiff(late[0].due, P.today)} 天。` : `${late.length} 件超期了，最早的是「${late[0].title}」。`;
+  if (waiting.length) return `${waiting.length} 件在等别人：${waiting.map((m) => m.waiting_for).join("、")}。`;
+  if (goals.length || areas.length) return `${goals.length} 个目标在做，${areas.length} 个领域在管。`;
+  return "现在没有在做的事。在对话里说「开始做…」「这件事我来管」，komo 会记下。";
+}
+function matterRow(m, P) {
+  const due = dueOf(m, P.today);
+  const sub = m.kind === "area" ? (m.standard ? `标准：${m.standard}` : "领域") : m.state === "waiting" ? `在等：${m.waiting_for}` : m.next ? `下一步：${m.next}` : closedState(m) ? "" : "还没有下一步";
+  const mems = memoriesOf(m.id);
+  const motes = mems.slice(0, 6).map((x) => `<i class="mote ${moteClass(x)}"></i>`).join("");
+  const mark = closedState(m) ? "off" : m.kind === "area" ? "area" : m.state === "waiting" ? "wait" : m.state === "parked" ? "pale" : "on";
+  const pill = closedState(m) ? `<span class="pill off">${MATTER_STATE[m.state]}</span>` : m.state === "waiting" ? `<span class="pill wait">在等</span>` : m.state === "parked" ? `<span class="pill off">搁置</span>` : "";
+  return `<li class="mrow mrow-matter${m.id === P.selected ? " on" : ""}">
+    <span class="smark ${mark}" aria-hidden="true"></span>
+    <button class="mrow-main" data-pg-sel="matters" data-id="${m.id}" ${m.id === P.selected ? 'aria-current="true"' : ""}><span class="mtext">${esc(m.title)}</span>${sub ? `<span class="msub">${esc(sub)}</span>` : ""}</button>
+    <span class="mnum num r">${due ? `${due.text}<small class="${due.bad ? "bad" : ""}">${due.sub || (closedState(m) && m.closed_at ? `结案 ${day(m.closed_at)}` : "")}</small>` : closedState(m) && m.closed_at ? `<span class="muted">—</span><small>结案 ${day(m.closed_at)}</small>` : `<span class="muted">—</span>`}</span>
+    <span class="mmotes r">${mems.length ? `<span class="motes" aria-hidden="true">${motes}</span><span class="num">${mems.length}</span>` : `<span class="muted">—</span>`}</span>
+    <span class="mact">${pill}</span></li>`;
+}
+function matterGroup(title, items, P, emptyText, cap = 0) {
+  const shown = cap && !P.showClosed ? items.slice(0, cap) : items;
+  const more = cap && items.length > cap ? `<button class="text-btn more-btn" data-pg-act="toggle-closed">${P.showClosed ? "收起" : `显示全部 ${items.length} 件`}</button>` : "";
+  return `<div class="grp"><h2 class="grp-h">${title} <span class="muted num">${items.length}</span></h2>
+    ${items.length ? `<ul class="mrows">${shown.map((m) => matterRow(m, P)).join("")}</ul>${more}` : `<p class="empty-frame">${emptyText}</p>`}</div>`;
+}
+function renderMatters() {
+  const P = S.pg.matters;
+  $("matters-finding").textContent = P.st === "ready" ? matterFinding(P) : P.st === "error" ? "事项没取到。" : " ";
+  const order = (a, b) => {
+    const da = dueOf(a, P.today), db = dueOf(b, P.today);
+    return (db?.bad || 0) - (da?.bad || 0) || (a.due ? 0 : 1) - (b.due ? 0 : 1) || (a.due && b.due ? a.due.localeCompare(b.due) : 0) || a.created_at.localeCompare(b.created_at);
+  };
+  $("matters-list").innerHTML = listShell(P, () => {
+    const open = P.items.filter((m) => !closedState(m));
+    const goals = open.filter((m) => m.kind === "goal" && m.state !== "parked").sort(order);
+    const areas = open.filter((m) => m.kind === "area").sort((a, b) => a.created_at.localeCompare(b.created_at));
+    const parked = open.filter((m) => m.state === "parked").sort(order);
+    const closed = P.items.filter(closedState).sort((a, b) => (b.closed_at || "").localeCompare(a.closed_at || ""));
+    const head = `<div class="mhead mhead-matter" aria-hidden="true"><span></span><span>事项</span><span class="r">截止</span><span class="r">记忆</span><span></span></div>`;
+    return head +
+      matterGroup("目标", goals, P, "没有在做的目标：有结果、会结束的事记成目标，可以带截止日期。") +
+      matterGroup("领域", areas, P, "没有在管的领域：没有终点、要一直维持的事（每周告警轮换）记成领域。") +
+      (parked.length ? matterGroup("搁置", parked, P, "") : "") +
+      (closed.length ? matterGroup("已结案", closed, P, "", 5) : "");
+  });
+  if (wide() && P.st === "ready" && !P.selected) {
+    const first = P.items.find((m) => !closedState(m)) || P.items[0];
+    if (first) { P.selected = first.id; setPageHash(); return renderMatters(); }
+  }
+  finishDetail("matters", matterDetail(P));
+}
+// 每个状态能做什么（docs/goals.md §4 的表）：[动词, 文案, 是否要表单, 是否主按钮]
+function matterActions(m) {
+  if (closedState(m)) return [["reopen", "重开", false, true]];
+  if (m.kind === "area") return [["edit", "改名称或标准", true], ["link", "挂定时任务", true], ["retire", "不再管", false, false, "text"]];
+  if (m.state === "active") return [["done", "完成", false, true], ["next", m.next ? "改下一步" : "写下一步", true], ["wait", "转为在等", true], ["park", "搁置"], ["edit", "改标题或截止", true, false, "text"], ["link", "挂定时任务", true, false, "text"], ["drop", "放弃", false, false, "text"]];
+  if (m.state === "waiting") return [["resume", "等到了，继续", true, true], ["wait", "改在等什么", true], ["done", "完成"], ["park", "搁置"], ["edit", "改标题或截止", true, false, "text"], ["link", "挂定时任务", true, false, "text"], ["drop", "放弃", false, false, "text"]];
+  return [["resume", "继续", true, true], ["done", "完成"], ["edit", "改标题或截止", true, false, "text"], ["drop", "放弃", false, false, "text"]];
+}
+function matterForm(m, P) {
+  const f = P.form, busy = P.busy ? "disabled" : "";
+  const submit = (label) => `<div class="actions">${btn(P.busy ? "正在改" : label, `type="submit" ${busy}`, "primary")}${btn("取消", 'type="button" data-pg-act="form-cancel"')}</div>`;
+  const input = (name, label, value = "", extra = "") => `<label class="lbl" for="mf-${name}">${label}</label><input class="input" id="mf-${name}" name="${name}" value="${esc(value)}" maxlength="300" ${extra}>`;
+  if (f === "next") return `<form class="mform inline" id="matter-form" data-verb="next">${input("next", "下一步", m.next || "", 'placeholder="一句话；留空就是清掉"')}${submit("保存")}</form>`;
+  if (f === "wait") return `<form class="mform inline" id="matter-form" data-verb="wait">${input("waiting_for", "在等谁、等什么", m.waiting_for || "", "required")}${submit("转为在等")}</form>`;
+  if (f === "resume") return `<form class="mform inline" id="matter-form" data-verb="resume">${input("next", "接下来做什么（可不填）", m.next || "")}${submit("继续")}</form>`;
+  if (f === "edit") {
+    return `<form class="mform inline" id="matter-form" data-verb="edit">${input("title", m.kind === "goal" ? "标题" : "名称", m.title, 'required maxlength="80"')}
+      ${m.kind === "goal"
+        ? `<label class="lbl" for="mf-due">截止日期</label><input class="input" type="date" id="mf-due" name="due" value="${m.due || ""}"><p class="hint">清空日期就是不再设截止。</p>`
+        : input("standard", "要维持的标准", m.standard || "", 'placeholder="留空就是清掉"')}${submit("保存")}</form>`;
+  }
+  if (f === "link") {
+    const linked = new Set((m.triggers || []).filter((t) => t.kind === "cron").map((t) => t.job));
+    const jobs = S.pg.cron.jobs.filter((j) => !linked.has(j.id));
+    if (!jobs.length) return `<p class="hint">没有可挂的定时任务。先去<a class="ev-link" href="#/cron">定时</a>建一个。</p>`;
+    return `<form class="mform inline" id="matter-form" data-verb="link"><label class="lbl" for="mf-job">定时任务</label>
+      <select class="select" id="mf-job" name="job">${jobs.map((j) => `<option value="${j.id}">${esc(j.name)}</option>`).join("")}</select>${submit("挂上")}</form>`;
+  }
+  return "";
+}
+function triggerRow(t, m) {
+  const unlink = closedState(m) ? "" : `<button class="text-btn quiet" data-pg-act="unlink" data-trigger='${esc(JSON.stringify(t))}'>摘下</button>`;
+  if (t.kind === "cron") {
+    const j = S.pg.cron.jobs.find((x) => x.id === t.job);
+    return `<li class="ev"><span class="ev-what">定时任务</span><span class="ev-line">${j ? `<a class="ev-link" href="#/cron/${j.id}">${esc(j.name)}${icon("right")}</a>` : `<span class="muted">已删除的任务</span>`}${unlink}</span></li>`;
+  }
+  const s = S.sessions.find((x) => x.session === t.session);
+  return `<li class="ev"><span class="ev-what">monitor <span class="num">#${esc(t.monitor)}</span></span><span class="ev-line">${s ? `<a class="ev-link" href="#/s/${t.session}">${esc(titleOf(s))}${icon("right")}</a>` : `<span class="muted">会话已不在列表里</span>`}${unlink}</span></li>`;
+}
+function closureNotice(P) {
+  const n = P.notice;
+  if (!n) return "";
+  const parts = [];
+  if (n.closure?.archived) parts.push(`归档了 ${n.closure.archived} 条为它记的线索。`);
+  if (n.closure?.restored) parts.push(`恢复了 ${n.closure.restored} 条归档的线索。`);
+  if (n.still_linked?.length) parts.push(`还挂着 ${n.still_linked.length} 个触发器，没删；不用了就在下面摘下。`);
+  const conv = n.closure?.conventions || [];
+  if (!parts.length && !conv.length) return "";
+  return `<div class="notice">${parts.map((p) => `<p>${p}</p>`).join("")}
+    ${conv.length ? `<p>这些约定还归属它，照常带进对话；去记忆页改归属或遗忘：</p><ul>${conv.map((c) => `<li><a class="ev-link" href="#/memory/${c.id}">${esc(c.content)}</a></li>`).join("")}</ul>` : ""}</div>`;
+}
+function matterNewForm(P) {
+  return `<form class="mform" id="matter-new">
+    <div class="detail-top"><h2 class="detail-h">新建事项</h2><button type="button" class="icon-btn" data-pg-close aria-label="关闭">${icon("x")}</button></div>
+    <fieldset class="seg"><legend class="lbl">是什么</legend>
+      <label><input type="radio" name="kind" value="goal" checked>目标：有结果、会结束</label>
+      <label><input type="radio" name="kind" value="area">领域：没有终点、要一直维持</label></fieldset>
+    <label class="lbl" for="mn-title">一句话</label><input class="input" id="mn-title" name="title" required maxlength="80" placeholder="例：这周把 owl 的发布观察做完">
+    <div data-for="goal"><label class="lbl" for="mn-next">下一步（可不填）</label><input class="input" id="mn-next" name="next" maxlength="300">
+      <label class="lbl" for="mn-due">截止日期（可不填）</label><input class="input" type="date" id="mn-due" name="due"></div>
+    <div data-for="area" hidden><label class="lbl" for="mn-standard">要维持的标准（可不填）</label><input class="input" id="mn-standard" name="standard" maxlength="300" placeholder="例：每周一前完成告警值班轮换"></div>
+    ${failLine(P)}
+    <div class="actions">${btn(P.busy ? "正在建" : "建好", `type="submit" ${P.busy ? "disabled" : ""}`, "primary")}${btn("取消", 'type="button" data-pg-close')}</div></form>`;
+}
+function matterDetail(P) {
+  if (P.selected === "new") return matterNewForm(P);
+  const m = P.items.find((x) => x.id === P.selected);
+  if (P.st !== "ready") return P.st === "error" ? "" : `<div class="detail-pad">${skeletonRows(4, "sk-row in-card")}</div>`;
+  if (!m) return `<p class="empty-frame">${P.items.length ? "选一件，看它的下一步、触发器和为它记的记忆。" : "新建的事项会出现在这里。"}</p>`;
+  const due = dueOf(m, P.today);
+  const fields = m.kind === "goal"
+    ? [m.state === "waiting" ? ["在等", esc(m.waiting_for)] : null, ["下一步", m.next ? esc(m.next) : `<span class="muted">—</span>`], ["截止", due ? `${due.text}${due.sub ? ` · <span class="${due.bad ? "bad" : ""}">${due.sub}</span>` : ""}` : `<span class="muted">没设</span>`]]
+    : [["标准", m.standard ? esc(m.standard) : `<span class="muted">没写</span>`]];
+  const acts = matterActions(m);
+  const buttons = acts.filter((a) => a[4] !== "text").map(([verb, label, form, primary]) => btn(label, `data-pg-act="${form ? "form" : "verb"}" data-verb="${verb}" ${P.busy ? "disabled" : ""}`, primary ? "primary" : "")).join("");
+  const texts = acts.filter((a) => a[4] === "text").map(([verb, label, form]) => `<button class="text-btn quiet${verb === "drop" || verb === "retire" ? " danger-link" : ""}" data-pg-act="${form ? "form" : "verb"}" data-verb="${verb}">${label}</button>`).join("");
+  const mems = memoriesOf(m.id);
+  const ev = m.evidence || [];
+  return `<div class="detail-pad">
+    ${detailTop(m.kind === "goal" ? "目标" : "领域", MATTER_STATE[m.state], m.state === "waiting" ? " wait" : closedState(m) || m.state === "parked" ? " off" : "")}
+    <p class="detail-text">${esc(m.title)}</p>
+    ${kvBlock(fields).replace('class="kv"', 'class="kv plain"')}
+    ${failLine(P)}${closureNotice(P)}
+    <div class="actions">${buttons}</div>
+    ${texts ? `<div class="text-acts">${texts}</div>` : ""}
+    ${matterForm(m, P)}
+    <h3 class="sub-h">触发器 <span class="num muted">${(m.triggers || []).length}</span></h3>
+    ${(m.triggers || []).length ? `<ul class="evs">${m.triggers.map((t) => triggerRow(t, m)).join("")}</ul>` : `<p class="hint">没挂。在等别人时 komo 常会挂一个 monitor 盯着；定期要做的事可以挂定时任务。</p>`}
+    <h3 class="sub-h">为它记的记忆 <span class="num muted">${mems.length}</span></h3>
+    ${mems.length ? `<ul class="evs">${mems.map((x) => `<li class="ev ev-mem"><span class="mote ${moteClass(x)}" aria-hidden="true"></span><a class="ev-link plain" href="#/memory/${x.id}">${esc(x.content)}</a></li>`).join("")}</ul>` : `<p class="hint">还没有。提取时 komo 会把相关的新观察挂到进行中的事项下。</p>`}
+    ${kvBlock([["新建", `<span class="num">${day(m.created_at)}</span>`], ["更新", `<span class="num">${ago(m.updated_at)}</span>`], m.closed_at ? ["结案", `<span class="num">${day(m.closed_at)}</span>`] : null, ["版本", `第 <span class="num">${m.revision}</span> 版`]])}
+    <h3 class="sub-h">用户原话 <span class="num muted">${ev.length}</span></h3>
+    ${ev.length ? `<ul class="evs">${ev.map(evidenceRow).join("")}</ul>` : `<p class="hint">没有：这件事是在终端或这里直接建的。</p>`}
+  </div>`;
+}
+async function matterVerb(verb, fields = {}) {
+  const P = S.pg.matters, m = P.items.find((x) => x.id === P.selected);
+  if (!m) return;
+  P.busy = verb; P.fail = ""; render();
+  const body = { kind: m.kind, expected_revision: m.revision, request_key: `web:matter:${m.id}:${m.revision}:${verb}`, ...fields };
+  try {
+    const r = await api(`/v1/matters/${m.id}/${verb}`, { method: "POST", body: JSON.stringify(body) });
+    P.items = P.items.map((x) => (x.id === m.id ? r.matter : x));
+    P.notice = r.closure || r.still_linked ? { closure: r.closure, still_linked: r.still_linked } : null;
+    P.form = null;
+    if (r.closure?.archived || r.closure?.restored) LOADERS.matters(P).then(render);
+    api("/v1/matters").then((x) => { S.matters = x.matters; }).catch(() => {});
+  } catch (err) { P.fail = `没改成：${err.message}`; }
+  P.busy = ""; render();
+}
+async function matterCreate(form) {
+  const P = S.pg.matters, f = new FormData(form), kind = f.get("kind");
+  const body = { kind, title: f.get("title").trim(), request_key: `web:matter-add:${crypto.randomUUID()}` };
+  if (kind === "goal") { if (f.get("next").trim()) body.next = f.get("next").trim(); if (f.get("due")) body.due = f.get("due"); }
+  else if (f.get("standard").trim()) body.standard = f.get("standard").trim();
+  P.busy = "add"; P.fail = ""; render();
+  try {
+    const r = await api("/v1/matters", { method: "POST", body: JSON.stringify(body) });
+    P.items.push(r.matter); P.selected = r.matter.id; setPageHash();
+    api("/v1/matters").then((x) => { S.matters = x.matters; }).catch(() => {});
+  } catch (err) { P.fail = `没建成：${err.message}`; }
+  P.busy = ""; render();
+}
+
+/* ---------- 定时 ----------
+   一个列表，点开看详情。列表按在跑 → 暂停 → 跑完、再按下一次排；不选时列表独占画布，选了右边出详情。 */
+const FIRING = { queued: "排队中", ok: "成功", error: "出错", waiting: "等你处理", skipped: "跳过" };
+const FIRING_PILL = { ok: "", error: " bad", waiting: " wait", skipped: " off", queued: " off" };
+const NOTIFY = { always: "每次都投", on_error: "只在出错时投", never: "从不投" };
+const OVERLAP = { skip: "上次没跑完就跳过这次", allow: "照常再起一个" };
+const DOW = ["日", "一", "二", "三", "四", "五", "六"];
+const localTz = Intl.DateTimeFormat().resolvedOptions().timeZone;
+// 只用来把常见的五字段表达式读成人话；读不懂的照写表达式
+function cronParse(expr) {
+  const f = String(expr).trim().split(/\s+/);
+  if (f.length !== 5) return null;
+  const R = [[0, 59], [0, 23], [1, 31], [1, 12], [0, 7]];
+  const names = [null, null, null, "jan feb mar apr may jun jul aug sep oct nov dec".split(" "), "sun mon tue wed thu fri sat".split(" ")];
+  const val = (x, i) => { const n = names[i]?.indexOf(x.toLowerCase()); return n >= 0 ? n + (i === 3 ? 1 : 0) : Number(x); };
+  const sets = [];
+  for (let i = 0; i < 5; i++) {
+    const set = new Set();
+    for (const part of f[i].split(",")) {
+      const [range, stepS] = part.split("/"), step = stepS ? Number(stepS) : 1;
+      let [lo, hi] = range === "*" ? R[i] : range.split("-").map((x) => val(x, i));
+      if (hi === undefined) hi = stepS ? R[i][1] : lo;
+      if (![lo, hi, step].every(Number.isFinite) || step < 1) return null;
+      for (let v = lo; v <= hi; v += step) set.add(i === 4 && v === 7 ? 0 : v);
+    }
+    sets.push(set);
+  }
+  return { sets, raw: f };
+}
+function scheduleText(job) {
+  const t = job.trigger;
+  if (t.kind === "at") return `${day(t.at)} ${clock(new Date(t.at))}，只跑一次`;
+  const c = cronParse(t.expr);
+  if (!c) return t.expr;
+  const [mi, ho, dm, mo, dw] = c.raw;
+  const single = (x) => /^\d+$/.test(x);
+  const hm = single(mi) && single(ho) ? `${ho.padStart(2, "0")}:${mi.padStart(2, "0")}` : null;
+  let words = null;
+  if (hm && mo === "*") {
+    if (dm === "*" && dw === "*") words = `每天 ${hm}`;
+    else if (dm === "*" && /^[\d,-]+$/.test(dw)) words = dw === "1-5" ? `工作日 ${hm}` : `每周${[...c.sets[4]].sort().map((d) => DOW[d]).join("、")} ${hm}`;
+    else if (single(dm) && dw === "*") words = `每月 ${dm} 日 ${hm}`;
+  } else if (single(mi) && ho === "*" && dm === "*" && mo === "*" && dw === "*") words = `每小时第 ${mi} 分`;
+  else if (/^\*\/\d+$/.test(mi) && ho === "*" && dm === "*" && mo === "*" && dw === "*") words = `每 ${mi.slice(2)} 分钟`;
+  return (words || t.expr) + (t.tz && t.tz !== localTz ? `（${t.tz}）` : "");
+}
+function whenText(iso) {
+  if (!iso) return "—";
+  const d = new Date(iso), today = new Date(); today.setHours(0, 0, 0, 0);
+  const diff = Math.floor((new Date(d).setHours(0, 0, 0, 0) - today) / 86400000);
+  const pre = diff === 0 ? "今天" : diff === 1 ? "明天" : diff > 1 && diff < 7 ? `周${DOW[d.getDay()]}` : diff === -1 ? "昨天" : `${d.getMonth() + 1}月${d.getDate()}日`;
+  return `${pre} ${clock(d)}`;
+}
+const cronLast = (job) => S.pg.cron.status.get(job.id)?.last || null;
+const cronNext = (job) => S.pg.cron.status.get(job.id)?.next_run_at || job.next_run_at;
+function cronFinding(P) {
+  const jobs = P.jobs;
+  if (!jobs.length) return "还没有定时任务。在对话里说「每周五下午两点…」，komo 会建一个。";
+  const waiting = jobs.filter((j) => cronLast(j)?.status === "waiting");
+  if (waiting.length) return `${waiting.length} 个任务停在等你处理：${waiting.map((j) => `「${j.name}」`).join("")}。`;
+  const failed = jobs.filter((j) => cronLast(j)?.status === "error" || j.last_error);
+  if (failed.length) return `「${failed[0].name}」${failed[0].last_error ? "排不上下一次" : "上一次出错了"}。`;
+  const next = jobs.filter((j) => j.status === "active" && cronNext(j)).sort((a, b) => cronNext(a).localeCompare(cronNext(b)))[0];
+  return next ? `下一次是「${next.name}」，${whenText(cronNext(next))}。` : "所有任务都暂停了。";
+}
+function renderCron() {
+  const P = S.pg.cron;
+  $("cron-finding").textContent = P.st === "ready" ? cronFinding(P) : P.st === "error" ? "定时任务没取到。" : " ";
+  $("cron-list").innerHTML = listShell(P, () => {
+    if (!P.jobs.length) return `<p class="empty-frame">还没有定时任务。</p>`;
+    const order = { active: 0, paused: 1, done: 2 };
+    const jobs = [...P.jobs].sort((a, b) => order[a.status] - order[b.status] || (cronNext(a) || "~").localeCompare(cronNext(b) || "~"));
+    return `<div class="mhead mhead-cron" aria-hidden="true"><span></span><span>任务</span><span class="r">下一次</span><span class="r">上一次</span></div>
+      <ul class="mrows">${jobs.map((j) => {
+        const last = cronLast(j);
+        const mark = j.status === "active" ? (j.last_error ? "bad" : "on") : "off";
+        return `<li class="mrow mrow-cron${j.id === P.selected ? " on" : ""}">
+          <span class="smark ${mark}" aria-hidden="true"></span>
+          <button class="mrow-main" data-pg-sel="cron" data-id="${j.id}" ${j.id === P.selected ? 'aria-current="true"' : ""}><span class="mtext">${esc(j.name)}</span><span class="msub">${esc(scheduleText(j))}${j.status !== "active" ? `<span class="sep">·</span>${j.status === "paused" ? "已暂停" : "已跑完"}` : ""}</span></button>
+          <span class="mwhen num r">${j.status === "active" && cronNext(j) ? whenText(cronNext(j)) : `<span class="muted">—</span>`}</span>
+          <span class="mact">${last ? `<span class="pill${FIRING_PILL[last.status] ?? ""}">${FIRING[last.status] || last.status}</span>` : `<span class="muted">还没跑过</span>`}</span></li>`;
+      }).join("")}</ul>`;
+  });
+  finishDetail("cron", cronDetail(P));
+  // 没选中就不留详情栏：列表独占画布
+  $("cron-detail").hidden = !P.selected;
+  $("cron-body").classList.toggle("single", !P.selected);
+}
+function cronDetail(P) {
+  const j = P.jobs.find((x) => x.id === P.selected);
+  if (!j) return "";
+  const last = cronLast(j), busy = P.busy ? "disabled" : "";
+  const lastSession = last?.session && S.sessions.find((x) => x.session === last.session);
+  const stateName = { active: "在跑", paused: "已暂停", done: "已跑完" }[j.status];
+  const n = P.notice;
+  const acts = j.status === "done" ? "" : `<div class="actions">
+    ${btn(P.busy === "run" ? "正在触发" : "现在跑一次", `data-pg-act="cron-run" ${busy}`, "primary")}
+    ${btn(j.status === "paused" ? "恢复" : "暂停", `data-pg-act="cron-toggle" ${busy}`)}</div>`;
+  const del = P.confirm === "delete"
+    ? `<div class="danger"><p>删掉之后不再跑；跑过的记录还在各自的会话里。</p>
+        <div class="actions">${btn("删掉「" + esc(j.name) + "」", `data-pg-act="cron-delete" ${busy}`, "danger-btn")}${btn("取消", 'data-pg-act="confirm-cancel"')}</div></div>`
+    : `<button class="text-btn danger-link" data-pg-act="confirm" data-what="delete">删除这个任务</button>`;
+  return `<div class="detail-pad">
+    <div class="detail-top"><span class="detail-kind">${j.command != null ? "命令" : "提示词"}</span><span class="pill${j.status === "active" ? "" : " off"}">${stateName}</span>
+      <button class="icon-btn close-x" data-pg-close aria-label="关闭详情">${icon("x")}</button></div>
+    <p class="detail-text">${esc(j.name)}</p>
+    <p class="detail-when"><span class="muted">什么时候</span>${esc(scheduleText(j))}</p>
+    ${j.last_error ? `<p class="form-err">排不上下一次：${esc(j.last_error)}</p>` : ""}
+    ${failLine(P)}
+    ${n?.run ? `<div class="notice"><p>已触发，这一次在<a class="ev-link" href="#/s/${n.run.session}">它的会话${icon("right")}</a>里跑。</p></div>` : ""}
+    ${acts}
+    <h3 class="sub-h">跑什么</h3>
+    ${j.command != null ? `<pre class="code-block">${esc(j.command)}</pre>` : `<p class="detail-body">${esc(j.prompt)}</p>`}
+    ${kvBlock([
+      j.workdir ? ["目录", `<span class="num">${esc(j.workdir)}</span>`] : null,
+      ["下一次", j.status === "active" && cronNext(j) ? `<span class="num">${whenText(cronNext(j))}</span>` : `<span class="muted">—</span>`],
+      ["上一次", last ? `<span class="pill${FIRING_PILL[last.status] ?? ""}">${FIRING[last.status] || last.status}</span> <span class="num">${whenText(last.scheduled_at)}</span>${last.session ? ` · <a class="ev-link" href="#/s/${last.session}">${lastSession ? esc(titleOf(lastSession)) : "那次的会话"}</a>` : ""}${last.error ? `<div class="muted">${esc(last.error)}</div>` : ""}` : `<span class="muted">还没跑过</span>`],
+      ["投递", NOTIFY[j.notify] || j.notify],
+      ["重叠", OVERLAP[j.overlap] || j.overlap],
+    ])}
+    ${del}
+  </div>`;
+}
+async function cronAct(act) {
+  const P = S.pg.cron, j = P.jobs.find((x) => x.id === P.selected);
+  if (!j) return;
+  P.busy = act === "cron-run" ? "run" : "act"; P.fail = ""; P.notice = null; render();
+  try {
+    if (act === "cron-run") {
+      const r = await api(`/v1/cron/${j.id}/run`, { method: "POST", body: JSON.stringify({ request_key: `web:cron-run:${crypto.randomUUID()}` }) });
+      P.notice = { run: r };
+    } else if (act === "cron-toggle") {
+      await api(`/v1/cron/${j.id}`, { method: "PATCH", body: JSON.stringify({ status: j.status === "paused" ? "active" : "paused", request_key: `web:cron-status:${j.id}:${crypto.randomUUID()}` }) });
+    } else if (act === "cron-delete") {
+      await api(`/v1/cron/${j.id}`, { method: "DELETE" });
+      P.selected = null; P.confirm = null; setPageHash();
+    }
+    await LOADERS.cron(P);
+  } catch (err) { P.fail = `没成：${err.message}`; }
+  P.busy = ""; render();
+}
+
+/* ---------- 待处理 ----------
+   无人值守的 Run 停下来等人的地方：确认对外调用、核对结果不明的调用、前提没了。
+   每一条的答案菜单由 Gateway 给（verdicts），界面照抄，不自己推。 */
+const INBOX_KIND = { confirm: "要调对外工具", verify: "结果不明，等你核对", blocked: "前提没了" };
+const VERDICT = { approve: "执行", reject: "不执行", satisfied: "已经是那样了，继续", not_performed: "确定没执行，重放", resolve: "处理好了，重新判断", abandon: "到此为止" };
+function renderInbox() {
+  const P = S.pg.inbox;
+  const n = P.items.length;
+  $("inbox-finding").textContent = P.st === "ready" ? (n ? `${n} 条在等你答复；不答，那条 Run 就一直停着。` : "没有等你答复的事。") : P.st === "error" ? "待处理没取到。" : " ";
+  $("inbox-list").innerHTML = listShell(P, () => {
+    if (!n) return `<p class="empty-frame">现在没有停着的 Run。</p>
+      <h2 class="grp-h">什么会停在这里</h2>
+      <dl class="kv plain inbox-kinds">
+        <dt>要调对外工具</dt><dd>定时任务、monitor 或后台任务起的 Run，要调声明为对外的工具（发消息、提工单）时，等你点执行或不执行。</dd>
+        <dt>结果不明</dt><dd>一次调用跑到一半 Gateway 重启了，不知道做没做成：你核对后告诉它"已经是那样了"或"确定没执行"。</dd>
+        <dt>前提没了</dt><dd>它依赖的文件或会话没了：处理好之后让它重新判断，或到此为止。</dd>
+      </dl>
+      <p class="hint">没有渠道配 home_chat 时，这些卡投不到聊天里，只在这里和 <code>komo intervention list</code> 看得到。</p>`;
+    return `<ul class="mrows">${P.items.map((x) => {
+      const s = S.sessions.find((y) => y.session === x.session);
+      return `<li class="mrow mrow-inbox${x.handle === P.selected ? " on" : ""}">
+        <span class="smark ${x.kind === "confirm" ? "wait" : "bad"}" aria-hidden="true"></span>
+        <button class="mrow-main" data-pg-sel="inbox" data-id="${esc(x.handle)}"><span class="mtext">${esc(x.question)}</span>
+          <span class="msub">${INBOX_KIND[x.kind] || x.kind}<span class="sep">·</span>${s ? esc(titleOf(s)) : "会话已不在列表里"}<span class="sep">·</span><span class="num">${ago(x.created_at)}</span></span></button>
+        <span class="mwhen"></span></li>`;
+    }).join("")}</ul>`;
+  });
+  if (wide() && P.st === "ready" && !P.selected && n) { P.selected = P.items[0].handle; setPageHash(); return renderInbox(); }
+  const x = P.items.find((y) => y.handle === P.selected);
+  let html;
+  if (P.st !== "ready") html = P.st === "error" ? "" : `<div class="detail-pad">${skeletonRows(3, "sk-row in-card")}</div>`;
+  else if (P.notice?.answered) html = `<div class="detail-pad">${detailTop("已答复", "")}<p class="detail-text">${esc(P.notice.answered.note)}</p></div>`;
+  else if (!x) html = `<p class="empty-frame">${n ? "选一条答复它。" : "没有要答复的。"}</p>`;
+  else {
+    const s = S.sessions.find((y) => y.session === x.session);
+    const verdicts = (x.verdicts || []).map((v, i) => P.confirm === v
+      ? ""
+      : btn(VERDICT[v] || v, `data-pg-act="answer" data-verdict="${v}" ${P.busy ? "disabled" : ""}`, i === 0 ? "primary" : v === "abandon" ? "danger-btn" : "")).join("");
+    const abandonAsk = P.confirm === "abandon" ? `<div class="danger"><p>这条 Run 到此为止，取消后不会再继续。</p><div class="actions">${btn("确定到此为止", 'data-pg-act="answer" data-verdict="abandon" data-sure="1"', "danger-btn")}${btn("取消", 'data-pg-act="confirm-cancel"')}</div></div>` : "";
+    html = `<div class="detail-pad">${detailTop(INBOX_KIND[x.kind] || x.kind, "")}
+      <p class="detail-text">${esc(x.question)}</p>
+      ${failLine(P)}
+      <div class="actions">${verdicts}</div>${abandonAsk}
+      ${kvBlock([["会话", s ? `<a class="ev-link" href="#/s/${x.session}">${esc(titleOf(s))}${icon("right")}</a>` : `<span class="muted">${esc(x.session)}</span>`], ["停下", `<span class="num">${ago(x.created_at)}</span>`], ["句柄", `<span class="num">${esc(x.handle)}</span>`]])}
+      <p class="hint">答复只对这一次有效，没有"以后都允许"。</p></div>`;
+  }
+  finishDetail("inbox", html);
+  $("inbox-detail").hidden = P.st === "ready" && !n && !P.notice;
+  $("inbox-body").classList.toggle("single", $("inbox-detail").hidden);
+}
+async function inboxAnswer(verdict, sure) {
+  const P = S.pg.inbox, x = P.items.find((y) => y.handle === P.selected);
+  if (!x) return;
+  if (verdict === "abandon" && !sure) { P.confirm = "abandon"; render(); return; }
+  P.busy = verdict; P.fail = ""; render();
+  try {
+    const r = await api(`/v1/interventions/${encodeURIComponent(x.handle)}/answer`, { method: "POST", body: JSON.stringify({ verdict, request_key: `web:answer:${x.handle}:${verdict}` }) });
+    P.notice = { answered: r }; P.confirm = null;
+    await LOADERS.inbox(P);
+  } catch (err) { P.fail = `没答上：${err.message}`; }
+  P.busy = ""; render();
+}
+
+/* ---------- 设置 ----------
+   一个尺寸固定的弹窗：左边一列分节，右边是这一节，内容长了只在右边滚。模型、配置、环境变量三节能直接改：
+   Gateway 代写文件、校验通过才落盘、再热重载（docs/komo_bot.md §3「从 Web 改模型配置」「从 Web 改常用设置与环境变量」）；
+   其余各节只读。界面不说文件在磁盘上的哪儿。 */
+const WINDOW_SOURCE = { config: "配置里写的", provider: "provider 报的", unknown: "不知道" };
+const MCP_STATE = { connecting: "连接中", connected: "已连上", needs_auth: "要登录", "needs-auth": "要登录", failed: "连不上" };
+const BACKENDS = [["responses", "Responses"], ["chat_completions", "Chat Completions"], ["anthropic_messages", "Anthropic Messages"]];
+const SET_SECTIONS = [["models", "模型", "i-leaf"], ["config", "配置", "i-sliders"], ["env", "环境变量", "i-key"], ["index", "记忆索引", "i-search"], ["mcp", "MCP", "i-plug"], ["gateway", "Gateway", "i-term"], ["channels", "渠道", "i-chat"]];
+// 常用设置的说法（键与种类、选项由 Gateway 给，GET /v1/config/settings）
+const SETTING_COPY = {
+  default_agent: ["默认助手", "新会话用哪个助手。"],
+  "memory.enabled": ["记忆", "从对话里提取偏好、约定与结论，用得上时带进对话。"],
+  "memory.model": ["记忆用的模型", "提取和整理记忆时用哪个模型；不设就跟默认模型。"],
+  "memory.retrieval.mode": ["记忆检索方式", "怎么找出和眼下这段对话相关的记忆。"],
+  "compaction.enabled": ["自动压缩", "上下文快满时，把早先的对话压成一段摘要。"],
+  "execution.model_result_bytes": ["工具结果给模型的上限", "超过就只给开头的预览和完整结果的引用。单位字节。", "字节"],
+  "execution.call_timeout_secs": ["工具调用时限", "一次工具调用最长跑多久。", "秒"],
+  "execution.confirm_timeout_mins": ["对外操作等确认", "无人值守时，等你批准对外工具的时长；到点不答就不执行。", "分钟"],
+};
+const CHOICE_TEXT = { hybrid: "混合（关键词 + 向量）", keyword: "只用关键词", vector: "只用向量" };
+const errLine = (x) => (x?.error ? `<p class="form-err">没取到：${esc(x.error)}</p>` : "");
+let settingsHtml = "";
+function renderSettings() {
+  const P = S.pg.settings, D = P.data;
+  const cfg = D.config, issues = cfg?.issues || [];
+  const section = SET_SECTIONS.some(([k]) => k === P.selected) ? P.selected : "models";
+  $("settings-finding").textContent = P.st !== "ready" ? " "
+    : cfg?.error ? "配置检查没取到。"
+    : `Gateway ${D.health?.version || ""} 在跑，${issues.length ? `配置有 ${issues.length} 条提醒。` : "配置检查通过。"}`;
+  $("settings-nav").innerHTML = SET_SECTIONS.map(([k, label, ic]) => `<button type="button" data-set-sec="${k}" ${k === section ? 'aria-current="page"' : ""}>${icon(ic.slice(2))}${label}${k === "config" && issues.length ? `<span class="nav-count soft num">${issues.length}</span>` : ""}</button>`).join("");
+  if (P.st === "error") { $("settings-body").innerHTML = `<div class="block-error"><p>没取到：${esc(P.error)}。</p><button class="text-btn" data-pg-reload>重试</button></div>`; settingsHtml = ""; return; }
+  if (P.st !== "ready") { $("settings-body").innerHTML = skeletonRows(6, "sk-row mrow-sk"); settingsHtml = ""; return; }
+  const html = { models: modelsSection, config: configSection, env: envSection, index: indexSection, mcp: mcpSection, gateway: gatewaySection, channels: channelsSection }[section](P);
+  // 会话跑着时每秒重画一次：内容没变就不动 DOM，免得表单里正在输的字被冲掉
+  if (settingsHtml !== html) { $("settings-body").innerHTML = html; settingsHtml = html; }
+}
+function openSettings(section = null) {
+  const P = S.pg.settings, dlg = $("settings");
+  if (section) P.selected = section;
+  // 焦点落在弹窗本身：默认会落到第一个按钮（关闭钮），带着焦点环出现
+  if (!dlg.open) { P.edit = null; P.confirm = null; P.fail = ""; P.result.edit = null; dlg.showModal(); dlg.focus(); }
+  // 每次打开都重读：配置可能在文件里改过
+  P.st = P.st === "ready" ? "ready" : "loading"; render();
+  reloadPage("settings");
+}
+function settingsSection(k) {
+  const P = S.pg.settings;
+  if (P.selected === k) return;
+  P.selected = k; P.edit = null; P.confirm = null; P.fail = ""; P.result.edit = null;
+  $("settings-body").scrollTop = 0; render();
+}
+const secHead = (title, desc, right = "") => `<div class="set-head"><div><h3>${title}</h3><p>${desc}</p></div>${right}</div>`;
+
+// —— 模型：provider 一张卡，卡里是挂在它上面的模型 ——
+function keyLine(p) {
+  if (p.auth) return `<span class="kstate ok"><i class="kdot"></i>凭证来自 ${esc(p.auth)} 登录</span>`;
+  if (!p.env_key) return `<span class="kstate warn"><i class="kdot"></i>没写凭证变量</span>`;
+  return p.key_set ? `<span class="kstate ok"><i class="kdot"></i><span class="num">${esc(p.env_key)}</span> 已设置</span>` : `<span class="kstate warn"><i class="kdot"></i>缺 <span class="num">${esc(p.env_key)}</span></span>`;
+}
+function providerForm(P, p) {
+  const isNew = !p, busy = P.busy ? "disabled" : "";
+  return `<form class="mform cfg-form" id="cfg-provider-form" data-id="${esc(p?.id || "")}">
+    ${isNew ? `<label class="lbl" for="pf-id">名字</label><input class="input" id="pf-id" name="pid" required pattern="[A-Za-z0-9._-]+" maxlength="64" placeholder="例：deepseek">
+      <p class="hint">模型靠这个名字找到它。</p>` : ""}
+    <div class="two"><div><label class="lbl" for="pf-backend">协议</label><select class="select" id="pf-backend" name="api_backend">${BACKENDS.map(([v, n]) => `<option value="${v}" ${v === (p?.api_backend || "responses") ? "selected" : ""}>${n}</option>`).join("")}</select></div>
+      <div><label class="lbl" for="pf-url">Base URL</label><input class="input" id="pf-url" name="base_url" value="${esc(p?.base_url || "")}" placeholder="https://api.example.com/v1"></div></div>
+    ${p?.auth ? `<p class="hint">凭证来自 ${esc(p.auth)} 登录，不走 API key。</p><input type="hidden" name="auth" value="${esc(p.auth)}">`
+      : `<label class="lbl" for="pf-key">API key</label><input class="input" id="pf-key" name="api_key" type="password" autocomplete="new-password" placeholder="${p ? (p.key_set ? "已设置；留空不改" : "还没设置") : "粘贴 key"}">
+      <p class="hint">存成环境变量${p?.env_key ? ` <span class="num">${esc(p.env_key)}</span>` : "，名字默认是 <code>名字大写_API_KEY</code>"}，不进配置。</p>`}
+    <details class="adv" ${p?.timeout_secs || (p?.env_key && !isNew) ? "" : ""}><summary>更多设置</summary>
+      ${p?.auth ? "" : `<label class="lbl" for="pf-env">凭证变量名</label><input class="input" id="pf-env" name="env_key" value="${esc(p?.env_key || "")}" placeholder="留空：有 key 时用 名字大写_API_KEY">`}
+      <label class="lbl" for="pf-timeout">请求时限（秒）</label><input class="input" id="pf-timeout" name="timeout_secs" type="number" min="1" value="${p?.timeout_secs ?? ""}" placeholder="默认 120"></details>
+    ${failLine(P)}
+    <div class="actions">${btn(P.busy ? "正在保存" : isNew ? "添加" : "保存", `type="submit" ${busy}`, "primary")}${btn("取消", 'type="button" data-cfg="cancel"')}</div></form>`;
+}
+function modelForm(P, m, providerId) {
+  const C = P.data.cfg, isNew = !m, busy = P.busy ? "disabled" : "";
+  return `<form class="mform cfg-form" id="cfg-model-form" data-alias="${esc(m?.alias || "")}">
+    <div class="two">${isNew ? `<div><label class="lbl" for="mf2-alias">名字（alias）</label><input class="input" id="mf2-alias" name="alias" required pattern="[A-Za-z0-9._-]+" maxlength="64" placeholder="例：ds-chat"></div>` : ""}
+      <div><label class="lbl" for="mf2-name">显示名</label><input class="input" id="mf2-name" name="name" value="${esc(m?.name || "")}" placeholder="菜单里显示的名字"></div>
+      ${isNew ? "" : `<div><label class="lbl" for="mf2-provider">Provider</label><select class="select" id="mf2-provider" name="provider">${C.providers.map((p) => `<option value="${esc(p.id)}" ${p.id === (m?.provider || providerId) ? "selected" : ""}>${esc(p.id)}</option>`).join("")}</select></div>`}</div>
+    ${isNew ? `<input type="hidden" name="provider" value="${esc(providerId)}">` : ""}
+    <label class="lbl" for="mf2-model">上游模型 id</label><input class="input" id="mf2-model" name="model" required value="${esc(m?.model || "")}" placeholder="例：deepseek-chat">
+    <div class="two"><div><label class="lbl" for="mf2-window">上下文窗口（token）</label><input class="input" id="mf2-window" name="context_window" type="number" min="1" value="${m?.context_window ?? ""}" placeholder="留空：问 provider"></div>
+      <div><label class="lbl" for="mf2-effort">默认 effort</label><input class="input" id="mf2-effort" name="effort" value="${esc(m?.effort || "")}" placeholder="留空：provider 默认"></div></div>
+    <label class="lbl" for="mf2-efforts">可选的 effort 档位（逗号分隔，可不填）</label><input class="input" id="mf2-efforts" name="efforts" value="${esc((m?.efforts || []).join(", "))}" placeholder="low, medium, high">
+    ${failLine(P)}
+    <div class="actions">${btn(P.busy ? "正在保存" : isNew ? "添加" : "保存", `type="submit" ${busy}`, "primary")}${btn("取消", 'type="button" data-cfg="cancel"')}</div></form>`;
+}
+function delAsk(P, kind, id, used) {
+  if (!(P.confirm && P.confirm.kind === kind && P.confirm.id === id)) return "";
+  return `<div class="danger"><p>${used}</p><div class="actions">${btn(`删掉 ${esc(id)}`, `data-cfg="del-${kind}-sure" data-id="${esc(id)}" ${P.busy ? "disabled" : ""}`, "danger-btn")}${btn("取消", 'data-cfg="cancel"')}</div></div>`;
+}
+function modelRow(P, m, def) {
+  const editing = P.edit?.kind === "model" && P.edit.id === m.alias;
+  const menu = (S.models || []).find((x) => x.id === m.alias);
+  const win = m.context_window || menu?.context_window;
+  return `<li class="pm${editing ? " editing" : ""}">
+    <div class="pm-main"><span class="pm-name">${esc(m.name || m.alias)}${m.alias === def ? `<span class="pill">默认</span>` : ""}</span>
+      <span class="pm-sub"><span class="num">${esc(m.alias)}</span><span class="sep">·</span><span class="num">${esc(m.model)}</span>${win ? `<span class="sep">·</span><span class="num">${kTokens(win)}</span> 窗口` : ""}${m.effort ? `<span class="sep">·</span>effort ${esc(m.effort)}` : ""}</span></div>
+    ${m.standalone ? "" : `<span class="pm-act"><button class="text-btn quiet" data-cfg="edit-model" data-id="${esc(m.alias)}">编辑</button><button class="text-btn quiet danger-link" data-cfg="del-model" data-id="${esc(m.alias)}">删除</button></span>`}
+    ${editing ? modelForm(P, m) : ""}
+    ${delAsk(P, "model", m.alias, `删掉之后菜单里没有它；已经开始的请求用的是开始时那份配置，不受影响。`)}</li>`;
+}
+function modelsSection(P) {
+  const C = P.data.cfg;
+  if (!C || C.error) return secHead("模型", "") + errLine(C);
+  const def = C.default;
+  const completions = C.models;
+  const defaultPick = `<label class="def-pick"><span>默认模型</span><select class="select" id="cfg-default" ${P.busy ? "disabled" : ""}>${completions.map((m) => `<option value="${esc(m.alias)}" ${m.alias === def ? "selected" : ""}>${esc(m.name || m.alias)}</option>`).join("")}</select></label>`;
+  const cards = C.providers.map((p) => {
+    const mine = completions.filter((m) => m.provider === p.id);
+    const editing = P.edit?.kind === "provider" && P.edit.id === p.id;
+    const adding = P.edit?.kind === "new-model" && P.edit.provider === p.id;
+    return `<section class="pcard${editing ? " editing" : ""}">
+      <header class="pcard-head"><div class="pcard-title"><span class="pname">${esc(p.id)}</span><span class="tag">${esc((BACKENDS.find(([v]) => v === p.api_backend) || [0, p.api_backend || "协议没写"])[1])}</span>${keyLine(p)}</div>
+        ${editing ? "" : `<span class="pact">${btn("编辑", `data-cfg="edit-provider" data-id="${esc(p.id)}"`, "sm")}<button class="text-btn quiet danger-link" data-cfg="del-provider" data-id="${esc(p.id)}">删除</button></span>`}</header>
+      ${p.base_url && !editing ? `<p class="pcard-url num">${esc(p.base_url)}</p>` : ""}
+      ${editing ? providerForm(P, p) : ""}
+      ${delAsk(P, "provider", p.id, mine.length ? `还有 ${mine.length} 个模型挂在它上面，Gateway 会拒绝；先删掉或改挂别的 provider。` : `删掉 provider ${esc(p.id)}；它的 API key 留在环境变量里。`)}
+      <ul class="pms">${mine.map((m) => modelRow(P, m, def)).join("") || `<li class="pm empty">还没有模型挂在它上面。</li>`}</ul>
+      ${adding ? `<div class="pm-new">${modelForm(P, null, p.id)}</div>` : `<button class="text-btn quiet add-model" data-cfg="new-model" data-provider="${esc(p.id)}">${icon("plus")}添加模型</button>`}
+    </section>`;
+  }).join("");
+  const loose = completions.filter((m) => m.standalone);
+  const looseCard = loose.length ? `<section class="pcard"><header class="pcard-head"><div class="pcard-title"><span class="pname">独立模型</span><span class="muted small">端点直接写在模型项里，没挂 provider</span></div></header>
+      <ul class="pms">${loose.map((m) => modelRow(P, m, def)).join("")}</ul><p class="hint">这几个只能在配置文件里改。</p></section>` : "";
+  const addProvider = P.edit?.kind === "new-provider"
+    ? `<section class="pcard editing"><header class="pcard-head"><div class="pcard-title"><span class="pname">添加 provider</span></div></header>${providerForm(P, null)}</section>`
+    : `<button class="add-card" data-cfg="new-provider">${icon("plus")}添加 provider</button>`;
+  return secHead("模型", "改完马上生效：校验通过才保存，随后热重载。", completions.length ? defaultPick : "") + editNotice(P) + cards + looseCard + addProvider;
+}
+// 写完之后的一句回执；409 时给"重新读取"
+function editNotice(P) {
+  const R = P.result.edit;
+  return R ? `<div class="notice${R.bad ? " bad-notice" : ""}"><p>${R.text}</p>${R.reread ? `<button class="text-btn" data-cfg="reread">重新读取</button>` : ""}</div>` : "";
+}
+async function cfgSend(method, path, body, done) {
+  const P = S.pg.settings;
+  P.busy = "cfg"; P.fail = ""; render();
+  try {
+    // 三份视图共用一个 version：哪份读到了用哪份
+    const version = [P.data.cfg, P.data.settings, P.data.env].find((x) => x?.version)?.version;
+    const r = await api(path, { method, body: JSON.stringify({ version, ...body }) });
+    P.data.cfg = r.models; P.data.settings = r.settings; P.data.env = r.env;
+    api("/v1/config/check").then((x) => { P.data.config = x; render(); }).catch(() => {});
+    const n = r.reload?.changed?.length || 0;
+    P.result.edit = { text: `${done}。${n ? `重载装上了，变了 ${n} 个键` : "重载装上了"}${r.reload?.start_only?.length ? `；其中 ${r.reload.start_only.join("、")} 要重启 Gateway 才生效` : ""}。` };
+    P.edit = null; P.confirm = null;
+    api("/v1/models").then((x) => { S.models = x.models; fillModels(); render(); }).catch(() => {});
+  } catch (err) {
+    if (err.status === 409 && /改过了/.test(err.message)) P.result.edit = { text: esc(err.message), bad: true, reread: true };
+    else P.fail = err.message;
+    if (P.confirm) { P.result.edit = { text: esc(err.message), bad: true }; P.confirm = null; }
+  }
+  P.busy = ""; render();
+}
+function cfgAct(el) {
+  const P = S.pg.settings, a = el.dataset.cfg, id = el.dataset.id;
+  P.fail = "";
+  if (a === "cancel") { P.edit = null; P.confirm = null; render(); return; }
+  if (a === "reread") { P.result.edit = null; reloadPage("settings"); return; }
+  if (a === "new-provider") { P.edit = { kind: "new-provider" }; P.confirm = null; render(); setTimeout(() => $("pf-id")?.focus()); return; }
+  if (a === "edit-provider") { P.edit = { kind: "provider", id }; P.confirm = null; render(); return; }
+  if (a === "new-model") { P.edit = { kind: "new-model", provider: el.dataset.provider }; P.confirm = null; render(); setTimeout(() => $("mf2-alias")?.focus()); return; }
+  if (a === "edit-model") { P.edit = { kind: "model", id }; P.confirm = null; render(); return; }
+  if (a === "del-provider" || a === "del-model" || a === "del-env") { P.confirm = { kind: a.slice(4), id }; P.edit = null; render(); return; }
+  if (a === "set-clear") return settingSend(el.dataset.key, null);
+  if (a === "set-toggle") return settingSend(el.dataset.key, el.getAttribute("aria-checked") !== "true");
+  if (a === "edit-env") { P.edit = { kind: "env", id }; P.confirm = null; render(); setTimeout(() => $("env-one")?.focus()); return; }
+  if (a === "new-env") { P.edit = { kind: "env-new" }; P.envRows = [{ name: "", value: "" }]; P.confirm = null; render(); setTimeout(() => document.querySelector("[data-env-name]")?.focus()); return; }
+  if (a === "env-row-add") { syncEnvRows(); P.envRows.push({ name: "", value: "" }); render(); setTimeout(() => [...document.querySelectorAll("[data-env-name]")].pop()?.focus()); return; }
+  if (a === "env-row-del") { syncEnvRows(); P.envRows.splice(Number(el.dataset.row), 1); if (!P.envRows.length) P.envRows.push({ name: "", value: "" }); render(); return; }
+  if (a === "del-env-sure") return cfgSend("DELETE", `/v1/config/env/${encodeURIComponent(id)}`, {}, `删掉了 ${esc(id)}`);
+  if (a === "del-provider-sure") return cfgSend("DELETE", `/v1/config/model-providers/${encodeURIComponent(id)}`, {}, `删掉了 provider ${esc(id)}`);
+  if (a === "del-model-sure") return cfgSend("DELETE", `/v1/config/models/${encodeURIComponent(id)}`, {}, `删掉了模型 ${esc(id)}`);
+}
+function cfgSubmit(form) {
+  const f = new FormData(form), v = (k) => String(f.get(k) ?? "").trim();
+  if (form.id === "cfg-setting-num") return settingSend(form.dataset.key, v("v") === "" ? null : Number(v("v")));
+  if (form.id === "cfg-env-one") return cfgSend("PUT", "/v1/config/env", { vars: [{ name: form.dataset.name, value: String(f.get("value") ?? "") }] }, `${esc(form.dataset.name)} 设好了`);
+  if (form.id === "cfg-env-form") {
+    syncEnvRows();
+    const vars = S.pg.settings.envRows.map((r) => ({ name: r.name.trim(), value: r.value })).filter((r) => r.name || r.value);
+    if (!vars.length) return;
+    return cfgSend("PUT", "/v1/config/env", { vars }, vars.length === 1 ? `${esc(vars[0].name)} 设好了` : `设好了 ${vars.length} 个变量`);
+  }
+  const num = (k) => (v(k) ? Number(v(k)) : undefined);
+  if (form.id === "cfg-provider-form") {
+    const id = form.dataset.id || v("pid"); // 字段不能叫 id：会遮住 form.id，提交监听就认不出这张表
+    const body = { api_backend: v("api_backend"), base_url: v("base_url") || undefined, env_key: v("env_key") || undefined, auth: v("auth") || undefined, timeout_secs: num("timeout_secs"), api_key: v("api_key") || undefined };
+    return cfgSend("PUT", `/v1/config/model-providers/${encodeURIComponent(id)}`, body, form.dataset.id ? `保存了 provider ${esc(id)}` : `添加了 provider ${esc(id)}`);
+  }
+  const alias = form.dataset.alias || v("alias");
+  const efforts = v("efforts") ? v("efforts").split(/[,，\s]+/).filter(Boolean) : undefined;
+  const body = { provider: v("provider"), model: v("model"), name: v("name") || undefined, effort: v("effort") || undefined, efforts, context_window: num("context_window") };
+  return cfgSend("PUT", `/v1/config/models/${encodeURIComponent(alias)}`, body, form.dataset.alias ? `保存了模型 ${esc(alias)}` : `添加了模型 ${esc(alias)}`);
+}
+
+// —— 配置：一项一张卡，左边说它是什么，右边直接改 ——
+function settingSend(key, value) {
+  const label = SETTING_COPY[key]?.[0] || key;
+  S.pg.settings.failKey = key; // 失败原因写在这一项的卡片里
+  return cfgSend("PUT", `/v1/config/settings/${encodeURIComponent(key)}`, { value }, value === null ? `${label}回到了默认` : `${label}改好了`);
+}
+function choiceText(P, key, v) {
+  if (key === "memory.model") { const m = (P.data.cfg?.models || []).find((x) => x.alias === v); return m?.name || v; }
+  return CHOICE_TEXT[v] || v;
+}
+function settingControl(P, x) {
+  const dis = P.busy ? "disabled" : "", [label, , unit] = SETTING_COPY[x.key] || [x.key];
+  const eff = x.effective;
+  if (x.kind === "bool") {
+    return `<button type="button" class="switch" role="switch" aria-checked="${eff === true}" aria-label="${esc(label)}" data-cfg="set-toggle" data-key="${esc(x.key)}" ${dis}><i></i></button>`;
+  }
+  if (x.kind === "choice") {
+    // 没写的项头一个选项是"默认"，选它就删掉那一行；default_agent 没有默认，不给这一项
+    const unsetText = x.key === "memory.model" ? `跟默认模型（${esc(choiceText(P, x.key, eff))}）` : `默认（${esc(choiceText(P, x.key, eff))}）`;
+    const first = x.key === "default_agent" ? "" : `<option value="" ${x.value == null ? "selected" : ""}>${unsetText}</option>`;
+    return `<select class="select" data-setting="${esc(x.key)}" aria-label="${esc(label)}" ${dis}>${first}${(x.options || []).map((o) => `<option value="${esc(o)}" ${o === x.value ? "selected" : ""}>${esc(choiceText(P, x.key, o))}</option>`).join("")}</select>`;
+  }
+  return `<form class="snum" id="cfg-setting-num" data-key="${esc(x.key)}"><input class="input num" type="number" name="v" aria-label="${esc(label)}" ${x.min != null ? `min="${x.min}"` : ""} ${x.max != null ? `max="${x.max}"` : ""} value="${x.value ?? ""}" placeholder="${eff ?? ""}"><span class="unit">${unit || ""}</span>${btn("保存", `type="submit" ${dis}`, "sm")}</form>`;
+}
+function configSection(P) {
+  const cfg = P.data.config, X = P.data.settings, R = P.result, busy = (k) => (P.busy === k ? "disabled" : "");
+  const issues = cfg?.issues || [];
+  const stale = (cfg?.sources || []).some((s) => s.mtime > cfg.loaded_at);
+  const reload = R.reload;
+  const status = cfg?.error ? `<section class="scard">${errLine(cfg)}</section>` : `<section class="scard scard-status">
+    <div class="scard-row"><div class="scard-text"><h4>${issues.length ? `配置有 <span class="num">${issues.length}</span> 条提醒` : "配置检查通过"}</h4>
+      <p>生效的配置装于 <span class="num">${day(cfg.loaded_at)} ${clock(new Date(cfg.loaded_at))}</span>${stale ? `，<span class="bad">之后文件改过，还没装上</span>` : ""}。</p></div>
+      <div class="scard-ctl">${btn(P.busy === "reload" ? "正在加载" : "重新加载", `data-pg-act="config-reload" ${busy("reload")}`, "sm")}${btn("重新检查", `data-pg-act="config-check" ${busy("check")}`, "sm")}</div></div>
+    ${issues.length ? `<ul class="evs">${issues.map((x) => `<li class="ev"><span class="ev-line"><span class="pill${x.severity === "error" ? " bad" : " wait"}">${x.severity === "error" ? "错误" : "提醒"}</span><span class="num">${esc(x.key)}</span></span><span>${esc(x.message)}</span></li>`).join("")}</ul>` : ""}
+    ${reload ? `<div class="notice">${reload.error ? `<p class="bad">没装上：${esc(reload.error)}</p>` : `<p>${reload.changed.length ? `装上了，变了 ${reload.changed.length} 个键：<span class="num">${reload.changed.map(esc).join("、")}</span>` : "装上了，没有键变化"}。</p>
+      ${reload.start_only.length ? `<p class="bad">其中 <span class="num">${reload.start_only.map(esc).join("、")}</span> 只在启动时生效，要重启 Gateway（<code>komo gateway restart</code>）。</p>` : ""}`}</div>` : ""}</section>`;
+  const rows = !X || X.error ? errLine(X) : X.settings.map((x) => {
+    const [label, desc] = SETTING_COPY[x.key] || [x.key, ""];
+    const custom = x.value != null && x.key !== "default_agent" && x.kind !== "choice";
+    return `<section class="scard"><div class="scard-row${x.kind === "bool" ? " bool" : ""}"><div class="scard-text"><h4>${esc(label)}</h4><p>${desc}${custom ? ` <button class="text-btn quiet" data-cfg="set-clear" data-key="${esc(x.key)}">恢复默认</button>` : ""}</p></div>
+      <div class="scard-ctl">${settingControl(P, x)}</div></div>${P.failKey === x.key ? failLine({ fail: P.fail.replace(`\`${x.key}\``, label) }) : ""}</section>`;
+  }).join("");
+  return secHead("配置", "常用的几项，改完马上生效。其余的在配置文件里改，保存后 Gateway 自己装上。") + editNotice(P) + status + rows;
+}
+
+// —— 环境变量：API key 与其他凭证。值只进不出 ——
+function syncEnvRows() {
+  const P = S.pg.settings;
+  document.querySelectorAll("[data-env-name]").forEach((el) => { P.envRows[Number(el.dataset.envName)].name = el.value; });
+  document.querySelectorAll("[data-env-value]").forEach((el) => { P.envRows[Number(el.dataset.envValue)].value = el.value; });
+}
+// 把整段 .env 粘进名字框：一行一个变量，# 开头的跳过，值两边的引号去掉
+function envPaste(ev) {
+  const el = ev.target.closest?.("[data-env-name]");
+  const text = ev.clipboardData?.getData("text") || "";
+  if (!el || !/[=\n]/.test(text)) return;
+  const rows = text.split(/\r?\n/).map((l) => l.trim()).filter((l) => l && !l.startsWith("#") && l.includes("="))
+    .map((l) => { const [k, ...rest] = l.replace(/^export\s+/, "").split("="); return { name: k.trim(), value: rest.join("=").trim().replace(/^(['"])(.*)\1$/, "$2") }; });
+  if (!rows.length) return;
+  ev.preventDefault();
+  const P = S.pg.settings;
+  syncEnvRows();
+  const at = Number(el.dataset.envName);
+  P.envRows.splice(at, P.envRows[at].name || P.envRows[at].value ? 0 : 1, ...rows);
+  render();
+}
+function envSection(P) {
+  const E = P.data.env, dis = P.busy ? "disabled" : "";
+  if (!E || E.error) return secHead("环境变量", "") + errLine(E);
+  const rows = E.vars.map((v) => {
+    v.used_by ||= []; // 没人用时 Gateway 省掉这个字段
+    const editing = P.edit?.kind === "env" && P.edit.id === v.name;
+    const state = v.set ? `<span class="kstate ok"><i class="kdot"></i>已设置</span>` : `<span class="kstate warn"><i class="kdot"></i>${v.in_file ? "是空的" : "缺"}</span>`;
+    return `<li class="envrow${editing ? " editing" : ""}">
+      <div class="env-main"><span class="env-name num">${esc(v.name)}</span>${state}${v.used_by.length ? `<span class="env-use">${v.used_by.map(esc).join("、")} 在用</span>` : ""}</div>
+      ${editing ? "" : `<span class="pm-act"><button class="text-btn quiet" data-cfg="edit-env" data-id="${esc(v.name)}">${v.in_file ? "改值" : "设置"}</button>${v.in_file ? `<button class="icon-btn danger-icon" data-cfg="del-env" data-id="${esc(v.name)}" aria-label="删掉 ${esc(v.name)}" title="删掉">${icon("trash")}</button>` : ""}</span>`}
+      ${editing ? `<form class="env-one" id="cfg-env-one" data-name="${esc(v.name)}"><input class="input num" id="env-one" name="value" type="password" autocomplete="new-password" required placeholder="${v.set ? "新值，会替换现在的" : "值"}">${btn(P.busy ? "正在保存" : "保存", `type="submit" ${dis}`, "sm primary")}${btn("取消", 'type="button" data-cfg="cancel"', "sm")}${failLine(P)}</form>` : ""}
+      ${delAsk(P, "env", v.name, v.used_by.length ? `${v.used_by.map(esc).join("、")} 还在用它，Gateway 会拒绝。` : `删掉之后，读它的地方拿不到值。`)}</li>`;
+  }).join("");
+  const adding = P.edit?.kind === "env-new";
+  const form = adding ? `<form class="envform" id="cfg-env-form">
+      ${P.envRows.map((r, i) => `<div class="kvpair">
+        <label class="kv-k" for="envn-${i}">名字</label><input class="input num" id="envn-${i}" data-env-name="${i}" value="${esc(r.name)}" placeholder="MY_API_KEY" autocomplete="off" spellcheck="false">
+        <button type="button" class="icon-btn danger-icon" data-cfg="env-row-del" data-row="${i}" aria-label="去掉这一行">${icon("trash")}</button>
+        <label class="kv-k" for="envv-${i}">值</label><input class="input num" id="envv-${i}" data-env-value="${i}" type="password" value="${esc(r.value)}" placeholder="值" autocomplete="new-password"></div>`).join("")}
+      <div class="kv-more">${btn(`${icon("plus")}添加`, 'type="button" data-cfg="env-row-add"', "sm")}<span class="muted">或把 .env 的内容整段粘贴到名字框里。</span></div>
+      ${failLine(P)}
+      <div class="kv-foot">${btn("取消", 'type="button" data-cfg="cancel"')}${btn(P.busy ? "正在保存" : "保存", `type="submit" ${dis}`, "primary")}</div></form>`
+    : `<button class="add-card" data-cfg="new-env">${icon("plus")}添加变量</button>`;
+  return secHead("环境变量", "API key 与其他凭证。值只能写入、不再显示；改完马上生效。") + editNotice(P)
+    + (E.vars.length ? `<ul class="envlist">${rows}</ul>` : "") + form;
+}
+
+function indexSection(P) {
+  const ix = P.data.index, R = P.result;
+  if (ix.error) return secHead("记忆索引", "") + errLine(ix);
+  return secHead("记忆索引", "记忆检索的向量部分；索引不可用时检索按关键词降级。") + `<div class="set-panel">${kvBlock([
+      ["向量", `${esc(ix.space?.model || "")} · ${esc(ix.space?.provider || "")}`],
+      ["端点", `<span class="num">${esc(ix.space?.endpoint || "")}</span>`],
+      ["状态", `${{ ready: "就绪", building: "正在建", stale: "要重建", unavailable: "不可用" }[ix.state] || esc(ix.state)} · 已索引 <span class="num">${ix.indexed} / ${ix.total}</span> 条生效的`],
+      ix.errors?.length ? ["错误", `<span class="bad">${ix.errors.map(esc).join("；")}</span>`] : null,
+    ])}
+    ${R.rebuild ? `<div class="notice"><p>${R.rebuild.error ? `<span class="bad">没提交：${esc(R.rebuild.error)}</span>` : R.rebuild.accepted ? `已提交重建（代次 <span class="num">${esc(R.rebuild.generation)}</span>），后台跑完前检索按关键词降级。` : "已经有一次重建在跑，没有再起一个。"}</p></div>` : ""}
+    <div class="actions">${btn(P.busy === "rebuild" ? "正在提交" : "重建索引", `data-pg-act="index-rebuild" ${P.busy === "rebuild" ? "disabled" : ""}`)}</div></div>`;
+}
+function mcpSection(P) {
+  const mcp = P.result.mcp;
+  return secHead("MCP", "外部工具服务器，在配置文件里配；默认只在 codemode 里调。") + `<div class="set-panel">${mcp ? (mcp.error ? `<p class="form-err">没连上：${esc(mcp.error)}</p>` : `<ul class="evs">${mcp.servers.map((x) => `<li class="ev"><span class="ev-line"><span class="num">${esc(x.name)}</span><span class="pill${x.state === "connected" ? "" : x.state === "failed" ? " bad" : " wait"}">${MCP_STATE[x.state] || esc(x.state)}</span></span>${x.detail ? `<span class="muted">${esc(x.detail)}</span>` : ""}</li>`).join("") || `<li class="ev muted">没有配 MCP 服务器。</li>`}</ul>`) : `<p class="set-line muted">Gateway 平时不报 MCP 的连接状态；重连会等握手，然后列出每台的状态。</p>`}
+    <div class="actions">${btn(P.busy === "mcp" ? "正在重连" : "重连全部 MCP", `data-pg-act="mcp-reconnect" ${P.busy === "mcp" ? "disabled" : ""}`)}</div></div>`;
+}
+function gatewaySection(P) {
+  const h = P.data.health;
+  return secHead("Gateway", "唯一持有状态的进程；Web、TUI、CLI 都是它的客户端。") + `<div class="set-panel">${h.error ? errLine(h) : kvBlock([
+    ["版本", `<span class="num">${esc(h.version)}</span> · 协议 <span class="num">${h.protocol_version}</span>`],
+    ["启动于", `<span class="num">${day(h.started_at)} ${clock(new Date(h.started_at))}</span>`],
+    ["实例", `<span class="num">${esc(h.instance_id)}</span>`],
+    ["数据目录", `<span class="num">${esc(h.data_dir)}</span>`],
+    ["遥测", h.telemetry?.endpoint ? `${esc(h.telemetry.endpoint)} · ${h.telemetry.last_error ? `<span class="bad">出错：${esc(h.telemetry.last_error)}</span>` : h.telemetry.last_ok_at ? `正常，最近一次 ${ago(h.telemetry.last_ok_at)}` : "还没导出过"}` : `<span class="muted">没配</span>`],
+  ])}</div>`;
+}
+function channelsSection() {
+  return secHead("渠道", "飞书、Telegram、微信。谁能说话、哪个会话收主动消息，在配置文件里设；凭证见环境变量一节。") + `<div class="set-panel"><p class="set-line muted">渠道的连接状态 Gateway 还没有接口可查；在终端里用 <code>komo channel list</code> 与 <code>komo channel probe</code>。</p></div>`;
+}
+async function settingsAct(act) {
+  const P = S.pg.settings;
+  const key = { "config-reload": "reload", "config-check": "check", "index-rebuild": "rebuild", "mcp-reconnect": "mcp" }[act];
+  P.busy = key; render();
+  try {
+    if (act === "config-reload") P.result.reload = await api("/v1/config/reload", { method: "POST", body: "{}" });
+    if (act === "index-rebuild") P.result.rebuild = await api("/v1/memory-index/rebuild", { method: "POST", body: JSON.stringify({}) });
+    if (act === "mcp-reconnect") P.result.mcp = await api("/v1/mcp/reconnect", { method: "POST", body: JSON.stringify({ servers: [] }) });
+    await LOADERS.settings(P);
+  } catch (err) { P.result[key] = { error: err.message }; }
+  P.busy = ""; render();
+}
+const PAGE_RENDER = { memory: renderMemory, matters: renderMatters, cron: renderCron, inbox: renderInbox };
 
 /* ---------- 总渲染 ---------- */
 let frame = 0;
@@ -792,12 +1939,24 @@ function render({ stick = false, force = false } = {}) {
   frame = requestAnimationFrame(() => {
     const sc = $("scroll");
     const atBottom = sc.scrollHeight - sc.scrollTop - sc.clientHeight < 80;
-    renderGroups(); renderConn(); renderThread(); renderComposer(); renderPanel();
+    const onPage = S.page !== "session";
+    app.classList.toggle("on-page", onPage);
+    for (const [k, id] of Object.entries(PAGES)) $(id).hidden = S.page !== k;
+    // 当前页挪到 main 最前：读屏与检查工具认第一个 h1，隐藏页的 h1 不该排在它前面
+    if (onPage && document.querySelector(".main").firstElementChild !== $(PAGES[S.page])) document.querySelector(".main").prepend($(PAGES[S.page]));
+    document.querySelectorAll("[data-nav]").forEach((a) => a.toggleAttribute("aria-current", a.dataset.nav === S.page));
+    renderGroups(); renderConn(); renderNavCounts();
+    if ($("settings").open) renderSettings();
+    if (onPage) { PAGE_RENDER[S.page](); document.title = `${PAGE_NAME[S.page]} · komo`; return; }
+    app.classList.remove("detail-open");
+    renderThread(); renderComposer(); renderPanel();
     if ((stick && atBottom) || force) { sc.scrollTop = sc.scrollHeight; }
     if (S.view && S.view.status === "ready" && !S.view.scrolled) { sc.scrollTop = sc.scrollHeight; S.view.scrolled = true; }
   });
 }
 setInterval(() => { if (S.view?.runs.size || S.sessions.some((s) => running(s.session))) render(); }, 1000);
+// 待处理的数量不随会话事件流来（在别的页面上没有流）：半分钟取一次
+setInterval(() => { if (S.boot === "ready") api("/v1/interventions").then((r) => { S.inbox = r.interventions; renderNavCounts(); }).catch(() => {}); }, 30000);
 
 /* ---------- 交互 ---------- */
 const app = $("app");
@@ -846,6 +2005,60 @@ document.addEventListener("click", (ev) => {
   const sess = t.closest("[data-session]");
   if (sess) { openSession(sess.dataset.session); app.classList.remove("nav-open", "panel-open"); syncPanelButton(); return; }
 
+  const pgSel = t.closest("[data-pg-sel]");
+  if (pgSel) {
+    const page = pgSel.dataset.pgSel;
+    if (S.page !== page) location.hash = `#/${page}/${pgSel.dataset.id}`;
+    else selectIn(page, pgSel.dataset.id);
+    return;
+  }
+  if (t.closest("#open-settings")) { app.classList.remove("nav-open"); openSettings(); return; }
+  if (t.closest("#settings-close")) { $("settings").close(); return; }
+  const sec = t.closest("[data-set-sec]");
+  if (sec) { settingsSection(sec.dataset.setSec); return; }
+  if (t.closest("[data-pg-close]")) { closeDetail(S.page); return; }
+  if (t.closest("[data-pg-reload]")) { reloadPage(t.closest("#settings") ? "settings" : S.page); return; }
+  const addBtn = t.closest("#matters-add");
+  if (addBtn) { selectIn(addBtn.id.split("-")[0], "new"); setTimeout(() => $("mn-title")?.focus()); return; }
+  const ca = t.closest("[data-cfg]");
+  if (ca) { cfgAct(ca); return; }
+  const pa = t.closest("[data-pg-act]");
+  if (pa) { pageAct(pa); return; }
+  const M = S.mem;
+  const rung = t.closest("[data-rung]");
+  if (rung) {
+    const k = rung.dataset.rung;
+    // 点在已选的一档上回到"在起作用"；前两档本来就在"在起作用"里亮着，点了只看那一档
+    M.bucket = M.bucket === k ? "live" : k;
+    M.hits = null; M.query = ""; $("mem-query").value = ""; M.selected = null; M.confirmForget = M.classify = false; M.fail = "";
+    setMemHash(); render(); return;
+  }
+  const memBtn = t.closest("[data-mem]");
+  // 窄屏的详情是推进去的一层：进去时记下列表滚到哪，回来时还原
+  if (memBtn) {
+    // 从图上点的那一条可能不在当前这一档：换到它所在的档，列表里也看得到它
+    const hit = S.mem && S.memories.get(memBtn.dataset.mem);
+    if (hit && !M.hits && !inBucket(hit, M.bucket)) M.bucket = hit.state === "active" ? "live" : rungOf(hit);
+    if (!wide()) { M.listScroll = $("mem").scrollTop; $("mem").scrollTop = 0; } M.selected = memBtn.dataset.mem; M.confirmForget = M.classify = false; M.fail = ""; setMemHash(); render(); return;
+  }
+  if (t.closest("#mem-add")) { if (!wide()) { M.listScroll = $("mem").scrollTop; $("mem").scrollTop = 0; } M.selected = "new"; M.fail = ""; render(); setTimeout(() => $("f-content")?.focus()); return; }
+  if (t.closest("[data-mem-close]")) {
+    M.selected = null; M.fail = ""; setMemHash(); render();
+    if (!wide()) requestAnimationFrame(() => requestAnimationFrame(() => { $("mem").scrollTop = M.listScroll || 0; }));
+    return;
+  }
+  if (t.closest("[data-mem-reload]")) { openMemory(M.selected); return; }
+  const ma = t.closest("[data-mem-act]");
+  if (ma) {
+    const act = ma.dataset.memAct, id = ma.dataset.id || M.selected;
+    if (act === "forget-ask") M.confirmForget = true;
+    else if (act === "forget-cancel") M.confirmForget = false;
+    else if (act === "classify-open") M.classify = true;
+    else if (act === "classify-cancel") M.classify = false;
+    else if (act === "classify-ref") { memClassify(id, "reference"); return; }
+    else { if (act === "confirm" && !t.closest(".page-detail")) M.selected = id; memAct(act, id); return; }
+    render(); return;
+  }
   if (t.closest("[data-retry-boot]")) boot();
   if (t.closest("[data-retry-session]")) openSession(S.current);
   const rs = t.closest("[data-retry-send]");
@@ -853,7 +2066,8 @@ document.addEventListener("click", (ev) => {
   if (t.closest("#new-session")) newSession();
   if (t.closest("#stop-run")) cancelRuns();
   if (t.closest("#toggle-panel")) { app.classList.toggle(wide() ? "panel-closed" : "panel-open"); syncPanelButton(); }
-  if (t.closest("#open-nav")) app.classList.add("nav-open");
+  if (t.closest("[data-open-nav]")) app.classList.add("nav-open");
+  if (t.closest("[data-nav]")) app.classList.remove("nav-open");
   if (t.closest("#close-nav, #close-panel, #scrim")) { app.classList.remove("nav-open", "panel-open"); syncPanelButton(); }
 });
 // 点在菜单和它的按钮之外就关菜单（先于其他点击处理）
@@ -884,8 +2098,72 @@ $("input").addEventListener("keydown", (ev) => {
 $("input").addEventListener("input", (ev) => { ev.target.style.height = "auto"; ev.target.style.height = ev.target.scrollHeight + "px"; renderComposer(); });
 $("model").addEventListener("change", fillEfforts);
 $("search-input").addEventListener("input", (ev) => { S.query = ev.target.value.trim(); render(); });
-addEventListener("resize", syncPanelButton);
-addEventListener("hashchange", () => { const id = routeSession(); if (id && id !== S.current) openSession(id); });
+addEventListener("resize", () => { syncPanelButton(); if (S.page === "memory") render(); }); // 图按容器宽度画
+// 点在弹窗外的遮罩上关；关掉时丢下没提交的表单和删除确认
+$("settings").addEventListener("click", (ev) => { if (ev.target === ev.currentTarget) ev.currentTarget.close(); });
+$("settings").addEventListener("close", () => { const P = S.pg.settings; P.edit = null; P.confirm = null; P.fail = ""; });
+addEventListener("hashchange", (ev) => {
+  if (S.boot !== "ready") return;
+  const sec = routeSettings();
+  if (sec) { history.replaceState(null, "", new URL(ev.oldURL).hash || "#/"); openSettings(sec); return; }
+  const r = routePage();
+  if (r) {
+    if (S.page !== r.page) openPage(r.page, r.id);
+    else { const P = r.page === "memory" ? S.mem : S.pg[r.page]; if (P && r.id !== P.selected) { P.selected = r.id; P.fail = ""; P.form = null; render(); } }
+    return;
+  }
+  const id = routeSession();
+  if (id && (id !== S.current || S.page !== "session")) openSession(id);
+});
+function pageAct(el) {
+  const P = el.closest("#settings") ? S.pg.settings : S.pg[S.page], a = el.dataset.pgAct;
+  if (!P) return;
+  if (a === "form") { P.form = P.form === el.dataset.verb ? null : el.dataset.verb; P.fail = ""; render(); return; }
+  if (a === "form-cancel") { P.form = null; P.fail = ""; render(); return; }
+  if (a === "confirm") { P.confirm = el.dataset.what; render(); return; }
+  if (a === "confirm-cancel") { P.confirm = null; render(); return; }
+  if (a === "toggle-closed") { P.showClosed = !P.showClosed; render(); return; }
+  if (a === "verb") return matterVerb(el.dataset.verb);
+  if (a === "unlink") return matterVerb("unlink", { trigger: JSON.parse(el.dataset.trigger) });
+  if (a.startsWith("cron-")) return cronAct(a);
+  if (a === "answer") return inboxAnswer(el.dataset.verdict, !!el.dataset.sure);
+  if (a === "config-check") { P.busy = "check"; render(); return LOADERS.settings(P).then(() => { P.busy = ""; render(); }); }
+  return settingsAct(a);
+}
+function matterFormSubmit(form) {
+  const m = S.pg.matters.items.find((x) => x.id === S.pg.matters.selected), f = new FormData(form), verb = form.dataset.verb;
+  const v = (k) => String(f.get(k) ?? "").trim();
+  if (verb === "next") return matterVerb("next", { next: v("next") });
+  if (verb === "wait") return matterVerb("wait", { waiting_for: v("waiting_for") });
+  if (verb === "resume") return matterVerb("resume", v("next") ? { next: v("next") } : {});
+  if (verb === "link") return matterVerb("link", { trigger: { kind: "cron", job: v("job") } });
+  const fields = { title: v("title") };
+  if (m.kind === "goal") { if (v("due")) fields.due = v("due"); else if (m.due) fields.clear_due = true; }
+  else fields.standard = v("standard");
+  return matterVerb("edit", fields);
+}
+document.addEventListener("submit", (ev) => {
+  if (ev.target.id === "matter-form") { ev.preventDefault(); matterFormSubmit(ev.target); }
+  if (ev.target.id === "matter-new") { ev.preventDefault(); matterCreate(ev.target); }
+  if (/^cfg-(provider-form|model-form|setting-num|env-one|env-form)$/.test(ev.target.id)) { ev.preventDefault(); cfgSubmit(ev.target); }
+  if (ev.target.id === "mem-form") { ev.preventDefault(); memAdd(ev.target); }
+  if (ev.target.id === "classify-form") { ev.preventDefault(); memClassify(S.mem.selected, "convention", new FormData(ev.target).get("applies_when").trim()); }
+});
+document.addEventListener("change", (ev) => {
+  // 新建事项表单里的单选决定显示哪组字段（目标 / 领域）
+  if (ev.target.type === "radio" && ev.target.form?.id === "matter-new") {
+    ev.target.form.querySelectorAll("[data-for]").forEach((d) => { d.hidden = d.dataset.for !== ev.target.value; });
+  }
+  if (ev.target.dataset?.setting) { settingSend(ev.target.dataset.setting, ev.target.value === "" ? null : ev.target.value); return; }
+  if (ev.target.id === "cfg-default") { cfgSend("PUT", "/v1/config/default-model", { alias: ev.target.value }, `默认模型改成了 ${esc(ev.target.value)}`); return; }
+  if (ev.target.id === "mem-scope") { S.mem.scope = ev.target.value; S.mem.selected = null; render(); }
+  if (ev.target.name === "application" && ev.target.form?.id === "mem-form") {
+    const conv = ev.target.value === "convention";
+    $("f-when-wrap").hidden = !conv; $("f-when").required = conv;
+  }
+});
+document.addEventListener("paste", envPaste);
+$("mem-query").addEventListener("input", (ev) => { S.mem.selected = null; memSearch(ev.target.value.trim()); });
 
 syncPanelButton();
 boot();

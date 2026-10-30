@@ -12,12 +12,14 @@
 //! **这是整个 crate 里唯一读环境变量的地方**（§13.4 的编码规则），而其中
 //! `KOMO_HOME` 是唯一被直接读的那一个（§12）。
 
+mod edit;
 mod effort;
 mod env;
 mod error;
 mod file;
 mod holder;
 mod init;
+mod settings;
 mod validate;
 
 use std::path::{Path, PathBuf};
@@ -26,12 +28,18 @@ use std::sync::Arc;
 use komo_kernel::protocol::config::{ConfigIssue, ConfigSnapshot, IssueSeverity, KeyPath};
 use time::OffsetDateTime;
 
+pub use edit::{
+    EditError, ModelFields, ProviderFields, config_version, env_view, models_view,
+    remove_env_value, remove_model, remove_provider, set_default_model, set_env_value,
+    set_env_values, upsert_model, upsert_provider,
+};
 pub use effort::{EffortCapabilities, EffortProblem, EffortSupport};
-pub use env::{HomeError, KOMO_HOME, KOMO_LISTEN, Secrets, user_home};
+pub use env::{HomeError, KOMO_HOME, KOMO_LISTEN, Secrets, secrets_from_text, user_home};
 pub use error::ConfigError;
 pub use file::{DEFAULT_LISTEN, Sources, channel_credentials};
 pub use holder::{ConfigHolder, ReloadReport};
 pub use init::{API_KEY_VARIABLE, InitError, InitReport, config_template, env_template, init_home};
+pub use settings::{set_setting, settings_view};
 pub use validate::{has_errors, validate, validate_with};
 
 /// 从哪里加载。
@@ -79,10 +87,38 @@ pub fn load_config(options: &LoadOptions) -> Result<Loaded, ConfigError> {
     })?;
 
     let (file, unknown) = read_config(&sources.config)?;
+    assemble_checked(file, unknown, home, sources, secrets, &options.caps)
+}
 
+/// 拿**还没落盘**的两份文本走一遍与 [`load_config`] 相同的解析 + 校验：Web 改配置时先过
+/// 这一关再写文件（§3「从 Web 改模型配置」）。成功返回警告；有错误就是 `Invalid`。
+pub fn check_candidate(
+    home: &Path,
+    config_text: &str,
+    env_text: Option<&str>,
+    caps: &EffortCapabilities,
+) -> Result<Vec<ConfigIssue>, ConfigError> {
+    let sources = Sources::under(home);
+    let secrets = env::secrets_from_text(env_text, &sources.env).map_err(|e| ConfigError::Io {
+        path: sources.env.clone(),
+        message: e.to_string(),
+    })?;
+    let (file, unknown) = parse_config(&sources.config, config_text)?;
+    assemble_checked(file, unknown, home.to_path_buf(), sources, secrets, caps)
+        .map(|loaded| loaded.issues)
+}
+
+fn assemble_checked(
+    file: file::FileConfig,
+    unknown: Vec<String>,
+    home: PathBuf,
+    sources: Sources,
+    secrets: Secrets,
+    caps: &EffortCapabilities,
+) -> Result<Loaded, ConfigError> {
     let snapshot = file::assemble(file, &home, &sources, &secrets, OffsetDateTime::now_utc())?;
 
-    let mut issues = validate_with(&snapshot, &options.caps);
+    let mut issues = validate_with(&snapshot, caps);
     if has_errors(&issues) {
         return Err(ConfigError::Invalid { issues });
     }
@@ -118,11 +154,15 @@ fn read_config(path: &Path) -> Result<(file::FileConfig, Vec<String>), ConfigErr
         path: path.to_path_buf(),
         message: e.to_string(),
     })?;
+    parse_config(path, &text)
+}
+
+fn parse_config(path: &Path, text: &str) -> Result<(file::FileConfig, Vec<String>), ConfigError> {
     let parse_error = |e: toml::de::Error| ConfigError::Parse {
         file: path.to_path_buf(),
         message: e.to_string(),
     };
-    let deserializer = toml::Deserializer::parse(&text).map_err(parse_error)?;
+    let deserializer = toml::Deserializer::parse(text).map_err(parse_error)?;
     let mut unknown = Vec::new();
     let file = serde_ignored::deserialize(deserializer, |key| unknown.push(key.to_string()))
         .map_err(parse_error)?;

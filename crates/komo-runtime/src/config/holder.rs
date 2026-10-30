@@ -19,7 +19,7 @@ use super::effort::EffortCapabilities;
 use super::env::Secrets;
 use super::error::ConfigError;
 use super::file::Sources;
-use super::{LoadOptions, Loaded, load_config};
+use super::{LoadOptions, Loaded, check_candidate, load_config};
 
 /// 一次重载的结果。**只有键名**——值不进来，凭证更不进来（§3 第 3 步）。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -77,6 +77,9 @@ pub struct ConfigHolder {
     sources: Sources,
     home: PathBuf,
     caps: EffortCapabilities,
+    /// Web 改配置时"读 → 比版本 → 写 → 重载"这一整段串行（§3「从 Web 改模型配置」）。
+    /// 跨 `await`（重载要等渠道与 MCP），所以是 tokio 的锁。
+    edit: tokio::sync::Mutex<()>,
 }
 
 impl std::fmt::Debug for ConfigHolder {
@@ -101,6 +104,7 @@ impl ConfigHolder {
             sources,
             home,
             caps: options.caps.clone(),
+            edit: tokio::sync::Mutex::new(()),
         })
     }
 
@@ -115,6 +119,7 @@ impl ConfigHolder {
             sources,
             home,
             caps,
+            edit: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -163,6 +168,47 @@ impl ConfigHolder {
         })
     }
 
+    /// 改配置文件的那把锁：拿着它读、比版本、写、重载。
+    pub fn edit_lock(&self) -> &tokio::sync::Mutex<()> {
+        &self.edit
+    }
+
+    /// 两份文件此刻的原文；`.env` 不存在当空串。
+    pub fn read_texts(&self) -> std::io::Result<(String, String)> {
+        let config = std::fs::read_to_string(&self.sources.config)?;
+        let env = match std::fs::read_to_string(&self.sources.env) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(e) => return Err(e),
+        };
+        Ok((config, env))
+    }
+
+    /// 还没落盘的两份文本走一遍加载时的解析 + 校验。
+    pub fn check_texts(
+        &self,
+        config_text: &str,
+        env_text: &str,
+    ) -> Result<Vec<ConfigIssue>, ConfigError> {
+        check_candidate(&self.home, config_text, Some(env_text), &self.caps)
+    }
+
+    /// 原子地写回两份文件（给了才写）：同目录临时文件 → fsync → rename → fsync 目录。
+    /// `config.toml` 保留原来的权限，`.env` 一律 0600（§3：凭证文件）。
+    pub fn write_texts(
+        &self,
+        config_text: Option<&str>,
+        env_text: Option<&str>,
+    ) -> std::io::Result<()> {
+        if let Some(text) = config_text {
+            write_atomic(&self.sources.config, text, None)?;
+        }
+        if let Some(text) = env_text {
+            write_atomic(&self.sources.env, text, Some(0o600))?;
+        }
+        Ok(())
+    }
+
     /// §3 的四步。**任何错误 → 旧快照原样保留**。
     pub fn reload(&self) -> Result<ReloadReport, ConfigError> {
         let options = LoadOptions {
@@ -189,6 +235,30 @@ impl ConfigHolder {
     }
 }
 
+fn write_atomic(path: &std::path::Path, text: &str, mode: Option<u32>) -> std::io::Result<()> {
+    use std::io::Write;
+    let dir = path.parent().unwrap_or(std::path::Path::new("."));
+    let mut file = tempfile::NamedTempFile::new_in(dir)?;
+    file.write_all(text.as_bytes())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = match mode {
+            Some(mode) => mode,
+            None => std::fs::metadata(path)
+                .map(|m| m.permissions().mode() & 0o777)
+                .unwrap_or(0o644),
+        };
+        file.as_file()
+            .set_permissions(std::fs::Permissions::from_mode(mode))?;
+    }
+    #[cfg(not(unix))]
+    let _ = mode;
+    file.as_file().sync_all()?;
+    file.persist(path).map_err(|e| e.error)?;
+    std::fs::File::open(dir)?.sync_all()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -211,6 +281,37 @@ mod tests {
         let after = holder.current();
         assert_eq!(after.model.model, "chat-a", "旧快照原样保留");
         assert_eq!(after.loaded_at, before.loaded_at);
+    }
+
+    #[test]
+    fn edited_texts_are_checked_before_they_touch_the_disk() {
+        let fixture = Fixture::valid();
+        let holder = fixture.holder();
+        let (config, env) = holder.read_texts().unwrap();
+
+        let broken = Fixture::config_text("chat-b", "ultra");
+        assert!(
+            holder.check_texts(&broken, &env).is_err(),
+            "坏的那份过不了校验"
+        );
+        assert_eq!(holder.read_texts().unwrap().0, config, "校验不碰文件");
+
+        let good = Fixture::config_text("chat-b", "high");
+        holder.check_texts(&good, &env).unwrap();
+        let env_next = format!("{env}EXTRA_API_KEY='k'\n");
+        holder.write_texts(Some(&good), Some(&env_next)).unwrap();
+        holder.reload().unwrap();
+        assert_eq!(holder.current().model.model, "chat-b");
+        assert_eq!(holder.read_texts().unwrap().1, env_next);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&fixture.sources().env)
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600, ".env 写回后仍只有本人可读");
+        }
     }
 
     #[test]

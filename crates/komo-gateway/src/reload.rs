@@ -155,7 +155,7 @@ async fn announce_start_only(state: &Arc<GatewayState>, start_only: &[KeyPath]) 
 }
 
 /// 校验失败 → 422 `ConfigInvalid`，`keys` 带定位。
-fn config_failure(error: ConfigError) -> ApiFailure {
+pub(crate) fn config_failure(error: ConfigError) -> ApiFailure {
     let keys = match &error {
         ConfigError::Invalid { issues } => issues.iter().map(|issue| issue.key.clone()).collect(),
         _ => Vec::new(),

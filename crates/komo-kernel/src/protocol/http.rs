@@ -25,6 +25,17 @@
 //! | `GET /v1/models` | — | [`ModelsResponse`] |
 //! | `GET /v1/config/check` | — | [`ConfigCheckResponse`] |
 //! | `POST /v1/config/reload` | — | [`ConfigReloadResponse`]，失败走 [`ErrorBody`] |
+//! | `GET /v1/config/models` | — | [`ConfigModelsResponse`] |
+//! | `PUT /v1/config/model-providers/{id}` | [`ProviderUpsertRequest`] | [`ConfigEditResponse`] |
+//! | `DELETE /v1/config/model-providers/{id}` | [`ConfigVersionRequest`] | [`ConfigEditResponse`] |
+//! | `PUT /v1/config/models/{alias}` | [`ModelUpsertRequest`] | [`ConfigEditResponse`] |
+//! | `DELETE /v1/config/models/{alias}` | [`ConfigVersionRequest`] | [`ConfigEditResponse`] |
+//! | `PUT /v1/config/default-model` | [`DefaultModelRequest`] | [`ConfigEditResponse`] |
+//! | `GET /v1/config/settings` | — | [`ConfigSettingsResponse`] |
+//! | `PUT /v1/config/settings/{key}` | [`SettingRequest`] | [`ConfigEditResponse`] |
+//! | `GET /v1/config/env` | — | [`ConfigEnvResponse`] |
+//! | `PUT /v1/config/env` | [`EnvSetRequest`] | [`ConfigEditResponse`] |
+//! | `DELETE /v1/config/env/{name}` | [`ConfigVersionRequest`] | [`ConfigEditResponse`] |
 //!
 //! `confirm` 与 `forget` 都返回**整条**记忆而不是一个 `{ok:true}`：它们带着预期
 //! revision 来，回去的那条才说得清现在是第几版（§9.6 的幂等就是靠这个比出来的）。
@@ -1265,6 +1276,223 @@ pub struct ConfigReloadResponse {
     /// 刚加的、刚改的多半还是"连接中"。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mcp: Vec<McpServerStatus>,
+}
+
+/// `GET /v1/config/models`：文件里**写着的**模型配置（§3「从 Web 改模型配置」）。
+///
+/// 不是展开后的快照：看到的就是要改的。凭证只给"在不在"，**不给值**。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfigModelsResponse {
+    /// `config.toml` 与 `.env` 内容的哈希；写的时候原样带回来，对不上就 409。
+    pub version: String,
+    pub providers: Vec<ProviderEntry>,
+    /// 只有 completion 类；embedding 等其余模型项不在这里改。
+    pub models: Vec<ConfigModelEntry>,
+    /// `[models] default`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default: Option<String>,
+    /// 两个文件的路径，给"去文件里改"的提示用。
+    pub config_path: String,
+    pub env_path: String,
+}
+
+/// 一个 `[model_providers.<id>]`。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderEntry {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_backend: Option<String>,
+    /// 凭证所在的变量名（`env_key`，旧拼法 `api_key_env` 也读成它）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub env_key: Option<String>,
+    /// 不走变量的凭证来源（目前只有 `"chatgpt"`）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_secs: Option<u64>,
+    /// `env_key` 指向的变量此刻有没有值；`auth` 不走变量时为 `true`，什么都没写时为 `false`。
+    pub key_set: bool,
+}
+
+/// 一个 completion 类的 `[model.<alias>]`。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfigModelEntry {
+    pub alias: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub efforts: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u64>,
+    /// 不挂 provider、自己写了 `base_url` 的模型项：网页上只看不改它的端点。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub standalone: bool,
+}
+
+/// `PUT /v1/config/model-providers/{id}`：整份写这个 provider 的几个键（没给的键删掉），
+/// 表里别的键与注释不动。`Debug` 不印 `api_key` 的值。
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderUpsertRequest {
+    pub version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_backend: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub env_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_secs: Option<u64>,
+    /// 要写进 `.env` 的 key。省略 = 不动现有的值。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
+}
+
+impl std::fmt::Debug for ProviderUpsertRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProviderUpsertRequest")
+            .field("version", &self.version)
+            .field("base_url", &self.base_url)
+            .field("api_backend", &self.api_backend)
+            .field("env_key", &self.env_key)
+            .field("auth", &self.auth)
+            .field("timeout_secs", &self.timeout_secs)
+            .field("api_key", &self.api_key.as_ref().map(|_| "<set>"))
+            .finish()
+    }
+}
+
+/// `PUT /v1/config/models/{alias}`：整份写这个模型的几个键，表里别的键与注释不动。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelUpsertRequest {
+    pub version: String,
+    pub provider: String,
+    pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub efforts: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u64>,
+}
+
+/// `PUT /v1/config/default-model`。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DefaultModelRequest {
+    pub version: String,
+    pub alias: String,
+}
+
+/// 删除只带版本。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfigVersionRequest {
+    pub version: String,
+}
+
+/// 写完之后：模型、常用设置、环境变量三份新视图（共用一个新 `version`），以及这次重载的
+/// 报告（变了哪些键，不带值）。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfigEditResponse {
+    pub models: ConfigModelsResponse,
+    #[serde(default)]
+    pub settings: ConfigSettingsResponse,
+    #[serde(default)]
+    pub env: ConfigEnvResponse,
+    pub reload: ConfigReloadResponse,
+}
+
+/// `GET /v1/config/settings`：白名单里的常用设置（§3「从 Web 改常用设置与环境变量」）。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfigSettingsResponse {
+    pub version: String,
+    pub settings: Vec<ConfigSetting>,
+}
+
+/// 一项常用设置。`key` 是文件里的点路径（`memory.retrieval.mode`）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfigSetting {
+    pub key: String,
+    pub kind: SettingKind,
+    /// 文件里写的值；没写为空，生效的是默认。
+    #[serde(default)]
+    pub value: Option<serde_json::Value>,
+    /// 当前快照里生效的值。
+    #[serde(default)]
+    pub effective: Option<serde_json::Value>,
+    /// `choice` 的可选值。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub options: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max: Option<i64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SettingKind {
+    Bool,
+    Integer,
+    Choice,
+}
+
+/// `PUT /v1/config/settings/{key}`。`value: null` = 删掉这一行，回到默认。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SettingRequest {
+    pub version: String,
+    #[serde(default)]
+    pub value: Option<serde_json::Value>,
+}
+
+/// `GET /v1/config/env`：变量名与状态，**不带任何值**。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfigEnvResponse {
+    pub version: String,
+    pub vars: Vec<EnvVarEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnvVarEntry {
+    pub name: String,
+    /// `.env` 里有这一行。没有的是配置引用了却缺的名字。
+    pub in_file: bool,
+    /// `.env` 或进程环境里有非空值。
+    pub set: bool,
+    /// 引用它的配置项，如 `provider magpie`、`渠道 feishu`。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub used_by: Vec<String>,
+}
+
+/// `PUT /v1/config/env`：一次设一批变量。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnvSetRequest {
+    pub version: String,
+    pub vars: Vec<EnvAssignment>,
+}
+
+/// 一个变量的新值。值是凭证：`Debug` 只印名字，免得哪条日志把它带出去。
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnvAssignment {
+    pub name: String,
+    pub value: String,
+}
+
+impl std::fmt::Debug for EnvAssignment {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EnvAssignment")
+            .field("name", &self.name)
+            .finish_non_exhaustive()
+    }
 }
 
 /// 一台 MCP 服务器此刻的状态。

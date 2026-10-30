@@ -1503,3 +1503,224 @@ mod chat {
         let _: Option<Harness> = None;
     }
 }
+
+/// 从 Web 改模型配置（§3）：读 → 建 provider（key 只进 .env）→ 挂模型 → 改默认，每一步都
+/// 热装上；旧版本 409、校验不过 422 且文件不动、还在用的不让删。
+#[tokio::test]
+async fn model_settings_are_edited_through_the_gateway_and_reloaded() {
+    use komo_kernel::protocol::http::{ConfigEditResponse, ConfigModelsResponse};
+
+    let gateway = TestGateway::configured(&config_toml("")).await;
+    let home = gateway.state().home.clone();
+    let config_file = || std::fs::read_to_string(home.join("config.toml")).unwrap();
+
+    let (status, body) = gateway.get("/v1/config/models").await;
+    assert_eq!(status, 200, "{body}");
+    let view: ConfigModelsResponse = serde_json::from_str(&body).unwrap();
+    assert!(view.providers.is_empty());
+    assert_eq!(view.default.as_deref(), Some("main"));
+    assert!(
+        view.models
+            .iter()
+            .any(|m| m.alias == "main" && m.standalone)
+    );
+    let v1 = view.version;
+
+    let edit = |body: &str| -> ConfigEditResponse { serde_json::from_str(body).expect(body) };
+    let (status, body) = gateway
+        .request(
+            reqwest::Method::PUT,
+            "/v1/config/model-providers/proxy",
+            Some(serde_json::json!({
+                "version": v1, "base_url": "https://proxy.example.com/v1",
+                "api_backend": "responses", "api_key": "sk-web-secret"
+            })),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert!(!body.contains("sk-web-secret"), "响应里没有凭证值：{body}");
+    let after = edit(&body).models;
+    let proxy = after.providers.iter().find(|p| p.id == "proxy").unwrap();
+    assert_eq!(proxy.env_key.as_deref(), Some("PROXY_API_KEY"));
+    assert!(proxy.key_set);
+    let env = std::fs::read_to_string(home.join(".env")).unwrap();
+    assert!(env.contains("PROXY_API_KEY='sk-web-secret'"), "{env}");
+    assert!(
+        env.contains("KOMO_LLM_API_KEY=test-key"),
+        "别的行不动：{env}"
+    );
+    assert!(!config_file().contains("sk-web-secret"));
+
+    // 拿着旧版本再写：409，什么都不动。
+    let (status, body) = gateway
+        .request(
+            reqwest::Method::PUT,
+            "/v1/config/models/fast",
+            Some(serde_json::json!({ "version": v1, "provider": "proxy", "model": "m-fast" })),
+        )
+        .await;
+    assert_eq!(status, 409, "{body}");
+
+    let (status, body) = gateway
+        .request(
+            reqwest::Method::PUT,
+            "/v1/config/models/fast",
+            Some(serde_json::json!({
+                "version": after.version, "provider": "proxy", "model": "m-fast", "name": "Fast"
+            })),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let after = edit(&body).models;
+    let (_, menu) = gateway.get("/v1/models").await;
+    assert!(menu.contains("\"fast\""), "新模型热装上了：{menu}");
+
+    // 校验不过：422，文件一个字节不动。
+    let before = config_file();
+    let (status, body) = gateway
+        .request(
+            reqwest::Method::PUT,
+            "/v1/config/models/fast",
+            Some(serde_json::json!({
+                "version": after.version, "provider": "proxy", "model": "m-fast", "effort": "ultra"
+            })),
+        )
+        .await;
+    assert_eq!(status, 422, "{body}");
+    assert_eq!(config_file(), before);
+
+    let (status, body) = gateway
+        .request(
+            reqwest::Method::PUT,
+            "/v1/config/default-model",
+            Some(serde_json::json!({ "version": after.version, "alias": "fast" })),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let after = edit(&body).models;
+    assert_eq!(gateway.state().snapshot().model_catalog.default, "fast");
+
+    // 还在用的不让删。
+    let (status, body) = gateway
+        .request(
+            reqwest::Method::DELETE,
+            "/v1/config/model-providers/proxy",
+            Some(serde_json::json!({ "version": after.version })),
+        )
+        .await;
+    assert_eq!(status, 409, "{body}");
+    let (status, body) = gateway
+        .request(
+            reqwest::Method::DELETE,
+            "/v1/config/models/fast",
+            Some(serde_json::json!({ "version": after.version })),
+        )
+        .await;
+    assert_eq!(status, 409, "默认模型不让删：{body}");
+}
+
+/// 常用设置与环境变量：改一项热装上、白名单外 404；变量只写 `.env`，列表与响应里没有任何值，
+/// 还被引用的删不掉。
+#[tokio::test]
+async fn settings_and_env_vars_are_edited_through_the_gateway_without_values_leaking() {
+    use komo_kernel::protocol::http::{
+        ConfigEditResponse, ConfigEnvResponse, ConfigSettingsResponse,
+    };
+
+    let gateway = TestGateway::configured(&config_toml("")).await;
+    let home = gateway.state().home.clone();
+    let env_file = || std::fs::read_to_string(home.join(".env")).unwrap();
+    let edit = |body: &str| -> ConfigEditResponse { serde_json::from_str(body).expect(body) };
+
+    let (status, body) = gateway.get("/v1/config/settings").await;
+    assert_eq!(status, 200, "{body}");
+    let view: ConfigSettingsResponse = serde_json::from_str(&body).unwrap();
+    let compaction = view
+        .settings
+        .iter()
+        .find(|s| s.key == "compaction.enabled")
+        .unwrap();
+    let was = compaction.effective.clone().unwrap().as_bool().unwrap();
+
+    let (status, body) = gateway
+        .request(
+            reqwest::Method::PUT,
+            "/v1/config/settings/compaction.enabled",
+            Some(serde_json::json!({ "version": view.version, "value": !was })),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let after = edit(&body);
+    assert_eq!(
+        gateway.state().snapshot().compaction.enabled,
+        !was,
+        "热装上了"
+    );
+    let shown = after
+        .settings
+        .settings
+        .iter()
+        .find(|s| s.key == "compaction.enabled")
+        .unwrap();
+    assert_eq!(shown.effective, Some(serde_json::Value::Bool(!was)));
+    assert_eq!(
+        after.env.version, after.settings.version,
+        "三份视图共用一个版本"
+    );
+
+    let (status, body) = gateway
+        .request(
+            reqwest::Method::PUT,
+            "/v1/config/settings/gateway.listen",
+            Some(serde_json::json!({ "version": after.settings.version, "value": "0.0.0.0:1" })),
+        )
+        .await;
+    assert_eq!(status, 404, "白名单之外：{body}");
+
+    let (status, body) = gateway
+        .request(
+            reqwest::Method::PUT,
+            "/v1/config/env",
+            Some(serde_json::json!({
+                "version": after.env.version,
+                "vars": [{ "name": "WEB_TOKEN", "value": "tok-web-secret" }]
+            })),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert!(!body.contains("tok-web-secret"), "响应里没有值：{body}");
+    let after = edit(&body);
+    assert!(env_file().contains("WEB_TOKEN='tok-web-secret'"));
+    let (_, listed) = gateway.get("/v1/config/env").await;
+    assert!(
+        !listed.contains("tok-web-secret") && !listed.contains("test-key"),
+        "{listed}"
+    );
+    let listed: ConfigEnvResponse = serde_json::from_str(&listed).unwrap();
+    let token = listed.vars.iter().find(|v| v.name == "WEB_TOKEN").unwrap();
+    assert!(token.in_file && token.set && token.used_by.is_empty());
+    let llm = listed
+        .vars
+        .iter()
+        .find(|v| v.name == "KOMO_LLM_API_KEY")
+        .unwrap();
+    assert!(!llm.used_by.is_empty(), "模型用着它：{llm:?}");
+
+    let (status, body) = gateway
+        .request(
+            reqwest::Method::DELETE,
+            "/v1/config/env/KOMO_LLM_API_KEY",
+            Some(serde_json::json!({ "version": after.env.version })),
+        )
+        .await;
+    assert_eq!(status, 409, "还在用的不让删：{body}");
+    let (status, body) = gateway
+        .request(
+            reqwest::Method::DELETE,
+            "/v1/config/env/WEB_TOKEN",
+            Some(serde_json::json!({ "version": after.env.version })),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert!(!env_file().contains("WEB_TOKEN"));
+}

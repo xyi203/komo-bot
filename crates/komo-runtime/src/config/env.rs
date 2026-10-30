@@ -101,11 +101,20 @@ impl Secrets {
 /// 用 `from_path_iter` 而不是 `dotenvy::from_path`：后者会往进程环境里写，于是"谁读了
 /// 环境"这件事就散到了整个进程里，而热重载还会让它越写越多。
 pub fn load_secrets(env_file: &Path) -> Result<Secrets, std::io::Error> {
+    let text = if env_file.exists() {
+        Some(std::fs::read_to_string(env_file)?)
+    } else {
+        None
+    };
+    secrets_from_text(text.as_deref(), env_file)
+}
+
+/// 同 [`load_secrets`]，但 `.env` 的内容由调用方给：Web 改配置时先拿**改后的**文本校验，
+/// 校验过了才落盘（§3「从 Web 改模型配置」）。`env_file` 只用来写错误信息。
+pub fn secrets_from_text(text: Option<&str>, env_file: &Path) -> Result<Secrets, std::io::Error> {
     let mut secrets = Secrets::new();
-    if env_file.exists() {
-        let iter = dotenvy::from_path_iter(env_file)
-            .map_err(|e| std::io::Error::other(format!("{}：{e}", env_file.display())))?;
-        for entry in iter {
+    if let Some(text) = text {
+        for entry in dotenvy::from_read_iter(text.as_bytes()) {
             let (key, value) =
                 entry.map_err(|e| std::io::Error::other(format!("{}：{e}", env_file.display())))?;
             secrets.insert(key, value);

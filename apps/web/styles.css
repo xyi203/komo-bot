@@ -148,7 +148,7 @@ svg.i { width: 16px; height: 16px; flex: none; fill: none; stroke: currentColor;
 .title-btn:hover { background: var(--hover-on-white); }
 .title-btn h1 { margin: 0; font-size: 15px; line-height: 20px; font-weight: 500; color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .top-actions { display: flex; gap: 4px; margin-left: auto; }
-#toggle-panel[aria-expanded="true"] { background: var(--raised); color: var(--text); }
+#toggle-panel[aria-expanded="true"] { background: var(--active); color: var(--text); }
 
 .body { flex: 1; min-height: 0; display: grid; grid-template-columns: minmax(0, 1fr) 336px; }
 .app.panel-closed .body { grid-template-columns: minmax(0, 1fr); }

@@ -2238,6 +2238,9 @@ setInterval(() => { if (S.boot === "ready") api("/v1/interventions").then((r) =>
 /* ---------- 交互 ---------- */
 const app = $("app");
 const wide = () => innerWidth > 1180;
+// 宽屏下右栏开关记在本机；窄屏右栏是抽屉，每次都从关着开始
+try { if (localStorage.getItem("komo.panelClosed") === "1") app.classList.add("panel-closed"); } catch {}
+syncPanelButton();
 function syncPanelButton() {
   const open = wide() ? !app.classList.contains("panel-closed") : app.classList.contains("panel-open");
   $("toggle-panel").setAttribute("aria-expanded", open);
@@ -2354,7 +2357,11 @@ document.addEventListener("click", (ev) => {
   if (rs) retry(rs.dataset.retrySend);
   if (t.closest("#new-session")) newSession();
   if (t.closest("#stop-run")) cancelRuns();
-  if (t.closest("#toggle-panel")) { app.classList.toggle(wide() ? "panel-closed" : "panel-open"); syncPanelButton(); }
+  if (t.closest("#toggle-panel")) {
+    const closed = app.classList.toggle(wide() ? "panel-closed" : "panel-open");
+    if (wide()) try { localStorage.setItem("komo.panelClosed", closed ? "1" : "0"); } catch {}
+    syncPanelButton();
+  }
   if (t.closest("[data-open-nav]")) app.classList.add("nav-open");
   if (t.closest("[data-nav]")) app.classList.remove("nav-open");
   if (t.closest("#close-nav, #close-panel, #scrim")) { app.classList.remove("nav-open", "panel-open"); syncPanelButton(); }

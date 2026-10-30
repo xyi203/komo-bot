@@ -38,7 +38,6 @@ const S = {
   group: localStorage.getItem("komo.group") || "tree",                // tree | workdir | flat
   sort: localStorage.getItem("komo.sort") || "updated",               // updated | created
   closed: new Set(JSON.parse(localStorage.getItem("komo.closed") || "[]")), // 收起的分组
-  query: "",
   filter: localStorage.getItem("komo.filter") || "active",            // active | archived | all
   navOpen: new Set(JSON.parse(localStorage.getItem("komo.navOpen") || "[]")), // 展开了子任务的父会话
   open: new Set(),        // 展开着的折叠（按稳定 id）
@@ -413,7 +412,7 @@ function groupBlock(key, label, sessions, { title = "", add = null, nest = true 
   const closed = S.closed.has(key), more = S.showMore.has(key), cap = PAGE_ROWS[S.group];
   const shown = more ? sessions : sessions.slice(0, cap);
   const none = { active: "没有活跃的会话。", archived: "没有已归档的会话。", all: "还没有会话。" }[S.filter];
-  const rows = sessions.length ? shown.map((x) => (nest ? withChildren(x) : sessionBtn(x, false, true))).join("") : `<li class="empty-line pad">${S.query ? "没有标题匹配的会话。" : none}</li>`;
+  const rows = sessions.length ? shown.map((x) => (nest ? withChildren(x) : sessionBtn(x, false, true))).join("") : `<li class="empty-line pad">${none}</li>`;
   return `<section class="group">
     <div class="group-head"><button class="group-toggle" aria-expanded="${!closed}" data-group="${esc(key)}" title="${esc(title)}">${esc(label)} <span class="count num">${sessions.length}</span>${icon("down")}</button>
       ${add != null ? `<button class="icon-btn" data-new-in="${esc(add)}" aria-label="在 ${esc(label)} 新建会话" title="在 ${esc(title || label)} 新建会话">${icon("plus")}</button>` : ""}</div>
@@ -436,11 +435,6 @@ function drawGroups() {
     return ($("groups").innerHTML = `<div class="block-error"><p>会话列表没取到。</p><button class="text-btn" data-retry-boot>重试</button></div>`);
   }
   const visible = S.sessions.filter(passes);
-  // 搜索时不分组、不嵌套：直接列出标题匹配的
-  if (S.query) {
-    const q = S.query.toLowerCase();
-    return ($("groups").innerHTML = groupBlock("search", "搜索结果", visible.filter((x) => titleOf(x).toLowerCase().includes(q)).sort(bySort), { nest: false }));
-  }
   if (S.group === "flat") return ($("groups").innerHTML = groupBlock("flat", { active: "会话", archived: "已归档", all: "全部会话" }[S.filter], visible.sort(bySort), { nest: false }));
   const top = (x) => x.kind !== "task" || !S.sessions.some((p) => p.session === x.home && passes(p));
   const main = visible.find((x) => x.session === S.homeId);
@@ -513,6 +507,80 @@ async function commitRename(input) {
   }
   render();
 }
+/* ---------- 搜索弹窗（⌘K）：会话、事项、记忆、定时一处找 ---------- */
+const PAL_TYPES = [["all", "全部"], ["session", "会话"], ["matter", "事项"], ["memory", "记忆"], ["cron", "定时"]];
+S.pal = { type: "all", q: "", sel: 0, mem: null, memFor: "", cron: null };
+function openPalette() {
+  const P = S.pal;
+  P.q = ""; P.sel = 0; P.mem = null; P.memFor = "";
+  $("pal-input").value = "";
+  if (!$("palette").open) $("palette").showModal();
+  $("pal-input").focus();
+  renderPalette();
+  // 事项与定时打开时取一次（会话已经在手里）；记忆按输入去 Gateway 检索
+  if (!S.allMatters) api("/v1/matters?all=true").then((x) => { S.allMatters = x.matters; renderPalette(); }).catch(() => {});
+  api("/v1/cron").then((x) => { P.cron = x.jobs; renderPalette(); }).catch(() => {});
+}
+function palType(type) { S.pal.type = type; S.pal.sel = 0; palSearchMemories(); renderPalette(); $("pal-input").focus(); }
+let palTimer = 0;
+function palSearchMemories() {
+  const P = S.pal, q = P.q;
+  clearTimeout(palTimer);
+  if (!q || !["all", "memory"].includes(P.type)) return;
+  palTimer = setTimeout(async () => {
+    try {
+      const r = await api(`/v1/memories?query=${encodeURIComponent(q)}&limit=${P.type === "memory" ? 20 : 5}`);
+      if (P.q === q) { P.mem = r.memories; P.memFor = q; renderPalette(); }
+    } catch { if (P.q === q) { P.mem = []; P.memFor = q; renderPalette(); } }
+  }, 200);
+}
+const has = (text, q) => (text || "").toLowerCase().includes(q.toLowerCase());
+function palSections() {
+  const P = S.pal, q = P.q, all = P.type === "all", cap = all ? 5 : 30;
+  const want = (k) => all || P.type === k;
+  const go = (hash) => () => { location.hash = hash; };
+  const sessionItem = (s) => ({ icon: "chat", title: titleOf(s), meta: archived(s) ? "已归档" : s.kind === "task" ? "子任务" : dirOf(s) ? dirLabel(dirOf(s)) : "", run: () => openSession(s.session) });
+  const matterItem = (m) => ({ icon: m.kind === "area" ? "clock" : "target", title: m.title, meta: m.kind === "area" ? "领域" : "目标", run: go(`#/matters/${m.id}`) });
+  const cronItem = (j) => ({ icon: "clock", title: j.name, meta: scheduleText(j), run: go(`#/cron/${j.id}`) });
+  const memItem = (m) => ({ icon: "leaf", title: m.content, meta: scopeName(m.scope), run: go(`#/memory/${m.id}`) });
+  const sections = [];
+  const add = (title, items) => { if (items.length) sections.push({ title, items }); };
+  const sessions = [...S.sessions].sort((a, b) => new Date(b.updated_at) - new Date(a.updated_at));
+  if (!q) {
+    if (want("session")) add(all ? "最近" : "会话", sessions.filter((s) => !archived(s)).slice(0, all ? 8 : 30).map(sessionItem));
+    if (want("matter") && !all) add("事项", (S.allMatters || []).filter((m) => !m.closed_at).map(matterItem));
+    if (want("cron") && !all) add("定时", (P.cron || []).map(cronItem));
+    if (want("session")) add("动作", [{ icon: "plus", title: "新对话", meta: "", run: () => newSession() }]);
+    return sections;
+  }
+  if (want("session")) add("会话", sessions.filter((s) => has(titleOf(s), q)).slice(0, cap).map(sessionItem));
+  if (want("matter")) add("事项", (S.allMatters || []).filter((m) => has(m.title, q)).slice(0, cap).map(matterItem));
+  if (want("memory") && P.memFor === q) add("记忆", (P.mem || []).slice(0, cap).map(memItem));
+  if (want("cron")) add("定时", (P.cron || []).filter((j) => has(j.name, q) || has(j.prompt, q)).slice(0, cap).map(cronItem));
+  return sections;
+}
+const palFlat = () => palSections().flatMap((x) => x.items);
+function palOpen(i) {
+  const item = palFlat()[i];
+  if (!item) return;
+  $("palette").close();
+  item.run();
+}
+function renderPalette() {
+  if (!$("palette").open) return;
+  const P = S.pal, sections = palSections();
+  $("pal-tabs").innerHTML = PAL_TYPES.map(([k, label]) => `<button class="pal-tab" role="tab" aria-selected="${k === P.type}" data-pal-type="${k}" tabindex="-1">${label}</button>`).join("");
+  let n = 0;
+  const waiting = P.q && ["all", "memory"].includes(P.type) && P.memFor !== P.q;
+  const empty = P.type === "memory" && !P.q ? "输入关键词检索记忆。" : waiting && !sections.length ? "正在检索……" : P.q ? "没有找到。" : "这里还没有东西。";
+  $("pal-body").innerHTML = sections.length
+    ? sections.map((sec) => `<div class="pal-sec">${sec.title}</div>${sec.items.map((x) => {
+        const i = n++, on = i === P.sel;
+        return `<button class="pal-row" role="option" data-pal-i="${i}" aria-selected="${on}" tabindex="-1">${icon(x.icon)}<span class="pal-t">${esc(x.title)}</span>${x.meta ? `<span class="pal-m">${esc(x.meta)}</span>` : ""}<span class="pal-enter" aria-hidden="true">↵</span></button>`;
+      }).join("")}`).join("") + (waiting && sections.length ? `<p class="pal-empty">正在检索记忆……</p>` : "")
+    : `<p class="pal-empty">${empty}</p>`;
+}
+
 const MENU = [
   ["分组方式", "group", [["tree", "按会话树", "branch"], ["workdir", "按工作目录", "folder"], ["flat", "单列表", "list"]]],
   ["排序方式", "sort", [["updated", "最近更新", "clock"], ["created", "最近创建", "calendar"]]],
@@ -526,12 +594,6 @@ function setMenu(open) {
   $("view-menu").hidden = !open;
   $("view-menu-btn").setAttribute("aria-expanded", open);
   if (open) { renderMenu(); $("view-menu").querySelector('[aria-checked="true"]')?.focus(); }
-}
-function setSearch(open) {
-  $("sec-search").hidden = !open;
-  $("search-toggle").setAttribute("aria-expanded", open);
-  if (open) $("search-input").focus();
-  else if (S.query) { S.query = ""; $("search-input").value = ""; render(); }
 }
 function renderConn() {
   const ok = S.boot === "ready" && S.stream !== "retrying";
@@ -2213,8 +2275,12 @@ document.addEventListener("click", (ev) => {
     setMenu(false); $("view-menu-btn").focus(); render(); return;
   }
   if (t.closest("#view-menu-btn")) { setMenu($("view-menu").hidden); return; }
-  if (t.closest("#search-toggle")) { setSearch($("sec-search").hidden); return; }
-  if (t.closest("#nav-search")) { ev.preventDefault(); setSearch(true); return; }
+  if (t.closest("#nav-search")) { ev.preventDefault(); app.classList.remove("nav-open"); openPalette(); return; }
+  if (t.closest("#pal-close")) { $("palette").close(); return; }
+  const palRow = t.closest("[data-pal-i]");
+  if (palRow) { palOpen(Number(palRow.dataset.palI)); return; }
+  const palTab = t.closest("[data-pal-type]");
+  if (palTab) { palType(palTab.dataset.palType); return; }
   const kt = t.closest("[data-kids]");
   if (kt) { const id = kt.dataset.kids; S.navOpen.has(id) ? S.navOpen.delete(id) : S.navOpen.add(id); saveNav(); render(); return; }
   const dots = t.closest("[data-sess-menu]");
@@ -2317,10 +2383,9 @@ document.addEventListener("keydown", (ev) => {
   }
   if (ev.key === "Escape") {
     if (!$("view-menu").hidden) { setMenu(false); $("view-menu-btn").focus(); return; }
-    if (document.activeElement === $("search-input")) { setSearch(false); return; }
     app.classList.remove("nav-open", "panel-open"); syncPanelButton();
   }
-  if ((ev.metaKey || ev.ctrlKey) && ev.key.toLowerCase() === "k") { ev.preventDefault(); if (innerWidth <= 900) app.classList.add("nav-open"); setSearch(true); }
+  if ((ev.metaKey || ev.ctrlKey) && ev.key.toLowerCase() === "k") { ev.preventDefault(); $("palette").open ? $("palette").close() : openPalette(); }
   if (!$("view-menu").hidden && (ev.key === "ArrowDown" || ev.key === "ArrowUp")) {
     ev.preventDefault();
     const items = [...$("view-menu").querySelectorAll(".menu-item")], i = items.indexOf(document.activeElement);
@@ -2339,7 +2404,21 @@ $("input").addEventListener("keydown", (ev) => {
 });
 $("input").addEventListener("input", (ev) => { ev.target.style.height = "auto"; ev.target.style.height = ev.target.scrollHeight + "px"; renderComposer(); });
 $("model").addEventListener("change", fillEfforts);
-$("search-input").addEventListener("input", (ev) => { S.query = ev.target.value.trim(); render(); });
+$("pal-input").addEventListener("input", (ev) => { S.pal.q = ev.target.value.trim(); S.pal.sel = 0; palSearchMemories(); renderPalette(); });
+$("pal-input").addEventListener("keydown", (ev) => {
+  const P = S.pal, n = palFlat().length, input = ev.target;
+  if (ev.key === "ArrowDown" || ev.key === "ArrowUp") {
+    ev.preventDefault();
+    if (n) P.sel = (P.sel + (ev.key === "ArrowDown" ? 1 : -1) + n) % n;
+    renderPalette();
+    $("pal-body").querySelector('[aria-selected="true"]')?.scrollIntoView({ block: "nearest" });
+  }
+  if (ev.key === "Enter") { ev.preventDefault(); palOpen(P.sel); }
+  // 光标在输入框两头时左右键换类型，别的时候照常挪光标
+  const i = PAL_TYPES.findIndex(([k]) => k === P.type);
+  if (ev.key === "ArrowLeft" && input.selectionStart === 0 && input.selectionEnd === 0 && i > 0) { ev.preventDefault(); palType(PAL_TYPES[i - 1][0]); }
+  if (ev.key === "ArrowRight" && input.selectionStart === input.value.length && i < PAL_TYPES.length - 1) { ev.preventDefault(); palType(PAL_TYPES[i + 1][0]); }
+});
 addEventListener("resize", () => { syncPanelButton(); if (S.page === "memory") render(); }); // 图按容器宽度画
 // 点在弹窗外的遮罩上关；关掉时丢下没提交的表单和删除确认
 $("settings").addEventListener("click", (ev) => { if (ev.target === ev.currentTarget) ev.currentTarget.close(); });

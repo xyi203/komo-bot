@@ -68,12 +68,10 @@
       <div class="sec">
         <div class="sec-head">
           <span class="sec-title">会话</span>
-          <button class="icon-btn" id="search-toggle" aria-label="搜索会话" title="搜索会话" aria-expanded="false" aria-controls="sec-search"><svg class="i"><use href="#i-search"/></svg></button>
           <button class="icon-btn" id="view-menu-btn" aria-label="分组、排序与筛选" title="分组、排序与筛选" aria-haspopup="menu" aria-expanded="false" aria-controls="view-menu"><svg class="i"><use href="#i-sliders"/></svg></button>
           <button class="icon-btn" id="new-session-2" data-new-in="" aria-label="新对话" title="新对话"><svg class="i"><use href="#i-plus"/></svg></button>
         </div>
         <div class="menu" id="view-menu" role="menu" aria-label="分组、排序与筛选" hidden></div>
-        <div class="sec-search" id="sec-search" hidden><svg class="i"><use href="#i-search"/></svg><label class="visually-hidden" for="search-input">按标题搜索会话</label><input id="search-input" type="search" placeholder="按标题搜索" autocomplete="off"></div>
       </div>
       <div class="groups" id="groups"></div>
       <div class="user">
@@ -195,7 +193,13 @@
     <button class="icon-btn sdlg-x" id="settings-close" aria-label="关闭设置"><svg class="i"><use href="#i-x"/></svg></button>
   </dialog>
 
-  <script src="app.js"></script>
+  <dialog class="pal" id="palette" aria-label="搜索">
+    <div class="pal-top"><svg class="i"><use href="#i-search"/></svg><input id="pal-input" type="search" placeholder="搜索会话、事项、记忆、定时" autocomplete="off" aria-label="搜索" aria-controls="pal-body"><button class="icon-btn" id="pal-close" aria-label="关闭搜索"><svg class="i"><use href="#i-x"/></svg></button></div>
+    <div class="pal-tabs" id="pal-tabs" role="tablist" aria-label="类型"></div>
+    <div class="pal-body" id="pal-body" role="listbox" aria-label="结果"></div>
+    <div class="pal-foot"><span>关闭<kbd>Esc</kbd></span><span>换类型<kbd>←</kbd><kbd>→</kbd></span><span>选择<kbd>↑</kbd><kbd>↓</kbd></span><span>打开<kbd>↵</kbd></span></div>
+  </dialog>
   <div class="menu sess-menu" id="sess-menu" role="menu" aria-label="会话操作" hidden></div>
+  <script src="app.js"></script>
 </body>
 </html>

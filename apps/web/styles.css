@@ -327,10 +327,6 @@ button.live-line:hover .label { text-decoration: underline; text-underline-offse
 .sec-title { margin-right: auto; color: var(--muted); font-size: var(--fs-label); font-weight: 500; }
 .sec-head .icon-btn { width: 28px; height: 28px; }
 .sec-head .icon-btn:hover, .sec-head .icon-btn[aria-expanded="true"] { background: var(--hover); color: var(--text); }
-.sec-search { display: flex; align-items: center; gap: 8px; height: 32px; margin: 0 0 8px; padding: 0 10px; box-shadow: var(--ring-control); border-radius: var(--radius-control); background: var(--surface); color: var(--faint); }
-.sec-search:focus-within { box-shadow: var(--ring-strong); }
-.sec-search input { flex: 1; min-width: 0; border: 0; outline: 0; background: none; font: inherit; color: var(--text); }
-.sec-search input::placeholder { color: var(--faint); }
 .menu {
   position: absolute; top: 36px; right: 8px; z-index: 30; width: 248px; padding: 6px; border-radius: var(--radius-card);
   background: var(--surface); box-shadow: var(--ring), 0 8px 24px rgb(34 40 28 / 0.12); /* taste-skill-ignore: 弹出菜单浮在侧栏之上 */
@@ -875,3 +871,34 @@ button.live-line:hover .label { text-decoration: underline; text-underline-offse
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { transition: none !important; animation: none !important; }
 }
+
+/* 搜索弹窗（⌘K）：顶上输入，一排类型，中间分组的结果，底下快捷键 */
+.pal { width: min(760px, calc(100vw - 32px)); max-height: min(640px, calc(100vh - 96px)); margin: 12vh auto auto; padding: 0; border: 0; border-radius: 16px; background: var(--surface); color: var(--text); box-shadow: var(--ring), 0 24px 48px rgb(20 24 16 / 0.18); overflow: hidden; }
+.pal[open] { display: flex; flex-direction: column; }
+.pal::backdrop { background: rgb(20 24 16 / 0.32); }
+.pal-top { display: flex; align-items: center; gap: 10px; padding: 14px 14px 10px 22px; color: var(--faint); }
+.pal-top > .i { flex: none; }
+#pal-input { flex: 1; min-width: 0; height: 32px; border: 0; outline: 0; background: none; font: inherit; font-size: 16px; color: var(--text); }
+#pal-input::placeholder { color: var(--faint); }
+#pal-input::-webkit-search-cancel-button { display: none; }
+.pal-top .icon-btn { width: 32px; height: 32px; color: var(--muted); }
+.pal-top .icon-btn:hover { background: var(--hover-on-white); color: var(--text); }
+.pal-tabs { display: flex; gap: 4px; padding: 0 18px 12px; border-bottom: 1px solid var(--border); overflow-x: auto; }
+.pal-tab { flex: none; height: 30px; padding: 0 10px; border: 0; border-radius: 8px; background: none; color: var(--muted); font: inherit; font-size: var(--fs-label); cursor: pointer; }
+.pal-tab:hover { color: var(--text); }
+.pal-tab[aria-selected="true"] { background: var(--active); color: var(--text); font-weight: 500; }
+.pal-body { flex: 1; min-height: 120px; overflow-y: auto; overscroll-behavior: contain; padding: 4px 10px 10px; }
+.pal-sec { padding: 14px 12px 6px; color: var(--muted); font-size: var(--fs-small); }
+.pal-row { display: flex; align-items: center; gap: 12px; width: 100%; height: 40px; padding: 0 12px; border: 0; border-radius: 10px; background: none; color: var(--text); font: inherit; text-align: left; cursor: pointer; }
+.pal-row > .i { flex: none; width: 16px; height: 16px; color: var(--muted); }
+.pal-row:hover { background: var(--hover-on-white); }
+.pal-row[aria-selected="true"] { background: var(--active); }
+.pal-t { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pal-m { flex: none; max-width: 40%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); font-size: var(--fs-small); }
+.pal-enter { flex: none; width: 16px; color: var(--muted); visibility: hidden; }
+.pal-row[aria-selected="true"] .pal-enter { visibility: visible; }
+.pal-empty { margin: 0; padding: 20px 12px; color: var(--muted); font-size: var(--fs-label); }
+.pal-foot { display: flex; flex-wrap: wrap; gap: 6px 20px; padding: 12px 22px; border-top: 1px solid var(--border); color: var(--muted); font-size: var(--fs-small); }
+.pal-foot kbd { display: inline-grid; place-items: center; min-width: 20px; height: 20px; margin-left: 6px; padding: 0 5px; border-radius: 5px; box-shadow: var(--ring); font: inherit; font-size: 11px; }
+.pal-foot kbd + kbd { margin-left: 3px; }
+@media (max-width: 600px) { .pal { margin-top: 16px; max-height: calc(100vh - 32px); } .pal-foot { display: none; } }

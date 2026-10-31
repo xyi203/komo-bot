@@ -11,10 +11,14 @@
 /// 这条提示所在 user 消息的 `komoOrigin`。
 pub const CHANNEL_ORIGIN: &str = "channel";
 
+/// 附注的开头。发给模型的消息里 `komoOrigin` 不一定还在（旧 `TurnRequest` 的回放消息没有它），
+/// 按"最后一条用户消息"做判断的地方（测试里的脚本模型）靠它认出并跳过。
+pub const CHANNEL_NOTE_HEAD: &str = "（宿主附注，不是用户说的：";
+
 /// 回复要发到 `platform`（`feishu` / `telegram` / `wechat` 或自定义渠道 id）时追加的那一段。
 pub fn channel_reply_block(platform: &str) -> String {
     format!(
-        "（宿主附注，不是用户说的：这一轮的回复会发到{}，对方多半在手机上看。）先给结论，\
+        "{CHANNEL_NOTE_HEAD}这一轮的回复会发到{}，对方多半在手机上看。）先给结论，\
          一般不超过约 150 字；要问就只问能直接回答的那一个问题。细节、表格、长清单写进文件给路径，\
          或者派成后台任务，别整段贴；用户明确要全文时照给。",
         platform_label(platform)
@@ -39,6 +43,7 @@ mod tests {
     fn the_block_names_the_platform_and_is_stable_per_platform() {
         let feishu = channel_reply_block("feishu");
         assert_eq!(feishu, channel_reply_block("feishu"));
+        assert!(feishu.starts_with(CHANNEL_NOTE_HEAD), "{feishu}");
         assert!(feishu.contains("发到飞书"), "{feishu}");
         assert!(feishu.contains("150 字"), "{feishu}");
         assert!(channel_reply_block("wechat").contains("发到微信"));

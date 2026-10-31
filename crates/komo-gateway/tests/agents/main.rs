@@ -212,11 +212,21 @@ impl TasksLlm {
     }
 }
 
+/// 宿主附上的渠道篇幅附注（`docs/komo_bot.md` §11.2）：不是用户说的话，脚本按用户的话挑回答时跳过。
+fn is_host_note(message: &komo_kernel::types::turn::ReplayMessage) -> bool {
+    message
+        .text
+        .as_deref()
+        .is_some_and(|text| text.starts_with(komo_agent::context::channel::CHANNEL_NOTE_HEAD))
+}
+
 fn last_user_text(req: &TurnRequest) -> String {
     req.messages
         .iter()
         .rev()
-        .find(|message| message.role == komo_kernel::types::turn::Role::User)
+        .find(|message| {
+            message.role == komo_kernel::types::turn::Role::User && !is_host_note(message)
+        })
         .and_then(|message| message.text.clone())
         .unwrap_or_default()
 }
@@ -236,7 +246,7 @@ fn answered_since_last_user(req: &TurnRequest) -> bool {
     req.messages
         .iter()
         .rev()
-        .take_while(|message| message.role != Role::User)
+        .take_while(|message| message.role != Role::User || is_host_note(message))
         .any(|message| message.role == Role::Tool)
 }
 

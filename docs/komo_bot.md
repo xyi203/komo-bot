@@ -83,6 +83,7 @@ Gateway 持有模型连接、数据库与提交线、工具环境、运行状态
 | `komo`                                       | 确保本机 Gateway 就绪，进入 TUI 聊天。**会话在第一条消息送出之前才创建**——空跑一眼就退出，不在库和磁盘上留下空壳 |
 | `komo resume SESSION_ID`                     | 连接原会话并查看进度或处理待办；恢复调度由 Gateway 自动进行，不重复创建 Run |
 | `komo session list`                          | 查看会话列表和状态；`--all` 才列出已逻辑删除的会话（§8.10）                  |
+| `komo session search 关键词 [--limit N]`         | 跨会话找回：在会话标题与正文里找，给会话、片段与能接着查的 ID（§8.11「跨会话找回」） |
 | `komo session delete/purge SESSION_ID`       | 逻辑删除（`closing` → `deleted`）与回收（`purged`）。**删除只有这一条路**：`--now` 把未完成 Run 各写一条明确取消，`purge` 前先算引用（§8.10） |
 | `komo session export SESSION_ID [-o FILE]`   | 导出成 pi v3 树形 JSONL（header + 全部分支 entry，当前位置落在末条；blob 保持引用，`komoBlobRoot` 指向 Session 目录）；默认写 stdout，只读，不导入（`docs/storage-durable.md` §9 D6） |
 | `komo run inspect RUN_ID`                    | 查看执行过程、工具结果与产物                                                |
@@ -780,6 +781,10 @@ Session 不是只能追加的对象。pi-durable 没有删除，komo 保留三�
 - 插话在实际并入宿主的协议位置成为对话 entry；排队输入不能按受理时的相邻关系误接到尚未完成的工具调用之间（boundary 按确定规则放）。
 - 内容由提交线唯一写入；大正文先写文件、再提交引用（§8.5）。
 - `/fork` / `/clone` 保留所选路径需要的工具输出、图片、产物以及 `edits` / `head` 的目标关系；原 Session 被合法回收后，新 Session 仍可读取。生成的新会话不复制原 Run 的可执行状态，也不重放已发生的工具动作。
+
+#### 跨会话找回（`komo session search`，2026-10-31，roadmap-muse S3）
+
+飞书一个话题一个 Session、私聊进 home，彼此看不到；记忆提取不保证带上链接、ID 这类细节。`GET /v1/session-search?q=…&limit=…`（`komo-gateway` `service/durable/search.rs`）只读：在 `active` / `closing` 会话的标题与 entry 正文（用户的话、助手的回答、工具结果；宿主附上的召回块、渠道附注与 system 消息不看）里按关键词找，空白分开的几个词要在同一条消息里都出现（不分大小写），空关键词 400。每个 conversation 只看它自己的 entry（fork 祖先的算在祖先所在的会话里）。按最近一条命中的时刻倒序，默认 10 个会话、上限 50，每个会话给命中条数与最近 3 个片段（`用户：…` / `助手：…` / `工具 bash：…` / `标题：…`），带能接着查的 ID：会话 ID、任务会话的短号与派它的会话、还在跑的监听。可见性同 `komo memory search`：会话的 Agent 是 `memory = private` / `off` 的不出现（任务会话没记 Agent 时看父会话）。实现是逐会话扫 entry，个人用的量够了；慢了再加索引。系统提示「komo 自查」那段教模型在用户提到别的会话、别的渠道里的事时用它，不再 export 整个会话去 grep。要看全文仍用 `komo session export`。
 
 #### 导出（`komo session export`）
 

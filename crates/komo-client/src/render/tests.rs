@@ -22,6 +22,38 @@ const NOW: OffsetDateTime = datetime!(2026-09-16 08:00:00 UTC);
 
 // ---- session list ----
 
+/// 会话搜索：一个命中一段，会话 ID 在前；任务短号、派它的会话、监听写在第二行；片段逐条列出。
+#[test]
+fn a_session_search_names_the_session_the_ids_to_follow_and_the_snippets() {
+    use komo_kernel::protocol::http::{SessionSearchHit, SessionSearchResponse};
+    assert_eq!(
+        session_search(&SessionSearchResponse::default()),
+        "没有匹配的会话"
+    );
+    let response = SessionSearchResponse {
+        hits: vec![SessionSearchHit {
+            session: SessionId::from_raw("sess-9"),
+            title: "盯 CI".into(),
+            kind: "task".into(),
+            matched_at: NOW,
+            task: Some("#12".into()),
+            parent_session: Some(SessionId::from_raw("sess-1")),
+            monitors: vec!["#7「CI」".into()],
+            matches: 2,
+            snippets: vec!["助手：CI 挂了".into()],
+        }],
+    };
+    let text = session_search(&response);
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines[0], "sess-9 · task · 盯 CI");
+    assert!(
+        lines[1].contains("2 处") && lines[1].contains("任务 #12"),
+        "{text}"
+    );
+    assert!(lines[1].contains("派它的会话 sess-1") && lines[1].contains("监听 #7「CI」"));
+    assert_eq!(lines[2], "  - 助手：CI 挂了");
+}
+
 #[test]
 fn a_session_list_shows_status_and_title() {
     let response = SessionListResponse {

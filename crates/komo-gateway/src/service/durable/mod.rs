@@ -47,6 +47,7 @@ pub mod monitor_runner;
 pub mod nested_view;
 pub mod orchestration;
 pub mod runs;
+pub mod search;
 pub mod sessions;
 pub mod shell;
 pub mod submit;

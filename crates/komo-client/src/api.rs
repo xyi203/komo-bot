@@ -301,6 +301,18 @@ impl KomoClient {
         self.get_with("/v1/sessions", &params).await
     }
 
+    /// 跨会话找回：在会话标题与正文里按关键词找（`komo session search`）。
+    pub async fn search_sessions(
+        &self,
+        query: &SessionSearchQuery,
+    ) -> ClientResult<SessionSearchResponse> {
+        let mut params: Vec<(&str, String)> = vec![("q", query.q.clone())];
+        if let Some(limit) = query.limit {
+            params.push(("limit", limit.to_string()));
+        }
+        self.get_with("/v1/session-search", &params).await
+    }
+
     pub async fn session_tree(&self, session: &SessionId) -> ClientResult<SessionTreeResponse> {
         self.get(&format!("/v1/sessions/{session}/tree")).await
     }

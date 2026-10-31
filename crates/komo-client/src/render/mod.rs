@@ -14,7 +14,8 @@ use komo_kernel::protocol::http::{
     InterventionDetail, InterventionListResponse, InterventionSummary, McpReconnectResponse,
     McpServerState, McpServerStatus, MemoryConsolidateResponse, MemoryIndexStatus,
     MemoryListResponse, MemorySweepResponse, ModelWindow, ModelsResponse, RunDetail,
-    SessionListResponse, SessionSummary, SweepRule, TelemetryHealth, ToolCallSummary, WindowSource,
+    SessionListResponse, SessionSearchResponse, SessionSummary, SweepRule, TelemetryHealth,
+    ToolCallSummary, WindowSource,
 };
 use komo_kernel::types::memory::{
     Confirmation, MemoryItem, MemoryKind, MemoryScope, MemoryState, Provenance, RecallDiagnostics,
@@ -76,6 +77,42 @@ pub fn session_list(response: &SessionListResponse, now: OffsetDateTime) -> Stri
             stamp(session.updated_at),
             session_title(session)
         ));
+    }
+    out.join("\n")
+}
+
+/// `komo session search`：每个命中的会话一段——会话 ID、种类与标题、最近命中的时刻与条数、
+/// 能接着查的 ID（任务短号、派它的会话、还在跑的监听），再是片段。要看全文用 `komo session export`。
+pub fn session_search(response: &SessionSearchResponse) -> String {
+    if response.hits.is_empty() {
+        return "没有匹配的会话".into();
+    }
+    let mut out = Vec::new();
+    for hit in &response.hits {
+        let title = if hit.title.is_empty() {
+            "（无标题）"
+        } else {
+            hit.title.as_str()
+        };
+        out.push(format!("{} · {} · {title}", hit.session, hit.kind));
+        let mut facts = vec![format!(
+            "最近命中 {} · {} 处",
+            stamp(hit.matched_at),
+            hit.matches
+        )];
+        if let Some(task) = &hit.task {
+            facts.push(format!("任务 {task}"));
+        }
+        if let Some(parent) = &hit.parent_session {
+            facts.push(format!("派它的会话 {parent}"));
+        }
+        if !hit.monitors.is_empty() {
+            facts.push(format!("监听 {}", hit.monitors.join("、")));
+        }
+        out.push(format!("  {}", facts.join(" · ")));
+        for snippet in &hit.snippets {
+            out.push(format!("  - {snippet}"));
+        }
     }
     out.join("\n")
 }

@@ -134,6 +134,14 @@ enum SessionCommand {
         #[arg(long)]
         all: bool,
     },
+    /// 在各会话的标题与正文里找关键词（空白分开的几个词要在同一条消息里），给出会话、片段与能接着查的 ID。
+    Search {
+        /// 关键词。
+        query: String,
+        /// 最多给几个会话（默认 10，上限 50）。
+        #[arg(long)]
+        limit: Option<u32>,
+    },
     /// 逻辑删除一个会话：进 `closing`，不再接受新输入，**内容一个字节都不动**（§8.10）。
     Delete {
         /// 会话 ID。
@@ -678,6 +686,9 @@ async fn operator(
     match command {
         Command::Session { action } => match action {
             SessionCommand::List { all } => commands::session_list(client, all).await,
+            SessionCommand::Search { query, limit } => {
+                commands::session_search(client, &query, limit).await
+            }
             SessionCommand::Delete { session_id, now } => {
                 commands::session_delete(client, &session_id, now).await
             }

@@ -16,7 +16,7 @@ use komo_kernel::protocol::http::{
     CancelRunRequest, CreateCronRequest, InterventionAnswerRequest, InterventionListQuery,
     InterventionVerdict, MemoryAddRequest, MemoryClassifyRequest, MemoryConsolidateRequest,
     MemoryListQuery, MemoryRevisionRequest, MemorySweepRequest, RebuildIndexRequest,
-    SessionListQuery, UpdateCronRequest,
+    SessionListQuery, SessionSearchQuery, UpdateCronRequest,
 };
 use komo_kernel::types::ids::{CronJobId, MatterId, MemoryId, RunId, SessionId};
 use komo_kernel::types::memory::{
@@ -41,6 +41,18 @@ pub async fn session_list(client: &KomoClient, all: bool) -> Outcome {
         &response,
         time::OffsetDateTime::now_utc(),
     ))
+}
+
+/// `komo session search`：跨会话找回（只读，roadmap-muse S3）。
+pub async fn session_search(client: &KomoClient, query: &str, limit: Option<u32>) -> Outcome {
+    let response = client
+        .search_sessions(&SessionSearchQuery {
+            q: query.to_owned(),
+            limit,
+        })
+        .await
+        .map_err(failed)?;
+    Ok(render::session_search(&response))
 }
 
 /// `komo session delete`：**逻辑删除**（§8.10）。

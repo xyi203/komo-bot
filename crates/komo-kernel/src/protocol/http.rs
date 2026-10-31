@@ -212,6 +212,45 @@ pub struct SessionListResponse {
     pub sessions: Vec<SessionSummary>,
 }
 
+/// `GET /v1/session-search` 的 query（`komo session search`，roadmap-muse S3）。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionSearchQuery {
+    /// 关键词；空白分开的几个词要在同一条消息里都出现（不分大小写）。
+    pub q: String,
+    /// 最多给几个会话；没给 = 10，上限 50。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+}
+
+/// 一个命中的会话：最近命中的在前。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionSearchHit {
+    pub session: SessionId,
+    pub title: String,
+    /// `main` / `normal` / `task`。
+    pub kind: String,
+    /// 最近一条命中的消息的时刻。
+    #[serde(with = "time::serde::rfc3339")]
+    pub matched_at: OffsetDateTime,
+    /// 任务会话的短号（`#12`）与派它的会话。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_session: Option<SessionId>,
+    /// 这个会话里还在跑的监听，每项 `#句柄「标题」`。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub monitors: Vec<String>,
+    /// 命中的消息条数。
+    pub matches: u32,
+    /// 最近几条命中的片段（`用户：…` / `助手：…` / `工具 bash：…`），新的在前。
+    pub snippets: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionSearchResponse {
+    pub hits: Vec<SessionSearchHit>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionDetail {
     #[serde(flatten)]

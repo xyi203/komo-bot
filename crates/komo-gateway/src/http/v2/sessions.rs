@@ -6,15 +6,15 @@
 //! 状态码映射在 `http::error`（`SessionError`）：`NotFound` 404、`Invalid` 400、`NotOpen` /
 //! `Busy` / `Conflict` 409（`NotOpen` 说清是哪种状态）、请求键冲突 409、`Internal` 500。
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use komo_kernel::durable::legacy_ids;
 use komo_kernel::protocol::http::{
     BoundaryRequest, BoundaryResponse, CreateSessionRequest, DeleteSessionRequest, PurgeBlocked,
     PurgeSessionRequest, PurgeSessionResponse, ResumeRequest, ResumeResponse, SessionDetail,
-    SessionLifecycleResponse, SessionListResponse, SessionSummary, SubmitRunRequest,
-    SubmitRunResponse,
+    SessionLifecycleResponse, SessionListResponse, SessionSearchQuery, SessionSearchResponse,
+    SessionSummary, SubmitRunRequest, SubmitRunResponse,
 };
 use komo_kernel::types::ids::SessionId;
 use komo_kernel::types::model::Effort;
@@ -35,6 +35,7 @@ pub fn routes() -> Router<Api> {
     Router::new()
         .route("/v1/home-session", get(home))
         .route("/v1/sessions", get(list).post(create))
+        .route("/v1/session-search", get(search))
         .route("/v1/sessions/{id}", get(detail))
         .route("/v1/sessions/{id}/runs", post(submit))
         .route("/v1/sessions/{id}/resume", post(resume))
@@ -69,6 +70,24 @@ async fn list(
         sessions.push(core.session_summary(record).await?);
     }
     Ok(Json(SessionListResponse { sessions }))
+}
+
+/// `GET /v1/session-search?q=…&limit=…`：跨会话找回（`komo session search`，roadmap-muse S3）。
+/// 只读；可见性与次序见 `service::durable::search`。空关键词 400。
+async fn search(
+    State(api): State<Api>,
+    Query(query): Query<SessionSearchQuery>,
+) -> ApiResult<Json<SessionSearchResponse>> {
+    let core = api.state.core()?;
+    let config = api.state.snapshot();
+    let hits = core
+        .search_sessions(
+            &query.q,
+            query.limit.map(|limit| limit as usize),
+            &config.agent,
+        )
+        .await?;
+    Ok(Json(SessionSearchResponse { hits }))
 }
 
 /// `POST /v1/sessions`：建会话（sessions 行 + 根 conversation + `komo.agent`，一次提交），落在默认

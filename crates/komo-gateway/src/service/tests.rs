@@ -1385,6 +1385,45 @@ mod chat {
         );
     }
 
+    /// 回复要发到聊天渠道的 Run 追加一条篇幅附注（§4「渠道篇幅」）：宿主附上的 user 消息、写明平台，
+    /// 同一个 Run 只加一次。
+    #[tokio::test]
+    async fn a_chat_run_gets_one_channel_note_naming_the_platform() {
+        let (gateway, _) = start(FakeLlm::finisher("好")).await;
+        let ack = gateway
+            .dispatcher()
+            .handle(operator_dm("在吗", "telegram:70"))
+            .await
+            .expect("处理了");
+        let InboundAck::Queued { session, run } = ack else {
+            panic!("应该排队：{ack:?}");
+        };
+        gateway.wait_run(&run).await;
+        let tree = gateway
+            .state()
+            .core()
+            .unwrap()
+            .read_tree(session.as_str())
+            .await
+            .expect("读得出树");
+        let notes: Vec<_> = tree
+            .branches
+            .iter()
+            .flat_map(|branch| branch.entries.iter())
+            .filter(|entry| entry.kind == "komo.channel")
+            .collect();
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        let message = notes[0].model.as_deref().expect("发到渠道就带正文");
+        let [komo_kernel::durable::Message::User(user)] = message else {
+            panic!("{message:?}");
+        };
+        assert_eq!(user.host_origin(), Some("channel"));
+        assert!(
+            format!("{:?}", user.content).contains("发到Telegram"),
+            "{user:?}"
+        );
+    }
+
     /// ② 不在 `allow_from` 的发送者被拒、`/id` 对他可用、且**会话与 deliveries 无任何记录**。
     #[tokio::test]
     async fn a_stranger_is_refused_and_leaves_no_trace() {

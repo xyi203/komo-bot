@@ -22,6 +22,46 @@ const NOW: OffsetDateTime = datetime!(2026-09-16 08:00:00 UTC);
 
 // ---- session list ----
 
+/// 监听清单：跑着的写已跑与距截止，结束的写原因、不写截止；脚本在下一行。
+#[test]
+fn a_monitor_list_shows_age_deadline_title_and_session() {
+    use komo_kernel::protocol::http::{MonitorListResponse, MonitorSummary};
+    assert_eq!(
+        monitor_list(&MonitorListResponse::default(), NOW),
+        "没有监听"
+    );
+    let running = MonitorSummary {
+        handle: "7".into(),
+        title: "CI".into(),
+        session: Some(SessionId::from_raw("sess-1")),
+        state: "running".into(),
+        reason: None,
+        started_at: NOW - time::Duration::minutes(90),
+        deadline: NOW + time::Duration::minutes(30),
+        command: "gh run watch 1".into(),
+    };
+    let ended = MonitorSummary {
+        handle: "8".into(),
+        state: "ended".into(),
+        reason: Some("timeout".into()),
+        session: None,
+        ..running.clone()
+    };
+    let text = monitor_list(
+        &MonitorListResponse {
+            monitors: vec![running, ended],
+        },
+        NOW,
+    );
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(
+        lines[0],
+        "#7 运行中 · 已跑 1 时 30 分 · 距截止 30 分 0 秒 · 「CI」 · 会话 sess-1"
+    );
+    assert_eq!(lines[1], "  gh run watch 1");
+    assert_eq!(lines[2], "#8 已结束（timeout） · 已跑 1 时 30 分 · 「CI」");
+}
+
 /// 会话搜索：一个命中一段，会话 ID 在前；任务短号、派它的会话、监听写在第二行；片段逐条列出。
 #[test]
 fn a_session_search_names_the_session_the_ids_to_follow_and_the_snippets() {

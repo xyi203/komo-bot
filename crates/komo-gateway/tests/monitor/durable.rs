@@ -173,6 +173,32 @@ async fn stopping_kills_the_script_and_reports_nothing_more() {
     gateway.stop().await;
 }
 
+/// `GET /v1/monitors`（`komo monitor list`，S4）：默认只列还在跑的，带短号与挂它的会话；停掉之后
+/// 默认清单空了，`all=true` 里是 `ended(stopped)`。
+#[tokio::test]
+async fn the_monitor_list_shows_live_ones_with_their_session() {
+    let llm = MonitorLlm::new(Duration::ZERO);
+    let mut gateway = start(&llm, None).await;
+    let (session, id) = arm(&gateway, "while true; do sleep 0.2; done").await;
+
+    let (status, body) = gateway.get_json("/v1/monitors").await;
+    assert_eq!(status, 200, "{body}");
+    let monitors = body["monitors"].as_array().expect("数组");
+    assert_eq!(monitors.len(), 1, "{body}");
+    assert_eq!(monitors[0]["handle"], id.as_str());
+    assert_eq!(monitors[0]["session"], session.as_str());
+    assert_eq!(monitors[0]["state"], "running");
+
+    gateway.soft_delete(&session).await;
+    let (_, body) = gateway.get_json("/v1/monitors").await;
+    assert!(body["monitors"].as_array().unwrap().is_empty(), "{body}");
+    let (_, body) = gateway.get_json("/v1/monitors?all=true").await;
+    assert_eq!(body["monitors"][0]["state"], "ended", "{body}");
+    assert_eq!(body["monitors"][0]["reason"], "stopped", "{body}");
+
+    gateway.stop().await;
+}
+
 /// 删会话时停掉它名下的监听（S2，`docs/background-tasks.md` §2e）：进程组没了，登记 `ended{stopped}`，
 /// 不在要删的会话里交回结束消息。
 #[tokio::test]

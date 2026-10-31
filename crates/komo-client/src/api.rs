@@ -313,6 +313,18 @@ impl KomoClient {
         self.get_with("/v1/session-search", &params).await
     }
 
+    /// 监听清单（`komo monitor list`）。默认只列还在跑的。
+    pub async fn list_monitors(
+        &self,
+        query: &MonitorListQuery,
+    ) -> ClientResult<MonitorListResponse> {
+        let mut params: Vec<(&str, String)> = Vec::new();
+        if query.all {
+            params.push(("all", "true".into()));
+        }
+        self.get_with("/v1/monitors", &params).await
+    }
+
     pub async fn session_tree(&self, session: &SessionId) -> ClientResult<SessionTreeResponse> {
         self.get(&format!("/v1/sessions/{session}/tree")).await
     }

@@ -62,6 +62,11 @@ enum Command {
         #[command(subcommand)]
         action: InterventionCommand,
     },
+    /// 监听清单（`monitor` 工具挂的、转后台的 bash）；只读，停监听用 monitor_stop 或删会话（docs/monitor.md）。
+    Monitor {
+        #[command(subcommand)]
+        action: MonitorCommand,
+    },
     /// 管理定时任务（§10）。
     Cron {
         #[command(subcommand)]
@@ -162,6 +167,16 @@ enum SessionCommand {
     Purge {
         /// 会话 ID。
         session_id: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum MonitorCommand {
+    /// 列出还在跑的监听：短号、已跑多久、距截止多久、标题、挂它的会话与脚本。
+    List {
+        /// 带上已结束的（登记里留着的最近几十条）。
+        #[arg(long)]
+        all: bool,
     },
 }
 
@@ -869,6 +884,9 @@ async fn operator(
                 MemoryIndexCommand::Status => commands::memory_index(client).await,
                 MemoryIndexCommand::Rebuild => commands::memory_rebuild(client).await,
             },
+        },
+        Command::Monitor { action } => match action {
+            MonitorCommand::List { all } => commands::monitor_list(client, all).await,
         },
         Command::Goal { action } => matters::goal(client, action).await,
         Command::Area { action } => matters::area(client, action).await,

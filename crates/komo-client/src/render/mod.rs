@@ -13,9 +13,9 @@ use komo_kernel::protocol::http::{
     ConsolidateGroupStatus, ConsolidateOutcome, CronListResponse, HealthResponse, IndexState,
     InterventionDetail, InterventionListResponse, InterventionSummary, McpReconnectResponse,
     McpServerState, McpServerStatus, MemoryConsolidateResponse, MemoryIndexStatus,
-    MemoryListResponse, MemorySweepResponse, ModelWindow, ModelsResponse, RunDetail,
-    SessionListResponse, SessionSearchResponse, SessionSummary, SweepRule, TelemetryHealth,
-    ToolCallSummary, WindowSource,
+    MemoryListResponse, MemorySweepResponse, ModelWindow, ModelsResponse, MonitorListResponse,
+    RunDetail, SessionListResponse, SessionSearchResponse, SessionSummary, SweepRule,
+    TelemetryHealth, ToolCallSummary, WindowSource,
 };
 use komo_kernel::types::memory::{
     Confirmation, MemoryItem, MemoryKind, MemoryScope, MemoryState, Provenance, RecallDiagnostics,
@@ -113,6 +113,41 @@ pub fn session_search(response: &SessionSearchResponse) -> String {
         for snippet in &hit.snippets {
             out.push(format!("  - {snippet}"));
         }
+    }
+    out.join("\n")
+}
+
+/// `komo monitor list`：一个监听一行——短号、状态、已跑多久、距截止还有多久、标题、挂它的会话；
+/// 脚本缩进在下一行。`now` 由调用方给。
+pub fn monitor_list(response: &MonitorListResponse, now: OffsetDateTime) -> String {
+    if response.monitors.is_empty() {
+        return "没有监听".into();
+    }
+    let mut out = Vec::new();
+    for monitor in &response.monitors {
+        let state = match (monitor.state.as_str(), &monitor.reason) {
+            ("ended", Some(reason)) => format!("已结束（{reason}）"),
+            ("ended", None) => "已结束".into(),
+            ("starting", _) => "启动中".into(),
+            _ => "运行中".into(),
+        };
+        let mut line = format!(
+            "#{} {state} · 已跑 {}",
+            monitor.handle,
+            komo_kernel::types::task::duration_words(now - monitor.started_at)
+        );
+        if monitor.state != "ended" {
+            line.push_str(&format!(
+                " · 距截止 {}",
+                komo_kernel::types::task::duration_words(monitor.deadline - now)
+            ));
+        }
+        line.push_str(&format!(" · 「{}」", monitor.title));
+        if let Some(session) = &monitor.session {
+            line.push_str(&format!(" · 会话 {session}"));
+        }
+        out.push(line);
+        out.push(format!("  {}", monitor.command));
     }
     out.join("\n")
 }

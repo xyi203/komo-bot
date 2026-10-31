@@ -251,6 +251,41 @@ pub struct SessionSearchResponse {
     pub hits: Vec<SessionSearchHit>,
 }
 
+/// `GET /v1/monitors` 的 query（`komo monitor list`，roadmap-muse S4 看门狗要的只读入口）。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MonitorListQuery {
+    /// 带上已结束的（登记里留着的最近几十条）；默认只列还在跑的。
+    #[serde(default)]
+    pub all: bool,
+}
+
+/// 一个监听（`monitor` 工具挂的，或转后台的 `bash`）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MonitorSummary {
+    /// 短号（`monitor_stop` 用它）。
+    pub handle: String,
+    pub title: String,
+    /// 挂它的会话；那个 conversation 没登记 Session 时为空。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<SessionId>,
+    /// `starting` / `running` / `ended`。
+    pub state: String,
+    /// 结束的原因（`exit` / `timeout` / `stopped` ……），只有 `ended` 有。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(with = "time::serde::rfc3339")]
+    pub started_at: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339")]
+    pub deadline: OffsetDateTime,
+    /// 脚本的开头一段。
+    pub command: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MonitorListResponse {
+    pub monitors: Vec<MonitorSummary>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionDetail {
     #[serde(flatten)]

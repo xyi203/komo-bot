@@ -15,8 +15,8 @@ use komo_kernel::cron::{JobStatus, NotifyPolicy, OverlapPolicy};
 use komo_kernel::protocol::http::{
     CancelRunRequest, CreateCronRequest, InterventionAnswerRequest, InterventionListQuery,
     InterventionVerdict, MemoryAddRequest, MemoryClassifyRequest, MemoryConsolidateRequest,
-    MemoryListQuery, MemoryRevisionRequest, MemorySweepRequest, RebuildIndexRequest,
-    SessionListQuery, SessionSearchQuery, UpdateCronRequest,
+    MemoryListQuery, MemoryRevisionRequest, MemorySweepRequest, MonitorListQuery,
+    RebuildIndexRequest, SessionListQuery, SessionSearchQuery, UpdateCronRequest,
 };
 use komo_kernel::types::ids::{CronJobId, MatterId, MemoryId, RunId, SessionId};
 use komo_kernel::types::memory::{
@@ -53,6 +53,18 @@ pub async fn session_search(client: &KomoClient, query: &str, limit: Option<u32>
         .await
         .map_err(failed)?;
     Ok(render::session_search(&response))
+}
+
+/// `komo monitor list`：监听清单（只读，roadmap-muse S4）。
+pub async fn monitor_list(client: &KomoClient, all: bool) -> Outcome {
+    let response = client
+        .list_monitors(&MonitorListQuery { all })
+        .await
+        .map_err(failed)?;
+    Ok(render::monitor_list(
+        &response,
+        time::OffsetDateTime::now_utc(),
+    ))
 }
 
 /// `komo session delete`：**逻辑删除**（§8.10）。

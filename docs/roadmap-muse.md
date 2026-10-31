@@ -166,7 +166,14 @@ GTD（David Allen）的流程是收集 → 理清（要不要行动）→ 组织
   - 完成标准：在任务里挂一个每 15 秒打一行、只在第 3 行打"FAILED"的脚本，home 只收到一次交回；任务会话被删后监听停掉。
 - **S3 跨会话找回（已实现，2026-10-31；规格见 `docs/komo_bot.md` §8.11「跨会话找回」）**（文章的"链式召回"）。实现时定下的：HTTP 路径是 `/v1/session-search`（`/v1/sessions/{id}` 已占了 `sessions/` 下的单段路径）；标题命中也算一处；交回与注入里的 ID 核对过——`task.result` 头带 `#短号`、事项注入带 `id@版本`，没有要补的。完成标准（TUI 里一次 search 找到别的会话里的链接）要装机后真机验证。原计划：飞书一个话题一个 Session、私聊进 home，彼此看不到；记忆提取不保证带上链接、ID 这类细节。加只读的 `komo session search <关键词>`（Gateway HTTP 接口，CLI 印结果）：在会话标题与 entry 正文里匹配，按时间倒序给会话、标题、命中片段与能接着查的 ID（会话 ID、`#任务`、监听短号），条数有上限。可见性同 `komo memory search`：private / off 会话不出现。系统提示在"komo 自己的状态"一节教它。交回与注入里已带的 ID（`#任务`、目标 id）核对一遍，缺的补上。
   - 完成标准：在 TUI 里问"刚才在飞书里那篇文章"，Agent 用一次 `komo session search` 就找到另一个会话里的链接，不再 export 整个会话去 grep。
-- **S4 看门狗**（文章的 Watchdog）。不写新机制，用一个 prompt Cron Job：每 30 分钟查跑得太久、长时间没有新 entry 的任务会话，超期的等待中目标，跑了很久的监听；有问题才说，没事回 S1 的记号。查询入口不够（例如没有列出监听的命令）时补只读命令。Job 的提示写在这里，用 `komo cron add` 建。
+- **S4 看门狗（代码部分已实现，2026-10-31；Job 待装机后建）**（文章的 Watchdog）。补了只读的 `komo monitor list`（`GET /v1/monitors`，见 `docs/monitor.md` §2「清单」）。"长时间没有新 entry"没有现成的只读入口（`komo session list` 的更新时间是会话行的改动时刻，不是最后一条 entry），所以巡检先按 Run 的开始时刻判（`komo run inspect` 有"开始"），不另加字段；不够用再补。Job（装上含 S1 的版本之后由操作者建，旧二进制不认 NO_REPLY，会每 30 分钟投一条）：
+
+  ```
+  komo cron add --name watchdog --schedule '*/30 * * * *' --timezone Asia/Shanghai \
+    --max-rounds 12 --notify always --prompt '看门狗巡检。只读，不要停、删、改任何东西。用 bash 跑：komo session list、komo monitor list、komo goal list、komo intervention list；session list 里标着任务、运行列还在执行中的，再对它的 Run 跑 komo run inspect <RUN_ID> 看开始时刻与轮数。有下面这些才说：① 任务会话的 Run 开始超过 2 小时还没结束；② 等待中的目标标着已超期；③ 监听已跑超过 6 小时，或离截止不到 10 分钟；④ 有待处理的介入。每项一行：是什么、ID（会话 / Run / #短号 / 目标 id）、为什么像卡住、建议下一步。一切正常就整段只回 NO_REPLY。'
+  ```
+
+  原计划：不写新机制，用一个 prompt Cron Job：每 30 分钟查跑得太久、长时间没有新 entry 的任务会话，超期的等待中目标，跑了很久的监听；有问题才说，没事回 S1 的记号。查询入口不够（例如没有列出监听的命令）时补只读命令。Job 的提示写在这里，用 `komo cron add` 建。
   - 完成标准：平时零投递；人为留一个卡住的任务会话，下一次触发就报出来。
 
 ### P3 对外动作确认（已拍板，见 §4.1）

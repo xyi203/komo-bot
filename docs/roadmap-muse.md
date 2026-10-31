@@ -160,7 +160,7 @@ GTD（David Allen）的流程是收集 → 理清（要不要行动）→ 组织
 - **S5 按渠道定篇幅（已实现，2026-10-31）。** 文章实测"IM 单次回复不超过 100 词"有效。回复要发到飞书 / Telegram / 微信的 Run 加一段输出规范：先给结论、只问直接的问题，一般不超过约 150 字，长内容写进文件给路径或拆成任务；TUI / HTTP 不加。
   - 与原计划的取舍：原想放进系统段，但私聊（微信、Telegram）与 TUI 共用 home session，按渠道换系统段会让 home 每换一次渠道就打掉前缀缓存。改成照记忆召回块，每个 Run 在输入之后追加一次宿主附注（`komo.channel` entry），规格见 `docs/komo_bot.md` §11.2「渠道篇幅」。
   - 完成标准：渠道起的 Run 带一条写明平台的附注、同一 Run 只一条（`a_chat_run_gets_one_channel_note_naming_the_platform`）；`api` 对端与找不到对端只落记录（`hooks/channel.rs` 单测）。
-- **S1 内部输入可以不说话**（即 `docs/background-tasks.md` §6 的 NO_REPLY，P2 通知判断的前提）。只由内部输入（`task.result`、`monitor.event` / `monitor.end`、`bash-done`）或 Cron 起的 Run，回答整段是约定记号时：Run 照常收尾、entry 照常落（审计不丢），只是不投递到渠道，TUI 里显示成"未转告"。这条 Run 里只要有用户输入（含被并入的插话），记号不生效、照常回答。`monitor` / `task` 的工具文档与 Cron 的提示写明"不值得转告就只回记号"。
+- **S1 内部输入可以不说话（已实现，2026-10-31；规格见 `docs/background-tasks.md` §2d）**（即原 §6 的 NO_REPLY，P2 通知判断的前提）。与下面原计划的取舍：TUI 没有单独的"未转告"样式，事件流里显示的就是记号本身；`task.result` 的附注不加"可以不说话"（派任务是用户要的事，结论得转告）；宿主不往 Cron 输入里补提示（输入带内容哈希），由 Job 的 prompt 自己写；`bash-done` 现在就是 `monitor.end`，已覆盖。原计划：只由内部输入（`task.result`、`monitor.event` / `monitor.end`、`bash-done`）或 Cron 起的 Run，回答整段是约定记号时：Run 照常收尾、entry 照常落（审计不丢），只是不投递到渠道，TUI 里显示成"未转告"。这条 Run 里只要有用户输入（含被并入的插话），记号不生效、照常回答。`monitor` / `task` 的工具文档与 Cron 的提示写明"不值得转告就只回记号"。
   - 完成标准：一个挂在飞书会话上的监听，事件不值得说时渠道零消息、会话里有那一轮；同一轮里用户插了话时照常回复；Cron prompt Job 回记号时不投递。
 - **S2 任务会话自己挂监听**（文章的"订阅直通"）。fresh 任务的能力面放开 `monitor` / `monitor_stop`（`task` 仍不给，结果只交回一层）。事件直接进任务会话，任务处理完照常交回 home；任务对事件的回答是 S1 的记号时不交回，所以 home 只在有结论时被叫醒。任务会话删除时停掉它挂的监听；`task(task_id)` 查进度列出它挂着的监听。事件起的 Run 是否走"没写状态行就自动续跑"（§2c）实现时定，写回 `docs/background-tasks.md` 与 `docs/monitor.md`。
   - 完成标准：在任务里挂一个每 15 秒打一行、只在第 3 行打"FAILED"的脚本，home 只收到一次交回；任务会话被删后监听停掉。

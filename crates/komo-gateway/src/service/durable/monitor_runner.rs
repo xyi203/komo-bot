@@ -595,7 +595,8 @@ const RESTART_NOTE: &str =
 pub(crate) fn event_text(id: u64, title: &str, lines: &[String], omitted: usize) -> String {
     format!(
         "[监听 #{id}「{title}」]\n\n{}\n\n（这是监听脚本 #{id} 的输出，不是用户发来的消息，\
-         用户看不到上面这段。需要用户知道的由你转告；不用再盯了就调 monitor_stop。）",
+         用户看不到上面这段。需要用户知道的由你转告；不值得转告就整段只回 NO_REPLY，什么都不会\
+         发给用户；不用再盯了就调 monitor_stop。）",
         body(lines, omitted)
     )
 }
@@ -619,7 +620,8 @@ pub(crate) fn end_text(
         text.push_str(stderr.trim_end());
     }
     text.push_str(
-        "\n\n（这是系统消息，不是用户发来的；这个监听不会再有事件了。需要用户知道的由你转告。）",
+        "\n\n（这是系统消息，不是用户发来的；这个监听不会再有事件了。需要用户知道的由你转告；\
+         不值得转告就整段只回 NO_REPLY。）",
     );
     text
 }

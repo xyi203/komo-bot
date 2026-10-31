@@ -33,6 +33,9 @@
   `prepare`；登记、工具任务的三明治与恢复在 runtime（`harness/orchestration/monitor.rs`），起进程、泵、合批与时限在 gateway 的 `GatewayMonitorRunner`（`MonitorRunner`，runtime 的 `OrchestrationHooks::{start,stop}_monitor` 背后）。codemode 脚本里调不了。
 - **事件交回挂它的会话，投给路径上最近一条带 peer 的用户输入的来源对端**（没有就只有主会话退回 home chat）。在 home 里挂的，
   事件经 home 的模型转告到聊天；在 TUI 里挂的，事件在事件流里看得到。
+- **不值得说就不说（2026-10-31，roadmap-muse S1）。** 事件、结束消息与后台命令结束的附注写明"不值得转告
+  就整段只回 NO_REPLY"；只由这些内部输入起的那一轮回答是记号时，看客不投、不起标题，entry 照常落
+  （`docs/background-tasks.md` §2d）。
 - **事件与结束消息都按插话交回（2026-10-21）。** 事件、正常结束消息、重启后的"已中断"
   都走 `submit_interjecting`，与后台命令的完成通知（§8）同一套资格检查：宿主还在跑、
   对端与模型快照对得上时，在下一个工具边界并进去（`absorbed`，终态，泵照样放下一批）；

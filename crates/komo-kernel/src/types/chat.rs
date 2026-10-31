@@ -291,6 +291,20 @@ impl DeliveryTarget {
     }
 }
 
+/// 内部输入（任务结果、监听事件）或 Cron 起的 Run 不值得转告时，回答整段只写这个记号
+/// （`docs/background-tasks.md` §2d，roadmap-muse S1）：Run 照常收尾、entry 照常落，只是不投递。
+pub const SILENT_REPLY: &str = "NO_REPLY";
+
+/// 这段回答是不是 [`SILENT_REPLY`]：去掉首尾空白，再去掉一层反引号 / 引号后整段相等。
+/// 记号夹在别的话里不算——那是在说话。
+pub fn is_silent_reply(text: &str) -> bool {
+    let trimmed = text.trim();
+    let unwrapped = trimmed
+        .trim_matches(|c| matches!(c, '`' | '"' | '\'' | '「' | '」'))
+        .trim();
+    unwrapped == SILENT_REPLY
+}
+
 /// `deliveries` 表的三个状态（§11.4）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -313,6 +327,17 @@ pub struct Delivery {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 整段是记号才算不说话；包一层反引号 / 引号、带首尾空白也认；夹在话里不算。
+    #[test]
+    fn only_a_reply_that_is_the_marker_alone_is_silent() {
+        for silent in ["NO_REPLY", "  NO_REPLY\n", "`NO_REPLY`", "\"NO_REPLY\""] {
+            assert!(is_silent_reply(silent), "{silent:?}");
+        }
+        for spoken in ["", "no_reply", "NO_REPLY，没什么要说的", "结论：NO_REPLY"] {
+            assert!(!is_silent_reply(spoken), "{spoken:?}");
+        }
+    }
 
     #[test]
     fn a_custom_channel_peer_round_trips_without_a_registered_plugin() {

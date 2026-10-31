@@ -58,6 +58,16 @@
 - **自动续跑。** 回答没写状态行时先不交回：`answer` 的收尾提交里改调 `report::end_answered_run`，往任务会话放一条 `task.continue` 输入（"这条是 komo 自动发的……重新写一份完整的最后回复，末行写状态"）、起后继 run，`komo.task.continued` 记下它。以续跑输入开头的 run 收尾时不再续跑、照常交回，标题后加 `· 自动续跑过一次`——每条派出 / 追问的输入最多续跑一次，不会循环。父只收到续跑之后的那条回答，所以续跑提示要的是完整的最后回复。参考的是 Claude Code 的 `SubagentStop` hook：返回 block 时子 agent 接着做。
 - **不续跑的情况。** 带结果契约的回答只放 JSON，不看状态行，结局看契约复验；这次 final boundary 放了用户项或收件箱还有东西（派它的会话追问过来了）时，后继 run 本来就要起，续跑让给它，回答照常交回；失败、取消、预算等非正常收尾不续跑。
 
+## 2d. 内部输入可以不说话（2026-10-31 定并落地，roadmap-muse S1）
+
+监听每来一个事件，home 都要跑一轮，多半还会转告一句；P2 的通知判断（说 / 不说 / 攒到摘要里）、看门狗 Cron 的"没事不说话"都要先能**什么也不说**。借 hermes 的 NO_REPLY：
+
+- **记号。** 回答整段是 `NO_REPLY`（kernel `types::chat::SILENT_REPLY`；`is_silent_reply` 去首尾空白、再去一层反引号 / 引号后整段相等才算，夹在话里不算）。
+- **对话会话**（看客 `watch.rs` 的 `finish`）：回答是记号、且这条 run 的输入**全是内部输入**（首个输入，以及并进来、与它共用同一条回答 entry 的那些都是 `task.result` / `monitor.event` / `monitor.end`）时：不投递（渠道与 home chat 都不投）、不起标题。entry 照常落、Run 照常收尾，审计不丢；TUI 在事件流里看得到那一轮（显示的就是记号本身，没有单独的"未转告"样式）。有一条是用户说的话（聊天、TUI、认不出来源）就照原样投——有人在等回答。
+- **Cron prompt Job**（`durable/cron_watch.rs`）：回答是记号时触发照记 `ok`、不投，与命令型 Job 的空 stdout 一样（`docs/komo_bot.md` §10）。Job 的 prompt 自己写明"没事就只回 NO_REPLY"；宿主不往 Cron 的输入里补这句（输入正文带内容哈希，不动它）。
+- **谁会被告知可以不说话。** 监听事件、监听结束、后台命令结束三处附注与 `monitor` 工具说明写了"不值得转告就整段只回 NO_REPLY"。`task.result` 的附注**不加**：派任务是用户要的事，结论得转告。任务会话的回答是记号时不交回，见 §2e（S2）。
+- 验收：`watch_tests.rs` 的 `a_silent_reply_to_an_internal_input_is_not_delivered_but_one_to_the_user_is`，`tests/cron/notify.rs` 的 `a_silent_reply_settles_ok_but_delivers_nothing`，kernel 的 `only_a_reply_that_is_the_marker_alone_is_silent`。
+
 ## 2a. `task`：合并 `dispatch` / `follow` / `delegate`（2026-10-16 定并落地）
 
 同步的 `delegate`（子 Run 在同一 Session 里、父等它）删掉。不阻塞的子任务留不在父的 conversation 里——挪出去就是任务会话。它原来多出来的几样并进 `task`：
@@ -105,5 +115,5 @@ task(prompt, title, task_id?, model?, effort?, contract?, context?)   context: "
 ## 6. 后续
 
 - 长任务的主动进度提示（任务自己隔一阵说一句）：按需查询已做（§2，`task(task_id)`），主动报仍未做。
-- 交回的那一轮允许模型不说话（hermes 的 NO_REPLY，只对内部输入开放）。
+- ~~交回的那一轮允许模型不说话（hermes 的 NO_REPLY，只对内部输入开放）~~：已做，§2d。
 - 登记里的已结束监听只留最近 64 条；`komo.task` 随子 conversation 一直在，没有按时间清理。

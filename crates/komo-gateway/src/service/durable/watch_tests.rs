@@ -96,6 +96,73 @@ async fn an_internal_input_is_answered_to_the_latest_peer_on_the_path() {
     assert_eq!(finished_to(&sender, "111", &accepted.run), 1, "只一条");
 }
 
+/// 不说话（S1）：内部输入开的 run 回答整段是 `NO_REPLY` 时不投；同一个记号回给用户自己说的话
+/// 照原样投（有人在等回答）。
+#[tokio::test]
+async fn a_silent_reply_to_an_internal_input_is_not_delivered_but_one_to_the_user_is() {
+    let llm = FakeLlm::new(vec![
+        vec![text_round(1, "好")],
+        vec![text_round(1, "NO_REPLY")],
+        vec![text_round(1, "NO_REPLY")],
+    ]);
+    let (gateway, sender) = start(llm, None).await;
+    let ack = gateway
+        .handle(inbound(
+            ChannelPlatform::Telegram,
+            "111",
+            "111",
+            "在",
+            "t:1",
+            true,
+        ))
+        .await;
+    let InboundAck::Queued { session, run } = ack else {
+        panic!("{ack:?}");
+    };
+    gateway.wait_run(&run).await;
+
+    let core = gateway.state().core().unwrap().clone();
+    let silent = core
+        .submit_input(session.as_str(), internal("task-result:s:1"))
+        .await
+        .unwrap();
+    gateway.wait_run(&silent.run).await;
+
+    let ack = gateway
+        .handle(inbound(
+            ChannelPlatform::Telegram,
+            "111",
+            "111",
+            "回个 NO_REPLY",
+            "t:2",
+            true,
+        ))
+        .await;
+    let InboundAck::Queued { run: spoken, .. } = ack else {
+        panic!("{ack:?}");
+    };
+    gateway.wait_run(&spoken).await;
+
+    let watching = Arc::clone(&sender);
+    let waited = spoken.clone();
+    eventually("用户那一轮的记号照投", move || {
+        finished_to(&watching, "111", &waited) == 1
+    })
+    .await;
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert_eq!(finished_to(&sender, "111", &run), 1);
+    assert_eq!(
+        finished_to(&sender, "111", &silent.run),
+        0,
+        "内部输入那一轮不投"
+    );
+    assert_eq!(
+        finished_to(&sender, "999", &silent.run),
+        0,
+        "也不退回 home chat"
+    );
+}
+
 /// 路径上没有任何带 peer 的输入：主会话退回 home chat；别的会话（TUI / HTTP 开的）不投——它自己
 /// 看着事件流。
 #[tokio::test]

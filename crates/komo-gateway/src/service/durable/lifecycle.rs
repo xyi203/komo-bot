@@ -203,7 +203,38 @@ impl DurableCore {
         Ok(blockers)
     }
 
-    /// 这个 Session 名下还在跑的监听（purge 的阻挡项；delete 不替它们收尾——结束消息会再起 run）。
+    /// 删会话时停掉它名下还在跑的监听（2026-10-31，S2：任务会话也挂监听之后，删掉的任务不该留着
+    /// 脚本跑到超时）。会话已经 `closing`，登记 `ended{stopped}` 时不再交回结束消息（`finish_in_tx`），
+    /// 所以不会在要删的会话里再起 run。先登记、再停进程，同 `monitor_stop`；停进程失败只记一笔。
+    async fn stop_monitors(
+        &self,
+        conversations: &[ConversationRecord],
+    ) -> Result<(), SessionError> {
+        let ids: Vec<ConversationId> = conversations.iter().map(|c| c.id).collect();
+        let live: Vec<u64> = monitor::list(&*self.storage)
+            .await?
+            .into_iter()
+            .filter(|record| record.is_live() && ids.contains(&record.conversation))
+            .map(|record| record.id)
+            .collect();
+        for id in live {
+            self.harness
+                .finish_monitor(
+                    &self.engine,
+                    id,
+                    "stopped",
+                    Some("已停：挂它的会话被删除"),
+                    format!("[监听 #{id} 已停：挂它的会话被删除]"),
+                )
+                .await?;
+            if let Err(error) = self.harness.deps().orchestration.stop_monitor(id).await {
+                tracing::warn!(%error, monitor = id, "删会话时停监听进程没停掉");
+            }
+        }
+        Ok(())
+    }
+
+    /// 这个 Session 名下还在跑的监听（purge 的阻挡项；delete 会先停掉它们，这里兜住停失败的）。
     async fn live_monitors(
         &self,
         conversations: &[ConversationRecord],
@@ -250,6 +281,7 @@ impl DurableCore {
             .advance(id, &[SessionLifecycle::Active], SessionLifecycle::Closing)
             .await?;
         let conversations = session_conversations(&*self.storage, id).await?;
+        self.stop_monitors(&conversations).await?;
         if now {
             for _ in 0..DRAIN_ROUNDS {
                 self.withdraw_queued(&conversations).await?;

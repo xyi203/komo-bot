@@ -162,7 +162,7 @@
 |---|---|---|
 | `AgentHooks::setup` | `state.rs::freeze_run`、`agent_model` / `default_model_of`、`windows.rs`、`komo_agent::surface_of` | `komo.agent` → `komo.task`（任务会话）→ 默认 Agent；每次按当前配置解析；`task` 给的名字优先 |
 | 系统段 | `komo_agent::context::prompt::build`（公开为 `system_sections`）、`skills_block`、`project_files::discover`、`context_sources::recall_for` | key：`instructions` / `base` / `project` / `skills` / `memory`；fork 任务返回 `replay_sections(context)`；`project` 与 `memory` 优先用已展示的那份；规范文件变了由 `submit.rs` 把 `project_update_block` 补进下一条输入 |
-| `tools` / `ToolSet` | `ToolExecutor::tools()`、`refresh_mcp` / `tool_names`、`await_mcp` / `withdrawn_reason`（放宽为 pub）、`segment.rs` 的 `run_roots` / `ResourceMounts`、`config.execution.projection()` | MCP 工具有超时地等连上；撤掉的工具放 `WithdrawnTool` 桩，`prepare` 报原因；任务会话去掉 `task` 与 `monitor`；`ToolEnv.outputs` = Session 目录上的 `FileToolOutputStore`；`detach_after` 只给对话会话 |
+| `tools` / `ToolSet` | `ToolExecutor::tools()`、`refresh_mcp` / `tool_names`、`await_mcp` / `withdrawn_reason`（放宽为 pub）、`segment.rs` 的 `run_roots` / `ResourceMounts`、`config.execution.projection()` | MCP 工具有超时地等连上；撤掉的工具放 `WithdrawnTool` 桩，`prepare` 报原因；任务会话去掉 `task`（`monitor` 2026-10-31 起保留，`docs/background-tasks.md` §2e）；`ToolEnv.outputs` = Session 目录上的 `FileToolOutputStore`；`detach_after` 只给对话会话 |
 | 模型 / 预算 | `config.model_catalog`、`max_rounds` / `max_retries`、cron Job 的 `maxRounds` | `cache_key` = 会话 ID，fork 任务用父的 |
 | `AgentHooks::compaction` | `[compaction]`、`komo_agent::context::compaction` 的摘要提示 | 新增 `background_tokens` 键 |
 | `check_effort` | `default_model_of` + `EffortCapabilities` | 只给 effort 时用 Agent 默认模型或任务上一次的模型 |

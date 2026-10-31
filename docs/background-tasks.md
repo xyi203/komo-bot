@@ -43,7 +43,7 @@
 - **内部输入。** 交回的输入（以及监听的 `monitor.event` / `monitor.end`）带 `internal` 标记，规则三条：①取消父的 run 时 `abort_conversation` 只撤用户输入，**不撤内部输入**；②父的 run 非正常收尾（取消、失败、预算、fault、orphan）时，同一次提交里按 final boundary 放置收件箱里排着的全部输入、起后继 run——父照旧跑一轮把结论转告用户；③显式的单条 `Harness::withdraw` 对内部输入仍有效。**删除会话**时先撤回全部排队的输入（含内部输入）再 abort，不会再起后继 run（`docs/komo_bot.md` §8.10）。
 - **父忙时并入。** 交回的输入是 steer：父的 run 在跑，就在它的 postTools boundary 并进当前 run（旧实现的"插话并入"）；父空闲就直接放置、起新 run。回复由宿主那一轮投回来源对端——来源对端取"当前路径上最近一条带 peer 的用户输入"的 peer，没有就退回 home chat（只有主会话；TUI / HTTP 开的会话不投）。任务自己的最终回复不再直接投给渠道。
 - **父会话不在了**（删掉、purge）：`report` 在受理之前就返回，结果不交（任务会话本身仍在，`komo session list` 看得到）。
-- **任务会话里不能再派任务**：调用方 conversation 自己有 `komo.task` 就拒绝，结果只交回一层。fresh 任务的能力面里没有 `task` 与 `monitor`；fork 任务保留父的（见 §2b）。
+- **任务会话里不能再派任务**：调用方 conversation 自己有 `komo.task` 就拒绝，结果只交回一层。fresh 任务的能力面里没有 `task`（2026-10-31 起有 `monitor` / `monitor_stop`，§2e）；fork 任务保留父的（见 §2b）。
 - **接着做**：`task(prompt, task_id)` 往已有的任务 conversation 提交一条输入，它带着自己的历史接着做；结果同样交回。不带 `contract` 的追问是 steer（任务正忙时并进当前 run），带 `contract` 的排在后面。
 - **查进度**：`task(task_id)` 不带 `prompt`，只读那个任务的 `komo.live`、entry 与 `komo.task`，不提交任何东西：状态、已跑多久、正在执行的调用及其输出尾部；已收尾的 run 的终态来自 `komo.task.lastRun`。
 - **取消**：模型没有取消子任务的工具；显式取消是 `Harness::abort_conversation(engine, 子 conversation)`（子 run 以 `aborted` 收尾，照常交回一条"没有完成"）。`/cancel` 只停 home 当前这一轮（`abort_run`），不动任务。
@@ -67,6 +67,17 @@
 - **Cron prompt Job**（`durable/cron_watch.rs`）：回答是记号时触发照记 `ok`、不投，与命令型 Job 的空 stdout 一样（`docs/komo_bot.md` §10）。Job 的 prompt 自己写明"没事就只回 NO_REPLY"；宿主不往 Cron 的输入里补这句（输入正文带内容哈希，不动它）。
 - **谁会被告知可以不说话。** 监听事件、监听结束、后台命令结束三处附注与 `monitor` 工具说明写了"不值得转告就整段只回 NO_REPLY"。`task.result` 的附注**不加**：派任务是用户要的事，结论得转告。任务会话的回答是记号时不交回，见 §2e（S2）。
 - 验收：`watch_tests.rs` 的 `a_silent_reply_to_an_internal_input_is_not_delivered_but_one_to_the_user_is`，`tests/cron/notify.rs` 的 `a_silent_reply_settles_ok_but_delivers_nothing`，kernel 的 `only_a_reply_that_is_the_marker_alone_is_silent`。
+
+## 2e. 任务会话自己挂监听（2026-10-31 定并落地，roadmap-muse S2）
+
+外部事件（CI、MR 评论、工单状态）原来只能挂在 home 上：每个事件占 home 一轮，过程细节堆进 home 的上下文。借 DeepSeek Super-agent 的"订阅直通"：盯着的事交给任务，home 只在有结论时被叫醒。
+
+- **能力面。** fresh 任务放开 `monitor` / `monitor_stop`（gateway `hooks/tools.rs` 的 `ORCHESTRATION_TOOLS` 只剩 `task`），runtime `monitor::start` 里"任务会话不能挂"的拒绝删掉。`task` 仍不给，结果只交回一层。
+- **事件进任务会话。** 事件与结束消息照常交回挂它的 conversation（就是任务会话），在那里起一条 run；run 收尾照常经 `report` 交回父（`task-result:{子}:{这条 run 的首个输入}`，每条 run 一个键）。
+- **只由事件起的 run**（输入的请求键全是 `monitor:` / `monitor-end:`，读 submission 判断，不算表读）：回答是 NO_REPLY（§2d）时**不交回**、`lastRun` 不动；不走"没写状态行就自动续跑"（§2c）——事件那一轮不是派出的活，没有状态行可写，说了话就直接交回，标题按状态行规则（多半是"交回了，没说做完没有"）。并进了派出 / 追问输入的 run 照常续跑、照常交回。
+- **查进度**（`task` 只给 `task_id`）：`TaskProgress.monitors` 列出挂在这个任务会话上、还在跑的监听，渲染成末尾一行 `挂着的监听：#7「CI」`。
+- **删会话停掉监听**（对所有会话，不只任务会话）：`delete_session` 推进到 `closing` 之后，先给它名下每个还活着的监听登记 `ended{stopped}`、再停进程（同 `monitor_stop` 的次序）。`finish_in_tx` 发现所在 Session 已不是 `active` 时只登记、不交回结束消息，所以不会在要删的会话里再起 run。purge 的"监听还在跑"阻挡项留着，兜住停进程失败的。以前 delete 不替监听收尾，正是因为结束消息会再起 run。
+- 验收：runtime `a_task_monitor_reports_back_only_when_the_event_round_speaks`（任务挂监听；NO_REPLY 那一轮不交回；说话的那一轮交回且没有先续跑），gateway `task_sessions_lack_task_but_keep_monitor_in_schema`、`tests/monitor/durable.rs` 的 `deleting_the_session_stops_its_monitors_without_an_end_message`，kernel `live_monitors_are_listed_after_the_run`。
 
 ## 2a. `task`：合并 `dispatch` / `follow` / `delegate`（2026-10-16 定并落地）
 

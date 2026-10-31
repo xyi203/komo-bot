@@ -1738,9 +1738,10 @@ async fn reconciling_after_a_restart_resumes_the_declared_and_interrupts_the_res
     engine.close().await.unwrap();
 }
 
-/// 任务会话里别挂监听：任务这一轮一结束结果就交回去了。
+/// 任务会话里也能挂监听（S2，`docs/background-tasks.md` §2e）：事件进任务会话；只由事件起的那一轮
+/// 回答是 NO_REPLY 时不交回，否则照常交回——没写状态行也不自动续跑。
 #[tokio::test(start_paused = true)]
-async fn a_task_conversation_cannot_start_a_monitor() {
+async fn a_task_monitor_reports_back_only_when_the_event_round_speaks() {
     let world = World::new();
     let (_fixture, ..) = install(&world);
     world
@@ -1748,29 +1749,58 @@ async fn a_task_conversation_cannot_start_a_monitor() {
         .calls(&[("c1", "task", spawn_call("CHILD watch", "盯盘"))]);
     world.script.reply("dispatched");
     world.script.reply("noted");
+    world.script.reply("noted again");
     world.script.calls_for(
         "CHILD watch",
         &[("k1", "monitor", monitor_call("x", false, 5))],
     );
-    world
-        .script
-        .reply_for("CHILD watch", &finished("never mind"));
+    world.script.reply_for("CHILD watch", &finished("watching"));
+    world.script.reply_for("quiet line", "NO_REPLY");
+    world.script.reply_for("FAILED line", "CI failed");
     let engine = world.open().await;
     let id = world.submit(&engine, "go").await;
     world.harness.wait(&engine, id).await.unwrap();
     let child = world.child().await;
     world
         .until(|| async {
-            outline(&world.messages_in(child).await)
-                .last()
-                .is_some_and(|l| *l == format!("assistant: {}", finished("never mind")))
+            outline(&world.messages().await).contains(&"assistant: noted".to_owned())
+        })
+        .await;
+    let records = monitors(&world).await;
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(records[0].conversation, child, "挂在任务会话上");
+    assert_eq!(world.orch.launches().len(), 1);
+    let monitor_id = records[0].id;
+    assert_eq!(
+        submissions_with(&world, CONV, "task-result:").await.len(),
+        1
+    );
+
+    let quiet = monitor::event_draft(monitor_id, "x", "1:1", "[监听 #x「x」]\nquiet line");
+    let quiet = world.harness.submit(&engine, child, quiet).await.unwrap();
+    world.harness.wait(&engine, quiet).await.unwrap();
+    assert_eq!(
+        submissions_with(&world, CONV, "task-result:").await.len(),
+        1,
+        "NO_REPLY 那一轮不交回"
+    );
+
+    let loud = monitor::event_draft(monitor_id, "x", "1:2", "[监听 #x「x」]\nFAILED line");
+    let loud = world.harness.submit(&engine, child, loud).await.unwrap();
+    world.harness.wait(&engine, loud).await.unwrap();
+    let results = submissions_with(&world, CONV, "task-result:").await;
+    assert_eq!(results.len(), 2, "说了话的那一轮交回，且没有先自动续跑");
+    world
+        .until(|| async {
+            outline(&world.messages().await).contains(&"assistant: noted again".to_owned())
         })
         .await;
     assert!(
-        result_text(&world.messages_in(child).await, "k1").contains("后台任务会话里不能挂监听")
+        user_texts(&world.messages().await)
+            .iter()
+            .any(|text| text.contains("CI failed")),
+        "交回的正文是事件那一轮的回答"
     );
-    assert!(monitors(&world).await.is_empty());
-    assert!(world.orch.launches().is_empty());
     engine.close().await.unwrap();
 }
 

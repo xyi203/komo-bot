@@ -26,9 +26,10 @@ use super::env;
 use super::setup::Resolved;
 use crate::service::state::GatewayState;
 
-/// fresh 任务会话里不给的编排工具：`task`（深度只有一层）与 `monitor`（监听的事件与结束消息
-/// 交回挂它的会话，任务会话不挂）。
-const ORCHESTRATION_TOOLS: [&str; 3] = [komo_agent::TASK_TOOL, "monitor", "monitor_stop"];
+/// fresh 任务会话里不给的编排工具：`task`（深度只有一层）。`monitor` / `monitor_stop` 给
+/// （2026-10-31，roadmap-muse S2）：事件直接进任务会话，任务处理完照常交回，回答是 NO_REPLY 时不交回
+/// （`docs/background-tasks.md` §2e）。
+const ORCHESTRATION_TOOLS: [&str; 1] = [komo_agent::TASK_TOOL];
 
 /// 撤掉 / 没连上的工具的桩：名字还在能力面里，模型调它就拿到原因。不进模型的 schema（声明里
 /// 本来就没有它：撤掉之后的下一次系统段规划把它从已展示的工具里删掉）。

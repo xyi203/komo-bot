@@ -494,6 +494,11 @@ async fn progress(
     let entries = cx.rt.entries(child, None).await?;
     let now = cx.rt.now()?;
     let handle = child.to_string();
+    let monitors: Vec<String> = super::monitor::live_in(cx.rt, child)
+        .await?
+        .iter()
+        .map(|record| format!("#{}「{}」", record.handle(), record.title))
+        .collect();
     let finals: Vec<usize> = entries
         .iter()
         .enumerate()
@@ -520,6 +525,7 @@ async fn progress(
             short_id: handle,
             title: doc.title.clone(),
             run: None,
+            monitors,
         });
     };
     let accepted = message_time(first_user);
@@ -597,6 +603,7 @@ async fn progress(
             reason,
             waiting_on,
         }),
+        monitors,
     })
 }
 

@@ -26,9 +26,10 @@
 //!   一次；带结果契约的回答只放 JSON，不看状态行。
 
 use komo_kernel::durable::{
-    Content, ConversationId, EntryId, EntryRecord, Message, SessionLifecycle, SubmissionSettlement,
-    TaskId,
+    Content, ConversationId, EntryId, EntryRecord, Message, SessionLifecycle, SubmissionId,
+    SubmissionSettlement, TaskId,
 };
+use komo_kernel::types::chat::is_silent_reply;
 use komo_kernel::types::delegate::DelegateContract;
 use komo_kernel::types::task::{TASK_STATUS_BLOCKED, TASK_STATUS_DONE, duration_words};
 use serde_json::{Value, json};
@@ -116,6 +117,26 @@ fn answer_text(entry: &EntryRecord) -> String {
             _ => None,
         })
         .unwrap_or_default()
+}
+
+/// 这条 run 的输入全是监听交回的（请求键 `monitor:` / `monitor-end:`）。读 submission 不算表读。
+async fn events_only(tx: &mut Tx, inputs: &[SubmissionId]) -> Result<bool, DurableError> {
+    if inputs.is_empty() {
+        return Ok(false);
+    }
+    for id in inputs {
+        let key = tx
+            .submission(*id)
+            .await?
+            .and_then(|record| record.request_id);
+        let from_monitor = key
+            .as_deref()
+            .is_some_and(|key| key.starts_with("monitor:") || key.starts_with("monitor-end:"));
+        if !from_monitor {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 fn detail_text(detail: Option<&Value>) -> String {
@@ -282,6 +303,10 @@ async fn report(
     };
     let continued = doc.continued == Some(first);
     let has_contract = doc.contracts.contains_key(&first.to_string());
+    // 只由监听事件 / 结束消息起的 run（S2，`docs/background-tasks.md` §2e）：不自动续跑（事件那一轮
+    // 不是派出的活，没有状态行可写）；回答是 NO_REPLY 时不交回、lastRun 也不动。
+    let events_only = events_only(tx, &run.inputs).await?;
+    let may_continue = may_continue && !events_only;
 
     let (outcome, text, last) = match settlement {
         SubmissionSettlement::Done { answer } => {
@@ -289,6 +314,9 @@ async fn report(
                 .staged_entry(*answer)
                 .map(answer_text)
                 .unwrap_or_default();
+            if events_only && is_silent_reply(&text) {
+                return Ok(None);
+            }
             if may_continue && !continued && !has_contract && status_of(&text) == Status::Unstated {
                 return Ok(Some(doc));
             }

@@ -81,6 +81,9 @@ pub struct TaskProgress {
     pub title: String,
     /// `None`：任务会话里还没有 Run。
     pub run: Option<RunProgress>,
+    /// 任务会话里挂着、还在跑的监听，每项 `#句柄「标题」`（`docs/background-tasks.md` §2e）。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub monitors: Vec<String>,
 }
 
 /// 任务会话里最近一条 Run 的进度。
@@ -135,8 +138,16 @@ pub struct RunningCall {
 }
 
 impl TaskProgress {
-    /// 给模型看的中文快照。`now` 由调用方从 [`crate::traits::Clock`] 取。
+    /// 给模型看的中文快照。`now` 由调用方从 [`crate::traits::Clock`] 取。挂着监听时末尾列出它们。
     pub fn render(&self, now: OffsetDateTime) -> String {
+        let mut out = self.run_text(now);
+        if !self.monitors.is_empty() {
+            let _ = write!(out, "\n挂着的监听：{}", self.monitors.join("、"));
+        }
+        out
+    }
+
+    fn run_text(&self, now: OffsetDateTime) -> String {
         let head = format!("#{}「{}」", self.short_id, self.title);
         let Some(run) = &self.run else {
             return format!("{head}：还没有开始跑");
@@ -317,7 +328,18 @@ mod tests {
             short_id: "2a9c".into(),
             title: "抓数据".into(),
             run,
+            monitors: Vec::new(),
         }
+    }
+
+    /// 挂着的监听列在末尾，跑着与跑完都列；没有就不提。
+    #[test]
+    fn live_monitors_are_listed_after_the_run() {
+        let now = OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(100);
+        let mut task = snapshot(None);
+        assert!(!task.render(now).contains("监听"));
+        task.monitors = vec!["#7「CI」".into()];
+        assert!(task.render(now).ends_with("\n挂着的监听：#7「CI」"));
     }
 
     #[test]

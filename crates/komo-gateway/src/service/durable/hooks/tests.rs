@@ -397,9 +397,9 @@ async fn a_fresh_task_session_gets_the_task_mode_in_its_base() {
     );
 }
 
-/// 任务会话交给模型的工具表里没有 `task` 与 `monitor`（fresh 任务）；对话会话有。
+/// fresh 任务会话交给模型的工具表里没有 `task`，有 `monitor` / `monitor_stop`（S2）；对话会话都有。
 #[tokio::test]
-async fn task_sessions_lack_task_and_monitor_in_schema() {
+async fn task_sessions_lack_task_but_keep_monitor_in_schema() {
     let world = World::new(&config_with("", NO_MEMORY), finisher()).await;
     let hooks = world.hooks();
     let parent = world.conversation(Some(agent("assistant"))).await;
@@ -418,12 +418,16 @@ async fn task_sessions_lack_task_and_monitor_in_schema() {
 
     let child = hooks.tools(task).await.unwrap();
     let declared = names(child.definitions());
-    for name in ["task", "monitor", "monitor_stop"] {
+    assert!(
+        !declared.iter().any(|have| have == "task"),
+        "task 不该在任务会话里：{declared:?}"
+    );
+    assert!(child.get("task").is_none(), "task 也不在能力面里");
+    for name in ["monitor", "monitor_stop"] {
         assert!(
-            !declared.iter().any(|have| have == name),
-            "{name} 不该在任务会话里：{declared:?}"
+            declared.iter().any(|have| have == name),
+            "{name} in {declared:?}"
         );
-        assert!(child.get(name).is_none(), "{name} 也不在能力面里");
     }
     assert!(declared.iter().any(|have| have == "read"));
     assert!(!child.env.conversation);

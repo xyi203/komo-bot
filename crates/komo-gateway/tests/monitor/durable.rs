@@ -173,6 +173,35 @@ async fn stopping_kills_the_script_and_reports_nothing_more() {
     gateway.stop().await;
 }
 
+/// 删会话时停掉它名下的监听（S2，`docs/background-tasks.md` §2e）：进程组没了，登记 `ended{stopped}`，
+/// 不在要删的会话里交回结束消息。
+#[tokio::test]
+async fn deleting_the_session_stops_its_monitors_without_an_end_message() {
+    let llm = MonitorLlm::new(Duration::ZERO);
+    let mut gateway = start(&llm, None).await;
+
+    let marker = gateway.home.join("still-running");
+    let (session, _id) = arm(
+        &gateway,
+        &format!("while true; do touch {}; sleep 0.2; done", marker.display()),
+    )
+    .await;
+    gateway.soft_delete(&session).await;
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let _ = std::fs::remove_file(&marker);
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    assert!(!marker.exists(), "删会话之后脚本还在跑");
+    let records = registry(&gateway).await;
+    assert_eq!(ended_reason(&records[0]), Some("stopped"), "{records:?}");
+    assert!(
+        submissions_keyed(&gateway, "monitor-end:").await.is_empty(),
+        "会话在删，不该再交回结束消息"
+    );
+
+    gateway.stop().await;
+}
+
 /// 脚本自己退出之后才调 `monitor_stop`（处理上一条事件的 Run 与脚本收尾竞态）：答“已经结束了”
 /// 和怎么结束的，不算失败，也不说它“不在跑”。起因是 session `01a153c3` seq 3578。
 #[tokio::test]

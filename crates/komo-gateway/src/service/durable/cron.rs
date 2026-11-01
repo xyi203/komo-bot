@@ -34,6 +34,7 @@ use komo_kernel::traits::{CronRepo, Shutdown};
 use komo_kernel::types::digest::ContentHash;
 use komo_kernel::types::ids::CronJobId;
 use komo_kernel::types::model::ModelConfig;
+use komo_kernel::types::tool::CancelToken;
 use komo_runtime::durable::DurableError;
 use komo_runtime::durable::harness::inbox::Admitted;
 use komo_runtime::durable::harness::{InputEntry, SubmissionDraft, WhenBusy, WriteDraft};
@@ -212,9 +213,15 @@ impl DurableCronTarget {
             .map_err(target_error)?;
 
         let call = format!("shell-{}", uuid::Uuid::now_v7());
-        let ran = shell::run_command(&self.state, record.current_branch, command, &call)
-            .await
-            .map_err(target_error)?;
+        let ran = shell::run_command(
+            &self.state,
+            record.current_branch,
+            command,
+            &call,
+            &CancelToken::new(),
+        )
+        .await
+        .map_err(target_error)?;
         let text = format!("!{command}");
         let hash = ContentHash::of_str(&text).to_string();
         let now_ms = (core.clock.now().unix_timestamp_nanos() / 1_000_000) as i64;

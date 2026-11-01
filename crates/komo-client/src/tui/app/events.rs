@@ -251,6 +251,21 @@ impl App {
                 request_key,
                 response,
             } => {
+                // `!` 命令转了后台：这条待确认的行到此为止，结果跑完以一条 `shell.command` 进历史。
+                if response.detached {
+                    if let Some(at) = self
+                        .pending_submissions
+                        .iter()
+                        .position(|pending| pending.request_key == request_key)
+                    {
+                        let pending = self.pending_submissions.remove(at);
+                        self.note(format!(
+                            "{} 已转后台：命令接着跑，跑完输出进历史。Gateway 重启会丢掉它",
+                            pending.text
+                        ));
+                    }
+                    return Vec::new();
+                }
                 if let Some(pending) = self
                     .pending_submissions
                     .iter_mut()

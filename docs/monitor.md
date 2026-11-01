@@ -198,6 +198,13 @@
   交回「Gateway 重启，后台命令中断，结果不明」+ `background.log` 里已有的末尾，登记删掉。不重跑。
 - **记忆。** `monitor:` / `monitor-end:` / `bash-done:` 与 `task-result:` 一样渲染为「任务交回」，不能引为
   `user_statement`（`docs/memory.md` §9.10）。
+- **TUI 的 `!` 命令（2026-11-01）。** 用同一个阈值 `detach_after_secs`，但**不走上面这条路**：不登记
+  `komo.monitors`、没有 `#短号`、`monitor_stop` 停不掉、结束时不交回 `bash-done:` 输入、不起模型 Run。
+  整条命令本来就跑在 Gateway 的后台任务里（`service/durable/shell.rs`），HTTP 请求到点先回一张
+  `detached: true` 的回执，TUI 显示「已转后台」；命令跑完照常提交那条 `shell.command` write（下一轮模型
+  看得见）。起因：TUI 里 `!scripts/install-local.sh` 的 release 构建超过 120 s，被同步时限杀掉、什么都没装上。
+  没有崩溃重放：正常停机时终止进程组并在历史里留一条「Gateway 停机时它还没跑完」带已有输出；崩溃时丢了，
+  历史里没有它（`docs/storage-durable-d5.md` 决定 9）。
 
 **对话会话里禁 `sleep` 等待。** `bash` 的 `prepare` 在对话会话里拒绝命令中任何一个字面量、不短于 10 秒的
 `sleep`（`sleep 20`、`sleep 1m`、`sleep 0.5h`，含循环体里的；`sleep $N` 这类非字面量不管，短 sleep 放行），

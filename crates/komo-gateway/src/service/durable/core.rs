@@ -36,6 +36,8 @@ pub struct DurableCore {
     /// `GatewayState` 的槽（`assemble::wire` 填）：提交输入时核对规范文件是不是改过要读配置与工作目录，
     /// 这些在 `GatewayState` 上，而 `DurableCore` 先于它造出来。
     state: OnceLock<super::assemble::StateSlot>,
+    /// 还没落账的 `!` 命令（只在内存里，`shell`）：停机时先终止它们、等它们落账，再关提交线。
+    pub(super) shells: super::shell::RunningShells,
 }
 
 impl std::fmt::Debug for DurableCore {
@@ -100,6 +102,7 @@ impl DurableCore {
             faults,
             confirms,
             state: OnceLock::new(),
+            shells: super::shell::RunningShells::default(),
         }))
     }
 
@@ -162,12 +165,14 @@ impl DurableCore {
         self.interjection(conversation).raise();
     }
 
-    /// 关闭：先让编排钩子终止自己起的进程（登记留给下一代对账），再封住受理、等已受理的提交结算与
-    /// invocation 走完、关库（放掉 Turso 的文件锁）。幂等：第二次调用什么都不做。
+    /// 关闭：先终止还没落账的 `!` 命令（各自把"停机时被终止"落进历史）、让编排钩子终止自己起的进程
+    /// （登记留给下一代对账），再封住受理、等已受理的提交结算与 invocation 走完、关库（放掉 Turso 的
+    /// 文件锁）。幂等：第二次调用什么都不做。
     pub async fn close(&self) -> Result<(), DurableError> {
         if self.closed.swap(true, Ordering::SeqCst) {
             return Ok(());
         }
+        self.shells.shutdown().await;
         self.harness.deps().orchestration.shutdown().await;
         self.engine.close().await
     }

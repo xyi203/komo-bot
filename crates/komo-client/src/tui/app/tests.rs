@@ -1599,6 +1599,36 @@ fn enter_on_a_bang_sends_the_command_without_the_model() {
 }
 
 #[test]
+fn a_detached_bang_receipt_drops_the_pending_line_and_says_it_runs_in_the_background() {
+    let mut app = app();
+    type_text(&mut app, "!cargo build --release");
+    let effects = app.handle_key(key(KeyCode::Enter));
+    let [Effect::Submit { request_key, .. }] = effects.as_slice() else {
+        panic!("{effects:?}");
+    };
+    app.apply(ServerEvent::Submitted {
+        request_key: request_key.clone(),
+        response: Box::new(komo_kernel::protocol::http::SubmitRunResponse {
+            run: RunId::from_raw("shell-1"),
+            session: fixture::session(),
+            seq: Seq::ZERO,
+            state: RunState::Running,
+            deduplicated: false,
+            detached: true,
+        }),
+    });
+    assert!(app.pending_submissions.is_empty(), "不再挂着“等待事件同步”");
+    let notice = app.notices.last().expect("有一句说明");
+    assert!(
+        notice.text.contains("!cargo build --release"),
+        "{}",
+        notice.text
+    );
+    assert!(notice.text.contains("已转后台"), "{}", notice.text);
+    assert!(!notice.is_error);
+}
+
+#[test]
 fn a_bang_command_that_needs_a_terminal_is_refused_and_the_draft_stays() {
     let mut app = app();
     type_text(&mut app, "!vim notes.md");

@@ -16,9 +16,9 @@ use komo_kernel::protocol::http::{
     SessionLifecycleResponse, SessionListResponse, SessionSearchQuery, SessionSearchResponse,
     SessionSummary, SubmitRunRequest, SubmitRunResponse,
 };
-use komo_kernel::types::ids::SessionId;
+use komo_kernel::types::ids::{RunId, Seq, SessionId};
 use komo_kernel::types::model::Effort;
-use komo_kernel::types::status::SessionState;
+use komo_kernel::types::status::{RunState, SessionState};
 use komo_runtime::durable::harness::WhenBusy;
 
 use crate::http::Api;
@@ -187,6 +187,7 @@ async fn receipt(core: &DurableCore, accepted: Accepted) -> ApiResult<Json<Submi
         seq: legacy_ids::seq(accepted.submission, 0),
         state,
         deduplicated: accepted.deduplicated,
+        detached: false,
     }))
 }
 
@@ -205,14 +206,25 @@ async fn submit(
         return Err(ApiFailure::session_not_open(state));
     }
     if request.shell {
-        let accepted = shell::submit_shell(
+        let receipt_of = shell::submit_shell(
             &api.state,
             &id,
             Some(request.request_key.as_str().to_owned()),
             &request.text,
         )
         .await?;
-        return receipt(core, accepted).await;
+        return match receipt_of {
+            shell::ShellReceipt::Landed(accepted) => receipt(core, accepted).await,
+            // 转后台：还没有 submission，`run` 是这条命令的临时身份。
+            shell::ShellReceipt::Detached { call, deduplicated } => Ok(Json(SubmitRunResponse {
+                run: RunId::from_raw(call),
+                session: SessionId::from_raw(id),
+                seq: Seq::ZERO,
+                state: RunState::Running,
+                deduplicated,
+                detached: true,
+            })),
+        };
     }
     let model = model_override(
         &api,

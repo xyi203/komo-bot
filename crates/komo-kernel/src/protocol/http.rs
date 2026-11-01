@@ -427,6 +427,11 @@ pub struct SubmitRunResponse {
     /// 这次命中了同一请求键的原 Run。
     #[serde(default)]
     pub deduplicated: bool,
+    /// `!` 命令跑过 `[execution] detach_after_secs` 还没完，转到了后台：命令接着跑，跑完照常以一条
+    /// `shell.command` 进历史。此时还没有落账的 submission，`run` 只是这条命令的临时身份
+    /// （`shell-…`，`/v1/runs` 查不到），`state` 是 `running`，`seq` 是 0。
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub detached: bool,
 }
 
 // ---- POST /v1/sessions/{id}/resume ----

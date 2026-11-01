@@ -31,6 +31,7 @@ use komo_kernel::durable::{
 };
 use komo_kernel::types::chat::is_silent_reply;
 use komo_kernel::types::delegate::DelegateContract;
+use komo_kernel::types::handle::short_handle;
 use komo_kernel::types::task::{TASK_STATUS_BLOCKED, TASK_STATUS_DONE, duration_words};
 use serde_json::{Value, json};
 
@@ -380,7 +381,7 @@ async fn report(
     let input = format!(
         "[后台任务 #{handle}「{title}」{headline}{facts}]\n\n{text}\n\n{verdict}\
          （这是后台任务交回的结果，不是用户发来的消息；用户看不到上面这段，请把结论转告用户。）",
-        handle = conversation,
+        handle = short_handle(conversation.get()),
         title = doc.title,
     );
     let draft = SubmissionDraft::Input {

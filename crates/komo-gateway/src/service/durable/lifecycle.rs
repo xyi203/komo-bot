@@ -36,6 +36,7 @@ use komo_kernel::durable::{
 };
 use komo_kernel::protocol::http::{PurgeBlocker, ReconcileResponse};
 use komo_kernel::traits::Shutdown;
+use komo_kernel::types::handle::short_handle;
 use komo_kernel::types::ids::{RunId, SessionId};
 use komo_runtime::durable::harness::orchestration::monitor;
 use komo_runtime::durable::harness::{Harness, InboxItem, TOOL_KIND, WithdrawResult};
@@ -224,7 +225,7 @@ impl DurableCore {
                     id,
                     "stopped",
                     Some("已停：挂它的会话被删除"),
-                    format!("[监听 #{id} 已停：挂它的会话被删除]"),
+                    format!("[监听 #{} 已停：挂它的会话被删除]", short_handle(id)),
                 )
                 .await?;
             if let Err(error) = self.harness.deps().orchestration.stop_monitor(id).await {
@@ -248,7 +249,8 @@ impl DurableCore {
                 what: "monitor".into(),
                 detail: format!(
                     "监听 #{}「{}」还在跑；先 monitor_stop 或等它结束",
-                    record.id, record.title
+                    record.handle(),
+                    record.title
                 ),
             })
             .collect())

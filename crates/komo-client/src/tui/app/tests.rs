@@ -1359,6 +1359,7 @@ fn a_status_reply_says_what_is_running_and_how_many_wait() {
             updated_at: fixture::T0,
             kind: "normal".into(),
             home: None,
+            task: None,
         },
         unfinished: vec![],
         pending: vec![],

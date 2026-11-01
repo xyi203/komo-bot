@@ -609,9 +609,10 @@ async fn a_background_task_reports_back_through_home() {
     let home_row = core(&gateway).session(&home_session).await.unwrap();
     let receipts = tool_results(&gateway, home_row.root_conversation).await;
     assert!(
-        receipts
-            .iter()
-            .any(|(_, text)| text.contains(&format!("已派出 #{}", task.conversation))),
+        receipts.iter().any(|(_, text)| text.contains(&format!(
+            "已派出 #{}",
+            komo_kernel::types::handle::short_handle(task.conversation.get())
+        ))),
         "{receipts:?}"
     );
 

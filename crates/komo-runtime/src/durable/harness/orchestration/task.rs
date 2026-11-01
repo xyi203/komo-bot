@@ -7,6 +7,7 @@ use komo_kernel::durable::{
     SessionRecord, StopReason, ToolResultMessage,
 };
 use komo_kernel::types::delegate::DelegateContract;
+use komo_kernel::types::handle::{parse_handle, short_handle};
 use komo_kernel::types::ids::{RunId, SessionId, ToolCallId};
 use komo_kernel::types::model::Effort;
 use komo_kernel::types::status::RunState;
@@ -286,10 +287,10 @@ async fn spawn(cx: &Cx<'_>, request: Request) -> Result<(), TaskError> {
             }
             store_task_doc(tx, child, &doc).await?;
             let reply = Reply::ok(
-                format!("已派出 #{child}：{title}"),
+                format!("已派出 #{}：{title}", short_handle(child.get())),
                 json!({
                     "conversation": child,
-                    "handle": child.to_string(),
+                    "handle": short_handle(child.get()),
                     "title": title,
                 }),
             );
@@ -301,7 +302,8 @@ async fn spawn(cx: &Cx<'_>, request: Request) -> Result<(), TaskError> {
 
 // ---------------------------------------------------------------- 找到任务
 
-/// `task_id`（`#12` 或 `12`）解析成调用方派出去的那个子 conversation。
+/// `task_id`（短号 `k3x9qa` / `#k3x9qa`，过渡期老的 `#12` 也收）解析成调用方派出去的那个子
+/// conversation：短号算回候选 ID，只认父是调用方的那个；认不出或不止一个都按"不是这个会话派出去的"答。
 async fn resolve(
     cx: &Cx<'_>,
     raw: &str,
@@ -312,19 +314,22 @@ async fn resolve(
             raw.trim_start_matches('#')
         ))
     };
-    let Ok(id) = raw.trim().trim_start_matches('#').parse::<u64>() else {
-        return Ok(Err(unknown()));
-    };
-    let child = ConversationId::new(id);
-    let Some(record) = cx.rt.find_document(&task_doc_address(child)).await? else {
-        return Ok(Err(unknown()));
-    };
-    let doc: TaskDoc = serde_json::from_value(record.value)
-        .map_err(|e| TaskError::new(format!("komo.task is malformed: {e}")))?;
-    if doc.parent != cx.conversation() {
+    let mut found = Vec::new();
+    for id in parse_handle(raw) {
+        let child = ConversationId::new(id);
+        let Some(record) = cx.rt.find_document(&task_doc_address(child)).await? else {
+            continue;
+        };
+        let doc: TaskDoc = serde_json::from_value(record.value)
+            .map_err(|e| TaskError::new(format!("komo.task is malformed: {e}")))?;
+        if doc.parent == cx.conversation() {
+            found.push((child, doc));
+        }
+    }
+    if found.len() != 1 {
         return Ok(Err(unknown()));
     }
-    Ok(Ok((child, doc)))
+    Ok(Ok(found.remove(0)))
 }
 
 // ---------------------------------------------------------------- 接着做
@@ -398,14 +403,15 @@ async fn follow(cx: &Cx<'_>, raw: &str, request: Request) -> Result<(), TaskErro
                 let text = if busy {
                     // 受理那一刻分不出是并进去还是排在后面，两句都说。
                     format!(
-                        "#{child} 正在跑，这句会在它下一步之前并进去；并不进去的（带结果契约等）排在它后面"
+                        "#{} 正在跑，这句会在它下一步之前并进去；并不进去的（带结果契约等）排在它后面",
+                        short_handle(child.get())
                     )
                 } else {
-                    format!("已转给 #{child}")
+                    format!("已转给 #{}", short_handle(child.get()))
                 };
                 let reply = Reply::ok(
                     text,
-                    json!({ "conversation": child, "handle": child.to_string(), "queued_behind": busy }),
+                    json!({ "conversation": child, "handle": short_handle(child.get()), "queued_behind": busy }),
                 );
                 Ok(reply)
             })
@@ -493,7 +499,7 @@ async fn progress(
     };
     let entries = cx.rt.entries(child, None).await?;
     let now = cx.rt.now()?;
-    let handle = child.to_string();
+    let handle = short_handle(child.get());
     let monitors: Vec<String> = super::monitor::live_in(cx.rt, child)
         .await?
         .iter()

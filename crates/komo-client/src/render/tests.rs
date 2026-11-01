@@ -116,6 +116,7 @@ fn a_session_list_shows_status_and_title() {
                 updated_at: NOW,
                 kind: "normal".into(),
                 home: None,
+                task: None,
             },
             SessionSummary {
                 session: SessionId::from_raw("sess-2"),
@@ -130,6 +131,7 @@ fn a_session_list_shows_status_and_title() {
                 updated_at: NOW,
                 kind: "normal".into(),
                 home: None,
+                task: None,
             },
         ],
     };
@@ -171,6 +173,7 @@ fn a_task_session_is_marked_with_its_short_id() {
                     updated_at: NOW,
                     kind: "task".into(),
                     home: Some(SessionId::from_raw("sess-home")),
+                    task: None,
                 },
                 SessionSummary {
                     session: SessionId::from_raw("sess-main"),
@@ -185,6 +188,7 @@ fn a_task_session_is_marked_with_its_short_id() {
                     updated_at: NOW,
                     kind: "main".into(),
                     home: None,
+                    task: None,
                 },
             ],
         },
@@ -221,6 +225,7 @@ fn a_session_list_says_when_a_run_is_waiting_on_an_earlier_one() {
                 updated_at: NOW,
                 kind: "normal".into(),
                 home: None,
+                task: None,
             }],
         },
         NOW,
@@ -245,6 +250,7 @@ fn a_session_list_marks_every_state_that_is_not_active() {
         updated_at: NOW,
         kind: "normal".into(),
         home: None,
+        task: None,
     };
     let printed = session_list(
         &SessionListResponse {

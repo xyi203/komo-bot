@@ -53,7 +53,7 @@ fn handle_of(reply: &str) -> String {
         .nth(1)
         .map(|rest| {
             rest.chars()
-                .take_while(char::is_ascii_digit)
+                .take_while(char::is_ascii_alphanumeric)
                 .collect::<String>()
         })
         .filter(|id| !id.is_empty())

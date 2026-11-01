@@ -21,6 +21,7 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use komo_kernel::durable::ConversationId;
 use komo_kernel::traits::{OutputWriter, StoreError};
+use komo_kernel::types::handle::short_handle;
 use komo_kernel::types::ids::{AttemptId, ExecutorId, RunId, SessionId, ToolCallId};
 use komo_kernel::types::refs::AttemptRef;
 use komo_kernel::types::resource::{OutputFile, ResourceUri};
@@ -125,7 +126,7 @@ impl Detacher for GatewayMonitorRunner {
             Ok(adopted) => {
                 let handle = Detached {
                     id: adopted.id.to_string(),
-                    short_id: adopted.id.to_string(),
+                    short_id: short_handle(adopted.id),
                 };
                 let me = self.me.upgrade().expect("刚用过 self");
                 let ctx = self.ctx().map_err(|error| error.to_string())?;
@@ -185,7 +186,7 @@ impl GatewayMonitorRunner {
                 pid: live.pgid,
                 pgid: Some(live.pgid),
                 started_at: Some(live.started_at),
-                what: format!("bash 后台 #{id} · {title}"),
+                what: format!("bash 后台 #{} · {title}", short_handle(id)),
             },
         ) {
             tracing::warn!(%error, "转后台的子进程登记写不进去");
@@ -409,7 +410,8 @@ fn done_text(
     reference: &str,
 ) -> String {
     let mut text = format!(
-        "[后台命令 #{id}「{title}」结束] {headline}，用时 {}",
+        "[后台命令 #{}「{title}」结束] {headline}，用时 {}",
+        short_handle(id),
         duration(elapsed_secs)
     );
     if !tail.trim().is_empty() {
@@ -484,7 +486,10 @@ mod tests {
             "artifact://x/background",
         );
         assert!(
-            text.starts_with("[后台命令 #77「make」结束] 退出码 4，用时 1 分 5 秒"),
+            text.starts_with(&format!(
+                "[后台命令 #{}「make」结束] 退出码 4，用时 1 分 5 秒",
+                short_handle(77)
+            )),
             "{text}"
         );
         assert!(text.contains("输出末尾：\nafter-line"), "{text}");

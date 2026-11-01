@@ -154,7 +154,7 @@ impl Tool for TaskTool {
                     },
                     "task_id": {
                         "type": "string",
-                        "description": "接着做或查进度的任务：派出时给的短号（例如 3f2a）；不给就是新派一个。\
+                        "description": "接着做或查进度的任务：派出时给的短号（6 位字母数字，例如 k3x9qa）；不给就是新派一个。\
                                         只给它不给 prompt = 查进度"
                     },
                     "model": model,
@@ -174,7 +174,7 @@ impl Tool for TaskTool {
             }),
             doc: Some(
                 "- 同一轮派几个就是几个在并行，各自交回。\n\
-                 - 追问一个派出去的任务：带上 task_id（派出时给的短号，例如 3f2a），prompt \
+                 - 追问一个派出去的任务：带上 task_id（派出时给的短号，例如 k3x9qa），prompt \
                  作为新的一句话提交进它自己的会话，它带着自己查到的东西接着做，不要为同一件\
                  事另派一个。\n\
                  - 要结构化的结果就给 contract（一份 JSON Schema），任务的最后回复会按它复验，\
@@ -232,7 +232,7 @@ impl Tool for TaskTool {
                     .into(),
             });
         }
-        // `#3f2a` 这种带井号的写法也收——模型把回执里的短号原样抄过来时常带着它。
+        // `#k3x9qa` 这种带井号的写法也收——模型把回执里的短号原样抄过来时常带着它。
         let task_id = match &args.task_id {
             Some(raw) => {
                 let id = raw.trim().trim_start_matches('#').to_string();

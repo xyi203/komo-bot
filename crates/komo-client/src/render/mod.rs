@@ -175,9 +175,10 @@ fn session_title(session: &SessionSummary) -> String {
     }
 }
 
-/// 任务会话的短标注（`docs/background-tasks.md`）：`任务·#3f2a`，
-/// `#3f2a` 是这条会话自己的短号——与派出回执、`follow` 用的是同一个口径
-/// （`komo_kernel::types::task::short_id`），操作者能直接拿它对上聊天里的那一条。
+/// 任务会话的短标注（`docs/background-tasks.md`）：`任务·#k3x9qa`，
+/// `#k3x9qa` 是这条会话自己的短号——Gateway 在 `SessionSummary.task` 里给，与派出回执、
+/// `task_id` 同一个，操作者能直接拿它对上聊天里的那一条。老 Gateway 不给时退回会话 ID 后四位
+/// （`komo_kernel::types::task::short_id`）。
 ///
 /// 只有 `kind == "task"` 的会话才有这个标注；`main` / `normal` 一个字都不多印
 /// （不改变现有输出，§ 约束）。
@@ -185,7 +186,10 @@ fn task_marker(session: &SessionSummary) -> Option<String> {
     if session.kind != "task" {
         return None;
     }
-    let short = komo_kernel::types::task::short_id(&session.session);
+    let short = session
+        .task
+        .clone()
+        .unwrap_or_else(|| komo_kernel::types::task::short_id(&session.session));
     Some(format!("任务·#{short}"))
 }
 

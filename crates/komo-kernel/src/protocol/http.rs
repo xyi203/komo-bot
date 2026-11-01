@@ -189,6 +189,10 @@ pub struct SessionSummary {
     /// 从 `sessions.origin` 的 `task:{parent}` 里解出来。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub home: Option<SessionId>,
+    /// 任务会话的短号（不带 `#`，`komo_kernel::types::handle`，2026-10-31）：与派出回执、`task_id`
+    /// 同一个。老 Gateway 不带这一格，客户端退回会话 ID 后四位。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task: Option<String>,
 }
 
 fn session_still_active() -> SessionState {

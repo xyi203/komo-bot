@@ -463,6 +463,8 @@ impl DurableCore {
             home: (record.kind == SessionKind::Task)
                 .then(|| record.parent_session.clone().map(SessionId::from_raw))
                 .flatten(),
+            task: (record.kind == SessionKind::Task)
+                .then(|| komo_kernel::types::handle::short_handle(record.root_conversation.get())),
         }
     }
 

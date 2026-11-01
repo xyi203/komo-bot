@@ -93,8 +93,8 @@ use crate::compaction::{CompactionDebt, CompactionDecision, CompactionReason};
 use crate::events::{
     ConfigChanged, ContextCompacted, ConversationBoundary, EVENT_FORMAT_VERSION, Event,
     EventPayload, MemoryInjected, MessageAssistant, MessageUser, RunAbsorbed, RunAccepted,
-    RunCancelled, RunCompleted, RunFailed, RunQueued, RunStarted, ToolPlanned, ToolResult,
-    ToolStarted,
+    RunCancelled, RunCompleted, RunFailed, RunQueued, RunStarted, ShellCommand, ToolPlanned,
+    ToolResult, ToolStarted,
 };
 use crate::protocol::nested::display_result;
 use crate::types::{
@@ -106,6 +106,8 @@ use crate::types::{ContentRef, PREVIEW_LIMIT_BYTES, ToolCallRequest};
 /// `komo.settled` 的 kind（与 runtime `harness::entries::SETTLED` 一致，kernel 不依赖 runtime）。
 pub const SETTLED_ENTRY_KIND: &str = "komo.settled";
 const USER_ENTRY_KIND: &str = "komo.user";
+/// `!` 命令与命令型 cron 落下的 write entry（gateway `service/durable/shell.rs`）。
+pub const SHELL_ENTRY_KIND: &str = "shell.command";
 const ASSISTANT_ENTRY_KIND: &str = "komo.assistant";
 const TOOL_RESULT_ENTRY_KIND: &str = "komo.tool-result";
 /// 结果里带子调用清单的工具（与 runtime `tools::codemode::CODEMODE_TOOL` 一致）。
@@ -356,6 +358,9 @@ impl Projection {
                         0,
                         None,
                         EventPayload::MessageUser(MessageUser {
+                            shell: (kind == SHELL_ENTRY_KIND)
+                                .then(|| shell_command(entry, &text))
+                                .flatten(),
                             text: Some(text),
                             text_ref: None,
                             project_update: false,
@@ -392,6 +397,7 @@ impl Projection {
                 text,
                 text_ref: None,
                 project_update,
+                shell: None,
             })
         };
         match host {
@@ -812,6 +818,28 @@ fn spoken(entry: &EntryRecord, text: Option<String>) -> (Option<String>, bool) {
         }
         (text, _) => (text, false),
     }
+}
+
+/// `shell.command` entry → 界面要的那几样。`text` 是送给模型的消息：一句说明、空行、结果的模型视图。
+/// `data` 里没有 `command` 的（不认识的形状）不给，界面退回显示 `text`。
+fn shell_command(entry: &EntryRecord, text: &str) -> Option<ShellCommand> {
+    let data = entry.data.as_ref()?;
+    Some(ShellCommand {
+        command: data.get("command")?.as_str()?.to_owned(),
+        request_key: data
+            .get("requestKey")
+            .and_then(Value::as_str)
+            .map(RequestKey::new),
+        exit_code: data
+            .get("exitCode")
+            .and_then(Value::as_i64)
+            .and_then(|code| i32::try_from(code).ok()),
+        interrupted: data
+            .get("interrupted")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        output: text.split_once("\n\n").map(|(_, view)| view.to_owned()),
+    })
 }
 
 fn data_str<'a>(entry: &'a EntryRecord, key: &str) -> Option<&'a str> {

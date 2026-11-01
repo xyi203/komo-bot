@@ -301,6 +301,10 @@ async fn a_bang_command_past_the_threshold_detaches_and_lands_when_it_ends() {
 
     let text = wait_history(&gateway, &session, "finished-line").await;
     assert!(text.contains("shell.command"), "{text}");
+    assert!(
+        text.contains("\"requestKey\":\"bang-d\""),
+        "带着请求键，TUI 按它撤待确认的行：{text}"
+    );
     assert!(!text.contains("run=[]"), "子进程带着 KOMO_RUN：{text}");
     assert!(
         text.contains(&format!("session=[{session}]")),

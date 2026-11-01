@@ -24,7 +24,7 @@ mod tree_codec;
 use crate::compaction::{CompactionDebt, CompactionDecision};
 use crate::types::chat::PeerId;
 use crate::types::digest::ContentHash;
-use crate::types::ids::{AttemptId, EventId, RunId, Seq, SessionId, ToolCallId};
+use crate::types::ids::{AttemptId, EventId, RequestKey, RunId, Seq, SessionId, ToolCallId};
 use crate::types::model::{EffortSetting, TokenUsage};
 use crate::types::plan::{ExecutionPlan, PlanHash, PlanSource};
 use crate::types::refs::{ContentRef, OutputRef, PayloadRef, ToolResultStatus};
@@ -418,6 +418,27 @@ pub struct MessageUser {
     /// 界面只提一句。
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub project_update: bool,
+    /// 这一条是 `!` 命令（`shell.command` entry）：`text` 仍是送给模型的那段说明 + 输出（旧客户端
+    /// 照旧显示它），界面按这一格只画 `!命令` 与输出。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shell: Option<ShellCommand>,
+}
+
+/// [`MessageUser::shell`]：一条 `!` 命令与它的结果。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ShellCommand {
+    pub command: String,
+    /// 提交时的请求键：TUI 按它撤掉自己那条待确认的行（`!` 是 write，没有 `run.accepted`）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_key: Option<RequestKey>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    /// Gateway 停机时还没跑完、被终止了。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub interrupted: bool,
+    /// 结果的模型视图（抬头一行 + 正文，超限时是预览加完整输出引用）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -930,6 +951,7 @@ mod tests {
                 text: Some("第一行\n第二行".into()),
                 text_ref: None,
                 project_update: false,
+                shell: None,
             }),
         };
         let line = event.to_line().unwrap();

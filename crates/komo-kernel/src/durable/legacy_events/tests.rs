@@ -610,6 +610,46 @@ fn context_changes_and_plain_user_messages_have_their_own_frames() {
     assert_eq!(body.model.as_deref(), Some("m-2"));
 }
 
+/// `!` 命令的消息带着命令、请求键与输出：界面按它撤待确认的行、只画 `!命令` 与输出；`text` 仍是给模型的那段（旧客户端照旧）。
+#[test]
+fn a_shell_command_message_carries_its_command_request_key_and_output() {
+    let said = "用户直接运行了 shell 命令 `ls`（不是你调用的）：\n\n[bash · 完成]\nexit=0\na.txt";
+    let entries = vec![
+        entry(2, SHELL_ENTRY_KIND)
+            .with_model(vec![Message::user(said, 2000)])
+            .with_data(json!({"command": "ls", "requestKey": "tui:shell-1", "exitCode": 0})),
+        // 停机时被终止的那一种；命令型 cron 的没有请求键。
+        entry(3, SHELL_ENTRY_KIND)
+            .with_model(vec![Message::user("说明\n\nview", 3000)])
+            .with_data(json!({"command": "sleep 60", "interrupted": true})),
+        // 其它 write 不带这一格。
+        entry(4, "note.write").with_model(vec![Message::user("hi", 4000)]),
+    ];
+    let events = legacy_events(SESSION, &entries, &[]);
+    let shells: Vec<_> = events
+        .iter()
+        .map(|event| match &event.payload {
+            EventPayload::MessageUser(body) => (body.text.clone(), body.shell.clone()),
+            other => panic!("{other:?}"),
+        })
+        .collect();
+    assert_eq!(shells.len(), 3);
+    assert_eq!(shells[0].0.as_deref(), Some(said));
+    assert_eq!(
+        shells[0].1,
+        Some(ShellCommand {
+            command: "ls".into(),
+            request_key: Some(RequestKey::new("tui:shell-1")),
+            exit_code: Some(0),
+            interrupted: false,
+            output: Some("[bash · 完成]\nexit=0\na.txt".into()),
+        })
+    );
+    let stopped = shells[1].1.as_ref().unwrap();
+    assert!(stopped.interrupted && stopped.request_key.is_none());
+    assert_eq!(shells[2].1, None);
+}
+
 #[test]
 fn replayed_records_produce_no_second_frames() {
     let scenario = scenario();

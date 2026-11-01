@@ -237,13 +237,22 @@ pub struct PendingSubmission {
     pub request_key: RequestKey,
     pub text: String,
     pub state: SubmissionState,
+    /// `!` 命令：它是 write，没有 `run.accepted`；带着同一请求键的 `shell.command` 消息到了它就消失。
+    pub shell: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SubmissionState {
     Sending,
-    Submitted { run: RunId, deduplicated: bool },
-    Failed { error: String },
+    /// `queued` = 会话忙着，排在收件箱里（`!` 命令：已经跑完，这一轮结束后才进历史）。
+    Submitted {
+        run: RunId,
+        deduplicated: bool,
+        queued: bool,
+    },
+    Failed {
+        error: String,
+    },
 }
 
 /// 一次工具调用在界面上的一行。

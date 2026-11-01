@@ -50,7 +50,7 @@ use super::submit::{Accepted, Landing};
 use crate::service::state::GatewayState;
 
 /// `!` 命令放进会话的 entry 的 kind（`docs/storage-durable-d5.md` §2：gateway 写的 `shell.command`）。
-pub const SHELL_ENTRY: &str = "shell.command";
+pub const SHELL_ENTRY: &str = komo_kernel::durable::legacy_events::SHELL_ENTRY_KIND;
 
 /// 兜底计时器比 `call_timeout` 多给的一段：工具自己守时限，终止进程组与写完输出还要时间
 /// （同 harness 的 `REAP_GRACE`）。
@@ -512,6 +512,10 @@ async fn run_and_land(
     let now_ms = (core.clock.now().unix_timestamp_nanos() / 1_000_000) as i64;
     let mut data = ran.data.clone();
     data["inputHash"] = json!(shell.hash);
+    // TUI 按它撤掉自己那条待确认的行（`MessageUser::shell.request_key`）。
+    if let Some(key) = &request_id {
+        data["requestKey"] = json!(key);
+    }
     if interrupted {
         data["interrupted"] = json!(true);
     }

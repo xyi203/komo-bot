@@ -33,6 +33,7 @@ use std::time::Duration;
 
 use komo_kernel::durable::{ConversationId, Message};
 use komo_kernel::projection::{ToolResultFacts, project_views, select};
+use komo_kernel::protocol::config::ExecutionConfig;
 use komo_kernel::traits::{OutputWriter, ToolOutputStore};
 use komo_kernel::types::digest::ContentHash;
 use komo_kernel::types::ids::{AttemptId, RunId, ToolCallId};
@@ -202,12 +203,14 @@ fn result_body(outcome: &Result<ToolOutput, ToolError>) -> ToolResultBody {
 /// `status`；这里的 `Err` 只有"这个 Agent 没有 bash 工具"、输出落不了盘这类跑不起来的情形。
 ///
 /// `call` 是输出目录里 `call` 一级的名字（不同命令不同）；`cancel` 举起时 `bash` 终止进程组。
+/// `limit` 是这条命令的时限（[`Limit`]）。
 pub async fn run_command(
     state: &Arc<GatewayState>,
     conversation: ConversationId,
     command: &str,
     call: &str,
     cancel: &CancelToken,
+    limit: Limit,
 ) -> Result<ShellRun, SessionError> {
     let core = state
         .core()
@@ -275,7 +278,8 @@ pub async fn run_command(
         .await
         .map_err(|error| SessionError::Internal(format!("输出目录建不出来：{error}")))?;
     let started = std::time::Instant::now();
-    let outcome = run_tool(&*bash, command, &ctx, writer.as_mut()).await;
+    let args = bash_args(command, limit, &config.execution);
+    let outcome = run_tool(&*bash, args, &ctx, writer.as_mut()).await;
     let elapsed_ms = started.elapsed().as_millis() as u64;
     // 完整输出先落盘（同步 → 改名 → 同步目录），之后才提交引用它的 entry。
     let mut published = store
@@ -326,14 +330,34 @@ pub async fn run_command(
     })
 }
 
+/// 一条直跑命令的时限。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Limit {
+    /// `bash` 的默认时限（120 秒，受 `call_timeout_secs` 收紧）。命令型 cron 用它。
+    Default,
+    /// 整个 `[execution] call_timeout_secs`（默认 1800 秒）：TUI 的 `!`。它会转后台，跑满 120 秒
+    /// 不该被杀；上限与模型给 `bash` 的 `timeout_secs` 能要到的同一个，热生效。
+    CallTimeout,
+}
+
+/// 交给 `bash` 的参数。
+fn bash_args(command: &str, limit: Limit, execution: &ExecutionConfig) -> Value {
+    match limit {
+        Limit::Default => json!({ "command": command }),
+        Limit::CallTimeout => {
+            json!({ "command": command, "timeout_secs": execution.call_timeout_secs })
+        }
+    }
+}
+
 /// `prepare` → `execute`，带兜底时限。失败都折成 `ToolError`（落进 `output.json`，模型看得见）。
 async fn run_tool(
     bash: &dyn komo_kernel::traits::Tool,
-    command: &str,
+    args: Value,
     ctx: &ToolContext,
     sink: &mut dyn OutputWriter,
 ) -> Result<ToolOutput, ToolError> {
-    let plan = bash.prepare(json!({ "command": command }), ctx).await?;
+    let plan = bash.prepare(args, ctx).await?;
     match tokio::time::timeout(ctx.call_timeout + REAP_GRACE, bash.execute(plan, ctx, sink)).await {
         Ok(result) => result,
         Err(_) => Err(ToolError::Uncertain {
@@ -471,7 +495,15 @@ async fn run_and_land(
     text: String,
     request_id: Option<String>,
 ) -> Result<Accepted, SessionError> {
-    let ran = run_command(state, conversation, command, &shell.call, &shell.cancel).await?;
+    let ran = run_command(
+        state,
+        conversation,
+        command,
+        &shell.call,
+        &shell.cancel,
+        Limit::CallTimeout,
+    )
+    .await?;
     let core = state
         .core()
         .map_err(|error| SessionError::Internal(error.to_string()))?;
@@ -519,5 +551,27 @@ impl DurableCore {
             .iter()
             .find_map(super::runs::user_text_of)?;
         Some(view_of(&text).to_owned())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_bang_command_gets_the_whole_call_timeout_and_a_cron_command_the_bash_default() {
+        let execution = ExecutionConfig {
+            call_timeout_secs: 2400,
+            ..ExecutionConfig::default()
+        };
+        assert_eq!(
+            bash_args("make", Limit::CallTimeout, &execution),
+            json!({ "command": "make", "timeout_secs": 2400 })
+        );
+        assert_eq!(
+            bash_args("make", Limit::Default, &execution),
+            json!({ "command": "make" }),
+            "命令型 cron 不变"
+        );
     }
 }

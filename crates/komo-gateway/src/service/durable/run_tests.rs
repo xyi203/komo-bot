@@ -316,6 +316,36 @@ async fn a_bang_command_past_the_threshold_detaches_and_lands_when_it_ends() {
     assert_eq!(llm.turns(), 0, "不起模型 Run");
 }
 
+/// 转了后台的 `!` 命令仍有硬上限 `call_timeout_secs`：到点终止进程组，超时的结果照样落进历史。
+#[tokio::test]
+async fn a_detached_bang_command_is_still_stopped_at_the_call_timeout() {
+    let config = config_toml("[execution]\ndetach_after_secs = 1\ncall_timeout_secs = 3\n");
+    let gateway = GatewayBuilder::new(&config)
+        .fake_llm(FakeLlm::finisher("好"))
+        .start()
+        .await;
+    let session = open_session(&gateway).await;
+    let started = std::time::Instant::now();
+    let receipt = bang(
+        &gateway,
+        &session,
+        "bang-t",
+        "echo cap-start; sleep 30; echo late-$((40+2))",
+    )
+    .await;
+    assert!(receipt.detached, "{receipt:?}");
+
+    let text = wait_history(&gateway, &session, "cap-start").await;
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(15),
+        "到点就停，没等 sleep 30：{:?}",
+        started.elapsed()
+    );
+    assert!(text.contains("timeout=3s"), "报的是超时：{text}");
+    assert!(!text.contains("late-42"), "{text}");
+    assert!(!text.contains("\"interrupted\":true"), "不是停机：{text}");
+}
+
 /// 正常停机时还在后台跑的 `!` 命令被终止，历史里留一条说明（带着到那时为止的输出）；重启后不重跑。
 #[tokio::test]
 async fn stopping_the_gateway_ends_a_detached_bang_command_and_notes_it_in_history() {

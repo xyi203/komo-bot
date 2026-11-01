@@ -506,6 +506,7 @@ pub struct ExecutionConfig {
     pub model_result_bytes: usize,
     /// 单次工具调用的活动执行时限（秒）。工具自己的超时（如 bash 的 `timeout_secs`）
     /// 会被收紧到它以内，所以到点时是工具自己杀进程、报超时，而不是执行器丢下一个结果不明。
+    /// TUI 的 `!` 命令整个用它当时限（会转后台，不用 `bash` 默认的 120 秒）。
     #[serde(default = "default_call_timeout_secs")]
     pub call_timeout_secs: u64,
     /// 对话会话里的 `bash` 跑过这么久还没完，就自动转到后台（`docs/monitor.md` §8）。

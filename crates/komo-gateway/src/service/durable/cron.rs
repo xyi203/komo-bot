@@ -219,6 +219,7 @@ impl DurableCronTarget {
             command,
             &call,
             &CancelToken::new(),
+            shell::Limit::Default,
         )
         .await
         .map_err(target_error)?;

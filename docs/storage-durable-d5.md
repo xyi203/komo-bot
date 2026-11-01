@@ -210,7 +210,7 @@
 | 6 | 交回输入的来源对端 | 当前路径上最近一条带 peer 的用户输入的 peer，没有就退回 home chat |
 | 7 | memory 注入形态 | 系统段 `memory`，uses 记在 `komo.memory` document（2026-10-28 起改为每个 Run 一条 `komo.memory.recall` entry 追加在输入之后，`docs/memory.md` §9.4） |
 | 8 | `/cancel` / Esc | **只停当前一轮**（用户确认）：`Harness::abort_run` 不撤回收件箱；任何非正常收尾后，排队的输入（write、内部、用户）都接着放置开跑——恢复旧 komo 行为。排队中的单条用 `Harness::withdraw` |
-| 9 | `!` 命令与命令型 cron | gateway 直接用 bash 工具跑，不建 harness run；输出落 blob，提交一条 `shell.command` write；不做崩溃重放。**`!` 转后台（2026-11-01）**：命令跑在 Gateway 自己的后台任务里，HTTP 只等 `[execution] detach_after_secs`（0 = 一直等），到点还没完就回 `detached: true` 的回执（`run` = 临时身份 `shell-…`，`state = running`，`/v1/runs` 查不到），命令接着跑，跑完照常提交 `shell.command`、不起模型 Run；还没落账的命令只在内存表 `RunningShells` 里（同一请求键重发回同一张回执，内容不同 409）。正常停机先终止它们的进程组，把到那时为止的输出连同「Gateway 停机时被终止」落进历史（`data.interrupted = true`），最多等 5 秒；崩溃时丢了就是丢了，历史里什么都没有。命令型 cron 不转后台，行为不变 |
+| 9 | `!` 命令与命令型 cron | gateway 直接用 bash 工具跑，不建 harness run；输出落 blob，提交一条 `shell.command` write；不做崩溃重放。**`!` 转后台（2026-11-01）**：命令跑在 Gateway 自己的后台任务里，HTTP 只等 `[execution] detach_after_secs`（0 = 一直等），到点还没完就回 `detached: true` 的回执（`run` = 临时身份 `shell-…`，`state = running`，`/v1/runs` 查不到），命令接着跑，跑完照常提交 `shell.command`、不起模型 Run；还没落账的命令只在内存表 `RunningShells` 里（同一请求键重发回同一张回执，内容不同 409）。正常停机先终止它们的进程组，把到那时为止的输出连同「Gateway 停机时被终止」落进历史（`data.interrupted = true`），最多等 5 秒；崩溃时丢了就是丢了，历史里什么都没有。时限：`!` 给 `bash` 传 `timeout_secs = [execution] call_timeout_secs`（默认 1800，热生效），到点终止进程组、以超时结果落账；不再是 `bash` 默认的 120 秒。命令型 cron 不转后台、仍是 120 秒，行为不变 |
 | 10 | fork 时 document | 会话内分支复制 `komo.agent`，其余不带；`/fork` `/clone` 复制 `komo.agent`，不复制 live / inbox / task |
 | 11 | 导航位置 | 持久化进 `sessions.record.leaf`（偏离 §8.11，D7 回写文档） |
 | 12 | blob 根 | 沿用 `sessions/{uuid}/` |

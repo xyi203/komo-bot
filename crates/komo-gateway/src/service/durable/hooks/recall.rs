@@ -11,6 +11,11 @@
 //!    用户消息；选定的条目去掉本段已展示的，剩下的渲染成一条带 `komoOrigin = memory` 的 user 消息。
 //!    一条不剩（或召回失败）也落一条**没有 `model`** 的记录：不进上下文，只让之后知道召回过。
 //!
+//! **cron 触发的 Run 不召回**（首个输入是 `cron.input`，含 `komo cron run` 手动触发）：记忆、约定、事项三组
+//! 都不带，也不落召回记录——巡检 prompt 自带要做的事，按它召回进来的多是无关线索。看的是 Run 不是会话：
+//! cron 会话里用户自己发的消息另起 Run，照常召回；并进 cron Run 的插话属于那个 Run，不召回。第 1 步的核对
+//! 照做。
+//!
 //! 召回块最前面的事项组（`docs/goals.md` §5）走同一套：已展示的 `id@revision` 记在 `RecallData.matters`，
 //! 每轮请求前连同记忆一起核对、改写；`memory = private` 的会话不带事项。
 //!
@@ -39,6 +44,8 @@ use serde_json::{Value, json};
 
 use super::sections::recall_scopes;
 use super::setup::Resolved;
+use crate::service::durable::cron::CRON_INPUT;
+use crate::service::durable::watch;
 use crate::service::state::GatewayState;
 
 /// 视图里一个还展示着条目的召回块。
@@ -99,7 +106,10 @@ pub(super) async fn entries(
     let (Some(run), Some(scopes)) = (request.run, scopes) else {
         return out;
     };
-    if !state.memories.enabled() || recalled(&records, &request, run) {
+    if !state.memories.enabled()
+        || recalled(&records, &request, run)
+        || cron_run(state, &records, run).await
+    {
         return out;
     }
     let text = latest_user_text(&request.view.messages).unwrap_or_default();
@@ -221,6 +231,27 @@ fn recalled(
             .and_then(|entry| RecallData::of(entry))
             .is_some_and(|data| data.submission == run)
     })
+}
+
+/// 这个 Run 是 cron 触发的：首个输入放置成了 `cron.input`。读不出来按不是（照常召回）。
+async fn cron_run(
+    state: &GatewayState,
+    records: &HashMap<EntryId, &EntryRecord>,
+    run: komo_kernel::durable::SubmissionId,
+) -> bool {
+    let Ok(core) = state.core() else {
+        return false;
+    };
+    let Some(entry) = watch::input_entry(core, run).await else {
+        return false;
+    };
+    match records.get(&entry) {
+        Some(record) => record.kind == CRON_INPUT,
+        None => matches!(
+            core.storage.entry(entry).await,
+            Ok(Some(stored)) if stored.entry.kind == CRON_INPUT
+        ),
+    }
 }
 
 /// 最近一条用户自己说的话（宿主附上的召回块不算）。

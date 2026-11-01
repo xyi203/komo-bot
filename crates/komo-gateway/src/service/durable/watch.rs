@@ -94,12 +94,17 @@ fn placed_entry(record: &SubmissionRecord) -> Option<EntryId> {
     }
 }
 
+/// 一条 run（首个输入 submission）放置成的 entry（读不出来、还没放置过 / 已撤回就没有）。
+pub async fn input_entry(core: &DurableCore, first: SubmissionId) -> Option<EntryId> {
+    let Ok(Some(record)) = core.storage.submission(first).await else {
+        return None;
+    };
+    placed_entry(&record)
+}
+
 /// 一条 run（首个输入 submission）的来源。读不出来按 [`Source::Other`]：宁可不投，不投错人。
 pub async fn source_of(core: &DurableCore, first: SubmissionId) -> (Source, Option<EntryId>) {
-    let Ok(Some(record)) = core.storage.submission(first).await else {
-        return (Source::Other, None);
-    };
-    let Some(entry) = placed_entry(&record) else {
+    let Some(entry) = input_entry(core, first).await else {
         return (Source::Other, None);
     };
     match core.storage.entry(entry).await {

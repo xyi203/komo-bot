@@ -607,3 +607,96 @@ async fn a_convention_arrives_even_when_the_wording_matches_nothing() {
         seen[0].messages[..]
     );
 }
+
+/// §9.4「cron 触发的 Run 不召回」：cron 触发（这里是手动 `run`，同一种 `cron.input`）的 Run，请求里
+/// 没有召回块——命中的线索、常驻的约定、在管的目标都不带。看的是 Run 不是会话：同一个 cron 会话里
+/// 用户自己发的消息另起 Run，照常召回三组。
+#[tokio::test]
+async fn a_cron_run_recalls_nothing_but_a_user_message_in_its_session_does() {
+    use komo_kernel::types::memory::MemoryApplication;
+
+    let llm = ScriptedLlm::new(vec![
+        vec![text_round(1, "巡检完了。")],
+        vec![text_round(1, "26 度。")],
+    ]);
+    let gateway = super::gateway(&memory_config("keyword", false))
+        .scripted(llm.clone())
+        .start()
+        .await;
+    let mut convention = seeded(
+        "m-ticket",
+        "发布工单 Platform 默认选 saas",
+        Provenance::UserStatement,
+        MemoryState::Active,
+    );
+    convention.application = Some(MemoryApplication::Convention);
+    convention.applies_when = Some("创建发布工单、需要选 Platform 时".into());
+    for item in [
+        seeded(
+            "m-1",
+            "客厅空调设 26 度",
+            Provenance::UserStatement,
+            MemoryState::Active,
+        ),
+        convention,
+    ] {
+        gateway.state().memory.put(item, None).await.unwrap();
+    }
+    let (status, body) = gateway
+        .post_json(
+            "/v1/matters",
+            serde_json::json!({"kind": "goal", "title": "把客厅空调换成变频的"}),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let (status, job) = gateway
+        .post_json(
+            "/v1/cron",
+            serde_json::json!({"name": "watchdog", "schedule": "*/30 * * * *",
+                   "timezone": "Asia/Shanghai", "prompt": "空调设多少度来着"}),
+        )
+        .await;
+    assert_eq!(status, 200, "{job}");
+
+    let (status, fired) = gateway
+        .post_json(
+            &format!("/v1/cron/{}/run", job["id"].as_str().unwrap()),
+            serde_json::json!({}),
+        )
+        .await;
+    assert_eq!(status, 200, "{fired}");
+    let session: komo_kernel::types::ids::SessionId =
+        serde_json::from_value(fired["session"].clone()).expect("会话 id");
+    let run: komo_kernel::types::ids::RunId =
+        serde_json::from_value(fired["run"].clone()).expect("run id");
+    wait_for_terminal(&gateway, &run).await;
+
+    let run = run_in(&gateway, &session, "rk-user", "空调设多少度来着").await;
+    wait_for_terminal(&gateway, &run).await;
+
+    let seen = llm.requests.lock().expect("请求表").clone();
+    assert_eq!(seen.len(), 2);
+    let cron = crate::said(&seen[0]);
+    assert!(cron.contains("空调设多少度来着"), "{cron}");
+    for absent in [
+        "[已知记忆]",
+        "客厅空调设 26 度",
+        "Platform 默认选 saas",
+        "换成变频",
+    ] {
+        assert!(!cron.contains(absent), "cron Run 不该带 {absent}：{cron}");
+    }
+    let user = crate::said(&seen[1]);
+    let tail = &user[cron.len()..];
+    for present in [
+        "[已知记忆]",
+        "客厅空调设 26 度",
+        "Platform 默认选 saas",
+        "换成变频",
+    ] {
+        assert!(
+            tail.contains(present),
+            "用户的 Run 照常召回 {present}：{user}"
+        );
+    }
+}

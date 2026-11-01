@@ -851,6 +851,7 @@ komo cron remove JOB_ID
 - Gateway 停机期间错过的触发不集中补跑；停机前已经持久创建、尚未完成的 Cron Run 则按原 Run 自动恢复，这是两种不同情况。
 - 时区明确保存（IANA 名，`TimeZone` 只存名字）；同一日历时间因夏令时出现两次时，两次不同 UTC 时刻分别视为计划时间；不存在的本地时间跳过。**这两条与 croner 的内建策略相反**（它把缺口里的固定时刻抬到缺口之后、把重复的只算较早一次），所以由 kernel 的 `cron::search_from`（跳缺口）和 `cron::repeated_twin`（补后一半）自己实现，换 croner 版本时要一起看。时区解析走 `ZoneResolver` port（§13.5）：kernel 不带 tzdb，真 tzdb 实现在 runtime；没有 tzdb 时 `FixedOffsetZone` 是**明确的降级**（答不出重复与缺口，等于当这个区没有夏令时），不是默认。
 - 手动 run 使用独立请求幂等键，不冒充定时触发。
+- cron 触发的 Run（含手动 run）不做自动记忆召回，不注入「[已知记忆]」块（线索、约定、事项都不带）；要用记忆就在 prompt 里让 Agent 跑 `komo memory search`。同一个 cron 会话里用户自己发的消息照常召回（`docs/memory.md` §9.4「cron 触发的 Run 不召回」）。
 - 无人值守不改变执行规则：Cron Run 与交互 Run 一样，没有 Policy 与审批（§7）；需要人判断的只有阻塞，照常投 home chat；结果不明交给模型。
 - Cron 的结果去原 Session 查看，也可以用 resume 接手。
 

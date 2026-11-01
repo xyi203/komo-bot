@@ -205,6 +205,9 @@ commands run, terminal output when CLI behavior changes.
 - Web client: `docs/web.md` — W0 prototype in `apps/web/` (static files, no build;
   `node apps/web/serve.mjs`), what it reads from the Gateway, and the Gateway gaps
   it found. Visual tokens are summarized in `DESIGN.md`.
+- Clients: `docs/clients.md` — draft plan to rebuild the web client on TanStack
+  Start (SPA mode, served by the Gateway) and extend it to macOS (Electron) and
+  phones (PWA, then Capacitor); supersedes roadmap-muse §4.4.
 - Direction: `docs/roadmap-muse.md` — gaps and phases toward a Muse-style
   proactive personal agent (PARA-style goals and areas, proactivity,
   outward-action confirmation);

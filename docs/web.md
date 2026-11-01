@@ -4,7 +4,7 @@
 
 ## 1. 定位
 
-TUI 与聊天渠道之外的第三个入口，给电脑上的长会话用；手机继续用飞书（`docs/roadmap-muse.md` §4.4）。它是 Gateway 的 HTTP 客户端，不持有状态：会话正文是事件流的 fold，刷新即重建。
+TUI 与聊天渠道之外的第三个入口，给电脑上的长会话用。正式版改用 TanStack Start 重写，并扩展到 macOS 与手机，见 `docs/clients.md`；迁移完成前，本文仍是界面行为的规格。它是 Gateway 的 HTTP 客户端，不持有状态：会话正文是事件流的 fold，刷新即重建。
 
 运行：`node apps/web/serve.mjs`，打开 `http://127.0.0.1:5178`。`serve.mjs` 同源提供静态文件并把 `/v1/*`、`/healthz` 转给 Gateway，令牌只在服务端（每次请求现读 `runtime/gateway.json`）。正式版应由 Gateway 自己托管这些静态文件，见 §9。
 

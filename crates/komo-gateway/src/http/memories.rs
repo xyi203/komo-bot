@@ -6,7 +6,8 @@
 //! `GET /v1/memories` 有**两种问法**，答法不同，这不是一个可以合并的分支：
 //!
 //! - 带 `query` = 检索。走 [`MemoryManager::search`]，降级如实报，`vector` 模式不通就是
-//!   `VectorUnavailable` 而不是空集（§9.4）。
+//!   `VectorUnavailable` 而不是空集（§9.4）。响应带模式与逐条的两臂分数（`arm_scores`），
+//!   拿它对照 `min_keyword_score` / `min_similarity` 校准门槛。
 //! - 不带 `query` = 列库存。走目录，按作用域 / 状态筛。一个空查询在检索里应当返回空
 //!   （§9.4「没有足够相关内容时返回空」），而 `komo memory list` 要的显然不是空。
 
@@ -74,8 +75,7 @@ pub async fn list(
         }
         return Ok(Json(MemoryListResponse {
             memories: items,
-            degraded: false,
-            degraded_reason: None,
+            ..MemoryListResponse::default()
         }));
     }
 
@@ -104,6 +104,8 @@ pub async fn list(
         memories: result.items,
         degraded: result.degraded,
         degraded_reason: result.degraded_reason,
+        mode: Some(result.mode),
+        arm_scores: result.arm_scores,
     }))
 }
 

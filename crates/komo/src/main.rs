@@ -328,7 +328,8 @@ enum MemoryCommand {
         #[arg(long)]
         full: bool,
     },
-    /// 检索；支持 hybrid / keyword / vector（§9.4）。
+    /// 检索；支持 hybrid / keyword / vector（§9.4）。`id@版本` 后一列是相关度分数：关键词臂对照
+    /// `min_keyword_score`，余弦对照 `min_similarity`。
     Search {
         /// 查询词。
         query: String,

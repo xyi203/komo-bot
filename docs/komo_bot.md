@@ -1226,7 +1226,8 @@ matter_tokens = 600
 # 没有归属的线索要不要推（docs/memory.md §9.4 分层）；false 时它们只能 komo memory search 查到。存量挂好归属之前保持 true。
 push_unattached = true
 # 相关度门槛（docs/memory.md §9.4）：过任一道才留下；0 = 不启用（默认）。
-# 分数随 embedding 模型与前缀变，按自己的向量空间校准后再填，例如 qwen3-embedding:0.6b 无前缀：
+# 分数随 embedding 模型与前缀变，按自己的向量空间校准后再填（`komo memory search --mode keyword|vector|hybrid` 逐条显示对应的分数），
+# 例如 qwen3-embedding:0.6b 无前缀：
 # min_similarity = 0.56
 # min_keyword_score = 1.0
 

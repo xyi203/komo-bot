@@ -80,6 +80,61 @@ async fn a_two_character_chinese_query_hits_the_bigram_arm() {
     assert_eq!(memories[0]["id"], serde_json::json!("m-1"));
 }
 
+/// 检索响应带模式与逐条的两臂分数（`komo memory search` 拿它对照门槛）：keyword 只有关键词分，
+/// hybrid 两臂都有；不带查询词的清单两样都不带。
+#[tokio::test]
+async fn a_search_reports_its_mode_and_each_hits_arm_scores() {
+    let (gateway, _embeddings) = with_memories(
+        "hybrid",
+        vec![seeded(
+            "m-1",
+            "客厅空调设 26 度",
+            Provenance::UserStatement,
+            MemoryState::Active,
+        )],
+    )
+    .await;
+    let search = |mode: &'static str| {
+        let gateway = &gateway;
+        async move {
+            let (status, body) = gateway
+                .get_json(&format!(
+                    "/v1/memories?query=%E7%A9%BA%E8%B0%83&mode={mode}"
+                ))
+                .await;
+            assert_eq!(status, 200, "{body}");
+            body
+        }
+    };
+
+    let body = search("keyword").await;
+    assert_eq!(body["mode"], serde_json::json!("keyword"), "{body}");
+    let scores = body["arm_scores"].as_array().expect("分数");
+    assert_eq!(scores.len(), 1, "{body}");
+    assert_eq!(scores[0]["id"], serde_json::json!("m-1"));
+    assert!(scores[0]["keyword"].as_f64().unwrap() > 0.0, "{body}");
+    assert!(scores[0].get("vector").is_none(), "{body}");
+
+    let body = search("hybrid").await;
+    assert_eq!(body["mode"], serde_json::json!("hybrid"), "{body}");
+    let scores = body["arm_scores"].as_array().expect("分数");
+    let m1 = scores
+        .iter()
+        .find(|s| s["id"] == "m-1")
+        .expect("m-1 的分数");
+    assert!(
+        m1["keyword"].is_number() && m1["vector"].is_number(),
+        "{body}"
+    );
+
+    let (status, body) = gateway.get_json("/v1/memories").await;
+    assert_eq!(status, 200, "{body}");
+    assert!(
+        body.get("mode").is_none() && body.get("arm_scores").is_none(),
+        "{body}"
+    );
+}
+
 /// §14 ⑥：向量端点不可用时 **hybrid 明示降级、vector-only 明确报不可用**；
 /// 两者都不能被解释成"没有相关记忆"。
 #[tokio::test]

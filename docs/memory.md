@@ -174,6 +174,7 @@ MemoryManager 对 AgentRuntime 提供三个主要入口：recall、process_compl
 - **两个门槛默认都是 0，即不启用**——分数随 embedding 模型与前缀变，没有放之四海的值。配了 embedding 的实例要按自己的空间校准后写进配置；本机 `qwen3-embedding:0.6b`、不配前缀时的校准值是 0.56 / 1.0。换 `query_prefix` 或模型要重新校准。
 - 某一臂这一次没跑（向量降级、keyword 模式），只看另一臂的门槛；一臂门槛为 0 时它对这一臂不设限。
 - 每条留下的候选在召回诊断里记两臂分数与过了哪道门槛；丢掉的只记条数。复核门槛按附录 D 的方法用真实会话做。
+- **`komo memory search` 显示分数（2026-11-01，已实现）。** 校准门槛要看到分数：`GET /v1/memories` 带查询词时响应多两个字段——`mode`（这次用的模式；hybrid 降级时仍是 hybrid，看 `degraded`）与 `arm_scores`（逐条 `{id, keyword?, vector?, passed}`，就是 store 算出、门槛比较用的那两个原始分）；不带查询词的清单两样都没有。开着重排时 runtime 的 `search` 按交回去的条目重排、截断 `arm_scores`，不留短名单尾巴的分数。CLI 在 `id@版本` 之后多一列，组前一行说明对应哪个门槛：keyword 模式 `关键词 0.431`（对照 `min_keyword_score`），vector 模式 `余弦 0.612`（对照 `min_similarity`），hybrid 两臂都写 `关键词 0.431 · 余弦 未命中`——「未命中」= 不在这一臂的候选名单里，向量臂降级没跑写「未跑」；没有这条的分数（连的是旧 Gateway）写 `分数 -`。分数保留三位小数。`komo memory list` 与 `list --full` 不变。CLI 没有 `--json`，要原始数字直接读 HTTP 响应。测试：store `every_kept_item_carries_its_arm_scores_in_item_order`、runtime `a_judgement_can_lift_an_entry_the_fusion_ranked_lower`、gateway `tests/memory/recall.rs` `a_search_reports_its_mode_and_each_hits_arm_scores`、client `memory_search_shows_the_arm_scores_that_match_the_thresholds`。
 - 门槛之后的重排照旧"只重排、不增删"：重排后端挑 `none` 也不会把留下的候选清空——拒绝候选是门槛的事，不是排序的事。
 - 门槛不判"业务条件是否成立"。`applies_when` 只参与打分（进索引文本）；过了门槛的约定连同条件一起注入，条件成立与否由主模型对着当前任务判断。注入前按条件拒绝候选要另加判断调用，没有实测之前不做。
 

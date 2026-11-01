@@ -63,7 +63,7 @@ use crate::cron::{CronFiring, CronJob, JobStatus, NotifyPolicy, OverlapPolicy};
 use crate::types::chat::PeerId;
 use crate::types::ids::{CronJobId, MatterId, MemoryId, RequestKey, RunId, Seq, SessionId};
 use crate::types::memory::{
-    MemoryApplication, MemoryItem, MemoryKind, MemoryScope, MemoryState, RetrievalMode,
+    ArmScore, MemoryApplication, MemoryItem, MemoryKind, MemoryScope, MemoryState, RetrievalMode,
 };
 use crate::types::model::{Effort, EmbeddingSpace, ModelConfig};
 use crate::types::plan::{PlanHash, PlanSource};
@@ -993,6 +993,14 @@ pub struct MemoryListResponse {
     pub degraded: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub degraded_reason: Option<String>,
+    /// 带查询词的检索用的模式；不带查询词的清单没有。hybrid 降级时仍是 hybrid，看 `degraded`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<RetrievalMode>,
+    /// 检索结果逐条的两臂原始分数（§9.4 相关度门槛）：关键词臂是归一化分，对应
+    /// `min_keyword_score`；向量臂是余弦，对应 `min_similarity`。不在某臂候选名单里（或那臂没跑）
+    /// 就是 `None`。按 `id` 对应 `memories`；清单没有。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub arm_scores: Vec<ArmScore>,
 }
 
 /// confirm / forget 都携带预期 revision；重复请求幂等（§9.6）。

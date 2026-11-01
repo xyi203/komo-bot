@@ -18,8 +18,8 @@ use komo_kernel::protocol::http::{
     TelemetryHealth, ToolCallSummary, WindowSource,
 };
 use komo_kernel::types::memory::{
-    Confirmation, MemoryItem, MemoryKind, MemoryScope, MemoryState, Provenance, RecallDiagnostics,
-    RetrievalMode,
+    ArmScore, Confirmation, MemoryItem, MemoryKind, MemoryScope, MemoryState, Provenance,
+    RecallDiagnostics, RetrievalMode,
 };
 use komo_kernel::types::status::{RunState, SessionState, ToolCallState, WaitReason};
 use time::OffsetDateTime;
@@ -636,11 +636,17 @@ pub fn memory_list_full(response: &MemoryListResponse) -> String {
 /// `komo memory search`：列同 [`memory_list_full`]，约定与线索分开列，读到的和注入块是同一套
 /// 语义（§9.4）。约定 = active + convention；其余（reference、没分类、candidate、contested）
 /// 都是线索。
+///
+/// 响应带着检索模式时，`id@版本` 之后多一列相关度分数（[`score_cell`]），组前一行说明分数对应哪个
+/// 门槛。
 pub fn memory_search(response: &MemoryListResponse) -> String {
     let mut out = degraded_notice(response);
     if response.memories.is_empty() {
         out.push("没有匹配的记忆".into());
         return out.join("\n");
+    }
+    if let Some(mode) = response.mode {
+        out.push(score_legend(mode, response.degraded));
     }
     let (conventions, clues): (Vec<&MemoryItem>, Vec<&MemoryItem>) = response
         .memories
@@ -657,9 +663,62 @@ pub fn memory_search(response: &MemoryListResponse) -> String {
             continue;
         }
         out.push(format!("{title}："));
-        out.extend(group.into_iter().map(full_line));
+        out.extend(group.into_iter().map(|item| search_line(response, item)));
     }
     out.join("\n")
+}
+
+/// 分数列说的是什么：哪一臂的原始分、对应 `[memory.retrieval]` 的哪个门槛（§9.4）。
+fn score_legend(mode: RetrievalMode, degraded: bool) -> String {
+    match mode {
+        RetrievalMode::Keyword => {
+            "分数：关键词臂归一化分（对应 [memory.retrieval] min_keyword_score）".into()
+        }
+        RetrievalMode::Vector => "分数：向量余弦（对应 [memory.retrieval] min_similarity）".into(),
+        RetrievalMode::Hybrid => format!(
+            "分数：关键词 = 关键词臂归一化分（对应 min_keyword_score），余弦 = 向量臂（对应 min_similarity）；\
+             未命中 = 不在这一臂的候选名单里{}",
+            if degraded {
+                "；未跑 = 这一次向量臂没跑"
+            } else {
+                ""
+            }
+        ),
+    }
+}
+
+/// 一条检索结果的分数列。keyword / vector 只写那一臂；hybrid 两臂都写，不在某臂名单里的写
+/// 「未命中」，向量臂降级没跑的写「未跑」。响应里没有这条的分数（旧 Gateway）写 `-`。
+fn score_cell(mode: RetrievalMode, degraded: bool, score: Option<&ArmScore>) -> String {
+    let Some(score) = score else {
+        return "分数 -".into();
+    };
+    let value = |score: Option<f32>| score.map_or_else(|| "未命中".into(), |s| format!("{s:.3}"));
+    let keyword = format!("关键词 {}", value(score.keyword));
+    let vector = if degraded {
+        "余弦 未跑".to_string()
+    } else {
+        format!("余弦 {}", value(score.vector))
+    };
+    match mode {
+        RetrievalMode::Keyword => keyword,
+        RetrievalMode::Vector => vector,
+        RetrievalMode::Hybrid => format!("{keyword} · {vector}"),
+    }
+}
+
+fn search_line(response: &MemoryListResponse, item: &MemoryItem) -> String {
+    let Some(mode) = response.mode else {
+        return full_line(item);
+    };
+    let score = response.arm_scores.iter().find(|score| score.id == item.id);
+    format!(
+        "{}@{}\t{}\t{}",
+        item.id,
+        item.revision,
+        score_cell(mode, response.degraded, score),
+        full_fields(item)
+    )
 }
 
 fn degraded_notice(response: &MemoryListResponse) -> Vec<String> {
@@ -677,6 +736,11 @@ fn degraded_notice(response: &MemoryListResponse) -> Vec<String> {
 }
 
 fn full_line(item: &MemoryItem) -> String {
+    format!("{}@{}\t{}", item.id, item.revision, full_fields(item))
+}
+
+/// `id@版本` 之后的那些列。
+fn full_fields(item: &MemoryItem) -> String {
     let content = item
         .content
         .split(['\n', '\r', '\t'])
@@ -685,9 +749,7 @@ fn full_line(item: &MemoryItem) -> String {
         .collect::<Vec<_>>()
         .join(" ");
     format!(
-        "{}@{}\t{}\t{}\t{}\t注入 {} 次 · 用上 {} 次\t{}\t{}\t{}\t{}",
-        item.id,
-        item.revision,
+        "{}\t{}\t{}\t注入 {} 次 · 用上 {} 次\t{}\t{}\t{}\t{}",
         memory_state(item.state),
         provenance(item.provenance),
         confirmation(item.confirmation),

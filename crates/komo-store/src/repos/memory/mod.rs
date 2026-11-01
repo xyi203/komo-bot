@@ -2161,6 +2161,36 @@ mod tests {
         assert_eq!(ids_of(&strict), vec!["m-2"]);
     }
 
+    /// 留下的每条都带自己的两臂分数，顺序与 `items` 一致（`komo memory search` 逐行显示）；只跑关键词臂时
+    /// 向量分都是 `None`。
+    #[tokio::test]
+    async fn every_kept_item_carries_its_arm_scores_in_item_order() {
+        let (repo, _dir) = gated_repo().await;
+        for query in [
+            gated(0.0, 0.0),
+            RecallQuery {
+                query_vector: None,
+                ..query("空调", RetrievalMode::Keyword)
+            },
+        ] {
+            let result = repo.recall(&query).await.unwrap();
+            assert!(!result.items.is_empty());
+            let items: Vec<&str> = result.items.iter().map(|i| i.id.as_str()).collect();
+            let scored: Vec<&str> = result.arm_scores.iter().map(|s| s.id.as_str()).collect();
+            assert_eq!(items, scored, "{:?}", query.mode);
+            if query.mode == RetrievalMode::Keyword {
+                assert!(
+                    result
+                        .arm_scores
+                        .iter()
+                        .all(|s| s.keyword.is_some() && s.vector.is_none()),
+                    "{:?}",
+                    result.arm_scores
+                );
+            }
+        }
+    }
+
     /// 两个门槛都是 0 时与没有门槛一样：两臂名单里的都留着。
     #[tokio::test]
     async fn zero_thresholds_keep_everything_the_arms_returned() {

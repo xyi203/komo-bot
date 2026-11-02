@@ -22,6 +22,78 @@ const NOW: OffsetDateTime = datetime!(2026-09-16 08:00:00 UTC);
 
 // ---- session list ----
 
+/// 监听清单：跑着的写已跑与距截止，结束的写原因、不写截止；脚本在下一行。
+#[test]
+fn a_monitor_list_shows_age_deadline_title_and_session() {
+    use komo_kernel::protocol::http::{MonitorListResponse, MonitorSummary};
+    assert_eq!(
+        monitor_list(&MonitorListResponse::default(), NOW),
+        "没有监听"
+    );
+    let running = MonitorSummary {
+        handle: "7".into(),
+        title: "CI".into(),
+        session: Some(SessionId::from_raw("sess-1")),
+        state: "running".into(),
+        reason: None,
+        started_at: NOW - time::Duration::minutes(90),
+        deadline: NOW + time::Duration::minutes(30),
+        command: "gh run watch 1".into(),
+    };
+    let ended = MonitorSummary {
+        handle: "8".into(),
+        state: "ended".into(),
+        reason: Some("timeout".into()),
+        session: None,
+        ..running.clone()
+    };
+    let text = monitor_list(
+        &MonitorListResponse {
+            monitors: vec![running, ended],
+        },
+        NOW,
+    );
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(
+        lines[0],
+        "#7 运行中 · 已跑 1 时 30 分 · 距截止 30 分 0 秒 · 「CI」 · 会话 sess-1"
+    );
+    assert_eq!(lines[1], "  gh run watch 1");
+    assert_eq!(lines[2], "#8 已结束（timeout） · 已跑 1 时 30 分 · 「CI」");
+}
+
+/// 会话搜索：一个命中一段，会话 ID 在前；任务短号、派它的会话、监听写在第二行；片段逐条列出。
+#[test]
+fn a_session_search_names_the_session_the_ids_to_follow_and_the_snippets() {
+    use komo_kernel::protocol::http::{SessionSearchHit, SessionSearchResponse};
+    assert_eq!(
+        session_search(&SessionSearchResponse::default()),
+        "没有匹配的会话"
+    );
+    let response = SessionSearchResponse {
+        hits: vec![SessionSearchHit {
+            session: SessionId::from_raw("sess-9"),
+            title: "盯 CI".into(),
+            kind: "task".into(),
+            matched_at: NOW,
+            task: Some("#12".into()),
+            parent_session: Some(SessionId::from_raw("sess-1")),
+            monitors: vec!["#7「CI」".into()],
+            matches: 2,
+            snippets: vec!["助手：CI 挂了".into()],
+        }],
+    };
+    let text = session_search(&response);
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines[0], "sess-9 · task · 盯 CI");
+    assert!(
+        lines[1].contains("2 处") && lines[1].contains("任务 #12"),
+        "{text}"
+    );
+    assert!(lines[1].contains("派它的会话 sess-1") && lines[1].contains("监听 #7「CI」"));
+    assert_eq!(lines[2], "  - 助手：CI 挂了");
+}
+
 #[test]
 fn a_session_list_shows_status_and_title() {
     let response = SessionListResponse {
@@ -44,6 +116,7 @@ fn a_session_list_shows_status_and_title() {
                 updated_at: NOW,
                 kind: "normal".into(),
                 home: None,
+                task: None,
             },
             SessionSummary {
                 session: SessionId::from_raw("sess-2"),
@@ -58,6 +131,7 @@ fn a_session_list_shows_status_and_title() {
                 updated_at: NOW,
                 kind: "normal".into(),
                 home: None,
+                task: None,
             },
         ],
     };
@@ -99,6 +173,7 @@ fn a_task_session_is_marked_with_its_short_id() {
                     updated_at: NOW,
                     kind: "task".into(),
                     home: Some(SessionId::from_raw("sess-home")),
+                    task: None,
                 },
                 SessionSummary {
                     session: SessionId::from_raw("sess-main"),
@@ -113,6 +188,7 @@ fn a_task_session_is_marked_with_its_short_id() {
                     updated_at: NOW,
                     kind: "main".into(),
                     home: None,
+                    task: None,
                 },
             ],
         },
@@ -149,6 +225,7 @@ fn a_session_list_says_when_a_run_is_waiting_on_an_earlier_one() {
                 updated_at: NOW,
                 kind: "normal".into(),
                 home: None,
+                task: None,
             }],
         },
         NOW,
@@ -173,6 +250,7 @@ fn a_session_list_marks_every_state_that_is_not_active() {
         updated_at: NOW,
         kind: "normal".into(),
         home: None,
+        task: None,
     };
     let printed = session_list(
         &SessionListResponse {
@@ -713,6 +791,7 @@ fn a_memory_list_keeps_provenance_and_confirmation_apart() {
         memories: vec![memory_item()],
         degraded: false,
         degraded_reason: None,
+        ..Default::default()
     });
     insta_like(
         &printed,
@@ -732,6 +811,7 @@ fn a_full_memory_list_is_one_untruncated_line_per_memory() {
         memories: vec![wide, multiline],
         degraded: false,
         degraded_reason: None,
+        ..Default::default()
     });
     let lines: Vec<&str> = printed.lines().collect();
     assert_eq!(
@@ -750,6 +830,7 @@ fn a_degraded_retrieval_says_so_out_loud() {
         memories: vec![],
         degraded: true,
         degraded_reason: Some("向量后端不可用".into()),
+        ..Default::default()
     });
     assert!(
         printed.contains("⚠ 检索已降级为关键词：向量后端不可用"),
@@ -1252,6 +1333,7 @@ fn memory_search_lists_conventions_apart_from_clues_with_usage_and_condition() {
         ],
         degraded: false,
         degraded_reason: None,
+        ..Default::default()
     };
     let out = memory_search(&response);
     let conventions = out.find("约定").expect("约定组");
@@ -1276,6 +1358,103 @@ fn memory_search_lists_conventions_apart_from_clues_with_usage_and_condition() {
         memories: vec![],
         degraded: false,
         degraded_reason: None,
+        ..Default::default()
     };
     assert_eq!(memory_search(&empty), "没有匹配的记忆");
+}
+
+/// 带模式的检索结果在 `id@版本` 之后多一列分数，前面一行说明它对应哪个门槛：keyword / vector
+/// 只写那一臂；hybrid 两臂都写，不在名单里的写「未命中」，降级没跑的写「未跑」；没分数的写 `-`。
+#[test]
+fn memory_search_shows_the_arm_scores_that_match_the_thresholds() {
+    use komo_kernel::protocol::http::MemoryListResponse;
+    use komo_kernel::types::memory::{ArmScore, RetrievalMode};
+
+    let mut other = memory_item();
+    other.id = MemoryId::from_raw("mem-2");
+    let score = |id: &str, keyword: Option<f32>, vector: Option<f32>| ArmScore {
+        id: MemoryId::from_raw(id),
+        keyword,
+        vector,
+        passed: vec![],
+    };
+    let response = |mode, degraded, arm_scores| MemoryListResponse {
+        memories: vec![memory_item(), other.clone()],
+        degraded,
+        mode: Some(mode),
+        arm_scores,
+        ..Default::default()
+    };
+    let line = |out: &str, id: &str| {
+        out.lines()
+            .find(|line| line.starts_with(id))
+            .unwrap_or_else(|| panic!("{id}：{out}"))
+            .to_string()
+    };
+
+    let out = memory_search(&response(
+        RetrievalMode::Keyword,
+        false,
+        vec![score("mem-1", Some(0.6826), None)],
+    ));
+    assert!(out.contains("min_keyword_score"), "{out}");
+    assert!(
+        line(&out, "mem-1@3").starts_with("mem-1@3\t关键词 0.683\t候选\t"),
+        "{out}"
+    );
+    assert!(
+        line(&out, "mem-2@3").starts_with("mem-2@3\t分数 -\t候选\t"),
+        "{out}"
+    );
+
+    let out = memory_search(&response(
+        RetrievalMode::Vector,
+        false,
+        vec![score("mem-1", None, Some(0.71))],
+    ));
+    assert!(out.contains("min_similarity"), "{out}");
+    assert!(
+        line(&out, "mem-1@3").starts_with("mem-1@3\t余弦 0.710\t"),
+        "{out}"
+    );
+
+    let out = memory_search(&response(
+        RetrievalMode::Hybrid,
+        false,
+        vec![
+            score("mem-1", Some(0.5), None),
+            score("mem-2", None, Some(0.8)),
+        ],
+    ));
+    assert!(
+        line(&out, "mem-1@3").starts_with("mem-1@3\t关键词 0.500 · 余弦 未命中\t"),
+        "{out}"
+    );
+    assert!(
+        line(&out, "mem-2@3").starts_with("mem-2@3\t关键词 未命中 · 余弦 0.800\t"),
+        "{out}"
+    );
+    assert!(!out.contains("未跑"), "{out}");
+
+    let out = memory_search(&response(
+        RetrievalMode::Hybrid,
+        true,
+        vec![score("mem-1", Some(0.5), None)],
+    ));
+    assert!(out.starts_with("⚠ 检索已降级"), "{out}");
+    assert!(
+        line(&out, "mem-1@3").starts_with("mem-1@3\t关键词 0.500 · 余弦 未跑\t"),
+        "{out}"
+    );
+
+    // 不带模式（清单、旧 Gateway）：列与 `--full` 一样，没有分数列和说明。
+    let out = memory_search(&MemoryListResponse {
+        memories: vec![memory_item()],
+        ..Default::default()
+    });
+    assert!(!out.contains("分数"), "{out}");
+    assert!(
+        line(&out, "mem-1@3").starts_with("mem-1@3\t候选\t"),
+        "{out}"
+    );
 }

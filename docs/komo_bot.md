@@ -83,6 +83,8 @@ Gateway 持有模型连接、数据库与提交线、工具环境、运行状态
 | `komo`                                       | 确保本机 Gateway 就绪，进入 TUI 聊天。**会话在第一条消息送出之前才创建**——空跑一眼就退出，不在库和磁盘上留下空壳 |
 | `komo resume SESSION_ID`                     | 连接原会话并查看进度或处理待办；恢复调度由 Gateway 自动进行，不重复创建 Run |
 | `komo session list`                          | 查看会话列表和状态；`--all` 才列出已逻辑删除的会话（§8.10）                  |
+| `komo session search 关键词 [--limit N]`         | 跨会话找回：在会话标题与正文里找，给会话、片段与能接着查的 ID（§8.11「跨会话找回」） |
+| `komo monitor list [--all]`                   | 监听清单（`monitor` 挂的与转后台的 bash）：短号、已跑多久、距截止、标题、挂它的会话、脚本；只读（`docs/monitor.md`） |
 | `komo session delete/purge SESSION_ID`       | 逻辑删除（`closing` → `deleted`）与回收（`purged`）。**删除只有这一条路**：`--now` 把未完成 Run 各写一条明确取消，`purge` 前先算引用（§8.10） |
 | `komo session export SESSION_ID [-o FILE]`   | 导出成 pi v3 树形 JSONL（header + 全部分支 entry，当前位置落在末条；blob 保持引用，`komoBlobRoot` 指向 Session 目录）；默认写 stdout，只读，不导入（`docs/storage-durable.md` §9 D6） |
 | `komo run inspect RUN_ID`                    | 查看执行过程、工具结果与产物                                                |
@@ -190,7 +192,7 @@ Gateway 对数据目录持有进程锁。多个 CLI 同时启动时，只允许�
 
 Fedora 使用 systemd 管理，Mac 使用 launchd；服务管理器运行前台形式的 Gateway。**单元名是全局的（`komo-gateway.service` / `dev.komo.gateway`），只有默认数据目录 `~/.komo` 拥有它。** 别的 `KOMO_HOME` 走 `komo gateway` / `stop` / `restart` 会被**拒绝**并告诉你去前台跑 `KOMO_HOME=… komo gateway --foreground`：那条路会把单元文件改写成指向这个数据目录，现役服务随即被换掉——2026-09-21 实测过一次，`KOMO_HOME=/tmp/… komo config check` 经 `connect_or_start` 起服务，把现役单元换成了一份 debug 构建 + 沙箱数据目录。`komo gateway status` 会印出单元实际在服务哪个数据目录，与当前 `KOMO_HOME` 不一致时明说。**单元文件只设 `KOMO_HOME`（与可选的 `KOMO_LISTEN`）和 `PATH`，不加载 `.env`、不含任何凭证**。`PATH` 取自写单元的那个进程（操作者的 CLI），单元在每次 start / restart 时重写，`PATH` 随之刷新；写单元的进程没有 `PATH` 或为空就不写这一项，不编默认值。写它的原因（2026-09-24）：`bash` 工具的子进程继承 Gateway 的环境，而 launchd / systemd 默认只给 `/usr/bin:/bin:/usr/sbin:/sbin`——实测一次会话里 `komo`（`~/.cargo/bin`）与 `rg`（`/opt/homebrew/bin`）都是 `command not found`，白白耗掉几轮。`PATH` 不是凭证，下面几条理由都不适用于它。凭证不进单元的理由：launchd 没有 `EnvironmentFile` 的等价物，只能把值抄进 plist，那是把密钥复制到第二个文件；走进程环境还会让 `.env` 的热重载失效，并让每个子进程与日志都可能看到它。`.env` 由 Gateway 自己读成 `Secrets`（§3 热重载覆盖它），需要凭证的 Python 模块按**变量名**声明（§5.3），Gateway 在起子进程时按名注入。Mac 若后续需要操作用户桌面应用，应按登录用户的执行环境配置。后台服务不会让睡眠中的电脑继续执行任务。[Fedora systemd](https://fedoraproject.org/wiki/Packaging:Systemd) · [Apple launchd](https://developer.apple.com/library/archive/documentation/MacOSX/Conceptual/BPSystemStartup/Chapters/CreatingLaunchdJobs.html)
 
-**在 Gateway 里重启自己**（2026-10-13）。`bash` 工具的子进程带着 `KOMO_RUN`，`komo gateway stop` / `restart` 见到它就不当场做：同步做等于让 Gateway 停掉正在跑这条命令的自己——停机要等手上的调用收尾，那个调用正等着 Gateway 停下，互相等到服务管理器动手杀，这次调用的结果永远落不了盘；新 Gateway 起来时这条命令还在等它就绪，恢复扫描看见"上一代的子进程还活着"，把这条 Run 停在等人上（实测：TUI 里 `!komo gateway restart` 转了两分钟，事件订阅报 `error decoding response body`）。现在交给这条命令之外的人在它结束之后做：launchd 下起一个**自己进程组**的 `komo gateway <stop|restart> --after-pid <pid>`（`bootout` 不连它一起带走），等发起的命令退出再留 1.5 秒让结果落盘、Run 收尾，输出写 `logs/gateway-restart.log`；systemd 下后台进程躲不过 `stop`（同一个 cgroup），所以先按当前环境重写单元，再用 `systemd-run --user --on-active=2` 挂一次 `systemctl --user <verb>`。命令本身立刻返回一句"等它结束之后再重启"。`--after-pid` 是隐藏参数，只给那个后台进程用。只认 `bash`：`python` 的子进程没有 `KOMO_RUN`。systemd 这一支没有在真机上跑过（§14）。
+**在 Gateway 里重启自己**（2026-10-13）。`bash` 工具的子进程带着 `KOMO_RUN`，`komo gateway stop` / `restart` 见到它就不当场做：同步做等于让 Gateway 停掉正在跑这条命令的自己——停机要等手上的调用收尾，那个调用正等着 Gateway 停下，互相等到服务管理器动手杀，这次调用的结果永远落不了盘；新 Gateway 起来时这条命令还在等它就绪，恢复扫描看见"上一代的子进程还活着"，把这条 Run 停在等人上（实测：TUI 里 `!komo gateway restart` 转了两分钟，事件订阅报 `error decoding response body`）。现在交给这条命令之外的人在它结束之后做：launchd 下起一个**自己进程组**的 `komo gateway <stop|restart> --after-pid <pid>`（`bootout` 不连它一起带走），等发起的命令退出再留 1.5 秒让结果落盘、Run 收尾，输出写 `logs/gateway-restart.log`；systemd 下后台进程躲不过 `stop`（同一个 cgroup），所以先按当前环境重写单元，再用 `systemd-run --user --on-active=2` 挂一次 `systemctl --user <verb>`。命令本身立刻返回一句"等它结束之后再重启"。`--after-pid` 是隐藏参数，只给那个后台进程用。只认 `bash`：`python` 的子进程没有 `KOMO_RUN`。TUI 的 `!` 命令也经 `bash` 工具跑，子进程同样带 `KOMO_RUN`（值是 conversation ID，不是输入 Run，所以 `komo memory add` 在 `!` 里照旧拒绝而不是记成 Agent 的，`docs/memory.md` §9）与 `KOMO_SESSION`，所以 `!scripts/install-local.sh` 末尾的 `komo gateway restart` 也走推迟；`!` 跑过 `detach_after_secs` 会转后台（`docs/storage-durable-d5.md` 决定 9），推迟的重启在它结束、结果落账之后才到——systemd 那 2 秒内没落完的，停机时被终止并在历史里留说明。systemd 这一支没有在真机上跑过（§14）。
 
 默认监听回环地址。首版远程访问可通过 SSH 转发连接；直接开放网络监听时需要 HTTPS 和认证。选择远程实例时，不因连接失败而启动一个本机替代实例。`status` 与 `stop` 不隐式启动服务。
 
@@ -473,7 +475,7 @@ project_files = false              # 省略 = true
 
 新存储没有"受理时冻结一份 `RunSnapshot`"。每个决定点按**当前配置**重新解析（pi-durable 的 "names resolved at each use"）：`komo.agent` document 与 `komo.task`（任务会话）只存 Agent / 模型 / effort 的**名字**，生成任务的 `prepare` 每次问 `AgentHooks::setup` 解析 Agent、指令、能力面、投影预算、模型，工具任务的 `call` 问 `AgentHooks::tools`。**已经开始的 `request` 阶段**用 checkpoint 里冻结的模型、effort、预算与 `cutoff`（重启 / 重发逐字节相同）；退避重发走 `prepare` 会重新解析，所以配置变化从下一次尝试起生效，`[execution] model_result_bytes` 与 `decay_*` 的变化只影响之后落的结果（旧结果按当时存下的视图）。
 
-**会跨请求钉住的是提示前缀里的几段**：系统段（`instructions` / `base` / `project` / `skills` / `memory`，`komo.system` entry 里按 key 一段一段存）里的 `project`、`skills`、`memory` 三段，一旦展示过就**钉住到下一个 head 标记**（`/new`、压缩）才重算——不然一个 skill 的增删、规范文件的改动、记忆条目的变化会让前缀缓存从系统提示起整段作废；规范文件变了，由 `submit` 把 `project_update_block` 补在下一条输入正文后面——比的是模型最近看到的那一版（这个 head 之后补过的最近一块，没补过才比钉住的 `project` 段），同一版只补一次；补的那段只给模型，输入 entry 的 `data.projectUpdateAt` 记下原话长度，消息面与记忆抽取只读原话，TUI 只提一行。fork 任务的系统段取父那份（`replay_sections`），模型与 effort 沿用父。`SKILL.md` 的增删改、`disable` 名单、配置重载都从下一个 head 起生效。
+**会跨请求钉住的是提示前缀里的几段**：系统段（`instructions` / `base` / `project` / `skills` / `memory`，`komo.system` entry 里按 key 一段一段存）里的 `project`、`skills`、`memory` 三段，一旦展示过就**钉住到下一个 head 标记**（`/new`、压缩）才重算——不然一个 skill 的增删、规范文件的改动、记忆条目的变化会让前缀缓存从系统提示起整段作废；规范文件变了，由 `submit` 把 `project_update_block` 补在下一条输入正文后面——比的是模型最近看到的那一版（这个 head 之后补过的最近一块，没补过才比钉住的 `project` 段），同一版只补一次；补的那段只给模型，输入 entry 的 `data.projectUpdateAt` 记下原话长度，消息面与记忆抽取只读原话，TUI 只提一行。fork 任务的系统段取父那份（`replay_sections`），模型与 effort 沿用父。随 Run 变化的提示（记忆召回块 §9.4、渠道篇幅附注 §11.2）不进系统段，按 Run 追加在输入之后。`SKILL.md` 的增删改、`disable` 名单、配置重载都从下一个 head 起生效。
 
 等待期间改 Profile，在飞的请求不受影响，下一次解析用新的一版。（§7 那条硬限制由工具在 `prepare` 里判，本来就不进任何冻结。）
 
@@ -781,6 +783,10 @@ Session 不是只能追加的对象。pi-durable 没有删除，komo 保留三�
 - 内容由提交线唯一写入；大正文先写文件、再提交引用（§8.5）。
 - `/fork` / `/clone` 保留所选路径需要的工具输出、图片、产物以及 `edits` / `head` 的目标关系；原 Session 被合法回收后，新 Session 仍可读取。生成的新会话不复制原 Run 的可执行状态，也不重放已发生的工具动作。
 
+#### 跨会话找回（`komo session search`，2026-10-31，roadmap-muse S3）
+
+飞书一个话题一个 Session、私聊进 home，彼此看不到；记忆提取不保证带上链接、ID 这类细节。`GET /v1/session-search?q=…&limit=…`（`komo-gateway` `service/durable/search.rs`）只读：在 `active` / `closing` 会话的标题与 entry 正文（用户的话、助手的回答、工具结果；宿主附上的召回块、渠道附注与 system 消息不看）里按关键词找，空白分开的几个词要在同一条消息里都出现（不分大小写），空关键词 400。每个 conversation 只看它自己的 entry（fork 祖先的算在祖先所在的会话里）。按最近一条命中的时刻倒序，默认 10 个会话、上限 50，每个会话给命中条数与最近 3 个片段（`用户：…` / `助手：…` / `工具 bash：…` / `标题：…`），带能接着查的 ID：会话 ID、任务会话的短号与派它的会话、还在跑的监听。可见性同 `komo memory search`：会话的 Agent 是 `memory = private` / `off` 的不出现（任务会话没记 Agent 时看父会话）。实现是逐会话扫 entry，个人用的量够了；慢了再加索引。系统提示「komo 自查」那段教模型在用户提到别的会话、别的渠道里的事时用它，不再 export 整个会话去 grep。要看全文仍用 `komo session export`。
+
 #### 导出（`komo session export`）
 
 `GET /v1/sessions/{id}/export` → `komo session export SESSION_ID [-o FILE]`（`http/v2/export.rs`）：输出 `application/x-ndjson`，header 是 pi v3 的 `{type:"session", version:3, id, timestamp, cwd, parentSession?}` 外加 `komoBlobRoot`（Session 目录的绝对路径）；entry 逐条是 kernel 的 `pi_tree(..)` 结果（与 `/tree` 同一投影：一条 durable entry 可展开成 `"{id}"`、`"{id}:{n}"`，分支 = 同一 `parentId` 下的多个孩子）；blob 保持 komo 的引用（图片块 `{mime, path, hash}`，`artifact://…` 与 `tool-output/…` 路径都落在 `komoBlobRoot` 之下，不内联字节）；当前位置安排在文件末尾（本来就是末条则原样；leaf 没有后代且不是 `label` / `session_info` 则挪到最后；否则追加 `custom` entry `komo.leaf`）。只出不进。用 pi 的 `SessionManager.open` 真读这一步仍待做（本机没有 node，已对着 `session-manager.ts` 逐点核对，`docs/storage-durable.md` §9 D6）。
@@ -821,7 +827,7 @@ Cron Scheduler 只负责产生 Run，复用 AgentLoop、工具和存储。
  → 更新本次触发状态
 ```
 
-每个 Job 包含名称、五字段 cron 表达式、时区、prompt、工作目录、enabled、执行预算、重叠策略、`notify` 与版本。`notify` 三档 `always`（默认）/ `on_error` / `never` **只过滤结果的投递**；Run 因任务 faulted（§7.5）停下时三档都投 home chat——那是任务在问，不是在报告，一条没人看见的提问等于这个 Job 从此停在那里。每次触发是一条带状态的记录（`queued` / `running` / `ok` / `error` / `waiting` / `skipped`），重叠跳过与错过太久（超过 Job 自己的间隔）都留一条 `skipped`，`@at` 一次性永不过期。可指定该 Job 的主模型与 effort；覆盖按完整模型配置解析，不能影响记忆整理或向量模型。下面示例所需的搜索与 Memos 操作仍须匹配具体的已启用模块版本。
+每个 Job 包含名称、五字段 cron 表达式、时区、prompt、工作目录、enabled、执行预算、重叠策略、`notify` 与版本。`notify` 三档 `always`（默认）/ `on_error` / `never` **只过滤结果的投递**；prompt Job 的回答整段是 `NO_REPLY` 时触发照记 `ok`、三档都不投（2026-10-31，同命令型 Job 的空 stdout，`docs/background-tasks.md` §2d）；Run 因任务 faulted（§7.5）停下时三档都投 home chat——那是任务在问，不是在报告，一条没人看见的提问等于这个 Job 从此停在那里。每次触发是一条带状态的记录（`queued` / `running` / `ok` / `error` / `waiting` / `skipped`），重叠跳过与错过太久（超过 Job 自己的间隔）都留一条 `skipped`，`@at` 一次性永不过期。可指定该 Job 的主模型与 effort；覆盖按完整模型配置解析，不能影响记忆整理或向量模型。下面示例所需的搜索与 Memos 操作仍须匹配具体的已启用模块版本。
 
 ```bash
 komo cron add --name morning-summary \
@@ -845,6 +851,7 @@ komo cron remove JOB_ID
 - Gateway 停机期间错过的触发不集中补跑；停机前已经持久创建、尚未完成的 Cron Run 则按原 Run 自动恢复，这是两种不同情况。
 - 时区明确保存（IANA 名，`TimeZone` 只存名字）；同一日历时间因夏令时出现两次时，两次不同 UTC 时刻分别视为计划时间；不存在的本地时间跳过。**这两条与 croner 的内建策略相反**（它把缺口里的固定时刻抬到缺口之后、把重复的只算较早一次），所以由 kernel 的 `cron::search_from`（跳缺口）和 `cron::repeated_twin`（补后一半）自己实现，换 croner 版本时要一起看。时区解析走 `ZoneResolver` port（§13.5）：kernel 不带 tzdb，真 tzdb 实现在 runtime；没有 tzdb 时 `FixedOffsetZone` 是**明确的降级**（答不出重复与缺口，等于当这个区没有夏令时），不是默认。
 - 手动 run 使用独立请求幂等键，不冒充定时触发。
+- cron 触发的 Run（含手动 run）不做自动记忆召回，不注入「[已知记忆]」块（线索、约定、事项都不带）；要用记忆就在 prompt 里让 Agent 跑 `komo memory search`。同一个 cron 会话里用户自己发的消息照常召回（`docs/memory.md` §9.4「cron 触发的 Run 不召回」）。
 - 无人值守不改变执行规则：Cron Run 与交互 Run 一样，没有 Policy 与审批（§7）；需要人判断的只有阻塞，照常投 home chat；结果不明交给模型。
 - Cron 的结果去原 Session 查看，也可以用 resume 接手。
 
@@ -931,6 +938,7 @@ TELEGRAM_BOT_TOKEN=...
 - **Conversation**：操作者的**私聊**（Telegram DM、WeChat、TUI）落到同一个 **home session**——早上在微信说的话，回到终端接着说；飞书私聊例外，与飞书群一样一个话题一个 Session（见下文「飞书群里的话题」）；飞书 / Telegram 的群聊按 `{platform}:{chat_id}` 各自一个 Session（飞书群里改为一个话题一个 Session，见下文「飞书群里的话题」）。**没有群名单**（`groups` 2026-10-22 删除，旧配置里的这个键只报"不认识、已忽略"）：机器人所在的群里只响应 @机器人 的消息并剥掉提及；发送者在 `allow_from` 里（或 `allow_tenant` 下同一企业，见下文）就是操作者、照常全能力，否则被拒。已删除（或正在关闭）的会话不再接收平台消息，同一来源的下一条另开新会话。WeChat 只有 DM。要跑很久的事派给独立的任务会话在后台跑，结果交回 home session 由它转告，home 不被一件慢事堵住，见 `docs/background-tasks.md`。
 - **改名单不改数据库，也不重启**：`allow_from` / `home_chat` / `allow_tenant` 每条消息、每次投递都从当前配置快照读（§3 热重载第 2 步），文件保存后下一条消息就按新名单判定；`komo config check` 与重载共用同一套校验（id 形态、`home_chat` 所属渠道必须 enabled 且有凭证），校验不过则旧名单继续生效并在 home chat 报错。`komo doctor` 把"某渠道 enabled 但 `allow_from` 为空"当作警告列出。
 - Cron 触发的 Run 来源仍是 Cron（§8.8）；在聊天里 `/answer` 它的介入，不会让它获得交互操作者的身份。
+- **渠道篇幅（2026-10-31，roadmap-muse S5）**：回复要发到聊天渠道的 Run，输入之后追加**一次**一条宿主附上的 user 消息（`komoOrigin = channel`，entry kind `komo.channel`，`data {submission, platform}`）：写明发到哪个平台，先给结论、一般不超过约 150 字、只问能直接回答的那一个问题，长内容写文件给路径或派任务，用户明确要全文时照给。"发到哪"与看客的投递同一个判断（首个输入是 `chat.input` 取它的 peer；内部输入按决定 6 找路径上最近的 peer）；`api` 对端、找不到 peer 的只落一条不带 `model` 的记录，让后续轮次不再去查；TUI / HTTP / Cron 起的 Run 什么都不落；任务会话与 fork 任务不加（结果交回派它的会话转告）。**不放进系统段**：私聊（微信、Telegram）与 TUI 共用 home session，按渠道换系统段会让 home 每换一次渠道就打掉整段前缀缓存；照记忆召回块（§9.4）每 Run 追加，正文只看平台、同一平台逐字相同。代码：`komo-agent` `context/channel.rs`（正文），`komo-gateway` `hooks/channel.rs`（`context_entries` 里排在召回块之后）。
 - **聊天里发来的图片存成本地文件，正文只给路径**（2026-10-22，`channels/inbox.rs`）。入站消息只有文本，所以图片不进消息结构：渠道把它下载下来，按内容哈希存成 `{workspaces_dir}/inbox/{平台}/<哈希前 16 位>.<扩展名>`，在正文**最前面**加一行 `[用户发来一张图片，已存到 <绝对路径>，用 read 查看]`，用户的文字（附言）在后——附言是 `/pending` 时不会被当成命令。模型自己用 `read` 看（§8.3 的工具结果带图），代价是每张图多一轮模型往返，换来 Dispatcher、受理、回放、记忆提取一行都不用认识图片。下载失败不丢消息，正文改成 `[用户发来一张图片，但没能下载：原因]`。先判断这条要不要处理（群里没 @、机器人自己回流的）再下载；同一张图重投落在同一个文件上；单张上限 20 MB（Telegram `getFile` 的上限）；认不出格式也照存（`.bin`，HEIC 之类让模型先 `sips` 转）。放在工作区而不是数据目录：`read` 与 codemode 都读得到。各渠道：微信用 SDK 的 `CdnClient` 下载再 AES 解密；飞书单发的 `image` 与带图的富文本 `post` 都收，走 `GET /im/v1/messages/{id}/resources/{key}?type=image`（**要应���开 `im:resource` 权限**）；Telegram 取 `photo` 里最大的尺寸、附言一起带上，按文件发的 `image/*` 也收。语音、视频、其他文件仍不处理。
 
 ### 11.3 介入在聊天里
@@ -953,6 +961,8 @@ TELEGRAM_BOT_TOKEN=...
 **TUI 不接管整屏。** 它只占终端**最底下**那一小块**视口**（还在动的那一小段 · 状态行 · 命令面板 · 输入框），会话正文一条条**交还给终端自己的回滚区**：滚轮、选中复制、退出之后留在屏幕上的那段记录，都是终端本来就会做的事，不必在这里重做一遍，而且每条正文只画一次，不随每一帧重算。交出去的行**从此不再改**（例外只有整段重画：下面的 `Ctrl-T`，以及终端被拉大拉小——照 pi，尺寸一变就擦屏、擦回滚区、按新宽度从横幅起重交一遍，否则旧视口被终端折行挪位留下残骸，正文也停在旧宽度上；2026-10-19。整段重画就是把整段会话再写一遍，拖动时只画两次：变的第一下当场画，之后尺寸还在变就不画，停下 100ms 再按最后的尺寸补一次——伪终端里 0.34 秒改 20 次尺寸，原来整段重画 19 次、写出 4.7 MB，现在 2 次、0.5 MB），所以"定型"要判得保守：用户那条消息、助手那段回答、跑完（或所属 Run 已结束）的一次调用、一条提示才交；还没收到 `run.accepted` 的提交、草稿里正在写的那一段、还在跑的调用留在视口里逐帧重画。两边不重叠——定型的那一帧它从视口消失、同时出现在回滚区上。**草稿边生成边交**（2026-10-13）：停在代码块之外的空行之前的段落已经定型——渲染器一块一块出行，这一段单独渲染与整段渲染的开头逐行相同——当场交给回滚区（块与块之间空一行，照 pi，2026-10-15：空行只插在后一块之前、头尾不留，所以接缝上那一行由接着交的那一段补；紧跟在一段话下、原文没隔空行的列表不空；标题一、二级不写 `#`，一级加粗加下划线、二级加粗，三级起才留 `###` 前缀），视口只留正在写的那一段；正式的 `message.assistant` 到了只补余下的部分。否则一段几十行的回答生成期间只露出视口里几行尾巴，往上滚也滚不到开头。定稿与交出去的那段对不上（断线后草稿接错）就照实给出整条定稿并说明；Run 没等到定稿就结束了，交出去的半段留着，补一句没写完。**终端模式（输入以 `!` 开头）不给文字提示**：输入框标题不写说明，跑完也不补"为什么"，洋红色的边框与 `!` 已经说清这一条不经模型；只有发出去之前就注定跑不起来的命令（编辑器、分页器、`sudo`……）仍然当场拦下并在提示行里说一句，否则按了 Enter 什么都不发生。`Ctrl-T` 因此是一个**模式**而不是对某一条的展开，管的是整段会话（2026-10-14，照 pi 的 Ctrl-O）：切换时擦掉屏幕与终端的回滚区（先 `ESC[2J` 擦屏、回左上角、再 `ESC[3J` 擦回滚区——反过来，有的终端擦屏时推进回滚区的那一页会留下），从开场横幅起按新模式把整段会话重新交一遍，与平常的一帧一样包在同步输出里。代价是进 TUI 之前终端里的内容一并擦掉。提示没有自己的 seq，记下它出现时已经收到的最后一条事件，重交时排回那条之后（同一个 seq 上排在消息与调用后面），不挤到最后；提示只留最近 50 条，更早的重画后就没有了。
 
 **过一会儿就过时的话不进回滚区**（2026-10-28，交给终端后删不掉）：命令名写错、命令参数不对、补读历史时按 Enter，以及终端模式里发出去之前就被拦下的命令，都在输入框下方的提示行用红色说一句；草稿原样留在框里，下一次按键时清掉提示，改好就能重发，否则错误一直挂在回滚区里，命令原文也没法直接改。Esc / `/cancel` 成功后不发提示，状态行已经写着「已取消」（2026-10-27）。Run 失败也不发提示，原因跟着当前 Run 写在状态行，下一条 Run 开始就换掉；补读历史不会把旧失败逐条重印，否则补读和实时共用 absorb，每次 resume 都会把历史上的失败再印一遍。
+
+**`!` 命令在 TUI 里怎么显示**（2026-11-01）。按下 Enter 后视口里挂一条待确认的行：请求还在等命令时是「⋯ 正在跑…」，会话忙、结果排在收件箱里是「✓ 已跑完，等这一轮结束后进历史…」，跑过 `detach_after_secs` 收到 `detached` 回执就撤掉这一行、记一句「已转后台」。`!` 是 write submission，没有 `run.accepted`，所以对账靠请求键：Gateway 把它写进 `shell.command` entry 的 `data.requestKey`，`legacy_events` 投影出的 `message.user` 追加一格 `shell`（`command` / `request_key` / `exit_code` / `interrupted` / `output`，协议只加不改，旧客户端照旧读 `text`），TUI 见到带同一请求键的那条就撤掉待确认的行。回滚区里这一条画成 `-> !命令` 加输出的开头 12 行（暗色，多出的写「还有 N 行」），不再把给模型的那段「用户直接运行了 shell 命令…」原样再套一层 `-> ` 印出来。
 
 视口的位置由客户端**自己记账**，不用 ratatui 的 inline 视口：后者每次定位都要向终端问一次光标位置，而 crossterm 明写着「`event::read` / `event::poll` 正在进行时这一问会阻塞并超时」——TUI 有一个常驻读键线程，两者不能共存。所以只在**读键线程起来之前**问一次，之后视口的顶边与"缩高度腾出来的那几行空档"全靠自己那两笔账；空档在下一次往回滚区写正文时正好被填回去，输入框从三行缩回一行不会在历史与它之间留下一道再也填不上的缝。整帧包在同步输出（DECSET 2026）里，支持的终端等整帧到齐才上屏。
 
@@ -1216,7 +1226,8 @@ matter_tokens = 600
 # 没有归属的线索要不要推（docs/memory.md §9.4 分层）；false 时它们只能 komo memory search 查到。存量挂好归属之前保持 true。
 push_unattached = true
 # 相关度门槛（docs/memory.md §9.4）：过任一道才留下；0 = 不启用（默认）。
-# 分数随 embedding 模型与前缀变，按自己的向量空间校准后再填，例如 qwen3-embedding:0.6b 无前缀：
+# 分数随 embedding 模型与前缀变，按自己的向量空间校准后再填（`komo memory search --mode keyword|vector|hybrid` 逐条显示对应的分数），
+# 例如 qwen3-embedding:0.6b 无前缀：
 # min_similarity = 0.56
 # min_keyword_score = 1.0
 
@@ -1228,10 +1239,13 @@ push_unattached = true
 model_result_bytes = 30720
 # 单次工具调用的活动执行时限（秒）。bash 的 timeout_secs 会被收紧到它以内：到点是工具自己
 # 杀掉进程组、报超时（可以再发）；只有工具不守时限时执行器才兜底，那一刻报的是"结果不明"。
+# 它也是 TUI `!` 命令的时限（`!` 不用 bash 默认的 120 秒：跑过 detach_after_secs 会转后台，
+# 到这里才终止进程组）。命令型 Cron Job 仍是 bash 默认的 120 秒。
 # 热生效，对下一轮调用立即生效。省略 = 1800。
 call_timeout_secs = 1800
 # 对话会话里的 bash 跑过这么久还没完，就自动转到后台：这次调用先返回「已转后台 #id」，跑完时
 # 退出码与输出尾部作为一条消息交回会话（docs/monitor.md §8）。任务会话与 Cron 的 Run 不转。
+# TUI 的 `!` 命令用同一个阈值转后台，跑完以一条 shell.command 进历史（不交回、不起模型 Run）。
 # 热生效。0 = 不转。省略 = 120。
 detach_after_secs = 120
 # 投影超过这么多字节的成功结果才有资格换成稳定的短视图（抬头 + 首尾整行 + 完整输出引用，§8.3）。
@@ -1753,4 +1767,5 @@ Memory 与模型验收覆盖：
 | Anthropic 修订工具结果时补的第 4 个缓存断点实际命中率 | §8.3 的衰减与提示缓存 | **Responses 后端已有实测（2026-10-10，会话 01a12475-…，magpie、claude-opus-5-5）**：首版按次数逐条改写，10 轮 run 里 `cache_read` 四次退回 13317（只剩系统提示 + 工具表），全价输入 85k（约 53k 是失效重写），折算成本与 Claude Code 持平——自动前缀缓存下改写中间一条就是整段失效，由此改成缓存优先（§8.3）。**Anthropic 的未验证。** 补在被改结果之前那条 user 消息末块——它正是更早某次请求的末尾断点；命中要看 `cache_read` 是否覆盖到那里。命中不了就退回"系统提示 + 工具表"两级，衰减省下的读取要重新算账 |
 | 工作目录里的项目规范（`AGENTS.md` / `CLAUDE.md`）进不进提示、怎么找 | §4.3 冻结、`docs/agent.md` §10 的提示顺序 | **已做（2026-10-13），真实会话未验证。** 起因：pi 会话 01a132e5 在 komo-bot 目录里启动，第一轮就带着 `AGENTS.md`；komo 会话 01a11fda 的工作目录是 `workspaces/`，前 3 轮花在找源码、之后手动 `cat AGENTS.md`。规则照 pi 的 `loadProjectContextFiles`：从工作目录一直往上走到 `/`（不停在 git 根或家目录），每层按 `AGENTS.override.md` → `AGENTS.md` → `AGENTS.MD` → `CLAUDE.md` → `CLAUDE.MD` 取第一个读得出来的普通文件，外层在前、提示里说明冲突以靠后的为准；不加全局文件（Profile 的 `instructions` 就是那一份），不做 git worktree 去重。每条 Run 受理时找一次，正文冻结进 `payloads/`（`RunSnapshot.project_files_ref`），续跑按引用读回、读不出来按会话缺内容停下；Cron 与旧行没有快照，兜底身份现场找。只进主 Agent 的提示（komo 自查之后、Skills 之前）；子代理继承父快照但不渲染。**没有大小上限**（pi 也没有）：大文件整份进每一段的提示前缀，改了文件下一条 Run 的前缀缓存从这一块起失效——真实会话的 token 代价待看。测试：`service::project_files::tests`、`context::prompt::tests` 的两条 project_files、e2e `project_files_are_frozen_at_acceptance_like_the_profile`。**改为会话级沿用（2026-10-14）**：起因是 komo 会话 01a13a9e 里 agent 改了 vault 的 `AGENTS.md`，之后两条 Run 的系统提示前缀从这一块起失效，缓存读从 11.7K 掉到 7.7K。现在同一会话（同一 Agent、同一工作目录）的新 Run 沿用上一条主 Run 的 `project_files_ref`，系统提示逐字不变；受理时现场找到的不一样就另存为 `RunSnapshot.project_files_update_ref`，回放时补在这条 Run 的任务消息后面（`prompt::project_update_block`，全删了也明说）。做在 Gateway 的冻结与装配两层，三个 provider 适配器不动。e2e 同名测试改为断言三次请求的系统提示逐字相同、新版只出现在新 Run 的任务后面 |
 | 在 Gateway 自己的 `bash` 里 `komo gateway restart` / `stop` 推迟执行（§3） | TUI 的 `!` 与模型发起的重启不再卡住、不再把那条 Run 停在等人上 | **单元测试已过，真机未验证（2026-10-13）。** launchd 一支要在 Mac 上装新二进制后跑一次 `!komo gateway restart`：命令立刻返回、Run 正常结束、约 1.5 秒后 Gateway 换了实例、TUI 说"事件订阅已恢复"，`logs/gateway-restart.log` 里是"Gateway 已重启"。systemd 一支（`systemd-run --user --on-active=2`）要在 Fedora 上同样跑一次；`systemd-run` 起不来时命令直接报错，不会退回同步重启 |
+| TUI 的 `!` 命令转后台（决定 9，`docs/monitor.md` §8，2026-11-01） | `!scripts/install-local.sh` 这类超过阈值的命令不再被杀；结果落进历史后 TUI 的待确认行消失 | **测试已过（`run_tests::a_bang_command_past_the_threshold_detaches_and_lands_when_it_ends`、`…stopping_the_gateway_ends_a_detached_bang_command…`），真机未验证。** 装机后在 TUI 里跑一次 `!sleep 150; echo ok`：约 120 秒显示「已转后台」，输入框可用，150 秒左右 `!sleep…` 与 `ok` 进历史；再跑一次 `!cd ~/code/komo-bot && scripts/install-local.sh`：构建跑完、装上、Gateway 推迟重启，重启后历史里有那条命令的结果 |
 | 监听（`monitor`）在 Linux 与真实会话上的行为（§6.1「监听」） | `docs/monitor.md` §5 的停机 / 遗留进程组回收；事件经 home 转告到聊天的打扰程度 | **macOS 上测试已过，Linux 与真实会话未验证（2026-10-14）。** 四条端到端测试（`komo-gateway/tests/monitor`）只在 macOS 上跑过，那里没有 bwrap。Linux 上要核实两件：bwrap 的 `--die-with-parent` 让 Gateway 崩溃时脚本随之退出（遗留进程组那一支走不到）；systemd `stop` 时进程组在 `Running::stop` 里先被终止、登记留给下一代。真实会话要看：盯一条 MR 流水线时每条事件的转告是否太吵——太吵就加"这条不用说"的出口，而不只靠脚本过滤 |

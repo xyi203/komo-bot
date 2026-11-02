@@ -23,6 +23,7 @@
 
 use std::collections::BTreeSet;
 
+use komo_kernel::events::ShellCommand;
 use komo_kernel::fold::SurfaceMessage;
 use komo_kernel::types::ids::{RunId, Seq, ToolCallId};
 use komo_kernel::types::status::ToolCallState;
@@ -190,6 +191,21 @@ impl Emitted {
         for pending in &app.pending_submissions {
             let mut block = user_lines(&pending.text, width);
             let (label, style) = match &pending.state {
+                // `!` 的请求要等命令跑完（或转后台）才回：这段时间里它在跑，不是在发。
+                SubmissionState::Sending if pending.shell => (
+                    "  ⋯ 正在跑…".to_string(),
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::DIM),
+                ),
+                SubmissionState::Submitted { queued: true, .. } if pending.shell => (
+                    "  ✓ 已跑完，等这一轮结束后进历史…".to_string(),
+                    Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM),
+                ),
+                SubmissionState::Submitted { .. } if pending.shell => (
+                    "  ✓ 已跑完，等待事件同步…".to_string(),
+                    Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM),
+                ),
                 SubmissionState::Sending => (
                     "  ↥ 发送中…".to_string(),
                     Style::default()
@@ -415,6 +431,11 @@ fn message_lines(message: &SurfaceMessage, width: u16) -> Vec<Line<'static>> {
             }
             lines.push(dim(&format!("{ABSORBED_MARK}{excerpt}")));
         }
+        Role::User if message.shell.is_some() => {
+            if let Some(shell) = &message.shell {
+                lines.extend(shell_lines(shell, width));
+            }
+        }
         Role::User => {
             if let Some(text) = message.text.as_deref() {
                 lines.extend(user_lines(text, width));
@@ -514,6 +535,35 @@ fn user_lines(text: &str, width: u16) -> Vec<Line<'static>> {
         .collect()
 }
 
+/// `!` 命令的输出在回滚区里最多印这么多行；完整输出在引用里，模型下一轮看得见。
+const SHELL_PREVIEW_LINES: usize = 12;
+
+/// `!` 命令那一条：`-> !命令`，下面是输出的开头几行（暗色、对齐在命令下）。给模型的那句说明不印。
+fn shell_lines(shell: &ShellCommand, width: u16) -> Vec<Line<'static>> {
+    let mut lines = user_lines(&format!("!{}", shell.command), width);
+    let indent = " ".repeat(markdown::display_width(USER_MARK));
+    if let Some(output) = shell.output.as_deref() {
+        let all: Vec<&str> = output.trim_end().lines().collect();
+        for line in all.iter().take(SHELL_PREVIEW_LINES) {
+            for piece in markdown::wrap_to_width(line, body_width(width)) {
+                lines.push(dim(&format!("{indent}{piece}")));
+            }
+        }
+        if all.len() > SHELL_PREVIEW_LINES {
+            lines.push(dim(&format!(
+                "{indent}…（还有 {} 行）",
+                all.len() - SHELL_PREVIEW_LINES
+            )));
+        }
+    }
+    if shell.interrupted {
+        lines.push(dim(&format!(
+            "{indent}（Gateway 停机时它还没跑完，已被终止）"
+        )));
+    }
+    lines
+}
+
 /// 折行，**先按真正的换行切开**。
 ///
 /// 少了第一步，一段多行正文会被当成一整行拿去折，换行原样留在行里——交给终端就是一级
@@ -584,6 +634,7 @@ mod tests {
             provider_blocks: None,
             absorbed_from: None,
             project_update: true,
+            shell: None,
         };
         let shown = text_of(&message_lines(&message, 80));
         assert!(shown.starts_with("-> 再说一句"), "{shown}");
@@ -592,6 +643,67 @@ mod tests {
             "{shown}"
         );
         assert_eq!(shown.lines().count(), 2, "{shown}");
+    }
+
+    /// `!` 命令：跑着时说在跑，遇忙排队时说等这一轮；带同一请求键的 `shell.command` 一到，待确认的行
+    /// 就没了，回滚区里是 `-> !命令` 加输出的开头几行，不印给模型的那句说明。
+    #[test]
+    fn a_bang_result_replaces_its_pending_line_and_shows_the_command_and_output() {
+        let mut app = App::new(Some(fixture::session()), TuiMode::New, "seed");
+        app.input.set("!ls");
+        let effects = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let [Effect::Submit { request_key, .. }] = effects.as_slice() else {
+            panic!("{effects:?}");
+        };
+        let mut emitted = Emitted::new();
+        assert!(text_of(&emitted.live(&app, 80)).contains("正在跑"));
+
+        app.apply(ServerEvent::Submitted {
+            request_key: request_key.clone(),
+            response: Box::new(komo_kernel::protocol::http::SubmitRunResponse {
+                run: komo_kernel::types::ids::RunId::from_raw("7"),
+                session: fixture::session(),
+                seq: Seq(1),
+                state: komo_kernel::types::status::RunState::Queued,
+                deduplicated: false,
+                detached: false,
+            }),
+        });
+        let live = text_of(&emitted.live(&app, 80));
+        assert!(live.contains("等这一轮结束后进历史"), "{live}");
+
+        let output: String = (1..=20).map(|n| format!("line-{n}\n")).collect();
+        let said = format!("用户直接运行了 shell 命令 `ls`（不是你调用的）：\n\n{output}");
+        feed(
+            &mut app,
+            &[fixture::event(
+                1,
+                None,
+                komo_kernel::events::EventPayload::MessageUser(komo_kernel::events::MessageUser {
+                    text: Some(said),
+                    text_ref: None,
+                    project_update: false,
+                    shell: Some(ShellCommand {
+                        command: "ls".into(),
+                        request_key: Some(request_key.clone()),
+                        exit_code: Some(0),
+                        interrupted: false,
+                        output: Some(output),
+                    }),
+                }),
+            )],
+        );
+        assert!(app.pending_submissions.is_empty(), "待确认的行没了");
+        let settled = text_of(&emitted.take(&app, 80));
+        assert!(settled.contains("-> !ls"), "{settled}");
+        assert!(settled.contains("line-1"), "{settled}");
+        assert!(settled.contains("line-12"), "{settled}");
+        assert!(!settled.contains("line-13"), "只给开头几行：{settled}");
+        assert!(settled.contains("还有 8 行"), "{settled}");
+        assert!(!settled.contains("用户直接运行了"), "{settled}");
+        assert!(!settled.contains("等待事件同步"), "{settled}");
+        let live = text_of(&emitted.live(&app, 80));
+        assert!(!live.contains("!ls"), "{live}");
     }
 
     /// 提问用 `->` 开头，不是「你」——这是一行命令提示符，不是一句对白。

@@ -268,6 +268,9 @@ const BASH_TOOL: &str = "bash";
 /// 的排查经验，由 Agent 自己 `komo memory search`，替代宿主在 Run 中途插召回。静态文字，不
 /// 影响前缀；查到的按注入块同一套规则用（约定照做、线索先核实）。
 ///
+/// 「找别的会话」那句（2026-10-31，roadmap-muse S3）：用户说"刚才在飞书里那篇文章"时，模型曾
+/// `komo session list` + `session export` 再 grep 才找到另一个会话里的链接。静态文字，不影响前缀。
+///
 /// 「目标与领域」那句（2026-10-29，`docs/goals.md` §4）：事项由 Agent 在 Run 里当场记，用户在场、
 /// 上下文齐全；后台提取不建事项。静态文字，不影响前缀。末尾补一句挂触发器（P1e，§8）：等待时 monitor
 /// 盯着、交回来再 resume。
@@ -286,6 +289,8 @@ const SELF_BLOCK: &str = "komo 自己的状态（cron、会话 / Run、记忆、
                           注入的记忆不够用、或者报错之后想看以前的排查经验，用 \
                           `komo memory search \"关键词\"` 查；查到的按同样的规则用——约定照做，\
                           线索先核实。\
+                          用户提到别的会话、别的渠道里的事（\"刚才在飞书里那篇\"），用 \
+                          `komo session search \"关键词\"` 找到会话与片段，别 export 整个会话去 grep。\
                           用户说开始做某事、开始管某事、在等某人某事、先放一放、办完了、不管了，\
                           就当场用 `komo goal` / `komo area` 记下（`komo goal --help`）；推进时用 \
                           `komo goal next` 更新下一步；目标转等待时通常顺手挂个 monitor 盯着，用 \

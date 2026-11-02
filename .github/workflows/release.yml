@@ -33,9 +33,10 @@ jobs:
             exit 1
           fi
 
+  # 不 needs guard：guard 不给打包传任何东西，两者并行；不对版本的标签由 release 的 needs 拦在发布前。
+  # 这样 workflow_dispatch（guard 被跳过）也能照常打包——依赖一个被跳过的 job 会连带跳过。
   package:
     name: Package ${{ matrix.asset_suffix }}
-    needs: guard
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -64,7 +65,7 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - uses: Swatinem/rust-cache@v2
+      # 不挂 rust-cache：标签各自是一个 ref，存下的缓存别的标签读不到，只白占仓库 10 GB 配额。
 
       - name: Build
         run: |
@@ -94,7 +95,7 @@ jobs:
 
   release:
     name: Publish Release
-    needs: package
+    needs: [guard, package]
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     permissions:

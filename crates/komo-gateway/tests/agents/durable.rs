@@ -609,9 +609,10 @@ async fn a_background_task_reports_back_through_home() {
     let home_row = core(&gateway).session(&home_session).await.unwrap();
     let receipts = tool_results(&gateway, home_row.root_conversation).await;
     assert!(
-        receipts
-            .iter()
-            .any(|(_, text)| text.contains(&format!("已派出 #{}", task.conversation))),
+        receipts.iter().any(|(_, text)| text.contains(&format!(
+            "已派出 #{}",
+            komo_kernel::types::handle::short_handle(task.conversation.get())
+        ))),
         "{receipts:?}"
     );
 
@@ -764,6 +765,9 @@ async fn a_chat_message_is_absorbed_into_a_running_home_and_its_channel_is_told(
 /// home 还在跑时交回的结果在一轮收尾后并进那条 Run（`run.absorbed`），不另开一条
 /// （§6 插话，§14 `task` 验收 ③）：home 派出任务后停在一道门上，任务跑完、结果交回时 home
 /// 还在跑；门开之后那一轮收尾，结果并进来，home 接着把它转告出去。
+///
+/// `task` 与 `gate` 必须在同一轮：分两轮时中间隔着一个 postTools boundary，任务跑得比 home 快就在
+/// 那里先并进来，脚本模型改去转告、根本不调 `gate`，home 没等门就收尾了。
 ///
 /// 改了做法：Legacy 等交回的 Run 出现再看它终态；新版交回的输入是 home 里请求键 `task-result:…` 的
 /// submission，出现即可（它要等宿主收尾才结算），之后看它的 run 状态是 `absorbed`。

@@ -62,6 +62,11 @@ enum Command {
         #[command(subcommand)]
         action: InterventionCommand,
     },
+    /// 监听清单（`monitor` 工具挂的、转后台的 bash）；只读，停监听用 monitor_stop 或删会话（docs/monitor.md）。
+    Monitor {
+        #[command(subcommand)]
+        action: MonitorCommand,
+    },
     /// 管理定时任务（§10）。
     Cron {
         #[command(subcommand)]
@@ -134,6 +139,14 @@ enum SessionCommand {
         #[arg(long)]
         all: bool,
     },
+    /// 在各会话的标题与正文里找关键词（空白分开的几个词要在同一条消息里），给出会话、片段与能接着查的 ID。
+    Search {
+        /// 关键词。
+        query: String,
+        /// 最多给几个会话（默认 10，上限 50）。
+        #[arg(long)]
+        limit: Option<u32>,
+    },
     /// 逻辑删除一个会话：进 `closing`，不再接受新输入，**内容一个字节都不动**（§8.10）。
     Delete {
         /// 会话 ID。
@@ -154,6 +167,16 @@ enum SessionCommand {
     Purge {
         /// 会话 ID。
         session_id: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum MonitorCommand {
+    /// 列出还在跑的监听：短号、已跑多久、距截止多久、标题、挂它的会话与脚本。
+    List {
+        /// 带上已结束的（登记里留着的最近几十条）。
+        #[arg(long)]
+        all: bool,
     },
 }
 
@@ -305,7 +328,8 @@ enum MemoryCommand {
         #[arg(long)]
         full: bool,
     },
-    /// 检索；支持 hybrid / keyword / vector（§9.4）。
+    /// 检索；支持 hybrid / keyword / vector（§9.4）。`id@版本` 后一列是相关度分数：关键词臂对照
+    /// `min_keyword_score`，余弦对照 `min_similarity`。
     Search {
         /// 查询词。
         query: String,
@@ -678,6 +702,9 @@ async fn operator(
     match command {
         Command::Session { action } => match action {
             SessionCommand::List { all } => commands::session_list(client, all).await,
+            SessionCommand::Search { query, limit } => {
+                commands::session_search(client, &query, limit).await
+            }
             SessionCommand::Delete { session_id, now } => {
                 commands::session_delete(client, &session_id, now).await
             }
@@ -858,6 +885,9 @@ async fn operator(
                 MemoryIndexCommand::Status => commands::memory_index(client).await,
                 MemoryIndexCommand::Rebuild => commands::memory_rebuild(client).await,
             },
+        },
+        Command::Monitor { action } => match action {
+            MonitorCommand::List { all } => commands::monitor_list(client, all).await,
         },
         Command::Goal { action } => matters::goal(client, action).await,
         Command::Area { action } => matters::area(client, action).await,

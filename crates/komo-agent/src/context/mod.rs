@@ -5,6 +5,7 @@
 //! I/O 才能获得的事实凑齐，传进来的必须已经是**读到的正文**，不是"去哪读"的指针。
 //! 回放消息不在这里：新存储的上下文由 kernel 的 `durable` 从 entry 推出来。
 
+pub mod channel;
 pub mod compaction;
 pub mod memory;
 mod prompt;

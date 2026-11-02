@@ -2,35 +2,109 @@ name: CI
 
 on:
   push:
-    branches: ["**"]
+    branches: [main]
+    # 只改文档的提交不跑。与下面 changes job 的过滤保持同一份清单。
+    paths-ignore:
+      - "**/*.md"
+      - "docs/**"
+      - "apps/**"
+  # PR 不在触发器上按路径过滤：整条 workflow 被跳过时，必需检查会一直挂在 pending，PR 合不进去。
+  # 改为 workflow 照常触发、由 changes job 判断，测试 job 被 if 跳过时结果仍计为通过。
   pull_request:
+  workflow_dispatch:
+
+concurrency:
+  # PR 连推只跑最新一次，旧的取消。main 每个提交都要完整跑完：组名带 run_id，各自成组——
+  # 只关 cancel-in-progress 不够，同组里排队等待的那一条仍会被更新的一条顶掉。
+  group: ci-${{ github.ref == 'refs/heads/main' && github.run_id || github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
+  # CI 不要调试信息：自己的 crate 少编少链，缓存也更小；panic 位置照样带文件行号。
+  CARGO_PROFILE_DEV_DEBUG: "0"
 
 jobs:
-  check:
+  changes:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: read
+    outputs:
+      code: ${{ steps.filter.outputs.code }}
+    steps:
+      # pull_request 事件下走 API 取改动文件，不用 checkout。
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          predicate-quantifier: every
+          filters: |
+            code:
+              - "**"
+              - "!**/*.md"
+              - "!docs/**"
+              - "!apps/**"
+
+  fmt:
+    needs: changes
+    # push / workflow_dispatch 时 changes 被跳过，outputs 为空，照常跑。
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - run: rustup component add rustfmt
+      - run: cargo fmt --all -- --check
 
-      - name: Install Rust
-        run: rustup show && rustup component add rustfmt
+  # 耗时大头是编译（每台都要全量编，跨 crate 拆不开：gateway 的测试要 workspace 一起编出来的
+  # fixture），其次是 ~340 CPU 秒的测试。按 nextest 分片拆到三台，每台只跑三分之一。
+  test:
+    name: test (${{ matrix.partition }}/3)
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        partition: [1, 2, 3]
+    steps:
+      - uses: actions/checkout@v4
 
+      # 三片编的东西一样，共用一份缓存，只由第 1 片在 main 上保存：PR 的缓存别的 ref 用不上，
+      # 只会挤占仓库 10 GB 配额。
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: test
+          save-if: ${{ matrix.partition == 1 && github.ref == 'refs/heads/main' }}
 
-      - name: cargo fmt --check
-        run: cargo fmt --all -- --check
-
-      - name: cargo test --workspace
-        run: cargo test --workspace
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
 
       # §13.4：`cargo tree -d` 进入 CI，出现新的重复版本要有理由。
       # W0 只收集输出存成 artifact，暂不做失败判定。
       - name: cargo tree -d
+        if: matrix.partition == 1
         run: cargo tree -d --workspace > cargo-tree-duplicates.txt || true
 
       - uses: actions/upload-artifact@v4
+        if: matrix.partition == 1
         with:
           name: cargo-tree-duplicates
           path: cargo-tree-duplicates.txt
+
+      - name: cargo nextest run
+        run: cargo nextest run --workspace --partition slice:${{ matrix.partition }}/3
+
+      # nextest 不跑 doctest。
+      - name: cargo test --doc
+        if: matrix.partition == 1
+        run: cargo test --workspace --doc
+
+  # 分支保护的必需检查指向这一个：分片数变了名字不变；文档 PR 里测试被跳过时它照样给出结果。
+  ci:
+    name: CI result
+    if: always()
+    needs: [changes, fmt, test]
+    runs-on: ubuntu-latest
+    steps:
+      - if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
+        run: exit 1

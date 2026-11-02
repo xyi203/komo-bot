@@ -6,7 +6,7 @@
 //!
 //! 与 Legacy 版本不同的断言各有理由，写在对应测试的注释里；共同的两条：
 //!
-//! - **句柄是监听 id**（工具任务的 ID，十进制），不再是 UUID 后四位；
+//! - **句柄由监听 id 算出**（工具任务的 ID 经 `komo_kernel::types::handle` 得到的 6 位字母数字），不再是 UUID 后四位；
 //! - **登记在 `komo.monitors`**，"登记删掉"变成"登记里这条已 `ended`（理由是……）"。
 
 use std::path::Path;
@@ -169,6 +169,61 @@ async fn stopping_kills_the_script_and_reports_nothing_more() {
     );
     let records = registry(&gateway).await;
     assert_eq!(ended_reason(&records[0]), Some("stopped"), "{records:?}");
+
+    gateway.stop().await;
+}
+
+/// `GET /v1/monitors`（`komo monitor list`，S4）：默认只列还在跑的，带短号与挂它的会话；停掉之后
+/// 默认清单空了，`all=true` 里是 `ended(stopped)`。
+#[tokio::test]
+async fn the_monitor_list_shows_live_ones_with_their_session() {
+    let llm = MonitorLlm::new(Duration::ZERO);
+    let mut gateway = start(&llm, None).await;
+    let (session, id) = arm(&gateway, "while true; do sleep 0.2; done").await;
+
+    let (status, body) = gateway.get_json("/v1/monitors").await;
+    assert_eq!(status, 200, "{body}");
+    let monitors = body["monitors"].as_array().expect("数组");
+    assert_eq!(monitors.len(), 1, "{body}");
+    assert_eq!(monitors[0]["handle"], id.as_str());
+    assert_eq!(monitors[0]["session"], session.as_str());
+    assert_eq!(monitors[0]["state"], "running");
+
+    gateway.soft_delete(&session).await;
+    let (_, body) = gateway.get_json("/v1/monitors").await;
+    assert!(body["monitors"].as_array().unwrap().is_empty(), "{body}");
+    let (_, body) = gateway.get_json("/v1/monitors?all=true").await;
+    assert_eq!(body["monitors"][0]["state"], "ended", "{body}");
+    assert_eq!(body["monitors"][0]["reason"], "stopped", "{body}");
+
+    gateway.stop().await;
+}
+
+/// 删会话时停掉它名下的监听（S2，`docs/background-tasks.md` §2e）：进程组没了，登记 `ended{stopped}`，
+/// 不在要删的会话里交回结束消息。
+#[tokio::test]
+async fn deleting_the_session_stops_its_monitors_without_an_end_message() {
+    let llm = MonitorLlm::new(Duration::ZERO);
+    let mut gateway = start(&llm, None).await;
+
+    let marker = gateway.home.join("still-running");
+    let (session, _id) = arm(
+        &gateway,
+        &format!("while true; do touch {}; sleep 0.2; done", marker.display()),
+    )
+    .await;
+    gateway.soft_delete(&session).await;
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let _ = std::fs::remove_file(&marker);
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    assert!(!marker.exists(), "删会话之后脚本还在跑");
+    let records = registry(&gateway).await;
+    assert_eq!(ended_reason(&records[0]), Some("stopped"), "{records:?}");
+    assert!(
+        submissions_keyed(&gateway, "monitor-end:").await.is_empty(),
+        "会话在删，不该再交回结束消息"
+    );
 
     gateway.stop().await;
 }

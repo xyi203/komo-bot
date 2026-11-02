@@ -36,6 +36,45 @@ async fn always_delivers_a_good_run() {
     gw.stop().await;
 }
 
+/// 不说话（S1）：prompt Job 的回答整段是 `NO_REPLY` 时触发照记 `ok`，`always` 下也不投——
+/// 同命令型 Job 的空 stdout。
+#[tokio::test]
+async fn a_silent_reply_settles_ok_but_delivers_nothing() {
+    let home = Home::new();
+    let gw = home
+        .start(FakeLlm::always(vec![text_round(1, "NO_REPLY")]))
+        .await;
+    let job = gw.add_job(daily("always")).await;
+    let before = gw.home.texts().len();
+    gw.make_due(&job.id).await;
+    let run = gw.tick().await.fired[0].run.clone();
+    gw.wait_state(&run, |s| s.is_terminal(), "终态").await;
+
+    let mut settled = false;
+    for _ in 0..100 {
+        if gw
+            .firings(&job.id)
+            .await
+            .first()
+            .map(|f| f.status)
+            .is_some_and(|s| s == komo_kernel::cron::FiringStatus::Ok)
+        {
+            settled = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(settled, "这一次触发应当已经记成 ok");
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert_eq!(
+        gw.home.texts().len(),
+        before,
+        "记号不该多出一条投递：{:?}",
+        gw.home.texts()
+    );
+    gw.stop().await;
+}
+
 /// `on_error`：跑成了**不投**，但一次等待照样投——那是任务在**问**，不是在报告。
 #[tokio::test]
 async fn on_error_keeps_quiet_about_a_good_run_but_never_about_a_wait() {

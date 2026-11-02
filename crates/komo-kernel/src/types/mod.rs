@@ -7,6 +7,7 @@ pub mod agent;
 pub mod chat;
 pub mod delegate;
 pub mod digest;
+pub mod handle;
 pub mod ids;
 pub mod matter;
 pub mod memory;

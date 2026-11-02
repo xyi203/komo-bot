@@ -4,36 +4,37 @@
 //! `sessions` 里的行（`kind = task`、UUIDv7、`parent_session`、标题）也是 runtime 派出那次提交里
 //! 写的。这里只给 gateway 要**说给人听**的那几句：
 //!
-//! - **短号统一是 `#<子 conversation ID>`**（[`handle`] / [`parse_handle`]）：模型在回执里看到的
-//!   `已派出 #12`、`task_id: "12"`、监听的 `#id` 同一种写法，不再有旧的"UUID 后四位"。任务会话的根
-//!   conversation 就是那个子 conversation（`SessionRecord::root_conversation`）。
+//! - **短号是 6 位小写字母加数字**（2026-10-31，[`handle`] / [`parse_handle`]，算法在
+//!   `komo_kernel::types::handle`）：子 conversation ID 经固定密钥的可逆置换再转 base36，模型在回执里
+//!   看到的 `已派出 #k3x9qa`、`task_id: "k3x9qa"`、监听的 `#短号` 同一种写法。老的纯数字（`#12`）解析
+//!   时还收，不再往外给。任务会话的根 conversation 就是那个子 conversation（`SessionRecord::root_conversation`）。
 //! - [`TaskLine`]：一个任务会话现在的样子（标题、父会话、跑着 / 排队 / 上一次怎么收的尾），
 //!   [`TaskLine::render`] 是一行给操作者看的话；`/status`、`/pending` 一类渠道命令（W3a）直接用。
 //! - [`DurableCore::task_label`]：任务会话里那些"需要你判断"的消息前面挂的标签
 //!   `后台任务 #12「查空调」`，操作者在聊天里同时看着几个任务时靠它分清是哪一个在问。
 //!
-//! 已知差异：`komo session list` 的"任务·#xxxx"标注由 `komo-client` 按会话 ID 的后四位算（协议冻结，
-//! 客户端不动），所以在 Durable 下它与这里的 `#<conversation>` 对不上；以聊天与回执里的为准，
-//! 客户端侧留给 D6 之后。
+//! `komo session list` 的"任务·#短号"由 `SessionSummary.task` 带过去（2026-10-31 起与这里同一个短号）；
+//! 老 Gateway 不带这一格时客户端仍按会话 ID 后四位算。
 
 use komo_kernel::durable::{ConversationId, SessionKind, SessionLifecycle, SessionRecord};
+use komo_kernel::types::handle::{self as short, short_handle};
 use komo_runtime::durable::harness::{Harness, task_doc};
 
 use super::DurableCore;
 use super::sessions::SessionError;
 
-/// 任务短号：`#<conversation>`。
+/// 任务短号：`#` 加子 conversation 的 6 位短号。
 pub fn handle(conversation: ConversationId) -> String {
-    format!("#{conversation}")
+    format!("#{}", short_handle(conversation.get()))
 }
 
-/// 解析模型 / 操作者写的任务短号：`12`、`#12`、` #12 `。
-pub fn parse_handle(raw: &str) -> Option<ConversationId> {
-    raw.trim()
-        .trim_start_matches('#')
-        .parse::<u64>()
-        .ok()
+/// 模型 / 操作者写的任务短号可能指的子 conversation（`k3x9qa`、`#K3X9QA`，老的 `#12` 也收）。
+/// 不止一个候选时由调用方在自己的范围里认。
+pub fn parse_handle(raw: &str) -> Vec<ConversationId> {
+    short::parse_handle(raw)
+        .into_iter()
         .map(ConversationId::new)
+        .collect()
 }
 
 /// 一个任务现在跑到哪了（一句话的口径）。
@@ -51,7 +52,7 @@ pub enum TaskPhase {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskLine {
-    /// 子 conversation，句柄 `#id`。
+    /// 子 conversation，句柄见 [`handle`]。
     pub conversation: ConversationId,
     /// 任务会话的 Session ID。
     pub session: String,
@@ -68,7 +69,7 @@ impl TaskLine {
         handle(self.conversation)
     }
 
-    /// `#12「查空调」· 运行中（第 2 轮）`。
+    /// `#1lxxbx「查空调」· 运行中（第 2 轮）`。
     pub fn render(&self) -> String {
         let phase = match &self.phase {
             TaskPhase::Running { rounds } => format!("运行中（已 {rounds} 轮）"),
@@ -162,14 +163,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_handle_is_the_conversation_number_with_a_hash_and_parses_back_loosely() {
+    fn a_handle_is_six_letters_and_digits_and_parses_back_loosely() {
         let conversation = ConversationId::new(12);
-        assert_eq!(handle(conversation), "#12");
-        for raw in ["12", "#12", "  #12 "] {
-            assert_eq!(parse_handle(raw), Some(conversation), "{raw}");
+        assert_eq!(handle(conversation), "#1lxxbx");
+        for raw in ["1lxxbx", "#1lxxbx", "  #1LXXBX ", "12", "#12"] {
+            assert_eq!(parse_handle(raw), vec![conversation], "{raw}");
         }
-        for raw in ["", "#", "zzzz", "-1", "1a2b"] {
-            assert_eq!(parse_handle(raw), None, "{raw}");
+        for raw in ["", "#", "-1", "1a2b"] {
+            assert!(parse_handle(raw).is_empty(), "{raw}");
         }
     }
 
@@ -183,11 +184,11 @@ mod tests {
             lifecycle: SessionLifecycle::Active,
             phase: TaskPhase::Running { rounds: 2 },
         };
-        assert_eq!(line.render(), "#12「查空调」· 运行中（已 2 轮）");
+        assert_eq!(line.render(), "#1lxxbx「查空调」· 运行中（已 2 轮）");
         line.phase = TaskPhase::Finished("completed".into());
-        assert_eq!(line.render(), "#12「查空调」· 已完成");
+        assert_eq!(line.render(), "#1lxxbx「查空调」· 已完成");
         line.phase = TaskPhase::Queued;
         line.lifecycle = SessionLifecycle::Deleted;
-        assert_eq!(line.render(), "#12「查空调」· 排队中（已删除）");
+        assert_eq!(line.render(), "#1lxxbx「查空调」· 排队中（已删除）");
     }
 }

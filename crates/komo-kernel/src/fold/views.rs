@@ -44,6 +44,9 @@ pub struct SurfaceMessage {
     /// 用户消息后面附了会话中改过的项目规范（[`MessageUser::project_update`](crate::events::MessageUser)）。
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub project_update: bool,
+    /// 这一条是 `!` 命令（[`MessageUser::shell`](crate::events::MessageUser)）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shell: Option<crate::events::ShellCommand>,
 }
 
 /// 回放面上的一条工具结果。

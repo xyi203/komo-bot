@@ -4,7 +4,7 @@ use komo_kernel::events::{Event, EventPayload};
 use komo_kernel::protocol::http::InterventionSummary;
 use komo_kernel::protocol::nested::calls_of;
 use komo_kernel::protocol::sse::{SseEvent, SseFrame};
-use komo_kernel::types::ids::RunId;
+use komo_kernel::types::ids::{RequestKey, RunId};
 use komo_kernel::types::refs::ToolResultStatus;
 use komo_kernel::types::status::{RunState, ToolCallState};
 
@@ -251,6 +251,27 @@ impl App {
                 request_key,
                 response,
             } => {
+                // `!` 命令转了后台：这条待确认的行到此为止，结果跑完以一条 `shell.command` 进历史。
+                if response.detached {
+                    if let Some(at) = self
+                        .pending_submissions
+                        .iter()
+                        .position(|pending| pending.request_key == request_key)
+                    {
+                        let pending = self.pending_submissions.remove(at);
+                        self.note(format!(
+                            "{} 已转后台：命令接着跑，跑完输出进历史。Gateway 重启会丢掉它",
+                            pending.text
+                        ));
+                    }
+                    return Vec::new();
+                }
+                // 重发命中了早就落进历史的 `!` 命令：那条 `shell.command` 已经折过了，不会再来一次。
+                if self.shell_landed(&request_key) {
+                    self.pending_submissions
+                        .retain(|pending| pending.request_key != request_key);
+                    return Vec::new();
+                }
                 if let Some(pending) = self
                     .pending_submissions
                     .iter_mut()
@@ -259,6 +280,7 @@ impl App {
                     pending.state = SubmissionState::Submitted {
                         run: response.run.clone(),
                         deduplicated: response.deduplicated,
+                        queued: response.state == RunState::Queued,
                     };
                 }
                 Vec::new()
@@ -381,6 +403,17 @@ impl App {
             .collect();
     }
 
+    /// 带着这个请求键的 `!` 命令已经折进消息面了。
+    fn shell_landed(&self, key: &RequestKey) -> bool {
+        self.surface.messages.iter().any(|message| {
+            message
+                .shell
+                .as_ref()
+                .and_then(|shell| shell.request_key.as_ref())
+                == Some(key)
+        })
+    }
+
     /// 吃进一条 JSONL 事件：折进 Surface，再补两张 Surface 说不出的边表。
     fn absorb(&mut self, event: &Event) {
         // 补读与订阅各读各的一段（订阅从游标之后起），照理不会重叠；真重了也不能把用量
@@ -410,6 +443,17 @@ impl App {
             self.follow(run, &event.payload);
         }
         match &event.payload {
+            // `!` 命令是 write，没有 `run.accepted`：它的消息带着提交时的请求键。
+            EventPayload::MessageUser(body) => {
+                if let Some(key) = body
+                    .shell
+                    .as_ref()
+                    .and_then(|shell| shell.request_key.as_ref())
+                {
+                    self.pending_submissions
+                        .retain(|pending| &pending.request_key != key);
+                }
+            }
             EventPayload::RunAccepted(body) => {
                 self.pending_submissions
                     .retain(|pending| pending.request_key != body.request_key);

@@ -763,6 +763,16 @@ impl MemoryManager {
                 }
             }
             result.items.truncate(top_k as usize);
+            // 分数跟着条目走：重排换了顺序、截掉了短名单的尾巴，`arm_scores` 只留交回去的那几条、按它们的顺序。
+            let mut scores = std::mem::take(&mut result.arm_scores);
+            result.arm_scores = result
+                .items
+                .iter()
+                .filter_map(|item| {
+                    let at = scores.iter().position(|score| score.id == item.id)?;
+                    Some(scores.swap_remove(at))
+                })
+                .collect();
         }
         Ok(result)
     }

@@ -191,6 +191,7 @@ impl App {
             request_key: request_key.clone(),
             text: body.clone(),
             state: SubmissionState::Sending,
+            shell: false,
         });
         vec![Effect::Submit {
             request_key,
@@ -215,6 +216,7 @@ impl App {
             request_key: request_key.clone(),
             text: text.to_string(),
             state: SubmissionState::Sending,
+            shell: true,
         });
         vec![Effect::Submit {
             request_key,

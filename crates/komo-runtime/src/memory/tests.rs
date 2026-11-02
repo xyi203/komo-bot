@@ -3056,6 +3056,14 @@ async fn a_judgement_can_lift_an_entry_the_fusion_ranked_lower() {
     // 融合顺序是稳定的（同分按 id），所以没有重排时第一条是 m-1；判断把 m-3 抬了上来。
     assert_eq!(result.items.len(), 1, "top_k 是 1");
     assert_eq!(result.items[0].id.as_str(), "m-3");
+    // 分数跟着条目走：只留交回去的 m-3 那一份（`komo memory search` 逐行显示）。
+    let scored: Vec<&str> = result.arm_scores.iter().map(|s| s.id.as_str()).collect();
+    assert_eq!(scored, vec!["m-3"], "{:?}", result.arm_scores);
+    assert!(
+        result.arm_scores[0].keyword.is_some(),
+        "{:?}",
+        result.arm_scores
+    );
 
     // 判断看到的是**短名单**（比 top_k 宽）：三条候选加一个"都不相关"，还带着这次的输入。
     let seen = judge.seen();

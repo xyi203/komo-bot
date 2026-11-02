@@ -33,6 +33,15 @@
   `prepare`；登记、工具任务的三明治与恢复在 runtime（`harness/orchestration/monitor.rs`），起进程、泵、合批与时限在 gateway 的 `GatewayMonitorRunner`（`MonitorRunner`，runtime 的 `OrchestrationHooks::{start,stop}_monitor` 背后）。codemode 脚本里调不了。
 - **事件交回挂它的会话，投给路径上最近一条带 peer 的用户输入的来源对端**（没有就只有主会话退回 home chat）。在 home 里挂的，
   事件经 home 的模型转告到聊天；在 TUI 里挂的，事件在事件流里看得到。
+- **不值得说就不说（2026-10-31，roadmap-muse S1）。** 事件、结束消息与后台命令结束的附注写明"不值得转告
+  就整段只回 NO_REPLY"；只由这些内部输入起的那一轮回答是记号时，看客不投、不起标题，entry 照常落
+  （`docs/background-tasks.md` §2d）。
+- **清单（2026-10-31，roadmap-muse S4）。** `komo monitor list [--all]`（`GET /v1/monitors`，gateway
+  `http/v2/monitors.rs`）只读列出登记：还在跑的按开始时刻在前，`--all` 带上已结束的与原因；每项带短号、
+  挂它的会话、开始与截止时刻、脚本开头 120 字。停监听仍是 `monitor_stop` 或删会话。
+- **任务会话里也能挂（2026-10-31，roadmap-muse S2）。** 事件进任务会话，那一轮的回答照常交回派它的会话；
+  只由事件起的那一轮回答是 NO_REPLY 时不交回，也不自动续跑。删会话（任何会话）时先登记 `ended{stopped}`
+  再停进程，所在 Session 已在删时不交回结束消息（`docs/background-tasks.md` §2e）。
 - **事件与结束消息都按插话交回（2026-10-21）。** 事件、正常结束消息、重启后的"已中断"
   都走 `submit_interjecting`，与后台命令的完成通知（§8）同一套资格检查：宿主还在跑、
   对端与模型快照对得上时，在下一个工具边界并进去（`absorbed`，终态，泵照样放下一批）；
@@ -72,7 +81,7 @@
 | 模型调 `monitor_stop` | 不交回（它自己知道） | 删 |
 | Gateway 停机 | 不交回 | **留着**，下一代启动时交回"中断了"，或（声明了 `resume_after_restart`）重挂 |
 
-`monitor_stop(monitor_id)` 只在挂它的那个会话里找；短号对不上时列出这个会话还在跑的监听，
+短号是由监听 id 算出的 6 位小写字母加数字（2026-10-31 起，与任务短号同一套，见 `docs/storage-durable-d5.md` W2c；老的十进制 id 解析时还收）：事件与结束消息头、开始 / 停止回执、转后台回执与结束消息、`komo monitor list` 都用它。`monitor_stop(monitor_id)` 只在挂它的那个会话里找；短号对不上时列出这个会话还在跑的监听，
 撞号时列出 6 位候选。
 
 **停一个已经结束的不算失败（2026-10-21）。** 处理事件的 Run 常常在脚本自己退出之后才调
@@ -189,11 +198,20 @@
   交回「Gateway 重启，后台命令中断，结果不明」+ `background.log` 里已有的末尾，登记删掉。不重跑。
 - **记忆。** `monitor:` / `monitor-end:` / `bash-done:` 与 `task-result:` 一样渲染为「任务交回」，不能引为
   `user_statement`（`docs/memory.md` §9.10）。
+- **TUI 的 `!` 命令（2026-11-01）。** 用同一个阈值 `detach_after_secs`，但**不走上面这条路**：不登记
+  `komo.monitors`、没有 `#短号`、`monitor_stop` 停不掉、结束时不交回 `bash-done:` 输入、不起模型 Run。
+  整条命令本来就跑在 Gateway 的后台任务里（`service/durable/shell.rs`），HTTP 请求到点先回一张
+  `detached: true` 的回执，TUI 显示「已转后台」；命令跑完照常提交那条 `shell.command` write（下一轮模型
+  看得见）。起因：TUI 里 `!scripts/install-local.sh` 的 release 构建超过 120 s，被同步时限杀掉、什么都没装上。
+  硬上限是整个 `call_timeout_secs`（默认 1800，`!` 给 `bash` 传 `timeout_secs`，与模型能要到的上限同一个），
+  不是 `bash` 默认的 120 秒。
+  没有崩溃重放：正常停机时终止进程组并在历史里留一条「Gateway 停机时它还没跑完」带已有输出；崩溃时丢了，
+  历史里没有它（`docs/storage-durable-d5.md` 决定 9）。
 
 **对话会话里禁 `sleep` 等待。** `bash` 的 `prepare` 在对话会话里拒绝命令中任何一个字面量、不短于 10 秒的
 `sleep`（`sleep 20`、`sleep 1m`、`sleep 0.5h`，含循环体里的；`sleep $N` 这类非字面量不管，短 sleep 放行），
 提示改挂 `monitor`（脚本只在完成或出错时打一行，间隔不短于 15 秒）并先回复用户。任务会话与 Cron 的 Run
-照常能 sleep（任务会话用不了 `monitor`）。判断是词法的，引号里的 `sleep 20` 也会被拒——代价是偶尔多问一次，
+照常能 sleep（任务会话不转后台；2026-10-31 起任务会话也能挂 `monitor`）。判断是词法的，引号里的 `sleep 20` 也会被拒——代价是偶尔多问一次，
 换来不用解析 shell。
 
 验收：`crates/komo-gateway/tests/detach/main.rs`（真数据目录、真子进程）——转后台立刻返回且进程跑完后交回

@@ -15,7 +15,9 @@
 
 use std::sync::{Arc, Mutex};
 
-use komo_gateway::service::test_support::harness::{FakeLlm, call_round, text_round};
+use komo_gateway::service::test_support::harness::{
+    FakeLlm, call_round, multi_call_round, text_round,
+};
 use komo_kernel::traits::{LlmClient, TurnDriver};
 use komo_kernel::types::model::TokenUsage;
 use komo_kernel::types::turn::{LlmError, Round, RoundInput, TurnRequest};
@@ -188,7 +190,7 @@ enabled = false
 /// - `帮我查一下空调`（home）→ 调 `task`（用 `cheap`、带契约），再把工具结果原样念出来；
 /// - `功耗呢`（home）→ 调 `task` 接着做（目标短号由测试写进 `follow_task_id`，不给 model）；
 /// - `跑个慢命令`（home）→ 调 `task`，派出去的任务会调 `unsure` 停在一条介入上；
-/// - `派了再等`（home）→ 先调 `task`，再调 `gate` 停在门上，门开之后再说一句；
+/// - `派了再等`（home）→ 同一轮里调 `task` 和 `gate`，停在门上，门开之后再说一句；
 /// - `派个慢 bash`（home）→ 调 `task`，派出去的任务会跑 `echo step-1; sleep 30`；
 /// - `进度呢`（home）→ 只带 `task_id`（写进 `follow_task_id`）调 `task` 查进度；`进度呢 zzzz`
 ///   查一个不存在的短号；
@@ -212,11 +214,21 @@ impl TasksLlm {
     }
 }
 
+/// 宿主附上的渠道篇幅附注（`docs/komo_bot.md` §11.2）：不是用户说的话，脚本按用户的话挑回答时跳过。
+fn is_host_note(message: &komo_kernel::types::turn::ReplayMessage) -> bool {
+    message
+        .text
+        .as_deref()
+        .is_some_and(|text| text.starts_with(komo_agent::context::channel::CHANNEL_NOTE_HEAD))
+}
+
 fn last_user_text(req: &TurnRequest) -> String {
     req.messages
         .iter()
         .rev()
-        .find(|message| message.role == komo_kernel::types::turn::Role::User)
+        .find(|message| {
+            message.role == komo_kernel::types::turn::Role::User && !is_host_note(message)
+        })
         .and_then(|message| message.text.clone())
         .unwrap_or_default()
 }
@@ -236,7 +248,7 @@ fn answered_since_last_user(req: &TurnRequest) -> bool {
     req.messages
         .iter()
         .rev()
-        .take_while(|message| message.role != Role::User)
+        .take_while(|message| message.role != Role::User || is_host_note(message))
         .any(|message| message.role == Role::Tool)
 }
 
@@ -322,7 +334,7 @@ impl LlmClient for TasksLlm {
                     "task",
                     serde_json::json!({ "prompt": "跑一下 echo hi", "title": "慢命令" }),
                 )]),
-                "派了再等" => Script::Calls(vec![
+                "派了再等" => Script::Together(vec![
                     (
                         "task",
                         serde_json::json!({ "prompt": "查一下热水器状态", "title": "查热水器" }),
@@ -389,6 +401,9 @@ enum Script {
     Reply(String),
     /// 一轮一个调用，按顺序；调用都收尾之后把最后一条工具结果原样念出来。
     Calls(Vec<(&'static str, serde_json::Value)>),
+    /// 同一轮里一起调，调用都收尾之后把第一条工具结果原样念出来。同一轮的调用之间没有
+    /// postTools boundary，排着的 steer 要等它们全部终结才放进来。
+    Together(Vec<(&'static str, serde_json::Value)>),
 }
 
 struct ScriptDriver {
@@ -406,21 +421,32 @@ impl TurnDriver for ScriptDriver {
             Script::Calls(calls) => match calls.get(self.step - 1) {
                 Some((tool, args)) => call_round(round, &format!("pc-{tool}"), tool, args.clone()),
                 // 原样念出工具结果：短号是运行时现生成的，脚本没法提前写死。
-                None => {
-                    let text = match input {
-                        RoundInput::ToolResults { results, .. } => results
-                            .first()
-                            .map(|result| result.content.clone())
-                            .unwrap_or_default(),
-                        RoundInput::First => String::new(),
-                    };
-                    text_round(round, &text)
-                }
+                None => text_round(round, &first_result(input)),
             },
+            Script::Together(calls) if self.step == 1 => {
+                let ids: Vec<String> = calls.iter().map(|(tool, _)| format!("pc-{tool}")).collect();
+                let calls: Vec<_> = ids
+                    .iter()
+                    .zip(calls)
+                    .map(|(id, (tool, args))| (id.as_str(), *tool, args.clone()))
+                    .collect();
+                multi_call_round(round, &calls)
+            }
+            Script::Together(_) => text_round(round, &first_result(input)),
         }
     }
 
     fn usage(&self) -> TokenUsage {
         TokenUsage::default()
+    }
+}
+
+fn first_result(input: RoundInput) -> String {
+    match input {
+        RoundInput::ToolResults { results, .. } => results
+            .first()
+            .map(|result| result.content.clone())
+            .unwrap_or_default(),
+        RoundInput::First => String::new(),
     }
 }

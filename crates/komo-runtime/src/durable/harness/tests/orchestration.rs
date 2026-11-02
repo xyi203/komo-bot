@@ -13,6 +13,7 @@ use komo_kernel::durable::{
     ConversationId, InputState, Message, SubmissionKind, SubmissionRecord, TaskOutcome, TaskState,
 };
 use komo_kernel::traits::Tool;
+use komo_kernel::types::handle::short_handle;
 use komo_kernel::types::model::Effort;
 use komo_kernel::types::task::{TASK_STATUS_BLOCKED, TASK_STATUS_DONE};
 use serde_json::json;
@@ -159,7 +160,7 @@ async fn a_dispatched_task_runs_in_a_child_and_its_result_reaches_the_parent() {
     let handled = world.messages().await;
     assert_eq!(
         result_text(&handled, "c1"),
-        format!("已派出 #{child}：查空调")
+        format!("已派出 #{}：查空调", short_handle(child.get()))
     );
     assert_eq!(
         outline(&handled),
@@ -185,8 +186,9 @@ async fn a_dispatched_task_runs_in_a_child_and_its_result_reaches_the_parent() {
     assert_eq!(
         user_texts(&parent)[1],
         format!(
-            "[后台任务 #{child}「查空调」已完成 · 0 轮工具调用 · 0 秒]\n\nAC is on\n{TASK_STATUS_DONE}\n\n\
-             （这是后台任务交回的结果，不是用户发来的消息；用户看不到上面这段，请把结论转告用户。）"
+            "[后台任务 #{}「查空调」已完成 · 0 轮工具调用 · 0 秒]\n\nAC is on\n{TASK_STATUS_DONE}\n\n\
+             （这是后台任务交回的结果，不是用户发来的消息；用户看不到上面这段，请把结论转告用户。）",
+            short_handle(child.get())
         )
     );
     let results = world.entries_of(TASK_RESULT_ENTRY).await;
@@ -266,7 +268,10 @@ async fn an_answer_without_a_status_line_is_continued_once_before_it_is_reported
     let (child, text) = dispatch_and_collect(&world, spawn_call("CHILD fix", "修")).await;
 
     assert!(
-        text.starts_with(&format!("[后台任务 #{child}「修」已完成 · 0 轮工具调用 · ")),
+        text.starts_with(&format!(
+            "[后台任务 #{}「修」已完成 · 0 轮工具调用 · ",
+            short_handle(child.get())
+        )),
         "{text}"
     );
     assert!(text.contains(" · 自动续跑过一次]"), "{text}");
@@ -299,7 +304,8 @@ async fn a_continued_answer_is_reported_even_without_a_status_line() {
 
     assert!(
         text.starts_with(&format!(
-            "[后台任务 #{child}「修」交回了，没说做完没有 · 0 轮工具调用 · "
+            "[后台任务 #{}「修」交回了，没说做完没有 · 0 轮工具调用 · ",
+            short_handle(child.get())
         )),
         "{text}"
     );
@@ -324,7 +330,10 @@ async fn a_blocked_answer_is_reported_without_continuing() {
     let (child, text) = dispatch_and_collect(&world, spawn_call("CHILD fix", "修")).await;
 
     assert!(
-        text.starts_with(&format!("[后台任务 #{child}「修」受阻 · 0 轮工具调用 · ")),
+        text.starts_with(&format!(
+            "[后台任务 #{}「修」受阻 · 0 轮工具调用 · ",
+            short_handle(child.get())
+        )),
         "{text}"
     );
     assert!(!text.contains("自动续跑"), "{text}");
@@ -354,7 +363,10 @@ async fn an_answer_under_a_contract_is_reported_without_a_status_line() {
     let (child, text) = dispatch_and_collect(&world, call).await;
 
     assert!(
-        text.starts_with(&format!("[后台任务 #{child}「查」已完成 · 0 轮工具调用 · ")),
+        text.starts_with(&format!(
+            "[后台任务 #{}「查」已完成 · 0 轮工具调用 · ",
+            short_handle(child.get())
+        )),
         "{text}"
     );
     assert!(text.contains("（结果契约复验：符合"), "{text}");
@@ -638,7 +650,7 @@ async fn a_fork_child_starts_from_the_parents_conversation_at_that_moment() {
     // 父的账里没有这些补充：c1 的结果是"已派出"。
     assert_eq!(
         result_text(&world.messages().await, "c1"),
-        format!("已派出 #{child}：修 B1")
+        format!("已派出 #{}：修 B1", short_handle(child.get()))
     );
     // 提示缓存的路由键是父。
     assert!(
@@ -684,7 +696,7 @@ async fn a_follow_up_goes_into_the_same_child_and_reports_again() {
     world.script.calls(&[(
         "c2",
         "task",
-        json!({ "task_id": format!("#{child}"), "prompt": "FOLLOW more" }),
+        json!({ "task_id": format!("#{}", short_handle(child.get())), "prompt": "FOLLOW more" }),
     )]);
     world.script.reply("forwarded");
     first.notify_one();
@@ -695,7 +707,7 @@ async fn a_follow_up_goes_into_the_same_child_and_reports_again() {
         .await;
     assert_eq!(
         result_text(&world.messages().await, "c2"),
-        format!("已转给 #{child}")
+        format!("已转给 #{}", short_handle(child.get()))
     );
     assert_eq!(
         world.children().await,
@@ -723,9 +735,13 @@ async fn a_follow_up_goes_into_the_same_child_and_reports_again() {
     let delivered = submissions_with(&world, CONV, &format!("task-result:{child}:")).await;
     assert_eq!(delivered.len(), 2, "one hand-back per run");
     let users = user_texts(&world.messages().await);
-    assert!(users[1].starts_with(&format!("[后台任务 #{child}「活」已完成 · 0 轮工具调用 · ")));
+    let head = format!(
+        "[后台任务 #{}「活」已完成 · 0 轮工具调用 · ",
+        short_handle(child.get())
+    );
+    assert!(users[1].starts_with(&head));
     assert!(users[1].contains("]\n\nfirst done"));
-    assert!(users[2].starts_with(&format!("[后台任务 #{child}「活」已完成 · 0 轮工具调用 · ")));
+    assert!(users[2].starts_with(&head));
     assert!(users[2].contains("]\n\nsecond done"));
     engine.close().await.unwrap();
 }
@@ -1139,7 +1155,8 @@ async fn aborting_the_child_reports_that_it_did_not_finish() {
     let text = user_texts(&world.messages().await).remove(1);
     assert!(
         text.starts_with(&format!(
-            "[后台任务 #{child}「卡住」没有完成 · 0 轮工具调用 · "
+            "[后台任务 #{}「卡住」没有完成 · 0 轮工具调用 · ",
+            short_handle(child.get())
         )),
         "{text}"
     );
@@ -1178,7 +1195,7 @@ async fn a_status_query_reads_the_child_without_disturbing_it() {
     world.harness.wait(&engine, again).await.unwrap();
     let running = result_text(&world.messages().await, "s1");
     assert!(
-        running.starts_with(&format!("#{child}「慢活」：运行中")),
+        running.starts_with(&format!("#{}「慢活」：运行中", short_handle(child.get()))),
         "{running}"
     );
     assert_eq!(
@@ -1290,7 +1307,7 @@ async fn a_crash_between_the_spawn_and_its_result_does_not_spawn_twice() {
     assert_eq!(world.tasks(ANCHOR_KIND).await.len(), 1);
     assert_eq!(
         result_text(&world.messages().await, "c1"),
-        format!("已派出 #{child}：一次")
+        format!("已派出 #{}：一次", short_handle(child.get()))
     );
     world
         .until(|| async {
@@ -1344,7 +1361,8 @@ async fn a_monitor_is_registered_started_and_readable_after_a_restart() {
         result_text(&world.messages().await, "m1"),
         format!(
             "已开始监听 #{}：盯日志（最长 30 分钟）。事件会以 [监听 #{}…] 开头的消息交回。",
-            record.id, record.id
+            record.handle(),
+            record.handle()
         )
     );
     assert_eq!(
@@ -1491,15 +1509,21 @@ async fn stopping_a_monitor_records_it_and_stopping_twice_is_not_an_error() {
     // s0 在停之前：列出在跑的；s3 在停之后：没有在跑的了。
     assert_eq!(
         result_text(&messages, "s0"),
-        format!("停不了：#9999 不是这个会话挂着的监听；这个会话在跑的：#{monitor_id}「盯」")
+        format!(
+            "停不了：#9999 不是这个会话挂着的监听；这个会话在跑的：#{}「盯」",
+            short_handle(monitor_id)
+        )
     );
     assert_eq!(
         result_text(&messages, "s1"),
-        format!("已停止监听 #{monitor_id}：盯")
+        format!("已停止监听 #{}：盯", short_handle(monitor_id))
     );
     assert_eq!(
         result_text(&messages, "s2"),
-        format!("不用停了：监听 #{monitor_id}「盯」已经停掉了")
+        format!(
+            "不用停了：监听 #{}「盯」已经停掉了",
+            short_handle(monitor_id)
+        )
     );
     assert_eq!(
         result_text(&messages, "s3"),
@@ -1588,7 +1612,10 @@ async fn a_finished_monitor_hands_back_exactly_one_end_message() {
     world.harness.wait(&engine, last).await.unwrap();
     assert_eq!(
         result_text(&world.messages().await, "s1"),
-        format!("不用停了：监听 #{monitor_id}「盯」已结束：脚本退出（exit=0）")
+        format!(
+            "不用停了：监听 #{}「盯」已结束：脚本退出（exit=0）",
+            short_handle(monitor_id)
+        )
     );
     assert!(world.orch.stops().is_empty(), "nothing to stop");
     engine.close().await.unwrap();
@@ -1631,7 +1658,7 @@ async fn a_registered_foreign_process_is_stoppable_finishable_and_reconciled() {
     world.harness.wait(&engine, stop).await.unwrap();
     assert_eq!(
         result_text(&world.messages().await, "s1"),
-        "已停止监听 #9001：转后台甲"
+        format!("已停止监听 #{}：转后台甲", short_handle(9001))
     );
     assert_eq!(world.orch.stops(), vec![9001]);
 
@@ -1738,9 +1765,10 @@ async fn reconciling_after_a_restart_resumes_the_declared_and_interrupts_the_res
     engine.close().await.unwrap();
 }
 
-/// 任务会话里别挂监听：任务这一轮一结束结果就交回去了。
+/// 任务会话里也能挂监听（S2，`docs/background-tasks.md` §2e）：事件进任务会话；只由事件起的那一轮
+/// 回答是 NO_REPLY 时不交回，否则照常交回——没写状态行也不自动续跑。
 #[tokio::test(start_paused = true)]
-async fn a_task_conversation_cannot_start_a_monitor() {
+async fn a_task_monitor_reports_back_only_when_the_event_round_speaks() {
     let world = World::new();
     let (_fixture, ..) = install(&world);
     world
@@ -1748,29 +1776,58 @@ async fn a_task_conversation_cannot_start_a_monitor() {
         .calls(&[("c1", "task", spawn_call("CHILD watch", "盯盘"))]);
     world.script.reply("dispatched");
     world.script.reply("noted");
+    world.script.reply("noted again");
     world.script.calls_for(
         "CHILD watch",
         &[("k1", "monitor", monitor_call("x", false, 5))],
     );
-    world
-        .script
-        .reply_for("CHILD watch", &finished("never mind"));
+    world.script.reply_for("CHILD watch", &finished("watching"));
+    world.script.reply_for("quiet line", "NO_REPLY");
+    world.script.reply_for("FAILED line", "CI failed");
     let engine = world.open().await;
     let id = world.submit(&engine, "go").await;
     world.harness.wait(&engine, id).await.unwrap();
     let child = world.child().await;
     world
         .until(|| async {
-            outline(&world.messages_in(child).await)
-                .last()
-                .is_some_and(|l| *l == format!("assistant: {}", finished("never mind")))
+            outline(&world.messages().await).contains(&"assistant: noted".to_owned())
+        })
+        .await;
+    let records = monitors(&world).await;
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(records[0].conversation, child, "挂在任务会话上");
+    assert_eq!(world.orch.launches().len(), 1);
+    let monitor_id = records[0].id;
+    assert_eq!(
+        submissions_with(&world, CONV, "task-result:").await.len(),
+        1
+    );
+
+    let quiet = monitor::event_draft(monitor_id, "x", "1:1", "[监听 #x「x」]\nquiet line");
+    let quiet = world.harness.submit(&engine, child, quiet).await.unwrap();
+    world.harness.wait(&engine, quiet).await.unwrap();
+    assert_eq!(
+        submissions_with(&world, CONV, "task-result:").await.len(),
+        1,
+        "NO_REPLY 那一轮不交回"
+    );
+
+    let loud = monitor::event_draft(monitor_id, "x", "1:2", "[监听 #x「x」]\nFAILED line");
+    let loud = world.harness.submit(&engine, child, loud).await.unwrap();
+    world.harness.wait(&engine, loud).await.unwrap();
+    let results = submissions_with(&world, CONV, "task-result:").await;
+    assert_eq!(results.len(), 2, "说了话的那一轮交回，且没有先自动续跑");
+    world
+        .until(|| async {
+            outline(&world.messages().await).contains(&"assistant: noted again".to_owned())
         })
         .await;
     assert!(
-        result_text(&world.messages_in(child).await, "k1").contains("后台任务会话里不能挂监听")
+        user_texts(&world.messages().await)
+            .iter()
+            .any(|text| text.contains("CI failed")),
+        "交回的正文是事件那一轮的回答"
     );
-    assert!(monitors(&world).await.is_empty());
-    assert!(world.orch.launches().is_empty());
     engine.close().await.unwrap();
 }
 

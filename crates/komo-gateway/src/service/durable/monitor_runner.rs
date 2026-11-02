@@ -32,6 +32,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use komo_kernel::durable::{ConversationId, Storage, SubmissionId, SubmissionStatus};
 use komo_kernel::traits::{OutputWriter, StoreError};
+use komo_kernel::types::handle::short_handle;
 use komo_kernel::types::ids::{AttemptId, ExecutorId, RunId, SessionId, ToolCallId};
 use komo_kernel::types::refs::AttemptRef;
 use komo_kernel::types::tool::CancelToken;
@@ -250,7 +251,7 @@ impl GatewayMonitorRunner {
             record.cwd.clone(),
             env,
             limit,
-            format!("monitor #{id} · {}", record.title),
+            format!("monitor #{} · {}", record.handle(), record.title),
         );
         child.register = Some(ChildRegistration {
             registry: Arc::new(ctx.children.clone()),
@@ -591,11 +592,13 @@ impl Batch {
 const RESTART_NOTE: &str =
     "\n\n（中间 Gateway 重启过，这个监听已按原句柄自动重挂；断开那几秒里脚本打的行没有收到。）";
 
-/// 一条事件的正文。句柄是监听 id（`#id`，`monitor_stop` 用它）。
+/// 一条事件的正文。句柄是监听的短号（`#k3x9qa`，`monitor_stop` 用它）。
 pub(crate) fn event_text(id: u64, title: &str, lines: &[String], omitted: usize) -> String {
+    let id = short_handle(id);
     format!(
         "[监听 #{id}「{title}」]\n\n{}\n\n（这是监听脚本 #{id} 的输出，不是用户发来的消息，\
-         用户看不到上面这段。需要用户知道的由你转告；不用再盯了就调 monitor_stop。）",
+         用户看不到上面这段。需要用户知道的由你转告；不值得转告就整段只回 NO_REPLY，什么都不会\
+         发给用户；不用再盯了就调 monitor_stop。）",
         body(lines, omitted)
     )
 }
@@ -609,7 +612,7 @@ pub(crate) fn end_text(
     omitted: usize,
     stderr: &str,
 ) -> String {
-    let mut text = format!("[监听 #{id}「{title}」{headline}]");
+    let mut text = format!("[监听 #{}「{title}」{headline}]", short_handle(id));
     if !lines.is_empty() {
         text.push_str("\n\n最后的输出：\n");
         text.push_str(&body(lines, omitted));
@@ -619,7 +622,8 @@ pub(crate) fn end_text(
         text.push_str(stderr.trim_end());
     }
     text.push_str(
-        "\n\n（这是系统消息，不是用户发来的；这个监听不会再有事件了。需要用户知道的由你转告。）",
+        "\n\n（这是系统消息，不是用户发来的；这个监听不会再有事件了。需要用户知道的由你转告；\
+         不值得转告就整段只回 NO_REPLY。）",
     );
     text
 }
@@ -800,8 +804,8 @@ mod tests {
         assert_eq!(lines.last().unwrap(), "l99");
         assert_eq!(batch.omitted(), 60);
 
-        let text = event_text(4242, "流水线", &lines, batch.omitted());
-        assert!(text.starts_with("[监听 #4242「流水线」]"), "{text}");
+        let text = event_text(12, "流水线", &lines, batch.omitted());
+        assert!(text.starts_with("[监听 #1lxxbx「流水线」]"), "{text}");
         assert!(text.contains("l9\n…（中间省略 60 行）…\nl70"), "{text}");
     }
 
@@ -851,7 +855,7 @@ mod tests {
     #[test]
     fn the_end_text_carries_the_reason_the_last_lines_and_the_stderr_tail() {
         let text = end_text(
-            4242,
+            12,
             "流水线",
             &Ending::Exited(Some(1)).headline(),
             &["job deploy: failed".to_string()],
@@ -859,7 +863,7 @@ mod tests {
             "glab: 401 Unauthorized\n",
         );
         assert!(
-            text.starts_with("[监听 #4242「流水线」已结束：脚本退出（exit=1）]"),
+            text.starts_with("[监听 #1lxxbx「流水线」已结束：脚本退出（exit=1）]"),
             "{text}"
         );
         assert!(text.contains("job deploy: failed"), "{text}");

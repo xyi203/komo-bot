@@ -149,6 +149,33 @@ GTD（David Allen）的流程是收集 → 理清（要不要行动）→ 组织
 
 完成标准：一个挂了 monitor 的领域一周内的投递条数、被忽略条数可以统计；调成 `off` 后零投递；每周回顾按时送达，回顾里确认的结案、归档、遗忘都落进去。
 
+### S 借 DeepSeek Super-agent 的五条（2026-10-31 操作者认可，开做）
+
+来源：DeepSeek Harness 团队《Super-agent 设计探索：迈向更自主的 Agent 系统》（§5 参考）。文章的五个模块里，全双工（自动转后台、`task`、`monitor`、插话）、Router 批处理（boundary 一次放入排队输入、监听合批）、Worker 交回 Router（`task.result`）、程序层过滤（群里只认 @、监听脚本先过滤）、Spill（2 KiB 预览 + `artifact://`）komo 已经有。存算分离 / BYOM、Router 水平切分、A2A 是云端多用户的问题，不借。
+
+要留意的一处：文章的消融实验里，"单会话 + subagent 工具、靠提示词决定委派"在中性提示下 5 次一次都没委派，这正是 home 现在的形状（`docs/background-tasks.md` §2）。不退回分发器（§1 删它的理由仍在）；长命令由自动转后台兜底。是否要更强的委派，先从 durable 记录统计"home 自己跑了很久、期间有用户消息在排队"的次数再定。
+
+按依赖排，S5 → S1 → S2 → S3 → S4：
+
+- **S5 按渠道定篇幅（已实现，2026-10-31）。** 文章实测"IM 单次回复不超过 100 词"有效。回复要发到飞书 / Telegram / 微信的 Run 加一段输出规范：先给结论、只问直接的问题，一般不超过约 150 字，长内容写进文件给路径或拆成任务；TUI / HTTP 不加。
+  - 与原计划的取舍：原想放进系统段，但私聊（微信、Telegram）与 TUI 共用 home session，按渠道换系统段会让 home 每换一次渠道就打掉前缀缓存。改成照记忆召回块，每个 Run 在输入之后追加一次宿主附注（`komo.channel` entry），规格见 `docs/komo_bot.md` §11.2「渠道篇幅」。
+  - 完成标准：渠道起的 Run 带一条写明平台的附注、同一 Run 只一条（`a_chat_run_gets_one_channel_note_naming_the_platform`）；`api` 对端与找不到对端只落记录（`hooks/channel.rs` 单测）。
+- **S1 内部输入可以不说话（已实现，2026-10-31；规格见 `docs/background-tasks.md` §2d）**（即原 §6 的 NO_REPLY，P2 通知判断的前提）。与下面原计划的取舍：TUI 没有单独的"未转告"样式，事件流里显示的就是记号本身；`task.result` 的附注不加"可以不说话"（派任务是用户要的事，结论得转告）；宿主不往 Cron 输入里补提示（输入带内容哈希），由 Job 的 prompt 自己写；`bash-done` 现在就是 `monitor.end`，已覆盖。原计划：只由内部输入（`task.result`、`monitor.event` / `monitor.end`、`bash-done`）或 Cron 起的 Run，回答整段是约定记号时：Run 照常收尾、entry 照常落（审计不丢），只是不投递到渠道，TUI 里显示成"未转告"。这条 Run 里只要有用户输入（含被并入的插话），记号不生效、照常回答。`monitor` / `task` 的工具文档与 Cron 的提示写明"不值得转告就只回记号"。
+  - 完成标准：一个挂在飞书会话上的监听，事件不值得说时渠道零消息、会话里有那一轮；同一轮里用户插了话时照常回复；Cron prompt Job 回记号时不投递。
+- **S2 任务会话自己挂监听（已实现，2026-10-31；规格见 `docs/background-tasks.md` §2e）**（文章的"订阅直通"）。实现时定下的：事件起的 run 不自动续跑；删会话停监听对所有会话生效（不只任务会话），所在 Session 在删时不交回结束消息；完成标准里的"home 只收到一次交回"由 runtime 测试按"NO_REPLY 那一轮不交回、说话那一轮交回"验证，真机脚本留到装机后。原计划：fresh 任务的能力面放开 `monitor` / `monitor_stop`（`task` 仍不给，结果只交回一层）。事件直接进任务会话，任务处理完照常交回 home；任务对事件的回答是 S1 的记号时不交回，所以 home 只在有结论时被叫醒。任务会话删除时停掉它挂的监听；`task(task_id)` 查进度列出它挂着的监听。事件起的 Run 是否走"没写状态行就自动续跑"（§2c）实现时定，写回 `docs/background-tasks.md` 与 `docs/monitor.md`。
+  - 完成标准：在任务里挂一个每 15 秒打一行、只在第 3 行打"FAILED"的脚本，home 只收到一次交回；任务会话被删后监听停掉。
+- **S3 跨会话找回（已实现，2026-10-31；规格见 `docs/komo_bot.md` §8.11「跨会话找回」）**（文章的"链式召回"）。实现时定下的：HTTP 路径是 `/v1/session-search`（`/v1/sessions/{id}` 已占了 `sessions/` 下的单段路径）；标题命中也算一处；交回与注入里的 ID 核对过——`task.result` 头带 `#短号`、事项注入带 `id@版本`，没有要补的。完成标准（TUI 里一次 search 找到别的会话里的链接）要装机后真机验证。原计划：飞书一个话题一个 Session、私聊进 home，彼此看不到；记忆提取不保证带上链接、ID 这类细节。加只读的 `komo session search <关键词>`（Gateway HTTP 接口，CLI 印结果）：在会话标题与 entry 正文里匹配，按时间倒序给会话、标题、命中片段与能接着查的 ID（会话 ID、`#任务`、监听短号），条数有上限。可见性同 `komo memory search`：private / off 会话不出现。系统提示在"komo 自己的状态"一节教它。交回与注入里已带的 ID（`#任务`、目标 id）核对一遍，缺的补上。
+  - 完成标准：在 TUI 里问"刚才在飞书里那篇文章"，Agent 用一次 `komo session search` 就找到另一个会话里的链接，不再 export 整个会话去 grep。
+- **S4 看门狗（代码部分已实现，2026-10-31；Job 待装机后建）**（文章的 Watchdog）。补了只读的 `komo monitor list`（`GET /v1/monitors`，见 `docs/monitor.md` §2「清单」）。"长时间没有新 entry"没有现成的只读入口（`komo session list` 的更新时间是会话行的改动时刻，不是最后一条 entry），所以巡检先按 Run 的开始时刻判（`komo run inspect` 有"开始"），不另加字段；不够用再补。Job（装上含 S1 的版本之后由操作者建，旧二进制不认 NO_REPLY，会每 30 分钟投一条）：
+
+  ```
+  komo cron add --name watchdog --schedule '*/30 * * * *' --timezone Asia/Shanghai \
+    --max-rounds 12 --notify always --prompt '看门狗巡检。只读，不要停、删、改任何东西。用 bash 跑：komo session list、komo monitor list、komo goal list、komo intervention list；session list 里标着任务、运行列还在执行中的，再对它的 Run 跑 komo run inspect <RUN_ID> 看开始时刻与轮数。有下面这些才说：① 任务会话的 Run 开始超过 2 小时还没结束；② 等待中的目标标着已超期；③ 监听已跑超过 6 小时，或离截止不到 10 分钟；④ 有待处理的介入。每项一行：是什么、ID（会话 / Run / #短号 / 目标 id）、为什么像卡住、建议下一步。一切正常就整段只回 NO_REPLY。'
+  ```
+
+  原计划：不写新机制，用一个 prompt Cron Job：每 30 分钟查跑得太久、长时间没有新 entry 的任务会话，超期的等待中目标，跑了很久的监听；有问题才说，没事回 S1 的记号。查询入口不够（例如没有列出监听的命令）时补只读命令。Job 的提示写在这里，用 `komo cron add` 建。
+  - 完成标准：平时零投递；人为留一个卡住的任务会话，下一次触发就报出来。
+
 ### P3 对外动作确认（已拍板，见 §4.1）
 
 只覆盖"代表用户对外说话或花钱"的那一小类，不恢复 Policy。规格：[`docs/confirm.md`](confirm.md)（2026-10-29 认可并实现，P3a–P3c）。
@@ -202,4 +229,5 @@ GTD（David Allen）的流程是收集 → 理清（要不要行动）→ 组织
 - GTD：David Allen，*Getting Things Done*（2001，2015 修订版）。取下一步行动、等待中、将来/也许、情境与每周回顾。
 - 艾森豪威尔矩阵（紧急 × 重要）：只取两个维度用于通知判断。
 - Zettelkasten（Niklas Luhmann）、常青笔记（Andy Matuschak）、渐进式总结与 CODE（Tiago Forte）、MOC（Nick Milo）、Johnny.Decimal：对照过，komo 已有对应或不适合，见 §1「其他方法」。
+- DeepSeek Harness 团队《Super-agent 设计探索：迈向更自主的 Agent 系统》（微信公众号 DeepSeek 产品部，2026-10-31，https://mp.weixin.qq.com/s/zoS7GlReWPhfCjENGxXCdg ；原型 deepseek-ai/dsh-superagent-prototype）：双层架构、事件驱动（两级过滤、订阅直通、Inline & Spill 与链式召回、投机执行）、全双工、存算分离、Watchdog。借了哪几条见 §3「S」。
 - hindsight（vectorize-io/hindsight）：directive 与记忆分开、首轮注入加 Agent 主动查、知识页投影成 markdown；对照见 `docs/memory.md` §9.4「约定不过门槛，Agent 主动查」。

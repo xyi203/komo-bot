@@ -63,7 +63,7 @@ use crate::cron::{CronFiring, CronJob, JobStatus, NotifyPolicy, OverlapPolicy};
 use crate::types::chat::PeerId;
 use crate::types::ids::{CronJobId, MatterId, MemoryId, RequestKey, RunId, Seq, SessionId};
 use crate::types::memory::{
-    MemoryApplication, MemoryItem, MemoryKind, MemoryScope, MemoryState, RetrievalMode,
+    ArmScore, MemoryApplication, MemoryItem, MemoryKind, MemoryScope, MemoryState, RetrievalMode,
 };
 use crate::types::model::{Effort, EmbeddingSpace, ModelConfig};
 use crate::types::plan::{PlanHash, PlanSource};
@@ -189,6 +189,10 @@ pub struct SessionSummary {
     /// 从 `sessions.origin` 的 `task:{parent}` 里解出来。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub home: Option<SessionId>,
+    /// 任务会话的短号（不带 `#`，`komo_kernel::types::handle`，2026-10-31）：与派出回执、`task_id`
+    /// 同一个。老 Gateway 不带这一格，客户端退回会话 ID 后四位。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task: Option<String>,
 }
 
 fn session_still_active() -> SessionState {
@@ -210,6 +214,80 @@ pub struct SessionListQuery {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionListResponse {
     pub sessions: Vec<SessionSummary>,
+}
+
+/// `GET /v1/session-search` 的 query（`komo session search`，roadmap-muse S3）。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionSearchQuery {
+    /// 关键词；空白分开的几个词要在同一条消息里都出现（不分大小写）。
+    pub q: String,
+    /// 最多给几个会话；没给 = 10，上限 50。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+}
+
+/// 一个命中的会话：最近命中的在前。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionSearchHit {
+    pub session: SessionId,
+    pub title: String,
+    /// `main` / `normal` / `task`。
+    pub kind: String,
+    /// 最近一条命中的消息的时刻。
+    #[serde(with = "time::serde::rfc3339")]
+    pub matched_at: OffsetDateTime,
+    /// 任务会话的短号（`#12`）与派它的会话。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_session: Option<SessionId>,
+    /// 这个会话里还在跑的监听，每项 `#句柄「标题」`。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub monitors: Vec<String>,
+    /// 命中的消息条数。
+    pub matches: u32,
+    /// 最近几条命中的片段（`用户：…` / `助手：…` / `工具 bash：…`），新的在前。
+    pub snippets: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionSearchResponse {
+    pub hits: Vec<SessionSearchHit>,
+}
+
+/// `GET /v1/monitors` 的 query（`komo monitor list`，roadmap-muse S4 看门狗要的只读入口）。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MonitorListQuery {
+    /// 带上已结束的（登记里留着的最近几十条）；默认只列还在跑的。
+    #[serde(default)]
+    pub all: bool,
+}
+
+/// 一个监听（`monitor` 工具挂的，或转后台的 `bash`）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MonitorSummary {
+    /// 短号（`monitor_stop` 用它）。
+    pub handle: String,
+    pub title: String,
+    /// 挂它的会话；那个 conversation 没登记 Session 时为空。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<SessionId>,
+    /// `starting` / `running` / `ended`。
+    pub state: String,
+    /// 结束的原因（`exit` / `timeout` / `stopped` ……），只有 `ended` 有。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(with = "time::serde::rfc3339")]
+    pub started_at: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339")]
+    pub deadline: OffsetDateTime,
+    /// 脚本的开头一段。
+    pub command: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MonitorListResponse {
+    pub monitors: Vec<MonitorSummary>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -349,6 +427,11 @@ pub struct SubmitRunResponse {
     /// 这次命中了同一请求键的原 Run。
     #[serde(default)]
     pub deduplicated: bool,
+    /// `!` 命令跑过 `[execution] detach_after_secs` 还没完，转到了后台：命令接着跑，跑完照常以一条
+    /// `shell.command` 进历史。此时还没有落账的 submission，`run` 只是这条命令的临时身份
+    /// （`shell-…`，`/v1/runs` 查不到），`state` 是 `running`，`seq` 是 0。
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub detached: bool,
 }
 
 // ---- POST /v1/sessions/{id}/resume ----
@@ -910,6 +993,14 @@ pub struct MemoryListResponse {
     pub degraded: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub degraded_reason: Option<String>,
+    /// 带查询词的检索用的模式；不带查询词的清单没有。hybrid 降级时仍是 hybrid，看 `degraded`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<RetrievalMode>,
+    /// 检索结果逐条的两臂原始分数（§9.4 相关度门槛）：关键词臂是归一化分，对应
+    /// `min_keyword_score`；向量臂是余弦，对应 `min_similarity`。不在某臂候选名单里（或那臂没跑）
+    /// 就是 `None`。按 `id` 对应 `memories`；清单没有。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub arm_scores: Vec<ArmScore>,
 }
 
 /// confirm / forget 都携带预期 revision；重复请求幂等（§9.6）。

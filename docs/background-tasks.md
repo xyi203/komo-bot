@@ -38,12 +38,12 @@
 
 - **没有分发器。** home 用会话自己的 Agent 跑；什么时候派、什么时候自己做，由模型按 `task` 的工具说明判断（几秒能做完的直接做）。工具说明只留这条判断、prompt 要自包含与结果交回的方式，追问、查进度、`contract`、并行的细则在 `tool://task/doc`（按需读，`docs/komo_bot.md` §4）。
 - **派出 = 一次提交。** `task` 是一个 `komo.tool` 任务，`call` 阶段在 `Tool::prepare` 之后转进 `orchestration`（不走通用的 intent → execute）：同一次提交里建**锚任务**（`komo.background`，conversation 所有、background、立刻 completed）、子 conversation（所有者是锚任务）、`komo.task` document（父、标题、模型 / effort 名字、结果契约）、`sessions` 行（`kind = task`、`parent_session`）、第一条输入与它的 run，并把工具任务的 checkpoint 推进到 `orchestrate { reply }`，之后另一次提交落"已派出"结果 entry。两次之间崩溃，恢复从 `orchestrate` 接着落结果，**不会再派一遍**。锚任务让子 conversation 是 background 的：它不挡父的 idle，父的 run 被取消也不连带子（与旧规则一致）；子有活时锚任务停在 `completing`。
-- **句柄**是子 conversation 的十进制 ID（`#12`；`komo session list` 里的"任务·#xxxx"标注仍是会话 UUID 后四位，客户端协议冻结，与它对不上）：`task_id` 解析成 conversation 后核对 `komo.task.parent` 就是调用方，不需要登记表。
+- **句柄**是由子 conversation ID 算出的 6 位小写字母加数字（`#1lxxbx`，2026-10-31 起；之前是十进制 ID `#12`，解析时还收）：`task_id` 算回候选 conversation 后核对 `komo.task.parent` 就是调用方，不需要登记表；算法与理由见 `docs/storage-durable-d5.md` W2c。派出回执、交回的消息头、查进度、`TaskLine::render`、`task_label` 都用它；`komo session list` 的"任务·#短号"由 `SessionSummary.task` 带过去，与回执一致（老 Gateway 不带时客户端退回会话 UUID 后四位）。
 - **交回 = runtime 的 `report`，同一次提交。** 子 conversation 的 run 每个出口（回答、模型失败、预算、abort、调度器写的 faulted / orphaned）都经 `report::end_run` / `end_answered_run` / `end_run_abnormal`：在结束 run 的**同一次提交**里往父 conversation 受理一条 steer 输入——entry kind `task.result`，请求键 `task-result:{子 conversation}:{这条 run 的首个输入}`，在父里按请求键去重，所以原子、幂等，没有"终态了、交回之前崩溃"那个旧窗口。正文是 `[后台任务 #12「标题」<结局> · <轮数> 轮工具调用 · <用时>] …`（任务的最终回复，或失败 / 取消的原因）；结局与自动续跑见 §2c。
 - **内部输入。** 交回的输入（以及监听的 `monitor.event` / `monitor.end`）带 `internal` 标记，规则三条：①取消父的 run 时 `abort_conversation` 只撤用户输入，**不撤内部输入**；②父的 run 非正常收尾（取消、失败、预算、fault、orphan）时，同一次提交里按 final boundary 放置收件箱里排着的全部输入、起后继 run——父照旧跑一轮把结论转告用户；③显式的单条 `Harness::withdraw` 对内部输入仍有效。**删除会话**时先撤回全部排队的输入（含内部输入）再 abort，不会再起后继 run（`docs/komo_bot.md` §8.10）。
 - **父忙时并入。** 交回的输入是 steer：父的 run 在跑，就在它的 postTools boundary 并进当前 run（旧实现的"插话并入"）；父空闲就直接放置、起新 run。回复由宿主那一轮投回来源对端——来源对端取"当前路径上最近一条带 peer 的用户输入"的 peer，没有就退回 home chat（只有主会话；TUI / HTTP 开的会话不投）。任务自己的最终回复不再直接投给渠道。
 - **父会话不在了**（删掉、purge）：`report` 在受理之前就返回，结果不交（任务会话本身仍在，`komo session list` 看得到）。
-- **任务会话里不能再派任务**：调用方 conversation 自己有 `komo.task` 就拒绝，结果只交回一层。fresh 任务的能力面里没有 `task` 与 `monitor`；fork 任务保留父的（见 §2b）。
+- **任务会话里不能再派任务**：调用方 conversation 自己有 `komo.task` 就拒绝，结果只交回一层。fresh 任务的能力面里没有 `task`（2026-10-31 起有 `monitor` / `monitor_stop`，§2e）；fork 任务保留父的（见 §2b）。
 - **接着做**：`task(prompt, task_id)` 往已有的任务 conversation 提交一条输入，它带着自己的历史接着做；结果同样交回。不带 `contract` 的追问是 steer（任务正忙时并进当前 run），带 `contract` 的排在后面。
 - **查进度**：`task(task_id)` 不带 `prompt`，只读那个任务的 `komo.live`、entry 与 `komo.task`，不提交任何东西：状态、已跑多久、正在执行的调用及其输出尾部；已收尾的 run 的终态来自 `komo.task.lastRun`。
 - **取消**：模型没有取消子任务的工具；显式取消是 `Harness::abort_conversation(engine, 子 conversation)`（子 run 以 `aborted` 收尾，照常交回一条"没有完成"）。`/cancel` 只停 home 当前这一轮（`abort_run`），不动任务。
@@ -57,6 +57,27 @@
 - **标题带数字。** 结局后面是这条 run 的工具调用轮数（`komo.live.run.rounds`，不含最后那次回答）与用时（`run.startedAt` 到收尾；旧 `komo.live` 没有开始时刻就不报）。父会话一眼看得出交得早不早，不用去翻任务会话。
 - **自动续跑。** 回答没写状态行时先不交回：`answer` 的收尾提交里改调 `report::end_answered_run`，往任务会话放一条 `task.continue` 输入（"这条是 komo 自动发的……重新写一份完整的最后回复，末行写状态"）、起后继 run，`komo.task.continued` 记下它。以续跑输入开头的 run 收尾时不再续跑、照常交回，标题后加 `· 自动续跑过一次`——每条派出 / 追问的输入最多续跑一次，不会循环。父只收到续跑之后的那条回答，所以续跑提示要的是完整的最后回复。参考的是 Claude Code 的 `SubagentStop` hook：返回 block 时子 agent 接着做。
 - **不续跑的情况。** 带结果契约的回答只放 JSON，不看状态行，结局看契约复验；这次 final boundary 放了用户项或收件箱还有东西（派它的会话追问过来了）时，后继 run 本来就要起，续跑让给它，回答照常交回；失败、取消、预算等非正常收尾不续跑。
+
+## 2d. 内部输入可以不说话（2026-10-31 定并落地，roadmap-muse S1）
+
+监听每来一个事件，home 都要跑一轮，多半还会转告一句；P2 的通知判断（说 / 不说 / 攒到摘要里）、看门狗 Cron 的"没事不说话"都要先能**什么也不说**。借 hermes 的 NO_REPLY：
+
+- **记号。** 回答整段是 `NO_REPLY`（kernel `types::chat::SILENT_REPLY`；`is_silent_reply` 去首尾空白、再去一层反引号 / 引号后整段相等才算，夹在话里不算）。
+- **对话会话**（看客 `watch.rs` 的 `finish`）：回答是记号、且这条 run 的输入**全是内部输入**（首个输入，以及并进来、与它共用同一条回答 entry 的那些都是 `task.result` / `monitor.event` / `monitor.end`）时：不投递（渠道与 home chat 都不投）、不起标题。entry 照常落、Run 照常收尾，审计不丢；TUI 在事件流里看得到那一轮（显示的就是记号本身，没有单独的"未转告"样式）。有一条是用户说的话（聊天、TUI、认不出来源）就照原样投——有人在等回答。
+- **Cron prompt Job**（`durable/cron_watch.rs`）：回答是记号时触发照记 `ok`、不投，与命令型 Job 的空 stdout 一样（`docs/komo_bot.md` §10）。Job 的 prompt 自己写明"没事就只回 NO_REPLY"；宿主不往 Cron 的输入里补这句（输入正文带内容哈希，不动它）。
+- **谁会被告知可以不说话。** 监听事件、监听结束、后台命令结束三处附注与 `monitor` 工具说明写了"不值得转告就整段只回 NO_REPLY"。`task.result` 的附注**不加**：派任务是用户要的事，结论得转告。任务会话的回答是记号时不交回，见 §2e（S2）。
+- 验收：`watch_tests.rs` 的 `a_silent_reply_to_an_internal_input_is_not_delivered_but_one_to_the_user_is`，`tests/cron/notify.rs` 的 `a_silent_reply_settles_ok_but_delivers_nothing`，kernel 的 `only_a_reply_that_is_the_marker_alone_is_silent`。
+
+## 2e. 任务会话自己挂监听（2026-10-31 定并落地，roadmap-muse S2）
+
+外部事件（CI、MR 评论、工单状态）原来只能挂在 home 上：每个事件占 home 一轮，过程细节堆进 home 的上下文。借 DeepSeek Super-agent 的"订阅直通"：盯着的事交给任务，home 只在有结论时被叫醒。
+
+- **能力面。** fresh 任务放开 `monitor` / `monitor_stop`（gateway `hooks/tools.rs` 的 `ORCHESTRATION_TOOLS` 只剩 `task`），runtime `monitor::start` 里"任务会话不能挂"的拒绝删掉。`task` 仍不给，结果只交回一层。
+- **事件进任务会话。** 事件与结束消息照常交回挂它的 conversation（就是任务会话），在那里起一条 run；run 收尾照常经 `report` 交回父（`task-result:{子}:{这条 run 的首个输入}`，每条 run 一个键）。
+- **只由事件起的 run**（输入的请求键全是 `monitor:` / `monitor-end:`，读 submission 判断，不算表读）：回答是 NO_REPLY（§2d）时**不交回**、`lastRun` 不动；不走"没写状态行就自动续跑"（§2c）——事件那一轮不是派出的活，没有状态行可写，说了话就直接交回，标题按状态行规则（多半是"交回了，没说做完没有"）。并进了派出 / 追问输入的 run 照常续跑、照常交回。
+- **查进度**（`task` 只给 `task_id`）：`TaskProgress.monitors` 列出挂在这个任务会话上、还在跑的监听，渲染成末尾一行 `挂着的监听：#7「CI」`。
+- **删会话停掉监听**（对所有会话，不只任务会话）：`delete_session` 推进到 `closing` 之后，先给它名下每个还活着的监听登记 `ended{stopped}`、再停进程（同 `monitor_stop` 的次序）。`finish_in_tx` 发现所在 Session 已不是 `active` 时只登记、不交回结束消息，所以不会在要删的会话里再起 run。purge 的"监听还在跑"阻挡项留着，兜住停进程失败的。以前 delete 不替监听收尾，正是因为结束消息会再起 run。
+- 验收：runtime `a_task_monitor_reports_back_only_when_the_event_round_speaks`（任务挂监听；NO_REPLY 那一轮不交回；说话的那一轮交回且没有先续跑），gateway `task_sessions_lack_task_but_keep_monitor_in_schema`、`tests/monitor/durable.rs` 的 `deleting_the_session_stops_its_monitors_without_an_end_message`，kernel `live_monitors_are_listed_after_the_run`。
 
 ## 2a. `task`：合并 `dispatch` / `follow` / `delegate`（2026-10-16 定并落地）
 
@@ -105,5 +126,5 @@ task(prompt, title, task_id?, model?, effort?, contract?, context?)   context: "
 ## 6. 后续
 
 - 长任务的主动进度提示（任务自己隔一阵说一句）：按需查询已做（§2，`task(task_id)`），主动报仍未做。
-- 交回的那一轮允许模型不说话（hermes 的 NO_REPLY，只对内部输入开放）。
+- ~~交回的那一轮允许模型不说话（hermes 的 NO_REPLY，只对内部输入开放）~~：已做，§2d。
 - 登记里的已结束监听只留最近 64 条；`komo.task` 随子 conversation 一直在，没有按时间清理。

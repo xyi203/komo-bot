@@ -19,6 +19,7 @@ use komo_kernel::cron::FiringStatus;
 use komo_kernel::durable::{WriteState, legacy_ids};
 use komo_kernel::events::EventPayload;
 use komo_kernel::traits::ToolOutputStore;
+use komo_kernel::types::chat::is_silent_reply;
 use komo_kernel::types::ids::{RunId, SessionId};
 use komo_kernel::types::refs::OutputRef;
 use komo_store::{FileToolOutputStore, SessionPaths};
@@ -98,14 +99,17 @@ async fn run_outcome(state: &Arc<GatewayState>, session: &SessionId, run: &RunId
         }
         match &event.payload {
             EventPayload::RunCompleted(body) => {
+                let text = body
+                    .final_message
+                    .clone()
+                    .unwrap_or_else(|| "（这一轮没有文字回复）".to_string());
+                // 回的是不说话的记号（S1）：触发照记 `Ok`，不投（同命令型 Job 的空 stdout）。
+                let deliver = !is_silent_reply(&text);
                 return Outcome {
                     status: FiringStatus::Ok,
                     error: None,
-                    text: body
-                        .final_message
-                        .clone()
-                        .unwrap_or_else(|| "（这一轮没有文字回复）".to_string()),
-                    deliver: true,
+                    text,
+                    deliver,
                 };
             }
             EventPayload::RunFailed(body) => {

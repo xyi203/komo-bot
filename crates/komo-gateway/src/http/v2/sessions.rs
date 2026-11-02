@@ -6,19 +6,19 @@
 //! 状态码映射在 `http::error`（`SessionError`）：`NotFound` 404、`Invalid` 400、`NotOpen` /
 //! `Busy` / `Conflict` 409（`NotOpen` 说清是哪种状态）、请求键冲突 409、`Internal` 500。
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use komo_kernel::durable::legacy_ids;
 use komo_kernel::protocol::http::{
     BoundaryRequest, BoundaryResponse, CreateSessionRequest, DeleteSessionRequest, PurgeBlocked,
     PurgeSessionRequest, PurgeSessionResponse, ResumeRequest, ResumeResponse, SessionDetail,
-    SessionLifecycleResponse, SessionListResponse, SessionSummary, SubmitRunRequest,
-    SubmitRunResponse,
+    SessionLifecycleResponse, SessionListResponse, SessionSearchQuery, SessionSearchResponse,
+    SessionSummary, SubmitRunRequest, SubmitRunResponse,
 };
-use komo_kernel::types::ids::SessionId;
+use komo_kernel::types::ids::{RunId, Seq, SessionId};
 use komo_kernel::types::model::Effort;
-use komo_kernel::types::status::SessionState;
+use komo_kernel::types::status::{RunState, SessionState};
 use komo_runtime::durable::harness::WhenBusy;
 
 use crate::http::Api;
@@ -35,6 +35,7 @@ pub fn routes() -> Router<Api> {
     Router::new()
         .route("/v1/home-session", get(home))
         .route("/v1/sessions", get(list).post(create))
+        .route("/v1/session-search", get(search))
         .route("/v1/sessions/{id}", get(detail))
         .route("/v1/sessions/{id}/runs", post(submit))
         .route("/v1/sessions/{id}/resume", post(resume))
@@ -69,6 +70,24 @@ async fn list(
         sessions.push(core.session_summary(record).await?);
     }
     Ok(Json(SessionListResponse { sessions }))
+}
+
+/// `GET /v1/session-search?q=…&limit=…`：跨会话找回（`komo session search`，roadmap-muse S3）。
+/// 只读；可见性与次序见 `service::durable::search`。空关键词 400。
+async fn search(
+    State(api): State<Api>,
+    Query(query): Query<SessionSearchQuery>,
+) -> ApiResult<Json<SessionSearchResponse>> {
+    let core = api.state.core()?;
+    let config = api.state.snapshot();
+    let hits = core
+        .search_sessions(
+            &query.q,
+            query.limit.map(|limit| limit as usize),
+            &config.agent,
+        )
+        .await?;
+    Ok(Json(SessionSearchResponse { hits }))
 }
 
 /// `POST /v1/sessions`：建会话（sessions 行 + 根 conversation + `komo.agent`，一次提交），落在默认
@@ -168,6 +187,7 @@ async fn receipt(core: &DurableCore, accepted: Accepted) -> ApiResult<Json<Submi
         seq: legacy_ids::seq(accepted.submission, 0),
         state,
         deduplicated: accepted.deduplicated,
+        detached: false,
     }))
 }
 
@@ -186,14 +206,25 @@ async fn submit(
         return Err(ApiFailure::session_not_open(state));
     }
     if request.shell {
-        let accepted = shell::submit_shell(
+        let receipt_of = shell::submit_shell(
             &api.state,
             &id,
             Some(request.request_key.as_str().to_owned()),
             &request.text,
         )
         .await?;
-        return receipt(core, accepted).await;
+        return match receipt_of {
+            shell::ShellReceipt::Landed(accepted) => receipt(core, accepted).await,
+            // 转后台：还没有 submission，`run` 是这条命令的临时身份。
+            shell::ShellReceipt::Detached { call, deduplicated } => Ok(Json(SubmitRunResponse {
+                run: RunId::from_raw(call),
+                session: SessionId::from_raw(id),
+                seq: Seq::ZERO,
+                state: RunState::Running,
+                deduplicated,
+                detached: true,
+            })),
+        };
     }
     let model = model_override(
         &api,

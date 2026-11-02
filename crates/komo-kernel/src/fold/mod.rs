@@ -172,6 +172,7 @@ impl Surface {
                     provider_blocks: None,
                     absorbed_from: None,
                     project_update: false,
+                    shell: None,
                 });
             }
             EventPayload::RunQueued(_) => {
@@ -259,6 +260,7 @@ impl Surface {
                         provider_blocks: None,
                         absorbed_from: event.run.clone(),
                         project_update: original.project_update,
+                        shell: original.shell.clone(),
                     };
                     self.last_role = Some(Role::User);
                     self.messages.push(copy);
@@ -276,6 +278,7 @@ impl Surface {
                 provider_blocks: None,
                 absorbed_from: None,
                 project_update: body.project_update,
+                shell: body.shell.clone(),
             }),
             EventPayload::MessageAssistant(body) => {
                 if event.run.is_some() {
@@ -294,6 +297,7 @@ impl Surface {
                     provider_blocks: body.provider_blocks.clone(),
                     absorbed_from: None,
                     project_update: false,
+                    shell: None,
                 });
             }
             EventPayload::ConversationBoundary(_) => {
@@ -378,6 +382,7 @@ impl Surface {
                             provider_blocks: None,
                             absorbed_from: None,
                             project_update: false,
+                            shell: None,
                         },
                     });
                 }
@@ -473,6 +478,7 @@ impl Surface {
             provider_blocks: None,
             absorbed_from: None,
             project_update: false,
+            shell: None,
         });
     }
 
@@ -874,6 +880,7 @@ mod tests {
                 text: Some("再说一句".into()),
                 text_ref: None,
                 project_update: true,
+                shell: None,
             }),
         )];
         let surface = fold(&events);
@@ -892,6 +899,7 @@ mod tests {
                     text: Some("第二句".into()),
                     text_ref: None,
                     project_update: false,
+                    shell: None,
                 }),
             ),
         ];

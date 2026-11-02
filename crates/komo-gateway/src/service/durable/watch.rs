@@ -35,7 +35,7 @@ use komo_kernel::durable::{
 };
 use komo_kernel::events::EventPayload;
 use komo_kernel::protocol::sse::SseEvent;
-use komo_kernel::types::chat::{ChannelPeer, DeliveryTarget, Outbound};
+use komo_kernel::types::chat::{ChannelPeer, DeliveryTarget, Outbound, is_silent_reply};
 use komo_kernel::types::ids::{RunId, SessionId};
 
 use super::DurableCore;
@@ -94,12 +94,17 @@ fn placed_entry(record: &SubmissionRecord) -> Option<EntryId> {
     }
 }
 
+/// 一条 run（首个输入 submission）放置成的 entry（读不出来、还没放置过 / 已撤回就没有）。
+pub async fn input_entry(core: &DurableCore, first: SubmissionId) -> Option<EntryId> {
+    let Ok(Some(record)) = core.storage.submission(first).await else {
+        return None;
+    };
+    placed_entry(&record)
+}
+
 /// 一条 run（首个输入 submission）的来源。读不出来按 [`Source::Other`]：宁可不投，不投错人。
 pub async fn source_of(core: &DurableCore, first: SubmissionId) -> (Source, Option<EntryId>) {
-    let Ok(Some(record)) = core.storage.submission(first).await else {
-        return (Source::Other, None);
-    };
-    let Some(entry) = placed_entry(&record) else {
+    let Some(entry) = input_entry(core, first).await else {
         return (Source::Other, None);
     };
     match core.storage.entry(entry).await {
@@ -252,7 +257,15 @@ async fn finish(state: &Arc<GatewayState>, session: &str, run: &RunId, outcome: 
         return;
     };
     if let Outcome::Completed(text) = &outcome {
-        super::titles::spawn(state, session, run, text);
+        if is_silent_reply(text) {
+            // 不说话（S1）：只由内部输入起、也没并进用户输入的 run 不投；记号不拿来起标题。
+            if only_internal(core, first).await {
+                tracing::debug!(%run, "内部输入的这一轮不转告");
+                return;
+            }
+        } else {
+            super::titles::spawn(state, session, run, text);
+        }
     }
     let Some(destination) = destination(core, session, first).await else {
         // TUI / HTTP 自己在看事件流（§13.1），cron 归它自己的看客。
@@ -336,6 +349,48 @@ async fn answer_text(core: &DurableCore, entry: EntryId) -> Option<String> {
             _ => None,
         })?;
     (!text.trim().is_empty()).then_some(text)
+}
+
+/// 这条 run 里的输入全是内部输入：首个输入，以及并进来、与它共用同一条回答 entry 的那些。
+/// 有一条是用户说的话（聊天、TUI、认不出来）就不是——有人在等回答，记号照原样投。
+async fn only_internal(core: &DurableCore, first: SubmissionId) -> bool {
+    let Ok(Some(record)) = core.storage.submission(first).await else {
+        return false;
+    };
+    let SubmissionKind::Input {
+        state: InputState::Done { answer, .. },
+    } = &record.kind
+    else {
+        return false;
+    };
+    let query = SubmissionQuery {
+        conversation: Some(record.conversation),
+        status: Some(SubmissionStatus::Done),
+        order: Some(ScanOrder::Ascending),
+    };
+    let mut cursor: Option<Cursor> = None;
+    loop {
+        let Ok(page) = core
+            .storage
+            .scan_submissions(&query, 256, cursor.as_ref())
+            .await
+        else {
+            return false;
+        };
+        for other in &page.items {
+            let shares = matches!(
+                &other.kind,
+                SubmissionKind::Input { state: InputState::Done { answer: a, .. } } if a == answer
+            );
+            if shares && source_of(core, other.id).await.0 != Source::Internal {
+                return false;
+            }
+        }
+        match page.next {
+            Some(next) => cursor = Some(next),
+            None => return true,
+        }
+    }
 }
 
 /// 这条已结算的输入是不是并进了更早的输入开的 run（并进来的输入与宿主共用同一条回答 entry，

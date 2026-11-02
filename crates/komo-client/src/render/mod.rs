@@ -13,12 +13,13 @@ use komo_kernel::protocol::http::{
     ConsolidateGroupStatus, ConsolidateOutcome, CronListResponse, HealthResponse, IndexState,
     InterventionDetail, InterventionListResponse, InterventionSummary, McpReconnectResponse,
     McpServerState, McpServerStatus, MemoryConsolidateResponse, MemoryIndexStatus,
-    MemoryListResponse, MemorySweepResponse, ModelWindow, ModelsResponse, RunDetail,
-    SessionListResponse, SessionSummary, SweepRule, TelemetryHealth, ToolCallSummary, WindowSource,
+    MemoryListResponse, MemorySweepResponse, ModelWindow, ModelsResponse, MonitorListResponse,
+    RunDetail, SessionListResponse, SessionSearchResponse, SessionSummary, SweepRule,
+    TelemetryHealth, ToolCallSummary, WindowSource,
 };
 use komo_kernel::types::memory::{
-    Confirmation, MemoryItem, MemoryKind, MemoryScope, MemoryState, Provenance, RecallDiagnostics,
-    RetrievalMode,
+    ArmScore, Confirmation, MemoryItem, MemoryKind, MemoryScope, MemoryState, Provenance,
+    RecallDiagnostics, RetrievalMode,
 };
 use komo_kernel::types::status::{RunState, SessionState, ToolCallState, WaitReason};
 use time::OffsetDateTime;
@@ -80,6 +81,77 @@ pub fn session_list(response: &SessionListResponse, now: OffsetDateTime) -> Stri
     out.join("\n")
 }
 
+/// `komo session search`：每个命中的会话一段——会话 ID、种类与标题、最近命中的时刻与条数、
+/// 能接着查的 ID（任务短号、派它的会话、还在跑的监听），再是片段。要看全文用 `komo session export`。
+pub fn session_search(response: &SessionSearchResponse) -> String {
+    if response.hits.is_empty() {
+        return "没有匹配的会话".into();
+    }
+    let mut out = Vec::new();
+    for hit in &response.hits {
+        let title = if hit.title.is_empty() {
+            "（无标题）"
+        } else {
+            hit.title.as_str()
+        };
+        out.push(format!("{} · {} · {title}", hit.session, hit.kind));
+        let mut facts = vec![format!(
+            "最近命中 {} · {} 处",
+            stamp(hit.matched_at),
+            hit.matches
+        )];
+        if let Some(task) = &hit.task {
+            facts.push(format!("任务 {task}"));
+        }
+        if let Some(parent) = &hit.parent_session {
+            facts.push(format!("派它的会话 {parent}"));
+        }
+        if !hit.monitors.is_empty() {
+            facts.push(format!("监听 {}", hit.monitors.join("、")));
+        }
+        out.push(format!("  {}", facts.join(" · ")));
+        for snippet in &hit.snippets {
+            out.push(format!("  - {snippet}"));
+        }
+    }
+    out.join("\n")
+}
+
+/// `komo monitor list`：一个监听一行——短号、状态、已跑多久、距截止还有多久、标题、挂它的会话；
+/// 脚本缩进在下一行。`now` 由调用方给。
+pub fn monitor_list(response: &MonitorListResponse, now: OffsetDateTime) -> String {
+    if response.monitors.is_empty() {
+        return "没有监听".into();
+    }
+    let mut out = Vec::new();
+    for monitor in &response.monitors {
+        let state = match (monitor.state.as_str(), &monitor.reason) {
+            ("ended", Some(reason)) => format!("已结束（{reason}）"),
+            ("ended", None) => "已结束".into(),
+            ("starting", _) => "启动中".into(),
+            _ => "运行中".into(),
+        };
+        let mut line = format!(
+            "#{} {state} · 已跑 {}",
+            monitor.handle,
+            komo_kernel::types::task::duration_words(now - monitor.started_at)
+        );
+        if monitor.state != "ended" {
+            line.push_str(&format!(
+                " · 距截止 {}",
+                komo_kernel::types::task::duration_words(monitor.deadline - now)
+            ));
+        }
+        line.push_str(&format!(" · 「{}」", monitor.title));
+        if let Some(session) = &monitor.session {
+            line.push_str(&format!(" · 会话 {session}"));
+        }
+        out.push(line);
+        out.push(format!("  {}", monitor.command));
+    }
+    out.join("\n")
+}
+
 /// §8.10 的四个状态在清单里的写法。`active` 是常态，留空。
 fn session_state(state: SessionState) -> &'static str {
     match state {
@@ -103,9 +175,10 @@ fn session_title(session: &SessionSummary) -> String {
     }
 }
 
-/// 任务会话的短标注（`docs/background-tasks.md`）：`任务·#3f2a`，
-/// `#3f2a` 是这条会话自己的短号——与派出回执、`follow` 用的是同一个口径
-/// （`komo_kernel::types::task::short_id`），操作者能直接拿它对上聊天里的那一条。
+/// 任务会话的短标注（`docs/background-tasks.md`）：`任务·#k3x9qa`，
+/// `#k3x9qa` 是这条会话自己的短号——Gateway 在 `SessionSummary.task` 里给，与派出回执、
+/// `task_id` 同一个，操作者能直接拿它对上聊天里的那一条。老 Gateway 不给时退回会话 ID 后四位
+/// （`komo_kernel::types::task::short_id`）。
 ///
 /// 只有 `kind == "task"` 的会话才有这个标注；`main` / `normal` 一个字都不多印
 /// （不改变现有输出，§ 约束）。
@@ -113,7 +186,10 @@ fn task_marker(session: &SessionSummary) -> Option<String> {
     if session.kind != "task" {
         return None;
     }
-    let short = komo_kernel::types::task::short_id(&session.session);
+    let short = session
+        .task
+        .clone()
+        .unwrap_or_else(|| komo_kernel::types::task::short_id(&session.session));
     Some(format!("任务·#{short}"))
 }
 
@@ -560,11 +636,17 @@ pub fn memory_list_full(response: &MemoryListResponse) -> String {
 /// `komo memory search`：列同 [`memory_list_full`]，约定与线索分开列，读到的和注入块是同一套
 /// 语义（§9.4）。约定 = active + convention；其余（reference、没分类、candidate、contested）
 /// 都是线索。
+///
+/// 响应带着检索模式时，`id@版本` 之后多一列相关度分数（[`score_cell`]），组前一行说明分数对应哪个
+/// 门槛。
 pub fn memory_search(response: &MemoryListResponse) -> String {
     let mut out = degraded_notice(response);
     if response.memories.is_empty() {
         out.push("没有匹配的记忆".into());
         return out.join("\n");
+    }
+    if let Some(mode) = response.mode {
+        out.push(score_legend(mode, response.degraded));
     }
     let (conventions, clues): (Vec<&MemoryItem>, Vec<&MemoryItem>) = response
         .memories
@@ -581,9 +663,62 @@ pub fn memory_search(response: &MemoryListResponse) -> String {
             continue;
         }
         out.push(format!("{title}："));
-        out.extend(group.into_iter().map(full_line));
+        out.extend(group.into_iter().map(|item| search_line(response, item)));
     }
     out.join("\n")
+}
+
+/// 分数列说的是什么：哪一臂的原始分、对应 `[memory.retrieval]` 的哪个门槛（§9.4）。
+fn score_legend(mode: RetrievalMode, degraded: bool) -> String {
+    match mode {
+        RetrievalMode::Keyword => {
+            "分数：关键词臂归一化分（对应 [memory.retrieval] min_keyword_score）".into()
+        }
+        RetrievalMode::Vector => "分数：向量余弦（对应 [memory.retrieval] min_similarity）".into(),
+        RetrievalMode::Hybrid => format!(
+            "分数：关键词 = 关键词臂归一化分（对应 min_keyword_score），余弦 = 向量臂（对应 min_similarity）；\
+             未命中 = 不在这一臂的候选名单里{}",
+            if degraded {
+                "；未跑 = 这一次向量臂没跑"
+            } else {
+                ""
+            }
+        ),
+    }
+}
+
+/// 一条检索结果的分数列。keyword / vector 只写那一臂；hybrid 两臂都写，不在某臂名单里的写
+/// 「未命中」，向量臂降级没跑的写「未跑」。响应里没有这条的分数（旧 Gateway）写 `-`。
+fn score_cell(mode: RetrievalMode, degraded: bool, score: Option<&ArmScore>) -> String {
+    let Some(score) = score else {
+        return "分数 -".into();
+    };
+    let value = |score: Option<f32>| score.map_or_else(|| "未命中".into(), |s| format!("{s:.3}"));
+    let keyword = format!("关键词 {}", value(score.keyword));
+    let vector = if degraded {
+        "余弦 未跑".to_string()
+    } else {
+        format!("余弦 {}", value(score.vector))
+    };
+    match mode {
+        RetrievalMode::Keyword => keyword,
+        RetrievalMode::Vector => vector,
+        RetrievalMode::Hybrid => format!("{keyword} · {vector}"),
+    }
+}
+
+fn search_line(response: &MemoryListResponse, item: &MemoryItem) -> String {
+    let Some(mode) = response.mode else {
+        return full_line(item);
+    };
+    let score = response.arm_scores.iter().find(|score| score.id == item.id);
+    format!(
+        "{}@{}\t{}\t{}",
+        item.id,
+        item.revision,
+        score_cell(mode, response.degraded, score),
+        full_fields(item)
+    )
 }
 
 fn degraded_notice(response: &MemoryListResponse) -> Vec<String> {
@@ -601,6 +736,11 @@ fn degraded_notice(response: &MemoryListResponse) -> Vec<String> {
 }
 
 fn full_line(item: &MemoryItem) -> String {
+    format!("{}@{}\t{}", item.id, item.revision, full_fields(item))
+}
+
+/// `id@版本` 之后的那些列。
+fn full_fields(item: &MemoryItem) -> String {
     let content = item
         .content
         .split(['\n', '\r', '\t'])
@@ -609,9 +749,7 @@ fn full_line(item: &MemoryItem) -> String {
         .collect::<Vec<_>>()
         .join(" ");
     format!(
-        "{}@{}\t{}\t{}\t{}\t注入 {} 次 · 用上 {} 次\t{}\t{}\t{}\t{}",
-        item.id,
-        item.revision,
+        "{}\t{}\t{}\t注入 {} 次 · 用上 {} 次\t{}\t{}\t{}\t{}",
         memory_state(item.state),
         provenance(item.provenance),
         confirmation(item.confirmation),

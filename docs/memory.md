@@ -174,6 +174,7 @@ MemoryManager 对 AgentRuntime 提供三个主要入口：recall、process_compl
 - **两个门槛默认都是 0，即不启用**——分数随 embedding 模型与前缀变，没有放之四海的值。配了 embedding 的实例要按自己的空间校准后写进配置；本机 `qwen3-embedding:0.6b`、不配前缀时的校准值是 0.56 / 1.0。换 `query_prefix` 或模型要重新校准。
 - 某一臂这一次没跑（向量降级、keyword 模式），只看另一臂的门槛；一臂门槛为 0 时它对这一臂不设限。
 - 每条留下的候选在召回诊断里记两臂分数与过了哪道门槛；丢掉的只记条数。复核门槛按附录 D 的方法用真实会话做。
+- **`komo memory search` 显示分数（2026-11-01，已实现）。** 校准门槛要看到分数：`GET /v1/memories` 带查询词时响应多两个字段——`mode`（这次用的模式；hybrid 降级时仍是 hybrid，看 `degraded`）与 `arm_scores`（逐条 `{id, keyword?, vector?, passed}`，就是 store 算出、门槛比较用的那两个原始分）；不带查询词的清单两样都没有。开着重排时 runtime 的 `search` 按交回去的条目重排、截断 `arm_scores`，不留短名单尾巴的分数。CLI 在 `id@版本` 之后多一列，组前一行说明对应哪个门槛：keyword 模式 `关键词 0.431`（对照 `min_keyword_score`），vector 模式 `余弦 0.612`（对照 `min_similarity`），hybrid 两臂都写 `关键词 0.431 · 余弦 未命中`——「未命中」= 不在这一臂的候选名单里，向量臂降级没跑写「未跑」；没有这条的分数（连的是旧 Gateway）写 `分数 -`。分数保留三位小数。`komo memory list` 与 `list --full` 不变。CLI 没有 `--json`，要原始数字直接读 HTTP 响应。测试：store `every_kept_item_carries_its_arm_scores_in_item_order`、runtime `a_judgement_can_lift_an_entry_the_fusion_ranked_lower`、gateway `tests/memory/recall.rs` `a_search_reports_its_mode_and_each_hits_arm_scores`、client `memory_search_shows_the_arm_scores_that_match_the_thresholds`。
 - 门槛之后的重排照旧"只重排、不增删"：重排后端挑 `none` 也不会把留下的候选清空——拒绝候选是门槛的事，不是排序的事。
 - 门槛不判"业务条件是否成立"。`applies_when` 只参与打分（进索引文本）；过了门槛的约定连同条件一起注入，条件成立与否由主模型对着当前任务判断。注入前按条件拒绝候选要另加判断调用，没有实测之前不做。
 
@@ -206,6 +207,7 @@ MemoryManager 对 AgentRuntime 提供三个主要入口：recall、process_compl
 - **提取看不到正文。** `legacy_events` 把 `komo.memory.recall` 投影成挂在所属 Run 上的 `MemoryInjected`，只带 `uses` 和诊断，不投影成 `MessageUser`。因此提取窗口里根本没有这段文字，也就不可能被引为证据；`komo.*` 前缀的 entry 本来也不当用户消息投影。提取的"本批注入过哪些条目"和 run 详情的 `memories` / `recall` 都读这份投影：每个 Run 只记自己那一块，"沿用上一块"的说法取消。
 - **协议层。** 内容只在 `komo-agent` 渲染这一处，消息上带 `extra.komoOrigin = "memory"`，代码找"最近的用户输入"或判断压缩切点时靠它跳过这条。Anthropic 不支持对话中间的 system 消息，所以首版所有适配器都按 user 角色发送，Anthropic 会把它和紧邻的输入合成同一个 user 轮。Responses 改用 developer 角色属于适配层的可选优化，首版不做。
 - **耗时预算。** 召回在 Run 首次请求前同步进行，用户要等它完成。不另加旋钮：向量臂受 `[memory.embedding] timeout_secs` 约束，超时或报错按上面的降级规则退成关键词；整个召回失败也不拦这一轮，只落一条筛空记录。报错之后的按需查询改由 Agent 自己跑 `komo memory search`，宿主不在 Run 中途插召回（见下文「约定不过门槛，Agent 主动查」）。
+- **cron 触发的 Run 不召回（2026-11-01，已实现）。** 首个输入是 `cron.input` 的 Run（定时触发与 `komo cron run` 手动触发都是）不做自动召回：线索、约定、事项三组都不带，也不落 `komo.memory.recall` 记录（诊断里没有这个 Run 的召回行）。理由：Job 的 prompt 是写好的巡检清单，又长又杂，按它召回进来的多是无关线索；约定与事项是给"用户此刻要求的任务"提供默认值和背景的，无人值守的巡检用不上，约定里还可能有巡检不该顺手做的事。要用记忆的 Job 在 prompt 里让 Agent 自己跑 `komo memory search`。判断看 Run 不看会话（`hooks/recall.rs` 的 `cron_run`：首个输入 submission 放置出的 entry 的 kind）：cron 会话里用户自己发的消息、任务交回与监听事件另起的 Run 照常召回；并进 cron Run 的插话属于那个 Run，不召回。每次请求前对已展示条目的失效核对照做。测试：`tests/memory/recall.rs` `a_cron_run_recalls_nothing_but_a_user_message_in_its_session_does`。
 - **预算。** 每块仍按条数和 token 预算截断（8 条、约 1500 tokens）。同一段里的块随 Run 累加，靠去重和压缩控制总量，不另设段级上限。
 - **旧会话的系统段 `memory`。** 升级后钩子不再交回 `memory` 段，已有会话的下一次请求会由系统补丁去掉它，前缀因此失效一次，之后按 Run 召回。conversation 级 document `komo.memory`（`MemoryDoc`）不再写入；旧会话里已有的那份只读，用来给旧 Run 的详情补 `memories`。
 

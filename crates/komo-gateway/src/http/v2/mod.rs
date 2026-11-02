@@ -13,11 +13,13 @@
 //! | `cron` | cron 增删改与 run-now | W3b |
 //! | `interventions` | 待处理清单、详情、答复、reconcile | W4a |
 //! | `export` | `GET /v1/sessions/{id}/export` | W4c |
+//! | `monitors` | `GET /v1/monitors`（只读清单） | S4 |
 
 pub mod cron;
 pub mod events;
 pub mod export;
 pub mod interventions;
+pub mod monitors;
 pub mod runs;
 pub mod sessions;
 pub mod tree;
@@ -39,4 +41,5 @@ pub fn routes() -> Router<Api> {
         .merge(cron::routes())
         .merge(interventions::routes())
         .merge(export::routes())
+        .merge(monitors::routes())
 }

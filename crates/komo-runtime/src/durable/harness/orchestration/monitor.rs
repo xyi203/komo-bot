@@ -47,11 +47,14 @@
 use std::time::Duration;
 
 use komo_kernel::durable::task::NextTaskState;
-use komo_kernel::durable::{Content, ConversationId, DocumentAddress, DocumentScope, Storage};
+use komo_kernel::durable::{
+    Content, ConversationId, DocumentAddress, DocumentScope, SessionLifecycle, Storage,
+};
+use komo_kernel::types::handle::{parse_handle, short_handle};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use super::{Cx, MonitorError, Reply, Step, task_doc_address};
+use super::{Cx, MonitorError, Reply, Step};
 use crate::durable::error::{DurableError, TaskError};
 use crate::durable::harness::generation::GenerationTask;
 use crate::durable::harness::inbox::{self, InputEntry, QueueModes, SubmissionDraft, WhenBusy};
@@ -116,8 +119,9 @@ pub struct MonitorRecord {
 }
 
 impl MonitorRecord {
+    /// 短号（6 位字母数字，`komo_kernel::types::handle`）：回执、事件头、`monitor_stop` 都用它。
     pub fn handle(&self) -> String {
-        self.id.to_string()
+        short_handle(self.id)
     }
 
     pub fn is_live(&self) -> bool {
@@ -203,6 +207,19 @@ pub async fn list(storage: &dyn Storage) -> Result<Vec<MonitorRecord>, DurableEr
     }
 }
 
+/// 挂在 `conversation` 上、还在跑的监听（任务查进度列出它们）。
+pub(super) async fn live_in(
+    rt: &TaskRuntime,
+    conversation: ConversationId,
+) -> Result<Vec<MonitorRecord>, TaskError> {
+    Ok(read(rt)
+        .await?
+        .items
+        .into_iter()
+        .filter(|record| record.is_live() && record.conversation == conversation)
+        .collect())
+}
+
 async fn read(rt: &TaskRuntime) -> Result<Registry, TaskError> {
     match rt.find_document(&monitors_address()).await? {
         None => Ok(Registry::default()),
@@ -236,7 +253,7 @@ pub fn event_draft(id: u64, title: &str, suffix: &str, text: impl Into<String>) 
         content: Content::Text(text.into()),
         entry: Some(InputEntry::new(
             MONITOR_EVENT_ENTRY,
-            Some(json!({ "monitor": { "id": id, "handle": id.to_string(), "title": title } })),
+            Some(json!({ "monitor": { "id": id, "handle": short_handle(id), "title": title } })),
         )),
         when_busy: WhenBusy::Steer,
         request_id: Some(format!("monitor:{id}:{suffix}")),
@@ -266,7 +283,18 @@ pub(crate) async fn finish_in_tx(
     }
     let (conversation, title) = (record.conversation, record.title.clone());
     // 表读（会话在不在、请求键、head）先于这次提交的第一次表写；登记是 document，不算表写。
-    let present = tx.conversation(conversation).await?.is_some();
+    // 所在的 Session 已经在删（`closing` 之后）也只登记：结束消息会在要删的会话里再起一条 run
+    // （删会话时由 gateway 停掉它名下的监听，S2）。
+    let present = match tx.conversation(conversation).await? {
+        None => false,
+        Some(record) => match record.session.as_deref() {
+            None => true,
+            Some(session) => tx
+                .session(session)
+                .await?
+                .is_none_or(|row| row.lifecycle == SessionLifecycle::Active),
+        },
+    };
     record.state = MonitorState::Ended {
         reason: reason.to_owned(),
         detail: detail.map(str::to_owned),
@@ -279,7 +307,7 @@ pub(crate) async fn finish_in_tx(
             entry: Some(InputEntry::new(
                 MONITOR_END_ENTRY,
                 Some(json!({
-                    "monitor": { "id": id, "handle": id.to_string(), "title": title, "reason": reason }
+                    "monitor": { "id": id, "handle": short_handle(id), "title": title, "reason": reason }
                 })),
             )),
             when_busy: WhenBusy::Steer,
@@ -311,7 +339,11 @@ pub enum Reconciled {
 }
 
 pub(crate) fn interrupted_message(record: &MonitorRecord, why: &str) -> String {
-    format!("[监听 #{}「{}」已结束]\n\n{why}", record.id, record.title)
+    format!(
+        "[监听 #{}「{}」已结束]\n\n{why}",
+        record.handle(),
+        record.title
+    )
 }
 
 // ---------------------------------------------------------------- 工具任务
@@ -325,19 +357,7 @@ pub(super) struct Request {
 }
 
 pub(super) async fn start(cx: &Cx<'_>, request: Request) -> Result<(), TaskError> {
-    // 任务会话里别挂：任务这一轮一结束结果就交回去了（`docs/monitor.md` §3 的工具说明）。
-    if cx
-        .rt
-        .find_document(&task_doc_address(cx.conversation()))
-        .await?
-        .is_some()
-    {
-        return cx
-            .reply(&Reply::error(
-                "挂不上监听：后台任务会话里不能挂监听：任务这一轮一结束，结果就交回去了",
-            ))
-            .await;
-    }
+    // 任务会话里也能挂（2026-10-31，S2）：事件进任务会话，处理完照常交回（`report`）。
     let id = cx.rt.task_id().get();
     let conversation = cx.conversation();
     // 效果一：登记（starting），checkpoint 推进到 `orchestrate { monitorStart }`。
@@ -380,7 +400,10 @@ fn started_reply(record: &MonitorRecord, note: &str) -> Reply {
     Reply::ok(
         format!(
             "已开始监听 #{}：{}（最长 {} 分钟）。事件会以 [监听 #{}…] 开头的消息交回。{note}",
-            record.id, record.title, record.timeout_minutes, record.id
+            record.handle(),
+            record.title,
+            record.timeout_minutes,
+            record.handle()
         ),
         json!({
             "id": record.id,
@@ -497,18 +520,20 @@ pub(super) async fn stop(cx: &Cx<'_>, raw: &str) -> Result<(), TaskError> {
     let conversation = cx.conversation();
     let registry = read(cx.rt).await?;
     let wanted = raw.trim().trim_start_matches('#');
-    let found = wanted
-        .parse::<u64>()
-        .ok()
-        .and_then(|id| registry.find(id))
+    // 短号算回 ID（老的纯数字写法也收），只在这个会话挂的里面认；认出不止一个按认不出处理。
+    let mut found: Vec<MonitorRecord> = parse_handle(raw)
+        .into_iter()
+        .filter_map(|id| registry.find(id))
         .filter(|record| record.conversation == conversation)
-        .cloned();
+        .cloned()
+        .collect();
+    let found = (found.len() == 1).then(|| found.remove(0));
     let Some(record) = found else {
         let running: Vec<String> = registry
             .items
             .iter()
             .filter(|record| record.conversation == conversation && record.is_live())
-            .map(|record| format!("#{}「{}」", record.id, record.title))
+            .map(|record| format!("#{}「{}」", record.handle(), record.title))
             .collect();
         let tail = if running.is_empty() {
             "这个会话没有在跑的监听".to_owned()
@@ -529,7 +554,11 @@ pub(super) async fn stop(cx: &Cx<'_>, raw: &str) -> Result<(), TaskError> {
         };
         return cx
             .reply(&Reply::ok(
-                format!("不用停了：监听 #{}「{}」{how}", record.id, record.title),
+                format!(
+                    "不用停了：监听 #{}「{}」{how}",
+                    record.handle(),
+                    record.title
+                ),
                 json!({
                     "id": record.id,
                     "handle": record.handle(),
@@ -566,7 +595,7 @@ async fn finish_stop(cx: &Cx<'_>, record: &MonitorRecord) -> Result<(), TaskErro
     match cx.guarded(cx.hooks().stop_monitor(record.id)).await? {
         Ok(()) | Err(MonitorError::Unknown(_)) => {
             cx.reply(&Reply::ok(
-                format!("已停止监听 #{}：{}", record.id, record.title),
+                format!("已停止监听 #{}：{}", record.handle(), record.title),
                 json!({ "id": record.id, "handle": record.handle(), "title": record.title, "already_ended": null }),
             ))
             .await
@@ -585,7 +614,7 @@ pub(super) async fn abort_stop(cx: &Cx<'_>) -> Result<Reply, TaskError> {
     let record = stopping_record(cx).await?;
     let _ = cx.hooks().stop_monitor(record.id).await;
     Ok(Reply::ok(
-        format!("已停止监听 #{}：{}", record.id, record.title),
+        format!("已停止监听 #{}：{}", record.handle(), record.title),
         json!({ "id": record.id, "handle": record.handle(), "title": record.title }),
     ))
 }
@@ -597,14 +626,13 @@ async fn stopping_record(cx: &Cx<'_>) -> Result<MonitorRecord, TaskError> {
         .get("monitor_id")
         .and_then(Value::as_str)
         .unwrap_or_default()
-        .trim()
-        .trim_start_matches('#')
         .to_owned();
     let registry = read(cx.rt).await?;
-    wanted
-        .parse::<u64>()
-        .ok()
-        .and_then(|id| registry.find(id))
+    let conversation = cx.conversation();
+    parse_handle(&wanted)
+        .into_iter()
+        .filter_map(|id| registry.find(id))
+        .find(|record| record.conversation == conversation)
         .cloned()
-        .ok_or_else(|| TaskError::new(format!("monitor #{wanted} is not registered")))
+        .ok_or_else(|| TaskError::new(format!("monitor {wanted} is not registered")))
 }

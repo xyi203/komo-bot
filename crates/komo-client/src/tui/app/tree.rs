@@ -349,6 +349,7 @@ fn display_message(id: &str, seq: Seq, role: Role, text: String) -> SurfaceMessa
         provider_blocks: None,
         absorbed_from: None,
         project_update: false,
+        shell: None,
     }
 }
 

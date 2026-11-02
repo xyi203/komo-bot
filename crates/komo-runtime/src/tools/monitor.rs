@@ -50,11 +50,11 @@ impl Tool for MonitorTool {
             description:
                 "在后台挂一个脚本盯着某件事（流水线、工单、日志报错、指标阈值），你不用等，\
                 这一轮可以直接回复用户。脚本往 stdout 每打一行就是一个事件，以 [监听 #短号…] 开头的\
-                消息交回给你；用户看不到它，需要告知的由你转告。\n\
+                消息交回给你；用户看不到它，需要告知的由你转告，不值得说就整段只回 NO_REPLY（不投递）。\n\
                 写脚本：① 只打印要处理的行，先过滤（每行都会让你跑一轮）；② 管道每段逐行刷新\
                 （grep --line-buffered、awk fflush()，别用 head）；③ 失败状态（failed / canceled / \
                 Error / 崩溃）也要打印；④ 有终点的事让脚本到终态自己退出。对话会话里等状态一律挂\
-                监听，后台任务会话里别挂。\n\
+                监听；后台任务里挂的，事件交回任务自己，处理完照常交回派你的会话。\n\
                 用前先 read tool://monitor/doc。"
                     .into(),
             parameters: serde_json::json!({
@@ -90,8 +90,9 @@ impl Tool for MonitorTool {
                  超时或被停时还会交回一条结束消息。\n\
                  - 轮询循环里 sleep 不要短于 15 秒。对话会话里 bash 里 10 秒以上的 sleep 会被拒绝，\
                  等状态（流水线、工单、部署进度）挂监听，脚本只在完成或出错时打一行；构建、下载这类\
-                 慢命令照常交给 bash（跑久了自动转后台）。后台任务会话里别挂：任务这一轮一结束，\
-                 结果就交回去了。\n\
+                 慢命令照常交给 bash（跑久了自动转后台）。后台任务里挂的监听：每个事件让任务再跑一轮，\
+                 这一轮的回答照常交回派它的会话，回答整段是 NO_REPLY 时不交回；任务会话被删时\
+                 监听跟着停。\n\
                  - timeout_minutes 省略 = 30，上限 {MAX_MONITOR_MINUTES}。\n\
                  - Gateway 重启时监听会中断：脚本只读、重跑一遍没有副作用（轮询状态、查进度、\
                  tail 日志）就设 resume_after_restart = true，重启后按原短号自动重挂、剩余时限\
@@ -181,7 +182,7 @@ impl Tool for MonitorStopTool {
         ToolDefinition {
             name: "monitor_stop".into(),
             description: "停掉这个会话挂着的一个监听（终止它的整个进程组）。monitor_id 是挂上时\
-                          给的短号（例如 3f2a）；给错了会列出还在跑的那些。停掉之后不会再交回\
+                          给的短号（6 位字母数字，例如 k3x9qa）；给错了会列出还在跑的那些。停掉之后不会再交回\
                           结束消息。它已经自己结束了也没关系：会告诉你怎么结束的，\
                           结束消息照常单独交回。"
                 .into(),
@@ -190,7 +191,7 @@ impl Tool for MonitorStopTool {
                 "properties": {
                     "monitor_id": {
                         "type": "string",
-                        "description": "监听短号，例如 3f2a"
+                        "description": "监听短号，例如 k3x9qa"
                     }
                 },
                 "required": ["monitor_id"],

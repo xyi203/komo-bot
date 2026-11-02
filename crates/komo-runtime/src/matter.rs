@@ -405,6 +405,7 @@ mod tests {
                     text: Some("开始做 owl 的发布观察".into()),
                     text_ref: None,
                     project_update: false,
+                    shell: None,
                 }),
                 entry: None,
             }])

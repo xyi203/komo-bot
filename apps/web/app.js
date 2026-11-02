@@ -1267,9 +1267,11 @@ const LOADERS = {
   },
   async inbox(P) { P.items = (await api("/v1/interventions")).interventions; S.inbox = P.items; },
   async settings(P) {
-    const [health, config, index, cfg, settings, env, mcp, channels] = await Promise.allSettled([api("/healthz"), api("/v1/config/check"), api("/v1/memory-index"), api("/v1/config/models"), api("/v1/config/settings"), api("/v1/config/env"), api("/v1/mcp"), api("/v1/channels")]);
+    // 往返时间量的是 浏览器 → 原型服务 → Gateway 这一整圈
+    const timed = async () => { const t0 = performance.now(); const h = await api("/healthz"); return { ...h, rtt_ms: Math.round(performance.now() - t0) }; };
+    const [health, config, index, cfg, settings, env, mcp, channels, conn] = await Promise.allSettled([timed(), api("/v1/config/check"), api("/v1/memory-index"), api("/v1/config/models"), api("/v1/config/settings"), api("/v1/config/env"), api("/v1/mcp"), api("/v1/channels"), api("/__web/connection")]);
     const v = (r) => (r.status === "fulfilled" ? r.value : { error: r.reason?.message || "没取到" });
-    P.data = { health: v(health), config: v(config), index: v(index), cfg: v(cfg), settings: v(settings), env: v(env), mcp: v(mcp), channels: v(channels) };
+    P.data = { health: v(health), config: v(config), index: v(index), cfg: v(cfg), settings: v(settings), env: v(env), mcp: v(mcp), channels: v(channels), conn: v(conn) };
   },
 };
 async function openPage(page, id = null) {
@@ -2054,6 +2056,7 @@ async function fetchProviderModels() {
 }
 function cfgSubmit(form) {
   const f = new FormData(form), v = (k) => String(f.get(k) ?? "").trim();
+  if (form.id === "cfg-conn-form") return connSend("PUT", { url: v("url"), token: v("token") });
   if (form.id === "cfg-setting-num") return settingSend(form.dataset.key, v("v") === "" ? null : Number(v("v")));
   if (form.id === "cfg-env-one") return cfgSend("PUT", "/v1/config/env", { vars: [{ name: form.dataset.name, value: String(f.get("value") ?? "") }] }, `${esc(form.dataset.name)} 设好了`);
   if (form.id === "cfg-env-form") {
@@ -2238,9 +2241,36 @@ function mcpSection(P) {
   return secHead("MCP", "外部工具服务器。增删改在配置文件里；这里看连没连上、有哪些工具。", R.servers.length ? btn(busy ? "正在重连" : "重连全部", `data-pg-act="mcp-reconnect" ${busy ? "disabled" : ""}`, "sm") : "") + failed
     + (R.servers.length ? `<div class="mcp-table"><div class="mcp-head"><span>服务器</span><span>方式</span><span>工具</span><span>状态</span><span></span></div>${rows}</div>` : `<div class="set-panel"><p class="set-line muted">没有配 MCP 服务器。</p></div>`);
 }
+/* 连接：这个网页连哪台 Gateway。地址与令牌交给本机的原型服务（serve.mjs）记在内存里、转发时带上，
+   不进浏览器存储；换了连接整页重载，旧 Gateway 的会话与事件流不混进来 */
+function connCard(P) {
+  const c = P.data.conn, h = P.data.health, editing = P.edit?.kind === "conn", dis = P.busy ? "disabled" : "";
+  if (c.error) return `<section class="scard"><div class="scard-text"><h4>连接</h4><p>原型服务没有连接设置的接口：${esc(c.error)}。重启 <code>serve.mjs</code> 后再看。</p></div></section>`;
+  const where = c.mode === "remote" ? "远程" : "本机";
+  const state = h.error ? `<span class="kstate bad"><i class="kdot"></i>连不上</span>` : `<span class="kstate ok"><i class="kdot"></i>已连上</span><span class="sep">·</span>往返 <span class="num">${h.rtt_ms}</span> ms`;
+  const ctl = editing ? "" : (c.mode === "remote" ? btn(P.busy === "conn-local" ? "正在切换" : "改回本机", `data-pg-act="conn-local" ${dis}`, "sm") : "") + btn("修改", 'data-pg-act="conn-edit"', "sm");
+  const form = editing ? `<form class="cfg-form" id="cfg-conn-form" autocomplete="off">
+      <label class="lbl" for="conn-url">地址</label><input class="input mono" id="conn-url" name="url" type="url" required placeholder="https://komo.example.ts.net" value="${esc(P.edit?.url ?? (c.mode === "remote" ? c.url : ""))}">
+      <label class="lbl" for="conn-token">令牌</label><input class="input mono" id="conn-token" name="token" type="password" required autocomplete="new-password" placeholder="那台 Gateway 的 runtime/gateway.json 里的 token">
+      <p class="hint">先试连，通过才换上。令牌只交给本机的原型服务、由它转发时带上，不存进浏览器；原型服务重启后回到本机。</p>
+      ${failLine(P)}<div class="actions">${btn(P.busy === "conn" ? "正在试连" : "连接", `type="submit" ${dis}`, "primary")}${btn("取消", 'type="button" data-cfg="cancel"')}</div></form>` : failLine(P);
+  return `<section class="scard"><div class="scard-row"><div class="scard-text"><h4>连接<span class="tag">${where}</span></h4>
+      <p><span class="mono">${esc(c.url || "—")}</span><span class="sep">·</span>${state}</p></div>
+    <div class="scard-ctl">${ctl}</div></div>${form}</section>`;
+}
+async function connSend(method, body) {
+  const P = S.pg.settings;
+  P.busy = method === "DELETE" ? "conn-local" : "conn"; P.fail = "";
+  if (body && P.edit?.kind === "conn") P.edit.url = body.url; // 试连没过时重画表单，地址留着，令牌要重填
+  render();
+  try {
+    await api("/__web/connection", { method, body: body ? JSON.stringify(body) : undefined });
+    location.reload();
+  } catch (err) { P.fail = err.message; P.busy = ""; render(); }
+}
 function gatewaySection(P) {
   const h = P.data.health;
-  return secHead("Gateway", "唯一持有状态的进程；Web、TUI、CLI 都是它的客户端。") + `<div class="set-panel">${h.error ? errLine(h) : kvBlock([
+  return secHead("Gateway", "唯一持有状态的进程；Web、TUI、CLI 都是它的客户端。") + connCard(P) + `<div class="set-panel">${h.error ? errLine(h) : kvBlock([
     ["版本", `<span class="num">${esc(h.version)}</span> · 协议 <span class="num">${h.protocol_version}</span>`],
     ["启动于", `<span class="num">${day(h.started_at)} ${clock(new Date(h.started_at))}</span>`],
     ["实例", `<span class="mono">${esc(h.instance_id)}</span>`],
@@ -2278,6 +2308,8 @@ function channelsSection(P) {
 }
 async function settingsAct(act, el) {
   const P = S.pg.settings;
+  if (act === "conn-edit") { P.edit = { kind: "conn" }; P.fail = ""; render(); setTimeout(() => $("conn-url")?.focus()); return; }
+  if (act === "conn-local") return connSend("DELETE");
   if (act === "channel-probe") {
     // 探测另起一个插件进程问平台，可能要几秒；结果记在那个渠道的卡片上
     const id = el.dataset.id;
@@ -2573,7 +2605,7 @@ function matterFormSubmit(form) {
 document.addEventListener("submit", (ev) => {
   if (ev.target.id === "matter-form") { ev.preventDefault(); matterFormSubmit(ev.target); }
   if (ev.target.id === "matter-new") { ev.preventDefault(); matterCreate(ev.target); }
-  if (/^cfg-(provider-form|model-form|setting-num|env-one|env-form)$/.test(ev.target.id)) { ev.preventDefault(); cfgSubmit(ev.target); }
+  if (/^cfg-(provider-form|model-form|setting-num|env-one|env-form|conn-form)$/.test(ev.target.id)) { ev.preventDefault(); cfgSubmit(ev.target); }
   if (ev.target.id === "mem-form") { ev.preventDefault(); memAdd(ev.target); }
   if (ev.target.id === "classify-form") { ev.preventDefault(); memClassify(S.mem.selected, "convention", new FormData(ev.target).get("applies_when").trim()); }
 });

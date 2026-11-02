@@ -6,7 +6,7 @@
 
 TUI 与聊天渠道之外的第三个入口，给电脑上的长会话用。正式版改用 TanStack Start 重写，并扩展到 macOS 与手机，见 `docs/clients.md`；迁移完成前，本文仍是界面行为的规格。它是 Gateway 的 HTTP 客户端，不持有状态：会话正文是事件流的 fold，刷新即重建。
 
-运行：`node apps/web/serve.mjs`，打开 `http://127.0.0.1:5178`。`serve.mjs` 同源提供静态文件并把 `/v1/*`、`/healthz` 转给 Gateway，令牌只在服务端（每次请求现读 `runtime/gateway.json`）。正式版应由 Gateway 自己托管这些静态文件，见 §9。
+运行：`node apps/web/serve.mjs`，打开 `http://127.0.0.1:5178`。`serve.mjs` 同源提供静态文件并把 `/v1/*`、`/healthz` 转给 Gateway，令牌只在服务端（每次请求现读 `runtime/gateway.json`）。设置的 Gateway 一节可以改连另一台 Gateway：填地址和令牌，`serve.mjs` 先试连（`/healthz` 加一个要鉴权的接口），通过才换上，地址与令牌只记在它的内存里，重启回到本机；`/__web/connection` 只接受本机 Host 与同源 Origin，不允许指回自己。换了连接整页重载，不混用两台 Gateway 的数据。正式版应由 Gateway 自己托管这些静态文件，见 §9。
 
 ## 2. 布局
 

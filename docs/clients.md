@@ -1,7 +1,8 @@
 # 客户端：网页、macOS、手机
 
 > 状态：草案（2026-11-01）。已由操作者拍板的有三条：前端栈用 TanStack Start、macOS 用 Electron、网页由 Gateway 托管
-> （借鉴 Hermes Agent 与 DeepSeek Harness，见 §7）；§2 其余各条是建议，待认可。
+> （借鉴 Hermes Agent 与 DeepSeek Harness，见 §7）；2026-11-02 补拍板：新版界面要多语言，语言偏好只存在各端（D9）。
+> §2 其余各条是建议，待认可。
 > 取代 [`roadmap-muse.md`](roadmap-muse.md) §4.4"手机端先用飞书，不做原生 App"。现有原型的界面规格仍在 [`web.md`](web.md)，
 > 视觉 token 在 [`DESIGN.md`](../DESIGN.md)。不带文件名的章节号指 [`komo_bot.md`](komo_bot.md)。
 
@@ -31,6 +32,7 @@ macOS 应用和手机端，需要一套标准的前端栈，以及一份所有�
 | D6 | 浏览器怎么鉴权 | 配对换 cookie：`komo web` 打开 `http://127.0.0.1:7777/pair#code=<一次性码>`，Gateway 换成 `HttpOnly; SameSite=Strict` 的会话 cookie；`auth` 层同时接受 Bearer 与这个 cookie；会改东西的请求另外核对 `Origin`。另加 **Host 校验**：只接受回环地址、监听地址和 `[gateway] trusted_hosts` 里列出的 Host，其余一律 403（同 DeepSeek Harness） | `EventSource` 带不了请求头，cookie 能带；`HttpOnly` 让 JS 拿不到；一次性码用完作废，不进日志。Host 校验挡的是 DNS 重绑定：恶意网页把自己的域名改解析到 `127.0.0.1`，就能以"同源"身份读 Gateway 的响应。cookie 按主机名隔离，带不过去，但不需要鉴权的路由（静态文件、`/healthz`、配对换 cookie）照样暴露。校验只负责放行，鉴权仍靠令牌和 cookie |
 | D7 | macOS | **Electron**（已拍板），用 electron-builder 打包和自动更新；连接分本机与远程两种模式 | 跟网页同一套代码。见 §4 |
 | D8 | 手机 | 先做 PWA；PWA 不够用时再用 Capacitor 套壳 | 见 §5 |
+| D9 | 多语言 | 新版从第一行界面代码起就走文案表，先做 `zh-CN` 与 `en`；文案表用 Paraglide JS（编译期生成带类型的消息函数）。语言偏好**只存在各端**（已拍板）：浏览器与 PWA 存 `localStorage`，Electron 存在自己的设置里，Capacitor 存在 App 偏好里；没选过就跟系统语言（`zh*` 用中文，其余用英文） | 原型里几百处写死的中文不再搬第二次：C1 迁移一节就抽一节的文案。消息函数带类型，漏翻、键名写错在编译期报错，没用到的文案不进产物。偏好不进 Gateway：语言是看界面的人的事，同一个 Gateway 可以有人用中文、有人用英文；代价是换设备要重选一次 |
 
 ## 3. 共用部分
 
@@ -43,6 +45,17 @@ macOS 应用和手机端，需要一套标准的前端栈，以及一份所有�
 - **构建**：`pnpm build` 产出 `apps/client/dist`。Rust 的冷构建不依赖 Node：Gateway 运行时从一个目录读静态文件
   （发布包里的 `web/`，开发时由 `[web] dir` 指过去），不嵌进二进制。发布包多出 `web/` 目录，会碰到 §13.6 的发布约定
   （`release.yml`、`install.sh`、`update.rs` 三处一起改）。
+
+- **多语言**（D9）：
+  - **翻译范围**：只翻界面自己的文字，包括导航、按钮、提示、空状态、错误说明，以及界面按 key 渲染的东西（介入的答复选项、
+    常用设置的说明、状态名）。不翻的有三类：模型的回复、记忆与事项的正文这类用户内容，机器的名字（模型 id、路径、配置键），
+    以及 Gateway 原样返回的 `ErrorBody.message`。错误按 `code` 映射成译文，不认识的 `code` 再回落到原文。
+  - **术语**：中英对照表跟设计文档走（约定 convention、线索 reference、目标 goal、领域 area、任务会话 task session、
+    插话 interjection、待处理 inbox……）。英文取代码里的名字，两种语言里的同一个概念各只有一种说法。
+  - **格式**：日期、时间、相对时间、数字和复数都交给 `Intl`，按当前语言渲染，不手拼字符串。
+  - **布局**：英文通常比中文长 30%–50%。按钮、标签页、表头不能按中文定宽；迁移每一节都要在两种语言下各看一遍。
+  - **检查**：加一条 lint，JSX 里出现中文字面量就报错，防止新写的界面绕过文案表。
+  - **不影响的地方**：TUI、CLI 和渠道回执不受这个偏好影响，仍然由 Gateway 决定。原型 `apps/web` 保持只有中文，不补多语言。
 
 ## 4. macOS：Electron
 
@@ -93,8 +106,8 @@ macOS 应用和手机端，需要一套标准的前端栈，以及一份所有�
 
 | 阶段 | 内容 | 完成的标志 |
 |---|---|---|
-| C0 | workspace、协议类型生成、`packages/api`、Start SPA 壳与 token、Gateway 提供静态文件与 cookie 鉴权 | `komo web` 打开 7777 上的新壳，能列会话、能收 SSE |
-| C1 | 按 §3 的顺序逐节迁移，对齐原型 | web.md 每一节都有新版对应；`apps/web` 与 `serve.mjs` 删除 |
+| C0 | workspace、协议类型生成、`packages/api`、Start SPA 壳与 token、多语言骨架（文案表、语言切换、lint）、Gateway 提供静态文件与 cookie 鉴权 | `komo web` 打开 7777 上的新壳，能列会话、能收 SSE，能在中英文之间切换 |
+| C1 | 按 §3 的顺序逐节迁移，对齐原型；每节的文案同时进中英文两份 | web.md 每一节都有新版对应，且两种语言下都检查过；`apps/web` 与 `serve.mjs` 删除 |
 | C2 | Electron 壳（§4） | 签名后的 `.app` 能连本机 Gateway，通知与托盘可用 |
 | C3 | 远程访问（Tailscale 或 Tunnel，`public_url` / `trusted_hosts`）、设备配对、PWA 与 Web Push（§5 的 1–3） | iPhone 主屏幕上的 PWA 能聊天、收确认卡推送 |
 | C4 | Capacitor 原生壳（§5 的 4） | 按需 |
@@ -130,7 +143,8 @@ komo 照搬的：启动令牌换 cookie、Host 校验（D6）、`public_url` / `
 
 ## 8. 待定
 
-- D2–D4、D6、D8 待认可。
+- D2–D4、D6、D8 待认可；D9 里用 Paraglide JS 做文案表也待认可（备选 i18next，运行时加载、生态更大，但键名没有类型检查）。
+- 第三种语言要不要做、谁来维护译文（C1 前）。
 - D3 的新依赖（`ts-rs`）要先补 §13.4 的依赖表；不加的话，退路是用 `schemars` 出 JSON Schema 再转 TypeScript，依赖一样要登记。
 - 包管理器用 pnpm；Node 版本跟 Electron 内置的版本对齐。
 - Apple Developer 账号与签名证书（C2 前）。

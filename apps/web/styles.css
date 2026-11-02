@@ -668,7 +668,7 @@ button.live-line:hover .label { text-decoration: underline; text-underline-offse
 .sdlg-side { display: flex; flex-direction: column; gap: 12px; min-height: 0; padding: 20px 12px 16px; border-right: 1px solid var(--border); background: var(--ground); }
 .sdlg-side h2 { margin: 0 10px 4px; font-size: 18px; line-height: 26px; font-weight: 600; }
 .sdlg-status { margin: auto 10px 0; color: var(--muted); font-size: var(--fs-small); line-height: 18px; }
-.sdlg-main { min-width: 0; min-height: 0; overflow-y: auto; overscroll-behavior: contain; padding: 0 28px 28px; }
+.sdlg-main { --pad: 28px; min-width: 0; min-height: 0; overflow-y: auto; overscroll-behavior: contain; padding: 0 var(--pad) var(--pad); }
 .sdlg-x { position: absolute; top: 16px; right: 16px; z-index: 2; }
 @media (prefers-reduced-motion: no-preference) {
   .sdlg[open] { animation: sdlg-in 180ms var(--ease); }
@@ -683,7 +683,8 @@ button.live-line:hover .label { text-decoration: underline; text-underline-offse
 .set-nav button[aria-current] { background: var(--active); font-weight: 500; }
 .nav-count.soft { background: var(--pill-wait-bg); color: var(--pill-wait-ink); }
 /* 节标题吸顶：内容从它下面滚过去，右上角的关闭按钮落在它上面，不压内容 */
-.set-head { position: sticky; top: 0; z-index: 1; display: flex; align-items: flex-end; gap: 16px; margin-bottom: 4px; padding: 24px 40px 12px 0; background: var(--surface); }
+/* 吸顶标题铺满左右内边距：否则卡片的环从两侧 1px 露出来 */
+.set-head { position: sticky; top: 0; z-index: 1; display: flex; align-items: flex-end; gap: 16px; margin: 0 calc(-1 * var(--pad)) 4px; padding: 24px calc(var(--pad) + 40px) 12px var(--pad); background: var(--surface); }
 .set-head > div:first-child { flex: 1; min-width: 0; }
 .set-head h3 { margin: 0; font-size: 18px; line-height: 26px; font-weight: 600; }
 .set-head p { margin: 4px 0 0; color: var(--muted); font-size: var(--fs-label); line-height: 20px; }
@@ -819,9 +820,9 @@ button.live-line:hover .label { text-decoration: underline; text-underline-offse
 }
 @media (max-width: 900px) {
   .sdlg[open] { grid-template-columns: 180px minmax(0, 1fr); }
-  .sdlg-main { padding: 0 20px 24px; }
+  .sdlg-main { --pad: 20px; padding-bottom: 24px; }
   .set-head { padding-top: 20px; }
-  .set-head { flex-direction: column; align-items: stretch; }
+  .set-head { flex-direction: column; align-items: flex-start; } /* 按钮保持本来的宽度，不拉满 */
 }
 @media (max-width: 600px) {
   .page { padding: 16px 16px 32px; }
@@ -841,9 +842,9 @@ button.live-line:hover .label { text-decoration: underline; text-underline-offse
   .set-nav { flex-direction: row; overflow-x: auto; margin: 0 -16px; padding: 0 16px 10px; scrollbar-width: none; mask-image: linear-gradient(to right, #000 calc(100% - 32px), transparent); }
   .set-nav button { flex: none; height: 32px; }
   .sdlg-status { display: none; }
-  .sdlg-main { padding: 0 16px 24px; }
+  .sdlg-main { --pad: 16px; padding-bottom: 24px; }
   .sdlg-x { top: 12px; right: 12px; }
-  .set-head { padding: 16px 0 10px; }
+  .set-head { padding: 16px var(--pad) 10px; }
   .mcp-head { display: none; }
   .mcp-head, .mcp-row { grid-template-columns: minmax(0, 1fr) auto 16px; row-gap: 2px; padding: 10px 14px; }
   .mcp-way { grid-column: 1; grid-row: 2; }
@@ -858,6 +859,7 @@ button.live-line:hover .label { text-decoration: underline; text-underline-offse
   .snum .input { flex: 1; width: auto; }
   .snum { flex: 1; }
   .pcard-head { align-items: flex-start; }
+  .def-pick { align-self: stretch; }
   .def-pick .select { min-width: 0; flex: 1; }
   .page-head .btn { padding: 0 10px; }
   .ladder { padding: 14px 14px 10px; }

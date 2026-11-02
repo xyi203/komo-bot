@@ -92,7 +92,7 @@ jobs:
           path: cargo-tree-duplicates.txt
 
       - name: cargo nextest run
-        run: cargo nextest run --workspace --partition count:${{ matrix.partition }}/3
+        run: cargo nextest run --workspace --partition slice:${{ matrix.partition }}/3
 
       # nextest 不跑 doctest。
       - name: cargo test --doc

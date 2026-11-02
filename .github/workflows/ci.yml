@@ -73,7 +73,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: test
-          save-if: ${{ matrix.partition == 1 && (github.ref == 'refs/heads/main' || github.head_ref == 'ci/speedup') }} # TEMP
+          save-if: ${{ matrix.partition == 1 && github.ref == 'refs/heads/main' }}
 
       - uses: taiki-e/install-action@v2
         with:

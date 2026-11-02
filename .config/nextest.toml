@@ -1,7 +1,0 @@
-# CI 用 cargo-nextest 跑测试（.github/workflows/ci.yml）。
-
-# 已知时序不稳：旧 CI 的 cargo test 下最近 50 次挂过 4 次（home 在测试 20ms 轮询的空当里已收尾），
-# nextest 并发更高时更常见。失败重跑，过了会标成 FLAKY；真回归时三次都会挂。修好后删掉这条。
-[[profile.default.overrides]]
-filter = 'package(komo-gateway) & binary(agents) & test(=durable::a_task_result_is_absorbed_into_a_running_home)'
-retries = 2

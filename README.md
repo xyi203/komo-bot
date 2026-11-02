@@ -54,3 +54,4 @@ set -as terminal-features ',xterm-256color:sync'
 
 `terminal-features` 只在客户端接入时生效：改完要 detach 再 attach，用
 `tmux list-clients -F '#{client_termfeatures}'` 确认里面有 `sync`。
+

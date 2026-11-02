@@ -145,5 +145,9 @@ pub(super) async fn build(
     }
 
     let env = env::build(state, config, resolved, &surface, outputs);
+    let tools = tools
+        .into_iter()
+        .map(|tool| crate::service::changes::Recording::wrap(tool, state))
+        .collect();
     Ok(ToolSet::new(tools, surface, env))
 }

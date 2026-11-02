@@ -1076,6 +1076,9 @@ CLI 通过 HTTP 发命令，通过 SSE 观察运行。Gateway 内部采用函数
 | POST /v1/reconcile               | 立刻跑一次 blob 引用检查（§8.9）；幂等，返回 `checked` / `blocked` / `closed` / `purged` |
 | GET /v1/runs/{id}                | 执行详情                                       |
 | POST /v1/runs/{id}/cancel        | 取消                                           |
+| GET /v1/runs/{id}/changes        | 这条 Run 改了哪些文件与增删行数；还没收尾就等它（至多 20 秒）。只活在 Gateway 进程里，没记过是 404（`docs/web.md` §16） |
+| GET /v1/runs/{id}/changes/{index} | 其中一个文件开始与收尾两份之间的 unified diff |
+| GET /v1/sessions/{id}/changes    | 这个会话里还记得的、改了文件的各条 Run |
 | GET /v1/interventions            | 待处理清单：faulted 的任务（§7.5）。每条带句柄、问题与可答的结论 |
 | GET /v1/interventions/{handle}   | 单项详情：问题（fault 原因）与可答的结论 |
 | POST /v1/interventions/{handle}/answer | 答复：只有 `abandon`（其余 422）；已答复的返回原结论，不报错 |

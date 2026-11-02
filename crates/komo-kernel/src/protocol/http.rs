@@ -1870,6 +1870,80 @@ pub struct ChannelProbeResponse {
     pub message: String,
 }
 
+// ---------------------------------------------------------------- 一轮改了哪些文件
+
+/// 一条 Run 改了哪些文件（`GET /v1/runs/{id}/changes`，照 DeepSeek Harness 的
+/// workspace-changes）。Gateway 在这条 Run 第一次执行工具之前与收尾时各给工作树拍一次 git
+/// 快照，`write` / `edit` 第一次碰的文件另存一份改前的整文件；只活在 Gateway 进程里，
+/// 重启之后先前的 Run 没有这份记录。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunChanges {
+    pub run: RunId,
+    /// 这条 Run 的工作目录；`path` 相对它。
+    pub cwd: String,
+    pub files: Vec<ChangedFile>,
+    /// 改动的文件总数；`files` 最多带 [`MAX_CHANGED_FILES`] 个。
+    pub total: usize,
+}
+
+/// 一份记录最多带这么多个文件。
+pub const MAX_CHANGED_FILES: usize = 500;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChangedFile {
+    /// 在工作目录里是相对路径，否则是绝对路径。
+    pub path: String,
+    /// 给人看、也用来排序的路径：相对路径、仓库里工作目录之上的 `../`、家目录下的 `~/`，
+    /// 其余是绝对路径。
+    pub display: String,
+    pub change: FileChange,
+    /// 增删行数；二进制或太大（没读）的文件没有。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub added: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deleted: Option<u64>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub binary: bool,
+    /// 超过整文件副本的上限，没有存下来：只知道改了，给不出对比。
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub oversized: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FileChange {
+    Added,
+    Modified,
+    Deleted,
+}
+
+/// 一个会话里 Gateway 还记得的各条 Run 的改动（`GET /v1/sessions/{id}/changes`），按 Run 先后。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionChanges {
+    pub runs: Vec<RunChanges>,
+}
+
+/// 一个文件这一轮的对比（`GET /v1/runs/{id}/changes/{index}`）：开始与收尾两份之间的
+/// unified diff，三行上下文。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileDiff {
+    pub path: String,
+    pub display: String,
+    pub status: DiffStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub patch: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiffStatus {
+    Text,
+    Binary,
+    Oversized,
+    /// 两份内容相同（比如只差末尾换行之外什么都没变）。
+    Identical,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

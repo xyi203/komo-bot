@@ -177,6 +177,64 @@ svg.i { width: 16px; height: 16px; flex: none; fill: none; stroke: currentColor;
 .view-tabs button[aria-selected="true"] { background: var(--active); color: var(--text); font-weight: 500; }
 .app.on-page .view-tabs { display: none; }
 
+/* 改动（照 DeepSeek Harness 的改动文件卡片与 review）：一轮末尾一张卡，改动页一个文件一张卡、展开是带
+   新旧行号的 unified diff。增删不另起色相：加的行墨色浅底、删的行淡字，符号列标 + / − */
+.view-tabs .tab-n { margin-left: 5px; color: var(--faint); font-size: var(--fs-small); font-variant-numeric: tabular-nums; }
+.cg-add { color: var(--text); font-variant-numeric: tabular-nums; }
+.cg-del { color: var(--faint); font-variant-numeric: tabular-nums; }
+.cg-n { display: flex; flex: none; gap: 6px; margin-left: auto; font-family: var(--mono); font-size: var(--fs-small); }
+.cg-n.muted { font-family: inherit; color: var(--faint); }
+.cg-path { display: flex; min-width: 0; white-space: nowrap; }
+.cg-dir { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; color: var(--faint); }
+.cg-name { flex: 0 0 auto; max-width: 100%; overflow: hidden; text-overflow: ellipsis; color: var(--text); }
+.cg-tag { flex: none; padding: 0 6px; border-radius: 999px; background: var(--pill-bg); color: var(--pill-ink); font-size: var(--fs-small); line-height: 18px; }
+
+/* 一轮末尾的卡片 */
+.cg-card { margin: 10px 0 2px; border-radius: var(--radius-card); background: var(--surface); box-shadow: var(--ring); overflow: hidden; }
+.cg-card-head, .cg-row-btn { display: flex; align-items: center; gap: 8px; width: 100%; border: 0; background: none; color: var(--text); font: inherit; text-align: left; cursor: pointer; }
+.cg-card-head { min-height: 44px; padding: 0 12px; font-size: var(--fs-body); }
+.cg-card-head:hover, .cg-row-btn:hover { background: var(--hover-on-white); }
+.cg-card:not(.single) .cg-card-head { border-bottom: 1px solid var(--rule); }
+.cg-ic { display: grid; flex: none; place-items: center; width: 24px; height: 24px; border-radius: 6px; box-shadow: var(--ring); color: var(--muted); }
+.cg-ic .i { width: 14px; height: 14px; }
+.cg-verb { flex: none; font-weight: 500; }
+.cg-card.single .cg-path { font-size: var(--fs-body); }
+.cg-row-btn { min-height: 34px; padding: 0 12px 0 44px; font-size: var(--fs-label); }
+.cg-fold { display: block; width: 100%; height: 32px; border: 0; border-top: 1px solid var(--rule); background: none; color: var(--muted); font: inherit; font-size: var(--fs-small); cursor: pointer; }
+.cg-fold:hover { background: var(--hover-on-white); color: var(--text); }
+
+/* 改动页 */
+.changes { max-width: 1040px; margin: 0 auto; padding-top: 4px; }
+.cg-turn + .cg-turn { margin-top: 24px; }
+.cg-h { display: flex; align-items: baseline; gap: 8px; margin: 4px 0 8px; color: var(--text); font-size: var(--fs-label); font-weight: 500; }
+.cg-h .num { flex: none; color: var(--muted); font-weight: 400; }
+.cg-turn-no { flex: none; }
+.cg-base { min-width: 0; margin-left: auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--faint); font-family: var(--mono); font-size: var(--fs-small); font-weight: 400; }
+.cg-file { margin-bottom: 8px; border-radius: var(--radius-card); background: var(--surface); box-shadow: var(--ring); overflow: hidden; }
+.cg-file-head { display: flex; align-items: center; gap: 8px; width: 100%; min-height: 40px; padding: 0 12px; border: 0; background: var(--raised); color: var(--text); font: inherit; font-size: var(--fs-label); text-align: left; cursor: pointer; }
+.cg-file-head:hover { background: var(--hover); }
+.cg-file-head[aria-expanded="false"] { background: none; }
+.cg-file-head[aria-expanded="false"]:hover { background: var(--hover-on-white); }
+.cg-file-head .i { flex: none; width: 15px; height: 15px; color: var(--muted); }
+.cg-file-head .cg-path { flex: 1; font-family: var(--mono); }
+.cg-chev { transition: transform var(--t) var(--ease); }
+.cg-file-head[aria-expanded="true"] .cg-chev { transform: rotate(90deg); }
+.cg-code { overflow-x: auto; padding: 4px 0 6px; border-top: 1px solid var(--rule); font-family: var(--mono); font-size: 12.5px; line-height: 20px; }
+.cg-row { display: flex; min-width: max-content; }
+.cg-ln { flex: none; width: 44px; padding-right: 8px; text-align: right; color: var(--faint); font-variant-numeric: tabular-nums; user-select: none; }
+.cg-sign { flex: none; width: 16px; text-align: center; color: var(--faint); user-select: none; }
+.cg-text { flex: 1; padding-right: 16px; white-space: pre; }
+.cg-row.add { background: var(--hover); }
+.cg-row.add .cg-sign, .cg-row.add .cg-ln { color: var(--text); }
+.cg-code.whole .cg-row.add { background: none; }
+.cg-row.del { color: var(--faint); }
+.cg-row.hunk { color: var(--faint); background: var(--raised); }
+.cg-row.hunk .cg-text { padding-left: 16px; }
+.cg-note { margin: 0; padding: 10px 12px; border-top: 1px solid var(--rule); color: var(--muted); font-size: var(--fs-small); }
+.cg-note.bad { color: var(--negative); }
+.cg-turn > .cg-note { border: 0; padding: 4px 0; }
+.cg-foot { margin: 20px 0 8px; color: var(--faint); font-size: var(--fs-small); line-height: 18px; }
+
 /* 轨迹（照 DeepSeek Harness 的 Trajectory）：时间概览三条泳道，下面按轮的记录表，选中一条右边出详情。
    泳道用墨色深浅区分，不另起色相；叶绿只给正在跑的那一格 */
 .trace { padding-top: 4px; }
@@ -1131,6 +1189,9 @@ button.live-line:hover .label { text-decoration: underline; text-underline-offse
   .tr-split { padding-left: 18px; }
   .tr-fold { left: -20px; }
   .call-card, .step-think { margin-left: 0; }
-  .view-tabs { margin-left: 0; }
-  .view-tabs button { padding: 0 8px; }
+  .view-tabs { gap: 0; margin-left: 0; }
+  .view-tabs button { padding: 0 6px; }
+  .view-tabs .tab-n { margin-left: 3px; }
+  .cg-ln { width: 30px; padding-right: 4px; }
+  .cg-row-btn { padding-left: 12px; }
 }

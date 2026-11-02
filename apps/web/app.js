@@ -55,6 +55,7 @@ const newView = (id) => ({
   id, status: "loading", error: "", items: [], turns: new Map(), calls: new Map(), runs: new Map(), stats: { output: 0, input: 0, cache: 0, steps: 0 },
   recall: null, usage: null, model: null, delta: null, next: 0, pending: [], tree: null,
   events: [], // 原样留着，轨迹视图从这里推
+  changes: new Map(), diffs: new Map(), // 每轮改了哪些文件（Gateway 记的）与取过的对比
 });
 
 /* ---------- 格式 ---------- */
@@ -290,7 +291,7 @@ async function openSession(id) {
       if (!page.more) break;
     }
     v.next = from; v.status = "ready"; S.lastGood = new Date();
-    loadTree(v);
+    loadTree(v); loadChanges(v);
     render({ stick: true });
     live(v);
   } catch (err) {
@@ -317,7 +318,7 @@ async function loadTree(v) {
 let sideTimer = null;
 function refreshSide(e) {
   if (!/^(run\.|memory\.)/.test(e.type)) return;
-  if (/^run\.(completed|failed|cancelled)$/.test(e.type) && S.view) loadTree(S.view);
+  if (/^run\.(completed|failed|cancelled)$/.test(e.type) && S.view) { loadTree(S.view); loadRunChanges(S.view, e.run_id); }
   clearTimeout(sideTimer);
   sideTimer = setTimeout(async () => {
     const [sessions, matters, inbox] = await Promise.allSettled([api("/v1/sessions?all=1"), api("/v1/matters"), api("/v1/interventions")]);
@@ -784,7 +785,7 @@ function turnView(t, v) {
   const shown = open ? parts : parts.filter((p) => p.kind === "text" || p.kind === "steer");
   const body = shown.map((p, i) => processRow(p, live && p.kind === "steps" && i === shown.length - 1 && !t.answer && !v.delta)).join("");
   const answer = t.answer
-    ? `<div class="msg-agent">${markdown(t.answer.text)}</div>
+    ? `<div class="msg-agent">${markdown(t.answer.text)}</div>${changesCard(t, v)}
        <div class="msg-meta left turn-foot"><button class="icon-btn sm" data-copy="${esc(t.answer.text)}" aria-label="复制回答">${icon("copy")}</button><span class="num">${stamp(t.answer.at)}</span></div>`
     : live && v.delta ? `<div class="msg-agent streaming">${markdown(v.delta.text)}</div>` : "";
   const tail = t.status === "failed" ? `<p class="note bad">本轮运行失败：${esc(t.reason)}</p>` : t.status === "cancelled" ? `<p class="note">任务已停止</p>` : "";
@@ -792,7 +793,7 @@ function turnView(t, v) {
     ${t.users.map((u) => userBubble(u.text, u.at)).join("")}
     ${head}
     ${body ? `<div class="turn-process">${body}</div>` : ""}
-    ${answer}${tail}
+    ${answer}${t.answer ? "" : changesCard(t, v)}${tail}
   </section>`;
 }
 function recallShort(uses) {
@@ -1114,11 +1115,129 @@ document.addEventListener("pointerup", (ev) => {
   render();
 });
 
+/* ---------- 改动：照 DeepSeek Harness 的改动文件卡片与 review ----------
+   Gateway 在每条 Run 第一次执行工具前、进终态时各拍一次 git 快照，文件工具第一次改的文件另存
+   改前的整文件（service::changes）。这里只读它：GET /v1/sessions/{id}/changes 一次拿全，
+   之后每轮结束时 GET /v1/runs/{run}/changes；点开一个文件才取它的对比。记录只活在 Gateway 进程里 */
+const CARD_ROWS = 4;      // 卡片先列这么多行
+const DIFF_ROWS = 5000;   // 一个文件最多画这么多行
+async function loadChanges(v) {
+  try {
+    const r = await api(`/v1/sessions/${v.id}/changes`);
+    for (const c of r.runs) v.changes.set(c.run, c);
+  } catch { /* 旧 Gateway 没有这个接口：没有卡片 */ }
+  if (S.view === v) render();
+}
+async function loadRunChanges(v, run) {
+  try { v.changes.set(run, await api(`/v1/runs/${run}/changes`)); } catch { return; }
+  if (S.view === v) render();
+}
+async function loadDiff(v, run, i) {
+  const key = `${run}:${i}`;
+  if (v.diffs.has(key)) return;
+  v.diffs.set(key, { loading: true });
+  try { v.diffs.set(key, await api(`/v1/runs/${run}/changes/${i}`)); } catch (err) { v.diffs.set(key, { error: err.message }); }
+  if (S.view === v) render();
+}
+const pathSplit = (display) => { const k = display.lastIndexOf("/"); return [display.slice(0, k + 1), display.slice(k + 1)]; };
+const pathView = (display) => { const [dir, name] = pathSplit(display); return `<span class="cg-path" title="${esc(display)}"><span class="cg-dir">${esc(dir)}</span><span class="cg-name">${esc(name)}</span></span>`; };
+function countsView(f) {
+  if (f.oversized) return `<span class="cg-n muted">过大</span>`;
+  if (f.binary) return `<span class="cg-n muted">二进制</span>`;
+  return `<span class="cg-n"><span class="cg-add">+${f.added ?? 0}</span><span class="cg-del">−${f.deleted ?? 0}</span></span>`;
+}
+const sumOf = (c) => c.files.reduce((a, f) => [a[0] + (f.added || 0), a[1] + (f.deleted || 0)], [0, 0]);
+// 一轮末尾的卡片：只改了一个文件就是"已编辑 文件名"；多个列出来，先 4 行。点一行在改动页打开这个文件
+function changesCard(t, v) {
+  const c = v.changes.get(t.run);
+  if (!c || !c.files.length || t.status === "running" || t.status === "queued") return "";
+  if (c.files.length === 1) {
+    const f = c.files[0];
+    return `<div class="cg-card single"><button class="cg-card-head" data-review="${esc(c.run)}:0" aria-label="在改动页看 ${esc(f.display)}">
+      <span class="cg-ic">${icon("file")}</span><span class="cg-verb">${f.change === "added" ? "已新建" : f.change === "deleted" ? "已删除" : "已编辑"}</span>${pathView(f.display)}${countsView(f)}</button></div>`;
+  }
+  const key = `cgc:${c.run}`, all = S.open.has(key);
+  const [add, del] = sumOf(c);
+  const rows = (all ? c.files : c.files.slice(0, CARD_ROWS))
+    .map((f, i) => `<button class="cg-row-btn" data-review="${esc(c.run)}:${i}">${pathView(f.display)}${f.change === "added" ? `<span class="cg-tag">新建</span>` : f.change === "deleted" ? `<span class="cg-tag">删除</span>` : ""}${countsView(f)}</button>`).join("");
+  const more = c.files.length > CARD_ROWS
+    ? `<button class="cg-fold" data-fold="${esc(key)}">${all ? "收起" : `展开其余 ${c.files.length - CARD_ROWS} 个`}</button>` : "";
+  return `<div class="cg-card"><button class="cg-card-head" data-review="${esc(c.run)}:0"><span class="cg-ic">${icon("code")}</span><span class="cg-verb">${c.total} 个文件已更改</span><span class="cg-n"><span class="cg-add">+${add}</span><span class="cg-del">−${del}</span></span></button>
+    <div class="cg-rows">${rows}</div>${more}</div>`;
+}
+// unified diff → 行：只看 @@ 之后的部分（文件头可能是副本的临时路径）
+function parsePatch(patch) {
+  const rows = [];
+  let a = 0, b = 0, inHunk = false;
+  for (const line of patch.split("\n")) {
+    const h = line.match(/^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@(.*)$/);
+    if (h) { a = +h[1]; b = +h[2]; inHunk = true; rows.push({ t: "@", s: line }); continue; }
+    if (!inHunk || line.startsWith("\\")) continue;
+    if (line.startsWith("+")) rows.push({ t: "+", b: b++, s: line.slice(1) });
+    else if (line.startsWith("-")) rows.push({ t: "-", a: a++, s: line.slice(1) });
+    else if (line.startsWith(" ")) rows.push({ t: " ", a: a++, b: b++, s: line.slice(1) });
+  }
+  return rows;
+}
+const DIFF_NOTE = { binary: "二进制文件，不给对比。", oversized: "文件超过 2 MiB，Gateway 没有存下来，给不出对比。", identical: "两份内容相同。" };
+function diffView(d) {
+  if (!d || d.loading) return `<p class="cg-note">正在取对比…</p>`;
+  if (d.error) return `<p class="cg-note bad">对比没取到：${esc(d.error)}（Gateway 重启过就没有了）</p>`;
+  if (d.status !== "text") return `<p class="cg-note">${DIFF_NOTE[d.status] || ""}</p>`;
+  const rows = parsePatch(d.patch || "");
+  const shown = rows.slice(0, DIFF_ROWS);
+  const cls = { "+": " add", "-": " del", " ": "", "@": " hunk" };
+  const whole = rows.every((r) => r.t === "+" || r.t === "@"); // 新建的文件整段都是加的，不再逐行铺底
+  return `<div class="cg-code${whole ? " whole" : ""}">${shown.map((r) => r.t === "@"
+    ? `<div class="cg-row hunk"><span class="cg-ln"></span><span class="cg-ln"></span><span class="cg-text">${esc(r.s)}</span></div>`
+    : `<div class="cg-row${cls[r.t]}"><span class="cg-ln">${r.a ?? ""}</span><span class="cg-ln">${r.b ?? ""}</span><span class="cg-sign" aria-hidden="true">${r.t === " " ? "" : r.t === "-" ? "−" : "+"}</span><span class="cg-text">${esc(r.s) || " "}</span></div>`).join("")}</div>
+    ${rows.length > shown.length ? `<p class="cg-note">只画了前 ${DIFF_ROWS} 行，还有 ${rows.length - shown.length} 行。</p>` : ""}`;
+}
+// 改动页：按轮列出，最近一轮在上；一轮里一个文件一张卡，展开时才取对比
+function changeRuns(v) {
+  const turnNo = new Map();
+  let n = 0;
+  for (const it of v.items) if (it.kind === "turn") turnNo.set(it.run, ++n);
+  return { turnNo, runs: [...v.changes.values()].sort((x, y) => (turnNo.get(y.run) || 0) - (turnNo.get(x.run) || 0)) };
+}
+function renderChanges(host, v) {
+  const { turnNo, runs } = changeRuns(v);
+  if (!runs.length) {
+    host.innerHTML = `<div class="state-box empty"><p>这段对话还没有记下改动。</p><p class="muted">Gateway 在每轮执行工具前后各拍一次快照，比出这一轮改了哪些文件；记录只留在这次 Gateway 进程里，重启之前的轮次没有。</p></div>`;
+    return;
+  }
+  const latest = runs[0].run;
+  host.innerHTML = `<div class="changes">${runs.map((c) => {
+    const [add, del] = sumOf(c);
+    const turn = turnNo.get(c.run);
+    return `<section class="cg-turn"><h2 class="cg-h"><span class="cg-turn-no">${turn ? `第 ${turn} 轮` : "一轮"}</span><span class="num">${c.total} 个文件 · <span class="cg-add">+${add}</span> <span class="cg-del">−${del}</span></span><span class="cg-base" title="${esc(c.cwd)}">${esc(homeDir(c.cwd))}</span></h2>
+      ${c.files.map((f, i) => {
+        const key = `cgf:${c.run}:${i}`;
+        const open = S.open.has(key) !== (c.run === latest); // 最近一轮默认展开
+        if (open) loadDiff(v, c.run, i);
+        return `<section class="cg-file" id="cg-${esc(c.run)}-${i}">
+          <button class="cg-file-head" aria-expanded="${open}" data-fold="${esc(key)}">${icon("right", "i cg-chev")}${icon("file")}${pathView(f.display)}${f.change === "added" ? `<span class="cg-tag">新建</span>` : f.change === "deleted" ? `<span class="cg-tag">删除</span>` : ""}${countsView(f)}</button>
+          ${open ? diffView(v.diffs.get(`${c.run}:${i}`)) : ""}</section>`;
+      }).join("")}
+      ${c.total > c.files.length ? `<p class="cg-note">还有 ${c.total - c.files.length} 个文件没列出来。</p>` : ""}</section>`;
+  }).join("")}
+  <p class="cg-foot">改动由 Gateway 在每轮执行工具前后各拍一次 git 快照得出，shell 改的也在里面；不在仓库里的文件只认 write 和 edit。这一轮开始前就没提交的改动不算进来。记录只留在这次 Gateway 进程里。</p></div>`;
+
+  // 从卡片点进来的那个文件：上面的对比陆续取回、高度在变，取完之前每次重画都再对一次位置
+  if (S.reviewAt) {
+    const at = S.reviewAt;
+    requestAnimationFrame(() => document.getElementById(at)?.scrollIntoView({ block: "start" }));
+    if (![...v.diffs.values()].some((d) => d.loading)) S.reviewAt = null;
+  }}
+const homeDir = (p) => p.replace(/^\/(?:Users|home)\/[^/]+(?=\/|$)/, "~");
+
 function renderThread() {
   const v = S.view;
   const host = $("transcript");
-  host.classList.toggle("wide", S.tab === "trace");
+  host.classList.toggle("wide", S.tab === "trace" || S.tab === "changes");
   document.querySelectorAll("[data-tab]").forEach((b) => b.setAttribute("aria-selected", b.dataset.tab === S.tab));
+  const n = v ? new Set([...v.changes.values()].flatMap((c) => c.files.map((f) => f.path))).size : 0;
+  $("changes-n").hidden = !n; $("changes-n").textContent = n;
   if (S.boot === "error") {
     host.innerHTML = `<div class="state-box"><p>连不上 Gateway：${esc(S.bootError)}。${S.lastGood ? `上次正常是 ${clock(S.lastGood)}。` : ""}</p><p class="muted">确认 Gateway 在跑（<code>komo gateway status</code>），再重试。</p><button class="text-btn" data-retry-boot>重试</button></div>`;
     return;
@@ -1136,6 +1255,7 @@ function renderThread() {
     return;
   }
   if (S.tab === "trace") { renderTrace(host, v); return; }
+  if (S.tab === "changes") { renderChanges(host, v); return; }
   const body = v.items
     .map((it) => {
       if (it.kind === "turn") return turnView(it, v);
@@ -2290,7 +2410,7 @@ function providerForm(P, p) {
     ${kindPick}
     ${key}
     <details class="adv padv" id="pf-adv" ${advOpen ? "open" : ""}><summary>自定义设置</summary>
-    ${field("pf-id", "Provider ID", `<input class="input" id="pf-id" name="pid" required pattern="[A-Za-z][A-Za-z0-9._-]*" maxlength="64" value="${esc(v.pid)}" placeholder="acme-gateway">`, isNew ? "以字母开头，模型靠它找到这个 provider，也用来派生凭证变量名。" : "改了会把挂在它上面的模型一并改过去。")}
+    ${field("pf-id", "Provider ID", `<input class="input" id="pf-id" name="pid" required pattern="[A-Za-z][A-Za-z0-9._\\-]*" maxlength="64" value="${esc(v.pid)}" placeholder="acme-gateway">`, isNew ? "以字母开头，模型靠它找到这个 provider，也用来派生凭证变量名。" : "改了会把挂在它上面的模型一并改过去。")}
     ${field("pf-name", "显示名称", `<input class="input" id="pf-name" name="name" maxlength="64" value="${esc(v.name)}" placeholder="显示名称">`)}
     ${field("pf-url", "API 地址", `<input class="input" id="pf-url" name="base_url" value="${esc(v.base_url)}" placeholder="https://gateway.example/v1">`)}
     ${field("pf-backend", "API 协议", protocol)}
@@ -2314,7 +2434,7 @@ function modelForm(P, m, providerId, kind) {
   // 视图里继承来的值不回填：留空就接着继承 provider 的，改了 provider 也跟着变
   const own = (k) => (m?.[k] && m[k] !== parent?.[k] ? m[k] : "");
   const field = (id, label, input) => `<div><label class="lbl" for="${id}">${label}</label>${input}</div>`;
-  const aliasInput = field("mf2-alias", "名字（alias）", `<input class="input" id="mf2-alias" name="alias" required pattern="[A-Za-z0-9._-]+" maxlength="64" value="${esc(m?.alias || "")}" placeholder="${kind === "embedding" ? "例：embedding" : "例：ds-chat"}">`);
+  const aliasInput = field("mf2-alias", "名字（alias）", `<input class="input" id="mf2-alias" name="alias" required pattern="[A-Za-z0-9._\\-]+" maxlength="64" value="${esc(m?.alias || "")}" placeholder="${kind === "embedding" ? "例：embedding" : "例：ds-chat"}">`);
   const modelInput = field("mf2-model", "上游模型 id", `<input class="input mono" id="mf2-model" name="model" required value="${esc(m?.model || "")}" placeholder="${kind === "embedding" ? "例：qwen3-embedding:0.6b" : "例：deepseek-chat"}">`);
   const providerPick = field("mf2-provider", "Provider", `<select class="select" id="mf2-provider" name="provider">${C.providers.filter((p) => kindOf(p) === kindOf(parent)).map((p) => `<option value="${esc(p.id)}" ${p.id === pid ? "selected" : ""}>${esc(p.id)}</option>`).join("")}</select>`);
   let body;
@@ -2812,8 +2932,22 @@ document.addEventListener("click", (ev) => {
     requestAnimationFrame(() => requestAnimationFrame(() => document.getElementById(`tr-${S.traceHi}`)?.scrollIntoView({ block: "center" })));
     return;
   }
+  // 改动卡片的一行：到改动页，展开这个文件、滚到它
+  const review = t.closest("[data-review]");
+  if (review && S.view) {
+    const [run, i] = review.dataset.review.split(":");
+    const latest = changeRuns(S.view).runs[0]?.run === run;
+    const key = `cgf:${run}:${i}`;
+    latest ? S.open.delete(key) : S.open.add(key);
+    S.tab = "changes"; S.traceHi = null; S.reviewAt = `cg-${run}-${i}`; render();
+    return;
+  }
   const tab = t.closest("[data-tab]");
-  if (tab) { S.tab = tab.dataset.tab; S.traceHi = null; render({ force: S.tab === "chat" }); return; }
+  if (tab) {
+    S.tab = tab.dataset.tab; S.traceHi = null; render({ force: S.tab === "chat" });
+    if (S.tab === "changes") requestAnimationFrame(() => requestAnimationFrame(() => { $("scroll").scrollTop = 0; }));
+    return;
+  }
   // 轨迹：选中一条、关详情、工具栏、收起轮次 / 调用、切详情页
   const pick = t.closest("[data-trace-pick]");
   if (pick) {

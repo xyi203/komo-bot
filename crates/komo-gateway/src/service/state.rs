@@ -176,6 +176,8 @@ pub struct GatewayState {
     pub max_retries: u32,
     /// 一段最多跑几轮模型（§6）；`None` = 不设。
     pub max_rounds: Option<u32>,
+    /// 每轮改了哪些文件（[`super::changes`]）：只活在进程里，不是事实来源。
+    pub changes: super::changes::ChangeRecorder,
 }
 
 impl std::fmt::Debug for GatewayState {
@@ -315,6 +317,7 @@ impl GatewayState {
         let max_rounds = None;
         let max_retries = RetryPolicy::default().max_attempts;
 
+        let changes = super::changes::ChangeRecorder::new(home.join("runtime").join("changes"));
         Ok(Arc::new(GatewayState {
             home,
             shared_home,
@@ -349,6 +352,7 @@ impl GatewayState {
             skills,
             max_retries,
             max_rounds,
+            changes,
         }))
     }
 

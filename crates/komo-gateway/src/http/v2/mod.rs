@@ -14,7 +14,9 @@
 //! | `interventions` | 待处理清单、详情、答复、reconcile | W4a |
 //! | `export` | `GET /v1/sessions/{id}/export` | W4c |
 //! | `monitors` | `GET /v1/monitors`（只读清单） | S4 |
+//! | `changes` | 每轮改了哪些文件与逐文件对比（只活在进程里） | — |
 
+pub mod changes;
 pub mod cron;
 pub mod events;
 pub mod export;
@@ -37,6 +39,7 @@ pub fn routes() -> Router<Api> {
         .merge(sessions::routes())
         .merge(tree::routes())
         .merge(runs::routes())
+        .merge(changes::routes())
         .merge(events::routes())
         .merge(cron::routes())
         .merge(interventions::routes())

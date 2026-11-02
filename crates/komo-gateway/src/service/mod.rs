@@ -11,6 +11,7 @@
 //! `aux.db`（cron / 投递 / memory / 幂等键等辅助表）。恢复由引擎开库时的 reconciliation 与
 //! [`durable::lifecycle::boot`] 负责，后台循环在 [`durable::background`]。
 
+pub mod changes;
 pub mod channels;
 pub mod cron_watch;
 pub mod durable;

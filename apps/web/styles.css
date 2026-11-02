@@ -17,13 +17,20 @@
   --muted: #565d4e;
   --faint: #636a5a;
   --primary: #20251b;
+  --primary-hover: #343b2c;
   --accent: #4f6b38;
   --accent-pale: #e7eedd;
   --negative: #b3261e;
+  --negative-pale: #fdf1f0;   /* 危险悬停底 */
+  --negative-ring: #f1c9c5;   /* 危险框的环 */
   --pill-bg: #eef0ea;
   --pill-ink: #3f4637;
   --pill-wait-bg: #fbf3d6;
   --pill-wait-ink: #6b4f0a;
+  --pill-bad-bg: #fdecea;
+  --pill-bad-ink: #8a1c15;
+  --wait-dot: #c98a12;        /* 缺凭证、要登录、在重试 */
+  --memory-off: #a9ae9f;      /* 图上"不再带"的记忆点 */
   --focus: hsl(212 100% 48%);   /* 键盘焦点专用；叶绿只表示在场与运行中 */
 
   /* 边线画在阴影层：1px 零模糊的环。透明度随底色走，纸色侧栏上也不发灰 */
@@ -131,7 +138,7 @@ svg.i { width: 16px; height: 16px; flex: none; fill: none; stroke: currentColor;
 .menu-err { margin: 6px 8px 4px; color: var(--negative); font-size: var(--fs-label); line-height: 20px; }
 
 .user { display: flex; align-items: center; gap: 8px; height: 52px; padding: 0 8px 0 16px; border-top: 1px solid var(--border); }
-.avatar { display: grid; place-items: center; width: 24px; height: 24px; border-radius: 50%; background: var(--accent-pale); color: var(--accent); font-size: var(--fs-small); font-weight: 600; }
+.avatar { display: grid; place-items: center; width: 24px; height: 24px; border-radius: 50%; background: var(--active); color: var(--text); font-size: var(--fs-small); font-weight: 600; }
 .who { display: flex; flex-direction: column; min-width: 0; font-weight: 500; line-height: 16px; }
 .who .host { color: var(--muted); font-size: var(--fs-small); font-weight: 400; }
 .user .dot { margin-left: auto; }
@@ -303,7 +310,8 @@ button.live-line:hover .label { text-decoration: underline; text-underline-offse
 /* 回复正文 */
 .msg-agent ul, .msg-agent ol { margin: 0 0 14px; padding-left: 22px; font-size: var(--fs-read); line-height: 26px; }
 .msg-agent .md-h { font-weight: 600; }
-.msg-agent a { color: var(--accent); text-underline-offset: 3px; }
+.msg-agent a { color: var(--text); text-decoration-color: var(--faint); text-underline-offset: 3px; }
+.msg-agent a:hover { text-decoration-color: currentColor; }
 .msg-agent pre { margin: 0 0 14px; padding: 12px 14px; overflow: auto; border-radius: var(--radius-control); background: var(--raised); }
 .msg-agent pre code { padding: 0; background: none; font-size: 13px; line-height: 20px; }
 .table-wrap { margin: 0 0 14px; overflow-x: auto; }
@@ -388,7 +396,7 @@ button.live-line:hover .label { text-decoration: underline; text-underline-offse
 .msg-meta.left { margin: -6px 0 0 -6px; }
 .icon-btn.sm { width: 26px; height: 26px; border-radius: 6px; }
 .icon-btn.sm .i { width: 14px; height: 14px; }
-.icon-btn.done { color: var(--accent); }
+.icon-btn.done { color: var(--text); }
 .turn-head {
   display: flex; align-items: center; gap: 6px; width: 100%; margin: 14px 0 12px; padding: 0 0 10px; border: 0; border-bottom: 1px solid var(--border);
   background: none; color: var(--muted); font-size: var(--fs-read); line-height: 22px; text-align: left; cursor: pointer;
@@ -431,10 +439,10 @@ button.live-line:hover .label { text-decoration: underline; text-underline-offse
 .btn:disabled { color: var(--muted); cursor: progress; }
 .btn .i { width: 14px; height: 14px; }
 .btn.primary { box-shadow: none; background: var(--primary); color: #fff; }
-.btn.primary:hover { background: #343b2c; }
+.btn.primary:hover { background: var(--primary-hover); }
 .btn.sm { height: 28px; padding: 0 10px; font-size: var(--fs-label); }
 .btn.danger-btn { box-shadow: 0 0 0 1px var(--negative); color: var(--negative); }
-.btn.danger-btn:hover { background: #fdf1f0; }
+.btn.danger-btn:hover { background: var(--negative-pale); }
 
 /* 在场光阶：一个容器，1px 分隔成四档；每档是筛选，光点一条记忆一个 */
 .ladder { margin-bottom: 24px; padding: 16px 20px 12px; box-shadow: var(--lift); border-radius: var(--radius-card); background: var(--surface); }
@@ -461,7 +469,7 @@ button.live-line:hover .label { text-decoration: underline; text-underline-offse
 .viz .vz.ring { fill: var(--surface); stroke: var(--accent); stroke-width: 1.5; }
 .viz .vz.pale { fill: var(--surface); stroke: var(--faint); stroke-width: 1.2; stroke-dasharray: 2 2; }
 .viz .vz.alert { fill: var(--surface); stroke: var(--negative); stroke-width: 1.5; }
-.viz .vz.off { fill: #a9ae9f; }
+.viz .vz.off { fill: var(--memory-off); }
 .viz .vz.dim { opacity: 0.2; }
 .viz .tally { fill: var(--text); font-size: 12px; font-weight: 500; }
 .viz .vz:hover { opacity: 1; stroke: var(--text); stroke-width: 1.5; }
@@ -519,13 +527,13 @@ button.live-line:hover .label { text-decoration: underline; text-underline-offse
 .detail-kind { display: inline-flex; align-items: center; gap: 8px; font-weight: 500; }
 .detail-top .pill { margin-left: auto; }
 .pill.off { color: var(--muted); }
-.pill.bad { background: #fdecea; color: #8a1c15; }
+.pill.bad { background: var(--pill-bad-bg); color: var(--pill-bad-ink); }
 .detail-text { margin: 12px 0 0; font-size: var(--fs-read); line-height: 24px; }
 .detail-when { margin: 8px 0 0; font-size: var(--fs-label); line-height: 20px; }
 .detail-when .muted { margin-right: 8px; }
 .actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 16px; }
 .danger-link { margin-top: 12px; color: var(--negative); font-weight: 400; font-size: var(--fs-label); }
-.danger { margin-top: 12px; padding: 12px; box-shadow: 0 0 0 1px #f1c9c5; border-radius: var(--radius-control); font-size: var(--fs-label); }
+.danger { margin-top: 12px; padding: 12px; box-shadow: 0 0 0 1px var(--negative-ring); border-radius: var(--radius-control); font-size: var(--fs-label); }
 .danger p { margin: 0; }
 .danger .actions { margin-top: 10px; }
 .form-err { margin: 12px 0 0; color: var(--negative); font-size: var(--fs-label); }
@@ -686,7 +694,7 @@ button.live-line:hover .label { text-decoration: underline; text-underline-offse
 .set-panel .actions { margin-top: 12px; }
 .set-line { margin: 0 0 6px; font-size: var(--fs-label); line-height: 20px; }
 .small { font-size: var(--fs-small); }
-.bad-notice { box-shadow: 0 0 0 1px #f1c9c5; }
+.bad-notice { box-shadow: 0 0 0 1px var(--negative-ring); }
 .sdlg-main > .notice { margin: 0 0 12px; }
 .notice .text-btn { margin-top: 6px; font-size: var(--fs-label); }
 
@@ -700,7 +708,7 @@ button.live-line:hover .label { text-decoration: underline; text-underline-offse
 .kdot { width: 7px; height: 7px; border-radius: 50%; background: var(--faint); } /* 没有状态色的（已断开、没起）是灰点 */
 .kstate.ok .kdot { background: var(--accent); }
 .kstate.warn { color: var(--pill-wait-ink); }
-.kstate.warn .kdot { background: #c98a12; }
+.kstate.warn .kdot { background: var(--wait-dot); }
 .pact { display: flex; align-items: center; gap: 12px; flex: none; }
 .pact .danger-link { margin: 0; }
 .pcard-url { margin: 2px 0 0; color: var(--muted); font-size: var(--fs-small); overflow-wrap: anywhere; }
@@ -774,7 +782,7 @@ button.live-line:hover .label { text-decoration: underline; text-underline-offse
 .mcp-desc { margin: 12px 0 0; color: var(--text); font-size: var(--fs-body); line-height: 22px; }
 .hint.bad { color: var(--negative); }
 .icon-btn.danger-icon { width: 28px; height: 28px; color: var(--negative); }
-.icon-btn.danger-icon:hover { background: #fdf1f0; color: var(--negative); }
+.icon-btn.danger-icon:hover { background: var(--negative-pale); color: var(--negative); }
 .env-one { grid-column: 1 / -1; display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 10px; }
 .env-one .input { flex: 1; min-width: 160px; }
 .env-one .form-err { flex-basis: 100%; margin: 0; }
@@ -938,8 +946,9 @@ button.live-line:hover .label { text-decoration: underline; text-underline-offse
 .pcard.prow { padding: 14px 16px; }
 .prow .pcard-head { min-height: 36px; }
 .prow .pname { font-size: 15px; font-weight: 500; }
-.sdot { width: 8px; height: 8px; border-radius: 50%; background: #c98a12; flex: none; }
-.sdot.ok { background: #2fb36b; }
+/* 凭证就绪 = 能运行，用叶绿；缺凭证是琥珀，和设置里其他状态点同一套 */
+.sdot { width: 8px; height: 8px; border-radius: 50%; background: var(--wait-dot); flex: none; }
+.sdot.ok { background: var(--accent); }
 .ppanel { margin-top: 12px; padding: 4px 18px 18px; border-radius: 12px; background: var(--ground); }
 .ppanel .cfg-form { padding-top: 0; }
 .ppanel-title { display: flex; align-items: baseline; gap: 10px; margin-top: 14px; }

@@ -1,0 +1,370 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-11-02T00:00:00+08:00",
+  "title": "Design System: komo",
+  "extensions": {
+    "colorMeta": {
+      "primary": {
+        "role": "primary",
+        "displayName": "苔墨",
+        "canonical": "oklch(25.6% 0.020 129)",
+        "tonalRamp": [
+          "#0a0c08",
+          "#232620",
+          "#3f443b",
+          "#5e6359",
+          "#7f8579",
+          "#a2a79d",
+          "#c6cbc2",
+          "#ecf0e9"
+        ]
+      },
+      "accent": {
+        "role": "primary",
+        "displayName": "叶绿",
+        "canonical": "oklch(49.2% 0.083 132)",
+        "tonalRamp": [
+          "#050e00",
+          "#1b2a0e",
+          "#354924",
+          "#516a3c",
+          "#718c5c",
+          "#96ae84",
+          "#bcd1ae",
+          "#e4f5d9"
+        ]
+      },
+      "ground": {
+        "role": "neutral",
+        "displayName": "林下纸",
+        "canonical": "oklch(96.2% 0.005 118)",
+        "tonalRamp": [
+          "#0b0b0a",
+          "#252523",
+          "#424240",
+          "#61625e",
+          "#82837f",
+          "#a5a5a2",
+          "#c9c9c7",
+          "#eeefed"
+        ]
+      },
+      "surface": {
+        "role": "neutral",
+        "displayName": "白纸"
+      },
+      "raised": {
+        "role": "neutral",
+        "displayName": "浅纸"
+      },
+      "active": {
+        "role": "neutral",
+        "displayName": "按下"
+      },
+      "text": {
+        "role": "neutral",
+        "displayName": "苔墨正文",
+        "canonical": "oklch(26.7% 0.023 129)",
+        "tonalRamp": [
+          "#0a0c07",
+          "#23271f",
+          "#3f443a",
+          "#5d6457",
+          "#7e8578",
+          "#a1a79c",
+          "#c6cbc1",
+          "#ecf0e8"
+        ]
+      },
+      "muted": {
+        "role": "neutral",
+        "displayName": "次要"
+      },
+      "faint": {
+        "role": "neutral",
+        "displayName": "更淡"
+      },
+      "control": {
+        "role": "neutral",
+        "displayName": "控件灰"
+      },
+      "negative": {
+        "role": "status",
+        "displayName": "失败",
+        "canonical": "oklch(50.1% 0.178 29)",
+        "tonalRamp": [
+          "#260000",
+          "#4f0000",
+          "#7c130e",
+          "#ab2c23",
+          "#d35245",
+          "#f08072",
+          "#ffad9f",
+          "#ffd9cd"
+        ]
+      },
+      "wait-dot": {
+        "role": "status",
+        "displayName": "琥珀（在等）",
+        "canonical": "oklch(68.0% 0.139 76)",
+        "tonalRamp": [
+          "#1a0400",
+          "#3d1c00",
+          "#623700",
+          "#8a5300",
+          "#ae7500",
+          "#cc9b51",
+          "#ebc287",
+          "#ffe9bc"
+        ]
+      },
+      "focus": {
+        "role": "status",
+        "displayName": "焦点蓝"
+      }
+    },
+    "typographyMeta": {
+      "page-title": {
+        "displayName": "页标题",
+        "purpose": "记忆、事项、定时、待处理页的 h1。"
+      },
+      "dialog-title": {
+        "displayName": "弹窗标题",
+        "purpose": "设置弹窗左栏与各节标题。"
+      },
+      "section-title": {
+        "displayName": "节标题",
+        "purpose": "图表、列表头、详情标题。"
+      },
+      "read": {
+        "displayName": "阅读",
+        "purpose": "komo 回复正文，阅读列宽 720。"
+      },
+      "body": {
+        "displayName": "正文",
+        "purpose": "界面默认字号。"
+      },
+      "label": {
+        "displayName": "标签",
+        "purpose": "次要控件、表格数值；可点的 500。"
+      },
+      "small": {
+        "displayName": "小字",
+        "purpose": "时间、计数、第二行说明。"
+      },
+      "mono": {
+        "displayName": "机器名字",
+        "purpose": "变量名、模型 id、路径、配置键；只有 400 / 500。"
+      }
+    },
+    "shadows": [
+      {
+        "name": "ring",
+        "value": "0 0 0 1px rgb(34 40 28 / 0.12)",
+        "purpose": "卡片、标签的边线，画在阴影层。"
+      },
+      {
+        "name": "ring-control",
+        "value": "0 0 0 1px rgb(34 40 28 / 0.2)",
+        "purpose": "按钮、输入框、下拉框，比卡片深一级。"
+      },
+      {
+        "name": "ring-strong",
+        "value": "0 0 0 1px #22281c",
+        "purpose": "输入框聚焦、预设选中。"
+      },
+      {
+        "name": "lift",
+        "value": "0 0 0 1px rgb(34 40 28 / 0.12), 0 2px 2px rgb(34 40 28 / 0.04)",
+        "purpose": "所有卡片。"
+      },
+      {
+        "name": "composer",
+        "value": "0 0 0 1px rgb(34 40 28 / 0.2), 0 2px 8px rgb(34 40 28 / 0.05)",
+        "purpose": "输入框浮在对话之上。"
+      },
+      {
+        "name": "menu",
+        "value": "0 0 0 1px rgb(34 40 28 / 0.12), 0 8px 24px rgb(34 40 28 / 0.12)",
+        "purpose": "弹出菜单。"
+      },
+      {
+        "name": "dialog",
+        "value": "0 0 0 1px rgb(34 40 28 / 0.12), 0 24px 64px rgb(20 24 16 / 0.18)",
+        "purpose": "设置与 ⌘K 弹窗。"
+      }
+    ],
+    "motion": [
+      {
+        "name": "ease",
+        "value": "cubic-bezier(0.16, 1, 0.3, 1)",
+        "purpose": "指数缓出，无回弹；所有过渡。"
+      },
+      {
+        "name": "t",
+        "value": "120ms",
+        "purpose": "控件反馈。"
+      },
+      {
+        "name": "drawer",
+        "value": "220ms",
+        "purpose": "侧栏与右栏抽屉。"
+      },
+      {
+        "name": "dialog-in",
+        "value": "180ms",
+        "purpose": "弹窗淡入上移 8px。"
+      }
+    ],
+    "breakpoints": [
+      {
+        "name": "panel-drawer",
+        "value": "1180px"
+      },
+      {
+        "name": "nav-drawer",
+        "value": "900px"
+      },
+      {
+        "name": "phone",
+        "value": "600px"
+      }
+    ]
+  },
+  "components": [
+    {
+      "name": "Primary Button",
+      "kind": "button",
+      "refersTo": "button-primary",
+      "description": "苔墨实心按钮，一屏最多一个。",
+      "html": "<button class=\"ds-btn ds-btn-primary\">保存</button>",
+      "css": ".ds-btn { display: inline-flex; align-items: center; height: 32px; padding: 0 12px; border: 0; border-radius: 8px; font: 500 14px/20px 'Noto Sans', 'Noto Sans SC', system-ui, sans-serif; cursor: pointer; transition: background-color 120ms ease, transform 120ms cubic-bezier(0.16, 1, 0.3, 1); } .ds-btn-primary { background: #20251b; color: #fff; } .ds-btn-primary:hover { background: #343b2c; } .ds-btn:active { transform: scale(0.97); } .ds-btn:focus-visible { outline: 2px solid hsl(212 100% 48%); outline-offset: 2px; }"
+    },
+    {
+      "name": "Secondary Button",
+      "kind": "button",
+      "refersTo": "button-secondary",
+      "description": "白底控件环，默认按钮。",
+      "html": "<button class=\"ds-btn2\">取消</button>",
+      "css": ".ds-btn2 { display: inline-flex; align-items: center; height: 32px; padding: 0 12px; border: 0; border-radius: 8px; background: #fff; color: #22281c; box-shadow: 0 0 0 1px rgb(34 40 28 / 0.2); font: 500 14px/20px 'Noto Sans', 'Noto Sans SC', system-ui, sans-serif; cursor: pointer; transition: background-color 120ms ease; } .ds-btn2:hover { background: #f3f4f0; } .ds-btn2:active { transform: scale(0.97); } .ds-btn2:focus-visible { outline: 2px solid hsl(212 100% 48%); outline-offset: 2px; }"
+    },
+    {
+      "name": "Text Input",
+      "kind": "input",
+      "refersTo": "input",
+      "description": "白底控件环，聚焦变墨环。",
+      "html": "<input class=\"ds-input\" placeholder=\"模型 id\">",
+      "css": ".ds-input { width: 240px; height: 36px; padding: 0 10px; border: 0; border-radius: 8px; background: #fff; color: #22281c; box-shadow: 0 0 0 1px rgb(34 40 28 / 0.2); font: 400 14px 'Noto Sans', 'Noto Sans SC', system-ui, sans-serif; outline: 0; } .ds-input::placeholder { color: #636a5a; } .ds-input:focus { box-shadow: 0 0 0 1px #22281c; }"
+    },
+    {
+      "name": "Composer",
+      "kind": "custom",
+      "refersTo": "composer",
+      "description": "一行输入框：加号、文字、发送，浮在对话之上。",
+      "html": "<div class=\"ds-composer\"><button class=\"ds-cbtn\" aria-label=\"添加\"><svg viewBox=\"0 0 24 24\" width=\"16\" height=\"16\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.5\" stroke-linecap=\"round\"><path d=\"M12 5v14M5 12h14\"/></svg></button><textarea rows=\"1\" placeholder=\"和 komo 说点什么\"></textarea><button class=\"ds-send\" aria-label=\"发送\"><svg viewBox=\"0 0 24 24\" width=\"16\" height=\"16\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.5\" stroke-linecap=\"round\" stroke-linejoin=\"round\"><path d=\"M12 19V5M6 11l6-6 6 6\"/></svg></button></div>",
+      "css": ".ds-composer { display: flex; align-items: flex-end; gap: 4px; width: 480px; padding: 6px; border-radius: 16px; background: #fff; box-shadow: 0 0 0 1px rgb(34 40 28 / 0.2), 0 2px 8px rgb(34 40 28 / 0.05); transition: box-shadow 120ms ease; } .ds-composer:focus-within { box-shadow: 0 0 0 1px #565d4e, 0 2px 8px rgb(34 40 28 / 0.05); } .ds-composer textarea { flex: 1; min-height: 32px; padding: 6px 4px; border: 0; outline: 0; resize: none; background: none; font: 400 15px/20px 'Noto Sans', 'Noto Sans SC', system-ui, sans-serif; color: #22281c; } .ds-cbtn { display: grid; place-items: center; width: 32px; height: 32px; border: 0; border-radius: 8px; background: none; color: #565d4e; cursor: pointer; } .ds-cbtn:hover { background: #f3f4f0; color: #22281c; } .ds-send { display: grid; place-items: center; width: 32px; height: 32px; border: 0; border-radius: 50%; background: #20251b; color: #fff; cursor: pointer; transition: transform 120ms cubic-bezier(0.16, 1, 0.3, 1); } .ds-send:hover { opacity: 0.88; } .ds-send:active { transform: scale(0.94); }"
+    },
+    {
+      "name": "Sidebar Nav",
+      "kind": "nav",
+      "refersTo": "nav-item",
+      "description": "纸色侧栏上的导航行，当前项是按下灰。",
+      "html": "<nav class=\"ds-side\"><a class=\"ds-nav\" aria-current=\"page\">记忆</a><a class=\"ds-nav\">事项</a><a class=\"ds-nav\">定时</a></nav>",
+      "css": ".ds-side { width: 240px; padding: 8px; background: #f2f3ef; } .ds-nav { display: flex; align-items: center; height: 34px; padding: 0 8px; border-radius: 8px; color: #22281c; font: 400 14px 'Noto Sans', 'Noto Sans SC', system-ui, sans-serif; cursor: pointer; transition: background-color 120ms ease; } .ds-nav:hover { background: #e9ebe5; } .ds-nav[aria-current] { background: #e3e6de; font-weight: 500; }"
+    },
+    {
+      "name": "Status Pills",
+      "kind": "chip",
+      "refersTo": "pill",
+      "description": "浅底深字成对出现；在等用琥珀。",
+      "html": "<span class=\"ds-pill\">候选</span> <span class=\"ds-pill ds-wait\">在等</span>",
+      "css": ".ds-pill { display: inline-flex; align-items: center; height: 20px; padding: 0 7px; border-radius: 999px; background: #eef0ea; color: #3f4637; font: 500 12px 'Noto Sans', 'Noto Sans SC', system-ui, sans-serif; } .ds-wait { background: #fbf3d6; color: #6b4f0a; }"
+    },
+    {
+      "name": "Card",
+      "kind": "card",
+      "refersTo": "card",
+      "description": "白底轻抬，边线在阴影层，没有 border。",
+      "html": "<div class=\"ds-card\"><b>上下文</b><p>32k / 128k</p></div>",
+      "css": ".ds-card { width: 304px; padding: 14px 16px; border-radius: 12px; background: #fff; box-shadow: 0 0 0 1px rgb(34 40 28 / 0.12), 0 2px 2px rgb(34 40 28 / 0.04); font: 400 14px/20px 'Noto Sans', 'Noto Sans SC', system-ui, sans-serif; color: #22281c; } .ds-card b { font-weight: 500; } .ds-card p { margin: 6px 0 0; color: #565d4e; font-size: 12px; font-variant-numeric: tabular-nums; }"
+    },
+    {
+      "name": "Presence Motes",
+      "kind": "custom",
+      "description": "记忆的在场光阶：实心叶绿=每次都带，空心=相关才带，虚线=候选，红圈=有争议，灰=不再带。",
+      "html": "<div class=\"ds-motes\"><i class=\"ds-m full\"></i><i class=\"ds-m ring\"></i><i class=\"ds-m pale\"></i><i class=\"ds-m alert\"></i><i class=\"ds-m off\"></i></div>",
+      "css": ".ds-motes { display: flex; align-items: center; gap: 10px; } .ds-m { display: inline-block; width: 8px; height: 8px; border-radius: 50%; box-sizing: border-box; } .ds-m.full { background: #4f6b38; } .ds-m.ring { border: 1.5px solid #4f6b38; } .ds-m.pale { border: 1.5px dashed #636a5a; } .ds-m.alert { border: 1.5px solid #b3261e; } .ds-m.off { width: 7px; height: 7px; background: #d3d7cc; }"
+    },
+    {
+      "name": "Switch",
+      "kind": "custom",
+      "refersTo": "switch-on",
+      "description": "开着是墨色，不用叶绿：开关是选择，不是在场。",
+      "html": "<button class=\"ds-switch\" role=\"switch\" aria-checked=\"true\"><i></i></button> <button class=\"ds-switch\" role=\"switch\" aria-checked=\"false\"><i></i></button>",
+      "css": ".ds-switch { position: relative; width: 40px; height: 24px; padding: 0; border: 0; border-radius: 12px; background: #d3d7cc; cursor: pointer; transition: background-color 120ms ease; } .ds-switch i { position: absolute; top: 3px; left: 3px; width: 18px; height: 18px; border-radius: 50%; background: #fff; box-shadow: 0 1px 2px rgb(20 24 16 / 0.2); transition: transform 160ms cubic-bezier(0.16, 1, 0.3, 1); } .ds-switch[aria-checked=\"true\"] { background: #20251b; } .ds-switch[aria-checked=\"true\"] i { transform: translateX(16px); } .ds-switch:focus-visible { outline: 2px solid hsl(212 100% 48%); outline-offset: 2px; }"
+    }
+  ],
+  "narrative": {
+    "northStar": "树荫下的账本",
+    "overview": "komo 的世界叫 komorebi（木漏れ日）：树叶间漏下的阳光。界面是一本放在树荫下的账本，墨与纸，记得清楚、经得起核对。光只从叶缝里漏下几处，叶绿永远表示\"此刻在场\"或\"正在运行\"，比如这一轮带上的记忆、上下文的占用、在跑的任务。光不是装饰，它的位置本身就是信息。小片刻攒成恒久之物，正是记忆随时间积累。\n\n布局照 Claude 桌面版：左边带文字的侧栏，中间是对话，右栏可以折叠。密度是工作台级别的，字号 12–15，行高宽松，没有大标题区，也没有营销式留白。人格是\"树荫下安静的朋友\"：不惊扰，动效只做反馈，状态写实，数字不粉饰。",
+    "keyCharacteristics": [
+      "无彩的墨与纸，只用一种色相：叶绿。",
+      "边线画在阴影层，1px 零模糊的环，不用 `border`。",
+      "机器的名字（变量名、模型 id、路径）用等宽字，和中文正文一眼分开。",
+      "光点按记忆离 prompt 的远近编码，从实心到空心到灰。",
+      "一份浅色主题，没有暗色。"
+    ],
+    "rules": [
+      {
+        "name": "叶隙光规则",
+        "body": "叶绿只表示\"在场\"和\"运行中\"。品牌装饰、头像、链接、选中态、完成反馈、开关打开都不用叶绿。开关是\"选择\"，不是\"在场\"，所以打开时是墨色；回复里的链接是墨色字配 `--faint` 下划线，悬停时下划线变实。",
+        "section": "colors"
+      },
+      {
+        "name": "一种色相规则",
+        "body": "状态底色都是浅底配深字成对出现。上下文构成的分段条只用同一色相的三档叶绿加几级灰，不引入第二种色相。",
+        "section": "colors"
+      },
+      {
+        "name": "三档字重规则",
+        "body": "只用三档字重：400 用来读，500 表示可点，600 用于标题。`strong` 也压到 600。",
+        "section": "typography"
+      },
+      {
+        "name": "机器名字规则",
+        "body": "环境变量名、模型 id、端点、路径、句柄、配置键都用 Geist Mono（`.mono`，0.93em）。等宽字体用作标题时只用 500，不让浏览器合成假粗体。",
+        "section": "typography"
+      },
+      {
+        "name": "等宽数位规则",
+        "body": "数字一律用等宽数位（`.num`，`tabular-nums`），列里的数右对齐。",
+        "section": "typography"
+      },
+      {
+        "name": "阴影描边规则",
+        "body": "卡片、输入框、按钮、标签都不用 `border`，而是画 1px 零模糊的环。环的透明度随底色走，放在纸色侧栏上也不会发灰。列表行之间的分隔线和虚线框（空状态、添加卡）仍然用 `border`。",
+        "section": "elevation"
+      },
+      {
+        "name": "真浮起规则",
+        "body": "只有真正浮在别的东西之上的元素才有远处的柔影，也就是输入框、菜单和弹窗。",
+        "section": "elevation"
+      }
+    ],
+    "dos": [
+      "**Do** 颜色只引用 `:root` 的语义 token。新增颜色先加 token，再写进本文头部。",
+      "**Do** 用 1.5px 描边的内联 SVG 画图标（16px，`svg.i`）。",
+      "**Do** 用产品自己的话写文案：界面用中文，术语与 `docs/komo_bot.md`、`docs/memory.md` 一致（约定、线索、目标、领域、任务会话、插话）。",
+      "**Do** 如实写数：没有的写\"—\"，零就写 0；估算的数在旁边说明口径。",
+      "**Do** 键盘焦点一律画 `--focus` 蓝色 2px 描边。"
+    ],
+    "donts": [
+      "**Don't** 把叶绿用在品牌装饰、强调、选中态、完成反馈或开关上。",
+      "**Don't** 引入第二种色相，包括第二种绿。",
+      "**Don't** 给卡片、输入框、按钮写 `border`。",
+      "**Don't** 用 emoji 或 Unicode 字符充当图标。",
+      "**Don't** 加入场动画、回弹曲线或骨架微光。",
+      "**Don't** 给只是放在原地的东西加柔影。"
+    ]
+  }
+}

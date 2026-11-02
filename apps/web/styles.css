@@ -129,9 +129,14 @@ svg.i { width: 16px; height: 16px; flex: none; fill: none; stroke: currentColor;
 @media (hover: none) { .sess-more { opacity: 1; } .srow > .session { padding-right: 36px; } }
 .session.renaming { cursor: default; background: var(--hover); }
 .sess-rename { flex: 1; min-width: 0; height: 26px; padding: 0 6px; border: 0; border-radius: 4px; background: var(--surface); box-shadow: 0 0 0 2px var(--focus); font: inherit; color: var(--text); outline: 0; }
-.sess-menu { position: fixed; top: 0; left: 0; right: auto; width: 220px; }
-.menu-item kbd { margin-left: auto; color: var(--faint); font: inherit; font-size: var(--fs-small); }
-.menu-item.danger, .menu-item.danger > .i { color: var(--negative); }
+/* 会话菜单照 Claude Code：窄、行矮、无图标，快捷键字母靠右；确认态才放宽 */
+.menu.sess-menu { position: fixed; top: 0; left: 0; right: auto; width: auto; min-width: 168px; padding: 4px; }
+.menu.sess-menu:has(.menu-confirm) { width: 232px; }
+.sess-menu .menu-item { gap: 24px; height: 30px; padding: 0 8px 0 10px; font-size: var(--fs-body); }
+.sess-menu .menu-sep { margin: 4px 6px; }
+.menu-item kbd { margin-left: auto; color: var(--faint); font: inherit; font-size: var(--fs-label); }
+.menu-item.is-danger { color: var(--negative); }
+.menu-item.is-danger:hover, .menu-item.is-danger:focus-visible { background: var(--negative-pale); }
 .menu-confirm { padding: 8px 8px 6px; }
 .menu-confirm p { margin: 0 0 10px; color: var(--muted); font-size: var(--fs-label); line-height: 20px; }
 .menu-confirm .actions { display: flex; gap: 8px; }

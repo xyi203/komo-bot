@@ -471,14 +471,15 @@ function drawGroups() {
 function renderSessMenu() {
   const m = $("sess-menu"), st = S.sessMenu, s = st && S.sessions.find((x) => x.session === st.id);
   if (!s) { S.sessMenu = null; m.hidden = true; return; }
-  const item = (act, ic, label, key, cls = "") => `<button class="menu-item${cls}" role="menuitem" data-sess-act="${act}">${icon(ic)}<span>${label}</span><kbd>${key}</kbd></button>`;
+  // 照 Claude Code 的会话菜单：只有文字和快捷键，不放图标；删除只用红字
+  const item = (act, label, key, cls = "") => `<button class="menu-item${cls}" role="menuitem" data-sess-act="${act}"><span>${label}</span><kbd>${key}</kbd></button>`;
   const busy = st.busy ? "disabled" : "";
   m.innerHTML = st.confirm === "archive"
     ? `<div class="menu-confirm"><p>归档后这段对话只能查看，不能再发消息；没跑完的会先跑完。</p><div class="actions">${btn("归档", `data-sess-act="archive-sure" ${busy}`, "primary sm")}${btn("取消", 'data-sess-act="cancel"', "sm")}</div></div>`
     : st.confirm === "delete"
     ? `<div class="menu-confirm"><p>${archived(s) ? "" : "没跑完的会先停掉，然后"}永久删掉这段对话的内容，不能恢复。</p><div class="actions">${btn("删除", `data-sess-act="delete-sure" ${busy}`, "danger-btn sm")}${btn("取消", 'data-sess-act="cancel"', "sm")}</div></div>`
-    : item("rename", "edit", "重命名", "R") + item("fork", "branch", "分叉", "F")
-      + (s.kind === "main" ? "" : `<div class="menu-sep" role="separator"></div>${archived(s) ? "" : item("archive", "archive", "归档", "A")}${item("delete", "trash", "删除", "D", " danger")}`);
+    : item("rename", "重命名", "R") + item("fork", "分叉", "F")
+      + (s.kind === "main" ? "" : `<div class="menu-sep" role="separator"></div>${archived(s) ? "" : item("archive", "归档", "A")}${item("delete", "删除", "D", " is-danger")}`);
   if (st.error) m.insertAdjacentHTML("beforeend", `<p class="menu-err">${esc(st.error)}</p>`);
   m.hidden = false;
   const anchor = document.querySelector(`[data-sess-menu="${st.id}"]`)?.getBoundingClientRect();

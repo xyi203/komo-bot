@@ -18,6 +18,7 @@ KOMO_HOME=/path/to/data node apps/web/serve.mjs
 | `app.js` | 接口、事件流 fold、渲染与交互 |
 | `styles.css` | 主题 token 与全部样式 |
 | `serve.mjs` | 本地代理 |
+| `scripts/replay-model.mjs` | 回放一段导出会话的模型输出，给演示 Gateway 造真实对话数据；工具会真的执行，只回放只读的轮次 |
 | `scripts/shot.mjs` | 经 DevTools 协议按真实视口截图：`node apps/web/scripts/shot.mjs <url> <out.png> 390x844 [先执行的 JS] [等待毫秒]` |
 
 这是原型：发消息、停止、新建、分叉都会真的作用到所连的 Gateway。

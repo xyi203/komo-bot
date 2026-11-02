@@ -17,9 +17,11 @@
     <symbol id="i-leaf" viewBox="0 0 24 24"><path d="M11 20A7 7 0 0 1 9.8 6.1C15.5 5 17 4.48 19 2c1 2 2 4.18 2 8 0 5.5-4.78 10-10 10Z"/><path d="M2 21c0-3 1.85-5.36 5.08-6C9.5 14.52 12 13 13 12"/></symbol>
     <symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></symbol>
     <symbol id="i-sliders" viewBox="0 0 24 24"><path d="M20 5h-7M9 5H4M20 12h-9M7 12H4M20 19h-5M11 19H4M13 3v4M7 10v4M15 17v4"/></symbol>
+    <symbol id="i-chev-up" viewBox="0 0 24 24"><path d="m6 15 6-6 6 6"/></symbol>
     <symbol id="i-up" viewBox="0 0 24 24"><path d="m6 11 6-6 6 6M12 19V5"/></symbol>
     <symbol id="i-down" viewBox="0 0 24 24"><path d="m7 10 5 5 5-5"/></symbol>
     <symbol id="i-right" viewBox="0 0 24 24"><path d="m10 7 5 5-5 5"/></symbol>
+    <symbol id="i-think" viewBox="0 0 24 24"><path d="M9 18h6M10 21h4M12 3a6 6 0 0 0-3.8 10.6c.5.4.8 1 .8 1.7V16h6v-.7c0-.7.3-1.3.8-1.7A6 6 0 0 0 12 3Z"/></symbol>
     <symbol id="i-term" viewBox="0 0 24 24"><path d="m5 17 5-5-5-5M12 19h7"/></symbol>
     <symbol id="i-code" viewBox="0 0 24 24"><path d="m8 7-5 5 5 5M16 7l5 5-5 5"/></symbol>
     <symbol id="i-eye" viewBox="0 0 24 24"><path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7S2 12 2 12Z"/><circle cx="12" cy="12" r="3"/></symbol>
@@ -144,6 +146,10 @@
       <header class="topbar">
         <button class="icon-btn open-nav" id="open-nav" data-open-nav aria-label="打开导航"><svg class="i"><use href="#i-sidebar"/></svg></button>
         <button class="title-btn"><h1 id="title">komo</h1><svg class="i"><use href="#i-down"/></svg></button>
+        <div class="view-tabs" role="tablist" aria-label="这段对话怎么看">
+          <button role="tab" data-tab="chat" aria-selected="true">对话</button>
+          <button role="tab" data-tab="trace" aria-selected="false">轨迹</button>
+        </div>
         <div class="top-actions">
           <button class="icon-btn" id="fork" aria-label="分叉这段对话" title="分叉这段对话"><svg class="i"><use href="#i-branch"/></svg></button>
           <button class="icon-btn" id="toggle-panel" aria-label="收起右栏" title="右栏：在做的事、记忆、上下文、后台、连接" aria-controls="panel" aria-expanded="true"><svg class="i"><use href="#i-details"/></svg></button>

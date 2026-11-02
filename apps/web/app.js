@@ -41,6 +41,12 @@ const S = {
   filter: localStorage.getItem("komo.filter") || "active",            // active | archived | all
   navOpen: new Set(JSON.parse(localStorage.getItem("komo.navOpen") || "[]")), // 展开了子任务的父会话
   open: new Set(),        // 展开着的折叠（按稳定 id）
+  tab: "chat",            // chat | trace：会话看对话还是轨迹
+  traceQuery: "",
+  traceDuration: false,   // 轨迹概览：false 每条记录等宽 | true 按实际时长
+  traceRange: null,       // 概览上拖出的聚焦区间（概览定义域里的 [起, 止]）
+  traceTab: "overview",   // 详情开着的那一页
+  traceTurnsClosed: new Set(), traceCallsClosed: new Set(),
   stream: "idle",         // idle | live | retrying
   page: "session",        // session | memory
   mem: { status: "idle", error: "", bucket: "live", scope: "", query: "", hits: null, degraded: "", selected: null, index: null, mode: null, busy: "", fail: "", confirmForget: false, classify: false },
@@ -48,6 +54,7 @@ const S = {
 const newView = (id) => ({
   id, status: "loading", error: "", items: [], turns: new Map(), calls: new Map(), runs: new Map(), stats: { output: 0, input: 0, cache: 0, steps: 0 },
   recall: null, usage: null, model: null, delta: null, next: 0, pending: [], tree: null,
+  events: [], // 原样留着，轨迹视图从这里推
 });
 
 /* ---------- 格式 ---------- */
@@ -136,8 +143,15 @@ function turnOf(v, e) {
   }
   return t;
 }
+// 推理摘要：Responses 的 reasoning.summary，Anthropic 的 thinking 块
+function thinkingOf(blocks) {
+  return (Array.isArray(blocks) ? blocks : [])
+    .map((b) => (b.type === "reasoning" ? (b.summary || []).map((x) => x.text || "").join("") : b.type === "thinking" ? b.thinking || "" : ""))
+    .join("").trim();
+}
 function apply(v, e) {
   const d = e.data || {};
+  v.events.push(e);
   const t = turnOf(v, e);
   switch (e.type) {
     case "message.user": {
@@ -161,6 +175,8 @@ function apply(v, e) {
       // 上一段"回答"后面又来了一轮：它其实是过程中的说明，挪回过程里
       if (t.answer) { t.process.push({ kind: "text", id: t.answer.id, text: t.answer.text }); t.answer = null; }
       const calls = d.tool_calls || [];
+      const thought = thinkingOf(d.provider_blocks);
+      if (thought) t.process.push({ kind: "think", id: `${e.event_id}:think`, text: thought });
       if (d.text && d.text.trim()) {
         if (calls.length) t.process.push({ kind: "text", id: e.event_id, text: d.text });
         else t.answer = { id: e.event_id, text: d.text, at: e.at };
@@ -168,7 +184,7 @@ function apply(v, e) {
       for (const tc of calls) {
         let group = t.process[t.process.length - 1];
         if (!group || group.kind !== "tools") t.process.push((group = { kind: "tools", id: `g-${tc.call_id}`, calls: [] }));
-        const call = { id: tc.call_id, name: tc.name, label: callLabel(tc.name, tc.arguments), status: "planned" };
+        const call = { id: tc.call_id, name: tc.name, args: tc.arguments || {}, label: callLabel(tc.name, tc.arguments), status: "planned" };
         group.calls.push(call);
         v.calls.set(tc.call_id, call);
         v.stats.steps++;
@@ -182,7 +198,7 @@ function apply(v, e) {
     }
     case "tool.result": {
       const c = v.calls.get(d.call_id);
-      if (c) { c.status = d.status; c.ms = d.elapsed_ms; c.preview = d.preview; }
+      if (c) { c.status = d.status; c.ms = d.elapsed_ms; c.preview = d.preview; c.resultEvent = e.event_id; }
       break;
     }
     case "run.started":
@@ -258,6 +274,7 @@ async function openSession(id) {
   S.page = "session";
   S.current = id;
   S.view = newView(id);
+  S.traceQuery = ""; S.traceHi = null; S.traceRange = null; S.traceTab = "overview"; S.traceTurnsClosed.clear(); S.traceCallsClosed.clear();
   const parent = S.sessions.find((x) => x.session === id)?.home;
   if (parent) { S.navOpen.add(parent); saveNav(); }
   if (location.hash !== `#/s/${id}`) history.replaceState(null, "", `#/s/${id}`);
@@ -459,9 +476,9 @@ function renderSessMenu() {
   m.innerHTML = st.confirm === "archive"
     ? `<div class="menu-confirm"><p>归档后这段对话只能查看，不能再发消息；没跑完的会先跑完。</p><div class="actions">${btn("归档", `data-sess-act="archive-sure" ${busy}`, "primary sm")}${btn("取消", 'data-sess-act="cancel"', "sm")}</div></div>`
     : st.confirm === "delete"
-    ? `<div class="menu-confirm"><p>永久删掉这段对话的内容，不能恢复。</p><div class="actions">${btn("删除", `data-sess-act="delete-sure" ${busy}`, "danger-btn sm")}${btn("取消", 'data-sess-act="cancel"', "sm")}</div></div>`
+    ? `<div class="menu-confirm"><p>${archived(s) ? "" : "没跑完的会先停掉，然后"}永久删掉这段对话的内容，不能恢复。</p><div class="actions">${btn("删除", `data-sess-act="delete-sure" ${busy}`, "danger-btn sm")}${btn("取消", 'data-sess-act="cancel"', "sm")}</div></div>`
     : item("rename", "edit", "重命名", "R") + item("fork", "branch", "分叉", "F")
-      + (s.kind === "main" ? "" : `<div class="menu-sep" role="separator"></div>${archived(s) ? item("delete", "trash", "删除", "D", " danger") : item("archive", "archive", "归档", "A")}`);
+      + (s.kind === "main" ? "" : `<div class="menu-sep" role="separator"></div>${archived(s) ? "" : item("archive", "archive", "归档", "A")}${item("delete", "trash", "删除", "D", " danger")}`);
   if (st.error) m.insertAdjacentHTML("beforeend", `<p class="menu-err">${esc(st.error)}</p>`);
   m.hidden = false;
   const anchor = document.querySelector(`[data-sess-menu="${st.id}"]`)?.getBoundingClientRect();
@@ -488,6 +505,9 @@ async function sessAct(act) {
   if (!path) return;
   st.busy = true; st.error = ""; renderSessMenu();
   try {
+    // purge 只认已归档的会话（Gateway 不替人做上一步）：没归档的先立即归档，停掉在跑的
+    const s = S.sessions.find((x) => x.session === id);
+    if (path === "purge" && s && !archived(s)) await api(`/v1/sessions/${id}/delete`, { method: "POST", body: JSON.stringify({ now: true }) });
     await api(`/v1/sessions/${id}/${path}`, { method: "POST", body: "{}" });
     await refreshSessions();
     S.sessMenu = null;
@@ -604,22 +624,105 @@ function renderConn() {
 }
 
 /* ---------- 渲染：对话 ---------- */
-function toolsFold(item) {
-  const total = item.calls.reduce((a, c) => a + (c.ms || 0), 0);
-  const failed = item.calls.filter((c) => c.status === "failed" || c.status === "uncertain").length;
-  const runningNow = item.calls.some((c) => c.status === "running" || c.status === "planned");
-  const open = S.open.has(item.id);
-  const rows = item.calls
-    .map((c) => {
-      const out = (c.preview || "").split("\n").slice(1, 13).join("\n");
-      const tail = c.status === "running" || c.status === "planned" ? `<span class="spinner sm" aria-label="运行中"></span>` : c.status === "failed" ? `<span class="bad">失败</span>` : c.status === "uncertain" ? `<span class="bad">结果不明</span>` : `<span class="num">${seconds(c.ms)}</span>`;
-      return `<div class="call">${icon(toolIcon[c.name] || "term")}<span class="label"><span class="tname">${esc(c.name)}</span>${esc(c.label)}</span><span class="ms">${tail}</span></div>
-        ${out.trim() ? `<div class="call-out">${esc(out)}</div>` : ""}`;
-    })
-    .join("");
-  const head = `${runningNow ? "正在运行" : "运行了"} ${item.calls.length} 次调用${total ? ` · <span class="num">${seconds(total)}</span>` : ""}${failed ? ` · <span class="bad">${failed} 次没成</span>` : ""}`;
-  return `<div class="fold"><button class="fold-head" aria-expanded="${open}" data-fold="${item.id}">${head}${icon("right")}</button>
-    <div class="fold-body" ${open ? "" : "hidden"}>${rows}</div></div>`;
+// 过程分组照 DeepSeek Harness 的 Chat（ui-chat/conversation-nodes）：同一轮里相邻的思考与工具调用并成一组，
+// 回复、插话把组截断；回复始终可见，收起一轮只收过程。组标题按工具类别次数排序取前三。
+const TOOL_CATEGORY = { bash: "commands", read: "read", rg: "search", write: "write", edit: "edit", codemode: "code", task: "subagents" };
+const CATEGORY = {
+  thinking: ["正在分析请求", "已完成分析", "think"],
+  read: ["正在读取文件", "已读取文件", "eye"],
+  search: ["正在搜索代码", "已搜索代码", "search"],
+  write: ["正在写入文件", "已写入文件", "edit"],
+  edit: ["正在编辑文件", "修改了文件", "edit"],
+  commands: ["正在运行命令", "执行了命令", "term"],
+  code: ["正在运行代码", "运行了代码", "code"],
+  subagents: ["正在协调子智能体", "已协调子智能体", "branch"],
+  tools: ["正在调用工具", "已调用工具", "plug"],
+};
+const TOOL_TITLE = { bash: "运行命令", read: "读取", rg: "搜索文件内容", write: "写入", edit: "编辑", codemode: "代码", task: "创建子智能体" };
+const categoryOf = (name) => TOOL_CATEGORY[name] || "tools";
+const callBusy = (c) => c.status === "running" || c.status === "planned";
+const callBad = (c) => c.status === "failed" || c.status === "uncertain";
+// 一行详情：按这份字段顺序取第一个非空的字符串（所有工具同一份顺序，不按工具定制）
+const DETAIL_FIELDS = ["title", "description", "objective", "task", "task_name", "name", "question", "prompt", "message", "command", "cmd", "queries", "query", "pattern", "url", "uri", "file_path", "path", "target", "action", "status"];
+function callDetail(c) {
+  const a = c.args || {};
+  for (const k of DETAIL_FIELDS) {
+    const val = Array.isArray(a[k]) && a[k].every((x) => typeof x === "string") ? a[k].join(", ") : a[k];
+    if (typeof val === "string" && val.trim()) return val.replace(/\s+/g, " ").trim();
+  }
+  return c.name;
+}
+// 思考的预览：最近一个首行以换行结束的段落的首行
+function thinkPreview(text) {
+  const paras = text.split(/\n\s*\n/).filter((p) => p.trim());
+  for (let i = paras.length - 1; i >= 0; i--) {
+    const p = paras[i].trim();
+    if (p.includes("\n") || i < paras.length - 1 || /\n\s*$/.test(text)) return p.split("\n")[0].replace(/\*\*/g, "");
+  }
+  return paras[0]?.split("\n")[0].replace(/\*\*/g, "") || "";
+}
+function segments(process) {
+  const out = [];
+  for (const p of process) {
+    if (p.kind !== "think" && p.kind !== "tools") { out.push(p); continue; }
+    let seg = out[out.length - 1];
+    if (!seg || seg.kind !== "steps") out.push((seg = { kind: "steps", id: `s-${p.id}`, steps: [] }));
+    if (p.kind === "think") seg.steps.push(p);
+    else seg.steps.push(...p.calls.map((c) => ({ kind: "call", id: c.id, call: c })));
+  }
+  return out;
+}
+// 组标题：结束了的按类别次数降序（同数按首次出现）取前三；在跑的写当前在跑的那个调用，没有就"正在分析请求"
+function groupTitle(seg, live) {
+  const calls = seg.steps.filter((x) => x.kind === "call").map((x) => x.call);
+  const busy = calls.filter(callBusy).sort((a, b) => (a.startedAt || "").localeCompare(b.startedAt || "")).at(-1);
+  if (live) {
+    if (busy) { const k = categoryOf(busy.name); return { text: CATEGORY[k][0], detail: callDetail(busy), cat: k }; }
+    const think = [...seg.steps].reverse().find((x) => x.kind === "think");
+    const lastPara = think?.text.split(/\n\s*\n/).filter((p) => p.trim()).at(-1)?.replace(/\*\*/g, "").replace(/\s+/g, " ").trim();
+    return { text: CATEGORY.thinking[0], detail: lastPara || "", cat: "thinking" };
+  }
+  const counts = new Map();
+  for (const c of calls) { const k = categoryOf(c.name); counts.set(k, (counts.get(k) || 0) + 1); }
+  const ranked = [...counts].sort((a, b) => b[1] - a[1]).map(([k]) => k); // sort 稳定：同数保留首次出现的顺序
+  if (!ranked.length) return { text: CATEGORY.thinking[1], cat: "thinking" };
+  const names = ranked.slice(0, 3).map((k) => CATEGORY[k][1]);
+  const text = names.length === 2 ? `${names[0]}并${names[0].startsWith("已") && names[1].startsWith("已") ? names[1].slice(1) : names[1]}` : names.join("，");
+  return { text: ranked.length > 3 ? `${text}等` : text, cat: ranked[0] };
+}
+function stepsFold(seg, live) {
+  const failed = seg.steps.filter((x) => x.kind === "call" && callBad(x.call)).length;
+  const open = S.open.has(seg.id);
+  const g = groupTitle(seg, live);
+  const lead = `<span class="g-ic">${icon(CATEGORY[g.cat][2])}</span>${icon(open ? "chev-up" : "down", "i g-chev")}`;
+  return `<div class="steps${live ? " live" : ""}"><button class="steps-head" aria-expanded="${open}" data-fold="${seg.id}">${lead}<span class="g-title">${esc(g.text)}${g.detail ? `<span class="g-detail"> · ${esc(g.detail)}</span>` : ""}</span>${failed ? `<span class="bad">· ${failed} 次失败</span>` : ""}</button>
+    ${open ? `<div class="steps-body">${seg.steps.map(stepRow).join("")}</div>` : ""}</div>`;
+}
+function stepRow(x) {
+  const open = S.open.has(x.id);
+  if (x.kind === "think") {
+    return `<div class="step"><button class="step-head" aria-expanded="${open}" data-fold="${x.id}">${icon("think")}<span class="step-verb">思考</span><span class="step-sum">${esc(thinkPreview(x.text))}</span></button>
+      ${open ? `<div class="step-think">${markdown(x.text)}</div>` : ""}</div>`;
+  }
+  const c = x.call;
+  const tail = callBusy(c) ? `<span class="spinner sm" aria-label="运行中"></span>` : callBad(c) ? `<span class="bad">${c.status === "failed" ? "失败" : "结果不明"}</span>` : "";
+  return `<div class="step"><button class="step-head${callBusy(c) ? " busy" : ""}" aria-expanded="${open}" data-fold="${c.id}">${icon(CATEGORY[categoryOf(c.name)][2])}<span class="step-verb">${esc(TOOL_TITLE[c.name] || "工具调用")}</span><span class="step-sum">${esc(callDetail(c))}</span><span class="step-ms">${tail}</span></button>
+    ${open ? callCard(c) : ""}</div>`;
+}
+// 展开的一次调用：命令（可复制）在上，输出在下；"查看"跳到轨迹里这一条的详情
+function callCard(c) {
+  const a = c.args || {};
+  const cmd = c.name === "bash" ? a.command : c.name === "codemode" ? a.code || a.script : JSON.stringify(a, null, 2);
+  const lines = (c.preview || "").split("\n");
+  const meta = [lines.shift()?.replace(/^\[|\]$/g, "")];
+  if (/^exit=/.test(lines[0] || "")) meta.push(lines.shift());
+  const out = lines.join("\n").replace(/^\n+/, "").trimEnd();
+  const dot = callBusy(c) ? " run" : callBad(c) ? " bad" : "";
+  return `<div class="call-card">
+    <div class="cc-head"><span class="cc-dot${dot}" aria-hidden="true"></span><span class="cc-tool">${esc(c.name)}</span><pre class="cc-cmd">${esc(cmd)}</pre><button class="icon-btn sm" data-copy="${esc(cmd)}" aria-label="复制命令">${icon("copy")}</button></div>
+    ${out ? `<pre class="cc-out">${esc(out)}</pre>` : callBusy(c) ? `<p class="cc-note">还没有输出</p>` : ""}
+    ${c.preview ? `<p class="cc-meta">${esc(meta.filter(Boolean).join(" · "))}</p>` : ""}
+  </div>${c.resultEvent ? `<button class="cc-inspect" data-inspect="${esc(c.resultEvent)}">${icon("code")}查看</button>` : ""}`;
 }
 function useCounts(uses) {
   const mems = uses.map((u) => S.memories.get(u.memory));
@@ -652,40 +755,42 @@ function userBubble(text, at) {
 }
 function duration(ms) {
   const s = Math.max(0, Math.round(ms / 1000)), m = Math.floor(s / 60), h = Math.floor(m / 60);
-  return h ? `${h}h ${m % 60}m` : m ? `${m}m ${s % 60}s` : `${s}s`;
+  return h ? `${h}小时${m % 60}分` : m ? `${m}分${s % 60}秒` : `${s}秒`;
 }
-function processRow(p) {
-  if (p.kind === "tools") return toolsFold(p);
+function processRow(p, live) {
+  if (p.kind === "steps") return stepsFold(p, live);
   if (p.kind === "recall") return recallFold(p);
   if (p.kind === "steer") return `<div class="steer"><span class="steer-tag">插话</span>${esc(p.text)}</div>`;
-  if (p.kind === "text") return `<div class="msg-agent proc">${markdown(p.text)}</div>`;
+  if (p.kind === "text") return `<div class="msg-agent">${markdown(p.text)}</div>`;
   return "";
 }
+// 一轮：抬头"已完成，用时 …"收起 / 展开这一轮的过程；收起时回复和插话照样在（只收思考、调用与召回）。
+// 只有回复的一轮没有可收的，抬头不给开合。结束了的默认收起，跑着的默认展开。
 function turnView(t, v) {
   const live = t.status === "running" || t.status === "queued";
   const spent = duration((t.end ? new Date(t.end) : new Date()) - new Date(t.start));
-  const steps = t.process.reduce((a, p) => a + (p.kind === "tools" ? p.calls.length : 0), 0);
-  const failedCalls = t.process.reduce((a, p) => a + (p.kind === "tools" ? p.calls.filter((c) => c.status === "failed" || c.status === "uncertain").length : 0), 0);
-  // 跑着的那一轮默认展开，看得到正在做什么；结束了的默认收起，只留结论
-  const open = S.open.has(t.id) ? true : S.open.has(`${t.id}:closed`) ? false : live;
-  const running = live ? [...v.calls.values()].reverse().find((c) => c.status === "running") : null;
-  const headText = live
-    ? `<span class="spinner sm" aria-hidden="true"></span>${running ? `${esc(running.name)} ${esc(running.label)}` : v.delta ? "正在回复" : "正在想"} · <span class="num">${spent}</span>`
-    : `${t.status === "done" ? "完成，" : ""}用时 <span class="num">${spent}</span>${steps ? ` · <span class="num">${steps}</span> 步` : ""}${failedCalls ? ` · <span class="bad">${failedCalls} 步没成</span>` : ""}`;
+  const parts = segments(t.process);
+  const foldable = parts.some((p) => p.kind === "steps" || p.kind === "recall");
+  const open = !foldable || (S.open.has(t.id) ? true : S.open.has(`${t.id}:closed`) ? false : live);
+  const headText = live ? `<span class="spinner sm" aria-hidden="true"></span>进行中，用时 <span class="num">${spent}</span>`
+    : t.status === "failed" ? `<span class="bad">处理失败</span>，用时 <span class="num">${spent}</span>`
+    : t.status === "cancelled" ? `已停止，用时 <span class="num">${spent}</span>`
+    : `已完成，用时 <span class="num">${spent}</span>`;
   const lit = t.recall.length ? `<span class="head-lit"><span class="mote full" aria-hidden="true"></span>${recallShort(t.recall)}</span>` : "";
-  const hasProcess = t.process.length > 0 || live;
-  const head = hasProcess
-    ? `<button class="turn-head" aria-expanded="${open}" data-turn="${t.id}">${headText}${icon("down", "i chev")}${lit}</button>`
-    : "";
+  const head = foldable || live
+    ? `<button class="turn-head" aria-expanded="${open}" data-turn="${t.id}"${foldable ? "" : " disabled"}>${headText}${foldable ? icon(open ? "chev-up" : "down", "i chev") : ""}${lit}</button>`
+    : `<p class="turn-head plain">${headText}${lit}</p>`;
+  const shown = open ? parts : parts.filter((p) => p.kind === "text" || p.kind === "steer");
+  const body = shown.map((p, i) => processRow(p, live && p.kind === "steps" && i === shown.length - 1 && !t.answer && !v.delta)).join("");
   const answer = t.answer
     ? `<div class="msg-agent">${markdown(t.answer.text)}</div>
-       <div class="msg-meta left"><button class="icon-btn sm" data-copy="${esc(t.answer.text)}" aria-label="复制回答">${icon("copy")}</button><span class="num">${stamp(t.answer.at)}</span></div>`
+       <div class="msg-meta left turn-foot"><button class="icon-btn sm" data-copy="${esc(t.answer.text)}" aria-label="复制回答">${icon("copy")}</button><span class="num">${stamp(t.answer.at)}</span></div>`
     : live && v.delta ? `<div class="msg-agent streaming">${markdown(v.delta.text)}</div>` : "";
-  const tail = t.status === "failed" ? `<p class="note bad">这一轮失败了：${esc(t.reason)}</p>` : t.status === "cancelled" ? `<p class="note">这一轮已取消</p>` : "";
+  const tail = t.status === "failed" ? `<p class="note bad">本轮运行失败：${esc(t.reason)}</p>` : t.status === "cancelled" ? `<p class="note">任务已停止</p>` : "";
   return `<section class="turn">
     ${t.users.map((u) => userBubble(u.text, u.at)).join("")}
     ${head}
-    ${hasProcess && open ? `<div class="turn-process">${t.process.map(processRow).join("") || `<p class="note">还没有步骤。</p>`}</div>` : ""}
+    ${body ? `<div class="turn-process">${body}</div>` : ""}
     ${answer}${tail}
   </section>`;
 }
@@ -693,9 +798,326 @@ function recallShort(uses) {
   const { conv, clue } = useCounts(uses);
   return `带上 ${[conv && `${conv} 条约定`, clue && `${clue} 条线索`].filter(Boolean).join("、")}`;
 }
+/* ---------- 渲染：轨迹 ----------
+   照 DeepSeek Harness 的 Trajectory：上面是时间概览（输入 / 模型 / 工具三条泳道），下面是按轮的记录表，
+   选中一条在右边看详情。时间概览默认每条记录等宽排一格（看顺序），"时长"切成真实起止（空闲压掉，看哪步慢）；
+   在概览上拖一段，记录表只留这段里在活动的记录。 */
+const ms = (iso) => Date.parse(iso);
+// 系统提示从树上取：komo.system 是增量，第一条是初始的整份，之后每条只带改了的段
+function systemRows(tree) {
+  if (!tree?.entries?.length) return { rows: [], tools: new Map() };
+  const byId = new Map(tree.entries.map((e) => [e.id, e]));
+  const path = [];
+  for (let id = tree.leafId; id && byId.has(id); id = byId.get(id).parentId) path.push(byId.get(id));
+  path.reverse();
+  const rows = [], tools = new Map(), sections = {};
+  for (const e of path) {
+    if (e.customType !== "komo.system") continue;
+    const m = e.data?.model?.[0] || {};
+    const changed = Object.entries(m.sections || {});
+    for (const [k, val] of changed) val == null ? delete sections[k] : (sections[k] = val);
+    const added = (m.toolsAdded || []).map((t) => t.name || t.function?.name), removed = (m.toolsRemoved || []).map((t) => t.name || t.function?.name);
+    for (const t of m.toolsAdded || []) tools.set(t.name || t.function?.name, t);
+    for (const n of removed) tools.delete(n);
+    const first = !rows.length;
+    const what = first ? "初始系统提示词"
+      : changed.length && (added.length || removed.length) ? "系统提示词和工具已更新"
+      : changed.length ? "系统提示词已更新" : "工具已更新";
+    const toolNote = [added.length && (first ? `${added.length} 个工具` : `新增：${added.join("、")}`), removed.length && `移除：${removed.join("、")}`].filter(Boolean);
+    rows.push({
+      kind: "sys", id: `sys-${e.id}`, at: e.timestamp, first, text: [what, ...(first ? [] : changed.map(([k]) => k)), ...toolNote].join(" · "),
+      changed, sections: { ...sections }, tools: [...tools.values()], added, removed,
+    });
+  }
+  return { rows, tools };
+}
+const LANE = { user: 0, ctx: 0, sys: 0, think: 1, model: 1, tool: 2 };
+function traceOf(v) {
+  const rows = [], calls = new Map(), last = new Map(), runs = new Map(), byRun = new Map();
+  let turn = 0;
+  const step = (run) => { const r = byRun.get(run); return r ? ++r.step : 0; };
+  const cum = { input: 0, cache: 0, output: 0, reasoning: 0 };
+  for (const e of v.events) {
+    const d = e.data || {}, run = e.run_id, n = byRun.get(run)?.n;
+    switch (e.type) {
+      case "run.started":
+        turn++; runs.set(run, { start: e.at, end: null, n: turn }); byRun.set(run, { n: turn, step: 0 });
+        last.set(run, e.at); break;
+      case "run.completed": case "run.failed": case "run.cancelled": case "run.abandoned":
+        if (runs.has(run)) runs.get(run).end = e.at;
+        if (e.type === "run.failed") rows.push({ kind: "ctx", id: e.event_id, n, at: e.at, bad: true, text: `这一轮失败了：${d.reason || "没有给出原因"}` });
+        if (e.type === "run.cancelled") rows.push({ kind: "ctx", id: e.event_id, n, at: e.at, text: "这一轮取消了" });
+        break;
+      case "message.user":
+        rows.push({ kind: "user", id: e.event_id, n, at: e.at, text: d.text }); last.set(run, e.at); break;
+      case "memory.injected":
+        if ((d.uses || []).length) rows.push({ kind: "ctx", id: e.event_id, n, at: e.at, text: `带上 ${d.uses.length} 条记忆：${d.uses.map((u) => S.memories.get(u.memory)?.content || u.memory).join("；")}` });
+        break;
+      case "context.compacted":
+        rows.push({ kind: "ctx", id: e.event_id, n, at: e.at, text: "上下文已压缩" }); break;
+      case "message.assistant": {
+        const from = last.get(run) || e.at;
+        const thought = thinkingOf(d.provider_blocks);
+        const tokens = { input: d.input_tokens, cache: d.cache_read_tokens, output: d.output_tokens, reasoning: d.reasoning_tokens };
+        for (const k of Object.keys(cum)) cum[k] += tokens[k] || 0;
+        const s = step(run);
+        if (thought) rows.push({ kind: "think", id: `${e.event_id}:think`, n, step: s, at: from, end: e.at, parent: e.event_id, text: thought });
+        const model = {
+          kind: "model", id: e.event_id, n, step: s, at: from, end: e.at, ms: ms(e.at) - ms(from),
+          text: d.text?.trim() || "（仅工具调用）", plain: !d.text?.trim(), body: d.text || "", thought, tokens, cum: { ...cum }, calls: [],
+        };
+        rows.push(model);
+        for (const tc of d.tool_calls || []) {
+          calls.set(tc.call_id, { name: tc.name, args: tc.arguments || {}, start: e.at, run, parent: e.event_id, step: s });
+          model.calls.push(tc.call_id);
+        }
+        last.set(run, e.at); break;
+      }
+      case "tool.started": { const c = calls.get(d.call_id); if (c) c.start = e.at; break; }
+      case "tool.result": {
+        const c = calls.get(d.call_id);
+        if (!c) break;
+        c.done = e.event_id;
+        rows.push({
+          kind: "tool", id: e.event_id, n: byRun.get(c.run)?.n, step: c.step, at: c.start, end: e.at, ms: d.elapsed_ms, name: c.name, args: c.args, parent: c.parent,
+          preview: d.preview || "", status: d.status, bad: d.status === "failed" || d.status === "uncertain",
+        });
+        last.set(c.run, e.at); break;
+      }
+    }
+  }
+  for (const [id, c] of calls) if (!c.done && v.runs.has(c.run)) {
+    rows.push({ kind: "tool", id: `live-${id}`, n: byRun.get(c.run)?.n, step: c.step, at: c.start, name: c.name, args: c.args, parent: c.parent, preview: "", status: "running", live: true });
+  }
+  // 模型行记下它派出的调用落在哪一行，详情里能点过去
+  const toolRow = new Map([...calls].map(([id, c]) => [id, c.done || `live-${id}`]));
+  for (const r of rows) if (r.kind === "model") r.calls = r.calls.map((id) => ({ row: toolRow.get(id), name: calls.get(id).name }));
+  // 系统提示：初始那份排在最前，之后的更新按时间插进去
+  const sys = systemRows(v.tree);
+  for (const s of sys.rows) {
+    if (s.first) { rows.unshift(s); continue; }
+    const i = rows.findIndex((r) => r.at && ms(r.at) > ms(s.at));
+    i < 0 ? rows.push(s) : rows.splice(i, 0, s);
+  }
+  rows.forEach((r, i) => { r.idx = i; });
+  // 还在等模型回话的那一轮：模型泳道上多一格进行中的
+  const waiting = [...runs].filter(([run, r]) => !r.end && v.runs.has(run) && ![...calls.values()].some((c) => c.run === run && !c.done)).map(([run]) => ({ from: last.get(run) }));
+  return { rows, runs, turns: turn, calls: calls.size, cum, waiting, schema: sys.tools };
+}
+// 概览的定义域：等宽时第 i 条记录占 [i, i+1)；按时长时是真实起止，记录之间没人在跑的空隙抠掉
+function traceSpans(t) {
+  const now = Date.now();
+  const timed = t.rows.map((r) => ({ r, a: ms(r.at), b: r.end ? ms(r.end) : r.live ? now : ms(r.at) })).filter((x) => Number.isFinite(x.a));
+  if (!S.traceDuration) {
+    const spans = timed.map((x, i) => ({ row: x.r, lane: LANE[x.r.kind], start: i, end: i + 1 }));
+    t.waiting.forEach((w, i) => spans.push({ lane: 1, start: spans.length + i, end: spans.length + i + 1, live: true }));
+    return { spans, start: 0, end: Math.max(spans.length, 1) };
+  }
+  const all = [...timed, ...t.waiting.map((w) => ({ a: ms(w.from), b: now, live: true }))].sort((x, y) => x.a - y.a || x.b - y.b);
+  let removed = 0, covered = null;
+  const cut = new Map();
+  for (const x of all) {
+    if (covered !== null && x.a > covered) removed += x.a - covered;
+    cut.set(x, removed);
+    covered = covered === null ? x.b : Math.max(covered, x.b);
+  }
+  const spans = all.map((x) => ({ row: x.r, lane: x.r ? LANE[x.r.kind] : 1, live: x.live || x.r?.live, start: x.a - cut.get(x), end: x.b - cut.get(x) }));
+  const start = Math.min(...spans.map((s) => s.start)), end = Math.max(...spans.map((s) => s.end), start + 1);
+  return { spans, start, end };
+}
+const TRACE_BADGE = { user: "用户", think: "思考", model: "助手", tool: "工具", ctx: "上下文", sys: "系统" };
+const KIND_ICON = { user: "chat", think: "think", model: "leaf", tool: "term", ctx: "list", sys: "gear" };
+function traceText(r) {
+  if (r.kind === "tool") return `${r.name} ${JSON.stringify(r.args)}`;
+  // 一行里不排版，去掉 Markdown 记号
+  return r.text.replace(/\*\*|`|^#+\s/gm, "").replace(/\s+/g, " ");
+}
+const resultLine = (r) => (r.preview || "").split("\n").slice(1).filter((l) => !/^exit=/.test(l)).join(" ").replace(/\s+/g, " ").trim();
+const searchHits = (t) => {
+  const q = S.traceQuery.trim().toLowerCase();
+  return q ? new Set(t.rows.filter((r) => `${traceText(r)} ${r.kind === "tool" ? resultLine(r) : ""}`.toLowerCase().includes(q)).map((r) => r.id)) : null;
+};
+function traceLanes(t, model, hits) {
+  if (!model.spans.length) return `<p class="note">还没有可画的记录。</p>`;
+  const span = model.end - model.start, pct = (n) => `${((n / span) * 100).toFixed(3)}%`;
+  const range = S.traceRange;
+  const turnLeft = t.rows.filter((r, i) => r.n && r.n !== t.rows[i - 1]?.n && r.n > 1)
+    .map((r) => model.spans.find((s) => s.row === r)).filter(Boolean)
+    .map((s) => `<span class="tr-mark" style="left:${pct(s.start - model.start)}"></span>`).join("");
+  const bars = model.spans.map((s) => {
+    const r = s.row, w = s.end - s.start;
+    const inRange = !range || (s.end >= range[0] && s.start <= range[1]);
+    const dim = !inRange || (hits && (!r || !hits.has(r.id)));
+    const cls = `tr-bar l${s.lane}${s.live ? " live" : ""}${r?.bad ? " bad" : ""}${r && r.id === S.traceHi ? " hi" : ""}${dim ? " dim" : ""}${!S.traceDuration ? " eq" : ""}`;
+    const tip = r ? `${TRACE_BADGE[r.kind]} · ${r.at ? fullTime(r.at) : ""}${r.end && r.at ? ` · ${seconds(ms(r.end) - ms(r.at))}` : ""}` : "等模型回话";
+    return `<span class="${cls}" style="left:${pct(s.start - model.start)};width:${pct(w)}"${r ? ` data-span="${esc(r.id)}"` : ""} title="${esc(tip)}"></span>`;
+  }).join("");
+  const sel = range ? `<span class="tr-range" style="left:${pct(range[0] - model.start)};width:${pct(range[1] - range[0])}"></span>` : "";
+  return `<div class="tr-lanes"><div class="tr-names" aria-hidden="true"><span>输入</span><span>模型</span><span>工具</span></div>
+    <div class="tr-track" id="tr-track" role="group" aria-label="时间概览：点一格看那条记录，横向拖动只看这段里的记录，Esc 清掉">${turnLeft}${sel}${bars}</div></div>`;
+}
+const tok = (n) => (n ? kTokens(n) : "");
+function traceRow(r, t) {
+  const sel = r.id === S.traceHi;
+  const icon_ = `<span class="tr-ic k-${r.kind}${r.bad ? " bad" : ""}" title="${TRACE_BADGE[r.kind]}">${icon(KIND_ICON[r.kind])}</span>`;
+  let text;
+  if (r.kind === "tool") {
+    const args = JSON.stringify(r.args);
+    text = `<span class="tr-req mono">${esc(r.name)} ${esc(args)}</span><span class="tr-arrow" aria-hidden="true">→</span><span class="tr-res mono">${r.live ? "运行中…" : esc(resultLine(r) || "无输出")}</span>`;
+  } else text = `<span class="tr-txt${r.plain ? " muted" : ""}">${esc(traceText(r))}</span>`;
+  const fold = r.kind === "model" && r.calls.length
+    ? `<button class="tr-fold" data-trace-fold="${esc(r.id)}" aria-expanded="${!S.traceCallsClosed.has(r.id)}" aria-label="${S.traceCallsClosed.has(r.id) ? "展开" : "收起"}这一步的工具调用">${icon("down", "i chev")}</button>` : "";
+  const cols = r.kind === "model"
+    ? [tok((r.tokens.input || 0) + (r.tokens.cache || 0)), tok(r.tokens.output), tok(r.tokens.reasoning), seconds(r.ms)]
+    : r.kind === "tool" ? ["", "", "", r.live ? elapsed(r.at) : r.bad ? (r.status === "failed" ? "失败" : "不明") : seconds(r.ms)] : ["", "", "", ""];
+  const folded = r.kind === "model" && S.traceCallsClosed.has(r.id) ? `<span class="tr-sum">${r.calls.length} 个工具调用</span>` : "";
+  return `<div class="tr-row${sel ? " hi" : ""}${r.kind === "tool" ? " sub" : ""}" id="tr-${esc(r.id)}"><button class="tr-line" aria-pressed="${sel}" data-trace-pick="${esc(r.id)}"><span class="tr-main">${icon_}${text}${folded}</span>${cols.map((c, i) => `<span class="tr-col num${i === 3 && r.bad ? " bad" : ""}">${esc(c)}</span>`).join("")}</button>${fold}</div>`;
+}
+function traceList(t, model, hits) {
+  const range = S.traceRange;
+  const inRange = range ? new Set(model.spans.filter((s) => s.row && s.end >= range[0] && s.start <= range[1]).map((s) => s.row.id)) : null;
+  const visible = t.rows.filter((r) => (!hits || hits.has(r.id)) && (!inRange || inRange.has(r.id)));
+  // 收起的调用：父那一步收起了，它的工具行不列（搜索和拖选时照列，免得命中的看不见）
+  const shown = hits || inRange ? visible : visible.filter((r) => !(r.kind === "tool" && S.traceCallsClosed.has(r.parent)));
+  const out = [];
+  let cur;
+  for (const r of shown) {
+    const n = r.n || 0;
+    if (n !== cur) {
+      cur = n;
+      if (n) {
+        const run = [...t.runs.values()].find((x) => x.n === n);
+        const closed = S.traceTurnsClosed.has(n);
+        const inTurn = t.rows.filter((x) => x.n === n);
+        const sum = closed ? ` · ${inTurn.filter((x) => x.kind === "model").length} 个步骤，${inTurn.filter((x) => x.kind === "tool").length} 个工具调用` : "";
+        out.push(`<div class="tr-turn"><button class="tr-turn-btn" data-trace-turn="${n}" aria-expanded="${!closed}">${icon("down", "i chev")}<span>第 ${n} 轮</span><span class="tr-turn-sum num">${run ? `${stamp(run.start)}${run.end ? ` · ${duration(ms(run.end) - ms(run.start))}` : " · 进行中"}` : ""}${sum}</span></button><span class="tr-col">输入</span><span class="tr-col">输出</span><span class="tr-col">思考</span><span class="tr-col">时间</span></div>`);
+      }
+    }
+    if (n && S.traceTurnsClosed.has(n) && !hits && !inRange) continue;
+    out.push(traceRow(r, t));
+  }
+  const note = range ? `<p class="tr-note">只列时间概览里选中那一段的 ${inRange.size} 条记录 · <button class="text-btn" data-trace-clear>看全部</button></p>` : "";
+  return note + (out.join("") || `<p class="note">没有对得上的记录。</p>`);
+}
+function traceToolbar(t) {
+  const turnsAll = t.turns > 0 && [...t.runs.values()].every((r) => S.traceTurnsClosed.has(r.n));
+  const folds = t.rows.filter((r) => r.kind === "model" && r.calls.length);
+  const allTurns = turnsAll, allCalls = folds.length > 0 && folds.every((r) => S.traceCallsClosed.has(r.id));
+  return `<button class="tr-tool" aria-pressed="${S.traceDuration}" data-trace-tool="duration" title="${S.traceDuration ? "改回等宽" : "按实际时长排"}">${icon("clock")}时长</button>
+    <button class="tr-tool" aria-pressed="${allTurns}" data-trace-tool="turns" title="${allTurns ? "展开所有轮次" : "收起所有轮次"}">${icon(allTurns ? "plus" : "list")}轮次</button>
+    <button class="tr-tool" aria-pressed="${allCalls}" data-trace-tool="calls" title="${allCalls ? "展开所有调用" : "收起所有调用"}">${icon(allCalls ? "plus" : "list")}调用</button>`;
+}
+// 详情：顶上是真的标签页；"概述"把各页的开头摆在一起，段标题点了切到那一页
+const fullTime = (iso) => { const d = new Date(iso); return `${ymd(d)} ${d.toLocaleTimeString("zh-CN", { hour12: false })}.${String(d.getMilliseconds()).padStart(3, "0")}`; };
+const STATUS_NAME = { completed: "已完成", failed: "失败", uncertain: "结果不明", running: "运行中" };
+const tokNum = (n) => `<span class="num">${Number(n).toLocaleString("en-US")} tok</span>`;
+function traceDetail(t, r) {
+  if (!r) return "";
+  const jump = (row, label) => (row ? `<button class="td-link" data-trace-pick="${esc(row)}">${esc(label)}${icon("right")}</button>` : "");
+  const pre = (s, cls = "") => `<pre class="td-pre${cls}">${esc(s)}</pre>`;
+  const sec = (tab, title, body) => `<section class="td-sec"><h4><button class="td-go" data-td-tab="${tab}">${title}${icon("right")}</button></h4><div class="td-peek">${body}</div></section>`;
+  const where = r.n ? `第 ${r.n} 轮${r.step ? ` · 第 ${r.step} 步` : ""}` : "会话开始";
+  const status = r.live ? `<span class="kstate ok"><span class="kdot"></span>运行中</span>` : r.bad ? `<span class="bad">${STATUS_NAME[r.status] || r.status}</span>` : "已完成";
+  const timing = (from, to, live) => kvBlock([["开始时间", `<span class="num">${from ? fullTime(from) : "不可用"}</span>`], ["时长", `<span class="num">${live ? elapsed(from) : from && to ? seconds(ms(to) - ms(from)) : "不可用"}</span>`], ["计时来源", live ? "会话时间戳（运行中）" : "会话时间戳"]]);
+  const usage = (u, title) => `<h5 class="td-h5">${title}</h5>${kvBlock([["输入", tokNum((u.input || 0) + (u.cache || 0))], u.cache != null && ["缓存读取", tokNum(u.cache)], ["输出", tokNum(u.output || 0)], u.reasoning != null && ["推理", tokNum(u.reasoning)]])}`;
+  let tabs;
+  if (r.kind === "tool") {
+    const def = t.schema.get(r.name), fn = def?.function || def || {};
+    const schema = def ? `<p class="td-name">${esc(r.name)}</p><p class="td-desc">${esc(fn.description || "")}</p>` : `<p class="note">Schema 不可用</p>`;
+    const args = JSON.stringify(r.args, null, 2), result = r.preview ? pre(r.preview, " out") : `<p class="note">${r.live ? "执行中…" : "未捕获结果"}</p>`;
+    tabs = [
+      ["overview", "概述", kvBlock([["层级", jump(r.parent, "助手消息")], ["状态", status]]) + sec("args", "参数", pre(args)) + sec("result", "结果", result) + sec("schema", "Schema", schema) + sec("timing", "计时", timing(r.at, r.end, r.live))],
+      ["args", "参数", pre(args)],
+      ["result", "结果", result],
+      ["schema", "Schema", schema + (fn.parameters ? `<h5 class="td-h5">参数</h5>${pre(JSON.stringify(fn.parameters, null, 2))}` : "")],
+      ["timing", "计时", timing(r.at, r.end, r.live)],
+    ];
+  } else if (r.kind === "model") {
+    const body = r.plain ? `<p class="note">无内容</p>` : `<div class="td-md">${markdown(r.body)}</div>`;
+    const callsRow = ["工具调用", r.calls.length ? r.calls.map((c) => jump(c.row, c.name)).join("") : "没有"];
+    tabs = [
+      ["overview", "概述", kvBlock([["状态", "已完成"], callsRow]) + (r.thought ? sec("think", "思考", `<div class="td-md muted">${markdown(r.thought)}</div>`) : "") + sec("preview", "预览", body) + sec("usage", "用量", kvBlock([["输入", tokNum((r.tokens.input || 0) + (r.tokens.cache || 0))], ["输出", tokNum(r.tokens.output || 0)]])) + sec("timing", "计时", timing(r.at, r.end))],
+      ...(r.thought ? [["think", "思考", `<div class="td-md">${markdown(r.thought)}</div>`]] : []),
+      ["preview", "预览", body],
+      ["raw", "原始内容", r.plain ? `<p class="note">无内容</p>` : pre(r.body)],
+      ["usage", "用量", usage(r.tokens, "本次请求") + usage(r.cum, "会话累计")],
+      ["timing", "计时", timing(r.at, r.end)],
+    ];
+  } else if (r.kind === "sys") {
+    const prompt = Object.entries(r.sections).map(([k, val]) => `<h5 class="td-h5">${esc(k)}</h5>${pre(val)}`).join("") || `<p class="note">本次请求没有系统提示词</p>`;
+    const tools = r.tools.length ? r.tools.map((d) => { const fn = d.function || d; return `<p class="td-name">${esc(fn.name)}</p><p class="td-desc">${esc(fn.description || "")}</p>`; }).join("") : `<p class="note">本次请求没有工具</p>`;
+    const diff = r.first ? null : (r.changed.map(([k, val]) => `<h5 class="td-h5">${esc(k)}</h5>${val == null ? `<p class="note">这一段删掉了。</p>` : pre(val)}`).join("") + (r.added.length ? `<p class="td-desc">新增工具：${r.added.map(esc).join("、")}</p>` : "") + (r.removed.length ? `<p class="td-desc">移除工具：${r.removed.map(esc).join("、")}</p>` : "")) || `<p class="note">无变化</p>`;
+    tabs = [...(diff ? [["diff", "差异", diff]] : []), ["prompt", "系统提示词", prompt], ["tools", "工具", tools]];
+  } else {
+    const body = `<div class="td-md">${markdown(r.text)}</div>`;
+    tabs = [
+      ["overview", "概述", (r.parent ? kvBlock([["层级", jump(r.parent, "助手消息")]]) : "") + sec("preview", "预览", body) + (r.at ? sec("timing", "计时", timing(r.at, r.end)) : "")],
+      ["preview", "预览", body],
+      ["raw", "原始内容", pre(r.text)],
+      ...(r.at ? [["timing", "计时", timing(r.at, r.end)]] : []),
+    ];
+  }
+  const tab = tabs.find(([id]) => id === S.traceTab) ? S.traceTab : tabs[0][0];
+  return `<div class="td-head"><span class="tr-ic k-${r.kind}${r.bad ? " bad" : ""}">${icon(KIND_ICON[r.kind])}</span><span class="td-kind">${TRACE_BADGE[r.kind]}</span><span class="td-where">${where}</span><button class="icon-btn sm" data-trace-close aria-label="关闭详情">${icon("x")}</button></div>
+    <div class="td-tabs" role="tablist" aria-label="详情">${tabs.map(([id, title]) => `<button role="tab" aria-selected="${id === tab}" data-td-tab="${id}">${esc(title)}</button>`).join("")}</div>
+    <div class="td-body" id="td-body" role="tabpanel">${tabs.find(([id]) => id === tab)[2]}</div>`;
+}
+// 跑着的时候每秒重画：搜索框在打字就只换下面几块，免得丢焦点
+function renderTrace(host, v) {
+  const t = traceOf(v);
+  S.traceModel = traceSpans(t);
+  const hits = searchHits(t);
+  const pick = t.rows.find((r) => r.id === S.traceHi);
+  const lanes = traceLanes(t, S.traceModel, hits), list = traceList(t, S.traceModel, hits);
+  if (host.firstElementChild?.dataset.trace === v.id) {
+    host.firstElementChild.classList.toggle("has-detail", !!pick);
+    $("tr-tools").innerHTML = traceToolbar(t); $("tr-lanes").innerHTML = lanes; $("tr-list").innerHTML = list;
+    // 详情只在换了选中的那一条或那一页时重建，否则读到一半的滚动位置会跳回顶
+    const d = $("tr-detail"), key = `${pick?.id || ""}|${S.traceTab}`;
+    if (d.dataset.key !== key || pick?.live) { const keep = d.dataset.key === key ? $("td-body")?.scrollTop : 0; d.innerHTML = traceDetail(t, pick); d.dataset.key = key; if (keep && $("td-body")) $("td-body").scrollTop = keep; }
+    return;
+  }
+  host.innerHTML = `<div class="trace${pick ? " has-detail" : ""}" data-trace="${v.id}">
+    <div class="tr-bar-top"><div class="tr-tools" id="tr-tools" role="toolbar" aria-label="轨迹工具栏">${traceToolbar(t)}</div>
+      <label class="tr-search">${icon("search")}<span class="visually-hidden">搜索轨迹</span><input id="trace-q" type="search" placeholder="搜索" value="${esc(S.traceQuery)}"></label></div>
+    <div id="tr-lanes">${lanes}</div>
+    <div class="tr-split"><div class="tr-list" id="tr-list">${list}</div><aside class="tr-detail" id="tr-detail" data-key="${pick?.id || ""}|${S.traceTab}" aria-label="事件详情">${traceDetail(t, pick)}</aside></div>
+  </div>`;
+}
+// 概览上的指针：点一格选那条记录；拖过一段设成聚焦区间；点空白清掉区间
+function trackAt(ev) {
+  const box = $("tr-track").getBoundingClientRect(), m = S.traceModel;
+  const f = Math.min(1, Math.max(0, (ev.clientX - box.left) / box.width));
+  return m.start + f * (m.end - m.start);
+}
+let traceDrag = null;
+document.addEventListener("pointerdown", (ev) => {
+  const track = ev.target.closest?.("#tr-track");
+  if (!track || ev.button !== 0) return;
+  traceDrag = { x: ev.clientX, at: trackAt(ev), span: ev.target.closest("[data-span]")?.dataset.span || null };
+  track.setPointerCapture(ev.pointerId);
+});
+document.addEventListener("pointermove", (ev) => {
+  if (!traceDrag || Math.abs(ev.clientX - traceDrag.x) < 4) return;
+  const at = trackAt(ev);
+  S.traceRange = [Math.min(traceDrag.at, at), Math.max(traceDrag.at, at)];
+  $("tr-lanes").innerHTML = traceLanes(traceOf(S.view), S.traceModel, searchHits(traceOf(S.view)));
+});
+document.addEventListener("pointerup", (ev) => {
+  if (!traceDrag) return;
+  const d = traceDrag; traceDrag = null;
+  if (Math.abs(ev.clientX - d.x) < 4) {
+    if (d.span) { S.traceHi = d.span; requestAnimationFrame(() => requestAnimationFrame(() => document.getElementById(`tr-${d.span}`)?.scrollIntoView({ block: "nearest", behavior: "smooth" }))); }
+    else S.traceRange = null;
+  }
+  render();
+});
+
 function renderThread() {
   const v = S.view;
   const host = $("transcript");
+  host.classList.toggle("wide", S.tab === "trace");
+  document.querySelectorAll("[data-tab]").forEach((b) => b.setAttribute("aria-selected", b.dataset.tab === S.tab));
   if (S.boot === "error") {
     host.innerHTML = `<div class="state-box"><p>连不上 Gateway：${esc(S.bootError)}。${S.lastGood ? `上次正常是 ${clock(S.lastGood)}。` : ""}</p><p class="muted">确认 Gateway 在跑（<code>komo gateway status</code>），再重试。</p><button class="text-btn" data-retry-boot>重试</button></div>`;
     return;
@@ -712,6 +1134,7 @@ function renderThread() {
     host.innerHTML = `<div class="state-box"><p>这段对话没取到：${esc(v.error)}。</p><button class="text-btn" data-retry-session>重试</button></div>`;
     return;
   }
+  if (S.tab === "trace") { renderTrace(host, v); return; }
   const body = v.items
     .map((it) => {
       if (it.kind === "turn") return turnView(it, v);
@@ -2381,6 +2804,39 @@ document.addEventListener("click", (ev) => {
     S.open.add(open ? `${id}:closed` : id);
     render(); return;
   }
+  // 对话里一次调用的"查看"：切到轨迹，选中这条，详情开在概述
+  const inspect = t.closest("[data-inspect]");
+  if (inspect) {
+    S.tab = "trace"; S.traceHi = inspect.dataset.inspect; S.traceTab = "overview"; S.traceRange = null; render();
+    requestAnimationFrame(() => requestAnimationFrame(() => document.getElementById(`tr-${S.traceHi}`)?.scrollIntoView({ block: "center" })));
+    return;
+  }
+  const tab = t.closest("[data-tab]");
+  if (tab) { S.tab = tab.dataset.tab; S.traceHi = null; render({ force: S.tab === "chat" }); return; }
+  // 轨迹：选中一条、关详情、工具栏、收起轮次 / 调用、切详情页
+  const pick = t.closest("[data-trace-pick]");
+  if (pick) {
+    const id = pick.dataset.tracePick, jumped = !pick.closest(".tr-list");
+    S.traceHi = id; if (jumped) S.traceTab = "overview"; render();
+    if (jumped) requestAnimationFrame(() => requestAnimationFrame(() => document.getElementById(`tr-${id}`)?.scrollIntoView({ block: "nearest", behavior: "smooth" })));
+    return;
+  }
+  if (t.closest("[data-trace-close]")) { S.traceHi = null; render(); return; }
+  if (t.closest("[data-trace-clear]")) { S.traceRange = null; render(); return; }
+  const tool = t.closest("[data-trace-tool]");
+  if (tool && S.view) {
+    const k = tool.dataset.traceTool, tr = traceOf(S.view);
+    if (k === "duration") { S.traceDuration = !S.traceDuration; S.traceRange = null; }
+    if (k === "turns") { const all = [...tr.runs.values()].map((r) => r.n); const closeAll = !all.every((n) => S.traceTurnsClosed.has(n)); S.traceTurnsClosed = new Set(closeAll ? all : []); }
+    if (k === "calls") { const all = tr.rows.filter((r) => r.kind === "model" && r.calls.length).map((r) => r.id); const closeAll = !all.every((id) => S.traceCallsClosed.has(id)); S.traceCallsClosed = new Set(closeAll ? all : []); }
+    render(); return;
+  }
+  const turnFold = t.closest("[data-trace-turn]");
+  if (turnFold) { const n = Number(turnFold.dataset.traceTurn); S.traceTurnsClosed.has(n) ? S.traceTurnsClosed.delete(n) : S.traceTurnsClosed.add(n); render(); return; }
+  const callFold = t.closest("[data-trace-fold]");
+  if (callFold) { const id = callFold.dataset.traceFold; S.traceCallsClosed.has(id) ? S.traceCallsClosed.delete(id) : S.traceCallsClosed.add(id); render(); return; }
+  const tdTab = t.closest("[data-td-tab]");
+  if (tdTab) { S.traceTab = tdTab.dataset.tdTab; render(); return; }
   const copy = t.closest("[data-copy]");
   if (copy) { navigator.clipboard?.writeText(copy.dataset.copy); copy.classList.add("done"); setTimeout(() => copy.classList.remove("done"), 1200); return; }
   if (t.closest("#fork")) { forkSession(); return; }
@@ -2542,6 +2998,19 @@ document.addEventListener("input", (ev) => {
   const q = ev.target.value.toLowerCase();
   if (S.pg.settings.edit) S.pg.settings.edit.filter = ev.target.value;
   document.querySelectorAll(".fchip").forEach((c) => { c.hidden = !c.dataset.id.toLowerCase().includes(q); });
+});
+// 轨迹：Esc 先清掉概览上的区间，再关详情；双击概览也清区间
+document.addEventListener("keydown", (ev) => {
+  if (ev.key !== "Escape" || S.tab !== "trace" || S.page !== "session" || S.sessMenu || $("settings").open) return;
+  if (S.traceRange) S.traceRange = null; else if (S.traceHi) S.traceHi = null; else return;
+  render();
+});
+document.addEventListener("dblclick", (ev) => { if (ev.target.closest?.("#tr-track")) { S.traceRange = null; render(); } });
+// 轨迹搜索只换列表，搜索框不重建
+document.addEventListener("input", (ev) => {
+  if (ev.target.id !== "trace-q" || !S.view) return;
+  S.traceQuery = ev.target.value;
+  renderTrace($("transcript"), S.view);
 });
 $("pal-input").addEventListener("input", (ev) => { S.pal.q = ev.target.value.trim(); S.pal.sel = 0; palSearchMemories(); renderPalette(); });
 $("pal-input").addEventListener("keydown", (ev) => {

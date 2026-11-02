@@ -1,0 +1,89 @@
+@import "tailwindcss";
+
+/* DESIGN.md 的 token 原样搬进 Tailwind v4 的 @theme：颜色、圆角、字体、字号与阴影都是 CSS 变量，
+   视觉与 apps/web 原型一致，不在这里另起一套。叶绿（accent）只表示"在场"与"运行中"。 */
+@theme {
+  --color-ground: #f2f3ef;
+  --color-surface: #ffffff;
+  --color-raised: #f1f2ee;
+  --color-active: #e3e6de;
+  --color-hover: #e9ebe5;
+  --color-hover-on-white: #f3f4f0;
+  --color-border: #e4e6df;
+  --color-rule: #eef0ea;
+  --color-control: #d3d7cc;
+  --color-text: #22281c;
+  --color-muted: #565d4e;
+  --color-faint: #636a5a;
+  --color-primary: #20251b;
+  --color-primary-hover: #343b2c;
+  --color-accent: #4f6b38;
+  --color-accent-pale: #e7eedd;
+  --color-negative: #b3261e;
+  --color-negative-pale: #fdf1f0;
+  --color-negative-ring: #f1c9c5;
+  --color-pill-bg: #eef0ea;
+  --color-pill-ink: #3f4637;
+  --color-pill-wait-bg: #fbf3d6;
+  --color-pill-wait-ink: #6b4f0a;
+  --color-pill-bad-bg: #fdecea;
+  --color-pill-bad-ink: #8a1c15;
+  --color-wait-dot: #c98a12;
+  --color-memory-off: #a9ae9f;
+  --color-focus: hsl(212 100% 48%);
+
+  --radius-xs: 4px;
+  --radius-sm: 6px;
+  --radius-control: 8px;
+  --radius-inner: 10px;
+  --radius-card: 12px;
+  --radius-dialog: 16px;
+
+  --font-sans: "Noto Sans", "Noto Sans SC", "PingFang SC", system-ui, sans-serif;
+  --font-mono: "Geist Mono", "Noto Sans Mono", ui-monospace, monospace;
+
+  --text-page-title: 24px;
+  --text-page-title--line-height: 32px;
+  --text-dialog-title: 18px;
+  --text-dialog-title--line-height: 26px;
+  --text-section-title: 16px;
+  --text-section-title--line-height: 24px;
+  --text-read: 15px;
+  --text-read--line-height: 26px;
+  --text-body: 14px;
+  --text-body--line-height: 20px;
+  --text-label: 13px;
+  --text-label--line-height: 20px;
+  --text-small: 12px;
+  --text-small--line-height: 18px;
+
+  /* 边线画在阴影层：1px 零模糊的环，透明度随底色走（原型的 --ring / --lift） */
+  --shadow-ring: 0 0 0 1px rgb(34 40 28 / 0.12);
+  --shadow-ring-control: 0 0 0 1px rgb(34 40 28 / 0.2);
+  --shadow-lift: 0 0 0 1px rgb(34 40 28 / 0.12), 0 2px 2px rgb(34 40 28 / 0.04);
+
+  --ease-out-expo: cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+@layer base {
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+  body {
+    margin: 0;
+    background: var(--color-surface);
+    color: var(--color-text);
+    font-family: var(--font-sans);
+    font-size: var(--text-body);
+    line-height: var(--text-body--line-height);
+    -webkit-font-smoothing: antialiased;
+    text-autospace: ideograph-alpha ideograph-numeric;
+  }
+  :focus-visible {
+    outline: 2px solid var(--color-focus);
+    outline-offset: 2px;
+    border-radius: 4px;
+  }
+}

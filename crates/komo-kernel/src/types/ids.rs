@@ -29,6 +29,7 @@ macro_rules! id_type {
     ($(#[$meta:meta])* $name:ident) => {
         $(#[$meta])*
         #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+        #[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(type = "string"))]
         #[serde(transparent)]
         pub struct $name(String);
 
@@ -131,6 +132,7 @@ id_type!(
 ///
 /// 它不是 UUID，所以没有 `new_at`：值由已有的事实派生出来。
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(type = "string"))]
 #[serde(transparent)]
 pub struct InterventionId(String);
 
@@ -175,6 +177,7 @@ impl FromStr for InterventionId {
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default,
 )]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(type = "number"))]
 #[serde(transparent)]
 pub struct Seq(pub u64);
 

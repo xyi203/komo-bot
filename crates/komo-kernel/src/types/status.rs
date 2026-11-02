@@ -34,6 +34,7 @@ use super::ids::{EventId, InterventionId, RunId};
 ///                Queued
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum RunState {
     /// 已受理：请求键预留了 Run ID，输入正文**可能还没写完**（§8.5）。**不可领取**——
@@ -138,6 +139,7 @@ impl RunState {
 /// 删会话今天等于 `rm -rf sessions/{id}`：数据库那一行还在、未完成的 Run 还在队列里、
 /// 下一轮模型请求带着空上下文就跑起来了，而操作者手上没有任何一条命令能做对这件事。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum SessionState {
     /// 默认。接受新输入，Run 正常排队。
@@ -240,6 +242,7 @@ impl AttemptState {
 /// 枚举。这样"哪些 Run 在等人"、"哪些 Run 到点了"都是普通查询，reconcile、CLI 与
 /// `/v1/interventions` 都不必反序列化一堆状态才能问出一句话。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum WaitReason {
     /// **不再产生**：审批在 2026-10-11 删掉了，这个变体只为解码删之前落盘的
@@ -262,6 +265,7 @@ pub enum WaitReason {
         /// 已经用掉的次数。**重启不重置预算**（§8.5）。
         attempts: u32,
         #[serde(with = "time::serde::rfc3339")]
+        #[cfg_attr(feature = "ts", ts(type = "string"))]
         not_before: OffsetDateTime,
         cause: RetryCause,
     },
@@ -280,6 +284,7 @@ pub enum WaitReason {
 /// 数据库写争用（退避几毫秒就够），而"服务端 5xx"要退得比它久。三者混成一个数字，就
 /// 只能取最保守的那个，每次 429 都白等。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum RetryCause {
     /// 服务端限流（429 / `Retry-After`）。

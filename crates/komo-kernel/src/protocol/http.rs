@@ -9,6 +9,8 @@
 //!
 //! | 端点 | 请求体 | 响应体 |
 //! |---|---|---|
+//! | `POST /v1/web/pair-code` | — | [`PairCodeResponse`] |
+//! | `POST /v1/web/session` | [`PairRequest`] | `{}` + `Set-Cookie` |
 //! | `POST /v1/sessions` | [`CreateSessionRequest`] | [`SessionSummary`] |
 //! | `POST /v1/sessions/{id}/boundary` | [`BoundaryRequest`] | [`BoundaryResponse`] |
 //! | `POST /v1/cron` | [`CreateCronRequest`] | [`CronJob`] |
@@ -71,11 +73,13 @@ use crate::types::status::{RunState, SessionState, WaitReason};
 
 /// 统一错误体。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct ErrorBody {
     pub error: ApiError,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct ApiError {
     pub code: ErrorCode,
     pub message: String,
@@ -95,6 +99,7 @@ impl ApiError {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum ErrorCode {
     NotFound,
@@ -121,11 +126,13 @@ pub enum ErrorCode {
 // ---- GET /healthz ----
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct HealthResponse {
     /// 实例身份。**不能只凭 PID 或端口判断**（§3）。
     pub instance_id: String,
     pub version: String,
     pub protocol_version: u32,
+    #[cfg_attr(feature = "ts", ts(type = "string"))]
     #[serde(with = "time::serde::rfc3339")]
     pub started_at: OffsetDateTime,
     pub data_dir: String,
@@ -136,13 +143,34 @@ pub struct HealthResponse {
 
 /// OTLP 导出的现状：端点与最近一次导出的结果。`endpoint = None` = 没配，不上报。
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct TelemetryHealth {
     pub endpoint: Option<String>,
+    #[cfg_attr(feature = "ts", ts(type = "string | null"))]
     #[serde(default, with = "time::serde::rfc3339::option")]
     pub last_ok_at: Option<OffsetDateTime>,
+    #[cfg_attr(feature = "ts", ts(type = "string | null"))]
     #[serde(default, with = "time::serde::rfc3339::option")]
     pub last_error_at: Option<OffsetDateTime>,
     pub last_error: Option<String>,
+}
+
+// ---- /v1/web/*：浏览器配对（docs/clients.md D6） ----
+
+/// `POST /v1/web/pair-code`（只认 Bearer）的响应：一次性配对码。只在 Gateway 内存里，用一次作废。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct PairCodeResponse {
+    pub code: String,
+    /// 多少秒后失效。
+    pub expires_in_secs: u32,
+}
+
+/// `POST /v1/web/session` 的请求体：用配对码换会话 cookie（`Set-Cookie`，响应体为空对象）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct PairRequest {
+    pub code: String,
 }
 
 // ---- /v1/sessions ----
@@ -158,6 +186,8 @@ pub struct CreateSessionRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(optional_fields))]
 pub struct SessionSummary {
     pub session: SessionId,
     pub title: String,
@@ -175,8 +205,10 @@ pub struct SessionSummary {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current_wait: Option<WaitReason>,
     pub applied_seq: Seq,
+    #[cfg_attr(feature = "ts", ts(type = "string"))]
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
+    #[cfg_attr(feature = "ts", ts(type = "string"))]
     #[serde(with = "time::serde::rfc3339")]
     pub updated_at: OffsetDateTime,
     /// 会话用途：`main` / `normal` / `task`（`docs/background-tasks.md`）。
@@ -212,6 +244,7 @@ pub struct SessionListQuery {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct SessionListResponse {
     pub sessions: Vec<SessionSummary>,
 }
@@ -377,6 +410,7 @@ pub struct ReconcileResponse {
 // ---- GET /v1/sessions/{id}/events ----
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct EventQuery {
     /// 从哪个游标读起（不含）。
     #[serde(default)]
@@ -386,8 +420,10 @@ pub struct EventQuery {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct EventPage {
     pub session: SessionId,
+    #[cfg_attr(feature = "ts", ts(type = "Array<import('./WireEvent').WireEvent>"))]
     pub events: Vec<crate::events::Event>,
     pub next: Seq,
     #[serde(default)]

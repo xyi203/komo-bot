@@ -108,6 +108,10 @@ tar = "0.4"
 grep = { version = "0.4", default-features = false }
 ignore = { version = "0.4", default-features = false }
 
+# §13.4：仅 komo-kernel 的 `ts` feature（默认关）：协议类型 → TypeScript，生成物提交在
+# `packages/protocol`（docs/clients.md D3）。只开 serde 属性兼容，不开 chrono / uuid 等类型适配。
+ts-rs = { version = "12.0.1", default-features = false, features = ["serde-compat", "no-serde-warnings"] }
+
 # §3 配置热重载：进程内唯一的 Arc<ConfigSnapshot> 原子替换。
 arc-swap = "1.9.2"
 

@@ -230,6 +230,30 @@ if [ "$(uname -s)" = Darwin ]; then
 else
   run_install_cmd mv -fT "${plugin_root}/${plugin_version}.new-$$" "${plugin_root}/${plugin_version}"
 fi
+# 网页壳（docs/clients.md D5）：`web/` 是个符号链接，指向 komo-web/<代次>/；整个换掉靠
+# 一次 rename，Gateway 读到的永远是完整的一份。旧版本的发布包没有 web/，那就不动现有的。
+if tar -tzf "${TMP_DIR}/${ASSET}" | grep -q '^web/'; then
+    mkdir -p "${TMP_DIR}/extract-web"
+    tar -xzf "${TMP_DIR}/${ASSET}" -C "${TMP_DIR}/extract-web" web
+    web_generation="${plugin_version}-install-$$"
+    web_root="${INSTALL_DIR}/komo-web"
+    run_install_cmd mkdir -p "$web_root"
+    run_install_cmd cp -R "${TMP_DIR}/extract-web/web" "${web_root}/${web_generation}"
+    run_install_cmd ln -s "komo-web/${web_generation}" "${INSTALL_DIR}/web.new-$$"
+    if [ -d "${INSTALL_DIR}/web" ] && [ ! -L "${INSTALL_DIR}/web" ]; then
+        error "${INSTALL_DIR}/web 是个真目录，不是 komo 装的符号链接——先把它挪走再装"
+        exit 1
+    fi
+    previous_web="$(readlink "${INSTALL_DIR}/web" 2>/dev/null || true)"
+    if [ "$(uname -s)" = Darwin ]; then
+      run_install_cmd mv -fh "${INSTALL_DIR}/web.new-$$" "${INSTALL_DIR}/web"
+    else
+      run_install_cmd mv -fT "${INSTALL_DIR}/web.new-$$" "${INSTALL_DIR}/web"
+    fi
+    case "$previous_web" in
+        komo-web/*) run_install_cmd rm -rf "${INSTALL_DIR}/${previous_web}" ;;
+    esac
+fi
 # Plugins are ready before the atomic main-binary replacement; old versions keep their set.
 run_install_cmd cp "${TMP_DIR}/komo" "${INSTALL_DIR}/komo.new"
 run_install_cmd chmod +x "${INSTALL_DIR}/komo.new"

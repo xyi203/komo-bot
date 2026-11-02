@@ -1,0 +1,16 @@
+{
+  "name": "@komo/protocol",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Gateway 协议类型。src/generated 由 `cargo test -p komo-kernel --features ts` 生成（KOMO_UPDATE_TS=1 重新生成），不要手改。",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "typescript": "5.9.3"
+  }
+}

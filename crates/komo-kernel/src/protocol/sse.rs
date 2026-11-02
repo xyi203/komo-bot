@@ -14,6 +14,7 @@ use crate::types::status::RunState;
 
 /// 一帧 SSE。`id` 就是 Session 内的 seq——游标和序号是同一个数，不再发明第二套。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct SseFrame {
     /// SSE 的 `id:`。
     pub id: Seq,
@@ -24,10 +25,11 @@ pub struct SseFrame {
 
 /// SSE 的 `event:` 与它的负载。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(tag = "event", content = "data", rename_all = "snake_case")]
 pub enum SseEvent {
     /// 一条已经同步且索引完成的 JSONL 事件（§8.8）。
-    Event(Box<Event>),
+    Event(#[cfg_attr(feature = "ts", ts(type = "import('./WireEvent').WireEvent"))] Box<Event>),
     /// 模型正在打字。
     ///
     /// **只在 SSE 上，永不进 JSONL。**§8.3：「工具输出先独立持久化，再一次提交对应结果
@@ -53,6 +55,7 @@ pub enum SseEvent {
     NestedCalls {
         run: RunId,
         call: ToolCallId,
+        #[cfg_attr(feature = "ts", ts(type = "Array<unknown>"))]
         calls: Vec<NestedCallView>,
     },
     /// 心跳。只为让代理不掐连接，不带任何状态。

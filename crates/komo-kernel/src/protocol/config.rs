@@ -32,6 +32,7 @@ use crate::types::model::{EmbeddingConfig, ModelCatalog, ModelConfig};
 
 /// 一个配置键的路径，例如 `channels.feishu.allow_from`。**只有键名，没有值。**
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(type = "string"))]
 #[serde(transparent)]
 pub struct KeyPath(String);
 
@@ -73,6 +74,12 @@ pub struct StartOnly {
     /// `[telemetry] otlp_endpoint`：OTLP/HTTP 端点。`None` = 不上报（docs/observability.md §4）。
     #[serde(default)]
     pub otlp_endpoint: Option<String>,
+    /// `[web] dir`：网页壳的静态文件目录（`docs/clients.md` D5）。`None` = 没配，Gateway 退到二进制旁的 `web/`。
+    #[serde(default)]
+    pub web_dir: Option<PathBuf>,
+    /// `[gateway] trusted_hosts`：除回环与监听地址外还接受哪些 `Host`（经反向代理 / 隧道访问时填域名）。
+    #[serde(default)]
+    pub trusted_hosts: Vec<String>,
 }
 
 /// 一个 MCP 服务器（`docs/mcp.md`）。凭证不在这里：`env` / `bearer_token_env` 写的是
@@ -873,6 +880,8 @@ mod tests {
                 listen: "127.0.0.1:7777".into(),
                 db_path: PathBuf::from("/home/u/.komo/state.db"),
                 otlp_endpoint: None,
+                web_dir: None,
+                trusted_hosts: vec![],
             },
             model_catalog: ModelCatalog::default(),
             model: model("chat-a"),
@@ -972,6 +981,22 @@ mod tests {
             vec![KeyPath::new("start_only.listen")]
         );
         assert_eq!(before.diff(&after).len(), 2, "其余部分照常报告");
+    }
+
+    /// 网页壳目录与受信任的 Host 只在启动时生效（`docs/clients.md` D5、D6）：重载报告要说出来。
+    #[test]
+    fn web_dir_and_trusted_hosts_are_start_only() {
+        let before = snapshot();
+        let mut after = snapshot();
+        after.start_only.web_dir = Some(PathBuf::from("/srv/komo/web"));
+        after.start_only.trusted_hosts = vec!["komo.example.com".into()];
+        assert_eq!(
+            before.start_only_changes(&after),
+            vec![
+                KeyPath::new("start_only.trusted_hosts"),
+                KeyPath::new("start_only.web_dir")
+            ]
+        );
     }
 
     /// MCP 服务器热重载就生效（`docs/mcp.md` §2.2）：差异键是 `mcp`（从无到有、从有到无）或

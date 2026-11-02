@@ -726,6 +726,22 @@ pub async fn mcp_reconnect(client: &KomoClient, servers: Vec<String>) -> Outcome
     Ok(render::mcp_reconnect(&response))
 }
 
+/// 用系统默认浏览器打开链接；起不来返回 `false`（调用方照样把链接印出来）。
+pub fn open_in_browser(url: &str) -> bool {
+    let opener = if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    };
+    std::process::Command::new(opener)
+        .arg(url)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .is_ok()
+}
+
 pub async fn doctor(home: &Path, reconcile: bool) -> Outcome {
     let client = match crate::connect::connect(home).await {
         Ok(client) => client,

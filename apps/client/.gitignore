@@ -1,0 +1,3 @@
+# Paraglide 编译产物：`pnpm build` / `pnpm typecheck` 前自动生成
+/src/paraglide
+/project.inlang/cache

@@ -4,7 +4,8 @@
 //! 模块之间再发 HTTP。」——所以这一层很薄：请求体 / 响应体就是 kernel 的协议类型，
 //! 真正的动作在 [`GatewayState`] 上，聊天渠道调的是同一批函数（§13.1 最后一段）。
 //!
-//! **除 `GET /healthz` 外统一认证**，由 [`crate::auth`] 的 layer 一次性挡住。
+//! **除 `GET /healthz`、配对换 cookie 与静态文件外统一认证**，由 [`crate::auth`] 的 layer 一次性挡住；
+//! 所有路由之外还有一层 Host 校验（[`crate::web::host_guard`]）。
 
 pub mod channels;
 pub mod config;
@@ -16,6 +17,7 @@ pub mod mcp;
 pub mod memories;
 pub mod v2;
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::Json;
@@ -25,6 +27,7 @@ use komo_kernel::protocol::PROTOCOL_VERSION;
 use komo_kernel::protocol::http::{HealthResponse, SessionSummary};
 
 use crate::service::state::GatewayState;
+use crate::web::{self, WebAuth};
 
 use idempotency::Idempotency;
 
@@ -33,6 +36,8 @@ use idempotency::Idempotency;
 pub struct Api {
     pub state: Arc<GatewayState>,
     pub idempotency: Arc<Idempotency>,
+    /// 配对码 / 会话 cookie / Host 策略 / 静态目录（`docs/clients.md` D5、D6）。
+    pub web: Arc<WebAuth>,
 }
 
 impl std::fmt::Debug for Api {
@@ -42,10 +47,23 @@ impl std::fmt::Debug for Api {
 }
 
 impl Api {
-    pub fn new(state: Arc<GatewayState>) -> Self {
+    /// `listen` 是**实际绑定**的地址（端口 0 绑出来的也算），Host 校验放行它。
+    pub fn new(state: Arc<GatewayState>, listen: SocketAddr) -> Self {
+        let snapshot = state.snapshot();
+        let web_dir = snapshot
+            .start_only
+            .web_dir
+            .clone()
+            .or_else(crate::web::default_web_dir);
+        let web = Arc::new(WebAuth::new(
+            listen,
+            &snapshot.start_only.trusted_hosts,
+            web_dir,
+        ));
         Api {
             state,
             idempotency: Arc::new(Idempotency::new()),
+            web,
         }
     }
 }
@@ -56,13 +74,29 @@ impl Api {
 /// 会话、run、树、事件、cron、intervention、导出在 [`v2::routes`]（路径与协议类型不变，handler
 /// 读写 `durable.db`）；memories、config、models、mcp、healthz 在这里。
 pub fn router(api: Api) -> Router {
-    let token = api.state.token.clone();
-    let open = Router::new().route("/healthz", get(healthz));
+    let auth = crate::auth::AuthState {
+        token: api.state.token.clone(),
+        web: Arc::clone(&api.web),
+    };
+    let hosts = Arc::clone(&api.web);
+    // 配对换 cookie 不需要别的鉴权（码本身就是凭据）；申请配对码要 Bearer（在 handler 里核对）。
+    let open = Router::new()
+        .route("/healthz", get(healthz))
+        .route("/v1/web/session", post(web::open_session));
     let guarded = shared_routes()
         .merge(v2::routes())
-        .layer(crate::auth::bearer(token));
+        .route("/v1/web/pair-code", post(web::pair_code))
+        .layer(axum::middleware::from_fn_with_state(
+            auth,
+            crate::auth::check,
+        ));
 
-    open.merge(guarded).with_state(api)
+    // 其余路径是网页壳的静态文件（`/v1/*` 在 fallback 里回 JSON 404）。Host 校验在最外层，
+    // 连静态文件与 /healthz 一起挡。
+    open.merge(guarded)
+        .fallback(web::fallback)
+        .with_state(api)
+        .layer(axum::middleware::from_fn_with_state(hosts, web::host_guard))
 }
 
 /// memories、matters、config、models、mcp 这几组路由（handler 在本目录，不碰存储模型）。
@@ -139,6 +173,29 @@ pub async fn fetch_home_session(
 ) -> Result<SessionSummary, String> {
     let mut request = reqwest::Client::new().get(format!(
         "{}/v1/home-session",
+        base_url.trim_end_matches('/')
+    ));
+    if let Some(token) = token {
+        request = request.bearer_auth(token);
+    }
+    let response = request.send().await.map_err(|error| error.to_string())?;
+    let status = response.status();
+    let body = response.text().await.map_err(|error| error.to_string())?;
+    if !status.is_success() {
+        return Err(format!("{status}：{body}"));
+    }
+    serde_json::from_str(&body).map_err(|error| format!("{error}（{body}）"))
+}
+
+/// `POST /v1/web/pair-code`，从进程外面要一个浏览器配对码（`komo web` 用它）。
+///
+/// 同 [`fetch_home_session`]：这个端点不在 `komo-client` 按 §13.1 写的接口表里，给一个最小调用。
+pub async fn request_pair_code(
+    base_url: &str,
+    token: Option<&str>,
+) -> Result<komo_kernel::protocol::http::PairCodeResponse, String> {
+    let mut request = reqwest::Client::new().post(format!(
+        "{}/v1/web/pair-code",
         base_url.trim_end_matches('/')
     ));
     if let Some(token) = token {

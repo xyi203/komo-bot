@@ -80,6 +80,8 @@ pub fn snapshot_fixture() -> ConfigSnapshot {
             listen: "127.0.0.1:7777".into(),
             db_path: home.join("state.db"),
             otlp_endpoint: None,
+            web_dir: None,
+            trusted_hosts: vec![],
         },
         model_catalog,
         model: main,

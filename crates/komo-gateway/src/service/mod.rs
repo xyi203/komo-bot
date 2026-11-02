@@ -297,7 +297,7 @@ pub async fn start(options: ServiceOptions) -> Result<Running, ServiceError> {
     // 投递是 3 秒，几百条能拖过客户端 60 秒的就绪超时（§11.4 的补发等得起：投递记录先
     // 写后发，按 `DeliveryId` 幂等，晚几十毫秒没有代价）。
     state.supervisor.start_all(&state).await;
-    let app = crate::http::router(Api::new(Arc::clone(&state)));
+    let app = crate::http::router(Api::new(Arc::clone(&state), addr));
     let serving = shutdown.clone();
     tokio::spawn(async move {
         let graceful = axum::serve(listener, app).with_graceful_shutdown(async move {

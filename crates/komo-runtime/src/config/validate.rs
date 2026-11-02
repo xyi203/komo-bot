@@ -131,6 +131,23 @@ fn check_start_only(snapshot: &ConfigSnapshot, issues: &mut Vec<ConfigIssue>) {
             ));
         }
     }
+    for host in &snapshot.start_only.trusted_hosts {
+        if host.contains("://") || host.contains('/') || host.chars().any(char::is_whitespace) {
+            issues.push(error(
+                "start_only.trusted_hosts",
+                format!("`{host}` 要写成主机名（可带端口），不带协议与路径，如 komo.example.com"),
+            ));
+        }
+    }
+    if let Some(dir) = &snapshot.start_only.web_dir
+        && !dir.is_dir()
+    {
+        // 没有目录只是没有网页，不拦 Gateway 启动。
+        issues.push(warning(
+            "start_only.web_dir",
+            format!("`{}` 不是目录：Gateway 不提供网页", dir.display()),
+        ));
+    }
     if !snapshot.start_only.data_dir.is_absolute() {
         issues.push(error(
             "start_only.data_dir",
@@ -926,6 +943,28 @@ mod tests {
                 "model.chat.effort",
                 "start_only.listen"
             ]
+        );
+    }
+
+    #[test]
+    fn a_trusted_host_with_a_scheme_is_refused() {
+        let mut snapshot = snapshot_fixture();
+        snapshot.start_only.trusted_hosts = vec!["komo.example.com:8443".into()];
+        assert!(keys(&validate(&snapshot)).is_empty());
+        snapshot.start_only.trusted_hosts = vec!["https://komo.example.com".into()];
+        assert_eq!(keys(&validate(&snapshot)), vec!["start_only.trusted_hosts"]);
+    }
+
+    #[test]
+    fn a_missing_web_dir_is_only_a_warning() {
+        let mut snapshot = snapshot_fixture();
+        snapshot.start_only.web_dir = Some("/nonexistent/komo/web".into());
+        let issues = validate(&snapshot);
+        assert_eq!(keys(&issues), vec!["start_only.web_dir"]);
+        assert!(
+            issues
+                .iter()
+                .all(|issue| issue.severity == IssueSeverity::Warning)
         );
     }
 

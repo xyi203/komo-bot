@@ -82,6 +82,7 @@ Gateway 持有模型连接、数据库与提交线、工具环境、运行状态
 | -------------------------------------------- | --------------------------------------------------------------------------- |
 | `komo`                                       | 确保本机 Gateway 就绪，进入 TUI 聊天。**会话在第一条消息送出之前才创建**——空跑一眼就退出，不在库和磁盘上留下空壳 |
 | `komo resume SESSION_ID`                     | 连接原会话并查看进度或处理待办；恢复调度由 Gateway 自动进行，不重复创建 Run |
+| `komo web [--no-open]`                       | 在浏览器里打开网页版（`docs/clients.md`）：经 Bearer 向 Gateway 要一个一次性配对码（`POST /v1/web/pair-code`，只在内存、两分钟失效、用一次作废），打开 `http://<Gateway>/pair#code=<码>`（码在 fragment 里，不进服务器日志），网页把码 POST 回去换 `HttpOnly; SameSite=Strict` 的会话 cookie。`--no-open` 只打印链接。会话 cookie 只在 Gateway 内存里，**Gateway 重启后要重新运行**。需要 Gateway 在跑（同 `komo`，没起就拉起） |
 | `komo session list`                          | 查看会话列表和状态；`--all` 才列出已逻辑删除的会话（§8.10）                  |
 | `komo session search 关键词 [--limit N]`         | 跨会话找回：在会话标题与正文里找，给会话、片段与能接着查的 ID（§8.11「跨会话找回」） |
 | `komo monitor list [--all]`                   | 监听清单（`monitor` 挂的与转后台的 bash）：短号、已跑多久、距截止、标题、挂它的会话、脚本；只读（`docs/monitor.md`） |
@@ -136,7 +137,7 @@ Gateway 对数据目录持有进程锁。多个 CLI 同时启动时，只允许�
    **不认识的键不算错**（2026-09-24）：`config.toml` 里多出来的键——升级后留下的退役键、拼错的键、写到了别的表下面的键（`default_agent` 落进前一个 `[agents.x]` 是最常见的一种）——被忽略，配置照常装上，但每一个都以完整路径（如 `gateway.listen_typo`）作为**警告**出现在 `komo config check`、`komo doctor` 与重载日志里。键认识、值的类型不对仍然是错误。
 2. 校验通过 → 原子替换进程内唯一的 `Arc<ConfigSnapshot>`（arc-swap）。**读配置的地方按用途读当前快照，不缓存**：Dispatcher 判定 Principal 时读 `allow_from` / `allow_tenant`，Notifier 解析 home chat 时读 `home_chat`，每个阶段（每次模型请求、每次工具调用）按当前快照解析 Agent / 模型 / effort（§6.2）——所以名单改完，下一条消息就按新名单判；模型改完，下一次请求用新模型，**已经开始的请求（checkpoint 里冻结的模型与 effort）与进行中的后台记忆任务继续用它们各自开始时抓的快照**（§13.3），不在半路换模型。
 3. 逐段比对新旧快照，只重建变化了的东西：某个 `[channels.*]` 的 `enabled` 或凭证变了 → 只停掉并重启那个渠道的 `serve`（飞书重连 ws、Telegram 重新起轮询），其他渠道不受影响，未 ack 的入站消息按平台的至少一次投递重来；模型 `base_url` / 凭证变了 → 换掉对应 `LlmClient` 实例；向量模型变了 → 走 §9.5 的空间指纹与索引代次流程，不在重载里偷偷重建索引。
-4. 一小组键**只在启动时生效**：数据目录 / `KOMO_HOME`、监听地址与端口、数据库路径。这些键改了，重载照常完成其余部分，然后明确报告"以下键需要 `komo gateway restart`"，不静默忽略，也不假装已生效。
+4. 一小组键**只在启动时生效**：数据目录 / `KOMO_HOME`、监听地址与端口、数据库路径、`[web] dir`、`[gateway] trusted_hosts`。这些键改了，重载照常完成其余部分，然后明确报告"以下键需要 `komo gateway restart`"，不静默忽略，也不假装已生效。
 
 重载事件带新旧快照的差异（键名，不带值，凭证更不带）写进 Gateway 日志；`komo doctor` 显示当前生效配置的加载时间与来源文件 mtime，两者不一致就是"文件改了但没装上"，把上一次校验错误一并印出来。
 
@@ -1121,8 +1122,14 @@ CLI 通过 HTTP 发命令，通过 SSE 观察运行。Gateway 内部采用函数
 | GET /v1/channels                 | 每个配置里的渠道：配置摘要加插件进程的运行状态（在跑 / 重试中 / 起不来 / 未启用）、进入时间、退出原因与重建次数（§3「Web 看渠道状态」） |
 | POST /v1/channels/{id}/probe     | 与 `komo channel probe` 同一条连通性核对，交回 `{ok, message}`；不起消费循环 |
 | GET /v1/home-session             | 操作者的 home session（§11.2）                 |
+| POST /v1/web/pair-code           | 要一个浏览器配对码（`PairCodeResponse`）：**只认 Bearer**（cookie 不能再铸码），码只在内存、两分钟失效、用一次作废（`docs/clients.md` D6） |
+| POST /v1/web/session             | 配对码换会话 cookie（`{"code": …}`，不需要别的鉴权——码本身就是凭据）；响应 `Set-Cookie: komo_session=…; HttpOnly; SameSite=Strict; Path=/`（经 HTTPS 代理时加 `Secure`）。cookie 只在内存，Gateway 重启后失效 |
 
-除最小健康检查外统一认证。创建会话、提交输入、介入答复、Cron 与 Memory 变更都支持幂等请求键；同一键对应不同内容则拒绝。创建会话的请求键与正文哈希持久保存，同键同内容重发返回原会话，同键不同内容返回 409 `request_key_conflict`，重启后仍有效。
+除最小健康检查、配对换 cookie 与网页静态文件外统一认证：`Authorization: Bearer <令牌>`，或浏览器的会话 cookie；用 cookie 的**非 GET / HEAD** 请求另外核对 `Origin` 与 `Host` 同源，否则 403。
+
+**网页壳与 Host 校验（`docs/clients.md` D5、D6）。** `/v1/*` 与 `/healthz` 之外的路径是网页壳的静态文件：从 `[web] dir` 读（没配就退到 `komo` 二进制旁的 `web/`，发布包与 `install.sh` / `komo update` 装在那里，§13.6），先找文件，没有扩展名的路径回落壳 html（`_shell.html`，客户端路由），带扩展名而找不到的 404；目录不存在不报错，只是没有网页（`komo config check` 给一条警告）。文件不嵌进二进制，Rust 冷构建不依赖 Node。**所有路由**（含静态文件、`/healthz`、配对）都先过 Host 校验：只放行回环（`127.0.0.1`、`::1`、`localhost`）、监听地址的主机部分和 `[gateway] trusted_hosts`（主机名列表，经反向代理 / 隧道访问时填域名；端口不参与比较），其余一律 403——挡 DNS 重绑定，只负责放行、不替代鉴权。`[web] dir` 与 `trusted_hosts` 都是启动期键（§3 第 4 条）。
+
+创建会话、提交输入、介入答复、Cron 与 Memory 变更都支持幂等请求键；同一键对应不同内容则拒绝。创建会话的请求键与正文哈希持久保存，同键同内容重发返回原会话，同键不同内容返回 409 `request_key_conflict`，重启后仍有效。
 
 聊天渠道不经 HTTP：它们在 插件通过私有管道 RPC 接入宿主的 `Inbound` / 发送口（§11.5），宿主调用与这些接口相同的函数，Dispatcher 是两边共用的入口（§11.1）。
 
@@ -1449,6 +1456,7 @@ kernel ← client ────────────────────�
 | `opentelemetry-otlp` | `0.33`，`default-features = false, features = ["http-proto", "reqwest-blocking-client", "trace", "metrics"]`；仅 bin | OTLP/HTTP + protobuf，走工作区同一份 reqwest 0.13（多开其 `blocking` 特性）；不开 `grpc-tonic` / `logs`。**blocking 而非 async 客户端**：SDK 在无 tokio reactor 的线程上 `block_on` 导出。`opentelemetry-otlp` 12.7s、`opentelemetry-http` 25.9s、`opentelemetry-proto` 6.9s；`cargo tree -d` 重复项与加之前逐条相同（95 个根），无新重复 |
 | `tracing-opentelemetry` | `0.34`，默认特性（含 `metrics`）；仅 bin | `OpenTelemetryLayer` + `MetricsLayer`（6.1s） |
 | `tracing-appender` | `0.2`，`default-features = false`；仅 bin | Gateway 日志按天轮转、留 7 个（`docs/observability.md` §6）（6.3s） |
+| `ts-rs` | `12`，`default-features = false, features = ["serde-compat", "no-serde-warnings"]`；仅 komo-kernel，且在 `ts` feature 后面（默认关，不进发布构建与冷编预算） | 协议类型 → TypeScript（`docs/clients.md` D3），生成物提交在 `packages/protocol/src/generated/`；`cargo test -p komo-kernel --features ts` 里有一条测试核对生成物是最新的，类型改了用 `KOMO_UPDATE_TS=1` 重新生成。只用 serde 属性兼容，不开 chrono / uuid 等类型适配（`OffsetDateTime` 与大整数在类型上显式标 `string` / `number`） |
 | `clap` | `derive` | 仅 bin |
 | `flate2` / `tar` | `flate2` 显式 `default-features = false, features = ["rust_backend"]`（miniz_oxide），`tar 0.4` | 仅 bin：`komo update` 解发布包（§13.6）。两者都是纯 Rust（不带 C 工具链），且**不进 gateway / runtime 的图**——它们谁也不更新自己；`rust_backend` 写死是不跟上游默认后端变 |
 | `ratatui` + `crossterm` + `pulldown-cmark` | 仅 komo-client | 在 client 支线上，与 gateway 并行编译 |
@@ -1633,11 +1641,11 @@ pub trait Clock: Send + Sync {
 
 ### 13.6 安装与升级
 
-发布产物由 `.github/workflows/release.yml` 在 `v*` 标签上构建，四个平台各一个包：`komo-darwin-arm64.tar.gz`、`komo-darwin-amd64.tar.gz`、`komo-linux-amd64.tar.gz`、`komo-linux-arm64.tar.gz`，外加一份共用的 `SHA256SUMS`（`sha256sum` 的默认两列格式）。**包内有 `komo`、`komo-channel-feishu`、`komo-channel-telegram`、`komo-channel-wechat` 四个普通文件**。linux 包在 Ubuntu 22.04 上原生构建（ring 与 mimalloc 编 C，不走交叉编译），glibc 下限因此是 2.35；darwin 两个架构都在 arm64 runner 上出。
+发布产物由 `.github/workflows/release.yml` 在 `v*` 标签上构建，四个平台各一个包：`komo-darwin-arm64.tar.gz`、`komo-darwin-amd64.tar.gz`、`komo-linux-amd64.tar.gz`、`komo-linux-arm64.tar.gz`，外加一份共用的 `SHA256SUMS`（`sha256sum` 的默认两列格式）。**包内有 `komo`、`komo-channel-feishu`、`komo-channel-telegram`、`komo-channel-wechat` 四个普通文件，外加网页壳目录 `web/`**（`pnpm build` 的静态产物 `apps/client/dist/client`，`release.yml` 在每个平台的作业里构建；`install.sh` 与 `komo update` 把它解到 `komo-web/<代次>/`，`<安装目录>/web` 是指向它的符号链接，整份靠一次 `rename` 换上，旧一代随后清掉；旧版本的包没有 `web/` 就不动现有的）。Gateway 的 `[web] dir` 没配时读二进制旁的 `web/`。linux 包在 Ubuntu 22.04 上原生构建（ring 与 mimalloc 编 C，不走交叉编译），glibc 下限因此是 2.35；darwin 两个架构都在 arm64 runner 上出。
 
-装与升级是同一条约定的两个入口：`scripts/install.sh`（`curl -fsSL …/main/scripts/install.sh | bash`，认平台 → 问 `releases/latest` 或 `KOMO_VERSION` → 下包与 `SHA256SUMS` → `shasum`/`sha256sum` 核对 → `tar -xzf` → 落到 `komo.new` 再 `mv -f`；默认装到 `~/.local/bin`，不用 sudo，`--prefix` / `KOMO_INSTALL_DIR` 可改——2026-09-24 起，原来是 `/usr/local/bin`）和 `komo update`（§3，用 Rust 自己走一遍同一套名字与校验，`crates/komo/src/update.rs`）。仓库名、资产名、校验和文件名三处必须一致：那两个文件加这里。
+装与升级是同一条约定的两个入口：`scripts/install.sh`（`curl -fsSL …/main/scripts/install.sh | bash`，认平台 → 问 `releases/latest` 或 `KOMO_VERSION` → 下包与 `SHA256SUMS` → `shasum`/`sha256sum` 核对 → `tar -xzf` → 落到 `komo.new` 再 `mv -f`；默认装到 `~/.local/bin`，不用 sudo，`--prefix` / `KOMO_INSTALL_DIR` 可改——2026-09-24 起，原来是 `/usr/local/bin`）和 `komo update`（§3，用 Rust 自己走一遍同一套名字与校验，`crates/komo/src/update.rs`）。仓库名、资产名、校验和文件名与包里的 `web/` 目录名三处必须一致：那两个文件加 `release.yml`。
 
-`komo update` 的顺序是**下载 → 校验 sha256 → 白名单解出四个普通文件 → 逐个试跑 `--version` → 准备版本化插件集合 → 同目录 `rename` 主程序**。插件放在主程序同级 `komo-plugins/<版本>/` 的原子切换目录链接下，旧版本集合保留；协议和安装细节见 `channel-plugins.md`。三条不变量：
+`komo update` 的顺序是**下载 → 校验 sha256 → 白名单解出四个普通文件与 `web/`（只认普通文件与目录，路径不许 `..`） → 逐个试跑 `--version` → 准备版本化插件集合与网页壳 → 同目录 `rename` 主程序**。插件放在主程序同级 `komo-plugins/<版本>/` 的原子切换目录链接下，旧版本集合保留；协议和安装细节见 `channel-plugins.md`。三条不变量：
 
 1. **换上去是最后一步，而且是一次 `rename`**。中途任何一步失败（校验和不对、包坏了、试跑不过），现在装着的那个 komo 一个字节都没动；临时文件与目标同目录，跨文件系统的 rename 会退化成复制。自我更新唯一不可接受的结局不是"没更新成"，是"更新成一个跑不起来的东西"。
 2. **试跑要求新二进制自报的版本就是标签版本**。glibc 太旧、架构不对、包被改过都在这一步挡下来。这条同时把发布流程绑住了：标签与 `[workspace.package].version` 不一致的包会被拒收，所以 `release.yml` 里那个 `guard` 作业是这条不变量的另一半，不是可选项。

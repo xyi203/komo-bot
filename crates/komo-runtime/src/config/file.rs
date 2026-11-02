@@ -46,6 +46,8 @@ pub(super) struct FileConfig {
     #[serde(default)]
     pub gateway: GatewaySection,
     #[serde(default)]
+    pub web: WebSection,
+    #[serde(default)]
     pub paths: PathsSection,
     #[serde(default)]
     pub model_providers: BTreeMap<String, ModelProviderSection>,
@@ -81,6 +83,16 @@ pub(super) struct TelemetrySection {
 #[derive(Debug, Default, Deserialize)]
 pub(super) struct GatewaySection {
     pub listen: Option<String>,
+    /// 除回环与监听地址外还接受的 `Host`（`docs/clients.md` D6）。
+    #[serde(default)]
+    pub trusted_hosts: Vec<String>,
+}
+
+/// `[web]`：网页壳（`docs/clients.md` D5）。
+#[derive(Debug, Default, Deserialize)]
+pub(super) struct WebSection {
+    /// 静态文件目录；相对路径按 `config.toml` 所在目录算。
+    pub dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -594,6 +606,14 @@ pub(super) fn assemble(
         ),
         data_dir: data_dir.clone(),
         listen,
+        web_dir: file.web.dir.map(|dir| resolve(&base, dir)),
+        trusted_hosts: file
+            .gateway
+            .trusted_hosts
+            .iter()
+            .map(|host| host.trim().to_string())
+            .filter(|host| !host.is_empty())
+            .collect(),
         otlp_endpoint: file
             .telemetry
             .otlp_endpoint

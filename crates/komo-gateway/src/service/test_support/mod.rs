@@ -100,6 +100,8 @@ pub fn sample_snapshot() -> ConfigSnapshot {
             listen: "127.0.0.1:7777".into(),
             db_path: "/tmp/komo/state.db".into(),
             otlp_endpoint: None,
+            web_dir: None,
+            trusted_hosts: vec![],
         },
         model_catalog: ModelCatalog {
             default: "main".into(),

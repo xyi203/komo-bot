@@ -23,9 +23,14 @@ cargo fmt --check
 cargo tree -d                  # duplicate versions must be attributed per channel
 cargo build --timings          # rerun at the end of every phase, record in docs
 
+pnpm install                   # root pnpm workspace (docs/clients.md): apps/client + packages/{protocol,api}
+pnpm build | lint | typecheck  # build → apps/client/dist/client (static shell, SPA mode); `pnpm dev` proxies to the local Gateway
+cargo test -p komo-kernel --features ts   # protocol → TS bindings are current (KOMO_UPDATE_TS=1 regenerates packages/protocol)
+
 komo init                      # write a minimal commented config.toml + 0600 .env (never overwrites)
 komo                           # start Gateway if needed, new session, TUI
 komo resume SESSION_ID
+komo web [--no-open]           # one-time pairing link → browser cookie session (Gateway serves [web] dir)
 komo gateway [--foreground] | gateway status|stop|restart
 komo config check | config reload
 komo channel list|probe | channel login CHANNEL  # wechat login remains an alias
@@ -64,7 +69,7 @@ komo-agent     AgentProfile → 能力面选择 · skills 发现与目录 · 编
                值类型（AgentProfile/AgentSurface）留在 kernel。
 komo-gateway   axum routes (`http/v2`) · `service/durable` (DurableCore: hooks,
                sessions/tree, feed, lifecycle) · SSE · auth · lock/discovery ·
-               launchd/systemd · Dispatcher · generic channel process host ·
+               web (Host guard · pairing → cookie · static shell) · launchd/systemd · Dispatcher · generic channel process host ·
                Notifier · deliveries · intervention rendering · config reload.
 komo-channel  Shared protocol, runner and image inbox, plus feature-gated
                feishu/telegram/wechat modules and their standalone plugin binaries.
@@ -146,7 +151,7 @@ depends on `agent`; `client` knows only protocol types.
 - **The release convention is one string in three places** (§13.6): the repo
   name, `komo-<os>-<arch>.tar.gz`, and `SHA256SUMS` appear in
   `.github/workflows/release.yml`, `scripts/install.sh`, and
-  `crates/komo/src/update.rs` — change one, change all three. The archive contains `komo` and all three `komo-channel-*` executables; install
+  `crates/komo/src/update.rs` — change one, change all three. The archive contains `komo`, all three `komo-channel-*` executables and the web shell directory `web/`; install
   and update prepare a versioned plugin set before swapping the main binary. The tag must
   equal `[workspace.package].version`, or `komo update` refuses the package.
 - **Config hot-reloads** (§3): one `Arc<ConfigSnapshot>` swapped atomically;

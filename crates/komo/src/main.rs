@@ -37,6 +37,14 @@ enum Command {
         /// 会话 ID。
         session_id: String,
     },
+    /// 在浏览器里打开网页版：向 Gateway 要一个一次性配对码，打开 `/pair#code=…`，网页换出会话 cookie（`docs/clients.md` D6）。
+    ///
+    /// 码在 URL 的 fragment 里，不进服务器日志；用一次作废，两分钟失效。Gateway 重启后 cookie 失效，要重新运行。
+    Web {
+        /// 只打印链接，不打开浏览器。
+        #[arg(long)]
+        no_open: bool,
+    },
     /// 会话列表与状态。
     Session {
         #[command(subcommand)]
@@ -606,6 +614,23 @@ async fn dispatch(cli: Cli, home: &Path) -> Result<Option<String>, String> {
                 .await
                 .map_err(|error| error.to_string())?;
             Ok(None)
+        }
+        Some(Command::Web { no_open }) => {
+            init_tracing(None, None);
+            let client = connect::connect_or_start(home).await?;
+            let discovery = komo_client::discovery::read_discovery_file(home)
+                .map_err(|error| error.to_string())?;
+            let base_url = client.base_url();
+            let pair = komo_gateway::http::request_pair_code(&base_url, discovery.token.as_deref())
+                .await?;
+            let url = format!("{}/pair#code={}", base_url.trim_end_matches('/'), pair.code);
+            if !no_open && !commands::open_in_browser(&url) {
+                eprintln!("没能自动打开浏览器，请手动打开下面的链接。");
+            }
+            Ok(Some(format!(
+                "{url}\n（一次性链接，{} 秒内有效，用过即作废）",
+                pair.expires_in_secs
+            )))
         }
         Some(Command::Resume { session_id }) => {
             init_tracing(None, None);
@@ -1181,6 +1206,10 @@ mod tests {
         assert!(matches!(
             Cli::parse_from(["komo", "home"]).command,
             Some(Command::Home)
+        ));
+        assert!(matches!(
+            Cli::parse_from(["komo", "web", "--no-open"]).command,
+            Some(Command::Web { no_open: true })
         ));
         assert!(matches!(
             Cli::parse_from(["komo", "resume", "sess-1"]).command,

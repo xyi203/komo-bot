@@ -5,8 +5,9 @@
 //! 字节都没动。自我更新唯一不可接受的结局不是"没更新成"，是"更新成一个跑不起来的东西"，
 //! 所以校验和试跑都赶在旧文件还在的时候做。
 //!
-//! 资产名（`komo-<os>-<arch>.tar.gz`）、校验和文件名（`SHA256SUMS`）与仓库名是三处共同
-//! 约定：这里、`.github/workflows/release.yml`、`scripts/install.sh`。改一处就得改另外两处。
+//! 资产名（`komo-<os>-<arch>.tar.gz`）、校验和文件名（`SHA256SUMS`）、仓库名与包里的
+//! `web/` 目录是三处共同约定：这里、`.github/workflows/release.yml`、`scripts/install.sh`。
+//! 改一处就得改另外两处。
 
 use std::path::Path;
 use std::time::Duration;
@@ -25,6 +26,8 @@ const PLUGINS: [&str; 3] = [
     "komo-channel-telegram",
     "komo-channel-wechat",
 ];
+/// 包里网页壳的目录名（`docs/clients.md` D5）；装到二进制旁，Gateway 默认从那里读。
+const WEB: &str = "web";
 /// 所有资产共用一份校验和，格式就是 `sha256sum` 的输出。
 const SUMS: &str = "SHA256SUMS";
 /// 连上 GitHub 的时限。**不设整体超时**：包二十来兆，链路慢的时候整体超时会把一次正常
@@ -112,6 +115,7 @@ async fn install(
     match outcome {
         Ok(()) => {
             install_plugins(&staged, directory, tag)?;
+            install_web(&staged, directory, tag)?;
             std::fs::rename(&staged, dest).map_err(|error| {
                 format!(
                     "换不上去（{} → {}）：{error}。看看 {} 你能不能写",
@@ -123,6 +127,7 @@ async fn install(
         }
         Err(error) => {
             let _ = std::fs::remove_dir_all(staged.with_extension("plugins"));
+            let _ = std::fs::remove_dir_all(staged.with_extension("web"));
             let _ = std::fs::remove_file(&staged);
             Err(error)
         }
@@ -180,6 +185,49 @@ fn install_plugins(staged: &Path, directory: &Path, tag: &str) -> Result<(), Str
     #[cfg(not(unix))]
     return Err("渠道发布包仅支持 macOS / Linux".into());
     std::fs::rename(link, root.join(version)).map_err(|e| e.to_string())
+}
+
+/// 网页壳：解到 `komo-web/<代次>/`，再把 `<目录>/web` 这个符号链接用一次 `rename` 指过去
+/// （同插件集的做法：Gateway 读到的永远是完整的一份）。旧版本的包没有 `web/`，那就不动现有的。
+fn install_web(staged: &Path, directory: &Path, tag: &str) -> Result<(), String> {
+    let source = staged.with_extension(WEB);
+    if !source.is_dir() {
+        return Ok(());
+    }
+    let version = tag.strip_prefix('v').unwrap_or(tag);
+    let root = directory.join("komo-web");
+    std::fs::create_dir_all(&root).map_err(|e| e.to_string())?;
+    let generation = format!(
+        "{version}-update-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| e.to_string())?
+            .as_nanos()
+    );
+    let live = directory.join(WEB);
+    if live.is_dir() && !live.is_symlink() {
+        return Err(format!(
+            "{} 是个真目录，不是 komo 装的符号链接——先把它挪走再更新",
+            live.display()
+        ));
+    }
+    let previous = std::fs::read_link(&live).ok();
+    std::fs::rename(&source, root.join(&generation)).map_err(|e| e.to_string())?;
+    let link = directory.join(format!("{WEB}.new-{}", std::process::id()));
+    let target = format!("komo-web/{generation}");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&target, &link).map_err(|e| e.to_string())?;
+    #[cfg(not(unix))]
+    return Err("网页发布包仅支持 macOS / Linux".into());
+    std::fs::rename(&link, &live).map_err(|e| e.to_string())?;
+    // 旧的那一代没人读了；只清自己装的（`komo-web/` 下面的），别的不碰。
+    if let Some(previous) = previous
+        && previous.starts_with("komo-web")
+    {
+        let _ = std::fs::remove_dir_all(directory.join(previous));
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------- GitHub
@@ -380,6 +428,10 @@ fn extract(archive: &Path, into: &Path) -> Result<(), String> {
         let mut entry = entry.map_err(|e| e.to_string())?;
         let path = entry.path().map_err(|e| e.to_string())?.into_owned();
         let name = path.to_str().ok_or("发布包包含非法文件名")?;
+        if name == WEB || name.starts_with("web/") {
+            extract_web_entry(&mut entry, &path, &into.with_extension(WEB))?;
+            continue;
+        }
         if name != BINARY && !PLUGINS.contains(&name) {
             continue;
         }
@@ -401,6 +453,37 @@ fn extract(archive: &Path, into: &Path) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// `web/` 下的一个成员落到 `root`：只认普通文件与目录，路径每一段都得是普通名字
+/// （没有 `..`、绝对路径），不按包内路径直接 unpack。
+fn extract_web_entry<R: std::io::Read>(
+    entry: &mut tar::Entry<'_, R>,
+    path: &Path,
+    root: &Path,
+) -> Result<(), String> {
+    let relative = path.strip_prefix(WEB).map_err(|e| e.to_string())?;
+    let mut target = root.to_path_buf();
+    for component in relative.components() {
+        match component {
+            std::path::Component::Normal(part) => target.push(part),
+            _ => return Err(format!("发布包里 web/ 的路径不合法：{}", path.display())),
+        }
+    }
+    let kind = entry.header().entry_type();
+    if kind.is_dir() {
+        return std::fs::create_dir_all(&target).map_err(|e| e.to_string());
+    }
+    if !kind.is_file() {
+        return Err(format!(
+            "发布包里 web/ 只许有普通文件与目录：{}",
+            path.display()
+        ));
+    }
+    std::fs::create_dir_all(target.parent().unwrap_or(root)).map_err(|e| e.to_string())?;
+    let mut out = std::fs::File::create(&target).map_err(|e| e.to_string())?;
+    std::io::copy(entry, &mut out).map_err(|e| e.to_string())?;
+    out.sync_all().map_err(|e| e.to_string())
 }
 
 fn set_executable(path: &Path) -> Result<(), String> {
@@ -554,6 +637,39 @@ mod tests {
         builder.into_inner().expect("收尾").finish().expect("压缩")
     }
 
+    /// 同 [`release_archive`]，另带 `web/`（一个目录成员、两个文件）。
+    fn release_archive_with_web(binary: &str) -> Vec<u8> {
+        let encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        let mut builder = tar::Builder::new(encoder);
+        let mut header = tar::Header::new_gnu();
+        header.set_size(binary.len() as u64);
+        header.set_mode(0o755);
+        header.set_cksum();
+        for name in std::iter::once(BINARY).chain(PLUGINS) {
+            builder
+                .append_data(&mut header, name, binary.as_bytes())
+                .expect("打包");
+        }
+        let mut dir = tar::Header::new_gnu();
+        dir.set_entry_type(tar::EntryType::Directory);
+        dir.set_size(0);
+        dir.set_mode(0o755);
+        dir.set_cksum();
+        builder
+            .append_data(&mut dir, "web/", std::io::empty())
+            .expect("目录");
+        for (name, body) in [("web/_shell.html", "<html>"), ("web/assets/app.js", "x")] {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(body.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, name, body.as_bytes())
+                .expect("文件");
+        }
+        builder.into_inner().expect("收尾").finish().expect("压缩")
+    }
+
     /// `sha256sum` 那两列的原文。
     fn sums_for(asset: &str, archive: &[u8]) -> String {
         format!("{}  {asset}\n", hex(&Sha256::digest(archive)))
@@ -612,6 +728,59 @@ mod tests {
             "临时文件要收干净：{:?}",
             dotfiles(dir.path())
         );
+    }
+
+    /// 包里有 `web/` 时，装到二进制旁：`web` 是指向 `komo-web/<代次>` 的符号链接，再更新一次换成新的一代并清掉旧的。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_web_shell_is_installed_next_to_the_binary() {
+        let tag = "v99.0.0";
+        let archive = release_archive_with_web(&fake_binary(tag));
+        let asset = format!("{BINARY}-{}.tar.gz", asset_suffix().expect("本机平台"));
+        let fake = Fake::start(
+            tag,
+            vec![
+                (asset.clone(), archive.clone()),
+                (SUMS.to_string(), sums_for(&asset, &archive).into_bytes()),
+            ],
+        )
+        .await;
+        let dir = tempfile::tempdir().expect("临时目录");
+        let dest = dir.path().join(BINARY);
+        std::fs::write(&dest, "旧的").expect("铺一个现在装着的");
+        let home = tempfile::tempdir().expect("临时 home");
+
+        update_against(home.path(), &client().expect("客户端"), &fake.api(), &dest)
+            .await
+            .expect("换得上");
+
+        let web = dir.path().join(WEB);
+        assert!(web.is_symlink(), "web 是符号链接");
+        assert_eq!(
+            std::fs::read_to_string(web.join("_shell.html")).unwrap(),
+            "<html>"
+        );
+        assert_eq!(
+            std::fs::read_to_string(web.join("assets/app.js")).unwrap(),
+            "x"
+        );
+        assert!(
+            dotfiles(dir.path()).is_empty(),
+            "临时文件要收干净：{:?}",
+            dotfiles(dir.path())
+        );
+
+        // 再装一代：旧的一代被清掉，web 仍然完整。
+        let first = std::fs::read_link(&web).unwrap();
+        let staged = dir.path().join(".komo-test.new");
+        std::fs::create_dir_all(staged.with_extension(WEB)).unwrap();
+        std::fs::write(staged.with_extension(WEB).join("_shell.html"), "<html>2").unwrap();
+        install_web(&staged, dir.path(), "v99.0.1").expect("再装一代");
+        assert_eq!(
+            std::fs::read_to_string(web.join("_shell.html")).unwrap(),
+            "<html>2"
+        );
+        assert!(!dir.path().join(first).exists(), "旧的一代要清掉");
     }
 
     /// 校验和对不上时，**现在这份一个字节都不能动**——这是整条命令存在的理由。

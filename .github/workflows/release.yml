@@ -67,13 +67,29 @@ jobs:
 
       # 不挂 rust-cache：标签各自是一个 ref，存下的缓存别的标签读不到，只白占仓库 10 GB 配额。
 
+      # 网页壳（docs/clients.md D5）：静态文件，打进发布包的 `web/`，Gateway 从二进制旁读它。
+      # scripts/install.sh 与 crates/komo/src/update.rs 按 `web/` 这个名字取。
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Build web
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm build
+
       - name: Build
         run: |
           cargo build --release --locked -p komo --target ${{ matrix.target }}
           cargo build --release --locked -p komo-channel --features feishu,telegram,wechat --target ${{ matrix.target }}
 
-      # 发布包包含主程序和三个独立渠道插件，安装器与 updater 一起验证、安装。
-      # scripts/install.sh 与 crates/komo/src/update.rs 按这两个名字取。
+      # 发布包包含主程序、三个独立渠道插件和网页壳目录 `web/`，安装器与 updater 一起验证、安装。
+      # scripts/install.sh 与 crates/komo/src/update.rs 按这些名字取。
       - name: Package
         run: |
           set -euo pipefail
@@ -81,8 +97,9 @@ jobs:
           for binary in komo komo-channel-feishu komo-channel-telegram komo-channel-wechat; do
             cp "target/${{ matrix.target }}/release/${binary}" "dist/${binary}"
           done
-          tar -czf "dist/komo-${{ matrix.asset_suffix }}.tar.gz" -C dist komo komo-channel-feishu komo-channel-telegram komo-channel-wechat
-          rm -f dist/komo dist/komo-channel-*
+          cp -R apps/client/dist/client dist/web
+          tar -czf "dist/komo-${{ matrix.asset_suffix }}.tar.gz" -C dist komo komo-channel-feishu komo-channel-telegram komo-channel-wechat web
+          rm -rf dist/komo dist/komo-channel-* dist/web
           ls -lh dist
 
       - name: Upload package

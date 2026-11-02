@@ -1,8 +1,8 @@
 # 客户端：网页、macOS、手机
 
-> 状态：草案（2026-11-01）。已由操作者拍板的有三条：前端栈用 TanStack Start、macOS 用 Electron、网页由 Gateway 托管
-> （借鉴 Hermes Agent 与 DeepSeek Harness，见 §7）；2026-11-02 补拍板：新版界面要多语言，语言偏好只存在各端（D9）。
-> §2 其余各条是建议，待认可。
+> 状态：草案（2026-11-01）；**C0 已实现（2026-11-02，§6.1）**。已由操作者拍板的有三条：前端栈用 TanStack Start、macOS 用 Electron、网页由 Gateway 托管
+> （借鉴 Hermes Agent 与 DeepSeek Harness，见 §7）；2026-11-02 补拍板：新版界面要多语言，语言偏好只存在各端（D9）；
+> 同日操作者认可按 §2 的建议做 D1–D6、D9（文案表用 Paraglide JS）。D7、D8 仍是建议。
 > 取代 [`roadmap-muse.md`](roadmap-muse.md) §4.4"手机端先用飞书，不做原生 App"。现有原型的界面规格仍在 [`web.md`](web.md)，
 > 视觉 token 在 [`DESIGN.md`](../DESIGN.md)。不带文件名的章节号指 [`komo_bot.md`](komo_bot.md)。
 
@@ -106,11 +106,38 @@ macOS 应用和手机端，需要一套标准的前端栈，以及一份所有�
 
 | 阶段 | 内容 | 完成的标志 |
 |---|---|---|
-| C0 | workspace、协议类型生成、`packages/api`、Start SPA 壳与 token、多语言骨架（文案表、语言切换、lint）、Gateway 提供静态文件与 cookie 鉴权 | `komo web` 打开 7777 上的新壳，能列会话、能收 SSE，能在中英文之间切换 |
+| C0（**已做**，§6.1） | workspace、协议类型生成、`packages/api`、Start SPA 壳与 token、多语言骨架（文案表、语言切换、lint）、Gateway 提供静态文件与 cookie 鉴权 | `komo web` 打开 7777 上的新壳，能列会话、能收 SSE，能在中英文之间切换 |
 | C1 | 按 §3 的顺序逐节迁移，对齐原型；每节的文案同时进中英文两份 | web.md 每一节都有新版对应，且两种语言下都检查过；`apps/web` 与 `serve.mjs` 删除 |
 | C2 | Electron 壳（§4） | 签名后的 `.app` 能连本机 Gateway，通知与托盘可用 |
 | C3 | 远程访问（Tailscale 或 Tunnel，`public_url` / `trusted_hosts`）、设备配对、PWA 与 Web Push（§5 的 1–3） | iPhone 主屏幕上的 PWA 能聊天、收确认卡推送 |
 | C4 | Capacitor 原生壳（§5 的 4） | 按需 |
+
+### 6.1 C0 实际做了什么（2026-11-02）
+
+| 项 | 位置 | 状态 |
+|---|---|---|
+| pnpm workspace（D4） | 根 `package.json` / `pnpm-workspace.yaml`；`apps/client`、`packages/protocol`、`packages/api`；`apps/desktop` 不在 C0，原型 `apps/web` 不动 | 完成。`pnpm install` / `build` / `lint` / `typecheck` 都过 |
+| 协议类型（D3） | kernel 的 `ts` feature（默认关）；`protocol/ts.rs` 导出到 `packages/protocol/src/generated/`；`cargo test -p komo-kernel --features ts` 核对生成物是最新的，`KOMO_UPDATE_TS=1` 重新生成；§13.4 已登记 `ts-rs` | 完成，**导出的是最小集合**：`ErrorBody`（`ApiError`、`ErrorCode`）、`HealthResponse`、`SessionListResponse`（`SessionSummary`、`RunState`、`WaitReason`…）、`EventQuery`、`EventPage`、`SseFrame`、配对的两个类型 |
+| `packages/api` | `fetch` 封装（同源相对路径、cookie、失败统一成 `ApiError`）、`subscribeSession`（SSE 带游标续传）、按资源组织的 Query key、`useSessions` / `useHealth` / `useSessionStream`、`invalidateOnFrame` | 完成 |
+| SPA 壳 | `apps/client`：TanStack Start SPA 模式 + Tailwind v4（DESIGN.md token 在 `src/styles.css` 的 `@theme`）+ shadcn/ui 初始化（`components.json`、`cn`、一个 Button）；左栏会话列表、选中后显示 SSE 帧、语言切换 | 完成，界面只到"列会话、看事件流"，其余留给 C1 |
+| 多语言（D9） | Paraglide JS（`messages/{zh-CN,en}.json`）；偏好存 `localStorage`，没选过按系统语言（`zh*` 中文，其余英文）；日期、相对时间、数字走 `Intl`；`pnpm lint` 里 `scripts/lint-i18n.mjs` 在 JSX 里发现中文字面量就报错 | 完成 |
+| Gateway 静态文件（D5） | `[web] dir`（没配退到二进制旁的 `web/`）；`/v1/*`、`/healthz` 照旧，其余先找文件、无扩展名回落壳 html；目录不存在只是没有网页；`komo config check` 对不存在的目录给警告 | 完成；`[web] dir` 与 `trusted_hosts` 是**启动期键**（改了重载会报"需要 `komo gateway restart`"） |
+| 鉴权（D6） | `komo web [--no-open]`；`POST /v1/web/pair-code`（只认 Bearer）与 `POST /v1/web/session`；`auth` 层认 Bearer 或 cookie，cookie 的写请求核对 Origin；所有路由先过 Host 校验；Rust 单测与 `tests/web` 集成测试 | 完成，见下面的偏离 |
+| 开发流程 | `apps/client/vite-gateway-proxy.ts`：`pnpm dev` 把 `/v1`、`/healthz` 转给本机 Gateway，令牌每次请求现读 `$KOMO_HOME/runtime/gateway.json` | 完成；开发模式下令牌由代理带，**不需要配对** |
+| 发布约定（§13.6） | 包里多 `web/`；`release.yml` 构建并打进归档，`install.sh`、`update.rs` 装到二进制旁（`web` 是指向 `komo-web/<代次>/` 的符号链接，一次 `rename` 换上） | 完成，三处一起改；`update.rs` 有单测，`release.yml` / `install.sh` 没法本地跑，只对过路径 |
+
+**与上文规格的偏离与取舍**
+
+- **构建产物在 `apps/client/dist/client/`，不是 `dist/`**：Start 的 client 环境这么输出（旁边的 `dist/server` 用不到）。开发时 `[web] dir` 指 `apps/client/dist/client`，`release.yml` 拷的也是这个目录。壳 html 是 `_shell.html`，Gateway 回落时先找它，再找 `index.html`。
+- **SSE 自己重连，不用 `EventSource` 的自动重连**：浏览器只记最后一个 `id:`，而 `run_status` / `assistant_delta` 这类派生帧与源事件同号，拿它当游标可能跳过还没送到的源事件。`subscribeSession` 记的是原始事件（`event` 帧）的 seq，`error` 来了就关掉自动重连，按退避自己重开并带 `?from=<seq>`。
+- **`Event` 没有 derive 能描述的形状**（自定义序列化），线上给 `WireEvent` 这个裸信封（`type` + `data`），`data` 是 `unknown`，由界面按 `type` 收窄；`SseEvent::NestedCalls.calls` 同样是 `unknown[]`。线上 `skip_serializing_if` 的 `Vec`（如 `ApiError.keys`）为空时不出现，TS 里仍是必填，`ApiError` 读的时候补成空数组。
+- **配对码两分钟失效、最多同时 64 个；会话 cookie 30 天、最多 64 个，Gateway 重启就全部失效**（重新 `komo web`）。`Secure` 靠请求的 `X-Forwarded-Proto: https` 判断（Gateway 自己不终止 TLS）；`public_url` 与二维码留给 C3。
+- **Host 校验只比主机名，端口不参与**；监听地址 `0.0.0.0` 时 `0.0.0.0` 本身也放行（本机客户端用发现文件里的 `base_url` 连）。cookie 写请求缺 `Origin` 按不同源处理（浏览器发 POST 一定带）；`POST /v1/web/session` 没有 cookie，所以只在带了 `Origin` 时核对同源，curl 照常能换。
+- **Paraglide 构建时从 jsDelivr 取 inlang 的 message-format 插件**（`project.inlang/settings.json` 的 `modules`），缓存在 `project.inlang/cache`（已忽略）；第一次构建需要联网。
+- **TypeScript 钉在 5.9.3**（registry 上 `latest` 已是 7.x，`typescript-eslint` 与 Start 的类型都按 5.x 验证过）；`pnpm lint` = 自写的 i18n 检查脚本 + ESLint（typescript-eslint 推荐集 + react-hooks）。
+- pnpm 11 的"发布满一定天数才装"策略把三个新版本拦下，已按提示加进 `pnpm-workspace.yaml` 的 `minimumReleaseAgeExclude`。
+
+**留给 C1 的事**：按 §3 的顺序迁移界面（会话树与对话流先行）；`SessionSummary` 以外的协议类型按用到的补 `ts-rs` 派生并列进 `export_all`；`WireEvent.data` 的按 `type` 收窄类型；错误 `code` 的完整译文表；`public_url` / 二维码 / 设备令牌（C3）；移动端布局（C0 的侧栏在窄屏下直接隐藏，没有会话切换入口）；`/pair` 页面的样式与失败重试体验；`apps/web` 与 `serve.mjs` 的删除。
 
 ## 7. 参考：Hermes Agent 与 DeepSeek Harness
 

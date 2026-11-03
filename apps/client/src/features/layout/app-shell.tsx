@@ -54,6 +54,8 @@ export function AppShell() {
   const sidebarClass = "flex min-h-0 flex-col border-r border-border bg-ground";
   return (
     <SidebarProvider value={context}>
+      {/* 桌面壳的拖窗口条（只在 macOS 桌面壳里显示，见 styles.css）：要排在最前，后面的按钮才能从拖动区里挖出来 */}
+      <div aria-hidden="true" className="titlebar" />
       <div className="grid h-svh grid-cols-[280px_minmax(0,1fr)] overflow-hidden max-[900px]:grid-cols-1">
         {narrow ? (
           <Sheet open={drawer} onOpenChange={setDrawer}>

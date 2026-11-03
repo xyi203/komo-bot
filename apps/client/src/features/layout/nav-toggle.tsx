@@ -6,5 +6,5 @@ import { useSidebarContext } from "./sidebar-context";
 export function NavToggle() {
   const { narrow, openDrawer } = useSidebarContext();
   if (!narrow) return null;
-  return <IconButton name="sidebar" label={m.nav_open()} onClick={openDrawer} className="max-[600px]:size-11" />;
+  return <IconButton name="sidebar" label={m.nav_open()} onClick={openDrawer} className="traffic-clear-toggle max-[600px]:size-11" />;
 }

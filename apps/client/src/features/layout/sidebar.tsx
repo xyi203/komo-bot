@@ -20,7 +20,7 @@ export function Sidebar() {
   const { closeDrawer, narrow } = useSidebarContext();
   return (
     <>
-      <div className="flex h-12 items-center gap-2 px-4">
+      <div className="traffic-clear flex h-12 items-center gap-2 px-4">
         <svg viewBox="0 0 28 28" aria-hidden="true" className="size-5.5">
           <circle cx="11" cy="12" r="8" fill="#4f6b38" />
           <circle cx="20.5" cy="18.5" r="4.5" fill="#4f6b38" fillOpacity="0.55" />

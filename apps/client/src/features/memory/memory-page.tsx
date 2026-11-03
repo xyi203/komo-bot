@@ -243,11 +243,12 @@ export function MemoryPage({ selected }: { selected: string | null }) {
             <SkeletonRows />
           ) : rows.length ? (
             <>
-              <div aria-hidden="true" className={cn(ROW_GRID, "h-8 items-center border-b border-border text-small text-muted max-[600px]:hidden")}>
+              {/* 列只有 76px，英文表头会折成两行：表头随内容长高、底对齐，不能定高（定高时第二行压在第一条记忆上） */}
+              <div aria-hidden="true" className={cn(ROW_GRID, "min-h-8 items-end border-b border-border pt-1 pb-1.5 text-small leading-4 text-muted max-[600px]:hidden")}>
                 <span />
                 <span>{m.memory_col_content()}</span>
-                <span className="justify-self-end">{m.memory_col_used()}</span>
-                <span className="justify-self-end">{m.memory_col_last()}</span>
+                <span className="justify-self-end text-right">{m.memory_col_used()}</span>
+                <span className="justify-self-end text-right">{m.memory_col_last()}</span>
                 <span />
               </div>
               <ul className="relative z-0">

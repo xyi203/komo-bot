@@ -10,12 +10,13 @@ import { WindowManager, isAppUrl } from "./window";
 
 // ---- 启动前要做的事（都必须在 ready 之前）----
 registerSchemes();
+// 本机冒烟用：指定 userData，免得和正在用的 App 共享连接配置。要在抢单实例锁之前：锁就放在 userData 里，
+// 先抢锁的话会撞上正在用的那个 App，这个直接退出。
+if (process.env.KOMO_DESKTOP_USER_DATA) app.setPath("userData", process.env.KOMO_DESKTOP_USER_DATA);
 if (!app.requestSingleInstanceLock()) {
   app.quit();
   process.exit(0);
 }
-// 本机冒烟用：指定 userData，免得和正在用的 App 共享连接配置。
-if (process.env.KOMO_DESKTOP_USER_DATA) app.setPath("userData", process.env.KOMO_DESKTOP_USER_DATA);
 
 const build = readBuildInfo();
 let pendingSession: string | undefined;
@@ -156,7 +157,10 @@ app.on("window-all-closed", () => {
   // 关窗口不退出：菜单栏图标还在，通知也照常来（macOS 惯例）。
 });
 app.on("activate", () => windows?.show());
-app.on("before-quit", () => system?.stop());
+app.on("before-quit", () => {
+  windows?.markQuitting();
+  system?.stop();
+});
 
 void app.whenReady().then(async () => {
   if (app.isPackaged) app.setAsDefaultProtocolClient("komo");
@@ -170,7 +174,7 @@ void app.whenReady().then(async () => {
     windows.show();
     windows.loadPage("settings");
   });
-  setupUpdater();
+  setupUpdater(() => windows.markQuitting());
 
   // 冷启动带着 komo:// 参数的情况（open-url 事件可能先于 ready，已经记进 pendingSession）。
   const link = process.argv.find((arg) => arg.startsWith("komo://"));

@@ -9,7 +9,8 @@ import { autoUpdater } from "electron-updater";
 const zh = () => app.getLocale().toLowerCase().startsWith("zh");
 const SIX_HOURS = 6 * 60 * 60 * 1000;
 
-export function setupUpdater() {
+/** `beforeInstall`：quitAndInstall 先关窗口再退出，不经过 before-quit，窗口得事先知道这次是真退出。 */
+export function setupUpdater(beforeInstall: () => void) {
   if (!app.isPackaged || process.env.KOMO_DESKTOP_NO_UPDATE) return;
   autoUpdater.autoDownload = true;
   autoUpdater.autoInstallOnAppQuit = true;
@@ -23,7 +24,10 @@ export function setupUpdater() {
         defaultId: 0,
       })
       .then(({ response }) => {
-        if (response === 0) autoUpdater.quitAndInstall();
+        if (response === 0) {
+          beforeInstall();
+          autoUpdater.quitAndInstall();
+        }
       });
   });
   void autoUpdater.checkForUpdates().catch(() => {});

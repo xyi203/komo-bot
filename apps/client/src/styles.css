@@ -88,6 +88,34 @@
   }
 }
 
+/* ---------- macOS 桌面壳：没有系统标题栏 ----------
+   红绿灯压在窗口左上角（trafficLightPosition，竖直居中在 48px 的顶栏里）。顶上 48px 整条当标题栏拖窗口；
+   拖动区按 DOM 顺序叠加，所以拖动条排在最前，之后所有能点的东西都声明 no-drag 挖出来。 */
+.titlebar {
+  display: none;
+}
+[data-desktop="darwin"] .titlebar {
+  display: block;
+  position: fixed;
+  inset: 0 0 auto;
+  height: 48px;
+  pointer-events: none;
+  -webkit-app-region: drag;
+  app-region: drag;
+}
+[data-desktop="darwin"]
+  :is(button, a, input, select, textarea, label, summary, [role="button"], [role="tab"], [role="menuitem"], [role="option"], [tabindex]) {
+  -webkit-app-region: no-drag;
+  app-region: no-drag;
+}
+/* 侧栏顶上的 komo 标记让到红绿灯右边；窄屏没有侧栏时，页头的"打开导航"按钮也让开 */
+[data-desktop="darwin"] .traffic-clear {
+  padding-left: 84px;
+}
+[data-desktop="darwin"] .traffic-clear-toggle {
+  margin-left: 68px;
+}
+
 /* ---------- 动效与正文 ---------- */
 @theme {
   --animate-spinner: spinner-turn 0.9s linear infinite;

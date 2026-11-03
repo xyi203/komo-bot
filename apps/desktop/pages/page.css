@@ -26,6 +26,9 @@ body {
   color: var(--ink);
   font: 14px/1.5 -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", sans-serif;
 }
+/* 窗口没有系统标题栏（window.ts）：提示页整页可拖，能点、能输入的挖出来 */
+body { -webkit-app-region: drag; }
+button, a, input, select, textarea, label, .button { -webkit-app-region: no-drag; }
 main { max-width: 520px; margin: 0 auto; padding: 56px 24px; }
 h1 { font-size: 20px; margin: 0 0 8px; font-weight: 600; }
 p { margin: 0 0 16px; }

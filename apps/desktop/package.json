@@ -1,6 +1,7 @@
 {
   "name": "@komo/desktop",
   "version": "0.0.0",
+  "productName": "komo",
   "private": true,
   "description": "komo 的 macOS 壳：Electron 用 app:// 加载 apps/client 的 SPA 产物，主进程把 /v1/* 转给当前 Gateway 并替渲染进程带令牌（docs/clients.md §4、§6.3）。",
   "main": "dist/main/index.js",

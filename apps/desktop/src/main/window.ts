@@ -12,6 +12,8 @@ export class WindowManager {
   /** 界面是否登记了 onOpenSession：登记了就用事件打开会话（不重载页面），否则整页跳转。 */
   private sessionListening = false;
   private paletteQueued = false;
+  /** 真要退出了（菜单退出、⌘Q、重启装更新）：这时关窗口才真的销毁它。 */
+  private quitting = false;
 
   constructor(private readonly build: BuildInfo, private readonly appVersion: string) {
     this.lockDownSession();
@@ -43,6 +45,8 @@ export class WindowManager {
       minHeight: 480,
       show: false,
       backgroundColor: "#ffffff",
+      // macOS 不要系统标题栏：红绿灯嵌进界面 48px 高的顶栏，界面自己留位置、自己标拖动区（apps/client styles.css）
+      ...(process.platform === "darwin" ? { titleBarStyle: "hidden" as const, trafficLightPosition: { x: 18, y: 17 } } : {}),
       webPreferences: {
         preload: path.resolve(__dirname, "../preload/index.js"),
         contextIsolation: true,
@@ -58,6 +62,19 @@ export class WindowManager {
     });
     this.win = win;
     win.once("ready-to-show", () => win.show());
+    // 关窗口只是藏起来：App 还在菜单栏里，再打开（Dock、启动台、托盘）就是原来的页面。
+    // 真销毁的话，show() 里新建的窗口什么都没加载，是一片空白。
+    win.on("close", (event) => {
+      if (this.quitting) return;
+      event.preventDefault();
+      if (win.isFullScreen()) {
+        // 全屏下直接 hide 会留下一块黑屏的桌面空间：先退出全屏再藏
+        win.once("leave-full-screen", () => win.hide());
+        win.setFullScreen(false);
+      } else {
+        win.hide();
+      }
+    });
     win.on("closed", () => {
       this.win = undefined;
       this.sessionListening = false;
@@ -99,6 +116,10 @@ export class WindowManager {
 
   markSessionListening() {
     this.sessionListening = true;
+  }
+
+  markQuitting() {
+    this.quitting = true;
   }
 
   show() {

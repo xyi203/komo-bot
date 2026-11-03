@@ -4,8 +4,19 @@ import { cn } from "@/lib/utils";
 // 回复正文：代码块、标题、列表、表格、行内代码、粗体、链接，够看就行（与原型同一份规则）。
 // 解析成 React 节点，不拼 HTML 字符串，所以不需要转义，也没有 dangerouslySetInnerHTML。
 
-// 行内：代码 > 粗体 > 链接，粗体与链接文字里可以再套行内代码等（原型是按顺序整串替换，嵌套自然成立）。
-const INLINE = /`([^`]+)`|\*\*(.+?)\*\*|\[([^\]]+)\]\(([^)\s]+)\)/;
+// 行内：代码 > 粗体 > 链接 > 裸链接，粗体与链接文字里可以再套行内代码等（原型是按顺序整串替换，嵌套自然成立）。
+// 裸链接只吃 ASCII：中文、全角括号标点紧跟在后面也能断开。
+const INLINE = /`([^`]+)`|\*\*(.+?)\*\*|\[([^\]]+)\]\(([^)\s]+)\)|(https?:\/\/[^\s<>"'`\u0080-\uffff]+)/;
+
+/** 裸链接末尾的句点逗号等不算链接；`)` 只在没配对时去掉（保留 wiki 那种带括号的地址）。 */
+function trimUrl(url: string): string {
+  for (;;) {
+    const last = url.at(-1);
+    if (last && ".,;:!?]}".includes(last)) url = url.slice(0, -1);
+    else if (last === ")" && url.split("(").length < url.split(")").length) url = url.slice(0, -1);
+    else return url;
+  }
+}
 
 /** 只放行 http(s)、mailto 与没有协议的路径；`javascript:` 之类不渲染成链接。 */
 const safeTarget = (target: string) => /^(https?:|mailto:)/i.test(target) || !/^[a-z][a-z0-9+.-]*:/i.test(target);
@@ -20,7 +31,17 @@ function inline(text: string): ReactNode[] {
       break;
     }
     if (hit.index > 0) out.push(rest.slice(0, hit.index));
-    const [whole, code, bold, label, target] = hit;
+    const [whole, code, bold, label, target, bare] = hit;
+    if (bare !== undefined) {
+      const url = trimUrl(bare);
+      out.push(
+        <a key={key} href={url} target="_blank" rel="noreferrer">
+          {url}
+        </a>,
+      );
+      rest = rest.slice(hit.index + url.length);
+      continue;
+    }
     if (code !== undefined) out.push(<code key={key}>{code}</code>);
     else if (bold !== undefined) out.push(<strong key={key}>{inline(bold)}</strong>);
     else if (target && safeTarget(target)) {

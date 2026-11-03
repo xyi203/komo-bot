@@ -207,6 +207,7 @@ function SessionBody({ sessionId, tab, setTab }: { sessionId: string; tab: Tab; 
               </TabsContent>
             </div>
             <Composer
+              sessionId={sessionId}
               view={view}
               context={context}
               busy={busy}

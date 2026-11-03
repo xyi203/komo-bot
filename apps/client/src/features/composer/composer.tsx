@@ -1,5 +1,5 @@
 import { useModels } from "@komo/api";
-import { useRef, useState, type ClipboardEvent, type DragEvent, type FormEvent, type KeyboardEvent } from "react";
+import { useLayoutEffect, useRef, useState, type ClipboardEvent, type DragEvent, type FormEvent, type KeyboardEvent } from "react";
 import { Icon } from "@/components/icon";
 import { ImageZoom } from "@/components/image-zoom";
 import { Spinner } from "@/components/spinner";
@@ -10,6 +10,7 @@ import { useNow } from "@/lib/hooks";
 import { showToast } from "@/lib/toast";
 import { cn } from "@/lib/utils";
 import { m } from "@/paraglide/messages.js";
+import { useDraftText } from "./draft";
 import { effortLabel, modelLabel } from "./effort";
 import { useAttachments, type Draft } from "./use-attachments";
 import type { SendOptions } from "./use-send";
@@ -21,8 +22,10 @@ let chosen: { model: string | null; effort: string } = { model: null, effort: ""
  * 输入框（docs/web.md §5）：加号（选图片或文件）、一行文字、发送；会话有 Run 在跑且输入为空时发送键变停止，输入了文字则是插话。
  * 图片与文件也可以直接粘贴或拖进来：先传给 Gateway，发送时把每个附件的那行说明拼在文字前面（附件不进消息结构）。
  * 框下：左边用量行（轮数、步数、tok、缓存命中；跑着时是计时），右边模型、effort 与上下文环。
+ * 没发出去的文字和附件按会话留着（`draft.ts`、`use-attachments.ts`）：切页、换会话再回来不丢。
  */
 export function Composer({
+  sessionId,
   view,
   context,
   busy,
@@ -31,6 +34,7 @@ export function Composer({
   onSend,
   onStop,
 }: {
+  sessionId: string;
   view: View | undefined;
   context: ContextView;
   busy: boolean;
@@ -39,10 +43,17 @@ export function Composer({
   onSend: (text: string, options: SendOptions) => void;
   onStop: () => void;
 }) {
-  const [text, setText] = useState("");
+  const [text, setText] = useDraftText(sessionId);
   const area = useRef<HTMLTextAreaElement>(null);
   const picker = useRef<HTMLInputElement>(null);
-  const { drafts, add, remove, clear } = useAttachments();
+  const { drafts, add, remove, clear } = useAttachments(sessionId);
+  // 带着草稿挂上来时按内容撑开高度（平时在 onChange 里撑）
+  useLayoutEffect(() => {
+    const el = area.current;
+    if (!el || !el.value) return;
+    el.style.height = "auto";
+    el.style.height = `${el.scrollHeight}px`;
+  }, []);
   const models = useModels().data;
   const [pick, setPick] = useState(chosen);
   const showStop = busy && !text.trim() && drafts.length === 0;

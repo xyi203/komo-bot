@@ -5,6 +5,7 @@ import { useNavigate } from "@tanstack/react-router";
 import { useEffect, useMemo, useRef, useState, type KeyboardEvent } from "react";
 import { Icon, type IconName } from "@/components/icon";
 import { IconButton } from "@/components/ui/icon-button";
+import { useDraftedSessions } from "@/features/composer/draft";
 import { useSessionActions } from "@/features/sessions/actions";
 import { dirName, dirOf, isArchived, isEmpty } from "@/features/sessions/model";
 import { sessionTitle } from "@/features/sessions/title";
@@ -80,6 +81,7 @@ function PaletteBody() {
 
   // 会话已经在手里；事项与定时打开时取一次；记忆按输入去 Gateway 检索（停 200 ms 再发，"全部"取 5 条、"记忆"取 20 条）
   const sessions = useSessions(true).data;
+  const drafted = useDraftedSessions();
   const matters = useMatters(true).data;
   const cron = useCronJobs().data;
   const settled = useDebounced(q, 200);
@@ -124,8 +126,8 @@ function PaletteBody() {
       meta: scopeName(x.scope),
       run: () => void navigate({ to: "/memory/$id", params: { id: x.id } }),
     });
-    // 和侧栏一样不列一句话都没发过的会话：标题全是"新会话"，列出来只是一串点不出区别的空行
-    const byRecent = (sessions ?? []).filter((s) => !isEmpty(s)).sort((a, b) => new Date(b.updated_at).getTime() - new Date(a.updated_at).getTime());
+    // 和侧栏一样不列一句话都没发过的会话（标题全是"新会话"，列出来只是一串点不出区别的空行），框里有草稿的除外
+    const byRecent = (sessions ?? []).filter((s) => !isEmpty(s) || drafted.has(s.session)).sort((a, b) => new Date(b.updated_at).getTime() - new Date(a.updated_at).getTime());
     if (!q) {
       if (want("session")) add(all ? m.palette_sec_recent() : m.palette_sec_session(), byRecent.filter((s) => !isArchived(s)).slice(0, all ? 8 : 30).map(sessionItem));
       if (want("matter") && !all) add(m.palette_sec_matter(), (matters ?? []).filter((x) => !x.closed_at).map(matterItem));
@@ -138,7 +140,7 @@ function PaletteBody() {
     if (want("memory") && memoryDone) add(m.palette_sec_memory(), (memorySearch.data ?? []).slice(0, cap).map(memoryItem));
     if (want("cron")) add(m.palette_sec_cron(), (cron ?? []).filter((j) => has(j.name, q) || has(j.prompt, q)).slice(0, cap).map(cronItem));
     return out;
-  }, [kind, q, sessions, matters, cron, memorySearch.data, memoryDone, actions, navigate]);
+  }, [kind, q, sessions, drafted, matters, cron, memorySearch.data, memoryDone, actions, navigate]);
   const flat = useMemo(() => sections.flatMap((s) => s.items), [sections]);
   const active = Math.min(sel, Math.max(0, flat.length - 1));
 

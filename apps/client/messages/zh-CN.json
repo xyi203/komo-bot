@@ -1183,6 +1183,7 @@
   "session_state_running": "运行中",
   "session_state_waiting": "等待中",
   "session_tag_archived": "已归档",
+  "session_tag_draft": "草稿",
   "session_tag_task": "子任务",
   "session_untitled": "新会话",
   "sessions_collapse": "收起",

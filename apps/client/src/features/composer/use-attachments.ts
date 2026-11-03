@@ -1,6 +1,7 @@
 import { uploadAttachment } from "@komo/api";
 import { useCallback, useSyncExternalStore } from "react";
 import { errorText } from "@/lib/errors";
+import { markFileDraft } from "./draft";
 
 /** 输入框里一个还没发出去的附件。粘进来就开始上传；传完拿到 Gateway 给的那行说明（`note`），发送时拼在正文前面。 */
 export interface Draft {
@@ -35,6 +36,7 @@ function boxOf(key: string): Box {
 function update(key: string, change: (all: Draft[]) => Draft[]) {
   const box = boxOf(key);
   box.drafts = change(box.drafts);
+  markFileDraft(key, box.drafts.length > 0);
   box.listeners.forEach((listener) => listener());
 }
 

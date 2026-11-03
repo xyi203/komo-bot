@@ -60,9 +60,18 @@ export interface Grouped {
 /** 还没有任何事件落账的会话（建了但一句话都没发）：`applied_seq` 仍是 0。 */
 export const isEmpty = (s: SessionSummary) => s.applied_seq === 0;
 
-export function groupSessions(sessions: readonly SessionSummary[], homeId: string | undefined, mode: GroupMode, options: ListOptions): Grouped {
-  // 空会话不进侧栏（主会话除外，它始终在最上）；发出第一句后 run 事件会让列表重取，它再出现
-  const visible = sessions.filter((s) => passes(s, options.filter) && (!isEmpty(s) || s.session === homeId));
+/**
+ * `drafted`：框里有没发草稿的会话（`composer/draft.ts`）。空会话不进侧栏（主会话除外，它始终在最上），
+ * 有草稿的除外：新建对话打了字没发就切走，还得点得回来；发出第一句后 run 事件会让列表重取，它照常出现。
+ */
+export function groupSessions(
+  sessions: readonly SessionSummary[],
+  homeId: string | undefined,
+  mode: GroupMode,
+  options: ListOptions,
+  drafted: ReadonlySet<string> = new Set(),
+): Grouped {
+  const visible = sessions.filter((s) => passes(s, options.filter) && (!isEmpty(s) || s.session === homeId || drafted.has(s.session)));
   const order = bySort(options.sort);
   if (mode === "flat") return { main: undefined, groups: [{ key: "flat", kind: "flat", sessions: visible.sort(order) }] };
   // 任务会话挂在父会话下；父会话被筛掉了才自己出现在顶层

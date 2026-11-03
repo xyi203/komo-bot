@@ -4,6 +4,7 @@ import { Link, useParams } from "@tanstack/react-router";
 import { useEffect, useRef, useState, type KeyboardEvent } from "react";
 import { Icon } from "@/components/icon";
 import { IconButton } from "@/components/ui/icon-button";
+import { useDraftedSessions } from "@/features/composer/draft";
 import { errorText } from "@/lib/errors";
 import { usePersistedChoice, usePersistedSet } from "@/lib/storage";
 import { cn } from "@/lib/utils";
@@ -18,6 +19,7 @@ import {
   dirName,
   groupSessions,
   isArchived,
+  isEmpty,
   isLive,
   isRunning,
   isWaiting,
@@ -58,6 +60,7 @@ function SessionList({ prefs }: { prefs: ViewPrefs }) {
   const [showMore, setShowMore] = useState<ReadonlySet<string>>(new Set());
   const [renaming, setRenaming] = useState<string | null>(null);
   const { sessionId } = useParams({ strict: false });
+  const drafted = useDraftedSessions();
 
   // 打开某个子任务时它的父会话自动展开
   const all = sessions.data;
@@ -91,9 +94,10 @@ function SessionList({ prefs }: { prefs: ViewPrefs }) {
   }
 
   if (!all) return null;
-  const grouped = groupSessions(all, home.data?.session, prefs.group, prefs);
+  const grouped = groupSessions(all, home.data?.session, prefs.group, prefs, drafted);
   const rowContext: RowContext = {
     all,
+    drafted,
     filter: prefs.filter,
     currentId: sessionId,
     renaming,
@@ -135,6 +139,8 @@ function SessionList({ prefs }: { prefs: ViewPrefs }) {
 
 interface RowContext {
   all: readonly SessionSummary[];
+  /** 框里有没发草稿的会话：一句话都没发过的那种在行尾标"草稿"。 */
+  drafted: ReadonlySet<string>;
   filter: FilterMode;
   currentId: string | undefined;
   renaming: string | null;
@@ -268,7 +274,14 @@ function StateDot({ running, waiting }: { running?: boolean; waiting?: boolean }
 function SessionRow({ session, ctx, child = false, flat = false }: { session: SessionSummary; ctx: RowContext; child?: boolean; flat?: boolean }) {
   const title = sessionTitle(session);
   const archived = isArchived(session);
-  const tag = archived && ctx.filter !== "archived" ? m.session_tag_archived() : flat && session.kind === "task" ? m.session_tag_task() : null;
+  const tag =
+    archived && ctx.filter !== "archived"
+      ? m.session_tag_archived()
+      : flat && session.kind === "task"
+        ? m.session_tag_task()
+        : isEmpty(session) && ctx.drafted.has(session.session)
+          ? m.session_tag_draft()
+          : null;
   const sidebar = useSidebarContext();
   if (ctx.renaming === session.session) {
     return (

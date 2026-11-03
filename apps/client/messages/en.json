@@ -1191,6 +1191,7 @@
   "session_state_running": "Running",
   "session_state_waiting": "Waiting",
   "session_tag_archived": "Archived",
+  "session_tag_draft": "Draft",
   "session_tag_task": "Task",
   "session_untitled": "New session",
   "sessions_collapse": "Show less",

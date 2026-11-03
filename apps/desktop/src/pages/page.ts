@@ -98,20 +98,39 @@ function renderSettings(info: ConnectionInfo) {
     token,
     el("label", {}, t("额外请求头（可选，每行 名字: 值）", "Extra request headers (optional, one `Name: value` per line)")),
     headers,
-    el("p", { class: "muted" }, t("不能设置 Authorization、Cookie、Host、Origin。令牌和请求头用系统钥匙串加密保存。", "Authorization, Cookie, Host and Origin can't be set. The token and headers are encrypted with the system keychain.")),
+    el("p", { class: "muted hint" }, t("不能设置 Authorization、Cookie、Host、Origin。令牌和请求头用系统钥匙串加密保存。", "Authorization, Cookie, Host and Origin can't be set. The token and headers are encrypted with the system keychain.")),
   );
+  // 已经连着本机时，"使用本机"什么也不会变：置灰，回去用"返回"
+  const alreadyLocal = info.mode === "local" && info.status === "ok";
+  let busy = false;
   const sync = () => {
     remoteForm.hidden = !remote.checked;
     save.textContent = remote.checked ? t("测试并保存", "Test and save") : t("使用本机", "Use local");
     test.hidden = !remote.checked;
+    save.disabled = busy || (!remote.checked && alreadyLocal);
+    test.disabled = busy;
   };
-  const test = button(t("只测试", "Test only"), async () => {
+  // 请求进行中按钮置灰：连点不会并发出几个请求、结果也不会被来回覆盖
+  const run = async (work: () => Promise<void>) => {
+    if (busy) return;
+    busy = true;
+    sync();
+    try {
+      await work();
+    } finally {
+      busy = false;
+      sync();
+    }
+  };
+  const test = button(t("只测试", "Test only"), () => void run(async () => {
     result.replaceChildren(el("p", { class: "muted" }, t("测试中…", "Testing…")));
     showTest(await api.connection.test({ url: url.value, token: token.value, headers: headers.value }));
-  });
-  const save = button("", async () => {
+  }));
+  const save = button("", () => void run(async () => {
     if (!remote.checked) {
-      await api.connection.useLocal();
+      result.replaceChildren();
+      const switched = await api.connection.useLocal();
+      if (!switched.ok) showTest(undefined, switched.error);
       return;
     }
     result.replaceChildren(el("p", { class: "muted" }, t("测试中…", "Testing…")));
@@ -119,7 +138,7 @@ function renderSettings(info: ConnectionInfo) {
     if (!saved.ok) {
       showTest(saved.test, saved.error);
     }
-  }, true);
+  }), true);
   const showTest = (test: TestResult | undefined, error?: string) => {
     result.replaceChildren();
     if (error) result.append(el("p", { class: "bad" }, error));
@@ -136,7 +155,12 @@ function renderSettings(info: ConnectionInfo) {
   root.append(
     el("h1", {}, t("连接设置", "Connection settings")),
     el("p", { class: "muted" }, info.status === "ok" ? `${t("当前", "Current")}: ${info.baseUrl ?? ""}` : info.message ?? ""),
-    el("div", { class: "mode" }, el("label", {}, local, t("本机", "Local")), el("label", {}, remote, t("远程", "Remote"))),
+    el(
+      "div",
+      { class: "field" },
+      el("span", {}, t("连接到", "Connect to")),
+      el("div", { class: "mode", role: "radiogroup" }, el("label", {}, local, t("本机", "Local")), el("label", {}, remote, t("远程", "Remote"))),
+    ),
     remoteForm,
     el("div", { class: "row" }, save, test, button(t("返回", "Back"), () => void api.connection.retry())),
     result,

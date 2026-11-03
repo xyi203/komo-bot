@@ -116,8 +116,8 @@ export function McpSection() {
           <p className="text-label text-muted">{m.mcp_none()}</p>
         </Panel>
       ) : (
-        <div className="overflow-hidden rounded-card bg-surface shadow-lift">
-          <div aria-hidden="true" className="grid h-9 grid-cols-[minmax(0,1fr)_144px_56px_104px_16px] items-center gap-x-4 border-b border-border px-4 text-small text-muted max-[600px]:hidden">
+        <div className="-mx-3">
+          <div aria-hidden="true" className="grid h-9 grid-cols-[minmax(0,1fr)_144px_56px_104px_16px] items-center gap-x-4 border-b border-border px-3 text-small text-muted max-[600px]:hidden">
             <span>{m.mcp_col_server()}</span>
             <span>{m.mcp_col_way()}</span>
             <span>{m.mcp_col_tools()}</span>
@@ -129,7 +129,7 @@ export function McpSection() {
               key={server.name}
               type="button"
               onClick={() => setSelected(server.name)}
-              className="grid min-h-13 w-full cursor-pointer grid-cols-[minmax(0,1fr)_144px_56px_104px_16px] items-center gap-x-4 border-0 border-t border-rule bg-transparent px-4 text-left text-text transition-colors first:border-t-0 hover:bg-hover-on-white max-[600px]:grid-cols-[minmax(0,1fr)_auto_16px] max-[600px]:gap-y-0.5 max-[600px]:px-3.5 max-[600px]:py-2.5"
+              className="grid min-h-13 w-full cursor-pointer grid-cols-[minmax(0,1fr)_144px_56px_104px_16px] items-center gap-x-4 border-0 border-t border-rule bg-transparent px-3 text-left text-text transition-colors first:border-t-0 hover:bg-hover-on-white max-[600px]:grid-cols-[minmax(0,1fr)_auto_16px] max-[600px]:gap-y-0.5 max-[600px]:py-2.5"
             >
               <span className="truncate font-mono max-[600px]:col-start-1 max-[600px]:row-start-1">{server.name}</span>
               <span className="text-label text-muted max-[600px]:col-start-1 max-[600px]:row-start-2">
@@ -209,9 +209,9 @@ function Detail({
         {failure && <FormError>{failure}</FormError>}
       </SettingsCard>
       {tools.length ? (
-        <ul className="overflow-hidden rounded-card bg-surface shadow-lift">
+        <ul>
           {tools.map((tool) => (
-            <li key={tool.name} className="border-t border-rule px-4 py-2.5 first:border-t-0 max-[600px]:px-3">
+            <li key={tool.name} className="border-t border-rule py-2.5 first:border-t-0">
               <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
                 <span className="font-mono font-medium [overflow-wrap:anywhere]">{tool.name}</span>
                 {exposureTag(tool.exposure)}

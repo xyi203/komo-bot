@@ -95,7 +95,7 @@ export function ProviderForm({
     return (
       <div className="pt-3.5">
         {tabs}
-        <PresetGrid selected={draft.preset} onPick={pickPreset} />
+        <PresetGrid onPick={pickPreset} />
         <div className="mt-4">
           <Button onClick={onCancel}>{m.cancel()}</Button>
         </div>
@@ -190,11 +190,16 @@ export function ProviderForm({
   return (
     <form onSubmit={submit} className="pt-0.5">
       {isNew && <div className="pt-3.5">{tabs}</div>}
-      {isNew && draft.tab === "preset" && <PresetGrid selected={draft.preset} onPick={pickPreset} />}
       {showTitle && (
         <div className="mt-3.5 flex items-baseline gap-2.5">
-          <span className="text-read font-semibold">{v.name || v.pid}</span>
+          <span className="text-read">{v.name || v.pid}</span>
           {v.name && v.pid && <span className="text-label text-muted">{v.pid}</span>}
+          {/* 选过预设之后列表收起，只留选中的那家；要换就回到列表 */}
+          {isNew && draft.tab === "preset" && (
+            <TextButton quiet className="ml-auto" onClick={() => setDraft((d) => ({ ...providerDraft(config, null), tab: d.tab }))}>
+              {m.models_preset_change()}
+            </TextButton>
+          )}
         </div>
       )}
 
@@ -399,26 +404,24 @@ export function ProviderForm({
   );
 }
 
-/** 预设卡：点一张填好 ID、显示名称、地址、协议，只剩密钥和模型。 */
-function PresetGrid({ selected, onPick }: { selected: string | null; onPick: (preset: Preset) => void }) {
+/** 预设列表：一家一行（名字在左、协议在右），行间细线，和设置行同一套；点一行填好 ID、显示名称、地址、协议，只剩密钥和模型。 */
+function PresetGrid({ onPick }: { onPick: (preset: Preset) => void }) {
   return (
-    <div className="mt-3 grid grid-cols-[repeat(auto-fill,minmax(150px,1fr))] gap-2.5">
+    <ul className="mt-3">
       {PRESETS.map((preset) => (
-        <button
-          key={preset.key}
-          type="button"
-          aria-pressed={selected === preset.key}
-          onClick={() => onPick(preset)}
-          className={cn(
-            "flex cursor-pointer flex-col gap-0.5 rounded-inner bg-surface px-3.5 py-3 text-left shadow-ring hover:shadow-ring-control",
-            selected === preset.key && "shadow-[0_0_0_2px_var(--color-primary)] hover:shadow-[0_0_0_2px_var(--color-primary)]",
-          )}
-        >
-          <b className="font-semibold">{preset.label}</b>
-          <span className="text-small text-muted">{backendName(preset.api_backend)}</span>
-        </button>
+        <li key={preset.key} className="border-t border-rule first:border-t-0">
+          <button
+            type="button"
+            onClick={() => onPick(preset)}
+            className="-mx-2 flex w-[calc(100%+16px)] cursor-pointer items-center gap-3 rounded-control px-2 py-2.5 text-left transition-colors hover:bg-hover-on-white"
+          >
+            <span className="min-w-0 flex-1 truncate">{preset.label}</span>
+            <span className="text-label text-muted">{backendName(preset.api_backend)}</span>
+            <Icon name="right" className="size-3.5 text-faint" />
+          </button>
+        </li>
       ))}
-    </div>
+    </ul>
   );
 }
 

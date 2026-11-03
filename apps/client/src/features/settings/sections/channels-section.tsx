@@ -6,14 +6,12 @@ import { Button } from "@/components/ui/button";
 import { errorText } from "@/lib/errors";
 import { formatElapsed } from "@/lib/format";
 import { m } from "@/paraglide/messages.js";
-import { CardRow, Hint, KState, Panel, SettingsCard, Tag } from "../controls";
+import { CardRow, KState, KeyValues, Panel, SettingsCard, Tag } from "../controls";
 import { withCode } from "../rich";
 import { SectionHead } from "../section-head";
 
 // 渠道的显示名是平台自己的名字，不随界面语言变（机器名）。
 const CHANNEL_NAME: Record<string, string> = { feishu: "Feishu", telegram: "Telegram", wechat: "WeChat" };
-
-const Sep = () => <span className="mx-1.5 text-faint">·</span>;
 
 // Gateway 只看得见插件进程这一层；平台长连接掉了由插件自己往 home 告警
 function State({ channel }: { channel: ChannelView }) {
@@ -82,50 +80,55 @@ export function ChannelsSection() {
       {head}
       {channels.data.channels.map((channel) => {
         const result = results[channel.channel];
+        // 和 Gateway 一节同一个样子：一行名字、状态与操作，下面是左键右值的细线行；没启用的只有那一行
         return (
-          <SettingsCard key={channel.channel}>
-            <CardRow
-              title={
-                <>
-                  {CHANNEL_NAME[channel.channel] ?? channel.channel}
-                  {channel.custom_plugin && <Tag>{m.channels_custom_plugin()}</Tag>}
-                </>
-              }
-              desc={
-                <span>
-                  <State channel={channel} />
-                  {channel.enabled && (
-                    <>
-                      <Sep />
-                      {channel.allow_tenant ? m.channels_allow_tenant({ count: channel.allow_from }) : m.channels_allow({ count: channel.allow_from })}
-                      <Sep />
-                      {channel.home_chat ? (
-                        <>
-                          {m.channels_home_to()} <span className="font-mono">{channel.home_chat}</span>
-                        </>
-                      ) : (
-                        m.channels_home_none()
-                      )}
-                    </>
-                  )}
-                </span>
-              }
-              control={
-                channel.enabled ? (
-                  <Button size="sm" disabled={probing === channel.channel} onClick={() => void probe(channel.channel)}>
-                    {probing === channel.channel ? m.channels_probing() : m.channels_probe()}
-                  </Button>
-                ) : undefined
-              }
-            />
-            {channel.outbound_only && <Hint>{withCode(m.channels_outbound_only())}</Hint>}
-            {channel.detail && channel.state !== "running" && <Hint bad>{channel.detail}</Hint>}
-            {result && (
-              <Hint bad={!result.ok}>
-                {result.ok ? m.channels_probe_ok() : m.channels_probe_failed()} {result.message}
-              </Hint>
+          <div key={channel.channel} className="border-b border-rule last:border-b-0">
+            <SettingsCard>
+              <CardRow
+                title={
+                  <>
+                    {CHANNEL_NAME[channel.channel] ?? channel.channel}
+                    {channel.custom_plugin && <Tag>{m.channels_custom_plugin()}</Tag>}
+                  </>
+                }
+                desc={<State channel={channel} />}
+                control={
+                  channel.enabled ? (
+                    <Button size="sm" disabled={probing === channel.channel} onClick={() => void probe(channel.channel)}>
+                      {probing === channel.channel ? m.channels_probing() : m.channels_probe()}
+                    </Button>
+                  ) : undefined
+                }
+              />
+            </SettingsCard>
+            {channel.enabled && (
+              <KeyValues
+                rows={[
+                  [
+                    m.channels_key_allow(),
+                    channel.outbound_only ? (
+                      <span className="text-muted">{withCode(m.channels_outbound_only())}</span>
+                    ) : channel.allow_tenant ? (
+                      m.channels_allow_tenant({ count: channel.allow_from })
+                    ) : (
+                      m.channels_allow({ count: channel.allow_from })
+                    ),
+                  ],
+                  [
+                    m.channels_key_home(),
+                    channel.home_chat ? <span className="font-mono">{channel.home_chat}</span> : <span className="text-muted">{m.channels_home_none()}</span>,
+                  ],
+                  !!channel.detail && channel.state !== "running" && [m.channels_key_error(), <span className="text-negative">{channel.detail}</span>],
+                  !!result && [
+                    m.channels_probe(),
+                    <span className={result.ok ? undefined : "text-negative"}>
+                      {result.ok ? m.channels_probe_ok() : m.channels_probe_failed()} {result.message}
+                    </span>,
+                  ],
+                ]}
+              />
             )}
-          </SettingsCard>
+          </div>
         );
       })}
     </>

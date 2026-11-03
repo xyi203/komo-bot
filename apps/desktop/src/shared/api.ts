@@ -55,6 +55,42 @@ export interface NotifyInput {
 
 export type WindowAction = "minimize" | "toggle-maximize" | "toggle-fullscreen" | "close";
 
+/** 右栏浏览器当前页。没打开过网页时 url 为空。 */
+export interface BrowserState {
+  url: string;
+  title: string;
+  canGoBack: boolean;
+  canGoForward: boolean;
+  loading: boolean;
+  /** 主框架没加载成功的原因。 */
+  error?: string;
+}
+
+/** 界面上浏览器占位框的位置（CSS 像素，相对窗口内容区左上角）。 */
+export interface BrowserRect {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+export type BrowserAction = "back" | "forward" | "reload" | "stop";
+
+export interface BrowserCapture {
+  png: Uint8Array;
+  width: number;
+  height: number;
+  url: string;
+  title: string;
+}
+
+export interface DevServer {
+  url: string;
+  port: number;
+  /** 首页的 <title>；不是 HTML 或没有就是空串。 */
+  title: string;
+}
+
 export interface KomoDesktopApi {
   /** 接口版本；以后有不兼容改动再加。 */
   readonly apiVersion: 1;
@@ -80,8 +116,25 @@ export interface KomoDesktopApi {
   window: {
     do(action: WindowAction): Promise<void>;
   };
+  /** 右栏浏览器：网页是一块盖在占位框上的原生视图，与界面隔离（单独 session、无 preload）。 */
+  browser: {
+    state(): Promise<BrowserState>;
+    /** 报占位框的位置；null 藏起来。 */
+    setBounds(rect: BrowserRect | null): Promise<void>;
+    /** 地址栏输入；没写协议的自动补，只认 http(s)。 */
+    navigate(input: string): Promise<{ ok: boolean; error?: string }>;
+    act(action: BrowserAction): Promise<void>;
+    /** 截当前可见的一屏（PNG）。 */
+    capture(): Promise<BrowserCapture>;
+    /** 扫本机常用端口上的 dev server。 */
+    detectDevServers(): Promise<DevServer[]>;
+    /** 地址、标题、加载状态变了。返回取消订阅函数。 */
+    onState(handler: (state: BrowserState) => void): () => void;
+  };
   /** 全局快捷键被按下：界面该打开 ⌘K。返回取消订阅函数。 */
   onCommandPalette(handler: () => void): () => void;
+  /** ⌘, 或菜单栏图标的"设置…"：界面该打开设置弹窗（section 是要停的那一节，如 gateway）。返回取消订阅函数。 */
+  onOpenSettings(handler: (section?: string) => void): () => void;
   /** 深链或通知点击要打开某个会话。登记之后主进程才改用它而不是整页跳转。 */
   onOpenSession(handler: (sessionId: string) => void): () => void;
 }

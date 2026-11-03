@@ -20,7 +20,7 @@ const text = {
   open: () => (zh() ? "打开 komo" : "Open komo"),
   pending: (n: number) => (zh() ? `待处理 ${n} 项` : `${n} pending`),
   nonePending: () => (zh() ? "没有待处理" : "Nothing pending"),
-  settings: () => (zh() ? "连接设置…" : "Connection settings…"),
+  settings: () => (zh() ? "设置…" : "Settings…"),
   quit: () => (zh() ? "退出 komo" : "Quit komo"),
   kind: (kind: string) =>
     kind === "confirm"

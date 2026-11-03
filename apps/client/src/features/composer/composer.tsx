@@ -5,8 +5,7 @@ import { ImageZoom } from "@/components/image-zoom";
 import { Spinner } from "@/components/spinner";
 import type { View } from "@/features/conversation/model";
 import { pctOf, pctText, type ContextView } from "@/features/panel/context-usage";
-import { formatElapsed, formatTokens } from "@/lib/format";
-import { useNow } from "@/lib/hooks";
+import { formatTokens } from "@/lib/format";
 import { showToast } from "@/lib/toast";
 import { cn } from "@/lib/utils";
 import { m } from "@/paraglide/messages.js";
@@ -182,7 +181,7 @@ export function Composer({
         </div>
       </form>
       <div className="mx-auto mt-1 flex h-7 max-w-180 items-center gap-2 px-2 text-label text-muted max-[600px]:justify-end">
-        <UsageLine view={view} busy={busy} />
+        <UsageLine view={view} />
         {models && models.length > 0 && (
           <>
             <select
@@ -268,32 +267,24 @@ function DraftList({ drafts, onRemove }: { drafts: readonly Draft[]; onRemove: (
 const pickClass =
   "h-6 min-w-0 max-w-40 cursor-pointer truncate rounded-sm border-0 bg-transparent px-1 text-label hover:bg-hover-on-white max-[600px]:max-w-32";
 
-/** 左边的用量行：跑着时是转圈加计时；否则"N 轮 M 步 · 4.4M tok · 缓存命中 95%"（从 `message.assistant` 的用量累加）。 */
-function UsageLine({ view, busy }: { view: View | undefined; busy: boolean }) {
+/**
+ * 左边的用量行："N 轮 M 步 · 4.4M tok · 缓存命中 95%"（从 `message.assistant` 的用量累加）。
+ * 跑着时也是这一行：转圈与计时只在这一轮的抬头（turn.tsx），这里不再重复一份。
+ */
+function UsageLine({ view }: { view: View | undefined }) {
   const turns = view?.turns.size ?? 0;
-  const running = busy ? [...(view?.runs.values() ?? [])][0] : undefined;
-  const now = useNow(!!running);
   if (!view || !turns) return <span className="max-[600px]:hidden" />;
   const { stats } = view;
   const hit = stats.input ? Math.round((stats.cache / stats.input) * 100) : null;
   return (
     <span className="inline-flex min-w-0 items-center gap-1 overflow-hidden whitespace-nowrap tabular-nums max-[600px]:hidden">
-      {running ? (
+      {m.composer_turns({ count: turns })} {m.composer_steps({ count: stats.steps })}
+      <Sep />
+      {m.composer_tokens({ tokens: formatTokens(stats.input + stats.output) })}
+      {hit != null && (
         <>
-          <Spinner small />
-          {m.composer_running({ time: formatElapsed(running.since, now) })}
-        </>
-      ) : (
-        <>
-          {m.composer_turns({ count: turns })} {m.composer_steps({ count: stats.steps })}
           <Sep />
-          {m.composer_tokens({ tokens: formatTokens(stats.input + stats.output) })}
-          {hit != null && (
-            <>
-              <Sep />
-              {m.composer_cache({ pct: hit })}
-            </>
-          )}
+          {m.composer_cache({ pct: hit })}
         </>
       )}
     </span>

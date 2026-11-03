@@ -14,9 +14,8 @@ import { Icon } from "@/components/icon";
 import { BlockError, SkeletonRows } from "@/components/page";
 import { Button } from "@/components/ui/button";
 import { errorText } from "@/lib/errors";
-import { cn } from "@/lib/utils";
 import { m } from "@/paraglide/messages.js";
-import { AddCard, Hint, NativeSelect, Notice, Pill, TextButton, Tag } from "../controls";
+import { AddCard, Hint, KState, NativeSelect, Notice, TextButton, Tag } from "../controls";
 import { EmbeddingForm, type EmbeddingSubmit } from "../models/embedding-form";
 import { isCustomProvider, kindOf } from "../models/defs";
 import { ProviderForm, type ProviderSubmit } from "../models/provider-form";
@@ -115,12 +114,12 @@ export function ModelsSection() {
         open={open}
         title={
           <>
-            <span className="text-read font-medium">{provider.name || provider.id}</span>
+            <span className="text-read">{provider.name || provider.id}</span>
             {kindOf(provider) === "embedding" && <Tag className="ml-0">{m.models_tag_embedding()}</Tag>}
             {isCustomProvider(provider.base_url) && <Tag className="ml-0">{m.models_tag_custom()}</Tag>}
-            <KeyDot ok={provider.key_set} title={providerDotTitle(provider)} />
           </>
         }
+        desc={<KState tone={provider.key_set ? "ok" : "warn"}>{providerDotTitle(provider)}</KState>}
         actions={
           <>
             <Button size="sm" onClick={() => { edit.setFailure(null); setConfirm(null); setEditing({ kind: "provider", id: provider.id }); }}>
@@ -163,12 +162,16 @@ export function ModelsSection() {
         open={open}
         title={
           <>
-            <span className="text-read font-medium">{entry.name || entry.alias}</span>
+            <span className="text-read">{entry.name || entry.alias}</span>
             <Tag className="ml-0">{m.models_tag_embedding()}</Tag>
             <Tag className="ml-0">{m.models_tag_custom()}</Tag>
-            {inUse && <Pill>{m.models_in_use()}</Pill>}
-            <KeyDot ok={entry.key_set} title={entry.key_set ? m.models_key_set({ name: entry.env_key ?? m.models_key_generic() }) : m.models_key_missing({ name: entry.env_key ?? "" })} />
+            {inUse && <Tag className="ml-0">{m.models_in_use()}</Tag>}
           </>
+        }
+        desc={
+          <KState tone={entry.key_set ? "ok" : "warn"}>
+            {entry.key_set ? m.models_key_set({ name: entry.env_key ?? m.models_key_generic() }) : m.models_key_missing({ name: entry.env_key ?? "" })}
+          </KState>
         }
         actions={
           <>
@@ -233,7 +236,7 @@ export function ModelsSection() {
             key={`chat:${model.alias}`}
             title={
               <>
-                <span className="text-read font-medium">{model.name || model.alias}</span>
+                <span className="text-read">{model.name || model.alias}</span>
                 <Tag className="ml-0">{m.models_tag_custom()}</Tag>
               </>
             }
@@ -241,7 +244,7 @@ export function ModelsSection() {
           />
         ))}
       {editing?.kind === "new-provider" ? (
-        <Card open title={<span className="text-read font-medium">{m.models_add_provider()}</span>}>
+        <Card open title={<span className="text-read">{m.models_add_provider()}</span>}>
           <Panel>
             <ProviderForm config={config} provider={null} busy={busy} failure={formFailure} onSubmit={(s) => void submitProvider(s)} onCancel={idle} />
           </Panel>
@@ -268,12 +271,18 @@ function providerDotTitle(provider: ProviderEntry): string {
   return provider.env_key ? m.models_key_missing({ name: provider.env_key }) : m.models_key_unnamed();
 }
 
-/** 一个提供商的卡：标题行（名称、标签、状态点）在左，操作在右；展开编辑时操作收起。 */
-function Card({ open, title, actions, children }: { open?: boolean; title: ReactNode; actions?: ReactNode; children?: ReactNode }) {
+/**
+ * 一个提供商的一行，和其余设置行（`SettingsCard` + `CardRow`）同一套尺寸：上一行名称与标签，下一行凭证状态（`KState`），
+ * 操作在右、对着两行的中线；展开编辑时操作收起。行间细线。
+ */
+function Card({ open, title, desc, actions, children }: { open?: boolean; title: ReactNode; desc?: ReactNode; actions?: ReactNode; children?: ReactNode }) {
   return (
-    <section className="mb-3 rounded-card bg-surface px-4 py-3.5 shadow-lift max-[600px]:p-3">
-      <header className="flex min-h-9 items-center gap-3 max-[600px]:items-start">
-        <div className="flex min-w-0 flex-1 flex-wrap items-center gap-x-2.5 gap-y-1.5">{title}</div>
+    <section className="border-b border-rule py-4 max-[600px]:py-3.5">
+      <header className="flex items-center gap-6 max-[600px]:gap-3">
+        <div className="min-w-0 flex-1">
+          <div className="flex min-h-5.5 flex-wrap items-center gap-x-2 gap-y-1 text-read leading-5.5">{title}</div>
+          {desc && <p className="mt-1 text-label leading-5 text-muted">{desc}</p>}
+        </div>
         {!open && actions && <span className="flex shrink-0 items-center gap-3">{actions}</span>}
       </header>
       {children}
@@ -281,13 +290,9 @@ function Card({ open, title, actions, children }: { open?: boolean; title: React
   );
 }
 
-/** 凭证就绪 = 能运行，用叶绿；缺凭证是琥珀。 */
-function KeyDot({ ok, title }: { ok: boolean; title: string }) {
-  return <span role="img" aria-label={title} title={title} className={cn("size-2 shrink-0 rounded-full", ok ? "bg-accent" : "bg-wait-dot")} />;
-}
-
+/** 展开的编辑 / 添加表单：不再放在灰底的井里，直接落在这一行下面（输入框自己有细环）。 */
 function Panel({ children }: { children: ReactNode }) {
-  return <div className="mt-3 rounded-card bg-ground px-4.5 pt-1 pb-4.5 max-[600px]:px-3.5">{children}</div>;
+  return <div className="pb-1">{children}</div>;
 }
 
 function DeleteAsk({ text, id, busy, failure, onSure, onCancel }: { text: string; id: string; busy: boolean; failure?: string; onSure: () => void; onCancel: () => void }) {

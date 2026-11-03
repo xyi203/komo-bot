@@ -1,6 +1,7 @@
 import { Menu, app, ipcMain, type IpcMainInvokeEvent, type MenuItemConstructorOptions } from "electron";
 import { channels } from "./channels";
-import type { NotifyInput, RemoteInput, WindowAction } from "../shared/api";
+import type { BrowserAction, BrowserRect, NotifyInput, RemoteInput, WindowAction } from "../shared/api";
+import { BrowserPane } from "./browser";
 import { ConnectionManager } from "./connection";
 import { readBuildInfo } from "./paths";
 import { installHandler, registerSchemes } from "./protocol";
@@ -41,6 +42,7 @@ app.on("open-url", (event, url) => {
 let windows: WindowManager;
 let connection: ConnectionManager;
 let system: SystemIntegration;
+let browser: BrowserPane;
 
 function openDeepLink(raw: string) {
   const id = parseDeepLink(raw);
@@ -117,13 +119,31 @@ function registerIpc() {
     else if (action === "toggle-fullscreen") win.setFullScreen(!win.isFullScreen());
     else if (action === "close") win.close();
   }));
+  ipcMain.handle(channels.browserState, guard(() => browser.state()));
+  ipcMain.handle(channels.browserBounds, guard((rect: BrowserRect | null) => browser.setBounds(validRect(rect))));
+  ipcMain.handle(channels.browserNavigate, guard((input: string) =>
+    typeof input === "string" ? browser.navigate(input.slice(0, 4096)) : { ok: false, error: "bad input" }));
+  ipcMain.handle(channels.browserAct, guard((action: BrowserAction) => {
+    if (["back", "forward", "reload", "stop"].includes(action)) browser.act(action);
+  }));
+  ipcMain.handle(channels.browserCapture, guard(() => browser.capture()));
+  ipcMain.handle(channels.browserDetect, guard(() => browser.detectDevServers()));
+  ipcMain.on(channels.openSettingsListening, (event) => {
+    if (isAppUrl(event.senderFrame?.url ?? "")) windows.markSettingsListening();
+  });
   ipcMain.on(channels.openSessionListening, (event) => {
     if (isAppUrl(event.senderFrame?.url ?? "")) windows.markSessionListening();
   });
 }
 
+function validRect(rect: unknown): BrowserRect | null {
+  if (!rect || typeof rect !== "object") return null;
+  const { x, y, width, height } = rect as Record<string, unknown>;
+  const ok = [x, y, width, height].every((n) => typeof n === "number" && Number.isFinite(n));
+  return ok ? { x: x as number, y: y as number, width: width as number, height: height as number } : null;
+}
+
 function buildMenu() {
-  const settings = () => windows.loadPage("settings");
   const template: MenuItemConstructorOptions[] = [
     {
       label: app.name,
@@ -131,7 +151,7 @@ function buildMenu() {
         { role: "about" },
         { label: "检查更新… / Check for Updates…", click: () => void checkForUpdatesInteractive() },
         { type: "separator" },
-        { label: "连接设置… / Connection Settings…", accelerator: "CommandOrControl+,", click: () => { windows.show(); settings(); } },
+        { label: "设置… / Settings…", accelerator: "CommandOrControl+,", click: () => windows.openSettings() },
         { type: "separator" },
         { role: "hide" },
         { role: "hideOthers" },
@@ -166,14 +186,12 @@ void app.whenReady().then(async () => {
   if (app.isPackaged) app.setAsDefaultProtocolClient("komo");
   connection = new ConnectionManager(build, app.getVersion());
   windows = new WindowManager(build, app.getVersion());
+  browser = new BrowserPane(() => windows.window);
   system = new SystemIntegration(connection, windows);
   installHandler(connection);
   registerIpc();
   buildMenu();
-  system.start(() => {
-    windows.show();
-    windows.loadPage("settings");
-  });
+  system.start(() => windows.openSettings("gateway"));
   setupUpdater(() => windows.markQuitting());
 
   // 冷启动带着 komo:// 参数的情况（open-url 事件可能先于 ready，已经记进 pendingSession）。

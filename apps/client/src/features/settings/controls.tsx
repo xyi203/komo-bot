@@ -1,12 +1,12 @@
 import type { ComponentProps, ReactNode } from "react";
 import { cn } from "@/lib/utils";
 
-// 设置各节共用的表单控件与卡片（原型 styles.css 的 .scard / .switch / .input / .select / .tag / .kstate / .notice）。
+// 设置各节共用的表单控件与行（原型 styles.css 的 .switch / .input / .select / .tag / .kstate / .notice）。
 // 模型节与其余六节都从这里取，样式只在这一处。
 
-/** 一项设置的卡片：左边名字与说明（`children` 之外由调用方放），右边控件。 */
+/** 一项设置的一行（照 Claude 桌面设置页，不是卡片）：左边名字与说明，右边控件；行间一条细线。 */
 export function SettingsCard({ children, className }: { children: ReactNode; className?: string }) {
-  return <section className={cn("mb-3 min-w-0 rounded-card bg-surface px-5 py-4 shadow-lift max-[600px]:px-4 max-[600px]:py-3.5", className)}>{children}</section>;
+  return <section className={cn("min-w-0 border-b border-rule py-4 last:border-b-0 max-[600px]:py-3.5", className)}>{children}</section>;
 }
 
 /** 卡片里的一行：左文右控件；窄屏控件落到文字下面（`inline` 的开关除外）。 */
@@ -14,7 +14,7 @@ export function CardRow({ title, desc, control, inline, mono }: { title: ReactNo
   return (
     <div className={cn("flex items-center gap-6 max-[600px]:gap-3", !inline && "max-[600px]:flex-col max-[600px]:items-stretch")}>
       <div className="min-w-0 flex-1">
-        <h4 className={cn("m-0 text-read leading-5.5", mono ? "font-mono font-medium" : "font-semibold")}>{title}</h4>
+        <h4 className={cn("m-0 text-read leading-5.5 font-normal", mono && "font-mono")}>{title}</h4>
         {desc && <p className="mt-1 text-label leading-5 text-muted">{desc}</p>}
       </div>
       {control && <div className="flex shrink-0 items-center gap-2 max-[600px]:[&_select]:min-w-0 max-[600px]:[&_select]:flex-1">{control}</div>}
@@ -22,9 +22,9 @@ export function CardRow({ title, desc, control, inline, mono }: { title: ReactNo
   );
 }
 
-/** 面板（键值、操作条）：和卡片同一张纸。 */
+/** 面板（键值、操作条、一句空状态）：不画框，直接落在节标题下面。 */
 export function Panel({ children, className }: { children: ReactNode; className?: string }) {
-  return <div className={cn("min-w-0 rounded-card bg-surface p-4 shadow-lift max-[600px]:p-3", className)}>{children}</div>;
+  return <div className={cn("min-w-0 py-1", className)}>{children}</div>;
 }
 
 /** 节头右边按钮的一行：右上角的操作。 */
@@ -185,7 +185,7 @@ export function AddCard({ children, ...props }: ComponentProps<"button">) {
   return (
     <button
       type="button"
-      className="flex h-12 w-full cursor-pointer items-center justify-center gap-1.5 rounded-card border border-dashed border-control bg-transparent text-muted transition-colors hover:bg-hover-on-white hover:text-text"
+      className="mt-3 flex h-12 w-full cursor-pointer items-center justify-center gap-1.5 rounded-card border border-dashed border-control bg-transparent text-muted transition-colors hover:bg-hover-on-white hover:text-text"
       {...props}
     >
       {children}
@@ -193,15 +193,15 @@ export function AddCard({ children, ...props }: ComponentProps<"button">) {
   );
 }
 
-/** 键值块：左边键、右边值。 */
+/** 键值块：一行一项，左边 `--muted` 的键、右边值，行间细线（和设置行同一套）。 */
 export function KeyValues({ rows }: { rows: ([ReactNode, ReactNode] | null | false)[] }) {
   return (
-    <dl className="m-0 grid grid-cols-[72px_minmax(0,1fr)] gap-x-3 text-label leading-5 max-[600px]:grid-cols-[64px_minmax(0,1fr)]">
+    <dl className="m-0">
       {rows.map((row) =>
         row ? (
-          <div key={String(row[0])} className="contents">
-            <dt className="py-1 text-muted">{row[0]}</dt>
-            <dd className="m-0 min-w-0 py-1 [overflow-wrap:anywhere]">{row[1]}</dd>
+          <div key={String(row[0])} className="grid grid-cols-[128px_minmax(0,1fr)] gap-x-4 border-b border-rule py-3 last:border-b-0 max-[600px]:grid-cols-[88px_minmax(0,1fr)]">
+            <dt className="text-muted">{row[0]}</dt>
+            <dd className="m-0 min-w-0 [overflow-wrap:anywhere]">{row[1]}</dd>
           </div>
         ) : null,
       )}

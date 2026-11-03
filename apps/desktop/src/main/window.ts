@@ -12,6 +12,8 @@ export class WindowManager {
   /** 界面是否登记了 onOpenSession：登记了就用事件打开会话（不重载页面），否则整页跳转。 */
   private sessionListening = false;
   private paletteQueued = false;
+  /** 界面登记了 onOpenSettings：⌘, 打开 SPA 里的设置弹窗；没登记（提示页、老界面）才去壳的连接设置页。 */
+  private settingsListening = false;
   /** 真要退出了（菜单退出、⌘Q、重启装更新）：这时关窗口才真的销毁它。 */
   private quitting = false;
 
@@ -99,7 +101,10 @@ export class WindowManager {
     wc.on("will-attach-webview", (event) => event.preventDefault());
     wc.on("did-start-navigation", (_event, _url, isInPlace, isMainFrame) => {
       // 整页换了才要让界面重新登记；SPA 内部路由跳转（isInPlace）不算。
-      if (isMainFrame && !isInPlace) this.sessionListening = false;
+      if (isMainFrame && !isInPlace) {
+        this.sessionListening = false;
+        this.settingsListening = false;
+      }
     });
     wc.on("did-finish-load", () => {
       if (this.paletteQueued && this.onSpa()) {
@@ -118,6 +123,18 @@ export class WindowManager {
 
   markSessionListening() {
     this.sessionListening = true;
+  }
+
+  markSettingsListening() {
+    this.settingsListening = true;
+  }
+
+  /** 打开设置：在 SPA 里就开设置弹窗（停在 section），否则（连不上、版本不一致）开壳的连接设置页。 */
+  openSettings(section?: string) {
+    this.show();
+    const wc = this.ensure().webContents;
+    if (this.onSpa() && this.settingsListening && !wc.isLoading()) wc.send(channels.openSettings, section);
+    else this.loadPage("settings");
   }
 
   markQuitting() {

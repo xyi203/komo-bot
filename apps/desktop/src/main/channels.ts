@@ -11,8 +11,17 @@ export const channels = {
   notify: "komo:notify",
   window: "komo:window",
   commandPalette: "komo:command-palette",
+  openSettings: "komo:open-settings",
+  openSettingsListening: "komo:open-settings-listening",
   openSession: "komo:open-session",
   openSessionListening: "komo:open-session-listening",
+  browserState: "komo:browser:state",
+  browserBounds: "komo:browser:bounds",
+  browserNavigate: "komo:browser:navigate",
+  browserAct: "komo:browser:act",
+  browserCapture: "komo:browser:capture",
+  browserDetect: "komo:browser:detect",
+  browserStateChanged: "komo:browser:state-changed",
 } as const;
 
 /** 界面里 ⌘K 事件的 DOM 事件名（preload 在 window 上派发，没有 detail）。 */

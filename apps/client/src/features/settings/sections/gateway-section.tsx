@@ -1,45 +1,42 @@
 import { useGatewayHealth } from "@komo/api";
 import { BlockError, SkeletonRows } from "@/components/page";
-import { Button } from "@/components/ui/button";
 import { errorText } from "@/lib/errors";
 import { formatDateTime, formatRelative } from "@/lib/format";
 import { m } from "@/paraglide/messages.js";
 import { CardRow, KState, KeyValues, Panel, SettingsCard } from "../controls";
 import { SectionHead } from "../section-head";
-
-/** Electron 壳（C2）给界面的约定：`window.komoDesktop?.connection?.openSettings()` 打开"换 Gateway"的设置。 */
-function desktopConnection(): { openSettings: () => void } | undefined {
-  return (window as unknown as { komoDesktop?: { connection?: { openSettings?: () => void } } }).komoDesktop?.connection as
-    | { openSettings: () => void }
-    | undefined;
-}
+import { DesktopConnectionRow, desktopConnection } from "./desktop-connection";
 
 /**
  * Gateway：版本与协议、启动时间、实例、数据目录、遥测。
  * 与原型的偏离：网页由 Gateway 同源托管，换 Gateway 就是换地址，所以不再有"改连的 Gateway"；
- * 这里只显示当前地址（`location.origin`），在 Electron 里多一个按钮去打开壳自己的连接设置。
+ * 这里只显示当前地址（`location.origin`）；在 Electron 里这一行就是连接设置（本机 / 远程），直接在下面填，不跳页。
  */
 export function GatewaySection() {
   const health = useGatewayHealth();
   const head = <SectionHead title={m.settings_sec_gateway()} description={m.gateway_desc()} />;
   const desktop = desktopConnection();
   const h = health.data;
+  const status = health.isError ? <KState tone="bad">{m.gateway_unreachable()}</KState> : h ? <><KState tone="ok">{m.gateway_connected()}</KState><span className="mx-1.5 text-faint">·</span>{m.gateway_rtt({ ms: h.rtt_ms })}</> : null;
   return (
     <>
       {head}
-      <SettingsCard>
-        <CardRow
-          title={m.gateway_connection()}
-          desc={
-            <>
-              <span className="font-mono">{location.origin}</span>
-              <span className="mx-1.5 text-faint">·</span>
-              {health.isError ? <KState tone="bad">{m.gateway_unreachable()}</KState> : h ? <><KState tone="ok">{m.gateway_connected()}</KState><span className="mx-1.5 text-faint">·</span>{m.gateway_rtt({ ms: h.rtt_ms })}</> : null}
-            </>
-          }
-          control={desktop ? <Button size="sm" onClick={() => desktop.openSettings()}>{m.gateway_change()}</Button> : undefined}
-        />
-      </SettingsCard>
+      {desktop ? (
+        <DesktopConnectionRow api={desktop} status={status} />
+      ) : (
+        <SettingsCard>
+          <CardRow
+            title={m.gateway_connection()}
+            desc={
+              <>
+                <span className="font-mono">{location.origin}</span>
+                <span className="mx-1.5 text-faint">·</span>
+                {status}
+              </>
+            }
+          />
+        </SettingsCard>
+      )}
       {health.isError ? (
         <BlockError message={m.gateway_load_error({ message: errorText(health.error) })} onRetry={() => void health.refetch()} />
       ) : !h ? (

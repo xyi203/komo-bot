@@ -11,6 +11,7 @@ import { ConversationProvider } from "@/features/conversation/context";
 import { foldEvents } from "@/features/conversation/model";
 import { Thread } from "@/features/conversation/thread";
 import { NavToggle } from "@/features/layout/nav-toggle";
+import { BrowserPane, desktopBrowser, useBrowserOpen } from "@/features/browser/browser-pane";
 import { PanelShell, usePanel } from "@/features/layout/panel";
 import { contextView } from "@/features/panel/context-usage";
 import { PanelContent } from "@/features/panel/panel-content";
@@ -50,6 +51,9 @@ function SessionBody({ sessionId, tab, setTab }: { sessionId: string; tab: Tab; 
   const changesQuery = useSessionChanges(sessionId);
   const actions = useSessionActions();
   const panel = usePanel();
+  const browserApi = desktopBrowser();
+  const [browserOpen, setBrowserOpen] = useBrowserOpen();
+  const showBrowser = !!browserApi && browserOpen;
   const trace = useTraceUi();
 
   const summary = sessions.data?.find((s) => s.session === sessionId);
@@ -189,6 +193,15 @@ function SessionBody({ sessionId, tab, setTab }: { sessionId: string; tab: Tab; 
               />
             </Tooltip>
             <IconButton name="branch" label={m.topbar_fork()} onClick={() => void actions.fork(sessionId)} className="max-[600px]:size-11" />
+            {browserApi && (
+              <IconButton
+                name="globe"
+                label={showBrowser ? m.browser_close() : m.browser_open()}
+                aria-expanded={showBrowser}
+                onClick={() => setBrowserOpen(!showBrowser)}
+                className={cn("max-[600px]:hidden", showBrowser && "bg-active text-text")}
+              />
+            )}
             <IconButton
               name="details"
               label={panel.open ? m.topbar_panel_close() : m.topbar_panel_open()}
@@ -198,7 +211,19 @@ function SessionBody({ sessionId, tab, setTab }: { sessionId: string; tab: Tab; 
             />
           </div>
         </header>
-        <div className={cn("grid min-h-0 flex-1", panel.docked && panel.open ? "grid-cols-[minmax(0,1fr)_336px]" : "grid-cols-[minmax(0,1fr)]")}>
+        <div
+          className={cn(
+            "grid min-h-0 flex-1",
+            // 浏览器开着：对话与网页对半分，右栏仍贴在最右
+            showBrowser
+              ? panel.docked && panel.open
+                ? "grid-cols-[minmax(0,1fr)_minmax(0,1fr)_336px]"
+                : "grid-cols-[minmax(0,1fr)_minmax(0,1fr)]"
+              : panel.docked && panel.open
+                ? "grid-cols-[minmax(0,1fr)_336px]"
+                : "grid-cols-[minmax(0,1fr)]",
+          )}
+        >
           <div className="relative flex min-h-0 min-w-0 flex-col">
             {/* 顶栏下一段白到透明的渐隐：正文滚上去是慢慢淡掉，不在分界线上被切成半行字。 */}
             <div aria-hidden className="pointer-events-none absolute inset-x-0 top-0 z-10 h-6 bg-linear-to-b from-surface to-transparent max-[600px]:h-4" />
@@ -256,6 +281,7 @@ function SessionBody({ sessionId, tab, setTab }: { sessionId: string; tab: Tab; 
               onStop={stop}
             />
           </div>
+          {showBrowser && browserApi && <BrowserPane api={browserApi} sessionId={sessionId} onClose={() => setBrowserOpen(false)} />}
           <PanelShell panel={panel}>
             <PanelContent
               view={view}

@@ -69,7 +69,7 @@ export function EnvSection() {
       {head}
       <EditNoticeView notice={edit.notice} />
       {vars.length > 0 && (
-        <ul className="mb-3 overflow-hidden rounded-card bg-surface shadow-lift">
+        <ul>
           {vars.map((variable) => (
             <EnvRow
               key={variable.name}
@@ -146,7 +146,7 @@ function EnvRow({
   const [value, setValue] = useState("");
   const mine = failure?.key === `env:${variable.name}`;
   return (
-    <li className="border-t border-rule px-4 py-2.5 first:border-t-0 max-[600px]:px-3">
+    <li className="border-t border-rule py-2.5 first:border-t-0">
       <div className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-x-3">
         <div className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1">
           <span className="font-mono font-medium [overflow-wrap:anywhere]">{variable.name}</span>
@@ -249,7 +249,7 @@ function AddForm({ busy, failure, onCancel, onSave }: { busy: boolean; failure: 
 
   return (
     <form
-      className="rounded-card bg-surface p-4 shadow-lift max-[600px]:p-3"
+      className="mt-3 rounded-card bg-ground p-4 max-[600px]:p-3"
       onSubmit={(event) => {
         event.preventDefault();
         const items = pairs.map((p) => ({ name: p.name.trim(), value: p.value })).filter((p) => p.name || p.value);
@@ -257,7 +257,7 @@ function AddForm({ busy, failure, onCancel, onSave }: { busy: boolean; failure: 
       }}
     >
       {pairs.map((pair) => (
-        <div key={pair.id} className="mb-3 grid grid-cols-[auto_minmax(0,1fr)_44px] overflow-hidden rounded-inner shadow-ring">
+        <div key={pair.id} className="mb-3 grid grid-cols-[auto_minmax(0,1fr)_44px] overflow-hidden rounded-inner bg-surface shadow-ring">
           <label htmlFor={`env-n-${pair.id}`} className="grid min-w-16 place-items-center-safe px-3 text-label text-muted">
             {m.env_name()}
           </label>

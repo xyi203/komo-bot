@@ -47,7 +47,8 @@ const BODIES: Record<SettingsSection, () => ReactNode> = {
 };
 
 /**
- * 设置（docs/web.md §15）：尺寸固定的弹窗，换节时外框不动，只换右边；开着它底下的页面照旧。
+ * 设置（docs/web.md §15）：尺寸固定的弹窗，照 Claude 桌面设置页：顶栏放标题与关闭，下面左栏分节、右边内容，
+ * 两栏同一张白纸，只靠细线分开。换节时外框不动，只换右边；开着它底下的页面照旧。
  * 弹窗关着时不挂载内容，所以每次打开都重读、没提交的表单随关闭丢掉。手机上铺满全屏，分节变成顶上一条横滑的药丸。
  */
 export function SettingsDialog() {
@@ -57,9 +58,13 @@ export function SettingsDialog() {
       {open && (
         <DialogContent
           aria-describedby={undefined}
-          className="grid h-[min(680px,calc(100dvh-32px))] w-[min(960px,calc(100vw-32px))] grid-cols-[216px_minmax(0,1fr)] max-[900px]:grid-cols-[180px_minmax(0,1fr)] max-[600px]:h-dvh max-[600px]:w-screen max-[600px]:grid-cols-1 max-[600px]:grid-rows-[auto_minmax(0,1fr)] max-[600px]:rounded-none max-[600px]:shadow-none"
+          className="grid h-[min(680px,calc(100dvh-32px))] w-[min(960px,calc(100vw-32px))] grid-cols-[216px_minmax(0,1fr)] grid-rows-[auto_minmax(0,1fr)] max-[900px]:grid-cols-[180px_minmax(0,1fr)] max-[600px]:h-dvh max-[600px]:w-screen max-[600px]:grid-cols-1 max-[600px]:grid-rows-[auto_auto_minmax(0,1fr)] max-[600px]:rounded-none max-[600px]:shadow-none"
         >
           <DialogDescription className="sr-only">{m.settings_title()}</DialogDescription>
+          <header className="col-span-full flex h-14 items-center justify-between border-b border-border pr-3 pl-5 max-[600px]:h-12 max-[600px]:pr-2 max-[600px]:pl-4">
+            <DialogTitle className="text-section-title font-semibold">{m.settings_title()}</DialogTitle>
+            <IconButton name="x" label={m.settings_close()} onClick={closeSettings} />
+          </header>
           <Side section={section} />
           <div
             id="settings-main"
@@ -71,12 +76,6 @@ export function SettingsDialog() {
               <LanguageSwitch />
             </div>
           </div>
-          <IconButton
-            name="x"
-            label={m.settings_close()}
-            onClick={closeSettings}
-            className="absolute top-4 right-4 z-2 max-[600px]:top-3 max-[600px]:right-3"
-          />
         </DialogContent>
       )}
     </Dialog>
@@ -87,8 +86,7 @@ function Side({ section }: { section: SettingsSection }) {
   const check = useConfigCheck();
   const issues = check.data?.issues.length ?? 0;
   return (
-    <div className="flex min-h-0 flex-col gap-3 border-r border-border bg-ground px-3 pt-5 pb-4 max-[600px]:gap-2 max-[600px]:border-r-0 max-[600px]:border-b max-[600px]:px-4 max-[600px]:pt-3.5 max-[600px]:pb-0">
-      <DialogTitle className="mx-2.5 mt-0 mb-1 text-dialog-title font-semibold max-[600px]:mt-0.5">{m.settings_title()}</DialogTitle>
+    <div className="flex min-h-0 flex-col gap-3 border-r border-border px-3 pt-3 pb-4 max-[600px]:border-r-0 max-[600px]:border-b max-[600px]:px-4 max-[600px]:pt-2.5 max-[600px]:pb-0">
       <nav
         aria-label={m.settings_nav()}
         className="flex flex-col gap-0.5 max-[600px]:-mx-4 max-[600px]:flex-row max-[600px]:overflow-x-auto max-[600px]:px-4 max-[600px]:pb-2.5 max-[600px]:[mask-image:linear-gradient(to_right,#000_calc(100%-32px),transparent)] max-[600px]:[scrollbar-width:none]"
@@ -100,7 +98,7 @@ function Side({ section }: { section: SettingsSection }) {
             aria-current={key === section ? "page" : undefined}
             onClick={() => selectSettingsSection(key)}
             className={cn(
-              "flex h-9 cursor-pointer items-center gap-2.5 rounded-control px-2.5 text-left transition-colors hover:bg-hover max-[600px]:h-8 max-[600px]:shrink-0",
+              "flex h-9 cursor-pointer items-center gap-2.5 rounded-control px-2.5 text-left transition-colors hover:bg-hover-on-white max-[600px]:h-8 max-[600px]:shrink-0",
               key === section && "bg-active font-medium",
             )}
           >

@@ -48,6 +48,26 @@ function release(box: Box, id: string) {
   box.live.delete(id);
 }
 
+/** 往某个会话的输入框里加附件并开始上传。输入框之外（如右栏浏览器的截图）也从这里放进来。 */
+export function addAttachments(key: string, files: readonly File[]) {
+  const box = boxOf(key);
+  for (const file of files) {
+    const id = crypto.randomUUID();
+    const controller = new AbortController();
+    const preview = file.type.startsWith("image/") ? URL.createObjectURL(file) : undefined;
+    box.live.set(id, { controller, preview });
+    update(key, (all) => [...all, { id, name: file.name || "file", preview, state: "uploading" }]);
+    const patch = (change: Partial<Draft>) => update(key, (all) => all.map((d) => (d.id === id ? { ...d, ...change } : d)));
+    uploadAttachment(file, file.name || undefined, controller.signal).then(
+      (receipt) => patch({ state: "ready", note: receipt.note }),
+      (error: unknown) => {
+        if (controller.signal.aborted) return;
+        patch({ state: "failed", error: errorText(error) });
+      },
+    );
+  }
+}
+
 /** 附件的增删与上传（按会话）。上传失败的留在框里标红，用户移除后才能发（不悄悄丢掉一个附件）。 */
 export function useAttachments(key: string) {
   const subscribe = useCallback(
@@ -60,27 +80,7 @@ export function useAttachments(key: string) {
   );
   const drafts = useSyncExternalStore(subscribe, () => boxes.get(key)?.drafts ?? EMPTY);
 
-  const add = useCallback(
-    (files: readonly File[]) => {
-      const box = boxOf(key);
-      for (const file of files) {
-        const id = crypto.randomUUID();
-        const controller = new AbortController();
-        const preview = file.type.startsWith("image/") ? URL.createObjectURL(file) : undefined;
-        box.live.set(id, { controller, preview });
-        update(key, (all) => [...all, { id, name: file.name || "file", preview, state: "uploading" }]);
-        const patch = (change: Partial<Draft>) => update(key, (all) => all.map((d) => (d.id === id ? { ...d, ...change } : d)));
-        uploadAttachment(file, file.name || undefined, controller.signal).then(
-          (receipt) => patch({ state: "ready", note: receipt.note }),
-          (error: unknown) => {
-            if (controller.signal.aborted) return;
-            patch({ state: "failed", error: errorText(error) });
-          },
-        );
-      }
-    },
-    [key],
-  );
+  const add = useCallback((files: readonly File[]) => addAttachments(key, files), [key]);
 
   const remove = useCallback(
     (id: string) => {

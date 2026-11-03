@@ -15,6 +15,21 @@ export function errorText(error: unknown): string {
       return m.error_denied();
     case "not_found":
       return m.error_not_found();
+    case "request_key_conflict":
+      return m.error_request_key_conflict();
+    case "version_conflict":
+      return m.error_version_conflict();
+    case "invalid_request":
+      return m.error_invalid_request();
+    case "conflict":
+      // 409 带着具体原因（还有引用没处置、这个状态下做不了）：原因本身是 Gateway 给的，不翻译
+      return error.message || m.error_conflict();
+    case "config_invalid":
+      return m.error_config_invalid();
+    case "vector_unavailable":
+      return m.error_vector_unavailable();
+    case "corrupt":
+      return m.error_corrupt();
     case "internal":
       return error.status === 500 ? m.error_internal() : error.message;
     default:

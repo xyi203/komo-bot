@@ -168,7 +168,7 @@ components:
 
 # Design System: komo
 
-产品事实见 [PRODUCT.md](PRODUCT.md)；本文只记录**已经建成**的东西，不写打算做的事。界面与交互的规格在 [docs/web.md](docs/web.md)，以后的客户端方案在 [docs/clients.md](docs/clients.md)。token 的实现在 [apps/web/styles.css](apps/web/styles.css) 的 `:root`，本文头部的 YAML 与它一一对应。
+产品事实见 [PRODUCT.md](PRODUCT.md)；本文只记录**已经建成**的东西，不写打算做的事。界面与交互的规格在 [docs/web.md](docs/web.md)，以后的客户端方案在 [docs/clients.md](docs/clients.md)。token 的实现在 [apps/client/src/styles.css](apps/client/src/styles.css) 的 `@theme`，本文头部的 YAML 与它一一对应。
 
 ## Overview
 

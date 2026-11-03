@@ -11,6 +11,7 @@ use sha2::{Digest, Sha256};
 
 /// 一段内容的 SHA-256，十六进制小写。
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(type = "string"))]
 #[serde(transparent)]
 pub struct ContentHash(String);
 

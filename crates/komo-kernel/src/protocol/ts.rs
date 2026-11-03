@@ -3,7 +3,7 @@
 //! 生成物提交在 `packages/protocol/src/generated/`，由下面的测试保证它是最新的：
 //! `cargo test -p komo-kernel --features ts`；类型改了要重新生成，加 `KOMO_UPDATE_TS=1`。
 //!
-//! 导出的是客户端用得到的最小集合（会话列表、事件页与 SSE 帧、错误体、healthz、配对）。其余
+//! 导出的是客户端用得到的集合（会话列表与生命周期、提交 Run、模型清单、每轮改动、事件页与 SSE 帧、错误体、healthz、配对）。其余
 //! 协议类型留到界面迁移（C1）用到时再加：给类型补 `cfg_attr(feature = "ts", derive(ts_rs::TS))`，
 //! 再把它列进 [`export_all`]。
 //!
@@ -21,8 +21,20 @@ use serde::{Deserialize, Serialize};
 use ts_rs::{Config, TS};
 
 use super::{
-    ErrorBody, EventPage, EventQuery, HealthResponse, PairCodeResponse, PairRequest,
-    SessionListResponse, SseFrame,
+    CancelRunResponse, ChannelProbeResponse, ChannelsResponse, ConfigCheckResponse,
+    ConfigEditResponse, ConfigEnvResponse, ConfigModelsResponse, ConfigReloadResponse,
+    ConfigSettingsResponse, ConfigVersionRequest, CreateSessionRequest, CronDeleteResponse,
+    CronListResponse, DefaultModelRequest, DeleteSessionRequest, EmbeddingUpsertRequest,
+    EnvSetRequest, ErrorBody, EventPage, EventQuery, FileDiff, ForkSessionResponse, HealthResponse,
+    InterventionAnswerRequest, InterventionAnswerResponse, InterventionListResponse,
+    ManualCronRunResponse, MatterActionRequest, MatterAddRequest, MatterDetail, MatterListResponse,
+    McpReconnectRequest, McpReconnectResponse, McpServersResponse, MemoryAddRequest,
+    MemoryAddResponse, MemoryClassifyRequest, MemoryDetail, MemoryIndexStatus, MemoryListResponse,
+    MemoryRevisionRequest, ModelUpsertRequest, ModelsResponse, NameSessionRequest,
+    PairCodeResponse, PairRequest, ProviderModelsRequest, ProviderModelsResponse,
+    ProviderUpsertRequest, PurgeBlocked, PurgeSessionResponse, RebuildIndexResponse,
+    SessionChanges, SessionLifecycleResponse, SessionListResponse, SettingRequest, SseFrame,
+    SubmitRunRequest, SubmitRunResponse, UpdateCronRequest,
 };
 
 /// `GET /v1/sessions/{id}/events` 与 SSE `event` 帧里一条事件的线上信封（[`crate::events::Event`] 的 JSON）。
@@ -59,6 +71,61 @@ pub fn export_all(dir: &Path) -> Result<(), String> {
     each(PairCodeResponse::export_all(&cfg))?;
     each(PairRequest::export_all(&cfg))?;
     each(WireEvent::export_all(&cfg))?;
+    // C1：会话列表与菜单、对话、改动页用到的。
+    each(CreateSessionRequest::export_all(&cfg))?;
+    each(ForkSessionResponse::export_all(&cfg))?;
+    each(NameSessionRequest::export_all(&cfg))?;
+    each(DeleteSessionRequest::export_all(&cfg))?;
+    each(SessionLifecycleResponse::export_all(&cfg))?;
+    each(PurgeSessionResponse::export_all(&cfg))?;
+    each(PurgeBlocked::export_all(&cfg))?;
+    each(SubmitRunRequest::export_all(&cfg))?;
+    each(SubmitRunResponse::export_all(&cfg))?;
+    each(CancelRunResponse::export_all(&cfg))?;
+    each(ModelsResponse::export_all(&cfg))?;
+    each(SessionChanges::export_all(&cfg))?;
+    each(FileDiff::export_all(&cfg))?;
+    // C1 B 段：待处理页。
+    each(InterventionListResponse::export_all(&cfg))?;
+    each(InterventionAnswerRequest::export_all(&cfg))?;
+    each(InterventionAnswerResponse::export_all(&cfg))?;
+    // C1 C 段：记忆、事项、定时、设置。
+    each(MemoryListResponse::export_all(&cfg))?;
+    each(MemoryDetail::export_all(&cfg))?;
+    each(MemoryAddRequest::export_all(&cfg))?;
+    each(MemoryAddResponse::export_all(&cfg))?;
+    each(MemoryClassifyRequest::export_all(&cfg))?;
+    each(MemoryRevisionRequest::export_all(&cfg))?;
+    each(MemoryIndexStatus::export_all(&cfg))?;
+    each(RebuildIndexResponse::export_all(&cfg))?;
+    each(MatterListResponse::export_all(&cfg))?;
+    each(MatterDetail::export_all(&cfg))?;
+    each(MatterAddRequest::export_all(&cfg))?;
+    each(MatterActionRequest::export_all(&cfg))?;
+    each(CronListResponse::export_all(&cfg))?;
+    each(UpdateCronRequest::export_all(&cfg))?;
+    each(ManualCronRunResponse::export_all(&cfg))?;
+    each(CronDeleteResponse::export_all(&cfg))?;
+    each(ConfigCheckResponse::export_all(&cfg))?;
+    each(ConfigReloadResponse::export_all(&cfg))?;
+    each(ConfigModelsResponse::export_all(&cfg))?;
+    each(ConfigEditResponse::export_all(&cfg))?;
+    each(ConfigSettingsResponse::export_all(&cfg))?;
+    each(ConfigEnvResponse::export_all(&cfg))?;
+    each(ConfigVersionRequest::export_all(&cfg))?;
+    each(DefaultModelRequest::export_all(&cfg))?;
+    each(ProviderUpsertRequest::export_all(&cfg))?;
+    each(EmbeddingUpsertRequest::export_all(&cfg))?;
+    each(ModelUpsertRequest::export_all(&cfg))?;
+    each(ProviderModelsRequest::export_all(&cfg))?;
+    each(ProviderModelsResponse::export_all(&cfg))?;
+    each(SettingRequest::export_all(&cfg))?;
+    each(EnvSetRequest::export_all(&cfg))?;
+    each(McpServersResponse::export_all(&cfg))?;
+    each(McpReconnectRequest::export_all(&cfg))?;
+    each(McpReconnectResponse::export_all(&cfg))?;
+    each(ChannelsResponse::export_all(&cfg))?;
+    each(ChannelProbeResponse::export_all(&cfg))?;
 
     let names: BTreeSet<String> = std::fs::read_dir(dir)
         .map_err(|error| error.to_string())?

@@ -156,6 +156,7 @@ impl fmt::Display for ModelRole {
 /// 规范化过的字符串而不是封闭枚举——把它写死成五个变体，等于替每个后来的模型宣布
 /// 它支持哪几档。常量给出常见的几档，适配器按目标模型的能力声明校验。
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(type = "string"))]
 #[serde(transparent)]
 pub struct Effort(String);
 
@@ -285,6 +286,8 @@ pub struct EmbeddingConfig {
 
 /// 向量空间指纹（§9.5）。同维度不代表同一空间；凭证值不进入指纹。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(optional_fields))]
 pub struct EmbeddingSpace {
     pub provider: String,
     pub endpoint: String,
@@ -314,6 +317,7 @@ impl EmbeddingSpace {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum DistanceRule {
     Cosine,

@@ -1,0 +1,37 @@
+# macOS 打包（docs/clients.md §4、§6.3）。入口是 scripts/package.mjs，它负责版本号、签名与公证的开关。
+appId: dev.komo.desktop
+productName: komo
+copyright: komo
+directories:
+  output: release
+  buildResources: assets
+# 主进程、preload 与提示页的编译产物。electron-updater 是唯一的运行时依赖，builder 自己带上。
+files:
+  - dist/**
+  - assets/trayTemplate*.png
+  - package.json
+# SPA 产物不进 asar：app:// 处理器按普通文件读它。
+extraResources:
+  - from: ../client/dist/client
+    to: client
+protocols:
+  - name: komo
+    schemes: [komo]
+mac:
+  category: public.app-category.productivity
+  icon: assets/icon.png
+  hardenedRuntime: true
+  gatekeeperAssess: false
+  target:
+    - target: dmg
+      arch: [arm64, x64]
+    - target: zip
+      arch: [arm64, x64]
+# 产物名固定成 Komo-<版本>-<架构>.<扩展名>：同一个 Release 里还有 komo-<系统>-<架构>.tar.gz 与 SHA256SUMS
+# （komo update 读的），两边名字不重叠，互不干扰。
+artifactName: Komo-${version}-${arch}.${ext}
+# 自动更新源：与 komo update 同一个 GitHub 仓库，但读的是 latest-mac.yml 与上面这几个产物。
+publish:
+  provider: github
+  owner: xyi203
+  repo: komo-bot

@@ -12,7 +12,17 @@ import { Route as rootRouteImport } from './routes/__root'
 import { Route as AppRouteImport } from './routes/_app'
 import { Route as PairRouteImport } from './routes/pair'
 import { Route as AppIndexRouteImport } from './routes/_app/index'
+import { Route as AppCronIndexRouteImport } from './routes/_app/cron/index'
+import { Route as AppCronIdRouteImport } from './routes/_app/cron/$id'
+import { Route as AppInboxIndexRouteImport } from './routes/_app/inbox/index'
+import { Route as AppInboxIdRouteImport } from './routes/_app/inbox/$id'
+import { Route as AppMattersIndexRouteImport } from './routes/_app/matters/index'
+import { Route as AppMattersIdRouteImport } from './routes/_app/matters/$id'
+import { Route as AppMemoryIndexRouteImport } from './routes/_app/memory/index'
+import { Route as AppMemoryIdRouteImport } from './routes/_app/memory/$id'
 import { Route as AppSessionsSessionIdRouteImport } from './routes/_app/sessions.$sessionId'
+import { Route as AppSettingsIndexRouteImport } from './routes/_app/settings/index'
+import { Route as AppSettingsSectionRouteImport } from './routes/_app/settings/$section'
 
 const AppRoute = AppRouteImport.update({
   id: '/_app',
@@ -28,35 +38,156 @@ const AppIndexRoute = AppIndexRouteImport.update({
   path: '/',
   getParentRoute: () => AppRoute,
 } as any)
+const AppCronIndexRoute = AppCronIndexRouteImport.update({
+  id: '/cron/',
+  path: '/cron/',
+  getParentRoute: () => AppRoute,
+} as any)
+const AppCronIdRoute = AppCronIdRouteImport.update({
+  id: '/cron/$id',
+  path: '/cron/$id',
+  getParentRoute: () => AppRoute,
+} as any)
+const AppInboxIndexRoute = AppInboxIndexRouteImport.update({
+  id: '/inbox/',
+  path: '/inbox/',
+  getParentRoute: () => AppRoute,
+} as any)
+const AppInboxIdRoute = AppInboxIdRouteImport.update({
+  id: '/inbox/$id',
+  path: '/inbox/$id',
+  getParentRoute: () => AppRoute,
+} as any)
+const AppMattersIndexRoute = AppMattersIndexRouteImport.update({
+  id: '/matters/',
+  path: '/matters/',
+  getParentRoute: () => AppRoute,
+} as any)
+const AppMattersIdRoute = AppMattersIdRouteImport.update({
+  id: '/matters/$id',
+  path: '/matters/$id',
+  getParentRoute: () => AppRoute,
+} as any)
+const AppMemoryIndexRoute = AppMemoryIndexRouteImport.update({
+  id: '/memory/',
+  path: '/memory/',
+  getParentRoute: () => AppRoute,
+} as any)
+const AppMemoryIdRoute = AppMemoryIdRouteImport.update({
+  id: '/memory/$id',
+  path: '/memory/$id',
+  getParentRoute: () => AppRoute,
+} as any)
 const AppSessionsSessionIdRoute = AppSessionsSessionIdRouteImport.update({
   id: '/sessions/$sessionId',
   path: '/sessions/$sessionId',
+  getParentRoute: () => AppRoute,
+} as any)
+const AppSettingsIndexRoute = AppSettingsIndexRouteImport.update({
+  id: '/settings/',
+  path: '/settings/',
+  getParentRoute: () => AppRoute,
+} as any)
+const AppSettingsSectionRoute = AppSettingsSectionRouteImport.update({
+  id: '/settings/$section',
+  path: '/settings/$section',
   getParentRoute: () => AppRoute,
 } as any)
 
 export interface FileRoutesByFullPath {
   '/': typeof AppIndexRoute
   '/pair': typeof PairRoute
+  '/cron/$id': typeof AppCronIdRoute
+  '/inbox/$id': typeof AppInboxIdRoute
+  '/matters/$id': typeof AppMattersIdRoute
+  '/memory/$id': typeof AppMemoryIdRoute
   '/sessions/$sessionId': typeof AppSessionsSessionIdRoute
+  '/settings/$section': typeof AppSettingsSectionRoute
+  '/cron/': typeof AppCronIndexRoute
+  '/inbox/': typeof AppInboxIndexRoute
+  '/matters/': typeof AppMattersIndexRoute
+  '/memory/': typeof AppMemoryIndexRoute
+  '/settings/': typeof AppSettingsIndexRoute
 }
 export interface FileRoutesByTo {
   '/pair': typeof PairRoute
   '/': typeof AppIndexRoute
+  '/cron/$id': typeof AppCronIdRoute
+  '/inbox/$id': typeof AppInboxIdRoute
+  '/matters/$id': typeof AppMattersIdRoute
+  '/memory/$id': typeof AppMemoryIdRoute
   '/sessions/$sessionId': typeof AppSessionsSessionIdRoute
+  '/settings/$section': typeof AppSettingsSectionRoute
+  '/cron': typeof AppCronIndexRoute
+  '/inbox': typeof AppInboxIndexRoute
+  '/matters': typeof AppMattersIndexRoute
+  '/memory': typeof AppMemoryIndexRoute
+  '/settings': typeof AppSettingsIndexRoute
 }
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/_app': typeof AppRouteWithChildren
   '/pair': typeof PairRoute
   '/_app/': typeof AppIndexRoute
+  '/_app/cron/$id': typeof AppCronIdRoute
+  '/_app/inbox/$id': typeof AppInboxIdRoute
+  '/_app/matters/$id': typeof AppMattersIdRoute
+  '/_app/memory/$id': typeof AppMemoryIdRoute
   '/_app/sessions/$sessionId': typeof AppSessionsSessionIdRoute
+  '/_app/settings/$section': typeof AppSettingsSectionRoute
+  '/_app/cron/': typeof AppCronIndexRoute
+  '/_app/inbox/': typeof AppInboxIndexRoute
+  '/_app/matters/': typeof AppMattersIndexRoute
+  '/_app/memory/': typeof AppMemoryIndexRoute
+  '/_app/settings/': typeof AppSettingsIndexRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
-  fullPaths: '/' | '/pair' | '/sessions/$sessionId'
+  fullPaths:
+    | '/'
+    | '/pair'
+    | '/cron/$id'
+    | '/inbox/$id'
+    | '/matters/$id'
+    | '/memory/$id'
+    | '/sessions/$sessionId'
+    | '/settings/$section'
+    | '/cron/'
+    | '/inbox/'
+    | '/matters/'
+    | '/memory/'
+    | '/settings/'
   fileRoutesByTo: FileRoutesByTo
-  to: '/pair' | '/' | '/sessions/$sessionId'
-  id: '__root__' | '/_app' | '/pair' | '/_app/' | '/_app/sessions/$sessionId'
+  to:
+    | '/pair'
+    | '/'
+    | '/cron/$id'
+    | '/inbox/$id'
+    | '/matters/$id'
+    | '/memory/$id'
+    | '/sessions/$sessionId'
+    | '/settings/$section'
+    | '/cron'
+    | '/inbox'
+    | '/matters'
+    | '/memory'
+    | '/settings'
+  id:
+    | '__root__'
+    | '/_app'
+    | '/pair'
+    | '/_app/'
+    | '/_app/cron/$id'
+    | '/_app/inbox/$id'
+    | '/_app/matters/$id'
+    | '/_app/memory/$id'
+    | '/_app/sessions/$sessionId'
+    | '/_app/settings/$section'
+    | '/_app/cron/'
+    | '/_app/inbox/'
+    | '/_app/matters/'
+    | '/_app/memory/'
+    | '/_app/settings/'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
@@ -87,6 +218,62 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AppIndexRouteImport
       parentRoute: typeof AppRoute
     }
+    '/_app/cron/': {
+      id: '/_app/cron/'
+      path: '/cron'
+      fullPath: '/cron/'
+      preLoaderRoute: typeof AppCronIndexRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/_app/cron/$id': {
+      id: '/_app/cron/$id'
+      path: '/cron/$id'
+      fullPath: '/cron/$id'
+      preLoaderRoute: typeof AppCronIdRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/_app/inbox/': {
+      id: '/_app/inbox/'
+      path: '/inbox'
+      fullPath: '/inbox/'
+      preLoaderRoute: typeof AppInboxIndexRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/_app/inbox/$id': {
+      id: '/_app/inbox/$id'
+      path: '/inbox/$id'
+      fullPath: '/inbox/$id'
+      preLoaderRoute: typeof AppInboxIdRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/_app/matters/': {
+      id: '/_app/matters/'
+      path: '/matters'
+      fullPath: '/matters/'
+      preLoaderRoute: typeof AppMattersIndexRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/_app/matters/$id': {
+      id: '/_app/matters/$id'
+      path: '/matters/$id'
+      fullPath: '/matters/$id'
+      preLoaderRoute: typeof AppMattersIdRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/_app/memory/': {
+      id: '/_app/memory/'
+      path: '/memory'
+      fullPath: '/memory/'
+      preLoaderRoute: typeof AppMemoryIndexRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/_app/memory/$id': {
+      id: '/_app/memory/$id'
+      path: '/memory/$id'
+      fullPath: '/memory/$id'
+      preLoaderRoute: typeof AppMemoryIdRouteImport
+      parentRoute: typeof AppRoute
+    }
     '/_app/sessions/$sessionId': {
       id: '/_app/sessions/$sessionId'
       path: '/sessions/$sessionId'
@@ -94,17 +281,51 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AppSessionsSessionIdRouteImport
       parentRoute: typeof AppRoute
     }
+    '/_app/settings/': {
+      id: '/_app/settings/'
+      path: '/settings'
+      fullPath: '/settings/'
+      preLoaderRoute: typeof AppSettingsIndexRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/_app/settings/$section': {
+      id: '/_app/settings/$section'
+      path: '/settings/$section'
+      fullPath: '/settings/$section'
+      preLoaderRoute: typeof AppSettingsSectionRouteImport
+      parentRoute: typeof AppRoute
+    }
   }
 }
 
 interface AppRouteChildren {
   AppIndexRoute: typeof AppIndexRoute
+  AppCronIdRoute: typeof AppCronIdRoute
+  AppInboxIdRoute: typeof AppInboxIdRoute
+  AppMattersIdRoute: typeof AppMattersIdRoute
+  AppMemoryIdRoute: typeof AppMemoryIdRoute
   AppSessionsSessionIdRoute: typeof AppSessionsSessionIdRoute
+  AppSettingsSectionRoute: typeof AppSettingsSectionRoute
+  AppCronIndexRoute: typeof AppCronIndexRoute
+  AppInboxIndexRoute: typeof AppInboxIndexRoute
+  AppMattersIndexRoute: typeof AppMattersIndexRoute
+  AppMemoryIndexRoute: typeof AppMemoryIndexRoute
+  AppSettingsIndexRoute: typeof AppSettingsIndexRoute
 }
 
 const AppRouteChildren: AppRouteChildren = {
   AppIndexRoute: AppIndexRoute,
+  AppCronIdRoute: AppCronIdRoute,
+  AppInboxIdRoute: AppInboxIdRoute,
+  AppMattersIdRoute: AppMattersIdRoute,
+  AppMemoryIdRoute: AppMemoryIdRoute,
   AppSessionsSessionIdRoute: AppSessionsSessionIdRoute,
+  AppSettingsSectionRoute: AppSettingsSectionRoute,
+  AppCronIndexRoute: AppCronIndexRoute,
+  AppInboxIndexRoute: AppInboxIndexRoute,
+  AppMattersIndexRoute: AppMattersIndexRoute,
+  AppMemoryIndexRoute: AppMemoryIndexRoute,
+  AppSettingsIndexRoute: AppSettingsIndexRoute,
 }
 
 const AppRouteWithChildren = AppRoute._addFileChildren(AppRouteChildren)

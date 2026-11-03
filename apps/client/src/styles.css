@@ -1,7 +1,7 @@
 @import "tailwindcss";
 
 /* DESIGN.md 的 token 原样搬进 Tailwind v4 的 @theme：颜色、圆角、字体、字号与阴影都是 CSS 变量，
-   视觉与 apps/web 原型一致，不在这里另起一套。叶绿（accent）只表示"在场"与"运行中"。 */
+   视觉以 DESIGN.md 为准，不在这里另起一套。叶绿（accent）只表示"在场"与"运行中"。 */
 @theme {
   --color-ground: #f2f3ef;
   --color-surface: #ffffff;
@@ -85,5 +85,146 @@
     outline: 2px solid var(--color-focus);
     outline-offset: 2px;
     border-radius: 4px;
+  }
+}
+
+/* ---------- 动效与正文 ---------- */
+@theme {
+  --animate-spinner: spinner-turn 0.9s linear infinite;
+  --animate-breathe: breathe 1.4s ease-in-out infinite;
+  --animate-caret: breathe 1s ease-in-out infinite;
+}
+@keyframes spinner-turn {
+  to {
+    transform: rotate(360deg);
+  }
+}
+@keyframes breathe {
+  50% {
+    opacity: 0.2;
+  }
+}
+@keyframes sheet-in-left {
+  from {
+    transform: translateX(-100%);
+  }
+}
+@keyframes sheet-in-right {
+  from {
+    transform: translateX(100%);
+  }
+}
+@keyframes fade-in {
+  from {
+    opacity: 0;
+  }
+}
+
+/* 回复正文：代码块、标题、列表、表格、行内代码、粗体、链接（原型 styles.css「回复正文」那一段） */
+.prose-komo p,
+.prose-komo ul,
+.prose-komo ol {
+  margin: 0 0 14px;
+  font-size: var(--text-read);
+  line-height: var(--text-read--line-height);
+}
+.prose-komo ul,
+.prose-komo ol {
+  padding-left: 22px;
+}
+.prose-komo ul {
+  list-style: disc;
+}
+.prose-komo ol {
+  list-style: decimal;
+}
+.prose-komo .md-h {
+  font-weight: 600;
+}
+.prose-komo code {
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: var(--color-raised);
+  font-family: var(--font-mono);
+  font-size: 13px;
+}
+.prose-komo a {
+  color: var(--color-text);
+  text-decoration: underline;
+  text-decoration-color: var(--color-faint);
+  text-underline-offset: 3px;
+}
+.prose-komo a:hover {
+  text-decoration-color: currentColor;
+}
+.prose-komo pre {
+  margin: 0 0 14px;
+  padding: 12px 14px;
+  overflow: auto;
+  border-radius: var(--radius-control);
+  background: var(--color-raised);
+}
+.prose-komo pre code {
+  padding: 0;
+  background: none;
+  font-size: 13px;
+  line-height: 20px;
+}
+.prose-komo .table-wrap {
+  margin: 0 0 14px;
+  overflow-x: auto;
+}
+.prose-komo table {
+  border-collapse: collapse;
+  font-size: var(--text-body);
+  line-height: 20px;
+}
+.prose-komo th {
+  color: var(--color-muted);
+  font-weight: 500;
+  text-align: left;
+}
+.prose-komo th,
+.prose-komo td {
+  padding: 7px 14px 7px 0;
+  border-bottom: 1px solid var(--color-rule);
+  vertical-align: top;
+}
+.prose-komo.compact p,
+.prose-komo.compact li {
+  margin-bottom: 8px;
+  font-size: var(--text-body);
+  line-height: 22px;
+}
+/* 流式输出的光标 */
+.prose-komo.streaming > :last-child::after {
+  content: "";
+  display: inline-block;
+  width: 7px;
+  height: 15px;
+  margin-left: 2px;
+  vertical-align: -2px;
+  background: var(--color-accent);
+  animation: var(--animate-caret);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    transition: none !important;
+    animation: none !important;
+  }
+}
+
+/* 设置弹窗：居中出现（translate 居中，所以动画只动 opacity 与 scale/位移的增量） */
+@theme {
+  --animate-dialog-in: dialog-in 180ms var(--ease-out-expo);
+}
+@keyframes dialog-in {
+  from {
+    opacity: 0;
+    scale: 0.985;
+    translate: 0 8px;
   }
 }

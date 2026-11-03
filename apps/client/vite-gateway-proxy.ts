@@ -1,4 +1,4 @@
-// 开发时把 `/v1/*` 与 `/healthz` 转给本机 Gateway，并在服务端带上令牌（同 apps/web/serve.mjs）：
+// 开发时把 `/v1/*` 与 `/healthz` 转给本机 Gateway，并在服务端带上令牌（原型 `serve.mjs` 的做法，已随原型删除）：
 // 令牌每次请求现读 `$KOMO_HOME/runtime/gateway.json`（Gateway 重启后会换），从不发给浏览器，
 // 所以 `pnpm dev` 不需要配对。生产里由 Gateway 自己托管网页，走 cookie（docs/clients.md D6）。
 import { readFile } from "node:fs/promises";

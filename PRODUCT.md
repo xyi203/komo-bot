@@ -22,14 +22,14 @@ komo 是一个 Rust 个人 agent 框架：一个二进制提供交互式 LLM 聊
 
 ## Operating Context
 
-- 主形态是聊天助理：终端 TUI（`komo`）、Web 客户端（`apps/web`，W0 原型，见 `docs/web.md`）、以及飞书 / Telegram / 微信渠道内的对话。
+- 主形态是聊天助理：终端 TUI（`komo`）、Web 客户端（`apps/client`，见 `docs/web.md`）、以及飞书 / Telegram / 微信渠道内的对话。
 - gateway 作为常驻进程运行（macOS launchd / Linux systemd 托管），承担定时 Job、monitor、后台任务会话与记忆提取；主动消息经 home chat 送达。
 - 操作者通过 CLI 或 Web 管理记忆、目标与领域、技能、cron、会话与配置，全部走 gateway 的 `/v1/*` HTTP 接口。没有审批与权限策略（2026-10-11 删除）；唯一的例外是触发器起的 Run 调用声明为对外的工具时，停在 confirm 检查点等操作者 approve / reject（`docs/confirm.md`），在 Web 的待处理页或渠道里答。
 - 单机单用户：数据库、配置、凭证都在本地 `~/.komo` 下。
 
 ## Capabilities and Constraints
 
-- 前端：`apps/web` 是无构建、无依赖的静态原型（HTML + 原生 JS + CSS），经 `serve.mjs` 同源代理只走 gateway 的 HTTP / SSE；颜色只引用 `styles.css` 里的语义 token。v0.8 之前的 React 渲染层与 Electron 壳已随脚手架删除。正式版计划用 TanStack Start（SPA）重写、由 Gateway 托管，再包成 Electron 与 PWA（`docs/clients.md`，草案）。
+- 前端：`apps/client` 是 TanStack Start（SPA 模式）+ Tailwind v4 + Radix，由 Gateway 同源托管，只走 gateway 的 HTTP / SSE；颜色只引用 `src/styles.css` `@theme` 里的语义 token。C1 起 W0 原型 `apps/web` 已删除。之后包成 Electron 与 PWA（`docs/clients.md`）。
 - 多 LLM provider（OpenAI / Anthropic 协议及兼容端点，如 DeepSeek、Codex），在设置里按 provider 管理对话与向量模型，模型菜单按会话切换；无 key 也能启动（回复配置指引）。
 - 领域术语以 `docs/komo_bot.md`、`docs/memory.md`、`docs/goals.md` 为准（Session、Run、约定、线索、目标、领域、任务会话、插话、待处理等），界面文案应与之一致。
 - 平台判定为 web：电脑上用 Web 客户端（以后 macOS 用 Electron 包同一套网页），手机先用 PWA、再按需上 Capacitor（`docs/clients.md`）；在那之前手机走飞书等渠道。

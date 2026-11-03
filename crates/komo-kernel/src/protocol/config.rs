@@ -110,6 +110,7 @@ pub struct McpServerConfig {
 
 /// MCP 工具给模型的方式（照 pi 的 `exposure`，没有 `deferred`：komo 没有 `tool_search`）。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum McpExposure {
     /// 不声明给模型，只在 codemode 脚本里调。
@@ -742,9 +743,13 @@ pub struct PathsConfig {
 /// 一个来源文件及其 mtime——`komo doctor` 拿它和"当前生效配置的加载时间"比对，
 /// 不一致就是"文件改了但没装上"（§3）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(optional_fields))]
 pub struct SourceFile {
+    #[cfg_attr(feature = "ts", ts(type = "string"))]
     pub path: PathBuf,
     #[serde(with = "time::serde::rfc3339")]
+    #[cfg_attr(feature = "ts", ts(type = "string"))]
     pub mtime: OffsetDateTime,
 }
 
@@ -834,6 +839,8 @@ fn diff_value(
 
 /// 配置校验的一条问题。`komo config check` 与重载共用同一套校验（§11.2）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(optional_fields))]
 pub struct ConfigIssue {
     pub key: KeyPath,
     pub severity: IssueSeverity,
@@ -841,6 +848,7 @@ pub struct ConfigIssue {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum IssueSeverity {
     /// 校验不过——**旧快照原样保留**，哪怕只错一个键（§3 第 1 步）。

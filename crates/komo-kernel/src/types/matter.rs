@@ -43,6 +43,7 @@ pub fn parse_due(raw: &str) -> Result<Date, String> {
 
 /// 事项的种类。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum MatterKind {
     /// 目标：有结果、会结束，可带截止日期。
@@ -88,6 +89,7 @@ impl FromStr for MatterKind {
 
 /// 事项的状态。goal 用前五个，area 用 `active` 与 `retired`。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum MatterState {
     Active,
@@ -148,6 +150,7 @@ impl FromStr for MatterState {
 ///
 /// 只是引用：触发器自己的生命周期不归事项管（结案不删它）。
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum MatterTrigger {
     Cron {
@@ -217,6 +220,8 @@ impl fmt::Display for MatterTrigger {
 
 /// 一个目标或领域（§3）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(optional_fields))]
 pub struct Matter {
     pub id: MatterId,
     /// 任何会进注入行的字段变了都升一版（注入按 `id@revision` 去重与失效，P1b）。
@@ -236,19 +241,24 @@ pub struct Matter {
         with = "iso_date::option",
         skip_serializing_if = "Option::is_none"
     )]
+    #[cfg_attr(feature = "ts", ts(type = "string"))]
     pub due: Option<Date>,
     /// 只给 area：要维持的标准。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub standard: Option<String>,
     /// 改承诺的那几次操作的用户原话证据，追加不改（§4「谁能改什么」）。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "ts", ts(as = "Option<Vec<Evidence>>"))]
     pub evidence: Vec<Evidence>,
     /// 挂着的触发器（§8），按挂上的先后；变了升版。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "ts", ts(as = "Option<Vec<MatterTrigger>>"))]
     pub triggers: Vec<MatterTrigger>,
     #[serde(with = "time::serde::rfc3339")]
+    #[cfg_attr(feature = "ts", ts(type = "string"))]
     pub created_at: OffsetDateTime,
     #[serde(with = "time::serde::rfc3339")]
+    #[cfg_attr(feature = "ts", ts(type = "string"))]
     pub updated_at: OffsetDateTime,
     /// 进 `done` / `dropped` / `retired` 时写，重开时清空。
     #[serde(
@@ -256,6 +266,7 @@ pub struct Matter {
         with = "time::serde::rfc3339::option",
         skip_serializing_if = "Option::is_none"
     )]
+    #[cfg_attr(feature = "ts", ts(type = "string"))]
     pub closed_at: Option<OffsetDateTime>,
 }
 

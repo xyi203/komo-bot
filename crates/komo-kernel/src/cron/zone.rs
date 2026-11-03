@@ -16,6 +16,7 @@ use crate::traits::ZoneResolver;
 /// 一个 IANA 时区名，例如 `Asia/Shanghai`。**只有名字**——偏移随日期变化，存下来就是
 /// 一个会过期的快照。
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(type = "string"))]
 #[serde(transparent)]
 pub struct TimeZone(String);
 

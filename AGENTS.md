@@ -27,6 +27,9 @@ pnpm install                   # root pnpm workspace (docs/clients.md): apps/cli
 pnpm build | lint | typecheck  # build → apps/client/dist/client (static shell, SPA mode); `pnpm dev` proxies to the local Gateway
 cargo test -p komo-kernel --features ts   # protocol → TS bindings are current (KOMO_UPDATE_TS=1 regenerates packages/protocol)
 
+pnpm desktop:dev               # macOS Electron 壳（apps/desktop，docs/clients.md §6.3）：先建 SPA 再起 Electron
+pnpm desktop:build             # 未签名的 .app（release/mac-arm64/），本机冒烟；pnpm desktop:dist 出 dmg/zip
+
 komo init                      # write a minimal commented config.toml + 0600 .env (never overwrites)
 komo                           # start Gateway if needed, new session, TUI
 komo resume SESSION_ID
@@ -148,7 +151,7 @@ depends on `agent`; `client` knows only protocol types.
 - **Channel identity lives in config, not the db** (§11.2): `allow_from` /
   `home_chat` / `groups` in `config.toml`, credentials in `.env`. No pairing
   table, no `/sethome`.
-- **The release convention is one string in three places** (§13.6): the repo
+- **The release convention is one string in three places** (§13.6; the macOS desktop packages `Komo-*` + `latest-mac.yml` ride the same tag but never match `komo-*.tar.gz`): the repo
   name, `komo-<os>-<arch>.tar.gz`, and `SHA256SUMS` appear in
   `.github/workflows/release.yml`, `scripts/install.sh`, and
   `crates/komo/src/update.rs` — change one, change all three. The archive contains `komo`, all three `komo-channel-*` executables and the web shell directory `web/`; install
@@ -209,9 +212,10 @@ commands run, terminal output when CLI behavior changes.
   approved 2026-10-29, implemented in slices P1a–P1e.
 - Channels: `docs/channel-plugins.md` — standalone official plugins, the private-pipe
   protocol, dynamic channel registration and bundle installation.
-- Web client: `docs/web.md` — W0 prototype in `apps/web/` (static files, no build;
-  `node apps/web/serve.mjs`), what it reads from the Gateway, and the Gateway gaps
-  it found. Visual tokens are summarized in `DESIGN.md`.
+- Web client: `docs/web.md` — behavior spec of the web client in `apps/client/`
+  (TanStack Start SPA served by the Gateway; dev: `pnpm --filter @komo/client dev`),
+  what it reads from the Gateway, and the Gateway gaps found. The W0 prototype
+  (`apps/web`, `serve.mjs`) was deleted in C1. Visual tokens are summarized in `DESIGN.md`.
 - Clients: `docs/clients.md` — draft plan to rebuild the web client on TanStack
   Start (SPA mode, served by the Gateway) and extend it to macOS (Electron) and
   phones (PWA, then Capacitor); supersedes roadmap-muse §4.4.

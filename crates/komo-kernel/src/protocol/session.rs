@@ -43,6 +43,7 @@ pub struct ForkSessionRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct ForkSessionResponse {
     pub session: SessionId,
 }
@@ -64,6 +65,7 @@ pub struct LabelSessionRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct NameSessionRequest {
     pub name: String,
 }

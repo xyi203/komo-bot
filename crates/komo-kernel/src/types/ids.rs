@@ -197,6 +197,7 @@ impl fmt::Display for Seq {
 
 /// 一次逻辑事件的 ID。重复提交同一 ID 必须幂等，内容不同则报错（§8.3）。
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(type = "string"))]
 #[serde(transparent)]
 pub struct EventId(String);
 
@@ -223,6 +224,7 @@ impl fmt::Display for EventId {
 /// 幂等请求键（§8.5、§11.1）：`feishu:{event_id}` / `telegram:{update_id}` /
 /// `wechat:{from}:{msg_id}` / HTTP 调用方自带的键。
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(type = "string"))]
 #[serde(transparent)]
 pub struct RequestKey(String);
 

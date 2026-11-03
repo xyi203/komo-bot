@@ -1,38 +1,1463 @@
 {
   "$schema": "https://inlang.com/schema/inlang-message-format",
   "app_name": "komo",
-  "gateway_version": "Gateway {version}（协议 {protocol}）",
-  "sessions_title": "会话",
-  "sessions_loading": "正在加载会话…",
-  "sessions_empty": "还没有会话",
-  "session_untitled": "未命名会话",
-  "session_kind_task": "任务",
-  "session_kind_main": "主会话",
-  "session_state_running": "运行中",
-  "session_state_waiting": "等待中",
-  "session_updated": "更新于 {time}",
-  "session_not_found": "没有找到这个会话",
-  "select_session": "从左边选一个会话，查看它的事件流",
-  "stream_title": "事件流",
-  "stream_connecting": "连接中…",
-  "stream_open": "已连接",
-  "stream_reconnecting": "断开了，正在按游标重连…",
-  "stream_empty": "还没有收到事件",
-  "stream_frame_count": "已收到 {count} 帧",
+  "call_copy_command": "复制命令",
+  "call_failed": "失败",
+  "call_inspect": "查看",
+  "call_no_output": "还没有输出",
+  "call_uncertain": "结果不明",
+  "cancel": "取消",
+  "cat_code_done": "运行了代码",
+  "cat_code_done_and": "运行了代码",
+  "cat_code_done_then": "运行了代码",
+  "cat_code_live": "正在运行代码",
+  "cat_commands_done": "执行了命令",
+  "cat_commands_done_and": "执行了命令",
+  "cat_commands_done_then": "执行了命令",
+  "cat_commands_live": "正在运行命令",
+  "cat_edit_done": "修改了文件",
+  "cat_edit_done_and": "修改了文件",
+  "cat_edit_done_then": "修改了文件",
+  "cat_edit_live": "正在编辑文件",
+  "cat_join_many": "{a}，{b}，{c}等",
+  "cat_join_three": "{a}，{b}，{c}",
+  "cat_join_two": "{a}并{b}",
+  "cat_read_done": "已读取文件",
+  "cat_read_done_and": "读取文件",
+  "cat_read_done_then": "已读取文件",
+  "cat_read_live": "正在读取文件",
+  "cat_search_done": "已搜索代码",
+  "cat_search_done_and": "搜索代码",
+  "cat_search_done_then": "已搜索代码",
+  "cat_search_live": "正在搜索代码",
+  "cat_subagents_done": "已协调子智能体",
+  "cat_subagents_done_and": "协调子智能体",
+  "cat_subagents_done_then": "已协调子智能体",
+  "cat_subagents_live": "正在协调子智能体",
+  "cat_thinking_done": "已完成分析",
+  "cat_thinking_live": "正在分析请求",
+  "cat_tools_done": "已调用工具",
+  "cat_tools_done_and": "已调用工具",
+  "cat_tools_done_then": "已调用工具",
+  "cat_tools_live": "正在调用工具",
+  "cat_write_done": "已写入文件",
+  "cat_write_done_and": "写入文件",
+  "cat_write_done_then": "已写入文件",
+  "cat_write_live": "正在写入文件",
+  "changes_binary": "二进制",
+  "changes_card_collapse": "收起",
+  "changes_card_expand": "展开其余 {count} 个",
+  "changes_card_files": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
+      "match": {
+        "countPlural=one": "{count} 个文件已更改",
+        "countPlural=other": "{count} 个文件已更改"
+      }
+    }
+  ],
+  "changes_card_open": "在改动页看 {path}",
+  "changes_diff_binary": "二进制文件，不给对比。",
+  "changes_diff_error": "对比没取到：{message}（Gateway 重启过就没有了）",
+  "changes_diff_identical": "两份内容相同。",
+  "changes_diff_loading": "正在取对比…",
+  "changes_diff_oversized": "文件超过 2 MiB，Gateway 没有存下来，给不出对比。",
+  "changes_diff_truncated": "只画了前 {shown} 行，还有 {rest} 行。",
+  "changes_empty": "这段对话还没有记下改动。",
+  "changes_empty_hint": "Gateway 在每轮执行工具前后各拍一次快照，比出这一轮改了哪些文件；记录只留在这次 Gateway 进程里，重启之前的轮次没有。",
+  "changes_foot": "改动由 Gateway 在每轮执行工具前后各拍一次 git 快照得出，shell 改的也在里面；不在仓库里的文件只认 write 和 edit。这一轮开始前就没提交的改动不算进来。记录只留在这次 Gateway 进程里。",
+  "changes_more": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
+      "match": {
+        "countPlural=one": "还有 {count} 个文件没列出来。",
+        "countPlural=other": "还有 {count} 个文件没列出来。"
+      }
+    }
+  ],
+  "changes_oversized": "过大",
+  "changes_tag_added": "新建",
+  "changes_tag_deleted": "删除",
+  "changes_turn": "第 {n} 轮",
+  "changes_turn_files": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
+      "match": {
+        "countPlural=one": "{count} 个文件",
+        "countPlural=other": "{count} 个文件"
+      }
+    }
+  ],
+  "changes_turn_unknown": "一轮",
+  "changes_verb_added": "已新建",
+  "changes_verb_deleted": "已删除",
+  "changes_verb_edited": "已编辑",
+  "channels_allow": "{count} 人可下指令",
+  "channels_allow_tenant": "{count} 人可下指令，同组织的也行",
+  "channels_custom_plugin": "自定义插件",
+  "channels_desc": "每个渠道是一个插件进程。谁能说话、主动消息发到哪，在配置文件里设；凭证见环境变量一节。",
+  "channels_home_none": "没设主动消息的去处",
+  "channels_home_to": "主动消息发到",
+  "channels_load_error": "渠道没取到：{message}。",
+  "channels_old_gateway": "在跑的 Gateway 还没有渠道状态的接口；装上新版后这里显示每个渠道在不在跑。终端里可用 komo channel list 与 komo channel probe。",
+  "channels_outbound_only": "allow_from 是空的：只出不进，没人能通过它下指令。",
+  "channels_probe": "探测",
+  "channels_probe_failed": "探测没通过：",
+  "channels_probe_ok": "探测通过：",
+  "channels_probing": "正在探测",
+  "channels_refresh": "刷新",
+  "channels_state_failed": "起不来",
+  "channels_state_idle": "启用了但没起",
+  "channels_state_off": "未启用",
+  "channels_state_retrying": "退出了，正在重试（第 {count} 次）",
+  "channels_state_running": "在跑",
+  "channels_state_running_for": "在跑 {time}",
+  "close": "关闭",
+  "composer_archived": "这段对话已归档，只能查看",
+  "composer_cache": "缓存命中 {pct}%",
+  "composer_effort": "推理强度",
+  "composer_interject": "↵ 插话，并进正在跑的这一轮",
+  "composer_label": "发给 komo",
+  "composer_model": "模型",
+  "composer_ring": "上下文 {pct}（{used} / {win}）",
+  "composer_ring_none": "这段对话还没有请求过模型",
+  "composer_running": "正在跑 · {time}",
+  "composer_send": "发送",
+  "composer_send_hint": "↵ 发送，⇧↵ 换行",
+  "composer_steps": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
+      "match": {
+        "countPlural=one": "{count} 步",
+        "countPlural=other": "{count} 步"
+      }
+    }
+  ],
+  "composer_stop": "停止这一轮",
+  "composer_tokens": "{tokens} tok",
+  "composer_turns": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
+      "match": {
+        "countPlural=one": "{count} 轮",
+        "countPlural=other": "{count} 轮"
+      }
+    }
+  ],
+  "config_call_timeout": "工具调用时限",
+  "config_call_timeout_desc": "一次工具调用最长跑多久。",
+  "config_check_error": "配置检查没取到：{message}。",
+  "config_check_issues": "配置有 {count} 条提醒",
+  "config_check_ok": "配置检查通过",
+  "config_compaction": "自动压缩",
+  "config_compaction_desc": "上下文快满时，把早先的对话压成一段摘要。",
+  "config_confirm_timeout": "对外操作等确认",
+  "config_confirm_timeout_desc": "无人值守时，等你批准对外工具的时长；到点不答就不执行。",
+  "config_default_agent": "默认助手",
+  "config_default_agent_desc": "新会话用哪个助手。",
+  "config_desc": "常用的几项，改完马上生效。其余的在配置文件里改，保存后 Gateway 自己装上。",
+  "config_done_default": "{label}回到了默认",
+  "config_done_set": "{label}改好了",
+  "config_embed_restart": "记忆用的向量模型要重启 Gateway 才换上：在终端跑 komo gateway restart。重启后自动按新模型补建索引，建好之前检索只用关键词；相关度门槛是按旧模型校准的，换了模型可能要重调。",
+  "config_issue_error": "错误",
+  "config_issue_warning": "提醒",
+  "config_load_error": "配置没取到：{message}。",
+  "config_loaded_at": "生效的配置装于 {time}。",
+  "config_memory_embedding": "记忆用的向量模型",
+  "config_memory_embedding_desc": "检索时把文字变成向量。换了要重启 Gateway 才生效。",
+  "config_memory_embedding_none": "不设（只按关键词检索）",
+  "config_memory_enabled": "记忆",
+  "config_memory_enabled_desc": "从对话里提取偏好、约定与结论，用得上时带进对话。",
+  "config_memory_model": "记忆用的模型",
+  "config_memory_model_desc": "提取和整理记忆时用哪个模型；不设就跟默认模型。",
+  "config_memory_model_follow": "跟默认模型（{model}）",
+  "config_mode_hybrid": "混合（关键词 + 向量）",
+  "config_mode_keyword": "只用关键词",
+  "config_mode_vector": "只用向量",
+  "config_receipt_reloaded": "{done}。重载装上了。",
+  "config_receipt_reloaded_changed": "{done}。重载装上了，变了 {count} 个键。",
+  "config_receipt_start_only": "其中 {keys} 要重启 Gateway 才生效。",
+  "config_recheck": "重新检查",
+  "config_reload": "重新加载",
+  "config_reload_changed": "装上了，变了 {count} 个键：{keys}。",
+  "config_reload_failed": "没装上：{message}",
+  "config_reload_start_only": "其中 {keys} 只在启动时生效，要重启 Gateway（komo gateway restart）。",
+  "config_reload_unchanged": "装上了，没有键变化。",
+  "config_reloading": "正在加载",
+  "config_reread": "重新读取",
+  "config_restore_default": "恢复默认",
+  "config_result_bytes": "工具结果给模型的上限",
+  "config_result_bytes_desc": "超过就只给开头的预览和完整结果的引用。",
+  "config_retrieval_mode": "记忆检索方式",
+  "config_retrieval_mode_desc": "怎么找出和眼下这段对话相关的记忆。",
+  "config_stale": "之后文件改过，还没装上。",
+  "config_unit_bytes": "字节",
+  "config_unit_mins": "分钟",
+  "config_unit_secs": "秒",
+  "conn_connecting": "正在连接 Gateway",
+  "conn_down": "连不上 Gateway",
+  "conn_label_down": "Gateway 未连接",
+  "conn_label_ok": "Gateway 已连接",
+  "conn_ok": "Gateway {version} · 已连接",
+  "conn_retrying": "事件流断了，正在重连",
+  "controls_save": "保存",
+  "controls_saving": "正在保存",
+  "copy": "复制",
+  "copy_answer": "复制回答",
+  "cron_col_job": "任务",
+  "cron_col_last": "上一次",
+  "cron_col_next": "下一次",
+  "cron_daily": "每天 {time}",
+  "cron_day_separator": "、",
+  "cron_day_today": "今天",
+  "cron_day_tomorrow": "明天",
+  "cron_day_yesterday": "昨天",
+  "cron_delete": "删除这个任务",
+  "cron_delete_confirm": "删掉「{name}」",
+  "cron_delete_warn": "删掉之后不再跑；跑过的记录还在各自的会话里。",
+  "cron_detail": "详情",
+  "cron_dow_fri": "五",
+  "cron_dow_mon": "一",
+  "cron_dow_sat": "六",
+  "cron_dow_sun": "日",
+  "cron_dow_thu": "四",
+  "cron_dow_tue": "二",
+  "cron_dow_wed": "三",
+  "cron_empty": "还没有定时任务。",
+  "cron_error_act": "没成：{message}",
+  "cron_every_minutes": "每 {n} 分钟",
+  "cron_finding_all_paused": "所有任务都暂停了。",
+  "cron_finding_error": "定时任务没取到。",
+  "cron_finding_failed": "「{name}」上一次出错了。",
+  "cron_finding_next": "下一次是「{name}」，{when}。",
+  "cron_finding_no_slot": "「{name}」排不上下一次。",
+  "cron_finding_none": "还没有定时任务。在对话里说「每周五下午两点…」，komo 会建一个。",
+  "cron_finding_waiting": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
+      "match": {
+        "countPlural=other": "{count} 个任务停在等你处理：{names}。"
+      }
+    }
+  ],
+  "cron_finished": "已跑完",
+  "cron_firing_error": "出错",
+  "cron_firing_ok": "成功",
+  "cron_firing_queued": "排队中",
+  "cron_firing_skipped": "跳过",
+  "cron_firing_waiting": "等你处理",
+  "cron_hourly": "每小时第 {minute} 分",
+  "cron_kind_command": "命令",
+  "cron_kind_prompt": "提示词",
+  "cron_kv_last": "上一次",
+  "cron_kv_next": "下一次",
+  "cron_kv_notify": "投递",
+  "cron_kv_overlap": "重叠",
+  "cron_kv_workdir": "目录",
+  "cron_last_session": "那次的会话",
+  "cron_list": "定时清单",
+  "cron_load_error": "没取到：{message}。",
+  "cron_monthly": "每月 {day} 日 {time}",
+  "cron_never_ran": "还没跑过",
+  "cron_no_slot": "排不上下一次：{reason}",
+  "cron_notify_always": "每次都投",
+  "cron_notify_never": "从不投",
+  "cron_notify_on_error": "只在出错时投",
+  "cron_once": "{when}，只跑一次",
+  "cron_overlap_allow": "照常再起一个",
+  "cron_overlap_skip": "上次没跑完就跳过这次",
+  "cron_pause": "暂停",
+  "cron_paused": "已暂停",
+  "cron_resume": "恢复",
+  "cron_run_busy": "正在触发",
+  "cron_run_now": "现在跑一次",
+  "cron_state_active": "在跑",
+  "cron_triggered_after": "里跑。",
+  "cron_triggered_before": "已触发，这一次在",
+  "cron_triggered_link": "它的会话",
+  "cron_tz": "（{tz}）",
+  "cron_weekdays": "工作日 {time}",
+  "cron_weekly": "每周{days} {time}",
+  "cron_what": "跑什么",
+  "cron_when": "什么时候",
+  "ctx_free": "空闲",
+  "ctx_memory": "记忆",
+  "ctx_messages": "对话消息",
+  "ctx_project": "项目规范",
+  "ctx_results": "工具结果",
+  "ctx_skills": "Skills 清单",
+  "ctx_summary": "压缩摘要",
+  "ctx_system": "系统提示",
+  "ctx_tools": "工具定义",
+  "dismiss": "知道了",
+  "duration_h_m": "{h}小时{m}分",
+  "duration_m_s": "{m}分{s}秒",
+  "duration_s": "{s}秒",
+  "effort_default": "默认",
+  "effort_high": "高",
+  "effort_low": "低",
+  "effort_max": "最高",
+  "effort_medium": "中",
+  "effort_minimal": "最低",
+  "effort_none": "不想",
+  "effort_xhigh": "很高",
+  "env_add": "添加变量",
+  "env_change": "改值",
+  "env_delete_ask": "删掉之后，读它的地方拿不到值。",
+  "env_delete_in_use": "{names} 还在用它，Gateway 会拒绝。",
+  "env_delete_label": "删掉 {name}",
+  "env_delete_sure": "删掉 {name}",
+  "env_desc": "API key 与其他凭证。值只能写入、不再显示；改完马上生效。",
+  "env_done_delete": "删掉了 {name}",
+  "env_done_set": "{name} 设好了",
+  "env_done_set_many": "设好了 {count} 个变量",
+  "env_load_error": "环境变量没取到：{message}。",
+  "env_name": "名字",
+  "env_paste_hint": "或把 .env 的内容整段粘贴到名字框里。",
+  "env_row_add": "添加",
+  "env_row_remove": "去掉这一行",
+  "env_set": "设置",
+  "env_state_empty": "是空的",
+  "env_state_missing": "缺",
+  "env_state_set": "已设置",
+  "env_used_by": "{names} 在用",
+  "env_value": "值",
+  "env_value_label": "值",
+  "env_value_replace": "新值，会替换现在的",
+  "error_config_invalid": "配置没有通过校验。",
+  "error_conflict": "这个状态下做不了这件事。",
+  "error_corrupt": "Gateway 发现数据损坏，已停止受影响的任务。",
+  "error_denied": "Gateway 拒绝了这个请求。",
+  "error_internal": "Gateway 出错了。",
+  "error_invalid_request": "请求不合法。",
+  "error_not_found": "找不到这个资源。",
+  "error_request_key_conflict": "同一请求键对应了不同的内容。",
+  "error_unauthorized": "没有登录，或者登录已经失效。",
+  "error_unreachable": "连不上 Gateway。",
+  "error_vector_unavailable": "向量检索不可用。",
+  "error_version_conflict": "内容已经被别处改过，刷新后再试。",
+  "gateway_change": "更换连接",
+  "gateway_connected": "已连上",
+  "gateway_connection": "连接",
+  "gateway_data_dir": "数据目录",
+  "gateway_desc": "唯一持有状态的进程；Web、TUI、CLI 都是它的客户端。",
+  "gateway_instance": "实例",
+  "gateway_load_error": "Gateway 状态没取到：{message}。",
+  "gateway_rtt": "往返 {ms} ms",
+  "gateway_started": "启动于",
+  "gateway_telemetry": "遥测",
+  "gateway_telemetry_error": "出错：{message}",
+  "gateway_telemetry_none": "还没导出过",
+  "gateway_telemetry_ok": "正常，最近一次 {ago}",
+  "gateway_telemetry_unset": "没配",
+  "gateway_unreachable": "连不上",
+  "gateway_version": "版本",
+  "gateway_version_value": "{version} · 协议 {protocol}",
+  "group_all": "全部会话",
+  "group_archived": "已归档",
+  "group_flat_active": "会话",
+  "group_recent": "最近",
+  "home_error": "取不到主会话：{message}",
+  "inbox_abandon_ask": "这条 Run 到此为止，取消后不会再继续。",
+  "inbox_abandon_sure": "确定到此为止",
+  "inbox_answer_error": "没答上：{message}",
+  "inbox_answered": "已答复",
+  "inbox_back": "回到列表",
+  "inbox_detail": "详情",
+  "inbox_empty": "现在没有停着的 Run。",
+  "inbox_explain_blocked": "它依赖的文件或会话没了：处理好之后让它重新判断，或到此为止。",
+  "inbox_explain_confirm": "定时任务、monitor 或后台任务起的 Run，要调声明为对外的工具（发消息、提工单）时，等你点执行或不执行。",
+  "inbox_explain_hint": "没有渠道配 home_chat 时，这些卡投不到聊天里，只在这里和 komo intervention list 看得到。",
+  "inbox_explain_title": "什么会停在这里",
+  "inbox_explain_verify": "一次调用跑到一半 Gateway 重启了，不知道做没做成：你核对后告诉它“已经是那样了”或“确定没执行”。",
+  "inbox_finding": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
+      "match": {
+        "countPlural=one": "{count} 条在等你答复；不答，那条 Run 就一直停着。",
+        "countPlural=other": "{count} 条在等你答复；不答，那条 Run 就一直停着。"
+      }
+    }
+  ],
+  "inbox_finding_error": "待处理没取到。",
+  "inbox_finding_none": "没有等你答复的事。",
+  "inbox_hint": "答复只对这一次有效，没有“以后都允许”。",
+  "inbox_kind_blocked": "前提没了",
+  "inbox_kind_confirm": "要调对外工具",
+  "inbox_kind_verify": "结果不明，等你核对",
+  "inbox_kind_verify_short": "结果不明",
+  "inbox_kv_handle": "句柄",
+  "inbox_kv_session": "会话",
+  "inbox_kv_stopped": "停下",
+  "inbox_list": "待处理清单",
+  "inbox_load_error": "没取到：{message}。",
+  "inbox_none_to_answer": "没有要答复的。",
+  "inbox_pick": "选一条答复它。",
+  "inbox_session_gone": "会话已不在列表里",
+  "inbox_verdict_abandon": "到此为止",
+  "inbox_verdict_approve": "执行",
+  "inbox_verdict_not_performed": "确定没执行，重放",
+  "inbox_verdict_reject": "不执行",
+  "inbox_verdict_resolve": "处理好了，重新判断",
+  "inbox_verdict_satisfied": "已经是那样了，继续",
+  "language_en": "English",
   "language_label": "语言",
   "language_zh_cn": "中文",
-  "language_en": "English",
-  "retry": "重试",
-  "unauthorized_title": "这个浏览器还没有配对",
-  "unauthorized_body": "在终端运行 komo web，它会打开一个一次性链接完成配对。",
-  "error_unauthorized": "没有登录，或者登录已经失效。",
-  "error_denied": "Gateway 拒绝了这个请求。",
-  "error_not_found": "找不到这个资源。",
-  "error_internal": "Gateway 出错了。",
-  "error_unreachable": "连不上 Gateway。",
+  "matter_act_done": "完成",
+  "matter_act_drop": "放弃",
+  "matter_act_edit": "改标题或截止",
+  "matter_act_edit_area": "改名称或标准",
+  "matter_act_link": "挂定时任务",
+  "matter_act_next_edit": "改下一步",
+  "matter_act_next_write": "写下一步",
+  "matter_act_park": "搁置",
+  "matter_act_reopen": "重开",
+  "matter_act_resume": "继续",
+  "matter_act_resume_wait": "等到了，继续",
+  "matter_act_retire": "不再管",
+  "matter_act_wait": "转为在等",
+  "matter_act_wait_edit": "改在等什么",
+  "matter_back": "回到列表",
+  "matter_busy_edit": "正在改",
+  "matter_closed_on": "结案 {date}",
+  "matter_closure_archived": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
+      "match": {
+        "countPlural=other": "归档了 {count} 条为它记的线索。"
+      }
+    }
+  ],
+  "matter_closure_conventions": "这些约定还归属它，照常带进对话；去记忆页改归属或遗忘：",
+  "matter_closure_linked": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
+      "match": {
+        "countPlural=other": "还挂着 {count} 个触发器，没删；不用了就在下面摘下。"
+      }
+    }
+  ],
+  "matter_closure_restored": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
+      "match": {
+        "countPlural=other": "恢复了 {count} 条归档的线索。"
+      }
+    }
+  ],
+  "matter_col_due": "截止",
+  "matter_col_matter": "事项",
+  "matter_col_memory": "记忆",
+  "matter_detail": "详情",
+  "matter_due_in": [
+    {
+      "declarations": [
+        "input days",
+        "local daysPlural = days: plural"
+      ],
+      "selectors": [
+        "daysPlural"
+      ],
+      "match": {
+        "daysPlural=other": "还有 {days} 天"
+      }
+    }
+  ],
+  "matter_due_overdue": [
+    {
+      "declarations": [
+        "input days",
+        "local daysPlural = days: plural"
+      ],
+      "selectors": [
+        "daysPlural"
+      ],
+      "match": {
+        "daysPlural=other": "超期 {days} 天"
+      }
+    }
+  ],
+  "matter_due_today": "今天到期",
+  "matter_due_tomorrow": "明天到期",
+  "matter_empty_areas": "没有在管的领域：没有终点、要一直维持的事（每周告警轮换）记成领域。",
+  "matter_empty_goals": "没有在做的目标：有结果、会结束的事记成目标，可以带截止日期。",
+  "matter_error_create": "没建成：{message}",
+  "matter_error_edit": "没改成：{message}",
+  "matter_evidence": "用户原话",
+  "matter_evidence_empty": "没有：这件事是在终端或这里直接建的。",
+  "matter_evidence_memos": "Memos 记录",
+  "matter_field_due": "截止",
+  "matter_field_next": "下一步",
+  "matter_field_standard": "标准",
+  "matter_field_waiting": "在等",
+  "matter_finding_counts": "{goals} 个目标在做，{areas} 个领域在管。",
+  "matter_finding_error": "事项没取到。",
+  "matter_finding_late_many": "{count} 件超期了，最早的是「{title}」。",
+  "matter_finding_late_one": [
+    {
+      "declarations": [
+        "input days",
+        "local daysPlural = days: plural"
+      ],
+      "selectors": [
+        "daysPlural"
+      ],
+      "match": {
+        "daysPlural=other": "「{title}」超期 {days} 天。"
+      }
+    }
+  ],
+  "matter_finding_none": "现在没有在做的事。在对话里说「开始做…」「这件事我来管」，komo 会记下。",
+  "matter_finding_waiting": "{count} 件在等别人：{what}。",
+  "matter_form_due": "截止日期",
+  "matter_form_due_hint": "清空日期就是不再设截止。",
+  "matter_form_job": "定时任务",
+  "matter_form_next": "下一步",
+  "matter_form_next_hint": "一句话；留空就是清掉",
+  "matter_form_resume_next": "接下来做什么（可不填）",
+  "matter_form_standard": "要维持的标准",
+  "matter_form_standard_hint": "留空就是清掉",
+  "matter_form_title_area": "名称",
+  "matter_form_title_goal": "标题",
+  "matter_form_waiting": "在等谁、等什么",
+  "matter_group_areas": "领域",
+  "matter_group_closed": "已结案",
+  "matter_group_goals": "目标",
+  "matter_group_parked": "搁置",
+  "matter_kind_area": "领域",
+  "matter_kind_goal": "目标",
+  "matter_kv_closed": "结案",
+  "matter_kv_created": "新建",
+  "matter_kv_revision": "版本",
+  "matter_kv_updated": "更新",
+  "matter_list": "事项清单",
+  "matter_load_error": "事项没取到：{message}。",
+  "matter_memories": "为它记的记忆",
+  "matter_memories_count": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
+      "match": {
+        "countPlural=other": "{count} 条为它记的记忆"
+      }
+    }
+  ],
+  "matter_memories_empty": "还没有。提取时 komo 会把相关的新观察挂到进行中的事项下。",
+  "matter_new_area": "领域：没有终点、要一直维持",
+  "matter_new_busy": "正在建",
+  "matter_new_button": "新建",
+  "matter_new_due": "截止日期（可不填）",
+  "matter_new_goal": "目标：有结果、会结束",
+  "matter_new_next": "下一步（可不填）",
+  "matter_new_one_line": "一句话",
+  "matter_new_placeholder": "例：这周把 owl 的发布观察做完",
+  "matter_new_standard": "要维持的标准（可不填）",
+  "matter_new_standard_placeholder": "例：每周一前完成告警值班轮换",
+  "matter_new_submit": "建好",
+  "matter_new_title": "新建事项",
+  "matter_new_what": "是什么",
+  "matter_no_jobs_after": "建一个。",
+  "matter_no_jobs_before": "没有可挂的定时任务。先去",
+  "matter_not_set": "没设",
+  "matter_not_written": "没写",
+  "matter_pick": "选一件，看它的下一步、触发器和为它记的记忆。",
+  "matter_pick_none": "新建的事项会出现在这里。",
+  "matter_provenance_model_inference": "模型推断",
+  "matter_provenance_tool_observation": "工具观察",
+  "matter_provenance_user_statement": "用户原话",
+  "matter_revision": "第 {n} 版",
+  "matter_save": "保存",
+  "matter_show_all": "显示全部 {count} 件",
+  "matter_show_less": "收起",
+  "matter_state_active": "进行中",
+  "matter_state_parked": "搁置",
+  "matter_state_waiting": "在等",
+  "matter_status_active": "在做",
+  "matter_status_done": "完成",
+  "matter_status_dropped": "放弃",
+  "matter_status_parked": "搁置",
+  "matter_status_retired": "不再管",
+  "matter_status_waiting": "在等",
+  "matter_sub_area": "领域",
+  "matter_sub_next": "下一步：{what}",
+  "matter_sub_no_next": "还没有下一步",
+  "matter_sub_standard": "标准：{what}",
+  "matter_sub_waiting": "在等：{what}",
+  "matter_submit_link": "挂上",
+  "matter_submit_resume": "继续",
+  "matter_submit_wait": "转为在等",
+  "matter_trigger_cron": "定时任务",
+  "matter_trigger_cron_gone": "已删除的任务",
+  "matter_trigger_session_gone": "会话已不在列表里",
+  "matter_triggers": "触发器",
+  "matter_triggers_empty": "没挂。在等别人时 komo 常会挂一个 monitor 盯着；定期要做的事可以挂定时任务。",
+  "matter_unlink": "摘下",
+  "mcp_back": "全部服务器",
+  "mcp_col_server": "服务器",
+  "mcp_col_state": "状态",
+  "mcp_col_tools": "工具",
+  "mcp_col_way": "方式",
+  "mcp_connect": "连接",
+  "mcp_default_exposure": "工具默认：{way}",
+  "mcp_desc": "外部工具服务器。增删改在配置文件里；这里看连没连上、有哪些工具。",
+  "mcp_disconnect": "断开连接",
+  "mcp_disconnect_failed": "断开没成：{message}",
+  "mcp_disconnected_hint": "手动断开了：不会自动再连，模型调它的工具会被告知已断开。点“连接”恢复；Gateway 重启后也会重新连上。",
+  "mcp_disconnecting": "正在断开",
+  "mcp_exposure_codemode": "脚本里调",
+  "mcp_exposure_direct": "直接给模型",
+  "mcp_exposure_hidden": "不挂",
+  "mcp_load_error": "MCP 没取到：{message}。",
+  "mcp_needs_auth_hint": "在终端跑 {command}，登录完下一次调用自动连上。",
+  "mcp_no_tools": "这台服务器没有列出工具。",
+  "mcp_none": "没有配 MCP 服务器。",
+  "mcp_old_gateway": "在跑的 Gateway 还没有服务器列表的接口；装上新版后这里列出每台服务器和它的工具。",
+  "mcp_reconnect": "重连",
+  "mcp_reconnect_all": "重连全部",
+  "mcp_reconnect_failed": "重连没成：{message}",
+  "mcp_reconnecting": "正在重连",
+  "mcp_state_connected": "已连上",
+  "mcp_state_connecting": "连接中",
+  "mcp_state_disconnected": "已断开",
+  "mcp_state_failed": "连不上",
+  "mcp_state_needs_auth": "要登录",
+  "mcp_tool_count": "工具 {count} 个",
+  "mcp_tool_outward": "对外",
+  "mcp_tool_read_only": "只读",
+  "mcp_tools_after_connect": "连上之后这里列出它的工具。",
+  "mcp_way_local": "本机进程",
+  "mcp_way_remote": "远程",
+  "memindex_covered": "已索引 {indexed} / {total} 条生效的",
+  "memindex_desc": "记忆检索的向量部分；索引不可用时检索按关键词降级。",
+  "memindex_endpoint": "端点",
+  "memindex_errors": "错误",
+  "memindex_load_error": "记忆索引没取到：{message}。",
+  "memindex_none": "没配",
+  "memindex_rebuild": "重建索引",
+  "memindex_rebuild_accepted": "已提交重建（代次 {generation}），后台跑完前检索按关键词降级。",
+  "memindex_rebuild_failed": "没提交：{message}",
+  "memindex_rebuild_running": "已经有一次重建在跑，没有再起一个。",
+  "memindex_rebuilding": "正在提交",
+  "memindex_state": "状态",
+  "memindex_state_building": "正在建",
+  "memindex_state_failed": "不可用",
+  "memindex_state_ready": "就绪",
+  "memindex_state_unconfigured": "没配向量模型",
+  "memindex_vector": "向量",
+  "memory_act_confirm": "确认第 {revision} 版",
+  "memory_act_forget": "遗忘第 {revision} 版",
+  "memory_act_forget_ask": "遗忘这条",
+  "memory_act_to_convention": "改成约定",
+  "memory_act_to_reference": "改成线索",
+  "memory_add": "记一条",
+  "memory_add_application": "怎么用",
+  "memory_add_busy": "正在记",
+  "memory_add_content": "内容",
+  "memory_add_content_ph": "一句话，单一的一件事",
+  "memory_add_convention": "约定：条件成立就照做",
+  "memory_add_hint": "你在这里记的算你亲口说的，直接记成已确认。",
+  "memory_add_kind": "种类",
+  "memory_add_reference": "线索：查找与判断时参考",
+  "memory_add_scope": "作用域",
+  "memory_add_submit": "记下",
+  "memory_add_title": "记一条",
+  "memory_applies_when": "适用于",
+  "memory_back": "回到列表",
+  "memory_chain_other": "另一条",
+  "memory_chain_superseded_by": "被这条取代：",
+  "memory_chain_supersedes": "取代了",
+  "memory_chart_aria": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
+      "match": {
+        "countPlural=one": "{count} 条记忆按记下的日子排开",
+        "countPlural=other": "{count} 条记忆按记下的日子排开"
+      }
+    }
+  ],
+  "memory_chart_dot": "{content}（{state}，带上 {count} 次）",
+  "memory_chart_empty": "还没有记忆：对话空闲一会儿后，komo 会从里面整理出偏好、事实和经验。",
+  "memory_chart_note": "一个点一条记忆，按记下的日子排；点越大，带进对话的次数越多。",
+  "memory_chart_title": "攒下的记忆",
+  "memory_chart_today": "今天",
+  "memory_chart_week": "{date}那周",
+  "memory_col_content": "内容",
+  "memory_col_last": "最近带上",
+  "memory_col_used": "带上 / 用上",
+  "memory_confirm": "确认",
+  "memory_confirm_title": "确认第 {revision} 版的文字",
+  "memory_confirmed": "已确认",
+  "memory_detail_label": "这条记忆",
+  "memory_evidence": "证据",
+  "memory_evidence_memos": "Memos 记录",
+  "memory_evidence_none": "没有事件证据：这条是你在终端或这里亲手记的。",
+  "memory_evidence_session_gone": "会话已不在列表里",
+  "memory_fail_add": "没记下：{message}",
+  "memory_fail_classify": "没改成：{message}",
+  "memory_fail_confirm": "没确认成：{message}",
+  "memory_fail_forget": "没遗忘成：{message}",
+  "memory_fail_restore": "没恢复成：{message}",
+  "memory_finding_all_unseen": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
+      "match": {
+        "countPlural=one": "在起作用的 {count} 条都还没过目。",
+        "countPlural=other": "在起作用的 {count} 条都还没过目。"
+      }
+    }
+  ],
+  "memory_finding_candidate": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
+      "match": {
+        "countPlural=one": "{count} 条候选还没进召回，等你看。",
+        "countPlural=other": "{count} 条候选还没进召回，等你看。"
+      }
+    }
+  ],
+  "memory_finding_confirmed": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
+      "match": {
+        "countPlural=one": "在起作用的 {count} 条你都确认过。",
+        "countPlural=other": "在起作用的 {count} 条你都确认过。"
+      }
+    }
+  ],
+  "memory_finding_contested": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
+      "match": {
+        "countPlural=one": "{count} 条有冲突，暂停带上，等你定哪条算数。",
+        "countPlural=other": "{count} 条有冲突，暂停带上，等你定哪条算数。"
+      }
+    }
+  ],
+  "memory_finding_error": "记忆没取到。",
+  "memory_finding_none": "现在没有生效的记忆：对话空闲后，komo 会从里面整理。",
+  "memory_finding_some_unseen": "在起作用的 {live} 条里，{unseen} 条还没过目。",
+  "memory_forget_note": "遗忘后这条不再带进对话，同一来源也不会再被整理出来。原对话不删。",
+  "memory_hint_archived": "所属的事结案后归档；重开那件事时恢复。",
+  "memory_hint_superseded": "被新的一条取代，不再带上。",
+  "memory_index_building": " · 索引正在建",
+  "memory_index_degraded": "检索降级了：{reason}",
+  "memory_index_failed": " · 索引不可用",
+  "memory_index_line": "检索用关键词 + 向量 · {model} · 已索引 {indexed} / {total} 条生效的",
+  "memory_index_unknown": "原因没有给出",
+  "memory_kind_experience": "经验",
+  "memory_kind_fact": "事实",
+  "memory_kind_preference": "偏好",
+  "memory_kv_adopted": "用上",
+  "memory_kv_belongs": "归属",
+  "memory_kv_brought": "带上",
+  "memory_kv_kind": "种类",
+  "memory_kv_noted": "记下",
+  "memory_kv_revision": "第 {revision} 版 · {status}",
+  "memory_kv_scope": "作用域",
+  "memory_kv_source": "来源",
+  "memory_kv_source_auto": "{source}，自动整理",
+  "memory_kv_times": "{count} 次",
+  "memory_kv_times_last": "{count} 次 · 最近 {when}",
+  "memory_kv_until": "有效到",
+  "memory_kv_version": "版本",
+  "memory_list_count": "{count} 条",
+  "memory_list_live": "在起作用",
+  "memory_list_search": "检索「{query}」",
+  "memory_load_error": "记忆没取到：{message}。",
+  "memory_matter_closed": "（已结案）",
+  "memory_matter_gone": "事项已不在",
+  "memory_none_always": "还没有约定：你说「以后都…」「默认…」这类话时，komo 会记成约定。",
+  "memory_none_live": "现在没有生效的记忆。",
+  "memory_none_out": "没有遗忘、被取代或归档的记忆。",
+  "memory_none_paused": "没有候选或有争议的记忆。",
+  "memory_none_relevant": "没有生效的线索。",
+  "memory_none_search": "没有检索到相关的记忆。",
+  "memory_pick": "选一条，看它从哪来、带上过几次。",
+  "memory_prov_model_inference": "模型推断",
+  "memory_prov_tool_observation": "工具观察",
+  "memory_prov_user_statement": "用户原话",
+  "memory_restore": "恢复",
+  "memory_row_adopted": "用上 {count}",
+  "memory_row_brought": "带上",
+  "memory_rung_always": "每次都带",
+  "memory_rung_always_sub": "约定",
+  "memory_rung_out": "不再带",
+  "memory_rung_out_sub": "已不生效",
+  "memory_rung_paused": "暂停",
+  "memory_rung_paused_sub": "候选与有争议",
+  "memory_rung_relevant": "相关才带",
+  "memory_rung_relevant_sub": "线索",
+  "memory_rungs_label": "按离对话的远近筛选",
+  "memory_scope_agent": "Agent {id}",
+  "memory_scope_all": "全部作用域",
+  "memory_scope_environment": "环境 {id}",
+  "memory_scope_label": "作用域",
+  "memory_scope_personal": "个人",
+  "memory_search_label": "检索记忆",
+  "memory_state_active": "生效",
+  "memory_state_archived": "已归档",
+  "memory_state_candidate": "候选",
+  "memory_state_contested": "有争议",
+  "memory_state_forgotten": "已遗忘",
+  "memory_state_superseded": "被取代",
+  "memory_unconfirmed": "未确认",
+  "memory_use_convention": "约定",
+  "memory_use_reference": "线索",
+  "memory_use_unclassified": "线索（未分类）",
+  "memory_when_label": "什么时候适用",
+  "memory_when_placeholder": "例：创建发布工单、需要选 Platform 时",
+  "models_add": "添加",
+  "models_add_model": "添加模型",
+  "models_add_provider": "添加模型提供商",
+  "models_advanced": "自定义设置",
+  "models_alias_auto": "自动",
+  "models_api_key": "API 密钥",
+  "models_api_key_enter": "输入 API 密钥",
+  "models_api_key_hint": "存成环境变量，不进配置。",
+  "models_api_key_keep": "留空使用已保存的凭据",
+  "models_backend": "API 协议",
+  "models_backend_embeddings": "OpenAI 兼容嵌入",
+  "models_backend_ollama_embeddings": "Ollama 嵌入",
+  "models_backend_unset": "协议没写",
+  "models_base_url": "API 地址",
+  "models_catalog": "模型目录",
+  "models_catalog_completion": "对话模型",
+  "models_catalog_embedding": "嵌入模型",
+  "models_catalog_empty": "还没有模型。",
+  "models_default": "默认模型",
+  "models_del_embed": "删掉向量模型 {id}；它的 key 留在环境变量里。",
+  "models_del_embed_in_use": "记忆正用着它，Gateway 会拒绝；先让记忆换一个向量模型。",
+  "models_del_provider": "删掉 provider {id}；它的 API 密钥留在环境变量里。",
+  "models_del_provider_used": "还有 {count} 个模型挂在它上面，Gateway 会拒绝；先在编辑里把模型目录清空，或改挂别的 provider。",
+  "models_del_sure": "删掉 {id}",
+  "models_delete": "删除",
+  "models_desc": "填入各提供商的 API 密钥即可使用其模型；改完马上生效。",
+  "models_dimensions": "维数",
+  "models_dimensions_ph": "模型返回的",
+  "models_display_name": "显示名称",
+  "models_done_default": "默认模型改成了 {alias}",
+  "models_done_embed_deleted": "删掉了向量模型 {id}",
+  "models_done_embed_renamed": "向量模型 {from} 改名为 {to}",
+  "models_done_embed_saved": "保存了向量模型 {alias}",
+  "models_done_provider_added": "添加了 provider {id}",
+  "models_done_provider_deleted": "删掉了 provider {id}",
+  "models_done_provider_renamed": "provider {from} 改名为 {to}",
+  "models_done_provider_saved": "保存了 provider {id}",
+  "models_dup_provider": "已经有叫 {id} 的 provider；换个 ID，或去编辑那一个。",
+  "models_edit": "编辑",
+  "models_effort": "默认 effort",
+  "models_effort_ph": "provider 默认",
+  "models_efforts": "可选档位",
+  "models_embed_alias_ph": "例：embedding",
+  "models_embed_backend": "向量协议",
+  "models_embed_dimensions_ph": "留空：用模型返回的",
+  "models_embed_env_key_ph": "名字大写_API_KEY",
+  "models_embed_key_hint": "key 存成环境变量，不进配置。改名字时记忆的引用一并改。",
+  "models_embed_key_set": "已设置；留空不改",
+  "models_embed_key_unset": "还没设置",
+  "models_embed_model": "上游模型 id",
+  "models_embed_name": "{label} 嵌入",
+  "models_embed_restart": "记忆用的向量模型要重启 Gateway 才换上：在终端跑 komo gateway restart。重启后自动按新模型补建索引，建好之前检索只用关键词；相关度门槛是按旧模型校准的，换了模型可能要重调。",
+  "models_env_key": "凭证变量名",
+  "models_env_key_ph": "留空：ID 大写_API_KEY",
+  "models_fetch": "获取可用模型",
+  "models_fetching": "正在获取…",
+  "models_filter_label": "筛选模型",
+  "models_filter_placeholder": "在 {count} 个模型里筛选",
+  "models_in_use": "记忆在用",
+  "models_key_generic": "凭证",
+  "models_key_login": "凭证来自 {auth} 登录",
+  "models_key_missing": "缺 {name}",
+  "models_key_set": "{name} 已设置",
+  "models_key_unnamed": "没写凭证变量",
+  "models_kind": "类型",
+  "models_kind_completion": "对话",
+  "models_kind_embedding": "嵌入（记忆检索用）",
+  "models_kind_locked": "挂着模型时不能改类型；要改先把模型目录清空保存。",
+  "models_load_error": "没取到：{message}。",
+  "models_model_id": "模型 ID",
+  "models_no_embedding": "还没有向量模型：记忆只能按关键词检索。添加一个协议选“嵌入”的提供商，再在它的模型目录里加模型。",
+  "models_no_match": "没有匹配的模型",
+  "models_provider_id": "Provider ID",
+  "models_provider_id_hint_edit": "改了会把挂在它上面的模型一并改过去。",
+  "models_provider_id_hint_new": "以字母开头，模型靠它找到这个 provider，也用来派生凭证变量名。",
+  "models_reread": "重新读取",
+  "models_row_alias": "名字（alias）",
+  "models_row_collapse": "收起更多设置",
+  "models_row_delete": "删掉这一行",
+  "models_row_expand": "展开更多设置",
+  "models_save": "保存",
+  "models_saving": "正在保存",
+  "models_standalone_only": "只能在配置文件里改",
+  "models_tab_custom": "自定义模型 API",
+  "models_tab_custom_hint": "连接中转站、自部署服务或其他兼容 OpenAI / Anthropic 协议的接口，需填写 API 地址、协议和模型。",
+  "models_tab_label": "提供商来源",
+  "models_tab_preset": "第三方模型提供商",
+  "models_tab_preset_hint": "选一家：地址和协议已经填好，填上 API 密钥、挑模型就行。",
+  "models_tag_custom": "自定义",
+  "models_tag_embedding": "嵌入",
+  "models_timeout": "请求时限（秒）",
+  "models_timeout_ph": "默认 120",
+  "models_window": "上下文窗口",
+  "models_window_ph": "问 provider",
+  "nav_close": "收起导航",
+  "nav_cron": "定时",
+  "nav_inbox": "待处理",
+  "nav_label": "导航与会话",
+  "nav_matters": "事项",
+  "nav_memory": "记忆",
+  "nav_new_session": "新对话",
+  "nav_open": "打开导航",
+  "nav_search": "搜索",
+  "nav_settings": "设置",
+  "pair_failed": "配对失败：{message}",
+  "pair_hint": "回到终端重新运行 komo web，换一个新链接。",
+  "pair_missing_code": "这个链接里没有配对码。",
   "pair_title": "配对浏览器",
   "pair_working": "正在配对…",
-  "pair_failed": "配对失败：{message}",
-  "pair_missing_code": "这个链接里没有配对码。",
-  "pair_hint": "回到终端重新运行 komo web，换一个新链接。"
+  "palette_close": "关闭搜索",
+  "palette_empty_blank": "这里还没有东西。",
+  "palette_empty_memory_hint": "输入关键词检索记忆。",
+  "palette_empty_none": "没有找到。",
+  "palette_key_close": "关闭",
+  "palette_key_open": "打开",
+  "palette_key_select": "选择",
+  "palette_key_type": "换类型",
+  "palette_meta_archived": "已归档",
+  "palette_meta_area": "领域",
+  "palette_meta_goal": "目标",
+  "palette_meta_task": "子任务",
+  "palette_placeholder": "搜索会话、事项、记忆、定时",
+  "palette_results": "结果",
+  "palette_searching": "正在检索……",
+  "palette_searching_memory": "正在检索记忆……",
+  "palette_sec_action": "动作",
+  "palette_sec_cron": "定时",
+  "palette_sec_matter": "事项",
+  "palette_sec_memory": "记忆",
+  "palette_sec_recent": "最近",
+  "palette_sec_session": "会话",
+  "palette_title": "搜索",
+  "palette_type_all": "全部",
+  "palette_type_cron": "定时",
+  "palette_type_matter": "事项",
+  "palette_type_memory": "记忆",
+  "palette_type_session": "会话",
+  "palette_types": "类型",
+  "panel_bg": "在后台",
+  "panel_bg_done": "已结束 · {when}",
+  "panel_bg_elapsed": "已跑 {time}",
+  "panel_bg_empty": "这段对话没有派出后台任务。",
+  "panel_bg_running": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
+      "match": {
+        "countPlural=one": "{count} 个在跑",
+        "countPlural=other": "{count} 个在跑"
+      }
+    }
+  ],
+  "panel_conn": "连接",
+  "panel_conn_bad": "有问题",
+  "panel_conn_gateway": "Gateway {version}",
+  "panel_conn_note": "渠道和 MCP 的连接状态，Gateway 还没有接口可查。",
+  "panel_conn_ok": "正常",
+  "panel_conn_started": "启动于 {when}",
+  "panel_conn_telemetry": "遥测",
+  "panel_conn_telemetry_error": "出错：{message}",
+  "panel_conn_telemetry_off": "未配置",
+  "panel_conn_telemetry_ok": "正常，最近一次 {when}",
+  "panel_context": "上下文",
+  "panel_context_none": "这段对话还没有请求过模型。",
+  "panel_context_note": "合计是上一次请求实报的 token；各项按字节估算后按合计校准。",
+  "panel_context_of": "{used} / {win}",
+  "panel_context_tree_error": "会话树没取到，分不出构成。",
+  "panel_context_tree_loading": "正在读会话树。",
+  "panel_context_used": "{pct} 已用",
+  "panel_failed": "没取到：{message}",
+  "panel_loading_session": "正在读这段对话。",
+  "panel_matter_next": "下一步 {what}",
+  "panel_matter_standard": "标准 {what}",
+  "panel_matter_waiting": "在等 {what}",
+  "panel_matters": "在做的事",
+  "panel_matters_all": "全部事项",
+  "panel_matters_empty": "没有进行中的目标或在管的领域。",
+  "panel_memory": "带上的记忆",
+  "panel_memory_all": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
+      "match": {
+        "countPlural=one": "全部 {count} 条生效的记忆",
+        "countPlural=other": "全部 {count} 条生效的记忆"
+      }
+    }
+  ],
+  "panel_memory_convention": "约定",
+  "panel_memory_detail": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
+      "match": {
+        "countPlural=one": "{kind} · 用过 {count} 次 · v{revision}",
+        "countPlural=other": "{kind} · 用过 {count} 次 · v{revision}"
+      }
+    }
+  ],
+  "panel_memory_empty": "最近这一轮没有带上记忆。",
+  "panel_memory_gone": "库里已经没有这条",
+  "panel_memory_reference": "线索",
+  "panel_title": "这一段",
+  "recall_brought": "带上 {parts}",
+  "recall_conventions": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
+      "match": {
+        "countPlural=one": "{count} 条约定",
+        "countPlural=other": "{count} 条约定"
+      }
+    }
+  ],
+  "recall_missing": "{id}（库里已经没有这条）",
+  "recall_references": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
+      "match": {
+        "countPlural=one": "{count} 条线索",
+        "countPlural=other": "{count} 条线索"
+      }
+    }
+  ],
+  "recall_separator": "、",
+  "retry": "重试",
+  "send_failed": "没发出去：{message}",
+  "send_sending": "发送中",
+  "session_archive": "归档",
+  "session_archive_body": "归档后这段对话只能查看，不能再发消息；没跑完的会先跑完。",
+  "session_delete": "删除",
+  "session_delete_body": "没跑完的会先停掉，然后永久删掉这段对话的内容，不能恢复。",
+  "session_delete_body_archived": "永久删掉这段对话的内容，不能恢复。",
+  "session_error_create": "没能新建会话：{message}",
+  "session_error_fork": "没能分叉：{message}",
+  "session_error_rename": "没能改名：{message}",
+  "session_fork": "分叉",
+  "session_kind_main": "主会话",
+  "session_load_error": "这段对话没取到：{message}",
+  "session_menu_more": "{title} 的更多操作",
+  "session_rename": "重命名",
+  "session_rename_label": "会话名称",
+  "session_state_running": "运行中",
+  "session_state_waiting": "等待中",
+  "session_tag_archived": "已归档",
+  "session_tag_task": "子任务",
+  "session_untitled": "未命名会话",
+  "sessions_collapse": "收起",
+  "sessions_error": "会话列表没取到：{message}",
+  "sessions_kids": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
+      "match": {
+        "countPlural=one": "{count} 个子任务",
+        "countPlural=other": "{count} 个子任务"
+      }
+    }
+  ],
+  "sessions_kids_collapse": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
+      "match": {
+        "countPlural=one": "收起 {count} 个子任务",
+        "countPlural=other": "收起 {count} 个子任务"
+      }
+    }
+  ],
+  "sessions_kids_expand": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
+      "match": {
+        "countPlural=one": "展开 {count} 个子任务",
+        "countPlural=other": "展开 {count} 个子任务"
+      }
+    }
+  ],
+  "sessions_kids_live": "{count} 个在跑",
+  "sessions_loading": "正在加载会话…",
+  "sessions_none_active": "没有活跃的会话。",
+  "sessions_none_all": "还没有会话。",
+  "sessions_none_archived": "没有已归档的会话。",
+  "sessions_show_all": "显示全部 {count} 个",
+  "sessions_title": "会话",
+  "settings_close": "关闭设置",
+  "settings_nav": "设置分节",
+  "settings_sec_channels": "渠道",
+  "settings_sec_config": "配置",
+  "settings_sec_env": "环境变量",
+  "settings_sec_gateway": "Gateway",
+  "settings_sec_index": "记忆索引",
+  "settings_sec_mcp": "MCP",
+  "settings_sec_models": "模型",
+  "settings_status_error": "配置检查没取到。",
+  "settings_status_issues": "Gateway {version} 在跑，配置有 {count} 条提醒。",
+  "settings_status_ok": "Gateway {version} 在跑，配置检查通过。",
+  "settings_title": "设置",
+  "steer_tag": "插话",
+  "step_think": "思考",
+  "steps_failed": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
+      "match": {
+        "countPlural=one": "{count} 次失败",
+        "countPlural=other": "{count} 次失败"
+      }
+    }
+  ],
+  "tab_changes": "改动",
+  "tab_chat": "对话",
+  "tab_trace": "轨迹",
+  "thread_compacted": "上下文在这里压缩过一次",
+  "thread_empty": "这段对话还没开始。",
+  "thread_empty_hint": "在下面说第一句话。",
+  "thread_empty_home": "主会话里还没有消息。",
+  "tool_bash": "运行命令",
+  "tool_codemode": "代码",
+  "tool_edit": "编辑",
+  "tool_generic": "工具调用",
+  "tool_read": "读取",
+  "tool_rg": "搜索文件内容",
+  "tool_task": "创建子智能体",
+  "tool_write": "写入",
+  "topbar_fork": "分叉这段对话",
+  "topbar_panel_close": "收起右栏",
+  "topbar_panel_open": "展开右栏",
+  "topbar_tabs": "这段对话怎么看",
+  "trace_assistant_message": "助手消息",
+  "trace_calls_collapse": "收起这一步的工具调用",
+  "trace_calls_expand": "展开这一步的工具调用",
+  "trace_calls_folded": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
+      "match": {
+        "countPlural=one": "{count} 个工具调用",
+        "countPlural=other": "{count} 个工具调用"
+      }
+    }
+  ],
+  "trace_col_input": "输入",
+  "trace_col_output": "输出",
+  "trace_col_think": "思考",
+  "trace_col_time": "时间",
+  "trace_compacted": "上下文已压缩",
+  "trace_detail_aside": "事件详情",
+  "trace_detail_close": "关闭详情",
+  "trace_detail_label": "详情",
+  "trace_duration": "时长",
+  "trace_empty_overview": "还没有可画的记录。",
+  "trace_executing": "执行中…",
+  "trace_failed": "失败",
+  "trace_kind_ctx": "上下文",
+  "trace_kind_model": "助手",
+  "trace_kind_sys": "系统",
+  "trace_kind_think": "思考",
+  "trace_kind_tool": "工具",
+  "trace_kind_user": "用户",
+  "trace_lane_input": "输入",
+  "trace_lane_model": "模型",
+  "trace_lane_tool": "工具",
+  "trace_level": "层级",
+  "trace_no_change": "无变化",
+  "trace_no_content": "无内容",
+  "trace_no_match": "没有对得上的记录。",
+  "trace_no_output": "无输出",
+  "trace_no_reason": "没有给出原因",
+  "trace_no_result": "未捕获结果",
+  "trace_no_system_prompt": "本次请求没有系统提示词",
+  "trace_no_tools": "本次请求没有工具",
+  "trace_none": "没有",
+  "trace_overview_label": "时间概览：点一格看那条记录，横向拖动只看这段里的记录，Esc 清掉",
+  "trace_range_clear": "看全部",
+  "trace_range_note": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
+      "match": {
+        "countPlural=one": "只列时间概览里选中那一段的 {count} 条记录",
+        "countPlural=other": "只列时间概览里选中那一段的 {count} 条记录"
+      }
+    }
+  ],
+  "trace_recall": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
+      "match": {
+        "countPlural=one": "带上 {count} 条记忆：{list}",
+        "countPlural=other": "带上 {count} 条记忆：{list}"
+      }
+    }
+  ],
+  "trace_run_cancelled": "这一轮取消了",
+  "trace_run_failed": "这一轮失败了：{reason}",
+  "trace_running": "运行中…",
+  "trace_schema_unavailable": "Schema 不可用",
+  "trace_search_label": "搜索轨迹",
+  "trace_search_placeholder": "搜索",
+  "trace_section_removed": "这一段删掉了。",
+  "trace_start_time": "开始时间",
+  "trace_status": "状态",
+  "trace_status_completed": "已完成",
+  "trace_status_done": "已完成",
+  "trace_status_running": "运行中",
+  "trace_sys_added": "新增：{names}",
+  "trace_sys_both": "系统提示词和工具已更新",
+  "trace_sys_initial": "初始系统提示词",
+  "trace_sys_prompt": "系统提示词已更新",
+  "trace_sys_removed": "移除：{names}",
+  "trace_sys_tool_count": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
+      "match": {
+        "countPlural=one": "{count} 个工具",
+        "countPlural=other": "{count} 个工具"
+      }
+    }
+  ],
+  "trace_sys_tools": "工具已更新",
+  "trace_tab_args": "参数",
+  "trace_tab_diff": "差异",
+  "trace_tab_overview": "概述",
+  "trace_tab_preview": "预览",
+  "trace_tab_prompt": "系统提示词",
+  "trace_tab_raw": "原始内容",
+  "trace_tab_result": "结果",
+  "trace_tab_schema": "Schema",
+  "trace_tab_think": "思考",
+  "trace_tab_timing": "计时",
+  "trace_tab_tools": "工具",
+  "trace_tab_usage": "用量",
+  "trace_timing_live": "会话时间戳（运行中）",
+  "trace_timing_source": "计时来源",
+  "trace_timing_stamp": "会话时间戳",
+  "trace_tok": "{count} tok",
+  "trace_tool_calls": "工具调用",
+  "trace_tool_calls_collapse": "收起所有调用",
+  "trace_tool_calls_expand": "展开所有调用",
+  "trace_tool_duration": "时长",
+  "trace_tool_duration_equal": "改回等宽",
+  "trace_tool_duration_real": "按实际时长排",
+  "trace_tool_only": "（仅工具调用）",
+  "trace_tool_turns": "轮次",
+  "trace_tool_turns_collapse": "收起所有轮次",
+  "trace_tool_turns_expand": "展开所有轮次",
+  "trace_toolbar": "轨迹工具栏",
+  "trace_toolbar_calls": "调用",
+  "trace_tools_added": "新增工具：{names}",
+  "trace_tools_removed": "移除工具：{names}",
+  "trace_turn": "第 {n} 轮",
+  "trace_turn_running": "进行中",
+  "trace_turn_summary": "{steps} 个步骤，{calls} 个工具调用",
+  "trace_unavailable": "不可用",
+  "trace_uncertain": "结果不明",
+  "trace_uncertain_short": "不明",
+  "trace_usage_cache": "缓存读取",
+  "trace_usage_input": "输入",
+  "trace_usage_output": "输出",
+  "trace_usage_reasoning": "推理",
+  "trace_usage_session": "会话累计",
+  "trace_usage_this_request": "本次请求",
+  "trace_waiting_model": "等模型回话",
+  "trace_where_start": "会话开始",
+  "trace_where_step": "第 {n} 轮 · 第 {step} 步",
+  "turn_cancelled": "已停止，用时 {time}",
+  "turn_cancelled_note": "任务已停止",
+  "turn_done": "已完成，用时 {time}",
+  "turn_failed": "处理失败",
+  "turn_failed_note": "本轮运行失败：{reason}",
+  "turn_no_reason": "没有给出原因",
+  "turn_running": "进行中，用时 {time}",
+  "turn_spent_suffix": "，用时 {time}",
+  "unauthorized_body": "在终端运行 komo web，它会打开一个一次性链接完成配对。",
+  "unauthorized_title": "这个浏览器还没有配对",
+  "view_filter": "筛选会话",
+  "view_filter_active": "隐藏已归档",
+  "view_filter_all": "全部对话（显示已归档）",
+  "view_filter_archived": "仅显示已归档",
+  "view_group": "分组方式",
+  "view_group_flat": "单列表",
+  "view_group_tree": "按会话树",
+  "view_group_workdir": "按工作目录",
+  "view_menu": "分组、排序与筛选",
+  "view_sort": "排序方式",
+  "view_sort_created": "最近创建",
+  "view_sort_updated": "最近更新",
+  "workdir_default": "默认目录",
+  "workdir_new": "在 {name} 新建会话"
 }

@@ -1,7 +1,7 @@
 {
   "name": "komo-clients",
   "private": true,
-  "description": "komo 的客户端 workspace（docs/clients.md）：apps/client 是 Gateway 托管的网页壳，packages/* 是各端共用的协议类型与 API 层。原型 apps/web 不在 workspace 里。",
+  "description": "komo 的客户端 workspace（docs/clients.md）：apps/client 是 Gateway 托管的网页壳，apps/desktop 是它的 macOS（Electron）壳，packages/* 是各端共用的协议类型与 API 层。",
   "packageManager": "pnpm@11.21.0",
   "engines": {
     "node": ">=22"
@@ -10,6 +10,9 @@
     "dev": "pnpm --filter @komo/client dev",
     "build": "pnpm -r --if-present build",
     "lint": "pnpm -r --if-present lint",
-    "typecheck": "pnpm -r --if-present typecheck"
+    "typecheck": "pnpm -r --if-present typecheck",
+    "desktop:dev": "pnpm --filter @komo/client build && pnpm --filter @komo/desktop dev",
+    "desktop:build": "pnpm --filter @komo/desktop pack",
+    "desktop:dist": "pnpm --filter @komo/desktop dist"
   }
 }

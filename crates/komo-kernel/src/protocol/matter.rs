@@ -34,21 +34,28 @@ pub struct MatterShowQuery {
 /// 清单。`today` 是 Gateway 本地时区的今天：超期按它读（[`Matter::is_overdue`]），客户端
 /// 不拿自己的时区再算一遍。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(optional_fields))]
 pub struct MatterListResponse {
     pub matters: Vec<Matter>,
     #[serde(with = "iso_date")]
+    #[cfg_attr(feature = "ts", ts(type = "string"))]
     pub today: Date,
 }
 
 /// 一条事项，以及读它时的今天（同 [`MatterListResponse::today`]）。所有写接口也回它。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(optional_fields))]
 pub struct MatterDetail {
     pub matter: Matter,
     #[serde(with = "iso_date")]
+    #[cfg_attr(feature = "ts", ts(type = "string"))]
     pub today: Date,
     /// done / drop / retire 的回应带：这条结案的事项还挂着的触发器，提醒操作者去留（不自动删，
     /// §8）。其余操作与没有挂着的时候为空。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "ts", ts(as = "Option<Vec<MatterTrigger>>"))]
     pub still_linked: Vec<MatterTrigger>,
     /// 只在这次操作是结案（done / drop / retire）或重开时带：这件事下面的记忆怎么处理了
     /// （`docs/goals.md` §6）。
@@ -58,6 +65,8 @@ pub struct MatterDetail {
 
 /// 结案时它名下的记忆怎么处理了（`memory.md` §9.6「结案归档」）。
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(optional_fields))]
 pub struct MatterClosure {
     /// 这次转成 `archived` 的线索条数。
     #[serde(default)]
@@ -65,6 +74,7 @@ pub struct MatterClosure {
     /// 归属它、仍在生效的约定：不因结案悄悄失效，由操作者定去向（`classify --for` 或 `forget`），
     /// 没答之前照常注入。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "ts", ts(as = "Option<Vec<ClosureConvention>>"))]
     pub conventions: Vec<ClosureConvention>,
     /// 这次顺带把归档的线索恢复成 `active` 了几条（只在 reopen 时有）。
     #[serde(default)]
@@ -73,6 +83,8 @@ pub struct MatterClosure {
 
 /// 结案时列出的一条约定。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(optional_fields))]
 pub struct ClosureConvention {
     pub id: MemoryId,
     pub revision: u32,
@@ -84,6 +96,8 @@ pub struct ClosureConvention {
 
 /// `POST /v1/matters`：新建，`active`。`next` / `due` 只给 goal，`standard` 只给 area。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(optional_fields))]
 pub struct MatterAddRequest {
     pub kind: MatterKind,
     pub title: String,
@@ -94,6 +108,7 @@ pub struct MatterAddRequest {
         with = "iso_date::option",
         skip_serializing_if = "Option::is_none"
     )]
+    #[cfg_attr(feature = "ts", ts(type = "string"))]
     pub due: Option<Date>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub standard: Option<String>,
@@ -116,6 +131,8 @@ pub struct MatterAddRequest {
 /// | `edit` | `title` / `due` / `clear_due`（goal）/ `standard`（area；空 = 清空），至少一样 |
 /// | 其余 | 无 |
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(optional_fields))]
 pub struct MatterActionRequest {
     /// CLI 知道自己是 `komo goal` 还是 `komo area`：给了就核对，对不上报错（拿领域的 id 跑
     /// `komo goal edit` 不该悄悄改了领域）。
@@ -132,9 +149,11 @@ pub struct MatterActionRequest {
         with = "iso_date::option",
         skip_serializing_if = "Option::is_none"
     )]
+    #[cfg_attr(feature = "ts", ts(type = "string"))]
     pub due: Option<Date>,
     /// `--no-due`。
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[cfg_attr(feature = "ts", ts(as = "Option<bool>"))]
     pub clear_due: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub standard: Option<String>,

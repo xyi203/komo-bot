@@ -1,8 +1,13 @@
-# apps/web 是无构建的原型，没有 package.json，不在这里。apps/desktop（Electron）C2 再加。
 packages:
   - apps/client
+  - apps/desktop
   - packages/*
-# pnpm 11 的"发布满一定天数才装"策略：这三个版本比阈值新，按 pnpm 的提示加进了排除名单。
+# electron-winstaller 只给 Windows 的 Squirrel 安装包用，这里只出 macOS，不跑它的构建脚本。
+# electron 的 postinstall 负责下载二进制，必须跑。
+allowBuilds:
+  electron: true
+  electron-winstaller: false
+# pnpm 11 的"发布满一定天数才装"策略：这几个版本比阈值新，按 pnpm 的提示加进了排除名单。
 minimumReleaseAgeExclude:
   - '@tanstack/query-core@5.105.2'
   - '@tanstack/react-query@5.105.2'

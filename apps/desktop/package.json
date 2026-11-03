@@ -1,0 +1,31 @@
+{
+  "name": "@komo/desktop",
+  "version": "0.0.0",
+  "private": true,
+  "description": "komo 的 macOS 壳：Electron 用 app:// 加载 apps/client 的 SPA 产物，主进程把 /v1/* 转给当前 Gateway 并替渲染进程带令牌（docs/clients.md §4、§6.3）。",
+  "main": "dist/main/index.js",
+  "author": "komo",
+  "homepage": "https://github.com/xyi203/komo-bot",
+  "scripts": {
+    "dev": "pnpm build:ts && electron .",
+    "build": "pnpm build:ts",
+    "build:ts": "node scripts/build-info.mjs && tsc -p tsconfig.json && tsc -p tsconfig.pages.json && node scripts/copy-pages.mjs",
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.pages.json --noEmit",
+    "lint": "eslint .",
+    "pack": "pnpm --filter @komo/client build && pnpm build:ts && node scripts/package.mjs --dir",
+    "dist": "pnpm --filter @komo/client build && pnpm build:ts && node scripts/package.mjs"
+  },
+  "dependencies": {
+    "electron-updater": "6.8.11"
+  },
+  "devDependencies": {
+    "@eslint/js": "10.0.1",
+    "@types/node": "26.6.6",
+    "electron": "45.2.1",
+    "electron-builder": "26.18.0",
+    "eslint": "10.14.0",
+    "globals": "17.14.0",
+    "typescript": "5.9.3",
+    "typescript-eslint": "8.72.1"
+  }
+}

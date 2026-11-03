@@ -34,6 +34,7 @@ use crate::types::model::{Effort, ModelConfig};
 ///
 /// 它只会给出一个**时刻**或者不给：`next_run_at` 永远握着一个调度器找得到的槽位。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Trigger {
     /// 五字段 cron 表达式，按 `tz` 的本地时间匹配。
@@ -41,6 +42,7 @@ pub enum Trigger {
     /// 一次性：`@at YYYY-MM-DD HH:MM`，创建时就解析成了它的瞬时。
     At {
         #[serde(with = "time::serde::rfc3339")]
+        #[cfg_attr(feature = "ts", ts(type = "string"))]
         at: OffsetDateTime,
     },
 }
@@ -319,6 +321,7 @@ pub fn matches(
 
 /// 同一 Job 上一次还没结束时怎么办（§10）。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum OverlapPolicy {
     /// 跳过本次并记录原因。默认——「含等待重试或结果核对」都算没结束。
@@ -334,6 +337,7 @@ pub enum OverlapPolicy {
 /// 了"永远答得出。而 `waiting` 那一档**不受它约束**——那是任务在**问**，不是在报告，
 /// 一条没人看见的提问等于这个 Job 从此停在那里。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum NotifyPolicy {
     /// 每次都投。默认。
@@ -382,6 +386,7 @@ impl NotifyPolicy {
 /// **跳过也是一种状态**：重叠跳过、这个计划时间已经有记录、错过太久——每一种都要在
 /// `komo cron list` 上看得见，否则一个天天被跳过的 Job 和一个天天跑成的 Job 长得一样。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum FiringStatus {
     /// 已经排进队列，还没有结果。
@@ -409,6 +414,7 @@ impl FiringStatus {
 
 /// Job 的生命周期。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum JobStatus {
     Active,
@@ -419,6 +425,8 @@ pub enum JobStatus {
 
 /// 一个定时任务（`cron_jobs`）。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(optional_fields))]
 pub struct CronJob {
     pub id: CronJobId,
     pub name: String,
@@ -433,17 +441,20 @@ pub struct CronJob {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(type = "string"))]
     pub workdir: Option<std::path::PathBuf>,
     pub status: JobStatus,
     #[serde(default)]
     pub overlap: OverlapPolicy,
     /// 本 Job 的主模型覆盖。**按完整模型配置解析**，不影响记忆整理或向量模型（§10）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(type = "unknown"))]
     pub model: Option<ModelConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<Effort>,
     /// 触发时预载进首轮上下文的 SKILL.md（§5.6）。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "ts", ts(as = "Option<Vec<String>>"))]
     pub skills: Vec<String>,
     /// 执行预算：最大轮数。
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -457,6 +468,7 @@ pub struct CronJob {
         with = "time::serde::rfc3339::option",
         skip_serializing_if = "Option::is_none"
     )]
+    #[cfg_attr(feature = "ts", ts(type = "string"))]
     pub next_run_at: Option<OffsetDateTime>,
     /// 触发 / 配置层面的问题。执行失败记在 firing 上，不记这里。
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -528,10 +540,13 @@ impl CronJob {
 /// 一次触发（`cron_firings`）。唯一键是 `job_id + scheduled_at_utc`——同一计划时间不
 /// 重复创建运行（§10）。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(optional_fields))]
 pub struct CronFiring {
     pub job: CronJobId,
     pub job_version: u64,
     #[serde(with = "time::serde::rfc3339")]
+    #[cfg_attr(feature = "ts", ts(type = "string"))]
     pub scheduled_at: OffsetDateTime,
     /// 不可变的触发快照：据此可以补完尚未写入的触发输入（§8.5）。
     pub prompt: String,

@@ -15,6 +15,7 @@ use super::model::{Effort, EffortSetting, Vector};
 
 /// 记忆的种类。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum MemoryKind {
     Preference,
@@ -25,6 +26,7 @@ pub enum MemoryKind {
 /// 这条记忆该怎么影响行为（§9.2「约定与线索」）。kind 说内容是什么、provenance 说从哪来、
 /// confirmation 说有没有复核过——三者都不回答这一问，所以单独一格。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum MemoryApplication {
     /// 长期约定：`applies_when` 成立且当次没有另外指定时直接照做。
@@ -69,6 +71,7 @@ impl FromStr for MemoryApplication {
 /// （`personal` / `project:<id>` / `environment:<id>` / `agent:<id>`，见 [`Display`] 与 [`FromStr`]），
 /// 因为 `?scope=` 装不下一个对象。两种写法必须能互相还原，所以它们有一个往返测试。
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum MemoryScope {
     Personal,
@@ -126,6 +129,7 @@ impl FromStr for MemoryScope {
 
 /// 这条内容是谁说的。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum Provenance {
     UserStatement,
@@ -136,6 +140,7 @@ pub enum Provenance {
 /// 确认等级。模型返回的 `user_confirmed` 字段没有写入权限（§9.2）——只有操作者的
 /// `confirm` 能把它抬起来。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum Confirmation {
     Unconfirmed,
@@ -144,6 +149,7 @@ pub enum Confirmation {
 
 /// 生命周期状态。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum MemoryState {
     /// 模型推断默认落这里，不作为已确认事实注入。
@@ -168,6 +174,7 @@ impl MemoryState {
 
 /// 证据引用：Session ID + event_id / seq 稳定定位原始消息或工具结果（§8.3）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum EvidenceRef {
     /// 一条 JSONL 事件。
@@ -187,10 +194,13 @@ pub enum EvidenceRef {
 
 /// 一条证据。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(optional_fields))]
 pub struct Evidence {
     pub reference: EvidenceRef,
     pub provenance: Provenance,
     #[serde(with = "time::serde::rfc3339")]
+    #[cfg_attr(feature = "ts", ts(type = "string"))]
     pub observed_at: OffsetDateTime,
     /// 哪一次 Run 的处理提取出来的。
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -199,8 +209,11 @@ pub struct Evidence {
 
 /// 提取这条记忆时的模型与提示词版本（§9.2）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(optional_fields))]
 pub struct ExtractionMetadata {
     pub model: String,
+    #[cfg_attr(feature = "ts", ts(type = "unknown"))]
     pub effort: EffortSetting,
     pub prompt_version: String,
     /// 处理到哪个来源游标。
@@ -225,6 +238,8 @@ impl ExtractionMetadata {
 
 /// 使用情况。**只度量使用，不增加真实性**（§9.2）。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(optional_fields))]
 pub struct MemoryUsage {
     #[serde(default)]
     pub count: u64,
@@ -233,6 +248,7 @@ pub struct MemoryUsage {
         with = "time::serde::rfc3339::option",
         skip_serializing_if = "Option::is_none"
     )]
+    #[cfg_attr(feature = "ts", ts(type = "string"))]
     pub last_used_at: Option<OffsetDateTime>,
     /// 用上次数：提取时模型指认"这一批的回复或工具调用确实依赖了它"并通过校验的批数
     /// （§9.10）。`count` 只数曝光，这里数采纳。
@@ -243,6 +259,7 @@ pub struct MemoryUsage {
         with = "time::serde::rfc3339::option",
         skip_serializing_if = "Option::is_none"
     )]
+    #[cfg_attr(feature = "ts", ts(type = "string"))]
     pub last_adopted_at: Option<OffsetDateTime>,
 }
 
@@ -252,6 +269,8 @@ pub struct MemoryUsage {
 /// 前向链留在新的这一条上，因为读到的人手里拿着的正是它——"它取代了什么"要能就地答
 /// 出来，而不是反过来去全表找谁指着自己。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(optional_fields))]
 pub struct SupersededRef {
     pub memory: MemoryId,
     pub revision: u32,
@@ -259,6 +278,8 @@ pub struct SupersededRef {
 
 /// 一条自动记忆。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(optional_fields))]
 pub struct MemoryItem {
     pub id: MemoryId,
     /// 递增内容版本；修改产生新版本。confirm / forget 携带预期 revision（§9.6）。
@@ -270,19 +291,24 @@ pub struct MemoryItem {
     pub confirmation: Confirmation,
     pub state: MemoryState,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "ts", ts(as = "Option<Vec<Evidence>>"))]
     pub evidence: Vec<Evidence>,
     /// 事实的**观察**时间，区别于入库时间。
     #[serde(with = "time::serde::rfc3339")]
+    #[cfg_attr(feature = "ts", ts(type = "string"))]
     pub observed_at: OffsetDateTime,
     #[serde(
         default,
         with = "time::serde::rfc3339::option",
         skip_serializing_if = "Option::is_none"
     )]
+    #[cfg_attr(feature = "ts", ts(type = "string"))]
     pub valid_until: Option<OffsetDateTime>,
     #[serde(with = "time::serde::rfc3339")]
+    #[cfg_attr(feature = "ts", ts(type = "string"))]
     pub created_at: OffsetDateTime,
     #[serde(with = "time::serde::rfc3339")]
+    #[cfg_attr(feature = "ts", ts(type = "string"))]
     pub updated_at: OffsetDateTime,
     pub extraction: ExtractionMetadata,
     #[serde(default)]
@@ -358,6 +384,7 @@ pub fn index_text(content: &str, applies_when: Option<&str>) -> String {
 
 /// 检索模式（§9.4）。默认 hybrid；keyword / vector 供明确选择与诊断。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum RetrievalMode {
     #[default]
@@ -462,6 +489,7 @@ pub struct RecallResult {
 
 /// 召回的两条臂。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum RecallArm {
     Keyword,
@@ -471,6 +499,8 @@ pub enum RecallArm {
 /// 一条留下的候选在两条臂里的原始分数（§9.4 相关度门槛）：关键词臂是归一化的 IDF 和，
 /// 向量臂是余弦。不在某条臂的候选名单里就是 `None`。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(optional_fields))]
 pub struct ArmScore {
     pub id: MemoryId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -479,6 +509,7 @@ pub struct ArmScore {
     pub vector: Option<f32>,
     /// 过了哪几道门槛；门槛不启用的臂不在其中。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "ts", ts(as = "Option<Vec<RecallArm>>"))]
     pub passed: Vec<RecallArm>,
 }
 

@@ -110,9 +110,57 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
+  # macOS 桌面端（docs/clients.md §6.2）：与 komo 同一个 tag、同一个 Release，版本号取
+  # [workspace.package].version（scripts/package.mjs 同步）。产物名是 Komo-<版本>-<架构>.dmg/.zip 与
+  # latest-mac.yml（electron-updater 读），与 komo-<系统>-<架构>.tar.gz / SHA256SUMS（komo update 读）互不重名，
+  # 所以 release job 里的 `sha256sum komo-*.tar.gz` 不会把它们算进去。
+  # 没配签名 secrets 时 CSC_LINK 等是空串，脚本照常出未签名包；公证只在签名且有 APPLE_* 时做。
+  desktop:
+    name: Package macOS desktop
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Build
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm build
+
+      - name: Package (arm64 + x64)
+        working-directory: apps/desktop
+        env:
+          CSC_LINK: ${{ secrets.CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: node scripts/package.mjs
+
+      - name: Upload desktop package
+        uses: actions/upload-artifact@v4
+        with:
+          name: komo-desktop-macos
+          path: |
+            apps/desktop/release/Komo-*.dmg
+            apps/desktop/release/Komo-*.zip
+            apps/desktop/release/*.blockmap
+            apps/desktop/release/latest-mac.yml
+          if-no-files-found: error
+          retention-days: 1
+
   release:
     name: Publish Release
-    needs: [guard, package]
+    needs: [guard, package, desktop]
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     permissions:

@@ -1,38 +1,1471 @@
 {
   "$schema": "https://inlang.com/schema/inlang-message-format",
   "app_name": "komo",
-  "gateway_version": "Gateway {version} (protocol {protocol})",
-  "sessions_title": "Sessions",
-  "sessions_loading": "Loading sessions…",
-  "sessions_empty": "No sessions yet",
-  "session_untitled": "Untitled session",
-  "session_kind_task": "Task",
-  "session_kind_main": "Home",
-  "session_state_running": "Running",
-  "session_state_waiting": "Waiting",
-  "session_updated": "Updated {time}",
-  "session_not_found": "This session was not found",
-  "select_session": "Pick a session on the left to watch its event stream",
-  "stream_title": "Event stream",
-  "stream_connecting": "Connecting…",
-  "stream_open": "Connected",
-  "stream_reconnecting": "Disconnected, resuming from the cursor…",
-  "stream_empty": "No events received yet",
-  "stream_frame_count": "{count} frames received",
+  "call_copy_command": "Copy command",
+  "call_failed": "Failed",
+  "call_inspect": "Inspect",
+  "call_no_output": "No output yet",
+  "call_uncertain": "Uncertain",
+  "cancel": "Cancel",
+  "cat_code_done": "Ran code",
+  "cat_code_done_and": "ran code",
+  "cat_code_done_then": "ran code",
+  "cat_code_live": "Running code",
+  "cat_commands_done": "Ran commands",
+  "cat_commands_done_and": "ran commands",
+  "cat_commands_done_then": "ran commands",
+  "cat_commands_live": "Running commands",
+  "cat_edit_done": "Edited files",
+  "cat_edit_done_and": "edited files",
+  "cat_edit_done_then": "edited files",
+  "cat_edit_live": "Editing files",
+  "cat_join_many": "{a}, {b}, {c}, and more",
+  "cat_join_three": "{a}, {b}, and {c}",
+  "cat_join_two": "{a} and {b}",
+  "cat_read_done": "Read files",
+  "cat_read_done_and": "read files",
+  "cat_read_done_then": "read files",
+  "cat_read_live": "Reading files",
+  "cat_search_done": "Searched code",
+  "cat_search_done_and": "searched code",
+  "cat_search_done_then": "searched code",
+  "cat_search_live": "Searching code",
+  "cat_subagents_done": "Coordinated sub-agents",
+  "cat_subagents_done_and": "coordinated sub-agents",
+  "cat_subagents_done_then": "coordinated sub-agents",
+  "cat_subagents_live": "Coordinating sub-agents",
+  "cat_thinking_done": "Analysis complete",
+  "cat_thinking_live": "Analyzing the request",
+  "cat_tools_done": "Called tools",
+  "cat_tools_done_and": "called tools",
+  "cat_tools_done_then": "called tools",
+  "cat_tools_live": "Calling tools",
+  "cat_write_done": "Wrote files",
+  "cat_write_done_and": "wrote files",
+  "cat_write_done_then": "wrote files",
+  "cat_write_live": "Writing files",
+  "changes_binary": "Binary",
+  "changes_card_collapse": "Show less",
+  "changes_card_expand": "Show {count} more",
+  "changes_card_files": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
+      "match": {
+        "countPlural=one": "{count} file changed",
+        "countPlural=other": "{count} files changed"
+      }
+    }
+  ],
+  "changes_card_open": "Show {path} in Changes",
+  "changes_diff_binary": "Binary file: no diff.",
+  "changes_diff_error": "Could not load the diff: {message} (it is gone once the Gateway restarts)",
+  "changes_diff_identical": "Both versions are identical.",
+  "changes_diff_loading": "Loading diff…",
+  "changes_diff_oversized": "The file is over 2 MiB; the Gateway did not keep a copy, so there is no diff.",
+  "changes_diff_truncated": "Showing the first {shown} lines; {rest} more not shown.",
+  "changes_empty": "No changes recorded for this session yet.",
+  "changes_empty_hint": "The Gateway takes a snapshot before and after each turn's tool calls and diffs them to find the files that changed. Records only live in this Gateway process, so turns from before a restart have none.",
+  "changes_foot": "Changes come from git snapshots the Gateway takes before and after each turn's tool calls, so edits made by the shell are included; files outside a repository are tracked only through write and edit. Changes that were already uncommitted before the turn started are not counted. Records only live in this Gateway process.",
+  "changes_more": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
+      "match": {
+        "countPlural=one": "{count} more file not listed.",
+        "countPlural=other": "{count} more files not listed."
+      }
+    }
+  ],
+  "changes_oversized": "Too large",
+  "changes_tag_added": "New",
+  "changes_tag_deleted": "Deleted",
+  "changes_turn": "Turn {n}",
+  "changes_turn_files": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
+      "match": {
+        "countPlural=one": "{count} file",
+        "countPlural=other": "{count} files"
+      }
+    }
+  ],
+  "changes_turn_unknown": "A turn",
+  "changes_verb_added": "Created",
+  "changes_verb_deleted": "Deleted",
+  "changes_verb_edited": "Edited",
+  "channels_allow": "{count} allowed to send commands",
+  "channels_allow_tenant": "{count} allowed to send commands, plus the same organization",
+  "channels_custom_plugin": "Custom plugin",
+  "channels_desc": "Each channel is a plugin process. Who may talk to it and where proactive messages go are set in the config file; credentials are under Environment variables.",
+  "channels_home_none": "No destination for proactive messages",
+  "channels_home_to": "Proactive messages go to",
+  "channels_load_error": "Couldn't load channels: {message}.",
+  "channels_old_gateway": "The running Gateway has no channel status endpoint yet; after updating, each channel's state is shown here. In a terminal you can use komo channel list and komo channel probe.",
+  "channels_outbound_only": "allow_from is empty: outbound only, nobody can send commands through it.",
+  "channels_probe": "Probe",
+  "channels_probe_failed": "Probe failed:",
+  "channels_probe_ok": "Probe passed:",
+  "channels_probing": "Probing",
+  "channels_refresh": "Refresh",
+  "channels_state_failed": "Won't start",
+  "channels_state_idle": "Enabled but not started",
+  "channels_state_off": "Disabled",
+  "channels_state_retrying": "Exited, retrying (attempt {count})",
+  "channels_state_running": "Running",
+  "channels_state_running_for": "Running for {time}",
+  "close": "Close",
+  "composer_archived": "This session is archived and read-only",
+  "composer_cache": "cache hit {pct}%",
+  "composer_effort": "Effort",
+  "composer_interject": "↵ to interject into the running turn",
+  "composer_label": "Message komo",
+  "composer_model": "Model",
+  "composer_ring": "Context {pct} ({used} / {win})",
+  "composer_ring_none": "This conversation has not called the model yet",
+  "composer_running": "Running · {time}",
+  "composer_send": "Send",
+  "composer_send_hint": "↵ to send, ⇧↵ for a new line",
+  "composer_steps": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
+      "match": {
+        "countPlural=one": "{count} step",
+        "countPlural=other": "{count} steps"
+      }
+    }
+  ],
+  "composer_stop": "Stop this turn",
+  "composer_tokens": "{tokens} tok",
+  "composer_turns": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
+      "match": {
+        "countPlural=one": "{count} turn",
+        "countPlural=other": "{count} turns"
+      }
+    }
+  ],
+  "config_call_timeout": "Tool call timeout",
+  "config_call_timeout_desc": "How long a single tool call may run.",
+  "config_check_error": "Couldn't run the config check: {message}.",
+  "config_check_issues": "Config warnings: {count}",
+  "config_check_ok": "Config check passed",
+  "config_compaction": "Auto-compaction",
+  "config_compaction_desc": "When the context is nearly full, earlier conversation is condensed into a summary.",
+  "config_confirm_timeout": "Wait for outward confirmation",
+  "config_confirm_timeout_desc": "When unattended, how long to wait for you to approve an outward tool; no answer by then means it does not run.",
+  "config_default_agent": "Default agent",
+  "config_default_agent_desc": "Which agent new sessions use.",
+  "config_desc": "The common few; changes apply right away. Everything else lives in the config file, which the Gateway picks up when you save it.",
+  "config_done_default": "{label} is back to its default",
+  "config_done_set": "{label} updated",
+  "config_embed_restart": "The memory embedding model only changes after a Gateway restart: run komo gateway restart in a terminal. The index is rebuilt automatically for the new model, and until it is ready retrieval uses keywords only; relevance thresholds were calibrated for the old model and may need retuning.",
+  "config_issue_error": "Error",
+  "config_issue_warning": "Warning",
+  "config_load_error": "Couldn't load the settings: {message}.",
+  "config_loaded_at": "The active config was loaded {time}.",
+  "config_memory_embedding": "Memory embedding model",
+  "config_memory_embedding_desc": "Turns text into vectors for retrieval. Changing it takes a Gateway restart.",
+  "config_memory_embedding_none": "None (keyword search only)",
+  "config_memory_enabled": "Memory",
+  "config_memory_enabled_desc": "Extracts preferences, conventions and conclusions from conversations and brings them back when relevant.",
+  "config_memory_model": "Memory model",
+  "config_memory_model_desc": "The model used to extract and tidy memories; unset follows the default model.",
+  "config_memory_model_follow": "Follow the default model ({model})",
+  "config_mode_hybrid": "Hybrid (keyword + vector)",
+  "config_mode_keyword": "Keyword only",
+  "config_mode_vector": "Vector only",
+  "config_receipt_reloaded": "{done}. Reload applied.",
+  "config_receipt_reloaded_changed": "{done}. Reload applied; {count} keys changed.",
+  "config_receipt_start_only": "{keys} only take effect after a Gateway restart.",
+  "config_recheck": "Re-check",
+  "config_reload": "Reload",
+  "config_reload_changed": "Loaded; {count} keys changed: {keys}.",
+  "config_reload_failed": "Not loaded: {message}",
+  "config_reload_start_only": "{keys} only take effect at startup; restart the Gateway (komo gateway restart).",
+  "config_reload_unchanged": "Loaded; no keys changed.",
+  "config_reloading": "Reloading",
+  "config_reread": "Reload",
+  "config_restore_default": "Restore default",
+  "config_result_bytes": "Tool result limit for the model",
+  "config_result_bytes_desc": "Beyond this the model gets a preview and a reference to the full result.",
+  "config_retrieval_mode": "Memory retrieval",
+  "config_retrieval_mode_desc": "How memories relevant to the current conversation are found.",
+  "config_stale": "The file has changed since; not loaded yet.",
+  "config_unit_bytes": "bytes",
+  "config_unit_mins": "min",
+  "config_unit_secs": "sec",
+  "conn_connecting": "Connecting to Gateway",
+  "conn_down": "Cannot reach the Gateway",
+  "conn_label_down": "Gateway not connected",
+  "conn_label_ok": "Gateway connected",
+  "conn_ok": "Gateway {version} · connected",
+  "conn_retrying": "Event stream dropped, reconnecting",
+  "controls_save": "Save",
+  "controls_saving": "Saving",
+  "copy": "Copy",
+  "copy_answer": "Copy answer",
+  "cron_col_job": "Job",
+  "cron_col_last": "Last run",
+  "cron_col_next": "Next run",
+  "cron_daily": "Daily at {time}",
+  "cron_day_separator": ", ",
+  "cron_day_today": "Today",
+  "cron_day_tomorrow": "Tomorrow",
+  "cron_day_yesterday": "Yesterday",
+  "cron_delete": "Delete this job",
+  "cron_delete_confirm": "Delete “{name}”",
+  "cron_delete_warn": "Once deleted it no longer runs; past runs stay in their sessions.",
+  "cron_detail": "Details",
+  "cron_dow_fri": "Fri",
+  "cron_dow_mon": "Mon",
+  "cron_dow_sat": "Sat",
+  "cron_dow_sun": "Sun",
+  "cron_dow_thu": "Thu",
+  "cron_dow_tue": "Tue",
+  "cron_dow_wed": "Wed",
+  "cron_empty": "No cron jobs yet.",
+  "cron_error_act": "Failed: {message}",
+  "cron_every_minutes": "Every {n} min",
+  "cron_finding_all_paused": "All jobs are paused.",
+  "cron_finding_error": "Could not load cron jobs.",
+  "cron_finding_failed": "“{name}” failed last time.",
+  "cron_finding_next": "Next up is “{name}”, {when}.",
+  "cron_finding_no_slot": "“{name}” has no next run scheduled.",
+  "cron_finding_none": "No cron jobs yet. Say “every Friday at 2pm…” in a conversation and komo will create one.",
+  "cron_finding_waiting": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
+      "match": {
+        "countPlural=one": "{count} job is waiting for you: {names}.",
+        "countPlural=other": "{count} jobs are waiting for you: {names}."
+      }
+    }
+  ],
+  "cron_finished": "Finished",
+  "cron_firing_error": "Failed",
+  "cron_firing_ok": "Succeeded",
+  "cron_firing_queued": "Queued",
+  "cron_firing_skipped": "Skipped",
+  "cron_firing_waiting": "Needs you",
+  "cron_hourly": "Hourly at minute {minute}",
+  "cron_kind_command": "Command",
+  "cron_kind_prompt": "Prompt",
+  "cron_kv_last": "Last run",
+  "cron_kv_next": "Next run",
+  "cron_kv_notify": "Delivery",
+  "cron_kv_overlap": "Overlap",
+  "cron_kv_workdir": "Directory",
+  "cron_last_session": "That run’s session",
+  "cron_list": "Cron jobs",
+  "cron_load_error": "Could not load: {message}.",
+  "cron_monthly": "Monthly on day {day} at {time}",
+  "cron_never_ran": "Never ran",
+  "cron_no_slot": "No next run: {reason}",
+  "cron_notify_always": "Every time",
+  "cron_notify_never": "Never",
+  "cron_notify_on_error": "Only on errors",
+  "cron_once": "{when}, once",
+  "cron_overlap_allow": "Start another anyway",
+  "cron_overlap_skip": "Skip this run if the last is still going",
+  "cron_pause": "Pause",
+  "cron_paused": "Paused",
+  "cron_resume": "Resume",
+  "cron_run_busy": "Starting…",
+  "cron_run_now": "Run now",
+  "cron_state_active": "Active",
+  "cron_triggered_after": ".",
+  "cron_triggered_before": "Triggered; this run is in ",
+  "cron_triggered_link": "its session",
+  "cron_tz": " ({tz})",
+  "cron_weekdays": "Weekdays at {time}",
+  "cron_weekly": "Every {days} at {time}",
+  "cron_what": "What it runs",
+  "cron_when": "When",
+  "ctx_free": "Free",
+  "ctx_memory": "Memory",
+  "ctx_messages": "Messages",
+  "ctx_project": "Project rules",
+  "ctx_results": "Tool results",
+  "ctx_skills": "Skills list",
+  "ctx_summary": "Compaction summary",
+  "ctx_system": "System prompt",
+  "ctx_tools": "Tool definitions",
+  "dismiss": "Dismiss",
+  "duration_h_m": "{h}h {m}m",
+  "duration_m_s": "{m}m {s}s",
+  "duration_s": "{s}s",
+  "effort_default": "Default",
+  "effort_high": "High",
+  "effort_low": "Low",
+  "effort_max": "Max",
+  "effort_medium": "Medium",
+  "effort_minimal": "Minimal",
+  "effort_none": "Off",
+  "effort_xhigh": "Extra high",
+  "env_add": "Add variables",
+  "env_change": "Change",
+  "env_delete_ask": "Once deleted, anything reading it gets no value.",
+  "env_delete_in_use": "{names} still uses it; the Gateway will refuse.",
+  "env_delete_label": "Delete {name}",
+  "env_delete_sure": "Delete {name}",
+  "env_desc": "API keys and other credentials. Values can only be written, never shown; changes apply right away.",
+  "env_done_delete": "Deleted {name}",
+  "env_done_set": "{name} is set",
+  "env_done_set_many": "{count} variables set",
+  "env_load_error": "Couldn't load environment variables: {message}.",
+  "env_name": "Name",
+  "env_paste_hint": "Or paste the contents of a .env file into the name box.",
+  "env_row_add": "Add",
+  "env_row_remove": "Remove this row",
+  "env_set": "Set",
+  "env_state_empty": "Empty",
+  "env_state_missing": "Missing",
+  "env_state_set": "Set",
+  "env_used_by": "Used by {names}",
+  "env_value": "Value",
+  "env_value_label": "Value",
+  "env_value_replace": "New value, replaces the current one",
+  "error_config_invalid": "The configuration did not pass validation.",
+  "error_conflict": "That cannot be done in the current state.",
+  "error_corrupt": "The Gateway found corrupted data and stopped the affected tasks.",
+  "error_denied": "The Gateway refused this request.",
+  "error_internal": "The Gateway ran into an error.",
+  "error_invalid_request": "The request was not valid.",
+  "error_not_found": "That resource was not found.",
+  "error_request_key_conflict": "The same request key was used with different content.",
+  "error_unauthorized": "Not signed in, or the session has expired.",
+  "error_unreachable": "Cannot reach the Gateway.",
+  "error_vector_unavailable": "Vector search is unavailable.",
+  "error_version_conflict": "The content was changed elsewhere; refresh and try again.",
+  "gateway_change": "Change connection",
+  "gateway_connected": "Connected",
+  "gateway_connection": "Connection",
+  "gateway_data_dir": "Data dir",
+  "gateway_desc": "The one process that holds state; the web app, TUI and CLI are all its clients.",
+  "gateway_instance": "Instance",
+  "gateway_load_error": "Couldn't load the Gateway status: {message}.",
+  "gateway_rtt": "Round trip {ms} ms",
+  "gateway_started": "Started",
+  "gateway_telemetry": "Telemetry",
+  "gateway_telemetry_error": "Error: {message}",
+  "gateway_telemetry_none": "Nothing exported yet",
+  "gateway_telemetry_ok": "OK, last export {ago}",
+  "gateway_telemetry_unset": "Not configured",
+  "gateway_unreachable": "Unreachable",
+  "gateway_version": "Version",
+  "gateway_version_value": "{version} · protocol {protocol}",
+  "group_all": "All sessions",
+  "group_archived": "Archived",
+  "group_flat_active": "Sessions",
+  "group_recent": "Recent",
+  "home_error": "Could not load the home session: {message}",
+  "inbox_abandon_ask": "This Run stops here and will not continue.",
+  "inbox_abandon_sure": "Yes, stop here",
+  "inbox_answer_error": "Could not answer: {message}",
+  "inbox_answered": "Answered",
+  "inbox_back": "Back to the list",
+  "inbox_detail": "Details",
+  "inbox_empty": "No Runs are stopped right now.",
+  "inbox_explain_blocked": "A file or session it depends on is gone: fix that and let it re-evaluate, or stop here.",
+  "inbox_explain_confirm": "A Run started by a cron job, monitor or background task waits here when it wants to call a tool declared outward (sending a message, filing a ticket) until you run it or not.",
+  "inbox_explain_hint": "When no channel has home_chat set, these cards cannot be delivered to chat; they only show up here and in komo intervention list.",
+  "inbox_explain_title": "What stops here",
+  "inbox_explain_verify": "The Gateway restarted halfway through a call and nobody knows whether it took effect: check, then tell it “already as intended” or “definitely not performed”.",
+  "inbox_finding": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
+      "match": {
+        "countPlural=one": "{count} item is waiting for your answer; until you answer, its Run stays stopped.",
+        "countPlural=other": "{count} items are waiting for your answer; until you answer, their Runs stay stopped."
+      }
+    }
+  ],
+  "inbox_finding_error": "Could not load the inbox.",
+  "inbox_finding_none": "Nothing is waiting for you.",
+  "inbox_hint": "Your answer applies to this one time only; there is no “always allow”.",
+  "inbox_kind_blocked": "Precondition gone",
+  "inbox_kind_confirm": "Outward tool call",
+  "inbox_kind_verify": "Outcome unclear, needs checking",
+  "inbox_kind_verify_short": "Outcome unclear",
+  "inbox_kv_handle": "Handle",
+  "inbox_kv_session": "Session",
+  "inbox_kv_stopped": "Stopped",
+  "inbox_list": "Inbox list",
+  "inbox_load_error": "Could not load: {message}.",
+  "inbox_none_to_answer": "Nothing to answer.",
+  "inbox_pick": "Pick one to answer it.",
+  "inbox_session_gone": "Session is no longer listed",
+  "inbox_verdict_abandon": "Stop here",
+  "inbox_verdict_approve": "Run it",
+  "inbox_verdict_not_performed": "Not performed, replay it",
+  "inbox_verdict_reject": "Don't run it",
+  "inbox_verdict_resolve": "Handled, re-evaluate",
+  "inbox_verdict_satisfied": "Already as intended, continue",
+  "language_en": "English",
   "language_label": "Language",
   "language_zh_cn": "中文",
-  "language_en": "English",
-  "retry": "Retry",
-  "unauthorized_title": "This browser is not paired yet",
-  "unauthorized_body": "Run komo web in a terminal; it opens a one-time link that pairs this browser.",
-  "error_unauthorized": "Not signed in, or the session has expired.",
-  "error_denied": "The Gateway refused this request.",
-  "error_not_found": "That resource was not found.",
-  "error_internal": "The Gateway ran into an error.",
-  "error_unreachable": "Cannot reach the Gateway.",
+  "matter_act_done": "Done",
+  "matter_act_drop": "Drop",
+  "matter_act_edit": "Edit title or due date",
+  "matter_act_edit_area": "Edit name or standard",
+  "matter_act_link": "Attach a cron job",
+  "matter_act_next_edit": "Edit next step",
+  "matter_act_next_write": "Write next step",
+  "matter_act_park": "Park",
+  "matter_act_reopen": "Reopen",
+  "matter_act_resume": "Resume",
+  "matter_act_resume_wait": "Got it, continue",
+  "matter_act_retire": "Stop caring",
+  "matter_act_wait": "Mark as waiting",
+  "matter_act_wait_edit": "Change what I’m waiting for",
+  "matter_back": "Back to the list",
+  "matter_busy_edit": "Saving…",
+  "matter_closed_on": "Closed {date}",
+  "matter_closure_archived": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
+      "match": {
+        "countPlural=one": "Archived {count} clue kept for it.",
+        "countPlural=other": "Archived {count} clues kept for it."
+      }
+    }
+  ],
+  "matter_closure_conventions": "These conventions still belong to it and keep going into conversations; change their owner or forget them on the Memory page:",
+  "matter_closure_linked": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
+      "match": {
+        "countPlural=one": "{count} trigger is still attached and was not deleted; detach it below if you no longer need it.",
+        "countPlural=other": "{count} triggers are still attached and were not deleted; detach them below if you no longer need them."
+      }
+    }
+  ],
+  "matter_closure_restored": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
+      "match": {
+        "countPlural=one": "Restored {count} archived clue.",
+        "countPlural=other": "Restored {count} archived clues."
+      }
+    }
+  ],
+  "matter_col_due": "Due",
+  "matter_col_matter": "Matter",
+  "matter_col_memory": "Memory",
+  "matter_detail": "Details",
+  "matter_due_in": [
+    {
+      "declarations": [
+        "input days",
+        "local daysPlural = days: plural"
+      ],
+      "selectors": [
+        "daysPlural"
+      ],
+      "match": {
+        "daysPlural=one": "{days} day left",
+        "daysPlural=other": "{days} days left"
+      }
+    }
+  ],
+  "matter_due_overdue": [
+    {
+      "declarations": [
+        "input days",
+        "local daysPlural = days: plural"
+      ],
+      "selectors": [
+        "daysPlural"
+      ],
+      "match": {
+        "daysPlural=one": "{days} day overdue",
+        "daysPlural=other": "{days} days overdue"
+      }
+    }
+  ],
+  "matter_due_today": "Due today",
+  "matter_due_tomorrow": "Due tomorrow",
+  "matter_empty_areas": "No areas in care: things with no end that you keep up (a weekly alert rotation) are areas.",
+  "matter_empty_goals": "No goals in progress: things with an outcome that will end are goals, and can carry a due date.",
+  "matter_error_create": "Could not create: {message}",
+  "matter_error_edit": "Could not apply: {message}",
+  "matter_evidence": "What you said",
+  "matter_evidence_empty": "None: this matter was created in the terminal or here directly.",
+  "matter_evidence_memos": "Memos record",
+  "matter_field_due": "Due",
+  "matter_field_next": "Next step",
+  "matter_field_standard": "Standard",
+  "matter_field_waiting": "Waiting for",
+  "matter_finding_counts": "Goals in progress: {goals}. Areas in care: {areas}.",
+  "matter_finding_error": "Could not load matters.",
+  "matter_finding_late_many": "{count} are overdue; the earliest is “{title}”.",
+  "matter_finding_late_one": [
+    {
+      "declarations": [
+        "input days",
+        "local daysPlural = days: plural"
+      ],
+      "selectors": [
+        "daysPlural"
+      ],
+      "match": {
+        "daysPlural=one": "“{title}” is {days} day overdue.",
+        "daysPlural=other": "“{title}” is {days} days overdue."
+      }
+    }
+  ],
+  "matter_finding_none": "Nothing in progress. Say “start working on…” or “I’ll handle this” in a conversation and komo will note it.",
+  "matter_finding_waiting": "{count} waiting on others: {what}.",
+  "matter_form_due": "Due date",
+  "matter_form_due_hint": "Clear the date to remove the deadline.",
+  "matter_form_job": "Cron job",
+  "matter_form_next": "Next step",
+  "matter_form_next_hint": "One sentence; leave empty to clear",
+  "matter_form_resume_next": "What to do next (optional)",
+  "matter_form_standard": "Standard to maintain",
+  "matter_form_standard_hint": "Leave empty to clear",
+  "matter_form_title_area": "Name",
+  "matter_form_title_goal": "Title",
+  "matter_form_waiting": "Who or what are you waiting for",
+  "matter_group_areas": "Areas",
+  "matter_group_closed": "Closed",
+  "matter_group_goals": "Goals",
+  "matter_group_parked": "Parked",
+  "matter_kind_area": "Area",
+  "matter_kind_goal": "Goal",
+  "matter_kv_closed": "Closed",
+  "matter_kv_created": "Created",
+  "matter_kv_revision": "Version",
+  "matter_kv_updated": "Updated",
+  "matter_list": "Matters",
+  "matter_load_error": "Could not load matters: {message}.",
+  "matter_memories": "Memories kept for it",
+  "matter_memories_count": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
+      "match": {
+        "countPlural=one": "{count} memory kept for it",
+        "countPlural=other": "{count} memories kept for it"
+      }
+    }
+  ],
+  "matter_memories_empty": "None yet. When extracting, komo attaches related new observations to matters in progress.",
+  "matter_new_area": "Area: no end, keep it up",
+  "matter_new_busy": "Creating…",
+  "matter_new_button": "New",
+  "matter_new_due": "Due date (optional)",
+  "matter_new_goal": "Goal: has an outcome, ends",
+  "matter_new_next": "Next step (optional)",
+  "matter_new_one_line": "One line",
+  "matter_new_placeholder": "e.g. Finish the owl release review this week",
+  "matter_new_standard": "Standard to maintain (optional)",
+  "matter_new_standard_placeholder": "e.g. Finish the on-call rotation before Monday each week",
+  "matter_new_submit": "Create",
+  "matter_new_title": "New matter",
+  "matter_new_what": "What is it",
+  "matter_no_jobs_after": " page first.",
+  "matter_no_jobs_before": "No cron job to attach. Create one on the ",
+  "matter_not_set": "Not set",
+  "matter_not_written": "Not written",
+  "matter_pick": "Pick one to see its next step, triggers and memories.",
+  "matter_pick_none": "New matters show up here.",
+  "matter_provenance_model_inference": "Model inference",
+  "matter_provenance_tool_observation": "Tool observation",
+  "matter_provenance_user_statement": "User statement",
+  "matter_revision": "Version {n}",
+  "matter_save": "Save",
+  "matter_show_all": "Show all {count}",
+  "matter_show_less": "Show less",
+  "matter_state_active": "Active",
+  "matter_state_parked": "Parked",
+  "matter_state_waiting": "Waiting",
+  "matter_status_active": "In progress",
+  "matter_status_done": "Done",
+  "matter_status_dropped": "Dropped",
+  "matter_status_parked": "Parked",
+  "matter_status_retired": "Retired",
+  "matter_status_waiting": "Waiting",
+  "matter_sub_area": "Area",
+  "matter_sub_next": "Next: {what}",
+  "matter_sub_no_next": "No next step yet",
+  "matter_sub_standard": "Standard: {what}",
+  "matter_sub_waiting": "Waiting: {what}",
+  "matter_submit_link": "Attach",
+  "matter_submit_resume": "Resume",
+  "matter_submit_wait": "Mark as waiting",
+  "matter_trigger_cron": "Cron job",
+  "matter_trigger_cron_gone": "Deleted job",
+  "matter_trigger_session_gone": "Session is no longer in the list",
+  "matter_triggers": "Triggers",
+  "matter_triggers_empty": "None attached. komo often attaches a monitor when you are waiting on someone; recurring work can get a cron job.",
+  "matter_unlink": "Detach",
+  "mcp_back": "All servers",
+  "mcp_col_server": "Server",
+  "mcp_col_state": "State",
+  "mcp_col_tools": "Tools",
+  "mcp_col_way": "Type",
+  "mcp_connect": "Connect",
+  "mcp_default_exposure": "Tools default: {way}",
+  "mcp_desc": "External tool servers. Add, change or remove them in the config file; here you see whether they are connected and which tools they offer.",
+  "mcp_disconnect": "Disconnect",
+  "mcp_disconnect_failed": "Disconnect failed: {message}",
+  "mcp_disconnected_hint": "Disconnected by hand: it won't reconnect on its own, and the model is told it is disconnected if it calls its tools. Click Connect to restore it; it also reconnects when the Gateway restarts.",
+  "mcp_disconnecting": "Disconnecting",
+  "mcp_exposure_codemode": "Via scripts",
+  "mcp_exposure_direct": "Direct to model",
+  "mcp_exposure_hidden": "Hidden",
+  "mcp_load_error": "Couldn't load MCP servers: {message}.",
+  "mcp_needs_auth_hint": "Run {command} in a terminal; once signed in, the next call connects automatically.",
+  "mcp_no_tools": "This server lists no tools.",
+  "mcp_none": "No MCP servers configured.",
+  "mcp_old_gateway": "The running Gateway has no server list endpoint yet; after updating, each server and its tools are listed here.",
+  "mcp_reconnect": "Reconnect",
+  "mcp_reconnect_all": "Reconnect all",
+  "mcp_reconnect_failed": "Reconnect failed: {message}",
+  "mcp_reconnecting": "Reconnecting",
+  "mcp_state_connected": "Connected",
+  "mcp_state_connecting": "Connecting",
+  "mcp_state_disconnected": "Disconnected",
+  "mcp_state_failed": "Failed",
+  "mcp_state_needs_auth": "Sign-in needed",
+  "mcp_tool_count": "Tools: {count}",
+  "mcp_tool_outward": "Outward",
+  "mcp_tool_read_only": "Read-only",
+  "mcp_tools_after_connect": "Its tools are listed here once connected.",
+  "mcp_way_local": "Local process",
+  "mcp_way_remote": "Remote",
+  "memindex_covered": "{indexed} / {total} active memories indexed",
+  "memindex_desc": "The vector side of memory retrieval; when the index is unavailable, retrieval falls back to keywords.",
+  "memindex_endpoint": "Endpoint",
+  "memindex_errors": "Errors",
+  "memindex_load_error": "Couldn't load the memory index: {message}.",
+  "memindex_none": "Not set",
+  "memindex_rebuild": "Rebuild index",
+  "memindex_rebuild_accepted": "Rebuild submitted (generation {generation}); until it finishes in the background, retrieval falls back to keywords.",
+  "memindex_rebuild_failed": "Not submitted: {message}",
+  "memindex_rebuild_running": "A rebuild is already running; none was started.",
+  "memindex_rebuilding": "Submitting",
+  "memindex_state": "State",
+  "memindex_state_building": "Building",
+  "memindex_state_failed": "Unavailable",
+  "memindex_state_ready": "Ready",
+  "memindex_state_unconfigured": "No embedding model",
+  "memindex_vector": "Vector",
+  "memory_act_confirm": "Confirm revision {revision}",
+  "memory_act_forget": "Forget revision {revision}",
+  "memory_act_forget_ask": "Forget this memory",
+  "memory_act_to_convention": "Make it a convention",
+  "memory_act_to_reference": "Make it a reference",
+  "memory_add": "Add a memory",
+  "memory_add_application": "How it is used",
+  "memory_add_busy": "Saving",
+  "memory_add_content": "Content",
+  "memory_add_content_ph": "One sentence, one single thing",
+  "memory_add_convention": "Convention: followed whenever its condition holds",
+  "memory_add_hint": "What you note here counts as said by you, so it is saved as confirmed.",
+  "memory_add_kind": "Kind",
+  "memory_add_reference": "Reference: consulted when looking things up and judging",
+  "memory_add_scope": "Scope",
+  "memory_add_submit": "Save",
+  "memory_add_title": "Add a memory",
+  "memory_applies_when": "Applies when",
+  "memory_back": "Back to the list",
+  "memory_chain_other": "another memory",
+  "memory_chain_superseded_by": "Superseded by",
+  "memory_chain_supersedes": "Supersedes",
+  "memory_chart_aria": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
+      "match": {
+        "countPlural=one": "{count} memory laid out by the day it was noted",
+        "countPlural=other": "{count} memories laid out by the day they were noted"
+      }
+    }
+  ],
+  "memory_chart_dot": "{content} ({state}, brought in {count}×)",
+  "memory_chart_empty": "No memories yet: after a conversation has been idle for a while, komo distills preferences, facts and experiences from it.",
+  "memory_chart_note": "One dot per memory, laid out by the day it was noted; the larger the dot, the more often it was brought into a conversation.",
+  "memory_chart_title": "Memories so far",
+  "memory_chart_today": "Today",
+  "memory_chart_week": "Week of {date}",
+  "memory_col_content": "Memory",
+  "memory_col_last": "Last brought",
+  "memory_col_used": "Brought / used",
+  "memory_confirm": "Confirm",
+  "memory_confirm_title": "Confirm the wording of revision {revision}",
+  "memory_confirmed": "Confirmed",
+  "memory_detail_label": "This memory",
+  "memory_evidence": "Evidence",
+  "memory_evidence_memos": "Memos record",
+  "memory_evidence_none": "No event evidence: you noted this one yourself, in the terminal or here.",
+  "memory_evidence_session_gone": "The session is no longer in the list",
+  "memory_fail_add": "Could not save: {message}",
+  "memory_fail_classify": "Could not change it: {message}",
+  "memory_fail_confirm": "Could not confirm: {message}",
+  "memory_fail_forget": "Could not forget: {message}",
+  "memory_fail_restore": "Could not restore: {message}",
+  "memory_finding_all_unseen": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
+      "match": {
+        "countPlural=one": "The {count} memory in effect has not been reviewed yet.",
+        "countPlural=other": "None of the {count} memories in effect has been reviewed yet."
+      }
+    }
+  ],
+  "memory_finding_candidate": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
+      "match": {
+        "countPlural=one": "{count} candidate is not recalled yet and waits for you to look.",
+        "countPlural=other": "{count} candidates are not recalled yet and wait for you to look."
+      }
+    }
+  ],
+  "memory_finding_confirmed": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
+      "match": {
+        "countPlural=one": "The {count} memory in effect is confirmed by you.",
+        "countPlural=other": "All {count} memories in effect are confirmed by you."
+      }
+    }
+  ],
+  "memory_finding_contested": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
+      "match": {
+        "countPlural=one": "{count} memory conflicts with another and is paused until you decide which one counts.",
+        "countPlural=other": "{count} memories conflict with others and are paused until you decide which ones count."
+      }
+    }
+  ],
+  "memory_finding_error": "Could not load memories.",
+  "memory_finding_none": "No memory is in effect yet: once conversations go idle, komo distills them.",
+  "memory_finding_some_unseen": "{unseen} of the {live} memories in effect have not been reviewed yet.",
+  "memory_forget_note": "Once forgotten it is no longer brought into conversations, and the same source will not be distilled again. The original conversation is kept.",
+  "memory_hint_archived": "Archived when its matter was closed; restored when that matter is reopened.",
+  "memory_hint_superseded": "Replaced by a newer memory; no longer brought in.",
+  "memory_index_building": " · index is being built",
+  "memory_index_degraded": "Search degraded: {reason}",
+  "memory_index_failed": " · index unavailable",
+  "memory_index_line": "Search uses keywords + vectors · {model} · indexed {indexed} / {total} active",
+  "memory_index_unknown": "no reason given",
+  "memory_kind_experience": "Experience",
+  "memory_kind_fact": "Fact",
+  "memory_kind_preference": "Preference",
+  "memory_kv_adopted": "Used",
+  "memory_kv_belongs": "Belongs to",
+  "memory_kv_brought": "Brought",
+  "memory_kv_kind": "Kind",
+  "memory_kv_noted": "Noted",
+  "memory_kv_revision": "Revision {revision} · {status}",
+  "memory_kv_scope": "Scope",
+  "memory_kv_source": "Source",
+  "memory_kv_source_auto": "{source}, distilled automatically",
+  "memory_kv_times": "{count}×",
+  "memory_kv_times_last": "{count}× · last {when}",
+  "memory_kv_until": "Valid until",
+  "memory_kv_version": "Revision",
+  "memory_list_count": "{count}",
+  "memory_list_live": "In effect",
+  "memory_list_search": "Search “{query}”",
+  "memory_load_error": "Could not load memories: {message}.",
+  "memory_matter_closed": "(closed)",
+  "memory_matter_gone": "The matter no longer exists",
+  "memory_none_always": "No conventions yet: when you say things like “from now on…” or “by default…”, komo records them as conventions.",
+  "memory_none_live": "No memory is in effect right now.",
+  "memory_none_out": "No forgotten, superseded or archived memories.",
+  "memory_none_paused": "No candidate or contested memories.",
+  "memory_none_relevant": "No reference is in effect.",
+  "memory_none_search": "No related memories found.",
+  "memory_pick": "Pick one to see where it came from and how often it was brought in.",
+  "memory_prov_model_inference": "Model inference",
+  "memory_prov_tool_observation": "Tool observation",
+  "memory_prov_user_statement": "User statement",
+  "memory_restore": "Restore",
+  "memory_row_adopted": "used {count}",
+  "memory_row_brought": "Brought",
+  "memory_rung_always": "Always brought",
+  "memory_rung_always_sub": "Conventions",
+  "memory_rung_out": "No longer brought",
+  "memory_rung_out_sub": "Not in effect",
+  "memory_rung_paused": "Paused",
+  "memory_rung_paused_sub": "Candidates and contested",
+  "memory_rung_relevant": "When relevant",
+  "memory_rung_relevant_sub": "References",
+  "memory_rungs_label": "Filter by closeness to the conversation",
+  "memory_scope_agent": "Agent {id}",
+  "memory_scope_all": "All scopes",
+  "memory_scope_environment": "Environment {id}",
+  "memory_scope_label": "Scope",
+  "memory_scope_personal": "Personal",
+  "memory_search_label": "Search memories",
+  "memory_state_active": "In effect",
+  "memory_state_archived": "Archived",
+  "memory_state_candidate": "Candidate",
+  "memory_state_contested": "Contested",
+  "memory_state_forgotten": "Forgotten",
+  "memory_state_superseded": "Superseded",
+  "memory_unconfirmed": "Unconfirmed",
+  "memory_use_convention": "Convention",
+  "memory_use_reference": "Reference",
+  "memory_use_unclassified": "Reference (unclassified)",
+  "memory_when_label": "When it applies",
+  "memory_when_placeholder": "e.g. when creating a release ticket and choosing a Platform",
+  "models_add": "Add",
+  "models_add_model": "Add model",
+  "models_add_provider": "Add model provider",
+  "models_advanced": "Custom settings",
+  "models_alias_auto": "Auto",
+  "models_api_key": "API key",
+  "models_api_key_enter": "Enter API key",
+  "models_api_key_hint": "Stored as an environment variable, not in the config.",
+  "models_api_key_keep": "Leave empty to keep the saved credential",
+  "models_backend": "API protocol",
+  "models_backend_embeddings": "OpenAI-compatible embeddings",
+  "models_backend_ollama_embeddings": "Ollama embeddings",
+  "models_backend_unset": "Protocol not set",
+  "models_base_url": "API address",
+  "models_catalog": "Model catalog",
+  "models_catalog_completion": "Chat models",
+  "models_catalog_embedding": "Embedding models",
+  "models_catalog_empty": "No models yet.",
+  "models_default": "Default model",
+  "models_del_embed": "Delete embedding model {id}; its key stays in the environment variables.",
+  "models_del_embed_in_use": "Memory is using it and the Gateway will refuse; switch memory to another embedding model first.",
+  "models_del_provider": "Delete provider {id}; its API key stays in the environment variables.",
+  "models_del_provider_used": "{count} models are still attached to it and the Gateway will refuse; clear its model catalog in Edit first, or attach them to another provider.",
+  "models_del_sure": "Delete {id}",
+  "models_delete": "Delete",
+  "models_desc": "Enter each provider's API key to use its models; changes take effect right away.",
+  "models_dimensions": "Dimensions",
+  "models_dimensions_ph": "As returned by the model",
+  "models_display_name": "Display name",
+  "models_done_default": "Default model is now {alias}",
+  "models_done_embed_deleted": "Deleted embedding model {id}",
+  "models_done_embed_renamed": "Renamed embedding model {from} to {to}",
+  "models_done_embed_saved": "Saved embedding model {alias}",
+  "models_done_provider_added": "Added provider {id}",
+  "models_done_provider_deleted": "Deleted provider {id}",
+  "models_done_provider_renamed": "Renamed provider {from} to {to}",
+  "models_done_provider_saved": "Saved provider {id}",
+  "models_dup_provider": "A provider named {id} already exists; pick another ID, or edit that one.",
+  "models_edit": "Edit",
+  "models_effort": "Default effort",
+  "models_effort_ph": "Provider default",
+  "models_efforts": "Effort levels",
+  "models_embed_alias_ph": "e.g. embedding",
+  "models_embed_backend": "Embedding protocol",
+  "models_embed_dimensions_ph": "Empty: use what the model returns",
+  "models_embed_env_key_ph": "NAME_IN_CAPS_API_KEY",
+  "models_embed_key_hint": "The key is stored as an environment variable, not in the config. Renaming also updates memory's reference.",
+  "models_embed_key_set": "Set; leave empty to keep",
+  "models_embed_key_unset": "Not set yet",
+  "models_embed_model": "Upstream model id",
+  "models_embed_name": "{label} Embedding",
+  "models_embed_restart": "The embedding model used by memory only takes effect after the Gateway restarts: run komo gateway restart in a terminal. The index is rebuilt automatically with the new model; until it is built, search uses keywords only. The relevance thresholds were tuned for the old model and may need adjusting.",
+  "models_env_key": "Credential variable",
+  "models_env_key_ph": "Empty: ID_IN_CAPS_API_KEY",
+  "models_fetch": "Fetch available models",
+  "models_fetching": "Fetching…",
+  "models_filter_label": "Filter models",
+  "models_filter_placeholder": "Filter among {count} models",
+  "models_in_use": "Used by memory",
+  "models_key_generic": "Credential",
+  "models_key_login": "Credentials come from {auth} login",
+  "models_key_missing": "{name} is missing",
+  "models_key_set": "{name} is set",
+  "models_key_unnamed": "No credential variable set",
+  "models_kind": "Type",
+  "models_kind_completion": "Chat",
+  "models_kind_embedding": "Embedding (for memory search)",
+  "models_kind_locked": "The type can't change while models are attached; clear the model catalog and save first.",
+  "models_load_error": "Could not load: {message}.",
+  "models_model_id": "Model ID",
+  "models_no_embedding": "No embedding model yet: memory can only search by keyword. Add a provider with the Embedding type, then add a model to its catalog.",
+  "models_no_match": "No matching models",
+  "models_provider_id": "Provider ID",
+  "models_provider_id_hint_edit": "Changing it also changes the models attached to it.",
+  "models_provider_id_hint_new": "Starts with a letter. Models find this provider by it, and the credential variable name is derived from it.",
+  "models_reread": "Reload",
+  "models_row_alias": "Name (alias)",
+  "models_row_collapse": "Hide more settings",
+  "models_row_delete": "Remove this row",
+  "models_row_expand": "Show more settings",
+  "models_save": "Save",
+  "models_saving": "Saving",
+  "models_standalone_only": "Editable in the config file only",
+  "models_tab_custom": "Custom model API",
+  "models_tab_custom_hint": "Connect a relay, a self-hosted service, or any interface compatible with the OpenAI or Anthropic protocol. API address, protocol, and models are required.",
+  "models_tab_label": "Provider source",
+  "models_tab_preset": "Third-party providers",
+  "models_tab_preset_hint": "Pick one: the address and protocol are filled in, so you only need an API key and a model.",
+  "models_tag_custom": "Custom",
+  "models_tag_embedding": "Embedding",
+  "models_timeout": "Request timeout (seconds)",
+  "models_timeout_ph": "Default 120",
+  "models_window": "Context window",
+  "models_window_ph": "Ask provider",
+  "nav_close": "Close navigation",
+  "nav_cron": "Cron",
+  "nav_inbox": "Inbox",
+  "nav_label": "Navigation and sessions",
+  "nav_matters": "Matters",
+  "nav_memory": "Memory",
+  "nav_new_session": "New chat",
+  "nav_open": "Open navigation",
+  "nav_search": "Search",
+  "nav_settings": "Settings",
+  "pair_failed": "Pairing failed: {message}",
+  "pair_hint": "Run komo web in the terminal again to get a fresh link.",
+  "pair_missing_code": "This link has no pairing code.",
   "pair_title": "Pair this browser",
   "pair_working": "Pairing…",
-  "pair_failed": "Pairing failed: {message}",
-  "pair_missing_code": "This link has no pairing code.",
-  "pair_hint": "Run komo web in the terminal again to get a fresh link."
+  "palette_close": "Close search",
+  "palette_empty_blank": "Nothing here yet.",
+  "palette_empty_memory_hint": "Type a keyword to search memories.",
+  "palette_empty_none": "Nothing found.",
+  "palette_key_close": "Close",
+  "palette_key_open": "Open",
+  "palette_key_select": "Select",
+  "palette_key_type": "Type",
+  "palette_meta_archived": "Archived",
+  "palette_meta_area": "Area",
+  "palette_meta_goal": "Goal",
+  "palette_meta_task": "Task",
+  "palette_placeholder": "Search sessions, matters, memories, schedules",
+  "palette_results": "Results",
+  "palette_searching": "Searching…",
+  "palette_searching_memory": "Searching memories…",
+  "palette_sec_action": "Actions",
+  "palette_sec_cron": "Schedules",
+  "palette_sec_matter": "Matters",
+  "palette_sec_memory": "Memories",
+  "palette_sec_recent": "Recent",
+  "palette_sec_session": "Sessions",
+  "palette_title": "Search",
+  "palette_type_all": "All",
+  "palette_type_cron": "Schedules",
+  "palette_type_matter": "Matters",
+  "palette_type_memory": "Memories",
+  "palette_type_session": "Sessions",
+  "palette_types": "Type",
+  "panel_bg": "In the background",
+  "panel_bg_done": "Finished · {when}",
+  "panel_bg_elapsed": "Running for {time}",
+  "panel_bg_empty": "This conversation has not sent out any background tasks.",
+  "panel_bg_running": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
+      "match": {
+        "countPlural=one": "{count} running",
+        "countPlural=other": "{count} running"
+      }
+    }
+  ],
+  "panel_conn": "Connection",
+  "panel_conn_bad": "Problem",
+  "panel_conn_gateway": "Gateway {version}",
+  "panel_conn_note": "The Gateway has no endpoint yet for channel and MCP connection status.",
+  "panel_conn_ok": "OK",
+  "panel_conn_started": "Started {when}",
+  "panel_conn_telemetry": "Telemetry",
+  "panel_conn_telemetry_error": "Error: {message}",
+  "panel_conn_telemetry_off": "Not configured",
+  "panel_conn_telemetry_ok": "OK, last export {when}",
+  "panel_context": "Context",
+  "panel_context_none": "This conversation has not called the model yet.",
+  "panel_context_note": "The total is the tokens reported by the last request; items are estimated from bytes and scaled to match the total.",
+  "panel_context_of": "{used} / {win}",
+  "panel_context_tree_error": "The session tree could not be loaded, so the breakdown is unavailable.",
+  "panel_context_tree_loading": "Reading the session tree.",
+  "panel_context_used": "{pct} used",
+  "panel_failed": "Could not load: {message}",
+  "panel_loading_session": "Reading this conversation.",
+  "panel_matter_next": "Next: {what}",
+  "panel_matter_standard": "Standard: {what}",
+  "panel_matter_waiting": "Waiting for {what}",
+  "panel_matters": "In progress",
+  "panel_matters_all": "All matters",
+  "panel_matters_empty": "No active goals or areas in care.",
+  "panel_memory": "Memories in use",
+  "panel_memory_all": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
+      "match": {
+        "countPlural=one": "All {count} active memory",
+        "countPlural=other": "All {count} active memories"
+      }
+    }
+  ],
+  "panel_memory_convention": "Convention",
+  "panel_memory_detail": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
+      "match": {
+        "countPlural=one": "{kind} · used {count} time · v{revision}",
+        "countPlural=other": "{kind} · used {count} times · v{revision}"
+      }
+    }
+  ],
+  "panel_memory_empty": "No memories were brought into the latest turn.",
+  "panel_memory_gone": "No longer in the library",
+  "panel_memory_reference": "Reference",
+  "panel_title": "This session",
+  "recall_brought": "Brought {parts}",
+  "recall_conventions": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
+      "match": {
+        "countPlural=one": "{count} convention",
+        "countPlural=other": "{count} conventions"
+      }
+    }
+  ],
+  "recall_missing": "{id} (no longer in the store)",
+  "recall_references": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
+      "match": {
+        "countPlural=one": "{count} reference",
+        "countPlural=other": "{count} references"
+      }
+    }
+  ],
+  "recall_separator": ", ",
+  "retry": "Retry",
+  "send_failed": "Not sent: {message}",
+  "send_sending": "Sending",
+  "session_archive": "Archive",
+  "session_archive_body": "An archived session is read-only: you can't send messages, and anything still running finishes first.",
+  "session_delete": "Delete",
+  "session_delete_body": "Anything still running is stopped first, then this session's content is deleted permanently. This can't be undone.",
+  "session_delete_body_archived": "This session's content is deleted permanently. This can't be undone.",
+  "session_error_create": "Could not create the session: {message}",
+  "session_error_fork": "Could not fork the session: {message}",
+  "session_error_rename": "Could not rename the session: {message}",
+  "session_fork": "Fork",
+  "session_kind_main": "Home",
+  "session_load_error": "Could not load this session: {message}",
+  "session_menu_more": "More actions for {title}",
+  "session_rename": "Rename",
+  "session_rename_label": "Session name",
+  "session_state_running": "Running",
+  "session_state_waiting": "Waiting",
+  "session_tag_archived": "Archived",
+  "session_tag_task": "Task",
+  "session_untitled": "Untitled session",
+  "sessions_collapse": "Show less",
+  "sessions_error": "Could not load sessions: {message}",
+  "sessions_kids": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
+      "match": {
+        "countPlural=one": "{count} task",
+        "countPlural=other": "{count} tasks"
+      }
+    }
+  ],
+  "sessions_kids_collapse": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
+      "match": {
+        "countPlural=one": "Collapse {count} task",
+        "countPlural=other": "Collapse {count} tasks"
+      }
+    }
+  ],
+  "sessions_kids_expand": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
+      "match": {
+        "countPlural=one": "Expand {count} task",
+        "countPlural=other": "Expand {count} tasks"
+      }
+    }
+  ],
+  "sessions_kids_live": "{count} running",
+  "sessions_loading": "Loading sessions…",
+  "sessions_none_active": "No active sessions.",
+  "sessions_none_all": "No sessions yet.",
+  "sessions_none_archived": "No archived sessions.",
+  "sessions_show_all": "Show all {count}",
+  "sessions_title": "Sessions",
+  "settings_close": "Close settings",
+  "settings_nav": "Settings sections",
+  "settings_sec_channels": "Channels",
+  "settings_sec_config": "Configuration",
+  "settings_sec_env": "Environment variables",
+  "settings_sec_gateway": "Gateway",
+  "settings_sec_index": "Memory index",
+  "settings_sec_mcp": "MCP",
+  "settings_sec_models": "Models",
+  "settings_status_error": "Could not load the config check.",
+  "settings_status_issues": "Gateway {version} is running, config check: {count} to review.",
+  "settings_status_ok": "Gateway {version} is running, config check passed.",
+  "settings_title": "Settings",
+  "steer_tag": "Interjection",
+  "step_think": "Thinking",
+  "steps_failed": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
+      "match": {
+        "countPlural=one": "{count} failed",
+        "countPlural=other": "{count} failed"
+      }
+    }
+  ],
+  "tab_changes": "Changes",
+  "tab_chat": "Chat",
+  "tab_trace": "Trace",
+  "thread_compacted": "The context was compacted here",
+  "thread_empty": "This session hasn't started yet.",
+  "thread_empty_hint": "Say the first thing below.",
+  "thread_empty_home": "No messages in the home session yet.",
+  "tool_bash": "Run command",
+  "tool_codemode": "Code",
+  "tool_edit": "Edit",
+  "tool_generic": "Tool call",
+  "tool_read": "Read",
+  "tool_rg": "Search file contents",
+  "tool_task": "Create sub-agent",
+  "tool_write": "Write",
+  "topbar_fork": "Fork this session",
+  "topbar_panel_close": "Hide side panel",
+  "topbar_panel_open": "Show side panel",
+  "topbar_tabs": "How to view this session",
+  "trace_assistant_message": "Assistant message",
+  "trace_calls_collapse": "Collapse this step's tool calls",
+  "trace_calls_expand": "Expand this step's tool calls",
+  "trace_calls_folded": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
+      "match": {
+        "countPlural=one": "{count} tool call",
+        "countPlural=other": "{count} tool calls"
+      }
+    }
+  ],
+  "trace_col_input": "Input",
+  "trace_col_output": "Output",
+  "trace_col_think": "Thinking",
+  "trace_col_time": "Time",
+  "trace_compacted": "Context compacted",
+  "trace_detail_aside": "Record details",
+  "trace_detail_close": "Close details",
+  "trace_detail_label": "Details",
+  "trace_duration": "Duration",
+  "trace_empty_overview": "Nothing to chart yet.",
+  "trace_executing": "Running…",
+  "trace_failed": "Failed",
+  "trace_kind_ctx": "Context",
+  "trace_kind_model": "Assistant",
+  "trace_kind_sys": "System",
+  "trace_kind_think": "Thinking",
+  "trace_kind_tool": "Tool",
+  "trace_kind_user": "User",
+  "trace_lane_input": "Input",
+  "trace_lane_model": "Model",
+  "trace_lane_tool": "Tools",
+  "trace_level": "Level",
+  "trace_no_change": "No change",
+  "trace_no_content": "No content",
+  "trace_no_match": "No matching records.",
+  "trace_no_output": "No output",
+  "trace_no_reason": "No reason given",
+  "trace_no_result": "No result captured",
+  "trace_no_system_prompt": "This request had no system prompt",
+  "trace_no_tools": "This request had no tools",
+  "trace_none": "None",
+  "trace_overview_label": "Time overview: click a cell to open that record, drag horizontally to keep only that stretch, Esc to clear",
+  "trace_range_clear": "Show all",
+  "trace_range_note": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
+      "match": {
+        "countPlural=one": "Only the {count} record in the selected stretch of the overview",
+        "countPlural=other": "Only the {count} records in the selected stretch of the overview"
+      }
+    }
+  ],
+  "trace_recall": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
+      "match": {
+        "countPlural=one": "Brought {count} memory: {list}",
+        "countPlural=other": "Brought {count} memories: {list}"
+      }
+    }
+  ],
+  "trace_run_cancelled": "This turn was cancelled",
+  "trace_run_failed": "This turn failed: {reason}",
+  "trace_running": "Running…",
+  "trace_schema_unavailable": "Schema unavailable",
+  "trace_search_label": "Search the trace",
+  "trace_search_placeholder": "Search",
+  "trace_section_removed": "This section was removed.",
+  "trace_start_time": "Started",
+  "trace_status": "Status",
+  "trace_status_completed": "Completed",
+  "trace_status_done": "Completed",
+  "trace_status_running": "Running",
+  "trace_sys_added": "Added: {names}",
+  "trace_sys_both": "System prompt and tools updated",
+  "trace_sys_initial": "Initial system prompt",
+  "trace_sys_prompt": "System prompt updated",
+  "trace_sys_removed": "Removed: {names}",
+  "trace_sys_tool_count": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
+      "match": {
+        "countPlural=one": "{count} tool",
+        "countPlural=other": "{count} tools"
+      }
+    }
+  ],
+  "trace_sys_tools": "Tools updated",
+  "trace_tab_args": "Arguments",
+  "trace_tab_diff": "Diff",
+  "trace_tab_overview": "Overview",
+  "trace_tab_preview": "Preview",
+  "trace_tab_prompt": "System prompt",
+  "trace_tab_raw": "Raw",
+  "trace_tab_result": "Result",
+  "trace_tab_schema": "Schema",
+  "trace_tab_think": "Thinking",
+  "trace_tab_timing": "Timing",
+  "trace_tab_tools": "Tools",
+  "trace_tab_usage": "Usage",
+  "trace_timing_live": "Session timestamps (running)",
+  "trace_timing_source": "Timing source",
+  "trace_timing_stamp": "Session timestamps",
+  "trace_tok": "{count} tok",
+  "trace_tool_calls": "Tool calls",
+  "trace_tool_calls_collapse": "Collapse all calls",
+  "trace_tool_calls_expand": "Expand all calls",
+  "trace_tool_duration": "Duration",
+  "trace_tool_duration_equal": "Back to equal width",
+  "trace_tool_duration_real": "Lay out by actual duration",
+  "trace_tool_only": "(tool calls only)",
+  "trace_tool_turns": "Turns",
+  "trace_tool_turns_collapse": "Collapse all turns",
+  "trace_tool_turns_expand": "Expand all turns",
+  "trace_toolbar": "Trace toolbar",
+  "trace_toolbar_calls": "Calls",
+  "trace_tools_added": "Tools added: {names}",
+  "trace_tools_removed": "Tools removed: {names}",
+  "trace_turn": "Turn {n}",
+  "trace_turn_running": "running",
+  "trace_turn_summary": "steps {steps}, tool calls {calls}",
+  "trace_unavailable": "Unavailable",
+  "trace_uncertain": "Uncertain",
+  "trace_uncertain_short": "Unclear",
+  "trace_usage_cache": "Cache read",
+  "trace_usage_input": "Input",
+  "trace_usage_output": "Output",
+  "trace_usage_reasoning": "Reasoning",
+  "trace_usage_session": "Session total",
+  "trace_usage_this_request": "This request",
+  "trace_waiting_model": "Waiting for the model",
+  "trace_where_start": "Session start",
+  "trace_where_step": "Turn {n} · step {step}",
+  "turn_cancelled": "Stopped after {time}",
+  "turn_cancelled_note": "Task stopped",
+  "turn_done": "Done in {time}",
+  "turn_failed": "Failed",
+  "turn_failed_note": "This turn failed: {reason}",
+  "turn_no_reason": "No reason given",
+  "turn_running": "Running, {time} so far",
+  "turn_spent_suffix": " after {time}",
+  "unauthorized_body": "Run komo web in a terminal; it opens a one-time link that pairs this browser.",
+  "unauthorized_title": "This browser is not paired yet",
+  "view_filter": "Filter sessions",
+  "view_filter_active": "Hide archived",
+  "view_filter_all": "All sessions (show archived)",
+  "view_filter_archived": "Archived only",
+  "view_group": "Group by",
+  "view_group_flat": "Single list",
+  "view_group_tree": "Session tree",
+  "view_group_workdir": "Working directory",
+  "view_menu": "Group, sort and filter",
+  "view_sort": "Sort by",
+  "view_sort_created": "Recently created",
+  "view_sort_updated": "Recently updated",
+  "workdir_default": "Default directory",
+  "workdir_new": "New session in {name}"
 }

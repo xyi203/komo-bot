@@ -1,31 +1,26 @@
-import { Slot } from "@radix-ui/react-slot";
-import { cva, type VariantProps } from "class-variance-authority";
 import type { ComponentProps } from "react";
 import { cn } from "@/lib/utils";
 
-// shadcn/ui 的 Button，配色换成 DESIGN.md 的 token（primary 是墨，secondary 是白底环）。
-const buttonVariants = cva(
-  "inline-flex h-8 shrink-0 items-center justify-center gap-2 rounded-control px-3 text-label font-medium whitespace-nowrap transition-colors disabled:pointer-events-none disabled:opacity-50",
-  {
-    variants: {
-      variant: {
-        primary: "bg-primary text-surface hover:bg-primary-hover",
-        secondary: "bg-surface text-text shadow-ring-control hover:bg-hover-on-white",
-        ghost: "text-muted hover:bg-hover-on-white hover:text-text",
-      },
-    },
-    defaultVariants: { variant: "secondary" },
-  },
-);
-
-function Button({
+/** 页面里的按钮（原型的 `.btn`）：默认白底描边，`primary` 近黑实心，`danger` 红描边。 */
+export function Button({
+  variant = "default",
+  size = "default",
   className,
-  variant,
-  asChild = false,
+  type = "button",
   ...props
-}: ComponentProps<"button"> & VariantProps<typeof buttonVariants> & { asChild?: boolean }) {
-  const Comp = asChild ? Slot : "button";
-  return <Comp data-slot="button" className={cn(buttonVariants({ variant }), className)} {...props} />;
+}: { variant?: "default" | "primary" | "danger"; size?: "default" | "sm" } & ComponentProps<"button">) {
+  return (
+    <button
+      type={type}
+      className={cn(
+        "inline-flex shrink-0 cursor-pointer items-center justify-center gap-1.5 rounded-control font-medium whitespace-nowrap transition-[background-color,box-shadow,transform] hover:bg-hover-on-white active:scale-97 disabled:cursor-progress disabled:text-muted",
+        size === "default" ? "h-8 px-3" : "h-7 px-2.5 text-label",
+        variant === "default" && "bg-surface text-text shadow-ring-control",
+        variant === "primary" && "bg-primary text-white shadow-none hover:bg-primary-hover",
+        variant === "danger" && "bg-surface text-negative shadow-[0_0_0_1px_var(--color-negative)] hover:bg-negative-pale",
+        className,
+      )}
+      {...props}
+    />
+  );
 }
-
-export { Button, buttonVariants };

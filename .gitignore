@@ -27,3 +27,6 @@ build/
 
 # 本机运行目录，不提交生成内容
 /.komo/
+
+# Electron 打包产物
+/apps/desktop/release/

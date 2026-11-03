@@ -176,6 +176,8 @@ pub struct PairRequest {
 // ---- /v1/sessions ----
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(optional_fields))]
 pub struct CreateSessionRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
@@ -339,18 +341,24 @@ pub struct SessionDetail {
 
 /// `POST /v1/sessions/{id}/delete`。
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(optional_fields))]
 pub struct DeleteSessionRequest {
     /// 不等待未完成的 Run：立刻把它们各写一条明确取消，再进 `deleted`（§8.10）。
     #[serde(default)]
+    #[cfg_attr(feature = "ts", ts(as = "Option<bool>"))]
     pub now: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_key: Option<RequestKey>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(optional_fields))]
 pub struct SessionLifecycleResponse {
     pub session: SessionId,
     pub state: SessionState,
+    #[cfg_attr(feature = "ts", ts(type = "string"))]
     #[serde(with = "time::serde::rfc3339")]
     pub changed_at: OffsetDateTime,
     /// `now` 时被明确取消的未完成 Run。空数组 = 没有要处置的。
@@ -366,6 +374,8 @@ pub struct PurgeSessionRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(optional_fields))]
 pub struct PurgeSessionResponse {
     pub session: SessionId,
     pub state: SessionState,
@@ -376,12 +386,14 @@ pub struct PurgeSessionResponse {
 
 /// 引用检查不过时的 409 正文：**列出要先处置什么**，不假装成功（§8.10）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct PurgeBlocked {
     pub session: SessionId,
     pub blockers: Vec<PurgeBlocker>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct PurgeBlocker {
     /// 哪一类（`memory_evidence` / `checkpoint` / `delivery` / `cron_firing` / `unfinished_run`）。
     pub what: String,
@@ -433,6 +445,8 @@ pub struct EventPage {
 // ---- POST /v1/sessions/{id}/runs ----
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(optional_fields))]
 pub struct SubmitRunRequest {
     /// 幂等键。同一键重发返回原 Run（§8.5）。
     pub request_key: RequestKey,
@@ -446,15 +460,19 @@ pub struct SubmitRunRequest {
     /// 工具与执行器，调用与结果记进会话，下一轮模型看得见。只有 HTTP 这一个入口——聊天
     /// 渠道没有，拿到 bot 对话权限不等于拿到这台机器的 shell。
     #[serde(default, skip_serializing_if = "is_false")]
+    #[cfg_attr(feature = "ts", ts(as = "Option<bool>"))]
     pub shell: bool,
     /// **插话**（§6）：会话里有 Run 正在跑时，这句话不排到它后面，而是由它在下一次请求
     /// 模型之前并进去。TUI 发；没轮上（那条 Run 已经在给最终回答、停在等待上、模型不同）
     /// 就照常排队。
     #[serde(default, skip_serializing_if = "is_false")]
+    #[cfg_attr(feature = "ts", ts(as = "Option<bool>"))]
     pub interject: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(optional_fields))]
 pub struct SubmitRunResponse {
     pub run: RunId,
     pub session: SessionId,
@@ -622,6 +640,7 @@ pub struct CancelRunRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct CancelRunResponse {
     pub run: RunId,
     pub state: RunState,
@@ -633,6 +652,8 @@ pub struct CancelRunResponse {
 /// 表——多一张表就多一处会与权威漂移的状态，而这次改造的全部理由
 /// 就是不要那个（§8.9）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(optional_fields))]
 pub struct InterventionSummary {
     /// 答复时用的句柄：`verify` / `blocked` 都是 Run ID。
     pub handle: String,
@@ -649,11 +670,13 @@ pub struct InterventionSummary {
     /// 界面就会给出一个按下去没反应的答案（§11.3 的 TUI 菜单是同一条理由）。
     #[serde(default)]
     pub verdicts: Vec<InterventionVerdict>,
+    #[cfg_attr(feature = "ts", ts(type = "string"))]
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum InterventionKind {
     /// 一次调用的结果不明，等人核对（§8.6）。
@@ -696,6 +719,7 @@ impl InterventionKind {
 /// 就再也纠不回来（§7.5）。`Satisfied` 说的是"核对之后目标已经是那个样子"，不是"我相信
 /// 它跑过了"。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum InterventionVerdict {
     /// `verify`：核对后目标已满足——给那次调用补一条结果，原 Run 继续。
@@ -756,6 +780,7 @@ pub struct InterventionListQuery {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct InterventionListResponse {
     pub interventions: Vec<InterventionSummary>,
 }
@@ -786,6 +811,8 @@ pub enum InterventionDetail {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(optional_fields))]
 pub struct InterventionAnswerRequest {
     pub verdict: InterventionVerdict,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -795,6 +822,8 @@ pub struct InterventionAnswerRequest {
 /// 答复的结果。**已答复的返回原结论，不报错**（§11.3）——同一人连点两次，第二次得到
 /// 的是"已经答过了"。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(optional_fields))]
 pub struct InterventionAnswerResponse {
     pub handle: String,
     pub kind: InterventionKind,
@@ -812,6 +841,8 @@ pub struct InterventionAnswerResponse {
 // ---- /v1/cron ----
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(optional_fields))]
 pub struct CronListResponse {
     pub jobs: Vec<CronJob>,
     /// 每个 Job 的**最近一次触发**与下一次时间（§10「Cron 的结果去原 Session 查看」的
@@ -823,6 +854,8 @@ pub struct CronListResponse {
 
 /// 一个 Job 的运行面：下一次什么时候，上一次怎么样。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(optional_fields))]
 pub struct CronJobStatus {
     pub job: CronJobId,
     #[serde(
@@ -830,6 +863,7 @@ pub struct CronJobStatus {
         with = "time::serde::rfc3339::option",
         skip_serializing_if = "Option::is_none"
     )]
+    #[cfg_attr(feature = "ts", ts(type = "string"))]
     pub next_run_at: Option<OffsetDateTime>,
     /// 最近一次触发。没有就是这个 Job 还没响过。
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -876,6 +910,8 @@ pub struct CreateCronRequest {
 
 /// `PATCH /v1/cron/{id}`：给出的字段才改。
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(optional_fields))]
 pub struct UpdateCronRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
@@ -900,6 +936,7 @@ pub struct UpdateCronRequest {
     pub model: Option<String>,
     /// 见 [`CreateCronRequest::model_config`]。
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(type = "unknown"))]
     pub model_config: Option<ModelConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<Effort>,
@@ -941,6 +978,8 @@ pub struct ManualCronRunRequest {
 
 /// **使用独立请求幂等键，不冒充定时触发**（§10）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(optional_fields))]
 pub struct ManualCronRunResponse {
     pub job: CronJobId,
     pub session: SessionId,
@@ -950,6 +989,8 @@ pub struct ManualCronRunResponse {
 
 /// `DELETE /v1/cron/{id}`：移除后续调度，已有执行历史保留。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(optional_fields))]
 pub struct CronDeleteResponse {
     pub job: CronJobId,
     pub removed: bool,
@@ -1022,6 +1063,8 @@ where
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(optional_fields))]
 pub struct MemoryListResponse {
     pub memories: Vec<MemoryItem>,
     /// 检索降级要明说（§9.4）。
@@ -1036,11 +1079,14 @@ pub struct MemoryListResponse {
     /// `min_keyword_score`；向量臂是余弦，对应 `min_similarity`。不在某臂候选名单里（或那臂没跑）
     /// 就是 `None`。按 `id` 对应 `memories`；清单没有。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "ts", ts(as = "Option<Vec<ArmScore>>"))]
     pub arm_scores: Vec<ArmScore>,
 }
 
 /// confirm / forget 都携带预期 revision；重复请求幂等（§9.6）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(optional_fields))]
 pub struct MemoryRevisionRequest {
     pub expected_revision: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1048,6 +1094,8 @@ pub struct MemoryRevisionRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(optional_fields))]
 pub struct MemoryDetail {
     pub memory: MemoryItem,
 }
@@ -1057,6 +1105,8 @@ pub struct MemoryDetail {
 /// `session` 与 `run` 要么都给、要么都不给：都给 = Agent 在这个 Run 里替用户记，证据是
 /// 这个 Run 里用户说的话，记成未确认；都不给 = 操作者在终端亲口说的，直接记成已确认。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(optional_fields))]
 pub struct MemoryAddRequest {
     pub content: String,
     pub kind: MemoryKind,
@@ -1081,6 +1131,8 @@ pub struct MemoryAddRequest {
 /// `POST /v1/memories/{id}/classify`：操作者给指定 revision 定使用方式与条件（§9.3
 /// 「存量分类」）。写成新 revision，证据与确认原样保留；规则同 add。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(optional_fields))]
 pub struct MemoryClassifyRequest {
     pub expected_revision: u32,
     /// 省略 = 沿用现有使用方式（只改归属时不给）。
@@ -1095,6 +1147,7 @@ pub struct MemoryClassifyRequest {
     pub belongs_to: Option<MatterId>,
     /// 清空归属（`classify --for none`）。
     #[serde(default, skip_serializing_if = "is_false")]
+    #[cfg_attr(feature = "ts", ts(as = "Option<bool>"))]
     pub clear_belongs_to: bool,
     /// 在 Run 里跑的 CLI 带上自己的会话：改归属要过 `memory = private / off` 的闸
     /// （`docs/goals.md` §2）。
@@ -1106,6 +1159,8 @@ pub struct MemoryClassifyRequest {
 
 /// 记下的那一条；`created = false` 是库里已有逐字相同的一条，这次只补了证据或确认。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(optional_fields))]
 pub struct MemoryAddResponse {
     pub memory: MemoryItem,
     pub created: bool,
@@ -1265,6 +1320,8 @@ pub struct MemoryConsolidateResponse {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(optional_fields))]
 pub struct MemoryIndexStatus {
     /// 当前向量空间的指纹来源。没有配置 embedding 时为 None。
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1284,6 +1341,7 @@ pub struct MemoryIndexStatus {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum IndexState {
     /// 没有配置向量模型。
@@ -1301,6 +1359,8 @@ pub struct RebuildIndexRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(optional_fields))]
 pub struct RebuildIndexResponse {
     pub generation: String,
     /// 这次是不是新提交的（false = 命中了正在跑的同一个代次）。
@@ -1320,6 +1380,8 @@ pub struct MemoryRef {
 
 /// 可选模型清单里的一项。
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(optional_fields))]
 pub struct ModelMenuEntry {
     /// 配置目录 alias；提交 Run / Cron 时使用它。
     pub id: String,
@@ -1346,6 +1408,7 @@ pub struct ModelMenuEntry {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct ModelsResponse {
     pub models: Vec<ModelMenuEntry>,
 }
@@ -1354,12 +1417,15 @@ pub struct ModelsResponse {
 
 /// `GET /v1/config/check`：只读，**不改变运行中的 Gateway**（§3 的命令表）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(optional_fields))]
 pub struct ConfigCheckResponse {
     /// 空 = 校验通过。
     #[serde(default)]
     pub issues: Vec<ConfigIssue>,
     /// 当前**生效**配置的加载时间。
     #[serde(with = "time::serde::rfc3339")]
+    #[cfg_attr(feature = "ts", ts(type = "string"))]
     pub loaded_at: OffsetDateTime,
     /// 各来源文件与它们的 mtime。和 `loaded_at` 对不上就是"文件改了但没装上"（§3）。
     #[serde(default)]
@@ -1371,6 +1437,7 @@ pub struct ConfigCheckResponse {
 
 /// 窗口取值的来源：配置 > provider `/models` > 未知。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum WindowSource {
     Config,
@@ -1380,12 +1447,16 @@ pub enum WindowSource {
 
 /// `komo config check` 里一个 completion alias 的上下文窗口。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(optional_fields))]
 pub struct ModelWindow {
     pub alias: String,
+    #[cfg_attr(feature = "ts", ts(type = "number | null"))]
     pub window: Option<u64>,
     pub source: WindowSource,
     /// 只在 `Unknown` 时有：探测中 / provider 没报告 / 失败原因。
     #[serde(default)]
+    #[cfg_attr(feature = "ts", ts(type = "string | null"))]
     pub detail: Option<String>,
 }
 
@@ -1395,6 +1466,8 @@ pub struct ModelWindow {
 /// 带定位；旧快照原样保留（§3 第 1 步：「校验不过的配置永远不会被装上，哪怕只错一个
 /// 键」）。
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(optional_fields))]
 pub struct ConfigReloadResponse {
     /// 变化了的键名，**不带值**（§3 第 3 步）。
     #[serde(default)]
@@ -1409,6 +1482,7 @@ pub struct ConfigReloadResponse {
     /// `mcp.*` 有键变化时，每台 MCP 服务器此刻的状态（`docs/mcp.md` §2.2）。重载不等握手：
     /// 刚加的、刚改的多半还是"连接中"。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "ts", ts(as = "Option<Vec<McpServerStatus>>"))]
     pub mcp: Vec<McpServerStatus>,
 }
 
@@ -1416,6 +1490,8 @@ pub struct ConfigReloadResponse {
 ///
 /// 不是展开后的快照：看到的就是要改的。凭证只给"在不在"，**不给值**。
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(optional_fields))]
 pub struct ConfigModelsResponse {
     /// `config.toml` 与 `.env` 内容的哈希；写的时候原样带回来，对不上就 409。
     pub version: String,
@@ -1430,6 +1506,7 @@ pub struct ConfigModelsResponse {
     pub env_path: String,
     /// `type = "embedding"` 的模型项，只读（换它要重建索引，§3「Web 看 MCP 服务器与向量模型」）。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "ts", ts(as = "Option<Vec<EmbeddingModelEntry>>"))]
     pub embeddings: Vec<EmbeddingModelEntry>,
     /// `[memory] embedding` 指的 alias。
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1438,6 +1515,8 @@ pub struct ConfigModelsResponse {
 
 /// 一个 embedding 模型项，文件里写着的样子。凭证只报在不在。
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(optional_fields))]
 pub struct EmbeddingModelEntry {
     pub alias: String,
     pub model: String,
@@ -1460,6 +1539,8 @@ pub struct EmbeddingModelEntry {
 
 /// 一个 `[model_providers.<id>]`。
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(optional_fields))]
 pub struct ProviderEntry {
     pub id: String,
     /// 设置页显示的名字（`name`）；没写就显示 `id`。
@@ -1483,6 +1564,8 @@ pub struct ProviderEntry {
 
 /// 一个 completion 类的 `[model.<alias>]`。
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(optional_fields))]
 pub struct ConfigModelEntry {
     pub alias: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1498,12 +1581,15 @@ pub struct ConfigModelEntry {
     pub context_window: Option<u64>,
     /// 不挂 provider、自己写了 `base_url` 的模型项：网页上只看不改它的端点。
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[cfg_attr(feature = "ts", ts(as = "Option<bool>"))]
     pub standalone: bool,
 }
 
 /// `PUT /v1/config/model-providers/{id}`：整份写这个 provider 的几个键（没给的键删掉），
 /// 表里别的键与注释不动。`Debug` 不印 `api_key` 的值。
 #[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(optional_fields))]
 pub struct ProviderUpsertRequest {
     pub version: String,
     /// 改名：先把这一项搬到这个新名字下，再按其余字段写。省略或同名 = 不改名。
@@ -1551,6 +1637,8 @@ impl std::fmt::Debug for ProviderUpsertRequest {
 /// `PUT /v1/config/embedding-models/{alias}`：整份写这个 embedding 模型项的几个键，表里别的键
 /// （`revision`、前缀等）与注释不动（§3「从 Web 加改向量模型」）。`Debug` 不印 `api_key` 的值。
 #[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(optional_fields))]
 pub struct EmbeddingUpsertRequest {
     pub version: String,
     /// 改名：先把这一项搬到这个新名字下，再按其余字段写。省略或同名 = 不改名。
@@ -1592,6 +1680,8 @@ impl std::fmt::Debug for EmbeddingUpsertRequest {
 
 /// `PUT /v1/config/models/{alias}`：整份写这个模型的几个键，表里别的键与注释不动。
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(optional_fields))]
 pub struct ModelUpsertRequest {
     pub version: String,
     pub provider: String,
@@ -1608,6 +1698,8 @@ pub struct ModelUpsertRequest {
 
 /// `PUT /v1/config/default-model`。
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(optional_fields))]
 pub struct DefaultModelRequest {
     pub version: String,
     pub alias: String,
@@ -1615,6 +1707,8 @@ pub struct DefaultModelRequest {
 
 /// provider 表单模型目录里的一行。`alias` 是 `[model.<alias>]` 的名字，`model` 是上游 id。
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(optional_fields))]
 pub struct ProviderModelRequest {
     pub alias: String,
     pub model: String,
@@ -1634,6 +1728,8 @@ pub struct ProviderModelRequest {
 /// 端点、协议取请求里的，没给就取 `provider` 那一项；key 取请求里的 `api_key`，没给就按
 /// `env_key`（或那一项的凭证变量）从 `.env` 读。`Debug` 不印 key。
 #[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(optional_fields))]
 pub struct ProviderModelsRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
@@ -1661,6 +1757,8 @@ impl std::fmt::Debug for ProviderModelsRequest {
 
 /// provider 报上来的模型 id，按它给的顺序。
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(optional_fields))]
 pub struct ProviderModelsResponse {
     #[serde(default)]
     pub models: Vec<String>,
@@ -1668,6 +1766,8 @@ pub struct ProviderModelsResponse {
 
 /// 删除只带版本。
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(optional_fields))]
 pub struct ConfigVersionRequest {
     pub version: String,
 }
@@ -1675,6 +1775,8 @@ pub struct ConfigVersionRequest {
 /// 写完之后：模型、常用设置、环境变量三份新视图（共用一个新 `version`），以及这次重载的
 /// 报告（变了哪些键，不带值）。
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(optional_fields))]
 pub struct ConfigEditResponse {
     pub models: ConfigModelsResponse,
     #[serde(default)]
@@ -1686,6 +1788,8 @@ pub struct ConfigEditResponse {
 
 /// `GET /v1/config/settings`：白名单里的常用设置（§3「从 Web 改常用设置与环境变量」）。
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(optional_fields))]
 pub struct ConfigSettingsResponse {
     pub version: String,
     pub settings: Vec<ConfigSetting>,
@@ -1693,17 +1797,22 @@ pub struct ConfigSettingsResponse {
 
 /// 一项常用设置。`key` 是文件里的点路径（`memory.retrieval.mode`）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(optional_fields))]
 pub struct ConfigSetting {
     pub key: String,
     pub kind: SettingKind,
     /// 文件里写的值；没写为空，生效的是默认。
     #[serde(default)]
+    #[cfg_attr(feature = "ts", ts(type = "unknown"))]
     pub value: Option<serde_json::Value>,
     /// 当前快照里生效的值。
     #[serde(default)]
+    #[cfg_attr(feature = "ts", ts(type = "unknown"))]
     pub effective: Option<serde_json::Value>,
     /// `choice` 的可选值。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "ts", ts(as = "Option<Vec<String>>"))]
     pub options: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub min: Option<i64>,
@@ -1712,6 +1821,7 @@ pub struct ConfigSetting {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum SettingKind {
     Bool,
@@ -1721,20 +1831,27 @@ pub enum SettingKind {
 
 /// `PUT /v1/config/settings/{key}`。`value: null` = 删掉这一行，回到默认。
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(optional_fields))]
 pub struct SettingRequest {
     pub version: String,
     #[serde(default)]
+    #[cfg_attr(feature = "ts", ts(type = "unknown"))]
     pub value: Option<serde_json::Value>,
 }
 
 /// `GET /v1/config/env`：变量名与状态，**不带任何值**。
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(optional_fields))]
 pub struct ConfigEnvResponse {
     pub version: String,
     pub vars: Vec<EnvVarEntry>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(optional_fields))]
 pub struct EnvVarEntry {
     pub name: String,
     /// `.env` 里有这一行。没有的是配置引用了却缺的名字。
@@ -1743,11 +1860,14 @@ pub struct EnvVarEntry {
     pub set: bool,
     /// 引用它的配置项，如 `provider magpie`、`渠道 feishu`。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "ts", ts(as = "Option<Vec<String>>"))]
     pub used_by: Vec<String>,
 }
 
 /// `PUT /v1/config/env`：一次设一批变量。
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(optional_fields))]
 pub struct EnvSetRequest {
     pub version: String,
     pub vars: Vec<EnvAssignment>,
@@ -1755,6 +1875,8 @@ pub struct EnvSetRequest {
 
 /// 一个变量的新值。值是凭证：`Debug` 只印名字，免得哪条日志把它带出去。
 #[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(optional_fields))]
 pub struct EnvAssignment {
     pub name: String,
     pub value: String,
@@ -1770,6 +1892,8 @@ impl std::fmt::Debug for EnvAssignment {
 
 /// 一台 MCP 服务器此刻的状态。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(optional_fields))]
 pub struct McpServerStatus {
     pub name: String,
     pub state: McpServerState,
@@ -1780,6 +1904,8 @@ pub struct McpServerStatus {
 
 /// `POST /v1/mcp/reconnect`：点名的 MCP 服务器断开重连（`docs/mcp.md` §2.5）。
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(optional_fields))]
 pub struct McpReconnectRequest {
     /// `[mcp.servers.<name>]` 里的名字；空 = 全部。
     #[serde(default)]
@@ -1789,6 +1915,8 @@ pub struct McpReconnectRequest {
 /// `POST /v1/mcp/disconnect` 也用这两个：点名的几台（空 = 全部）断开，交回断开后的状态。
 /// 重连等握手：每台服务器连完之后的状态。
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(optional_fields))]
 pub struct McpReconnectResponse {
     #[serde(default)]
     pub servers: Vec<McpServerStatus>,
@@ -1796,6 +1924,8 @@ pub struct McpReconnectResponse {
 
 /// `GET /v1/mcp`：每台 MCP 服务器此刻的样子（`docs/mcp.md` §2.6）。不等握手、不重连。
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(optional_fields))]
 pub struct McpServersResponse {
     #[serde(default)]
     pub servers: Vec<McpServerView>,
@@ -1803,6 +1933,8 @@ pub struct McpServersResponse {
 
 /// 一台服务器：状态之外，再带传输方式与最近一次握手列出的工具。命令、URL、变量名不给。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(optional_fields))]
 pub struct McpServerView {
     pub name: String,
     pub state: McpServerState,
@@ -1810,6 +1942,7 @@ pub struct McpServerView {
     pub detail: Option<String>,
     pub transport: McpTransportKind,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[cfg_attr(feature = "ts", ts(as = "Option<bool>"))]
     pub oauth: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
@@ -1820,6 +1953,7 @@ pub struct McpServerView {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum McpTransportKind {
     Stdio,
@@ -1828,6 +1962,8 @@ pub enum McpTransportKind {
 
 /// 服务器上的一个工具（原名）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(optional_fields))]
 pub struct McpToolView {
     pub name: String,
     /// 服务器给的说明，只取第一行。
@@ -1836,13 +1972,16 @@ pub struct McpToolView {
     /// `tool_exposure` 覆盖之后的实际值。
     pub exposure: McpExposure,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[cfg_attr(feature = "ts", ts(as = "Option<bool>"))]
     pub outward: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[cfg_attr(feature = "ts", ts(as = "Option<bool>"))]
     pub read_only: bool,
 }
 
 /// 照 pi 的 `connecting / connected / needs-auth / failed`。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum McpServerState {
     Connecting,
@@ -1856,29 +1995,37 @@ pub enum McpServerState {
 /// `GET /v1/channels`：每个配置里的渠道，配置摘要加上 Gateway 看得见的运行状态。凭证与
 /// 插件命令不给。
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(optional_fields))]
 pub struct ChannelsResponse {
     #[serde(default)]
     pub channels: Vec<ChannelView>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(optional_fields))]
 pub struct ChannelView {
     pub channel: String,
     pub enabled: bool,
     /// 配了 `plugin.command`（自定义渠道，或换了命令的官方渠道）。
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[cfg_attr(feature = "ts", ts(as = "Option<bool>"))]
     pub custom_plugin: bool,
     pub allow_from: usize,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[cfg_attr(feature = "ts", ts(as = "Option<bool>"))]
     pub allow_tenant: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub home_chat: Option<String>,
     /// 启用了却没人能通过它下指令（§11.2 的那条警告）。
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[cfg_attr(feature = "ts", ts(as = "Option<bool>"))]
     pub outbound_only: bool,
     pub state: ChannelRunState,
     /// 进入当前状态的时间；未启用时没有。
     #[serde(default, with = "time::serde::rfc3339::option")]
+    #[cfg_attr(feature = "ts", ts(type = "string | null"))]
     pub since: Option<OffsetDateTime>,
     /// 退出或起不来的原因。
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1891,6 +2038,7 @@ pub struct ChannelView {
 /// Gateway 只看得见插件进程这一层：在跑（握手、平台连接在插件里）、退出后退避重试、
 /// 起不来（缺凭证、缺插件这类重建前就失败的）、没启用。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum ChannelRunState {
     Off,
@@ -1901,6 +2049,8 @@ pub enum ChannelRunState {
 
 /// `POST /v1/channels/{id}/probe`：和 `komo channel probe` 同一条连通性核对，不起消费循环。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(optional_fields))]
 pub struct ChannelProbeResponse {
     pub ok: bool,
     pub message: String,
@@ -1913,6 +2063,7 @@ pub struct ChannelProbeResponse {
 /// 快照，`write` / `edit` 第一次碰的文件另存一份改前的整文件；只活在 Gateway 进程里，
 /// 重启之后先前的 Run 没有这份记录。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct RunChanges {
     pub run: RunId,
     /// 这条 Run 的工作目录；`path` 相对它。
@@ -1926,6 +2077,8 @@ pub struct RunChanges {
 pub const MAX_CHANGED_FILES: usize = 500;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(optional_fields))]
 pub struct ChangedFile {
     /// 在工作目录里是相对路径，否则是绝对路径。
     pub path: String,
@@ -1939,13 +2092,16 @@ pub struct ChangedFile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deleted: Option<u64>,
     #[serde(default, skip_serializing_if = "is_false")]
+    #[cfg_attr(feature = "ts", ts(as = "Option<bool>"))]
     pub binary: bool,
     /// 超过整文件副本的上限，没有存下来：只知道改了，给不出对比。
     #[serde(default, skip_serializing_if = "is_false")]
+    #[cfg_attr(feature = "ts", ts(as = "Option<bool>"))]
     pub oversized: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum FileChange {
     Added,
@@ -1955,6 +2111,7 @@ pub enum FileChange {
 
 /// 一个会话里 Gateway 还记得的各条 Run 的改动（`GET /v1/sessions/{id}/changes`），按 Run 先后。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct SessionChanges {
     pub runs: Vec<RunChanges>,
 }
@@ -1962,6 +2119,8 @@ pub struct SessionChanges {
 /// 一个文件这一轮的对比（`GET /v1/runs/{id}/changes/{index}`）：开始与收尾两份之间的
 /// unified diff，三行上下文。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(optional_fields))]
 pub struct FileDiff {
     pub path: String,
     pub display: String,
@@ -1971,6 +2130,7 @@ pub struct FileDiff {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum DiffStatus {
     Text,

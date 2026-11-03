@@ -2,7 +2,7 @@
   "name": "komo-clients",
   "private": true,
   "description": "komo 的客户端 workspace（docs/clients.md）：apps/client 是 Gateway 托管的网页壳，apps/desktop 是它的 macOS（Electron）壳，packages/* 是各端共用的协议类型与 API 层。",
-  "packageManager": "pnpm@11.21.0",
+  "packageManager": "pnpm@12.16.1",
   "engines": {
     "node": ">=22"
   },

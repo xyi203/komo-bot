@@ -12,3 +12,9 @@ minimumReleaseAgeExclude:
   - '@tanstack/query-core@5.105.2'
   - '@tanstack/react-query@5.105.2'
   - '@vitejs/plugin-react@6.2.1'
+# pnpm 12 起依赖可以附带 agent skills，要逐个批准；这里不装，和 pnpm 11 时一样。
+permissions:
+  '@tanstack/react-router':
+    skills: false
+  '@tanstack/react-start':
+    skills: false

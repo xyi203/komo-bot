@@ -1243,6 +1243,7 @@
   "settings_sec_channels": "Channels",
   "settings_sec_config": "Configuration",
   "settings_sec_env": "Environment variables",
+  "settings_nav_env": "Env variables",
   "settings_sec_gateway": "Gateway",
   "settings_sec_index": "Memory index",
   "settings_sec_mcp": "MCP",

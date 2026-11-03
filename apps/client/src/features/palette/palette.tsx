@@ -6,7 +6,7 @@ import { useEffect, useMemo, useRef, useState, type KeyboardEvent } from "react"
 import { Icon, type IconName } from "@/components/icon";
 import { IconButton } from "@/components/ui/icon-button";
 import { useSessionActions } from "@/features/sessions/actions";
-import { dirName, dirOf, isArchived } from "@/features/sessions/model";
+import { dirName, dirOf, isArchived, isEmpty } from "@/features/sessions/model";
 import { sessionTitle } from "@/features/sessions/title";
 import { scheduleText } from "@/lib/cron-text";
 import { cn } from "@/lib/utils";
@@ -124,7 +124,8 @@ function PaletteBody() {
       meta: scopeName(x.scope),
       run: () => void navigate({ to: "/memory/$id", params: { id: x.id } }),
     });
-    const byRecent = [...(sessions ?? [])].sort((a, b) => new Date(b.updated_at).getTime() - new Date(a.updated_at).getTime());
+    // 和侧栏一样不列一句话都没发过的会话：标题全是"新会话"，列出来只是一串点不出区别的空行
+    const byRecent = (sessions ?? []).filter((s) => !isEmpty(s)).sort((a, b) => new Date(b.updated_at).getTime() - new Date(a.updated_at).getTime());
     if (!q) {
       if (want("session")) add(all ? m.palette_sec_recent() : m.palette_sec_session(), byRecent.filter((s) => !isArchived(s)).slice(0, all ? 8 : 30).map(sessionItem));
       if (want("matter") && !all) add(m.palette_sec_matter(), (matters ?? []).filter((x) => !x.closed_at).map(matterItem));

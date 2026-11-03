@@ -1235,6 +1235,7 @@
   "settings_sec_channels": "渠道",
   "settings_sec_config": "配置",
   "settings_sec_env": "环境变量",
+  "settings_nav_env": "环境变量",
   "settings_sec_gateway": "Gateway",
   "settings_sec_index": "记忆索引",
   "settings_sec_mcp": "MCP",

@@ -25,10 +25,11 @@ const ICONS: Record<SettingsSection, IconName> = {
   channels: "chat",
 };
 
+// 左栏只有 216px（窄窗 180px）：分节名必须一行放得下，长的给短名（节标题仍用全称）
 const LABELS: Record<SettingsSection, () => string> = {
   models: () => m.settings_sec_models(),
   config: () => m.settings_sec_config(),
-  env: () => m.settings_sec_env(),
+  env: () => m.settings_nav_env(),
   index: () => m.settings_sec_index(),
   mcp: () => m.settings_sec_mcp(),
   gateway: () => m.settings_sec_gateway(),
@@ -103,8 +104,8 @@ function Side({ section }: { section: SettingsSection }) {
               key === section && "bg-active font-medium",
             )}
           >
-            <Icon name={ICONS[key]} className="text-muted" />
-            {LABELS[key]()}
+            <Icon name={ICONS[key]} className="shrink-0 text-muted" />
+            <span className="truncate">{LABELS[key]()}</span>
             {key === "config" && issues > 0 && (
               <span className="ml-auto h-4.5 min-w-5 rounded-[9px] bg-pill-wait-bg px-1.5 text-center text-[11px] leading-[18px] font-semibold text-pill-wait-ink tabular-nums">
                 {issues}

@@ -25,9 +25,11 @@ export class WindowManager {
 
   private lockDownSession() {
     const ses = session.defaultSession;
-    // 渲染进程不需要任何浏览器权限（通知由主进程发）。
-    ses.setPermissionRequestHandler((_wc, _permission, callback) => callback(false));
-    ses.setPermissionCheckHandler(() => false);
+    // 渲染进程只要一项浏览器权限：往剪贴板写（复制按钮的 navigator.clipboard.writeText，拒了就"点了没反应"）。
+    // 读剪贴板不放：⌘V 走编辑菜单的原生粘贴，不经过这项权限。通知由主进程发。
+    const allowed = (permission: string) => permission === "clipboard-sanitized-write";
+    ses.setPermissionRequestHandler((_wc, permission, callback) => callback(allowed(permission)));
+    ses.setPermissionCheckHandler((_wc, permission) => allowed(permission));
     // 除了 app://、DevTools 与内联资源，渲染进程发不出任何网络请求（CSP 之外再加一道）。
     ses.webRequest.onBeforeRequest((details, callback) => {
       const scheme = details.url.slice(0, details.url.indexOf(":") + 1);

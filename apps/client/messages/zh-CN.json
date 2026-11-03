@@ -1179,6 +1179,7 @@
   "session_load_error": "这段对话没取到：{message}",
   "session_menu_more": "{title} 的更多操作",
   "session_rename": "重命名",
+  "session_rename_hint": "{title}（点击改名）",
   "session_rename_label": "会话名称",
   "session_state_running": "运行中",
   "session_state_waiting": "等待中",

@@ -1187,6 +1187,7 @@
   "session_load_error": "Could not load this session: {message}",
   "session_menu_more": "More actions for {title}",
   "session_rename": "Rename",
+  "session_rename_hint": "{title} (click to rename)",
   "session_rename_label": "Session name",
   "session_state_running": "Running",
   "session_state_waiting": "Waiting",

@@ -46,10 +46,17 @@ export function useSessionActions() {
     async rename(session: SessionSummary, name: string) {
       const trimmed = name.trim();
       if (!trimmed || trimmed === session.title) return;
+      // 先改列表缓存里的标题（顶栏、侧栏马上换上新名，不闪回旧的），失败了重取回到原样
+      for (const all of [true, false]) {
+        queryClient.setQueryData<SessionListResponse>(keys.sessions.list(all), (previous) =>
+          previous ? { sessions: previous.sessions.map((s) => (s.session === session.session ? { ...s, title: trimmed } : s)) } : previous,
+        );
+      }
       try {
         await renameSession(session.session, trimmed);
         await refresh();
       } catch (error) {
+        void refresh();
         showToast(m.session_error_rename({ message: errorText(error) }));
       }
     },

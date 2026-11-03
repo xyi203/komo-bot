@@ -820,8 +820,47 @@ impl DurableCore {
         Ok(Self::after_append(&appended))
     }
 
-    /// 改会话名：`session.info {name}`，同一次提交更新 `sessions.title`。
+    /// 改会话名：空闲时追加 `session.info {name}`，同一次提交更新 `sessions.title`；
+    /// 有分支在忙（Run、排队、压缩）时不动树，只改 `sessions.title`（同自动起标题）——
+    /// 标题是给人看的，不该等 Run 停下。
     pub async fn name(&self, session: &str, name: &str) -> Result<NavigateOutcome, SessionError> {
+        match self.name_on_tree(session, name).await {
+            Err(SessionError::Busy(_)) => self.retitle(session, name).await,
+            other => other,
+        }
+    }
+
+    /// 忙时改名：只改 `sessions` 行的标题，不追加 entry、不动 leaf。
+    async fn retitle(&self, session: &str, name: &str) -> Result<NavigateOutcome, SessionError> {
+        let (id, title) = (session.to_owned(), name.to_owned());
+        self.engine
+            .commit(move |tx| {
+                Box::pin(async move {
+                    let Some(mut record) = tx.session(&id).await? else {
+                        return Ok(Err(SessionError::NotFound(format!("会话 {id}"))));
+                    };
+                    if let Err(error) = ensure_open(&record) {
+                        return Ok(Err(error));
+                    }
+                    record.title = Some(title);
+                    record.title_provisional = false;
+                    tx.put_session(record);
+                    Ok(Ok(()))
+                })
+            })
+            .await??;
+        let tree = load_tree(&*self.storage, session).await?;
+        Ok(NavigateOutcome {
+            leaf: tree.leaf,
+            editor_text: None,
+        })
+    }
+
+    async fn name_on_tree(
+        &self,
+        session: &str,
+        name: &str,
+    ) -> Result<NavigateOutcome, SessionError> {
         let tree = self.editable_tree(session).await?;
         let draft = EntryDraft::new(SESSION_INFO_ENTRY).with_data(json!({"name": name}));
         let appended = self

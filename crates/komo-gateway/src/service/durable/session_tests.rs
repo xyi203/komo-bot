@@ -1311,7 +1311,28 @@ async fn tree_ops_are_refused_while_any_branch_is_busy() {
             .await
             .map(drop),
     );
-    busy(core.name(&record.id, "x").await.map(drop));
+    // 改名不等 Run：只改标题，树不动
+    let entries_before = core
+        .read_tree(&record.id)
+        .await
+        .unwrap()
+        .branch(record.root_conversation)
+        .unwrap()
+        .entries
+        .len();
+    core.name(&record.id, "renamed while busy").await.unwrap();
+    let renamed = core.read_tree(&record.id).await.unwrap();
+    assert_eq!(renamed.session.title.as_deref(), Some("renamed while busy"));
+    assert!(!renamed.session.title_provisional);
+    assert_eq!(
+        renamed
+            .branch(record.root_conversation)
+            .unwrap()
+            .entries
+            .len(),
+        entries_before,
+        "忙时改名不追加 entry"
+    );
     busy(core.context_edit(&record.id, ids[0], None).await.map(drop));
     busy(core.compact(&record.id, None).await.map(drop));
     busy(
@@ -1407,10 +1428,12 @@ async fn a_busy_branch_that_is_not_current_still_blocks_tree_ops() {
         )
         .await
         .unwrap();
-    assert!(matches!(
-        core.name(&record.id, "x").await,
-        Err(SessionError::Busy(_))
-    ));
+    core.name(&record.id, "x").await.unwrap();
+    assert_eq!(
+        core.session(&record.id).await.unwrap().title.as_deref(),
+        Some("x"),
+        "别的分支忙时也能改名"
+    );
     assert!(matches!(
         core.navigate(&record.id, NavigateRequest::to(ids[0])).await,
         Err(SessionError::Busy(_))

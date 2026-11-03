@@ -25,7 +25,7 @@ pi 的"一个文件里多分支"在 pi-durable 里没有原生对应，对应物
 
 - **导航不追加 entry**：只改 `sessions` 行（`record.leaf`）。选中 user / custom message 时 leaf = 它的上一条、`editor_text` = 原文；提交编辑后的输入时才 fork。重启后位置还在（偏离 pi 的"纯导航不保存位置"，D5 决定 11）。
 - **提交**：输入路由到 `current_branch`。leaf 不在末端 → 同一次提交里 fork（leaf 恰是某 conversation 自己的最后一条时直接接在它后面，不 fork；leaf 在第一条之前就建新根 conversation）+ 复制 `komo.agent` + 清 `leaf` + 受理输入（`admit_in_tx`）；fork 只复制 `komo.agent`，不复制 live / inbox / task。
-- **忙时守卫**：任一分支忙（`komo.live.run` 在、收件箱非空、压缩进行中）时导航、编辑、命名、compact、fork 都 409（`SessionError::Busy`；首版保留，决定 6）。Run 固定自己所在的 conversation，导航换的是"下一条输入去哪个分支"。
+- **忙时守卫**：任一分支忙（`komo.live.run` 在、收件箱非空、压缩进行中）时导航、编辑、compact、fork 都 409（`SessionError::Busy`；首版保留，决定 6）。命名例外（2026-11-03）：忙时不追加 `session.info`、不动树，只在一次提交里改 `sessions.title`（同自动起标题）。标题是给人看的，不该等 Run 停下；空闲时照旧落 `session.info`。Run 固定自己所在的 conversation，导航换的是"下一条输入去哪个分支"。
 - **分支摘要**：沿旧路径找共同祖先，摘要（辅助模型 `LlmClient`，pi 的 `serializeConversation` 形状）作为 `branch.summary` entry 接到目标位置，在目标处 fork。
 - **`/compact`**：`Harness::compact(current_branch, instructions)` + 等压缩任务；leaf 不在末端先 fork。摘要是 write submission，`compact` 从任务结果的 `submissionId` 反查摘要 entry。
 - **与旧行为的差异**（相对 2026-10-23 之前）：历史 Run 的工具往返随当前分支回放，直到压缩或 `context_edit` 收掉；压缩覆盖整条分支，不再单独保留开头那句任务；每个 Run 固定自己的 conversation；fork 里没有 `seq` 冻结前缀。

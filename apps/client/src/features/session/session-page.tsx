@@ -17,6 +17,7 @@ import { PanelContent } from "@/features/panel/panel-content";
 import { useSessionActions } from "@/features/sessions/actions";
 import { isArchived, isLive } from "@/features/sessions/model";
 import { sessionTitle } from "@/features/sessions/title";
+import { SessionTitle } from "./session-title";
 import { useTraceUi } from "@/features/trace/state";
 import { TraceView } from "@/features/trace/trace-view";
 import { errorText } from "@/lib/errors";
@@ -162,7 +163,7 @@ function SessionBody({ sessionId, tab, setTab }: { sessionId: string; tab: Tab; 
       <Tabs value={tab} onValueChange={(value) => setTab(value as Tab)} className="flex h-full min-h-0 flex-col overflow-hidden">
         <header className="flex h-12 shrink-0 items-center gap-2 pr-3 pl-5 max-[900px]:pl-2">
           <NavToggle />
-          <h1 className="min-w-0 truncate text-[15px] leading-5 font-medium text-text">{summary ? title : m.app_name()}</h1>
+          <SessionTitle session={summary} fallback={m.app_name()} />
           <TabsList aria-label={m.topbar_tabs()} className="ml-2 shrink-0 gap-0.5 max-[600px]:ml-0 max-[600px]:gap-0">
             <Trigger value="chat">{m.tab_chat()}</Trigger>
             <Trigger value="trace">{m.tab_trace()}</Trigger>

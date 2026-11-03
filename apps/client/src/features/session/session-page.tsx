@@ -161,7 +161,7 @@ function SessionBody({ sessionId, tab, setTab }: { sessionId: string; tab: Tab; 
   return (
     <ConversationProvider value={conversation}>
       <Tabs value={tab} onValueChange={(value) => setTab(value as Tab)} className="flex h-full min-h-0 flex-col overflow-hidden">
-        <header className="flex h-12 shrink-0 items-center gap-2 pr-3 pl-5 max-[900px]:pl-2">
+        <header className="flex h-12 shrink-0 items-center gap-2 border-b border-border pr-3 pl-5 max-[900px]:pl-2">
           <NavToggle />
           <SessionTitle session={summary} fallback={m.app_name()} />
           <TabsList aria-label={m.topbar_tabs()} className="ml-2 shrink-0 gap-0.5 max-[600px]:ml-0 max-[600px]:gap-0">
@@ -199,14 +199,16 @@ function SessionBody({ sessionId, tab, setTab }: { sessionId: string; tab: Tab; 
           </div>
         </header>
         <div className={cn("grid min-h-0 flex-1", panel.docked && panel.open ? "grid-cols-[minmax(0,1fr)_336px]" : "grid-cols-[minmax(0,1fr)]")}>
-          <div className="flex min-h-0 min-w-0 flex-col">
+          <div className="relative flex min-h-0 min-w-0 flex-col">
+            {/* 顶栏下一段白到透明的渐隐：正文滚上去是慢慢淡掉，不在分界线上被切成半行字。 */}
+            <div aria-hidden className="pointer-events-none absolute inset-x-0 top-0 z-10 h-6 bg-linear-to-b from-surface to-transparent max-[600px]:h-4" />
             <div
               ref={scroller}
               onScroll={(event) => {
                 const el = event.currentTarget;
                 atBottom.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
               }}
-              className="min-h-0 flex-1 overflow-auto px-8 pt-2 pb-6 max-[600px]:px-4 max-[600px]:pt-1 max-[600px]:pb-4"
+              className="min-h-0 flex-1 overflow-auto px-8 pt-6 pb-6 max-[600px]:px-4 max-[600px]:pt-4 max-[600px]:pb-4"
             >
               <TabsContent value="chat" className="mx-auto max-w-180 outline-none">
                 {body(

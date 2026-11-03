@@ -1127,6 +1127,8 @@
   "panel_memory_empty": "最近这一轮没有带上记忆。",
   "panel_memory_gone": "库里已经没有这条",
   "panel_memory_reference": "线索",
+  "panel_show_less": "收起",
+  "panel_show_more": "显示更多",
   "panel_title": "这一段",
   "recall_brought": "带上 {parts}",
   "recall_conventions": [

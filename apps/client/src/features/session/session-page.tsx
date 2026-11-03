@@ -3,6 +3,7 @@ import type { RunChanges } from "@komo/protocol";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { IconButton } from "@/components/ui/icon-button";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { Tooltip } from "@/components/ui/tooltip";
 import { ChangesPage } from "@/features/changes/changes-page";
 import { Composer } from "@/features/composer/composer";
 import { useSend } from "@/features/composer/use-send";
@@ -25,8 +26,12 @@ import { m } from "@/paraglide/messages.js";
 
 type Tab = "chat" | "trace" | "changes";
 
+// 切到改动页的快捷键：⇧⌘D（Windows / Linux 上 Ctrl+Shift+D）
+const isMac = typeof navigator !== "undefined" && /Mac|iPhone|iPad/.test(navigator.platform);
+const CHANGES_SHORTCUT = isMac ? "⇧⌘D" : "Ctrl+Shift+D";
+
 /**
- * 一个会话的页面（docs/web.md §2–§4）：顶栏（标题、对话 / 轨迹 / 改动、分叉、右栏开关），中间是当前标签页，
+ * 一个会话的页面（docs/web.md §2–§4）：顶栏（标题、对话 / 轨迹、右上角改动 / 分叉 / 右栏开关），中间是当前标签页，
  * 下面是发送框，右边是右栏。标签页的选择跨会话保留（只在这一层记）；其余状态换会话就清掉（`key`）。
  */
 export function SessionPage({ sessionId }: { sessionId: string }) {
@@ -123,6 +128,19 @@ function SessionBody({ sessionId, tab, setTab }: { sessionId: string; tab: Tab; 
     }
   }, [tab]);
 
+  // ⇧⌘D：在改动页和对话之间来回（与右上角改动按钮同一个动作）
+  const toggleChanges = useCallback(() => setTab(tab === "changes" ? "chat" : "changes"), [setTab, tab]);
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      if ((event.metaKey || event.ctrlKey) && event.shiftKey && !event.altKey && !event.repeat && event.key.toLowerCase() === "d") {
+        event.preventDefault();
+        toggleChanges();
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [toggleChanges]);
+
   const ready = status === "ready" && !archived;
   const busy = (view?.runs.size ?? 0) > 0;
   const body = (content: React.ReactNode) =>
@@ -148,12 +166,27 @@ function SessionBody({ sessionId, tab, setTab }: { sessionId: string; tab: Tab; 
           <TabsList aria-label={m.topbar_tabs()} className="ml-2 shrink-0 gap-0.5 max-[600px]:ml-0 max-[600px]:gap-0">
             <Trigger value="chat">{m.tab_chat()}</Trigger>
             <Trigger value="trace">{m.tab_trace()}</Trigger>
-            <Trigger value="changes">
-              {m.tab_changes()}
-              {changedFiles > 0 && <span className="ml-[5px] text-small text-faint tabular-nums max-[600px]:ml-[3px]">{changedFiles}</span>}
-            </Trigger>
           </TabsList>
           <div className="ml-auto flex gap-1">
+            <Tooltip
+              label={
+                <>
+                  {m.tab_changes()}
+                  {changedFiles > 0 && <span className="ml-1.5 text-white/60 tabular-nums">{changedFiles}</span>}
+                </>
+              }
+              shortcut={CHANGES_SHORTCUT}
+            >
+              <IconButton
+                name="diff"
+                label={changedFiles > 0 ? `${m.tab_changes()} ${changedFiles}` : m.tab_changes()}
+                title={undefined}
+                aria-pressed={tab === "changes"}
+                aria-keyshortcuts={isMac ? "Shift+Meta+D" : "Control+Shift+D"}
+                onClick={toggleChanges}
+                className={cn("max-[600px]:size-11", tab === "changes" && "bg-active text-text")}
+              />
+            </Tooltip>
             <IconButton name="branch" label={m.topbar_fork()} onClick={() => void actions.fork(sessionId)} className="max-[600px]:size-11" />
             <IconButton
               name="details"

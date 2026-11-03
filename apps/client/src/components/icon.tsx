@@ -51,6 +51,9 @@ const PATHS = {
   "details": (
     <><rect x="4" y="4" width="16" height="16" rx="3"/><path d="M8 9.5h.01M8 14.5h.01M11 9.5h5M11 14.5h5" strokeLinecap="round"/></>
   ),
+  "diff": (
+    <><rect x="4" y="4" width="16" height="16" rx="3"/><path d="M12 7.5v5M9.5 10h5M9.5 16h5" strokeLinecap="round"/></>
+  ),
   "sidebar": (
     <><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M9 4v16"/></>
   ),

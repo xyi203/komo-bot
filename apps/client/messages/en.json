@@ -1135,6 +1135,8 @@
   "panel_memory_empty": "No memories were brought into the latest turn.",
   "panel_memory_gone": "No longer in the library",
   "panel_memory_reference": "Reference",
+  "panel_show_less": "Show less",
+  "panel_show_more": "Show more",
   "panel_title": "This session",
   "recall_brought": "Brought {parts}",
   "recall_conventions": [

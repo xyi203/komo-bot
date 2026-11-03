@@ -29,14 +29,14 @@ export function usePanel() {
   return { docked, open, toggle, setDrawer };
 }
 
-/** 宽屏时是对话右边的一栏（336），窄屏时是带遮罩的抽屉。 */
+/** 宽屏时是对话右边的一栏（336，左边一条细线隔开），窄屏时是带遮罩的抽屉。 */
 export function PanelShell({ panel, children }: { panel: ReturnType<typeof usePanel>; children: ReactNode }) {
   if (panel.docked) {
-    return panel.open ? <aside aria-label={m.panel_title()} className="min-h-0 overflow-auto px-4 pt-2 pb-6">{children}</aside> : null;
+    return panel.open ? <aside aria-label={m.panel_title()} className="min-h-0 overflow-auto border-l border-border px-3 pt-1 pb-6">{children}</aside> : null;
   }
   return (
     <Sheet open={panel.open} onOpenChange={panel.setDrawer}>
-      <SheetContent side="right" className="overflow-auto border-l border-border bg-ground px-4 pt-4 pb-6">
+      <SheetContent side="right" className="overflow-auto border-l border-border bg-ground px-3 pt-4 pb-6">
         <div className="mb-2 flex h-10 items-center justify-between">
           <SheetTitle className="text-section-title font-semibold">{m.panel_title()}</SheetTitle>
           <IconButton name="x" label={m.close()} onClick={() => panel.setDrawer(false)} />

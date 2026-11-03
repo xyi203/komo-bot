@@ -5,6 +5,7 @@ import { useState, type FormEvent, type ReactNode } from "react";
 import { Icon } from "@/components/icon";
 import { Button } from "@/components/ui/button";
 import { IconButton } from "@/components/ui/icon-button";
+import { Kv, SubHeading } from "@/features/matters/parts";
 import { sessionTitle } from "@/features/sessions/title";
 import { errorText } from "@/lib/errors";
 import { formatRelative } from "@/lib/format";
@@ -203,7 +204,7 @@ export function MemoryDetail({
       {fail && <p className="mt-3 text-label text-negative">{fail}</p>}
       {live ? (
         <>
-          <div className="mt-4 flex flex-wrap gap-2">
+          <div className="mt-5 flex flex-wrap gap-2 empty:hidden">
             {unconfirmed && (
               <Button variant="primary" disabled={!!busy} onClick={() => verb("confirm")}>
                 {m.memory_act_confirm({ revision: item.revision })}
@@ -260,14 +261,7 @@ export function MemoryDetail({
       ) : (
         <p className="mt-2.5 text-label leading-5 text-muted">{item.state === "archived" ? m.memory_hint_archived() : m.memory_hint_superseded()}</p>
       )}
-      <dl className="mt-4.5 grid grid-cols-[auto_minmax(0,1fr)] gap-x-3 rounded-control bg-raised px-3 py-2.5 text-label leading-5">
-        {kv.map(([k, v]) => (
-          <div key={k} className="contents">
-            <dt className="py-1 text-muted">{k}</dt>
-            <dd className="m-0 min-w-0 py-1 [overflow-wrap:anywhere]">{v}</dd>
-          </div>
-        ))}
-      </dl>
+      <Kv rows={kv} className="mt-5" />
       {chain.length > 0 && (
         <p className="mt-3 text-label leading-5 text-muted">
           {chain.map((node, i) => (
@@ -277,9 +271,7 @@ export function MemoryDetail({
           ))}
         </p>
       )}
-      <h3 className="mt-4.5 mb-1 text-label font-semibold">
-        {m.memory_evidence()} <span className="ml-1 font-normal text-muted tabular-nums">{evidence.length}</span>
-      </h3>
+      <SubHeading count={evidence.length}>{m.memory_evidence()}</SubHeading>
       {evidence.length ? (
         <ul>
           {evidence.map((e, i) => (

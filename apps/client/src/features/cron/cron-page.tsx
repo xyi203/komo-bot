@@ -5,7 +5,7 @@ import { Link, useNavigate } from "@tanstack/react-router";
 import { useMemo, useState } from "react";
 import { BlockError, DetailCard, Page, PageBody, SkeletonRows } from "@/components/page";
 import { Button } from "@/components/ui/button";
-import { DetailTop, FormError, Kv, linkClass, Notice, Pill, SubHeading, TextButton } from "@/features/matters/parts";
+import { columnLabelClass, DetailTop, FormError, Kv, linkClass, listClass, Notice, Pill, rowClass, rowOnClass, SubHeading, TextButton } from "@/features/matters/parts";
 import { sessionTitle } from "@/features/sessions/title";
 import { errorText } from "@/lib/errors";
 import { scheduleText } from "@/lib/cron-text";
@@ -90,21 +90,17 @@ export function CronPage({ selected }: { selected: string | null }) {
             <p className="my-3 rounded-control border border-dashed border-control px-3.5 py-2.5 text-label text-muted">{m.cron_empty()}</p>
           ) : (
             <>
-              <div aria-hidden="true" className={cn("grid h-8 items-center gap-x-3 border-b border-border text-small text-muted max-[600px]:hidden", COLUMNS)}>
+              <div aria-hidden="true" className={cn("grid min-h-8 items-end gap-x-3 pb-1 max-[600px]:hidden", COLUMNS)}>
                 <span />
-                <span>{m.cron_col_job()}</span>
-                <span className="text-right">{m.cron_col_next()}</span>
-                <span className="text-right">{m.cron_col_last()}</span>
+                <span className={columnLabelClass}>{m.cron_col_job()}</span>
+                <span className={cn(columnLabelClass, "text-right")}>{m.cron_col_next()}</span>
+                <span className={cn(columnLabelClass, "text-right")}>{m.cron_col_last()}</span>
               </div>
-              <ul className="relative z-0">
+              <ul className={listClass}>
                 {sorted.map((job) => (
                   <li
                     key={job.id}
-                    className={cn(
-                      "relative grid items-start gap-x-3 gap-y-1.5 border-b border-rule py-3 before:absolute before:inset-x-[-8px] before:inset-y-px before:-z-10 before:rounded-control before:transition-colors hover:before:bg-hover-on-white",
-                      COLUMNS,
-                      job.id === selected && "before:bg-active hover:before:bg-active",
-                    )}
+                    className={cn("grid items-start gap-x-3 gap-y-1.5", rowClass, COLUMNS, job.id === selected && rowOnClass)}
                   >
                     <span
                       aria-hidden="true"
@@ -130,7 +126,12 @@ export function CronPage({ selected }: { selected: string | null }) {
                         )}
                       </span>
                     </button>
-                    <span className="text-right text-label leading-5.5 text-muted tabular-nums max-[600px]:col-start-2 max-[600px]:row-start-2 max-[600px]:text-left max-[600px]:text-small max-[600px]:leading-4.5">
+                    <span
+                      className={cn(
+                        "text-right text-label leading-5.5 text-muted tabular-nums max-[600px]:col-start-2 max-[600px]:row-start-2 max-[600px]:text-left max-[600px]:text-small max-[600px]:leading-4.5",
+                        !(job.status === "active" && nextOf(job)) && "max-[600px]:hidden",
+                      )}
+                    >
                       {job.status === "active" && nextOf(job) ? formatWhen(nextOf(job)) : "—"}
                     </span>
                     <span className="justify-self-end max-[600px]:col-start-3 max-[600px]:row-start-1">
@@ -219,7 +220,7 @@ function CronDetail({
         </Notice>
       )}
       {job.status !== "done" && (
-        <div className="mt-4 flex flex-wrap gap-2">
+        <div className="mt-5 flex flex-wrap gap-2">
           <Button variant="primary" disabled={disabled} onClick={() => void act("run")}>
             {busy === "run" ? m.cron_run_busy() : m.cron_run_now()}
           </Button>

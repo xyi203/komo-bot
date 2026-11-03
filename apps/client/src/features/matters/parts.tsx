@@ -4,7 +4,28 @@ import { IconButton } from "@/components/ui/icon-button";
 import { cn } from "@/lib/utils";
 import { m } from "@/paraglide/messages.js";
 
-// 事项页与定时页共用的小部件（原型的 `.pill`、`.kv`、`.notice`、`.text-btn`、`.sub-h`、`.detail-top`、表单控件）。
+// 事项、记忆、定时三页共用的小部件（原型的 `.pill`、`.kv`、`.notice`、`.text-btn`、`.sub-h`、`.detail-top`、表单控件）。
+// 版式照 Claude 桌面的设置页：一节一个标题，下面一行一项，行与行之间只有一条细线，不再叠表头线、节线与灰底井。
+
+/** 列表：行间一条细线，首行上、末行下都不画。 */
+export const listClass = "relative z-0 divide-y divide-rule";
+/** 列表的一行：悬停与选中的底色画在伪元素上，向两侧各探出 8px，不挤正文。 */
+export const rowClass =
+  "relative py-3.5 before:absolute before:inset-x-[-8px] before:inset-y-0.5 before:-z-10 before:rounded-control before:transition-colors hover:before:bg-hover-on-white";
+export const rowOnClass = "before:bg-active hover:before:bg-active";
+
+/** 一节的标题（节标题字号，计数灰字）。 */
+export function SectionTitle({ children, count, className }: { children: ReactNode; count?: ReactNode; className?: string }) {
+  return (
+    <h2 className={cn("m-0 text-section-title font-semibold", className)}>
+      {children}
+      {count !== undefined && <span className="ml-1.5 text-body font-normal text-muted tabular-nums">{count}</span>}
+    </h2>
+  );
+}
+
+/** 列名：灰色小字，跟在节标题那一行里，底对齐（英文在窄列里会折成两行，随内容长高，不定高）。 */
+export const columnLabelClass = "text-small leading-4 text-muted max-[600px]:hidden";
 
 /** 小药丸：`wait` 琥珀、`bad` 红、`off` 灰字，默认纸色。 */
 export function Pill({ tone, children, className }: { tone?: "wait" | "bad" | "off"; children: ReactNode; className?: string }) {
@@ -48,21 +69,15 @@ export function DetailTop({
   );
 }
 
-/** 灰底键值井。 */
-export function Kv({ rows, plain, className }: { rows: (readonly [string, ReactNode] | null | false)[]; plain?: boolean; className?: string }) {
+/** 键值：一行一项，左边灰色标签、右边值，行间细线。 */
+export function Kv({ rows, className }: { rows: (readonly [string, ReactNode] | null | false)[]; className?: string }) {
   return (
-    <dl
-      className={cn(
-        "grid grid-cols-[auto_minmax(0,1fr)] gap-x-3 text-label leading-5",
-        plain ? "mt-3" : "mt-4.5 rounded-control bg-raised px-3 py-2.5",
-        className,
-      )}
-    >
+    <dl className={cn("mt-4 divide-y divide-rule border-t border-rule text-label leading-5", className)}>
       {rows.map((row) =>
         row ? (
-          <div key={row[0]} className="col-span-2 grid grid-cols-subgrid">
-            <dt className="py-1 text-muted">{row[0]}</dt>
-            <dd className="m-0 min-w-0 py-1 [overflow-wrap:anywhere]">{row[1]}</dd>
+          <div key={row[0]} className="flex items-baseline justify-between gap-4 py-2.5">
+            <dt className="shrink-0 text-muted">{row[0]}</dt>
+            <dd className="m-0 min-w-0 text-right [overflow-wrap:anywhere]">{row[1]}</dd>
           </div>
         ) : null,
       )}
@@ -72,7 +87,7 @@ export function Kv({ rows, plain, className }: { rows: (readonly [string, ReactN
 
 export function SubHeading({ children, count }: { children: ReactNode; count?: number }) {
   return (
-    <h3 className="mt-4.5 mb-1 text-label font-semibold">
+    <h3 className="mt-6 mb-1 text-label font-semibold">
       {children}
       {count !== undefined && <span className="ml-1 font-normal text-muted tabular-nums">{count}</span>}
     </h3>

@@ -13,7 +13,7 @@ import { m } from "@/paraglide/messages.js";
 import { dayDiff, dueOf, formatInstantDay, isClosed, statusLabel } from "./dates";
 import { MatterDetailView } from "./matter-detail";
 import { NewMatterForm } from "./matter-new";
-import { Pill, TextButton } from "./parts";
+import { columnLabelClass, listClass, Pill, rowClass, rowOnClass, SectionTitle, TextButton } from "./parts";
 
 /** 一页里的事项分组：目标、领域、搁置、已结案（`docs/web.md` §12）。 */
 function groupMatters(items: Matter[], today: string | undefined) {
@@ -165,14 +165,7 @@ export function MattersPage({ selected }: { selected: string | null }) {
             <SkeletonRows />
           ) : (
             <>
-              <div aria-hidden="true" className={cn("grid h-8 items-center gap-x-3 border-b border-border text-small text-muted max-[600px]:hidden", COLUMNS)}>
-                <span />
-                <span>{m.matter_col_matter()}</span>
-                <span className="text-right">{m.matter_col_due()}</span>
-                <span className="text-right">{m.matter_col_memory()}</span>
-                <span />
-              </div>
-              <Group title={m.matter_group_goals()} items={groups.goals} empty={m.matter_empty_goals()} {...{ today, selected, ownedBy, select }} />
+              <Group title={m.matter_group_goals()} items={groups.goals} empty={m.matter_empty_goals()} labels {...{ today, selected, ownedBy, select }} />
               <Group title={m.matter_group_areas()} items={groups.areas} empty={m.matter_empty_areas()} {...{ today, selected, ownedBy, select }} />
               {groups.parked.length > 0 && <Group title={m.matter_group_parked()} items={groups.parked} {...{ today, selected, ownedBy, select }} />}
               {groups.closed.length > 0 && (
@@ -198,6 +191,7 @@ function Group({
   title,
   items,
   empty,
+  labels,
   cap = 0,
   showAll,
   onToggle,
@@ -209,6 +203,8 @@ function Group({
   title: string;
   items: Matter[];
   empty?: string;
+  /** 在节标题那一行右边给出列名（只给第一节）。 */
+  labels?: boolean;
   cap?: number;
   showAll?: boolean;
   onToggle?: () => void;
@@ -219,26 +215,37 @@ function Group({
 }) {
   const shown = cap && !showAll ? items.slice(0, cap) : items;
   return (
-    <div className="[&+&]:mt-5">
-      <h2 className="mt-4 border-b border-border pb-2 text-label font-semibold">
-        {title}
-        <span className="ml-1 font-normal text-muted tabular-nums">{items.length}</span>
-      </h2>
+    <div className="[&+&]:mt-9">
+      <div className={cn("grid items-end gap-x-3 pb-1", COLUMNS)}>
+        <SectionTitle count={items.length} className="col-span-2">
+          {title}
+        </SectionTitle>
+        {labels && (
+          <>
+            <span aria-hidden="true" className={cn(columnLabelClass, "text-right")}>
+              {m.matter_col_due()}
+            </span>
+            <span aria-hidden="true" className={cn(columnLabelClass, "text-right")}>
+              {m.matter_col_memory()}
+            </span>
+          </>
+        )}
+      </div>
       {items.length ? (
         <>
-          <ul className="relative z-0">
+          <ul className={listClass}>
             {shown.map((matter) => (
               <Row key={matter.id} matter={matter} today={today} on={matter.id === selected} owned={ownedBy.get(matter.id) ?? []} onSelect={select} />
             ))}
           </ul>
           {cap > 0 && items.length > cap && onToggle && (
-            <TextButton tone="quiet" onClick={onToggle} className="mt-2">
+            <TextButton tone="quiet" onClick={onToggle} className="mt-3">
               {showAll ? m.matter_show_less() : m.matter_show_all({ count: items.length })}
             </TextButton>
           )}
         </>
       ) : (
-        <EmptyFrame className="mt-2.5">{empty}</EmptyFrame>
+        <EmptyFrame className="mt-2">{empty}</EmptyFrame>
       )}
     </div>
   );
@@ -275,11 +282,7 @@ function Row({
   const pill = closed || matter.state === "parked" ? <Pill tone="off">{statusLabel(matter.state)}</Pill> : matter.state === "waiting" ? <Pill tone="wait">{statusLabel(matter.state)}</Pill> : null;
   return (
     <li
-      className={cn(
-        "relative grid items-start gap-x-3 gap-y-1.5 border-b border-rule py-3 before:absolute before:inset-x-[-8px] before:inset-y-px before:-z-10 before:rounded-control before:transition-colors hover:before:bg-hover-on-white",
-        COLUMNS,
-        on && "before:bg-active hover:before:bg-active",
-      )}
+      className={cn("grid items-start gap-x-3 gap-y-1.5", rowClass, COLUMNS, on && rowOnClass)}
     >
       <Mark matter={matter} />
       <button
@@ -291,13 +294,25 @@ function Row({
         <span className="leading-5.5">{matter.title}</span>
         {sub && <span className="text-small text-muted">{sub}</span>}
       </button>
-      <span className="flex flex-col items-end leading-5.5 tabular-nums max-[600px]:col-start-2 max-[600px]:row-start-2 max-[600px]:flex-row max-[600px]:items-baseline max-[600px]:gap-2 max-[600px]:justify-self-start max-[600px]:text-small max-[600px]:leading-4.5 max-[600px]:text-muted">
-        {due ? due.text : <span className="text-muted">—</span>}
+      <span
+        className={cn(
+          "flex flex-col items-end leading-5.5 tabular-nums max-[600px]:col-start-2 max-[600px]:row-start-2 max-[600px]:flex-row max-[600px]:items-baseline max-[600px]:gap-2 max-[600px]:justify-self-start max-[600px]:text-small max-[600px]:leading-4.5 max-[600px]:text-muted",
+          !due && !closedOn && "max-[600px]:hidden",
+        )}
+      >
+        {due ? due.text : <span className="text-muted max-[600px]:hidden">—</span>}
         {(due?.sub || closedOn) && (
           <small className={cn("mt-1 text-small leading-4.5 max-[600px]:mt-0", due?.bad ? "text-negative" : "text-muted")}>{due?.sub || closedOn}</small>
         )}
       </span>
-      <span className="flex items-center justify-end gap-1.5 text-label leading-5.5 max-[600px]:col-start-2 max-[600px]:row-start-2 max-[600px]:justify-self-end">
+      <span
+        className={cn(
+          "flex items-center justify-end gap-1.5 text-label leading-5.5 max-[600px]:col-start-2 max-[600px]:row-start-2 max-[600px]:justify-self-end",
+          !owned.length && "max-[600px]:hidden",
+          // 手机上没有截止时，记忆点靠左接在说明下面，不单独挂在右边
+          !due && !closedOn && "max-[600px]:justify-self-start",
+        )}
+      >
         {owned.length ? (
           <>
             <span className="flex flex-wrap gap-[3px]" aria-hidden="true">

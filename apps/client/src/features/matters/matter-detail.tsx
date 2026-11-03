@@ -145,7 +145,6 @@ export function MatterDetailView({
       />
       <p className="mt-3 text-read leading-6">{matter.title}</p>
       <Kv
-        plain
         rows={
           matter.kind === "goal"
             ? [
@@ -173,7 +172,7 @@ export function MatterDetailView({
       />
       {fail && <FormError>{fail}</FormError>}
       {receipt && <ReceiptView receipt={receipt} />}
-      <div className="mt-4 flex flex-wrap gap-2">
+      <div className="mt-5 flex flex-wrap gap-2">
         {actions
           .filter((a) => !a.text)
           .map((a) => (

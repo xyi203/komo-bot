@@ -5,6 +5,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { Icon } from "@/components/icon";
 import { BlockError, DetailCard, EmptyFrame, Page, PageBody, SkeletonRows } from "@/components/page";
 import { Button } from "@/components/ui/button";
+import { columnLabelClass, listClass, rowClass, rowOnClass, SectionTitle } from "@/features/matters/parts";
 import { errorText } from "@/lib/errors";
 import { formatNumber, formatRelative } from "@/lib/format";
 import { useMediaQuery } from "@/lib/hooks";
@@ -37,7 +38,7 @@ const scroller = () => document.querySelector("main");
 
 /** 一行的网格：光点 | 正文两行 | 带上 / 用上 | 最近带上 | 动作；≤600 变两行行，次数与时间挪到第二行。 */
 const ROW_GRID =
-  "grid grid-cols-[16px_minmax(0,1fr)_76px_76px_76px] gap-x-3 max-[600px]:grid-cols-[16px_minmax(0,1fr)_auto] max-[600px]:gap-y-1.5";
+  "grid grid-cols-[16px_minmax(0,1fr)_76px_76px_92px] gap-x-3 max-[600px]:grid-cols-[16px_minmax(0,1fr)_auto] max-[600px]:gap-y-1.5";
 
 /**
  * 记忆页（docs/web.md §11）：komo 现在把哪些关于我的事带进对话，哪些等我过目。
@@ -196,11 +197,10 @@ export function MemoryPage({ selected }: { selected: string | null }) {
       />
       <PageBody columns={compact || !showDetail ? "grid-cols-[minmax(0,1fr)]" : "grid-cols-[minmax(0,1fr)_360px]"}>
         <section ref={listRef} aria-label={title} className="min-w-0">
-          <div className="mb-1 flex min-h-9 items-center gap-3 max-[600px]:flex-wrap">
-            <h2 className="m-0 flex-1 text-section-title font-semibold">
+          <div className="flex min-h-9 items-center gap-3 max-[600px]:flex-wrap">
+            <SectionTitle count={rows ? m.memory_list_count({ count: formatNumber(rows.length) }) : undefined} className="min-w-0 flex-1">
               {title}
-              {rows && <span className="ml-1 text-body font-normal text-muted tabular-nums"> {m.memory_list_count({ count: formatNumber(rows.length) })}</span>}
-            </h2>
+            </SectionTitle>
             <div className="flex min-w-0 gap-2 max-[600px]:w-full">
               <label className="flex h-8 w-50 items-center gap-2 rounded-control bg-surface px-2.5 text-faint shadow-ring-control focus-within:shadow-[0_0_0_2px_var(--color-focus)] max-[600px]:w-auto max-[600px]:min-w-0 max-[600px]:flex-1">
                 <Icon name="search" className="size-4" />
@@ -243,24 +243,24 @@ export function MemoryPage({ selected }: { selected: string | null }) {
             <SkeletonRows />
           ) : rows.length ? (
             <>
-              {/* 列只有 76px，英文表头会折成两行：表头随内容长高、底对齐，不能定高（定高时第二行压在第一条记忆上） */}
-              <div aria-hidden="true" className={cn(ROW_GRID, "min-h-8 items-end border-b border-border pt-1 pb-1.5 text-small leading-4 text-muted max-[600px]:hidden")}>
+              {/* 列只有 76px，英文列名会折成两行：随内容长高、底对齐，不能定高（定高时第二行压在第一条记忆上） */}
+              <div aria-hidden="true" className={cn(ROW_GRID, "mt-1 min-h-8 items-end pb-1 max-[600px]:hidden")}>
                 <span />
-                <span>{m.memory_col_content()}</span>
-                <span className="justify-self-end text-right">{m.memory_col_used()}</span>
-                <span className="justify-self-end text-right">{m.memory_col_last()}</span>
+                <span className={columnLabelClass}>{m.memory_col_content()}</span>
+                <span className={cn(columnLabelClass, "justify-self-end text-right")}>{m.memory_col_used()}</span>
+                <span className={cn(columnLabelClass, "justify-self-end text-right")}>{m.memory_col_last()}</span>
                 <span />
               </div>
-              <ul className="relative z-0">
+              <ul className={listClass}>
                 {rows.map((item) => (
                   <Row key={item.id} item={item} on={item.id === selected} onSelect={select} onConfirm={confirmFromRow} onRestore={restoreFromRow} />
                 ))}
               </ul>
             </>
           ) : (
-            <EmptyFrame>{searching ? m.memory_none_search() : noneText(view.bucket)}</EmptyFrame>
+            <EmptyFrame className="mt-2">{searching ? m.memory_none_search() : noneText(view.bucket)}</EmptyFrame>
           )}
-          <p className="mt-3 text-small text-muted">
+          <p className="mt-3 text-small text-muted empty:hidden">
             {degraded
               ? m.memory_index_degraded({ reason: degraded })
               : coverage && coverage.state !== "unconfigured"
@@ -293,10 +293,10 @@ function Ladder({
   onPick: (id: string) => void;
 }) {
   return (
-    <section aria-label={m.memory_chart_title()} className="mb-6 rounded-card bg-surface px-5 pt-4 pb-3 shadow-lift max-[600px]:px-3.5 max-[600px]:pt-3.5 max-[600px]:pb-2.5">
+    <section aria-label={m.memory_chart_title()} className="mb-9">
       <div className="mb-3 flex items-start gap-4 max-[600px]:flex-col max-[600px]:gap-2">
         <div className="min-w-0 flex-1">
-          <h2 className="m-0 text-section-title font-semibold">{m.memory_chart_title()}</h2>
+          <SectionTitle>{m.memory_chart_title()}</SectionTitle>
           <p className="mt-0.5 text-small text-muted">{m.memory_chart_note()}</p>
         </div>
         <div role="tablist" aria-label={m.memory_rungs_label()} className="flex flex-wrap justify-end gap-1 max-[600px]:justify-start">
@@ -354,11 +354,7 @@ function Row({
   };
   return (
     <li
-      className={cn(
-        ROW_GRID,
-        "relative items-start border-b border-rule py-3 before:absolute before:inset-x-[-8px] before:inset-y-px before:-z-10 before:rounded-control before:transition-colors hover:before:bg-hover-on-white",
-        on && "before:bg-active hover:before:bg-active",
-      )}
+      className={cn(ROW_GRID, "items-start", rowClass, on && rowOnClass)}
     >
       <MemoryMote kind={moteKind(item)} className="mt-1.75 justify-self-center" />
       <button
@@ -382,7 +378,12 @@ function Row({
         {formatNumber(item.usage.count)}
         <small className="mt-1 text-small leading-4.5 text-muted max-[600px]:mt-0">{m.memory_row_adopted({ count: formatNumber(item.usage.adopted_count) })}</small>
       </span>
-      <span className="justify-self-end text-label leading-5.5 text-muted tabular-nums max-[600px]:col-start-2 max-[600px]:row-start-2 max-[600px]:text-small max-[600px]:leading-4.5">
+      <span
+        className={cn(
+          "justify-self-end text-label leading-5.5 text-muted tabular-nums max-[600px]:col-start-2 max-[600px]:row-start-2 max-[600px]:text-small max-[600px]:leading-4.5",
+          !item.usage.last_used_at && "max-[600px]:hidden",
+        )}
+      >
         {item.usage.last_used_at ? formatRelative(item.usage.last_used_at) : "—"}
       </span>
       <span className="flex min-h-5.5 items-center justify-self-end text-label max-[600px]:col-start-3 max-[600px]:row-start-1">

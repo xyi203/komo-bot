@@ -161,7 +161,7 @@ MemoryManager 对 AgentRuntime 提供三个主要入口：recall、process_compl
 
 默认 hybrid；同时支持 keyword 和 vector 供明确选择与诊断。每路建议最多召回 40 项，合并后最多注入 8 项、约 1500 tokens；这些是可调整的初始预算，不强行填满。没有足够相关内容时返回空；相似度只用于相关性，不授予真实性或操作权限。"不强行填满"要靠下面的相关度门槛才成立：RRF 只给名次，两臂各自总能排出前 40，没有门槛时 8 个名额每次都被填满（附录 D.4、附录 F）。
 
-关键词索引不用 FTS5（Turso MVCC 下不可用，§8.2）：索引时把内容（有 `applies_when` 时连同它，§9.5）经 `lexical_terms` 切成 token 串写入 `memory_terms.terms`（首尾带空格），查询时每个 token 一个 `instr(terms, ' tok ') > 0`，命中数按 IDF 加权。`lexical_terms` 对 CJK 连续字符切 bigram、对 ASCII 切单词并小写化——"空调"本身就是一个 bigram，两字查询天然命中，不需要子串后备。IDF 在查询时用 `memory_terms` 行数和每个 token 的命中行数算；1 万条量级是一次全表 `instr`，§14 要求实测 P95，这里不预先宣称达标。
+关键词索引不用 FTS5（Turso MVCC 下不可用，§8.2）：索引时把内容（有 `applies_when` 时连同它，§9.5）经 `lexical_terms` 切成 token 串写入 `memory_terms.terms`（首尾带空格），查询时每个 token 一个 `instr(terms, ' tok ') > 0`，命中数按 IDF 加权。`lexical_terms` 对 CJK 连续字符切 bigram、对 ASCII 切单词并小写化——"空调"本身就是一个 bigram，两字查询天然命中，不需要子串后备。落单的虚字（的、了、是、和、在…，见 `terms.rs` 的 `LONE_STOPWORDS`）不成 token（2026-11-03）："devops-mcp-prod 的 issue_get_status" 里两边是空格的"的"单独成词，库小时 IDF 近满分，和"工单"一起凑到 1.152 过了门槛，把无关的工单参数经验召了回来；bigram 里的"的"和单个实字照旧。存量 `memory_terms` 里的单字"的"不用重建：查询侧不再产出它，就不会命中。IDF 在查询时用 `memory_terms` 行数和每个 token 的命中行数算；1 万条量级是一次全表 `instr`，§14 要求实测 P95，这里不预先宣称达标。
 
 **相关度门槛（2026-10-28，附录 F，已实现）。** 每条臂一道绝对门槛，**过任一道即留下**，两道都没过的在重排与预算截断之前丢掉。名次仍按两臂的**完整名单**做 RRF，门槛只删人、不改名次；留下的照旧按这个名次排序。
 

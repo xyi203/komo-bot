@@ -38,7 +38,7 @@
   （`docs/background-tasks.md` §2d）。
 - **清单（2026-10-31，roadmap-muse S4）。** `komo monitor list [--all]`（`GET /v1/monitors`，gateway
   `http/v2/monitors.rs`）只读列出登记：还在跑的按开始时刻在前，`--all` 带上已结束的与原因；每项带短号、
-  挂它的会话、开始与截止时刻、脚本开头 120 字。停监听仍是 `monitor_stop` 或删会话。
+  挂它的会话、开始与截止时刻、脚本开头 120 字；`detached` 标出转到后台的 `bash` 命令（2026-11-03，网页右栏"在后台"用它）。停监听仍是 `monitor_stop` 或删会话。
 - **任务会话里也能挂（2026-10-31，roadmap-muse S2）。** 事件进任务会话，那一轮的回答照常交回派它的会话；
   只由事件起的那一轮回答是 NO_REPLY 时不交回，也不自动续跑。删会话（任何会话）时先登记 `ended{stopped}`
   再停进程，所在 Session 已在删时不交回结束消息（`docs/background-tasks.md` §2e）。

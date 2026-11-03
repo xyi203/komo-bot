@@ -30,11 +30,12 @@ use super::{
     ManualCronRunResponse, MatterActionRequest, MatterAddRequest, MatterDetail, MatterListResponse,
     McpReconnectRequest, McpReconnectResponse, McpServersResponse, MemoryAddRequest,
     MemoryAddResponse, MemoryClassifyRequest, MemoryDetail, MemoryIndexStatus, MemoryListResponse,
-    MemoryRevisionRequest, ModelUpsertRequest, ModelsResponse, NameSessionRequest,
-    PairCodeResponse, PairRequest, ProviderModelsRequest, ProviderModelsResponse,
-    ProviderUpsertRequest, PurgeBlocked, PurgeSessionResponse, RebuildIndexResponse,
-    SessionChanges, SessionLifecycleResponse, SessionListResponse, SettingRequest, SseFrame,
-    SubmitRunRequest, SubmitRunResponse, UpdateCronRequest, UploadAttachmentResponse,
+    MemoryRevisionRequest, ModelUpsertRequest, ModelsResponse, MonitorListResponse,
+    NameSessionRequest, PairCodeResponse, PairRequest, ProviderModelsRequest,
+    ProviderModelsResponse, ProviderUpsertRequest, PurgeBlocked, PurgeSessionResponse,
+    RebuildIndexResponse, SessionChanges, SessionLifecycleResponse, SessionListResponse,
+    SettingRequest, SseFrame, SubmitRunRequest, SubmitRunResponse, UpdateCronRequest,
+    UploadAttachmentResponse,
 };
 
 /// `GET /v1/sessions/{id}/events` 与 SSE `event` 帧里一条事件的线上信封（[`crate::events::Event`] 的 JSON）。
@@ -100,6 +101,7 @@ pub fn export_all(dir: &Path) -> Result<(), String> {
     each(MemoryIndexStatus::export_all(&cfg))?;
     each(RebuildIndexResponse::export_all(&cfg))?;
     each(MatterListResponse::export_all(&cfg))?;
+    each(MonitorListResponse::export_all(&cfg))?;
     each(MatterDetail::export_all(&cfg))?;
     each(MatterAddRequest::export_all(&cfg))?;
     each(MatterActionRequest::export_all(&cfg))?;

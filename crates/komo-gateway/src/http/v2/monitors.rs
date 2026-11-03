@@ -58,6 +58,8 @@ async fn list(
             started_at: time_of(record.started_at),
             deadline: time_of(record.deadline),
             command,
+            // 转后台的命令登记成 `timeout_minutes = 0`（`monitor_runner::detached::is_detached`）
+            detached: record.timeout_minutes == 0,
         });
     }
     Ok(Json(MonitorListResponse { monitors }))

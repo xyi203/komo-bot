@@ -1057,9 +1057,12 @@
   "palette_type_session": "Sessions",
   "palette_types": "Type",
   "panel_bg": "In the background",
+  "panel_bg_command": "Background command",
   "panel_bg_done": "Finished · {when}",
   "panel_bg_elapsed": "Running for {time}",
-  "panel_bg_empty": "This conversation has not sent out any background tasks.",
+  "panel_bg_ended": "Ended ({reason})",
+  "panel_bg_empty": "Nothing from this conversation has run in the background.",
+  "panel_bg_monitor": "Monitor",
   "panel_bg_running": [
     {
       "declarations": [

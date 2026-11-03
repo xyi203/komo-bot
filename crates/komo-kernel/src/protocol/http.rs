@@ -300,6 +300,8 @@ pub struct MonitorListQuery {
 
 /// 一个监听（`monitor` 工具挂的，或转后台的 `bash`）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(optional_fields))]
 pub struct MonitorSummary {
     /// 短号（`monitor_stop` 用它）。
     pub handle: String,
@@ -313,14 +315,20 @@ pub struct MonitorSummary {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
     #[serde(with = "time::serde::rfc3339")]
+    #[cfg_attr(feature = "ts", ts(type = "string"))]
     pub started_at: OffsetDateTime,
     #[serde(with = "time::serde::rfc3339")]
+    #[cfg_attr(feature = "ts", ts(type = "string"))]
     pub deadline: OffsetDateTime,
     /// 脚本的开头一段。
     pub command: String,
+    /// 是转到后台的 `bash` 命令（不是 `monitor` 工具挂的监听）；旧 Gateway 不给，读成 `false`。
+    #[serde(default)]
+    pub detached: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct MonitorListResponse {
     pub monitors: Vec<MonitorSummary>,
 }

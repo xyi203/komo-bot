@@ -39,6 +39,7 @@ fn a_monitor_list_shows_age_deadline_title_and_session() {
         started_at: NOW - time::Duration::minutes(90),
         deadline: NOW + time::Duration::minutes(30),
         command: "gh run watch 1".into(),
+        detached: false,
     };
     let ended = MonitorSummary {
         handle: "8".into(),

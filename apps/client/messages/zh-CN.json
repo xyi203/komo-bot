@@ -1049,9 +1049,12 @@
   "palette_type_session": "会话",
   "palette_types": "类型",
   "panel_bg": "在后台",
+  "panel_bg_command": "转到后台的命令",
   "panel_bg_done": "已结束 · {when}",
   "panel_bg_elapsed": "已跑 {time}",
-  "panel_bg_empty": "这段对话没有派出后台任务。",
+  "panel_bg_ended": "已结束（{reason}）",
+  "panel_bg_empty": "这段对话没有在后台跑过任务、监听或命令。",
+  "panel_bg_monitor": "监听",
   "panel_bg_running": [
     {
       "declarations": [

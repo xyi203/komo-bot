@@ -1,5 +1,5 @@
-import { useHealth, useMatters, type MemoryBrief } from "@komo/api";
-import type { Matter, SessionSummary } from "@komo/protocol";
+import { useHealth, useMatters, useMonitors, type MemoryBrief } from "@komo/api";
+import type { Matter, MonitorSummary, SessionSummary } from "@komo/protocol";
 import { Link } from "@tanstack/react-router";
 import { useState, type ReactNode } from "react";
 import { Icon, type IconName } from "@/components/icon";
@@ -48,12 +48,16 @@ export function PanelContent({
   const uses = view?.recall ?? [];
   const activeCount = [...memories.values()].filter((x) => x.state === "active").length;
 
-  // 只列这段对话派出去的任务会话：在跑的在前，结束的给出用了多久
-  const kids = sessions
-    .filter((s) => s.kind === "task" && s.home === sessionId)
-    .sort((a, b) => Number(isLive(b)) - Number(isLive(a)) || new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
-  const runningKids = kids.filter(isLive);
-  const now = useNow(runningKids.length > 0);
+  // 这段对话在后台跑的：派出去的任务会话、挂的监听、转到后台的 bash 命令；在跑的在前，其余按开始时刻新的在前
+  const monitors = useMonitors(true);
+  const background: Background[] = [
+    ...sessions.filter((s) => s.kind === "task" && s.home === sessionId).map((kid): Background => ({ kind: "task", kid, live: isLive(kid), at: kid.created_at })),
+    ...(monitors.data ?? [])
+      .filter((x) => x.session === sessionId)
+      .map((monitor): Background => ({ kind: "monitor", monitor, live: monitor.state !== "ended", at: monitor.started_at })),
+  ].sort((a, b) => Number(b.live) - Number(a.live) || new Date(b.at).getTime() - new Date(a.at).getTime());
+  const runningCount = background.filter((x) => x.live).length;
+  const now = useNow(runningCount > 0);
 
   const health = useHealth();
   const telemetry = health.data?.telemetry;
@@ -117,11 +121,12 @@ export function PanelContent({
 
       <ContextSection context={context} treeStatus={treeStatus} />
 
-      <Section id="bg" title={m.panel_bg()} value={runningKids.length ? m.panel_bg_running({ count: runningKids.length }) : String(kids.length)}>
-        {kids.length ? (
+      <Section id="bg" title={m.panel_bg()} value={runningCount ? m.panel_bg_running({ count: runningCount }) : String(background.length)}>
+        {background.length ? (
           <Rows>
-            {kids.map((kid) => {
-              const live = isLive(kid);
+            {background.map((item) => {
+              if (item.kind === "monitor") return <MonitorRow key={`monitor-${item.monitor.handle}`} monitor={item.monitor} now={now} />;
+              const { kid, live } = item;
               return (
                 <Link
                   key={kid.session}
@@ -266,7 +271,26 @@ function RowBody({ lead, label, meta }: { lead: ReactNode; label: ReactNode; met
   );
 }
 
-/** 不能点的一行（连接、已不在库里的记忆）。 */
+type Background =
+  | { kind: "task"; kid: SessionSummary; live: boolean; at: string }
+  | { kind: "monitor"; monitor: MonitorSummary; live: boolean; at: string };
+
+/** 监听 / 转后台的命令：没有详情页，不能点；悬停给种类、短号、状态与脚本开头（停它仍由模型 `monitor_stop`）。 */
+function MonitorRow({ monitor, now }: { monitor: MonitorSummary; now: number }) {
+  const live = monitor.state !== "ended";
+  const kind = monitor.detached ? m.panel_bg_command() : m.panel_bg_monitor();
+  const state = live ? m.panel_bg_elapsed({ time: formatElapsed(monitor.started_at, now) }) : m.panel_bg_ended({ reason: monitor.reason ?? "" });
+  return (
+    <Row
+      lead={live ? <Spinner small /> : <Icon name={monitor.detached ? "code" : "eye"} className="size-4 text-muted" />}
+      label={monitor.title}
+      meta={live ? formatElapsed(monitor.started_at, now) : formatRelative(monitor.started_at)}
+      title={`${kind} #${monitor.handle} · ${state}\n${monitor.command}`}
+    />
+  );
+}
+
+/** 不能点的一行（连接、已不在库里的记忆、监听）。 */
 function Row({ lead, label, meta, title }: { lead: ReactNode; label: ReactNode; meta?: ReactNode; title?: string }) {
   return (
     <div title={title} className={cn(rowBase, "text-text")}>

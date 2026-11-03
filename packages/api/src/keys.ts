@@ -14,6 +14,8 @@ export const keys = {
   interventions: ["interventions"] as const,
   matters: ["matters"] as const,
   mattersAll: ["matters", "all"] as const,
+  monitors: ["monitors"] as const,
+  monitorsAll: ["monitors", "all"] as const,
   cron: ["cron"] as const,
   memoryFind: (query: string) => ["memories", "find", query] as const,
   memorySearch: (query: string, limit: number) => ["memories", "search", query, limit] as const,

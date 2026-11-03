@@ -100,6 +100,8 @@ export type { ModelMenuEntry } from "./ModelMenuEntry";
 export type { ModelUpsertRequest } from "./ModelUpsertRequest";
 export type { ModelWindow } from "./ModelWindow";
 export type { ModelsResponse } from "./ModelsResponse";
+export type { MonitorListResponse } from "./MonitorListResponse";
+export type { MonitorSummary } from "./MonitorSummary";
 export type { NameSessionRequest } from "./NameSessionRequest";
 export type { NotifyPolicy } from "./NotifyPolicy";
 export type { OverlapPolicy } from "./OverlapPolicy";

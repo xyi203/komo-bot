@@ -335,6 +335,12 @@ pub struct RetrievalConfig {
     /// 0 = 不启用。
     #[serde(default)]
     pub min_keyword_score: f32,
+    /// 只过关键词门槛的条目还要过的余弦下限，0–1；0 = 不启用。向量臂跑了、条目也有向量时，
+    /// 余弦低于它就不算过关键词门槛——小库里常用词（「当前」「使用」）的 IDF 接近满分，两个
+    /// 常用词凑出的关键词分就能过 `min_keyword_score`，而向量这时明确说不相关。条目没有向量、
+    /// 或向量臂降级没跑时不参与判断（§9.4）。
+    #[serde(default)]
+    pub min_keyword_cosine: f32,
     /// 没有归属的线索要不要推（§9.4「按"现在要不要用"分层」）。默认 `true`；`false` 时它们
     /// 降到"只能查"那一层。存量记忆归属都是空的，默认关掉会让它们一起不推。
     #[serde(default = "default_push_unattached")]
@@ -378,6 +384,7 @@ impl Default for RetrievalConfig {
             rerank_shortlist: default_rerank_shortlist(),
             min_similarity: 0.0,
             min_keyword_score: 0.0,
+            min_keyword_cosine: 0.0,
             push_unattached: default_push_unattached(),
         }
     }

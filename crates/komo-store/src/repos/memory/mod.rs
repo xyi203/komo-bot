@@ -623,10 +623,16 @@ async fn recall_in(ex: &mut dyn Executor, query: &RecallQuery) -> Result<RecallR
 
     let mut vector_note: Option<String> = None;
     let mut coverage = 0.0f32;
+    let mut cosines: std::collections::BTreeMap<String, f32> = Default::default();
     let vector = if wants_vector {
         match vector_arm(ex, query, candidate_limit).await? {
-            VectorArm::Ran { ranked, covered } => {
+            VectorArm::Ran {
+                ranked,
+                cosines: all,
+                covered,
+            } => {
                 coverage = covered;
+                cosines = all;
                 ranked
             }
             VectorArm::Unavailable { reason } => {
@@ -655,6 +661,10 @@ async fn recall_in(ex: &mut dyn Executor, query: &RecallQuery) -> Result<RecallR
     // 相关度门槛（§9.4）：过任一臂的门槛即留下，两臂都没过的在重排与 `top_k` 截断之前丢
     // 掉。名次仍是上面按两臂原始名单融出来的，门槛只删人、不改名次。没跑的臂不参与判断；
     // 门槛 0 = 该臂不设限，名单里的条目都算过。
+    //
+    // 关键词门槛还要向量不反对（`min_keyword_cosine`）：向量臂跑了、这条也有向量且余弦低于下限时，
+    // 关键词这道不算过。小库里 IDF 把常用词也当罕见词，两个常用词就凑得出门槛分。没有向量、
+    // 向量臂没跑时向量没有意见，照旧只看关键词分。
     let keyword_scores: std::collections::BTreeMap<&str, f32> =
         keyword.iter().map(|(id, s)| (id.as_str(), *s)).collect();
     let vector_scores: std::collections::BTreeMap<&str, f32> =
@@ -665,7 +675,15 @@ async fn recall_in(ex: &mut dyn Executor, query: &RecallQuery) -> Result<RecallR
     let mut kept: Vec<String> = Vec::with_capacity(ranked.len());
     for id in ranked {
         let mut passed = Vec::new();
-        if wants_keyword && gate(keyword_scores.get(id.as_str()), query.min_keyword_score) {
+        let vector_objects = vector_ran
+            && query.min_keyword_cosine > 0.0
+            && cosines
+                .get(id.as_str())
+                .is_some_and(|c| *c < query.min_keyword_cosine);
+        if wants_keyword
+            && !vector_objects
+            && gate(keyword_scores.get(id.as_str()), query.min_keyword_score)
+        {
             passed.push(RecallArm::Keyword);
         }
         if vector_ran && gate(vector_scores.get(id.as_str()), query.min_similarity) {
@@ -786,7 +804,13 @@ async fn keyword_arm(
 }
 
 enum VectorArm {
-    Ran { ranked: ScoredArm, covered: f32 },
+    /// `ranked` 是截到 `candidate_limit` 的候选名单（进 RRF）；`cosines` 是作用域内每条有向量的
+    /// 条目的余弦（不截断），`min_keyword_cosine` 用它判断——排在名单外不等于没有向量。
+    Ran {
+        ranked: ScoredArm,
+        cosines: std::collections::BTreeMap<String, f32>,
+        covered: f32,
+    },
     Unavailable { reason: String },
 }
 
@@ -878,10 +902,12 @@ async fn vector_arm(
             .unwrap_or(std::cmp::Ordering::Equal)
             .then(a.0.cmp(&b.0))
     });
+    let cosines = scored.iter().cloned().collect();
     scored.truncate(candidate_limit);
 
     Ok(VectorArm::Ran {
         ranked: scored,
+        cosines,
         covered,
     })
 }
@@ -1051,6 +1077,7 @@ mod tests {
             include_states: vec![],
             min_similarity: 0.0,
             min_keyword_score: 0.0,
+            min_keyword_cosine: 0.0,
         }
     }
 
@@ -2215,6 +2242,44 @@ mod tests {
         assert_eq!(ids_of(&kept), vec!["m-1"]);
         let dropped = repo.recall(&degraded(0.9)).await.unwrap();
         assert!(dropped.items.is_empty(), "关键词分没过门槛就是空，不补足");
+    }
+
+    /// 只过关键词门槛的条目，向量明确说不相关（余弦低于 `min_keyword_cosine`）时丢掉；没有向量、
+    /// 向量臂没跑、或下限是 0 时照旧留下。
+    #[tokio::test]
+    async fn a_keyword_only_hit_the_vector_calls_unrelated_is_dropped() {
+        let with_cosine_floor = |floor| RecallQuery {
+            min_keyword_cosine: floor,
+            ..gated(0.9, 0.5)
+        };
+
+        // m-1 没有向量：向量对它没有意见，下限不管。
+        let (repo, _dir) = gated_repo().await;
+        let kept = repo.recall(&with_cosine_floor(0.5)).await.unwrap();
+        assert_eq!(ids_of(&kept), vec!["m-1", "m-2"]);
+
+        // 给 m-1 一条与查询正交的向量：关键词分照样过 0.5，但余弦 0 < 0.5。
+        repo.put_vector(&MemoryId::from_raw("m-1"), 1, "gen-1", Vector(vec![0.0, 1.0]))
+            .await
+            .unwrap();
+        let vetoed = repo.recall(&with_cosine_floor(0.5)).await.unwrap();
+        assert_eq!(ids_of(&vetoed), vec!["m-2"], "向量反对，关键词门槛不算过");
+        assert_eq!(vetoed.dropped_by_threshold, Some(2));
+
+        // 下限 0 = 不启用：与加这道下限之前一样。
+        let off = repo.recall(&with_cosine_floor(0.0)).await.unwrap();
+        assert_eq!(ids_of(&off), vec!["m-1", "m-2"]);
+
+        // 向量臂没跑（降级）：只看关键词门槛，召回不因为向量不可用而变窄。
+        let degraded = repo
+            .recall(&RecallQuery {
+                query_vector: None,
+                ..with_cosine_floor(0.5)
+            })
+            .await
+            .unwrap();
+        assert!(degraded.degraded);
+        assert_eq!(ids_of(&degraded), vec!["m-1"]);
     }
 
     // ---------------------------------------------------------------- 使用方式与索引输入（§9.5）

@@ -281,6 +281,7 @@ fn memory_config(enabled: bool, mode: RetrievalMode) -> MemoryConfig {
             rerank_shortlist: 20,
             min_similarity: 0.0,
             min_keyword_score: 0.0,
+            min_keyword_cosine: 0.0,
             push_unattached: true,
         },
         consolidate: Default::default(),

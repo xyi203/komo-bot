@@ -1242,6 +1242,8 @@ push_unattached = true
 # 例如 qwen3-embedding:0.6b 无前缀：
 # min_similarity = 0.56
 # min_keyword_score = 1.0
+# 只过关键词门槛的条目，向量跑了且余弦低于它就不算过（挡常用词凑分的误召回；没向量、降级时不管）：
+# min_keyword_cosine = 0.45
 
 [execution]
 # 交给模型的工具结果正文上限（字节）。完整输出在 sessions/<id>/tool-output/ 下；这里

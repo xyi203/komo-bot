@@ -810,6 +810,7 @@ impl MemoryManager {
             include_states: vec![],
             min_similarity: retrieval.min_similarity,
             min_keyword_score: retrieval.min_keyword_score,
+            min_keyword_cosine: retrieval.min_keyword_cosine,
         }
     }
 

@@ -144,6 +144,7 @@ fn query(text: &str, mode: RetrievalMode, probe: Option<Vector>) -> RecallQuery 
         include_states: vec![],
         min_similarity: 0.0,
         min_keyword_score: 0.0,
+        min_keyword_cosine: 0.0,
     }
 }
 

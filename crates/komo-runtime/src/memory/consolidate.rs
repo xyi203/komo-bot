@@ -305,6 +305,7 @@ impl<'a> Consolidator<'a> {
         // 找近邻是为了去重与整理，不是挑"相关到值得注入"的——门槛只管注入召回。
         query.min_similarity = 0.0;
         query.min_keyword_score = 0.0;
+        query.min_keyword_cosine = 0.0;
         match self.manager.search(query).await {
             Ok(result) => result.items,
             Err(MemoryError::VectorUnconfigured) | Err(MemoryError::VectorUnavailable(_)) => {
@@ -315,6 +316,7 @@ impl<'a> Consolidator<'a> {
                 fallback.scopes = scopes.to_vec();
                 fallback.min_similarity = 0.0;
                 fallback.min_keyword_score = 0.0;
+                fallback.min_keyword_cosine = 0.0;
                 self.manager
                     .search(fallback)
                     .await

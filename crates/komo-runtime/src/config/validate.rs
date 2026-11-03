@@ -391,6 +391,12 @@ fn check_retrieval(snapshot: &ConfigSnapshot, issues: &mut Vec<ConfigIssue>) {
             "min_keyword_score 不能是负数或非有限值（0 = 不启用）",
         ));
     }
+    if !(0.0..=1.0).contains(&retrieval.min_keyword_cosine) {
+        issues.push(error(
+            "memory.retrieval.min_keyword_cosine",
+            "min_keyword_cosine 是只过关键词门槛时的余弦下限，写 0 到 1（0 = 不启用）",
+        ));
+    }
     if retrieval.rerank {
         // 重排换的是"谁进得了 top_k"。短名单和 top_k 一样宽时它只是换个顺序——写了这个
         // 组合的人想要的是重排，拿到的却是一个空转的开关。

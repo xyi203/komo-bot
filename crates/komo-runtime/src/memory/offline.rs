@@ -159,6 +159,7 @@ impl MemoryManager {
             // 近邻是整理用的，不受注入召回的相关度门槛约束。
             query.min_similarity = 0.0;
             query.min_keyword_score = 0.0;
+            query.min_keyword_cosine = 0.0;
             query
         };
         match self.search(build(None)).await {

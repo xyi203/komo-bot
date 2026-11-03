@@ -426,6 +426,10 @@ pub struct RecallQuery {
     /// 关键词臂归一化 IDF 和的下限；0 = 该臂不设限。
     #[serde(default, skip_serializing_if = "is_zero")]
     pub min_keyword_score: f32,
+    /// 只过关键词门槛的条目还要过的余弦下限；0 = 不启用。条目没有向量、或向量臂没跑时不参与
+    /// 判断（§9.4「关键词命中要向量不反对」）。
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub min_keyword_cosine: f32,
 }
 
 fn is_zero(value: &f32) -> bool {
@@ -627,6 +631,7 @@ mod tests {
             include_states,
             min_similarity: 0.0,
             min_keyword_score: 0.0,
+            min_keyword_cosine: 0.0,
         }
     }
 

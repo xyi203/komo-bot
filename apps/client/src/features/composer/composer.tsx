@@ -1,5 +1,5 @@
 import { useModels } from "@komo/api";
-import { useRef, useState, type FormEvent, type KeyboardEvent } from "react";
+import { useRef, useState, type ClipboardEvent, type DragEvent, type FormEvent, type KeyboardEvent } from "react";
 import { Icon } from "@/components/icon";
 import { Spinner } from "@/components/spinner";
 import type { View } from "@/features/conversation/model";
@@ -10,13 +10,15 @@ import { showToast } from "@/lib/toast";
 import { cn } from "@/lib/utils";
 import { m } from "@/paraglide/messages.js";
 import { effortLabel, modelLabel } from "./effort";
+import { useAttachments, type Draft } from "./use-attachments";
 import type { SendOptions } from "./use-send";
 
 // 模型与 effort 的选择在会话之间保留（原型里它们是页面上唯一的两个 <select>，换会话不重置），刷新后回到默认。
 let chosen: { model: string | null; effort: string } = { model: null, effort: "" };
 
 /**
- * 输入框（docs/web.md §5）：加号（附件，未接）、一行文字、发送；会话有 Run 在跑且输入为空时发送键变停止，输入了文字则是插话。
+ * 输入框（docs/web.md §5）：加号（选图片或文件）、一行文字、发送；会话有 Run 在跑且输入为空时发送键变停止，输入了文字则是插话。
+ * 图片与文件也可以直接粘贴或拖进来：先传给 Gateway，发送时把每个附件的那行说明拼在文字前面（附件不进消息结构）。
  * 框下：左边用量行（轮数、步数、tok、缓存命中；跑着时是计时），右边模型、effort 与上下文环。
  */
 export function Composer({
@@ -38,9 +40,11 @@ export function Composer({
 }) {
   const [text, setText] = useState("");
   const area = useRef<HTMLTextAreaElement>(null);
+  const picker = useRef<HTMLInputElement>(null);
+  const { drafts, add, remove, clear } = useAttachments();
   const models = useModels().data;
   const [pick, setPick] = useState(chosen);
-  const showStop = busy && !text.trim();
+  const showStop = busy && !text.trim() && drafts.length === 0;
 
   const defaultModel = models?.find((x) => x.default) ?? models?.[0];
   const current = models?.find((x) => x.id === (pick.model ?? defaultModel?.id)) ?? defaultModel;
@@ -53,14 +57,32 @@ export function Composer({
 
   const submit = (event?: FormEvent) => {
     event?.preventDefault();
-    if (disabled || !text.trim()) return;
-    onSend(text, {
+    if (disabled || (!text.trim() && drafts.length === 0)) return;
+    if (drafts.some((d) => d.state === "uploading")) return showToast(m.composer_attach_wait());
+    if (drafts.some((d) => d.state === "failed")) return showToast(m.composer_attach_blocked());
+    // 说明在前、用户的话在后（与聊天渠道一样：附言是 `/pending` 也不会被当成命令）
+    const body = [...drafts.map((d) => d.note ?? ""), text.trim() ? text : ""].filter(Boolean).join("\n");
+    onSend(body, {
       // 选的就是默认模型时不带 model，让 Gateway 用当前快照的主模型
       ...(current && current.id !== defaultModel?.id ? { model: current.id } : {}),
       ...(effort ? { effort } : {}),
     });
     setText("");
+    clear();
     if (area.current) area.current.style.height = "auto";
+  };
+  // 剪贴板里有文件（截图、从访达复制的文件）就当附件收下；只有文字照常粘贴
+  const onPaste = (event: ClipboardEvent<HTMLTextAreaElement>) => {
+    const files = [...event.clipboardData.files];
+    if (!files.length || disabled) return;
+    event.preventDefault();
+    add(files);
+  };
+  const onDrop = (event: DragEvent<HTMLFormElement>) => {
+    const files = [...event.dataTransfer.files];
+    if (!files.length) return;
+    event.preventDefault();
+    if (!disabled) add(files);
   };
   const onKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
     if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
@@ -73,64 +95,79 @@ export function Composer({
     <div className="shrink-0 px-8 pb-3 max-[600px]:px-3 max-[600px]:pb-2">
       <form
         onSubmit={submit}
+        onDragOver={(event) => event.dataTransfer.types.includes("Files") && event.preventDefault()}
+        onDrop={onDrop}
         className={cn(
-          "mx-auto flex max-w-180 items-end gap-1 rounded-[16px] p-1.5 shadow-[0_0_0_1px_rgb(34_40_28/0.2),0_2px_8px_rgb(34_40_28/0.05)] transition-shadow focus-within:shadow-[0_0_0_1px_var(--color-muted),0_2px_8px_rgb(34_40_28/0.05)]",
+          "mx-auto max-w-180 rounded-[16px] p-1.5 shadow-[0_0_0_1px_rgb(34_40_28/0.2),0_2px_8px_rgb(34_40_28/0.05)] transition-shadow focus-within:shadow-[0_0_0_1px_var(--color-muted),0_2px_8px_rgb(34_40_28/0.05)]",
           disabled ? "bg-raised" : "bg-surface",
         )}
       >
-        {/* 附件还没有 Gateway 接口（SubmitRunRequest 只有 text）：先放加号占位，点了说明还不支持 */}
-        <button
-          type="button"
-          aria-label={m.composer_attach()}
-          title={m.composer_attach()}
-          disabled={disabled}
-          onClick={() => showToast(m.composer_attach_unsupported())}
-          className="grid size-8 shrink-0 cursor-pointer place-items-center rounded-full text-text transition-colors hover:bg-hover-on-white disabled:cursor-not-allowed disabled:opacity-35 max-[600px]:m-1.5"
-        >
-          <Icon name="plus" />
-        </button>
-        <label className="sr-only" htmlFor="composer-input">
-          {m.composer_label()}
-        </label>
-        <textarea
-          id="composer-input"
-          ref={area}
-          rows={1}
-          value={text}
-          disabled={disabled}
-          placeholder={archived ? m.composer_archived() : busy ? m.composer_interject() : m.composer_send_hint()}
-          onChange={(event) => {
-            setText(event.target.value);
-            event.target.style.height = "auto";
-            event.target.style.height = `${event.target.scrollHeight}px`;
-          }}
-          onKeyDown={onKeyDown}
-          className="max-h-60 min-h-8 min-w-0 flex-1 resize-none bg-transparent px-1 py-1.5 text-read leading-5 text-text outline-none placeholder:text-faint max-[600px]:min-h-11 max-[600px]:py-3"
-        />
-        {showStop ? (
+        {drafts.length > 0 && <DraftList drafts={drafts} onRemove={remove} />}
+        <div className="flex items-end gap-1">
+          <input
+            ref={picker}
+            type="file"
+            multiple
+            hidden
+            onChange={(event) => {
+              add([...(event.target.files ?? [])]);
+              event.target.value = "";
+            }}
+          />
           <button
             type="button"
-            aria-label={m.composer_stop()}
-            title={m.composer_stop()}
-            onClick={onStop}
-            className="grid size-8 shrink-0 cursor-pointer place-items-center rounded-full bg-primary text-white transition-[transform,opacity] hover:opacity-90 active:scale-95 max-[600px]:m-1.5"
-          >
-            <Icon name="stop" solid />
-          </button>
-        ) : (
-          <button
-            type="submit"
-            aria-label={m.composer_send()}
-            title={m.composer_send()}
+            aria-label={m.composer_attach()}
+            title={m.composer_attach()}
             disabled={disabled}
-            className={cn(
-              "grid size-8 shrink-0 cursor-pointer place-items-center rounded-full bg-primary text-white transition-[transform,opacity] hover:opacity-90 active:scale-95 max-[600px]:m-1.5",
-              disabled && "cursor-not-allowed opacity-35",
-            )}
+            onClick={() => picker.current?.click()}
+            className="grid size-8 shrink-0 cursor-pointer place-items-center rounded-full text-text transition-colors hover:bg-hover-on-white disabled:cursor-not-allowed disabled:opacity-35 max-[600px]:m-1.5"
           >
-            <Icon name="up" />
+            <Icon name="plus" />
           </button>
-        )}
+          <label className="sr-only" htmlFor="composer-input">
+            {m.composer_label()}
+          </label>
+          <textarea
+            id="composer-input"
+            ref={area}
+            rows={1}
+            value={text}
+            disabled={disabled}
+            placeholder={archived ? m.composer_archived() : busy ? m.composer_interject() : m.composer_send_hint()}
+            onChange={(event) => {
+              setText(event.target.value);
+              event.target.style.height = "auto";
+              event.target.style.height = `${event.target.scrollHeight}px`;
+            }}
+            onKeyDown={onKeyDown}
+            onPaste={onPaste}
+            className="max-h-60 min-h-8 min-w-0 flex-1 resize-none bg-transparent px-1 py-1.5 text-read leading-5 text-text outline-none placeholder:text-faint max-[600px]:min-h-11 max-[600px]:py-3"
+          />
+          {showStop ? (
+            <button
+              type="button"
+              aria-label={m.composer_stop()}
+              title={m.composer_stop()}
+              onClick={onStop}
+              className="grid size-8 shrink-0 cursor-pointer place-items-center rounded-full bg-primary text-white transition-[transform,opacity] hover:opacity-90 active:scale-95 max-[600px]:m-1.5"
+            >
+              <Icon name="stop" solid />
+            </button>
+          ) : (
+            <button
+              type="submit"
+              aria-label={m.composer_send()}
+              title={m.composer_send()}
+              disabled={disabled}
+              className={cn(
+                "grid size-8 shrink-0 cursor-pointer place-items-center rounded-full bg-primary text-white transition-[transform,opacity] hover:opacity-90 active:scale-95 max-[600px]:m-1.5",
+                disabled && "cursor-not-allowed opacity-35",
+              )}
+            >
+              <Icon name="up" />
+            </button>
+          )}
+        </div>
       </form>
       <div className="mx-auto mt-1 flex h-7 max-w-180 items-center gap-2 px-2 text-label text-muted max-[600px]:justify-end">
         <UsageLine view={view} busy={busy} />
@@ -166,6 +203,51 @@ export function Composer({
         <ContextRing context={context} className={cn(!(models && models.length > 0) && "ml-auto")} />
       </div>
     </div>
+  );
+}
+
+/** 框里待发的附件：图片是方形缩略图，其他文件是带文件名的标签；传着的半透明，传失败的标红（悬停看原因）。 */
+function DraftList({ drafts, onRemove }: { drafts: readonly Draft[]; onRemove: (id: string) => void }) {
+  return (
+    <ul className="flex flex-wrap gap-2 px-1.5 pt-1.5 pb-2">
+      {drafts.map((d) => {
+        const hint =
+          d.state === "failed" ? m.composer_attach_failed({ name: d.name, message: d.error ?? "" }) : d.state === "uploading" ? m.composer_attach_uploading({ name: d.name }) : d.name;
+        return (
+          <li
+            key={d.id}
+            title={hint}
+            className={cn(
+              "group/draft relative rounded-inner bg-raised",
+              d.state === "uploading" && "opacity-60",
+              d.state === "failed" && "outline-2 outline-negative -outline-offset-2",
+            )}
+          >
+            {d.preview ? (
+              <img src={d.preview} alt={d.name} className="size-16 rounded-inner object-cover" />
+            ) : (
+              <span className="flex h-16 max-w-48 items-center gap-1.5 px-3 text-label text-text">
+                <Icon name="file" className="size-3.5 shrink-0 text-muted" />
+                <span className="truncate">{d.name}</span>
+              </span>
+            )}
+            {d.state === "uploading" && (
+              <span className="absolute inset-0 grid place-items-center">
+                <Spinner small />
+              </span>
+            )}
+            <button
+              type="button"
+              aria-label={m.composer_attach_remove({ name: d.name })}
+              onClick={() => onRemove(d.id)}
+              className="absolute -top-1.5 -right-1.5 grid size-5 cursor-pointer place-items-center rounded-full bg-primary text-white shadow-ring [@media(hover:hover)]:opacity-0 [@media(hover:hover)]:transition-opacity group-hover/draft:opacity-100 focus-visible:opacity-100"
+            >
+              <Icon name="x" className="size-3" />
+            </button>
+          </li>
+        );
+      })}
+    </ul>
   );
 }
 

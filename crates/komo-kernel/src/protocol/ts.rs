@@ -34,7 +34,7 @@ use super::{
     PairCodeResponse, PairRequest, ProviderModelsRequest, ProviderModelsResponse,
     ProviderUpsertRequest, PurgeBlocked, PurgeSessionResponse, RebuildIndexResponse,
     SessionChanges, SessionLifecycleResponse, SessionListResponse, SettingRequest, SseFrame,
-    SubmitRunRequest, SubmitRunResponse, UpdateCronRequest,
+    SubmitRunRequest, SubmitRunResponse, UpdateCronRequest, UploadAttachmentResponse,
 };
 
 /// `GET /v1/sessions/{id}/events` 与 SSE `event` 帧里一条事件的线上信封（[`crate::events::Event`] 的 JSON）。
@@ -81,6 +81,7 @@ pub fn export_all(dir: &Path) -> Result<(), String> {
     each(PurgeBlocked::export_all(&cfg))?;
     each(SubmitRunRequest::export_all(&cfg))?;
     each(SubmitRunResponse::export_all(&cfg))?;
+    each(UploadAttachmentResponse::export_all(&cfg))?;
     each(CancelRunResponse::export_all(&cfg))?;
     each(ModelsResponse::export_all(&cfg))?;
     each(SessionChanges::export_all(&cfg))?;

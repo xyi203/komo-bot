@@ -13,6 +13,8 @@ use komo_kernel::traits::LlmClient as _;
 use komo_kernel::types::ids::{RunId, SessionId};
 use komo_kernel::types::turn::{ReplayMessage, Role, RoundInput, TurnRequest};
 
+use komo_channel::inbox::attachment_label;
+
 use super::tree::input_text;
 use crate::service::state::GatewayState;
 
@@ -148,7 +150,27 @@ async fn replace_title_if(
 /// 空白输入没有标题可言（返回 `None`，于是空会话在列表里仍然是"无标题"，而不是一行空白）。
 /// 截断按**字符**切，不按字节——中文按字节切会切出半个字。
 pub(crate) fn title_for(text: &str) -> Option<String> {
-    let first = text.lines().map(str::trim).find(|line| !line.is_empty())?;
+    let lines: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    // 开头的附件说明（聊天渠道收的图、网页输入框的附件）不当标题：取用户自己的第一行；只有附件就用它们的短名字
+    let labels: String;
+    let first = match lines.iter().find(|line| attachment_label(line).is_none()) {
+        Some(line) => *line,
+        None => {
+            labels = lines
+                .iter()
+                .filter_map(|line| attachment_label(line))
+                .collect::<Vec<_>>()
+                .join("、");
+            if labels.is_empty() {
+                return None;
+            }
+            &labels
+        }
+    };
     let mut title: String = first.chars().take(PROVISIONAL_TITLE_CHARS).collect();
     if first.chars().count() > PROVISIONAL_TITLE_CHARS {
         title.push('…');
@@ -208,6 +230,21 @@ mod tests {
         let title = title_for(&long).unwrap();
         assert_eq!(title.chars().count(), 61, "60 个字符加省略号");
         assert!(title.ends_with('…'));
+    }
+
+    #[test]
+    fn attachment_notes_are_not_the_title() {
+        let image = "[用户发来一张图片，已存到 /w/inbox/web/0123456789abcdef.png，用 read 查看]";
+        let file =
+            "[用户发来一个文件 a.md，已存到 /w/inbox/web/0123456789abcdef/a.md，用 read 查看]";
+        assert_eq!(
+            title_for(&format!("{image}\n看看这张图")).as_deref(),
+            Some("看看这张图")
+        );
+        assert_eq!(
+            title_for(&format!("{image}\n{file}")).as_deref(),
+            Some("图片、文件 a.md")
+        );
     }
 
     #[test]

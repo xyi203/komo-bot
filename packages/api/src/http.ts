@@ -8,7 +8,13 @@ import { ApiError, fallbackBody } from "./errors";
 export async function request<T>(
   method: string,
   path: string,
-  options: { body?: unknown; signal?: AbortSignal; query?: Record<string, string | number | boolean | undefined> } = {},
+  options: {
+    body?: unknown;
+    /** 原样发出去的字节（附件上传）；给了它就不发 JSON `body`。 */
+    raw?: Blob;
+    signal?: AbortSignal;
+    query?: Record<string, string | number | boolean | undefined>;
+  } = {},
 ): Promise<T> {
   const url = withQuery(path, options.query);
   let response: Response;
@@ -18,9 +24,9 @@ export async function request<T>(
       credentials: "same-origin",
       headers: {
         accept: "application/json",
-        ...(options.body === undefined ? {} : { "content-type": "application/json" }),
+        ...(options.raw ? { "content-type": options.raw.type || "application/octet-stream" } : options.body === undefined ? {} : { "content-type": "application/json" }),
       },
-      body: options.body === undefined ? undefined : JSON.stringify(options.body),
+      body: options.raw ?? (options.body === undefined ? undefined : JSON.stringify(options.body)),
       signal: options.signal,
     });
   } catch (error) {

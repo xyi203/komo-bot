@@ -141,6 +141,7 @@ export type { TimeZone } from "./TimeZone";
 export type { ToolCallId } from "./ToolCallId";
 export type { Trigger } from "./Trigger";
 export type { UpdateCronRequest } from "./UpdateCronRequest";
+export type { UploadAttachmentResponse } from "./UploadAttachmentResponse";
 export type { WaitReason } from "./WaitReason";
 export type { WindowSource } from "./WindowSource";
 export type { WireEvent } from "./WireEvent";

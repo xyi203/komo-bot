@@ -940,7 +940,7 @@ TELEGRAM_BOT_TOKEN=...
 - **改名单不改数据库，也不重启**：`allow_from` / `home_chat` / `allow_tenant` 每条消息、每次投递都从当前配置快照读（§3 热重载第 2 步），文件保存后下一条消息就按新名单判定；`komo config check` 与重载共用同一套校验（id 形态、`home_chat` 所属渠道必须 enabled 且有凭证），校验不过则旧名单继续生效并在 home chat 报错。`komo doctor` 把"某渠道 enabled 但 `allow_from` 为空"当作警告列出。
 - Cron 触发的 Run 来源仍是 Cron（§8.8）；在聊天里 `/answer` 它的介入，不会让它获得交互操作者的身份。
 - **渠道篇幅（2026-10-31，roadmap-muse S5）**：回复要发到聊天渠道的 Run，输入之后追加**一次**一条宿主附上的 user 消息（`komoOrigin = channel`，entry kind `komo.channel`，`data {submission, platform}`）：写明发到哪个平台，先给结论、一般不超过约 150 字、只问能直接回答的那一个问题，长内容写文件给路径或派任务，用户明确要全文时照给。"发到哪"与看客的投递同一个判断（首个输入是 `chat.input` 取它的 peer；内部输入按决定 6 找路径上最近的 peer）；`api` 对端、找不到 peer 的只落一条不带 `model` 的记录，让后续轮次不再去查；TUI / HTTP / Cron 起的 Run 什么都不落；任务会话与 fork 任务不加（结果交回派它的会话转告）。**不放进系统段**：私聊（微信、Telegram）与 TUI 共用 home session，按渠道换系统段会让 home 每换一次渠道就打掉整段前缀缓存；照记忆召回块（§9.4）每 Run 追加，正文只看平台、同一平台逐字相同。代码：`komo-agent` `context/channel.rs`（正文），`komo-gateway` `hooks/channel.rs`（`context_entries` 里排在召回块之后）。
-- **聊天里发来的图片存成本地文件，正文只给路径**（2026-10-22，`channels/inbox.rs`）。入站消息只有文本，所以图片不进消息结构：渠道把它下载下来，按内容哈希存成 `{workspaces_dir}/inbox/{平台}/<哈希前 16 位>.<扩展名>`，在正文**最前面**加一行 `[用户发来一张图片，已存到 <绝对路径>，用 read 查看]`，用户的文字（附言）在后——附言是 `/pending` 时不会被当成命令。模型自己用 `read` 看（§8.3 的工具结果带图），代价是每张图多一轮模型往返，换来 Dispatcher、受理、回放、记忆提取一行都不用认识图片。下载失败不丢消息，正文改成 `[用户发来一张图片，但没能下载：原因]`。先判断这条要不要处理（群里没 @、机器人自己回流的）再下载；同一张图重投落在同一个文件上；单张上限 20 MB（Telegram `getFile` 的上限）；认不出格式也照存（`.bin`，HEIC 之类让模型先 `sips` 转）。放在工作区而不是数据目录：`read` 与 codemode 都读得到。各渠道：微信用 SDK 的 `CdnClient` 下载再 AES 解密；飞书单发的 `image` 与带图的富文本 `post` 都收，走 `GET /im/v1/messages/{id}/resources/{key}?type=image`（**要应���开 `im:resource` 权限**）；Telegram 取 `photo` 里最大的尺寸、附言一起带上，按文件发的 `image/*` 也收。语音、视频、其他文件仍不处理。
+- **聊天里发来的图片存成本地文件，正文只给路径**（2026-10-22，`channels/inbox.rs`）。入站消息只有文本，所以图片不进消息结构：渠道把它下载下来，按内容哈希存成 `{workspaces_dir}/inbox/{平台}/<哈希前 16 位>.<扩展名>`，在正文**最前面**加一行 `[用户发来一张图片，已存到 <绝对路径>，用 read 查看]`，用户的文字（附言）在后——附言是 `/pending` 时不会被当成命令。模型自己用 `read` 看（§8.3 的工具结果带图），代价是每张图多一轮模型往返，换来 Dispatcher、受理、回放、记忆提取一行都不用认识图片。下载失败不丢消息，正文改成 `[用户发来一张图片，但没能下载：原因]`。先判断这条要不要处理（群里没 @、机器人自己回流的）再下载；同一张图重投落在同一个文件上；单张上限 20 MB（Telegram `getFile` 的上限）；认不出格式也照存（`.bin`，HEIC 之类让模型先 `sips` 转）。放在工作区而不是数据目录：`read` 与 codemode 都读得到。各渠道：微信用 SDK 的 `CdnClient` 下载再 AES 解密；飞书单发的 `image` 与带图的富文本 `post` 都收，走 `GET /im/v1/messages/{id}/resources/{key}?type=image`（**要应���开 `im:resource` 权限**）；Telegram 取 `photo` 里最大的尺寸、附言一起带上，按文件发的 `image/*` 也收。语音、视频、其他文件仍不处理。网页输入框的附件（2026-11-03）走同一条路：`POST /v1/attachments` 存进 `inbox/web/`，图片用同一行说明，其他文件存成 `<哈希>/<原文件名>`、说明写 `[用户发来一个文件 <文件名>，已存到 <绝对路径>，用 read 查看]`；客户端把说明拼在文字前面提交（docs/web.md §5）。临时标题跳过这些说明行。
 
 ### 11.3 介入在聊天里
 
@@ -1119,6 +1119,8 @@ CLI 通过 HTTP 发命令，通过 SSE 观察运行。Gateway 内部采用函数
 | GET /v1/mcp                      | 每台 MCP 服务器此刻的状态、传输方式与最近一次握手列出的工具；不等握手、不重连（§3「Web 看 MCP 服务器与向量模型」） |
 | POST /v1/mcp/reconnect           | 点名的 MCP 服务器（空 = 全部）断开重连，等握手完交回各自状态；名字不在配置里 400（`docs/mcp.md` §2.5） |
 | POST /v1/mcp/disconnect          | 点名的 MCP 服务器（空 = 全部）手动断开，停到重连为止：后台不再连，调用报"已手动断开"；只在内存里，重启后照常连（`docs/mcp.md` §2.7） |
+| POST /v1/attachments             | 网页输入框的附件：请求体是原始字节（`?name=` 原文件名），像渠道收的图片一样存进 `{workspaces_dir}/inbox/web/`（§11.2），交回路径、拼进正文的说明，图片另有缩略图地址；上限 20 MB，超了 413 |
+| GET /v1/attachments/{inbox}/{name} | 取回收件箱里按内容哈希命名的图片（网页缩略图；渠道收的图也行）；别的名字一律 404，不是读文件的口子 |
 | GET /v1/channels                 | 每个配置里的渠道：配置摘要加插件进程的运行状态（在跑 / 重试中 / 起不来 / 未启用）、进入时间、退出原因与重建次数（§3「Web 看渠道状态」） |
 | POST /v1/channels/{id}/probe     | 与 `komo channel probe` 同一条连通性核对，交回 `{ok, message}`；不起消费循环 |
 | GET /v1/home-session             | 操作者的 home session（§11.2）                 |

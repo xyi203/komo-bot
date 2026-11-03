@@ -89,20 +89,91 @@ impl ImageInbox {
             .map_err(|error| format!("改名到 {} 失败：{error}", path.display()))?;
         Ok(path)
     }
+
+    /// 存一个不是图片的文件，保留原文件名（模型靠扩展名决定怎么打开它）：
+    /// `{内容哈希}/{文件名}`。同一份内容同一个名字重传落在同一个文件上；名字里的目录部分与控制字符去掉。
+    pub async fn save_file(&self, bytes: &[u8], name: &str) -> Result<PathBuf, String> {
+        if bytes.len() > DOWNLOAD_LIMIT_BYTES {
+            return Err(format!(
+                "文件 {} 字节，超过 {} 字节的上限",
+                bytes.len(),
+                DOWNLOAD_LIMIT_BYTES
+            ));
+        }
+        let hash = ContentHash::of_bytes(bytes);
+        let dir = self.dir.join(&hash.as_str()[..NAME_HASH_CHARS]);
+        let path = dir.join(file_name(name));
+        if tokio::fs::try_exists(&path).await.unwrap_or(false) {
+            return Ok(path);
+        }
+        tokio::fs::create_dir_all(&dir)
+            .await
+            .map_err(|error| format!("建不了目录 {}：{error}", dir.display()))?;
+        let partial = dir.join(format!(".{}.partial", hash.as_str()));
+        tokio::fs::write(&partial, bytes)
+            .await
+            .map_err(|error| format!("写不了 {}：{error}", partial.display()))?;
+        tokio::fs::rename(&partial, &path)
+            .await
+            .map_err(|error| format!("改名到 {} 失败：{error}", path.display()))?;
+        Ok(path)
+    }
+}
+
+/// 上传来的文件名只留最后一段、去掉控制字符，空的、`.`、`..` 换成 `file`；太长截到 120 个字符。
+fn file_name(name: &str) -> String {
+    let last = name.rsplit(['/', '\\']).next().unwrap_or("");
+    let clean: String = last.chars().filter(|c| !c.is_control()).take(120).collect();
+    let clean = clean.trim();
+    if clean.is_empty() || clean == "." || clean == ".." {
+        "file".into()
+    } else {
+        clean.to_string()
+    }
 }
 
 /// 一张图的结局：存到了哪，或者为什么没拿到。
 pub type SavedImage = Result<PathBuf, String>;
+
+/// 一张存好的图在正文里的那行说明。网页输入框的附件（Gateway 的 `POST /v1/attachments`）也用它与
+/// [`file_note`]，写法只有这两处；网页按这两个形状把说明认回缩略图与文件标签
+/// （`apps/client` 的 `features/conversation/attachments.ts`），改了要一起改。
+pub fn image_note(path: &Path) -> String {
+    format!(
+        "[用户发来一张图片，已存到 {}，用 read 查看]",
+        path.display()
+    )
+}
+
+/// 一个存好的文件（不是图片）在正文里的那行说明。
+pub fn file_note(path: &Path) -> String {
+    let name = path
+        .file_name()
+        .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+    format!(
+        "[用户发来一个文件 {name}，已存到 {}，用 read 查看]",
+        path.display()
+    )
+}
+
+/// 正文里的一行如果是附件说明（[`image_note`]、[`file_note`] 或下载失败的那句），给它一个短名字：
+/// `图片` / `文件 {文件名}`。不是说明就是 `None`。起临时标题时用它跳过这些行（整段路径当标题没法看）。
+pub fn attachment_label(line: &str) -> Option<String> {
+    let line = line.trim();
+    if line.starts_with("[用户发来一张图片") && line.ends_with(']') {
+        return Some("图片".into());
+    }
+    let rest = line.strip_prefix("[用户发来一个文件 ")?;
+    let (name, _) = rest.split_once("，已存到 ")?;
+    line.ends_with(']').then(|| format!("文件 {name}"))
+}
 
 /// 拼正文：每张图一行说明，用户自己的文字跟在后面。没有图就原样返回文字。
 pub fn compose_text(images: &[SavedImage], text: &str) -> String {
     let mut lines: Vec<String> = images
         .iter()
         .map(|image| match image {
-            Ok(path) => format!(
-                "[用户发来一张图片，已存到 {}，用 read 查看]",
-                path.display()
-            ),
+            Ok(path) => image_note(path),
             Err(reason) => format!("[用户发来一张图片，但没能下载：{reason}]"),
         })
         .collect();
@@ -162,6 +233,44 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn a_file_keeps_its_name_under_its_content_hash() {
+        let dir = tempfile::tempdir().expect("临时目录");
+        let inbox = ImageInbox::new(dir.path().join("inbox/web"));
+
+        let path = inbox
+            .save_file(b"a,b\n1,2\n", "../../报表 2026.csv")
+            .await
+            .expect("存得下");
+        assert_eq!(
+            path.file_name().and_then(|n| n.to_str()),
+            Some("报表 2026.csv")
+        );
+        assert_eq!(
+            path.parent().and_then(Path::parent),
+            Some(inbox.dir()),
+            "名字里的目录部分不算数"
+        );
+        assert_eq!(std::fs::read(&path).expect("读回"), b"a,b\n1,2\n");
+        assert_eq!(
+            inbox
+                .save_file(b"a,b\n1,2\n", "报表 2026.csv")
+                .await
+                .expect("重传"),
+            path
+        );
+
+        let empty = inbox.save_file(b"", "..").await.expect("空文件也收");
+        assert_eq!(empty.file_name().and_then(|n| n.to_str()), Some("file"));
+        assert_eq!(
+            file_note(&path),
+            format!(
+                "[用户发来一个文件 报表 2026.csv，已存到 {}，用 read 查看]",
+                path.display()
+            )
+        );
+    }
+
     #[test]
     fn notes_come_before_the_users_own_words() {
         let text = compose_text(
@@ -175,6 +284,12 @@ mod tests {
              /pending"
         );
         assert!(!text.starts_with('/'), "附言不能被当成命令");
+        let labels: Vec<_> = text.lines().map(attachment_label).collect();
+        assert_eq!(labels, [Some("图片".into()), Some("图片".into()), None]);
+        assert_eq!(
+            attachment_label(&file_note(Path::new("/w/abc/a.md"))).as_deref(),
+            Some("文件 a.md")
+        );
         assert_eq!(compose_text(&[], " 在吗 "), "在吗");
     }
 }

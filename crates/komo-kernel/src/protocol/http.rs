@@ -488,6 +488,25 @@ pub struct SubmitRunResponse {
     pub detached: bool,
 }
 
+// ---- /v1/attachments：网页输入框里粘贴、拖入或选的图片与文件 ----
+
+/// `POST /v1/attachments[?name=文件名]` 的回执（请求体就是文件的原始字节）。和聊天渠道收到的
+/// 图片一样存进 `{workspaces_dir}/inbox/web/`（§11.2）：图片按内容哈希命名，其他文件放进以内容
+/// 哈希命名的目录、保留原文件名。消息结构里没有附件，客户端把 [`Self::note`] 拼在用户文字的
+/// 前面一起提交，模型自己用 `read`（或 bash）去看。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(optional_fields))]
+pub struct UploadAttachmentResponse {
+    /// Gateway 这台机器上的绝对路径。
+    pub path: String,
+    /// 拼进正文的那一行说明，与聊天渠道的写法逐字相同。
+    pub note: String,
+    /// 认出是图片时才有：取回它的地址（`GET /v1/attachments/{收件箱}/{文件名}`），给界面显示缩略图。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_url: Option<String>,
+}
+
 // ---- POST /v1/sessions/{id}/resume ----
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

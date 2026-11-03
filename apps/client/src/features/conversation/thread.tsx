@@ -9,6 +9,7 @@ import { Link } from "@tanstack/react-router";
 import { cn } from "@/lib/utils";
 import { m } from "@/paraglide/messages.js";
 import type { View } from "./model";
+import { AttachmentList, splitAttachments } from "./attachments";
 import { TurnView, UserBubble } from "./turn";
 
 export interface PendingSend {
@@ -54,25 +55,33 @@ export function Thread({
           </p>
         );
       })}
-      {pending.map((p) => (
-        <div key={p.id} className="mt-6 mb-2 flex flex-col items-end gap-1">
-          <div className={cn("max-w-[80%] rounded-[16px] bg-raised px-3.5 py-2 text-read leading-6 break-words whitespace-pre-wrap max-[600px]:max-w-[88%]", p.state === "failed" ? "outline outline-negative -outline-offset-1" : "opacity-60")}>
-            {p.text}
+      {pending.map((p) => {
+        const { attachments, text } = splitAttachments(p.text);
+        return (
+          <div key={p.id} className="mt-6 mb-2 flex flex-col items-end gap-1">
+            <div className={cn("flex w-full flex-col items-end gap-1", p.state !== "failed" && "opacity-60")}>
+              <AttachmentList attachments={attachments} />
+              {text.trim() && (
+                <div className={cn("max-w-[80%] rounded-[16px] bg-raised px-3.5 py-2 text-read leading-6 break-words whitespace-pre-wrap max-[600px]:max-w-[88%]", p.state === "failed" && "outline outline-negative -outline-offset-1")}>
+                  {text}
+                </div>
+              )}
+            </div>
+            <span className="text-small text-muted">
+              {p.state === "failed" ? (
+                <>
+                  {m.send_failed({ message: p.error ?? "" })} ·{" "}
+                  <button type="button" className="cursor-pointer font-medium text-text underline underline-offset-3" onClick={() => onRetry(p.id)}>
+                    {m.retry()}
+                  </button>
+                </>
+              ) : (
+                m.send_sending()
+              )}
+            </span>
           </div>
-          <span className="text-small text-muted">
-            {p.state === "failed" ? (
-              <>
-                {m.send_failed({ message: p.error ?? "" })} ·{" "}
-                <button type="button" className="cursor-pointer font-medium text-text underline underline-offset-3" onClick={() => onRetry(p.id)}>
-                  {m.retry()}
-                </button>
-              </>
-            ) : (
-              m.send_sending()
-            )}
-          </span>
-        </div>
-      ))}
+        );
+      })}
       {kids.map((kid) => (
         <Link
           key={kid.session}

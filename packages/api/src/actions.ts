@@ -17,8 +17,9 @@ import type {
   SessionSummary,
   SubmitRunRequest,
   SubmitRunResponse,
+  UploadAttachmentResponse,
 } from "@komo/protocol";
-import { get, post } from "./http";
+import { get, post, request } from "./http";
 import type { SessionTree } from "./types";
 
 // 读
@@ -44,6 +45,9 @@ export const archiveSession = (session: string, body: DeleteSessionRequest = {})
 export const purgeSession = (session: string) => post<PurgeSessionResponse>(`/v1/sessions/${enc(session)}/purge`);
 export const submitRun = (session: string, body: SubmitRunRequest) =>
   post<SubmitRunResponse>(`/v1/sessions/${enc(session)}/runs`, body);
+/** 存一个附件（粘贴、拖入或选的图片与文件），回执里的 `note` 拼在正文前面一起提交（Gateway 不认识附件）。 */
+export const uploadAttachment = (file: Blob, name?: string, signal?: AbortSignal) =>
+  request<UploadAttachmentResponse>("POST", "/v1/attachments", { raw: file, query: { name }, signal });
 /** 答复一条待处理；同一请求键重发返回原结论。 */
 export const answerIntervention = (handle: string, body: InterventionAnswerRequest) =>
   post<InterventionAnswerResponse>(`/v1/interventions/${enc(handle)}/answer`, body);

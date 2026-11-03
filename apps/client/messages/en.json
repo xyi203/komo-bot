@@ -1183,7 +1183,7 @@
   "session_state_waiting": "Waiting",
   "session_tag_archived": "Archived",
   "session_tag_task": "Task",
-  "session_untitled": "Untitled session",
+  "session_untitled": "New session",
   "sessions_collapse": "Show less",
   "sessions_error": "Could not load sessions: {message}",
   "sessions_kids": [

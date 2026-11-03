@@ -143,14 +143,12 @@
   "composer_attach_wait": "附件还在上传，传完再发",
   "composer_cache": "缓存命中 {pct}%",
   "composer_effort": "推理强度",
-  "composer_interject": "↵ 插话，并进正在跑的这一轮",
   "composer_label": "发给 komo",
   "composer_model": "模型",
   "composer_ring": "上下文 {pct}（{used} / {win}）",
   "composer_ring_none": "这段对话还没有请求过模型",
   "composer_running": "正在跑 · {time}",
   "composer_send": "发送",
-  "composer_send_hint": "↵ 发送，⇧↵ 换行",
   "composer_steps": [
     {
       "declarations": [

@@ -143,14 +143,12 @@
   "composer_attach_wait": "Attachments are still uploading — send once they're done",
   "composer_cache": "cache hit {pct}%",
   "composer_effort": "Effort",
-  "composer_interject": "↵ to interject into the running turn",
   "composer_label": "Message komo",
   "composer_model": "Model",
   "composer_ring": "Context {pct} ({used} / {win})",
   "composer_ring_none": "This conversation has not called the model yet",
   "composer_running": "Running · {time}",
   "composer_send": "Send",
-  "composer_send_hint": "↵ to send, ⇧↵ for a new line",
   "composer_steps": [
     {
       "declarations": [

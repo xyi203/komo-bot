@@ -145,7 +145,7 @@ export function Composer({
             rows={1}
             value={text}
             disabled={disabled}
-            placeholder={archived ? m.composer_archived() : busy ? m.composer_interject() : m.composer_send_hint()}
+            placeholder={archived ? m.composer_archived() : undefined}
             onChange={(event) => {
               setText(event.target.value);
               event.target.style.height = "auto";

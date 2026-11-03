@@ -134,7 +134,7 @@ macOS 应用和手机端，需要一套标准的前端栈，以及一份所有�
 - **配对码两分钟失效、最多同时 64 个；会话 cookie 30 天、最多 64 个，Gateway 重启就全部失效**（重新 `komo web`）。`Secure` 靠请求的 `X-Forwarded-Proto: https` 判断（Gateway 自己不终止 TLS）；`public_url` 与二维码留给 C3。
 - **Host 校验只比主机名，端口不参与**；监听地址 `0.0.0.0` 时 `0.0.0.0` 本身也放行（本机客户端用发现文件里的 `base_url` 连）。cookie 写请求缺 `Origin` 按不同源处理（浏览器发 POST 一定带）；`POST /v1/web/session` 没有 cookie，所以只在带了 `Origin` 时核对同源，curl 照常能换。
 - **Paraglide 构建时从 jsDelivr 取 inlang 的 message-format 插件**（`project.inlang/settings.json` 的 `modules`），缓存在 `project.inlang/cache`（已忽略）；第一次构建需要联网。
-- **TypeScript 钉在 5.9.3**（registry 上 `latest` 已是 7.x，`typescript-eslint` 与 Start 的类型都按 5.x 验证过）；`pnpm lint` = 自写的 i18n 检查脚本 + ESLint（typescript-eslint 推荐集 + react-hooks）。
+- **TypeScript 7**（原生 `tsc`）；`pnpm lint` = 自写的 i18n 检查脚本（oxc-parser 解析 JSX）+ oxlint 默认规则（不带配置文件，按 `.gitignore` 跳过生成物）。ESLint 与 typescript-eslint 已移除——后者只支持 TypeScript <6.1。
 - pnpm 11 的"发布满一定天数才装"策略把三个新版本拦下，已按提示加进 `pnpm-workspace.yaml` 的 `minimumReleaseAgeExclude`。
 
 **留给 C1 的事**：按 §3 的顺序迁移界面（会话树与对话流先行）；`SessionSummary` 以外的协议类型按用到的补 `ts-rs` 派生并列进 `export_all`；`WireEvent.data` 的按 `type` 收窄类型；错误 `code` 的完整译文表；`public_url` / 二维码 / 设备令牌（C3）；移动端布局（C0 的侧栏在窄屏下直接隐藏，没有会话切换入口）；`/pair` 页面的样式与失败重试体验；`apps/web` 与 `serve.mjs` 的删除。

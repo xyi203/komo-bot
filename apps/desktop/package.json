@@ -12,7 +12,7 @@
     "build": "pnpm build:ts",
     "build:ts": "node scripts/build-info.mjs && tsc -p tsconfig.json && tsc -p tsconfig.pages.json && node scripts/copy-pages.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.pages.json --noEmit",
-    "lint": "eslint .",
+    "lint": "oxlint",
     "pack": "pnpm --filter @komo/client build && pnpm build:ts && node scripts/package.mjs --dir",
     "dist": "pnpm --filter @komo/client build && pnpm build:ts && node scripts/package.mjs"
   },
@@ -20,13 +20,10 @@
     "electron-updater": "6.8.11"
   },
   "devDependencies": {
-    "@eslint/js": "10.0.1",
     "@types/node": "26.6.6",
     "electron": "45.2.1",
     "electron-builder": "26.18.0",
-    "eslint": "10.14.0",
-    "globals": "17.14.0",
-    "typescript": "5.9.3",
-    "typescript-eslint": "8.72.1"
+    "oxlint": "1.90.0",
+    "typescript": "7.0.2"
   }
 }

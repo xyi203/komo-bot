@@ -4,7 +4,7 @@
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import { join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
-import ts from "typescript";
+import { parseSync } from "oxc-parser";
 
 const root = fileURLToPath(new URL("..", import.meta.url));
 const SKIP = new Set(["paraglide", "routeTree.gen.ts"]);
@@ -19,32 +19,62 @@ function* files(dir) {
   }
 }
 
-/** 一个 JSX 子树里所有带中文的文本 / 字符串节点。 */
-function cjkIn(node, source, out) {
-  const textual =
-    ts.isJsxText(node) || ts.isStringLiteralLike(node) || ts.isTemplateHead(node) || ts.isTemplateMiddle(node) || ts.isTemplateTail(node);
-  if (textual && CJK.test(node.text ?? "")) {
-    out.push({ node, text: node.text.trim() });
+/** AST 节点的直接子节点（oxc-parser 出的是 ESTree：带 type 的普通对象）。 */
+function* children(node) {
+  for (const [key, value] of Object.entries(node)) {
+    if (key === "parent") continue;
+    for (const child of Array.isArray(value) ? value : [value]) {
+      if (child && typeof child.type === "string") yield child;
+    }
   }
-  ts.forEachChild(node, (child) => cjkIn(child, source, out));
+}
+
+/** 节点的文字和报告位置：JSX 文本跳过开头空白，模板片段的位置本就从前面的 ` 或 } 算起。 */
+function textOf(node) {
+  if (node.type === "JSXText") {
+    const lead = node.value.length - node.value.trimStart().length;
+    return { text: node.value, at: node.start + lead };
+  }
+  if (node.type === "Literal" && typeof node.value === "string") return { text: node.value, at: node.start };
+  if (node.type === "TemplateElement") return { text: node.value.cooked ?? node.value.raw, at: node.start };
+  return null;
+}
+
+/** 一个 JSX 子树里所有带中文的文本 / 字符串节点。 */
+function cjkIn(node, out) {
+  const found = textOf(node);
+  if (found && CJK.test(found.text)) out.push({ at: found.at, text: found.text.trim() });
+  for (const child of children(node)) cjkIn(child, out);
+}
+
+function lineCol(code, offset) {
+  const before = code.slice(0, offset);
+  const line = before.split("\n").length;
+  return { line, column: offset - before.lastIndexOf("\n") };
 }
 
 let failures = 0;
 for (const file of files(join(root, "src"))) {
-  const source = ts.createSourceFile(file, readFileSync(file, "utf8"), ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
+  const code = readFileSync(file, "utf8");
+  const { program, errors } = parseSync(file, code, { lang: "tsx" });
+  if (errors.length > 0) {
+    console.error(`${relative(root, file)}  解析失败：${errors[0].message}`);
+    failures += 1;
+    continue;
+  }
   const found = [];
   const visit = (node) => {
-    if (ts.isJsxElement(node) || ts.isJsxSelfClosingElement(node) || ts.isJsxFragment(node)) {
+    if (node.type === "JSXElement" || node.type === "JSXFragment") {
       // 只从最外层的 JSX 节点往下找，里面的嵌套交给 cjkIn 一并走完
-      cjkIn(node, source, found);
+      cjkIn(node, found);
       return;
     }
-    ts.forEachChild(node, visit);
+    for (const child of children(node)) visit(child);
   };
-  visit(source);
-  for (const { node, text } of found) {
-    const { line, character } = source.getLineAndCharacterOfPosition(node.getStart());
-    console.error(`${relative(root, file)}:${line + 1}:${character + 1}  JSX 里不能写中文字面量，放进 messages/*.json：「${text.slice(0, 40)}」`);
+  visit(program);
+  for (const { at, text } of found.sort((a, b) => a.at - b.at)) {
+    const { line, column } = lineCol(code, at);
+    console.error(`${relative(root, file)}:${line}:${column}  JSX 里不能写中文字面量，放进 messages/*.json：「${text.slice(0, 40)}」`);
     failures += 1;
   }
 }

@@ -16,7 +16,7 @@ function SheetContent({
 }: ComponentProps<typeof Primitive.Content> & { side: "left" | "right" }) {
   return (
     <Primitive.Portal>
-      <Primitive.Overlay className="fixed inset-0 z-20 bg-[rgb(20_24_16/0.28)] data-[state=open]:animate-[fade-in_220ms_ease]" />
+      <Primitive.Overlay className="fixed inset-0 z-20 bg-[rgb(0_0_0/0.28)] data-[state=open]:animate-[fade-in_220ms_ease]" />
       <Primitive.Content
         className={cn(
           "fixed inset-y-0 z-25 flex flex-col outline-none",

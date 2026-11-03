@@ -111,7 +111,7 @@ export function TraceView({
         {picked && (
           <aside
             aria-label={m.trace_detail_aside()}
-            className="sticky top-2 mt-2 flex max-h-[calc(100vh-220px)] flex-col overflow-hidden rounded-card bg-surface shadow-lift max-[900px]:fixed max-[900px]:inset-x-0 max-[900px]:top-auto max-[900px]:bottom-0 max-[900px]:z-20 max-[900px]:mt-0 max-[900px]:max-h-[70vh] max-[900px]:rounded-b-none max-[900px]:rounded-t-[16px] max-[900px]:shadow-[0_0_0_1px_rgb(34_40_28/0.12),0_-8px_24px_rgb(34_40_28/0.12)]"
+            className="sticky top-2 mt-2 flex max-h-[calc(100vh-220px)] flex-col overflow-hidden rounded-card bg-surface shadow-lift max-[900px]:fixed max-[900px]:inset-x-0 max-[900px]:top-auto max-[900px]:bottom-0 max-[900px]:z-20 max-[900px]:mt-0 max-[900px]:max-h-[70vh] max-[900px]:rounded-b-none max-[900px]:rounded-t-[16px] max-[900px]:shadow-[0_0_0_1px_rgb(0_0_0/0.12),0_-8px_24px_rgb(0_0_0/0.12)]"
           >
             <TraceDetail key={picked.id} row={picked} trace={trace} ui={ui} />
           </aside>

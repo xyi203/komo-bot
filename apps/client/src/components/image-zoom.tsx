@@ -23,7 +23,7 @@ export function ImageZoom({ src, name, title, className, children }: { src: stri
         </button>
       </Primitive.Trigger>
       <Primitive.Portal>
-        <Primitive.Overlay className="fixed inset-0 z-40 bg-[rgb(20_24_16/0.78)] data-[state=open]:animate-[fade-in_180ms_ease]" />
+        <Primitive.Overlay className="fixed inset-0 z-40 bg-[rgb(0_0_0/0.78)] data-[state=open]:animate-[fade-in_180ms_ease]" />
         <Primitive.Content
           aria-describedby={undefined}
           onClick={() => setOpen(false)}

@@ -110,7 +110,7 @@ export function Composer({
         onDragOver={(event) => event.dataTransfer.types.includes("Files") && event.preventDefault()}
         onDrop={onDrop}
         className={cn(
-          "mx-auto max-w-180 rounded-[16px] p-1.5 shadow-[0_0_0_1px_rgb(34_40_28/0.2),0_2px_8px_rgb(34_40_28/0.05)] transition-shadow focus-within:shadow-[0_0_0_1px_var(--color-muted),0_2px_8px_rgb(34_40_28/0.05)]",
+          "mx-auto max-w-180 rounded-[16px] p-1.5 shadow-[0_0_0_1px_rgb(0_0_0/0.2),0_2px_8px_rgb(0_0_0/0.05)] transition-shadow focus-within:shadow-[0_0_0_1px_var(--color-muted),0_2px_8px_rgb(0_0_0/0.05)]",
           disabled ? "bg-raised" : "bg-surface",
         )}
       >

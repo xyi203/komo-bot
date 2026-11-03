@@ -87,7 +87,7 @@ export function TraceOverview({
         ))}
         {range && (
           <span
-            className="pointer-events-none absolute top-0 bottom-0 bg-[rgb(34_40_28/0.05)] shadow-[inset_1px_0_0_var(--color-faint),inset_-1px_0_0_var(--color-faint)]"
+            className="pointer-events-none absolute top-0 bottom-0 bg-[rgb(0_0_0/0.05)] shadow-[inset_1px_0_0_var(--color-faint),inset_-1px_0_0_var(--color-faint)]"
             style={{ left: pct(range[0] - model.start), width: pct(range[1] - range[0]) }}
           />
         )}

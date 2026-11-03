@@ -37,10 +37,10 @@ export function Palette() {
   return (
     <Dialog.Root open={open} onOpenChange={(next) => !next && closePalette()}>
       <Dialog.Portal>
-        <Dialog.Overlay className="fixed inset-0 z-30 bg-[rgb(20_24_16/0.32)]" />
+        <Dialog.Overlay className="fixed inset-0 z-30 bg-[rgb(0_0_0/0.32)]" />
         <Dialog.Content
           aria-describedby={undefined}
-          className="fixed top-[12vh] left-1/2 z-35 flex max-h-[min(640px,calc(100svh-96px))] w-[min(760px,calc(100vw-32px))] -translate-x-1/2 flex-col overflow-hidden rounded-dialog bg-surface text-text shadow-[0_0_0_1px_rgb(34_40_28/0.12),0_24px_48px_rgb(20_24_16/0.18)] outline-none max-[600px]:top-4 max-[600px]:max-h-[calc(100svh-32px)]"
+          className="fixed top-[12vh] left-1/2 z-35 flex max-h-[min(640px,calc(100svh-96px))] w-[min(760px,calc(100vw-32px))] -translate-x-1/2 flex-col overflow-hidden rounded-dialog bg-surface text-text shadow-[0_0_0_1px_rgb(0_0_0/0.12),0_24px_48px_rgb(0_0_0/0.18)] outline-none max-[600px]:top-4 max-[600px]:max-h-[calc(100svh-32px)]"
         >
           <Dialog.Title className="sr-only">{m.palette_title()}</Dialog.Title>
           <PaletteBody />

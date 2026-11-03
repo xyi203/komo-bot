@@ -1,24 +1,24 @@
 @import "tailwindcss";
 
 /* DESIGN.md 的 token 原样搬进 Tailwind v4 的 @theme：颜色、圆角、字体、字号与阴影都是 CSS 变量，
-   视觉以 DESIGN.md 为准，不在这里另起一套。叶绿（accent）只表示"在场"与"运行中"。 */
+   视觉以 DESIGN.md 为准，不在这里另起一套。陶土橙（accent）只表示"在场"与"运行中"。 */
 @theme {
-  --color-ground: #f2f3ef;
+  --color-ground: #f4f4f5;
   --color-surface: #ffffff;
-  --color-raised: #f1f2ee;
-  --color-active: #e3e6de;
-  --color-hover: #e9ebe5;
-  --color-hover-on-white: #f3f4f0;
-  --color-border: #e4e6df;
-  --color-rule: #eef0ea;
-  --color-control: #d3d7cc;
-  --color-text: #22281c;
-  --color-muted: #565d4e;
-  --color-faint: #636a5a;
-  --color-primary: #20251b;
-  --color-primary-hover: #343b2c;
-  --color-accent: #4f6b38;
-  --color-accent-pale: #e7eedd;
+  --color-raised: #f4f4f5;
+  --color-active: #e8e8ea;
+  --color-hover: #ececee;
+  --color-hover-on-white: #f5f5f6;
+  --color-border: #e6e6e8;
+  --color-rule: #efeff1;
+  --color-control: #d4d4d8;
+  --color-text: #1a1a1a;
+  --color-muted: #5c5c61;
+  --color-faint: #6b6b70;
+  --color-primary: #1a1a1a;
+  --color-primary-hover: #36363a;
+  --color-accent: #b95736;
+  --color-accent-pale: #f6e4dc;
   --color-negative: #b3261e;
   --color-negative-pale: #fdf1f0;
   --color-negative-ring: #f1c9c5;
@@ -31,14 +31,14 @@
   --color-diff-del-gutter: #f7dcd8;
   --color-diff-del-hl: #f0c0b9;
   --color-diff-del-ink: #b3261e;
-  --color-pill-bg: #eef0ea;
-  --color-pill-ink: #3f4637;
+  --color-pill-bg: #f0f0f1;
+  --color-pill-ink: #3f3f43;
   --color-pill-wait-bg: #fbf3d6;
   --color-pill-wait-ink: #6b4f0a;
   --color-pill-bad-bg: #fdecea;
   --color-pill-bad-ink: #8a1c15;
   --color-wait-dot: #c98a12;
-  --color-memory-off: #a9ae9f;
+  --color-memory-off: #a1a1a6;
   --color-focus: hsl(212 100% 48%);
 
   --radius-xs: 4px;
@@ -67,9 +67,9 @@
   --text-small--line-height: 18px;
 
   /* 边线画在阴影层：1px 零模糊的环，透明度随底色走（原型的 --ring / --lift） */
-  --shadow-ring: 0 0 0 1px rgb(34 40 28 / 0.12);
-  --shadow-ring-control: 0 0 0 1px rgb(34 40 28 / 0.2);
-  --shadow-lift: 0 0 0 1px rgb(34 40 28 / 0.12), 0 2px 2px rgb(34 40 28 / 0.04);
+  --shadow-ring: 0 0 0 1px rgb(0 0 0 / 0.12);
+  --shadow-ring-control: 0 0 0 1px rgb(0 0 0 / 0.2);
+  --shadow-lift: 0 0 0 1px rgb(0 0 0 / 0.12), 0 2px 2px rgb(0 0 0 / 0.04);
 
   --ease-out-expo: cubic-bezier(0.16, 1, 0.3, 1);
 }

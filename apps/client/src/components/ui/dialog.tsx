@@ -11,10 +11,10 @@ const DialogDescription = Primitive.Description;
 function DialogContent({ className, children, ...props }: ComponentProps<typeof Primitive.Content>) {
   return (
     <Primitive.Portal>
-      <Primitive.Overlay className="fixed inset-0 z-40 bg-[rgb(20_24_16/0.32)] data-[state=open]:animate-[fade-in_180ms_ease]" />
+      <Primitive.Overlay className="fixed inset-0 z-40 bg-[rgb(0_0_0/0.32)] data-[state=open]:animate-[fade-in_180ms_ease]" />
       <Primitive.Content
         className={cn(
-          "fixed top-1/2 left-1/2 z-45 -translate-x-1/2 -translate-y-1/2 overflow-hidden rounded-dialog bg-surface text-text shadow-[var(--shadow-ring),0_24px_64px_rgb(20_24_16/0.18)] outline-none data-[state=open]:animate-[dialog-in_180ms_var(--ease-out-expo)]",
+          "fixed top-1/2 left-1/2 z-45 -translate-x-1/2 -translate-y-1/2 overflow-hidden rounded-dialog bg-surface text-text shadow-[var(--shadow-ring),0_24px_64px_rgb(0_0_0/0.18)] outline-none data-[state=open]:animate-[dialog-in_180ms_var(--ease-out-expo)]",
           className,
         )}
         {...props}

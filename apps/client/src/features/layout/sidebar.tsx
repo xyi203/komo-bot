@@ -22,9 +22,9 @@ export function Sidebar() {
     <>
       <div className="traffic-clear flex h-12 items-center gap-2 px-4">
         <svg viewBox="0 0 28 28" aria-hidden="true" className="size-5.5">
-          <circle cx="11" cy="12" r="8" fill="#4f6b38" />
-          <circle cx="20.5" cy="18.5" r="4.5" fill="#4f6b38" fillOpacity="0.55" />
-          <circle cx="20" cy="7" r="2.5" fill="#4f6b38" fillOpacity="0.3" />
+          <circle cx="11" cy="12" r="8" className="fill-accent" />
+          <circle cx="20.5" cy="18.5" r="4.5" className="fill-accent" fillOpacity="0.55" />
+          <circle cx="20" cy="7" r="2.5" className="fill-accent" fillOpacity="0.3" />
         </svg>
         <span className="text-section-title font-semibold tracking-tight">{m.app_name()}</span>
         {narrow && <IconButton name="x" label={m.nav_close()} className="ml-auto" onClick={closeDrawer} />}

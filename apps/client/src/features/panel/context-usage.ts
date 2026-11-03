@@ -11,14 +11,14 @@ export type PartKey = "messages" | "results" | "tools" | "memory" | "skills" | "
 
 /** 分段的颜色是数据色（深到浅），不属于界面 token。 */
 export const PART_COLORS: Record<PartKey, string> = {
-  messages: "#4f6b38",
-  results: "#7f9a63",
-  tools: "#b3c59c",
-  memory: "#3f4637",
-  skills: "#8d9384",
-  project: "#aab0a1",
-  system: "#c9cdc1",
-  summary: "#dfe2d9",
+  messages: "#b95736",
+  results: "#d98a6c",
+  tools: "#ebb8a3",
+  memory: "#3f3f43",
+  skills: "#85858a",
+  project: "#a1a1a6",
+  system: "#c4c4c8",
+  summary: "#dedee1",
 };
 export const PART_ORDER: PartKey[] = ["messages", "results", "tools", "memory", "skills", "project", "system", "summary"];
 

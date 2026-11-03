@@ -79,7 +79,7 @@ export function Switch({ checked, onChange, label, disabled }: { checked: boolea
     >
       <i
         className={cn(
-          "absolute top-0.75 left-0.75 size-4.5 rounded-full bg-white shadow-[0_1px_2px_rgb(20_24_16/0.2)] transition-transform duration-150 ease-out-expo",
+          "absolute top-0.75 left-0.75 size-4.5 rounded-full bg-white shadow-[0_1px_2px_rgb(0_0_0/0.2)] transition-transform duration-150 ease-out-expo",
           checked && "translate-x-4",
         )}
       />

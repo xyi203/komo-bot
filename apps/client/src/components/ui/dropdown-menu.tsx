@@ -22,7 +22,7 @@ function DropdownMenuContent({
         sideOffset={sideOffset}
         collisionPadding={8}
         className={cn(
-          "z-30 rounded-card bg-surface p-1.5 shadow-[0_0_0_1px_rgb(34_40_28/0.12),0_8px_24px_rgb(34_40_28/0.12)]",
+          "z-30 rounded-card bg-surface p-1.5 shadow-[0_0_0_1px_rgb(0_0_0/0.12),0_8px_24px_rgb(0_0_0/0.12)]",
           size === "default" ? "w-62" : "min-w-42 p-1",
           className,
         )}

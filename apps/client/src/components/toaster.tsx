@@ -9,7 +9,7 @@ export function Toaster() {
   return (
     <div role="status" className="fixed inset-x-0 bottom-20 z-50 flex flex-col items-center gap-2 px-4">
       {toasts.map((toast) => (
-        <div key={toast.id} className="flex max-w-lg items-start gap-2 rounded-card bg-surface py-2.5 pr-2 pl-3.5 text-label leading-5 shadow-[0_0_0_1px_rgb(34_40_28/0.12),0_8px_24px_rgb(34_40_28/0.12)]">
+        <div key={toast.id} className="flex max-w-lg items-start gap-2 rounded-card bg-surface py-2.5 pr-2 pl-3.5 text-label leading-5 shadow-[0_0_0_1px_rgb(0_0_0/0.12),0_8px_24px_rgb(0_0_0/0.12)]">
           <span className="min-w-0 break-words">{toast.text}</span>
           <button
             type="button"

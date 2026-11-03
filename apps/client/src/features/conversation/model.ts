@@ -219,7 +219,8 @@ function apply(view: View, event: WireEvent): void {
       }
       break;
     case "context.compacted":
-      view.items.push({ kind: "note", id: event.event_id });
+      // 只有真换成摘要才标；`decayed`（旧工具结果换短视图）与 `skipped`（没压）不是给人看的边界
+      if (payload<{ outcome?: string }>(event).outcome === "compacted") view.items.push({ kind: "note", id: event.event_id });
       break;
     case "config.changed": {
       const { model } = payload<{ model: string }>(event);

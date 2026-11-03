@@ -8,7 +8,6 @@ import { Button } from "@/components/ui/button";
 import { columnLabelClass, listClass, rowClass, rowOnClass, SectionTitle } from "@/features/matters/parts";
 import { errorText } from "@/lib/errors";
 import { formatNumber, formatRelative } from "@/lib/format";
-import { useMediaQuery } from "@/lib/hooks";
 import { showToast } from "@/lib/toast";
 import { cn } from "@/lib/utils";
 import { m } from "@/paraglide/messages.js";
@@ -42,12 +41,11 @@ const ROW_GRID =
 
 /**
  * 记忆页（docs/web.md §11）：komo 现在把哪些关于我的事带进对话，哪些等我过目。
- * 上面是"攒下的记忆"图（图例兼筛选），下面是列表加详情；选中的 id 在地址里（`/memory/$id`），
- * 窄屏（≤1180）详情盖住列表，左上角返回。
+ * 上面是"攒下的记忆"图（图例兼筛选），下面是列表。点一条进它的详情页（不论窗口宽窄），左上角返回，列表回到原来的
+ * 滚动位置；选中的 id 在地址里（`/memory/$id`）。
  */
 export function MemoryPage({ selected }: { selected: string | null }) {
   const navigate = useNavigate();
-  const compact = useMediaQuery("(max-width: 1180px)");
   const view = useMemoryView();
   const query = useMemoriesAll();
   const coverage = useMemoryCoverage().data;
@@ -74,17 +72,15 @@ export function MemoryPage({ selected }: { selected: string | null }) {
   const current = selected ? byId.get(selected) : undefined;
 
   const select = (id: string) => {
-    if (compact) {
-      patchView({ listScroll: scroller()?.scrollTop ?? 0 });
-      scroller()?.scrollTo({ top: 0 });
-    }
+    patchView({ listScroll: scroller()?.scrollTop ?? 0 });
+    scroller()?.scrollTo({ top: 0 });
     patchView({ adding: false });
     void navigate({ to: "/memory/$id", params: { id } });
   };
   const back = () => {
     patchView({ adding: false });
     void navigate({ to: "/memory" });
-    if (compact) requestAnimationFrame(() => requestAnimationFrame(() => scroller()?.scrollTo({ top: getView().listScroll })));
+    requestAnimationFrame(() => requestAnimationFrame(() => scroller()?.scrollTo({ top: getView().listScroll })));
   };
   const clearSelection = () => {
     patchView({ adding: false });
@@ -97,10 +93,6 @@ export function MemoryPage({ selected }: { selected: string | null }) {
     // 只在选中的那条或清单变了才对一次，不拦着用户之后点别的档
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selected, ready]);
-  // 宽屏没选就选列表第一条（换地址不留历史）
-  useEffect(() => {
-    if (!compact && ready && !selected && !view.adding && rows && rows.length) void navigate({ to: "/memory/$id", params: { id: rows[0].id }, replace: true });
-  }, [compact, ready, selected, view.adding, rows, navigate]);
   // 选中的那条不在了（清单变了）：回到没选
   useEffect(() => {
     if (ready && selected && !byId.has(selected) && !find.isFetching) void navigate({ to: "/memory", replace: true });
@@ -123,13 +115,12 @@ export function MemoryPage({ selected }: { selected: string | null }) {
     }
   };
 
-  const showDetail = view.adding || !!selected || (!compact && !!rows?.length);
   const detail = (
-    <DetailCard label={m.memory_detail_label()} compact={compact}>
+    <DetailCard label={m.memory_detail_label()} compact>
       {view.adding ? (
         <AddForm
           scopes={scopesIn(all, true)}
-          compact={compact}
+          compact
           onClose={back}
           onAdded={(item) => {
             patchView({ bucket: "live", query: "", adding: false });
@@ -137,7 +128,7 @@ export function MemoryPage({ selected }: { selected: string | null }) {
           }}
         />
       ) : current ? (
-        <MemoryDetail key={current.id} item={current} all={byId} compact={compact} onBack={back} />
+        <MemoryDetail key={current.id} item={current} all={byId} compact onBack={back} />
       ) : !ready ? (
         query.isError ? null : (
           <div className="p-4">
@@ -150,8 +141,8 @@ export function MemoryPage({ selected }: { selected: string | null }) {
     </DetailCard>
   );
 
-  // 窄屏进了详情：页头与列表都收起，只给详情
-  if (compact && (selected || view.adding)) {
+  // 进了详情：页头与列表都收起，只给详情
+  if (selected || view.adding) {
     return (
       <Page title={m.nav_memory()} bare>
         {detail}
@@ -168,7 +159,7 @@ export function MemoryPage({ selected }: { selected: string | null }) {
       actions={
         <Button
           onClick={() => {
-            if (compact) patchView({ listScroll: scroller()?.scrollTop ?? 0 });
+            patchView({ listScroll: scroller()?.scrollTop ?? 0 });
             patchView({ adding: true });
             if (selected) void navigate({ to: "/memory" });
           }}
@@ -195,7 +186,7 @@ export function MemoryPage({ selected }: { selected: string | null }) {
           select(id);
         }}
       />
-      <PageBody columns={compact || !showDetail ? "grid-cols-[minmax(0,1fr)]" : "grid-cols-[minmax(0,1fr)_360px]"}>
+      <PageBody columns={"grid-cols-[minmax(0,1fr)]"}>
         <section ref={listRef} aria-label={title} className="min-w-0">
           <div className="flex min-h-9 items-center gap-3 max-[600px]:flex-wrap">
             <SectionTitle count={rows ? m.memory_list_count({ count: formatNumber(rows.length) }) : undefined} className="min-w-0 flex-1">
@@ -269,7 +260,6 @@ export function MemoryPage({ selected }: { selected: string | null }) {
                 : ""}
           </p>
         </section>
-        {showDetail && !compact && detail}
       </PageBody>
     </Page>
   );

@@ -1,13 +1,12 @@
 import { useCronList, useMatterList, useOwnedMemories, useSessions } from "@komo/api";
 import type { Matter, MemoryItem } from "@komo/protocol";
 import { useNavigate } from "@tanstack/react-router";
-import { useEffect, useMemo, useState } from "react";
+import { useMemo, useState } from "react";
 import { Icon } from "@/components/icon";
 import { BlockError, DetailCard, EmptyFrame, Page, PageBody, SkeletonRows } from "@/components/page";
 import { Button } from "@/components/ui/button";
 import { MemoryMote } from "@/features/memory/mote";
 import { errorText } from "@/lib/errors";
-import { useMediaQuery } from "@/lib/hooks";
 import { cn } from "@/lib/utils";
 import { m } from "@/paraglide/messages.js";
 import { dayDiff, dueOf, formatInstantDay, isClosed, statusLabel } from "./dates";
@@ -56,8 +55,8 @@ function finding(open: Matter[], today: string | undefined): string {
 const COLUMNS = "grid-cols-[16px_minmax(0,1fr)_104px_84px_76px] max-[600px]:grid-cols-[16px_minmax(0,1fr)_auto]";
 
 /**
- * 事项页（docs/web.md §12）：目标与领域，列表在左、详情在右；选中的 id 在地址里（`/matters/$id`），
- * 窄屏（≤1180）详情盖住列表。"新建"表单占详情的位置，不进地址。
+ * 事项页（docs/web.md §12）：目标与领域。点一件进它的详情页（不论窗口宽窄），左上角返回列表；选中的 id 在地址里
+ * （`/matters/$id`）。"新建"表单也是这样一页，不进地址。
  */
 export function MattersPage({ selected }: { selected: string | null }) {
   const query = useMatterList();
@@ -65,7 +64,6 @@ export function MattersPage({ selected }: { selected: string | null }) {
   const cron = useCronList().data;
   const sessions = useSessions(true).data;
   const navigate = useNavigate();
-  const compact = useMediaQuery("(max-width: 1180px)");
   const [creating, setCreating] = useState(false);
   const [showClosed, setShowClosed] = useState(false);
 
@@ -84,13 +82,6 @@ export function MattersPage({ selected }: { selected: string | null }) {
     return byMatter;
   }, [memories]);
 
-  // 宽屏没选就选第一件在做的（换地址不留历史）
-  useEffect(() => {
-    if (compact || creating || !ready || selected) return;
-    const first = groups.open[0] ?? items[0];
-    if (first) void navigate({ to: "/matters/$id", params: { id: first.id }, replace: true });
-  }, [compact, creating, ready, selected, groups.open, items, navigate]);
-
   const select = (id: string) => {
     setCreating(false);
     void navigate({ to: "/matters/$id", params: { id } });
@@ -100,12 +91,11 @@ export function MattersPage({ selected }: { selected: string | null }) {
     else void navigate({ to: "/matters" });
   };
 
-  const showDetail = creating || !!selected || (!compact && items.length > 0);
   const detail = (
-    <DetailCard label={m.matter_detail()} compact={compact}>
+    <DetailCard label={m.matter_detail()} compact>
       {creating ? (
         <NewMatterForm
-          compact={compact}
+          compact
           onBack={back}
           onClose={() => setCreating(false)}
           onCreated={(id) => {
@@ -127,7 +117,7 @@ export function MattersPage({ selected }: { selected: string | null }) {
           memories={ownedBy.get(current.id) ?? []}
           jobs={cron?.jobs ?? []}
           sessions={sessions ?? []}
-          compact={compact}
+          compact
           onBack={back}
         />
       ) : (
@@ -136,8 +126,8 @@ export function MattersPage({ selected }: { selected: string | null }) {
     </DetailCard>
   );
 
-  // 窄屏选中了一件（或在新建）：只给详情
-  if (compact && (selected || creating)) {
+  // 选中了一件（或在新建）：只给详情
+  if (selected || creating) {
     return (
       <Page title={m.nav_matters()} bare>
         {detail}
@@ -157,7 +147,7 @@ export function MattersPage({ selected }: { selected: string | null }) {
       finding={ready ? finding(groups.open, today) : query.isError ? m.matter_finding_error() : undefined}
       actions={newButton}
     >
-      <PageBody columns={compact || !showDetail ? "grid-cols-[minmax(0,1fr)]" : "grid-cols-[minmax(0,1fr)_360px]"}>
+      <PageBody columns={"grid-cols-[minmax(0,1fr)]"}>
         <section aria-label={m.matter_list()} className="min-w-0">
           {query.isError ? (
             <BlockError message={m.matter_load_error({ message: errorText(query.error) })} onRetry={() => void query.refetch()} />
@@ -181,7 +171,6 @@ export function MattersPage({ selected }: { selected: string | null }) {
             </>
           )}
         </section>
-        {showDetail && !compact && detail}
       </PageBody>
     </Page>
   );

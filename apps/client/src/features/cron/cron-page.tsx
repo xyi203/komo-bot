@@ -9,7 +9,6 @@ import { columnLabelClass, DetailTop, FormError, Kv, linkClass, listClass, Notic
 import { sessionTitle } from "@/features/sessions/title";
 import { errorText } from "@/lib/errors";
 import { scheduleText } from "@/lib/cron-text";
-import { useMediaQuery } from "@/lib/hooks";
 import { cn } from "@/lib/utils";
 import { m } from "@/paraglide/messages.js";
 import { formatWhen } from "./when";
@@ -28,14 +27,13 @@ function FiringPill({ last }: { last: CronFiring | undefined }) {
 }
 
 /**
- * 定时页（docs/web.md §13）：一个列表，点开看详情；不选时列表独占画布。选中的任务 id 在地址里（`/cron/$id`），
- * 窄屏（≤1180）详情盖住列表。新建与修改走对话或 `komo cron`。
+ * 定时页（docs/web.md §13）：一个列表，点一个进它的详情页（不论窗口宽窄），左上角返回。选中的任务 id 在地址里
+ * （`/cron/$id`）。新建与修改走对话或 `komo cron`。
  */
 export function CronPage({ selected }: { selected: string | null }) {
   const query = useCronList();
   const sessions = useSessions(true).data;
   const navigate = useNavigate();
-  const compact = useMediaQuery("(max-width: 1180px)");
   const jobs = useMemo(() => query.data?.jobs ?? [], [query.data]);
   const statuses = useMemo(() => new Map<string, CronJobStatus>((query.data?.status ?? []).map((x) => [x.job, x])), [query.data]);
   const ready = query.isSuccess;
@@ -64,13 +62,13 @@ export function CronPage({ selected }: { selected: string | null }) {
   const close = () => void navigate({ to: "/cron" });
 
   const detail = current ? (
-    <DetailCard label={m.cron_detail()} compact={compact}>
-      <CronDetail key={current.id} job={current} status={statuses.get(current.id)} sessions={sessions ?? []} compact={compact} onClose={close} />
+    <DetailCard label={m.cron_detail()} compact>
+      <CronDetail key={current.id} job={current} status={statuses.get(current.id)} sessions={sessions ?? []} compact onClose={close} />
     </DetailCard>
   ) : null;
 
-  // 窄屏选中了一个：只给详情
-  if (compact && selected && detail) {
+  // 选中了一个：只给详情
+  if (selected && detail) {
     return (
       <Page title={m.nav_cron()} bare>
         {detail}
@@ -80,7 +78,7 @@ export function CronPage({ selected }: { selected: string | null }) {
 
   return (
     <Page title={m.nav_cron()} finding={ready ? finding() : query.isError ? m.cron_finding_error() : undefined}>
-      <PageBody columns={detail && !compact ? "grid-cols-[minmax(0,1fr)_360px]" : "grid-cols-[minmax(0,1fr)]"}>
+      <PageBody columns={"grid-cols-[minmax(0,1fr)]"}>
         <section aria-label={m.cron_list()} className="min-w-0">
           {query.isError ? (
             <BlockError message={m.cron_load_error({ message: errorText(query.error) })} onRetry={() => void query.refetch()} />
@@ -143,7 +141,6 @@ export function CronPage({ selected }: { selected: string | null }) {
             </>
           )}
         </section>
-        {detail && !compact && detail}
       </PageBody>
     </Page>
   );
@@ -199,7 +196,8 @@ function CronDetail({
       <DetailTop
         label={isCommand ? m.cron_kind_command() : m.cron_kind_prompt()}
         pill={<Pill tone={job.status === "active" ? undefined : "off"}>{stateLabel(job.status)}</Pill>}
-        onClose={onClose}
+        compact={compact}
+        onBack={onClose}
       />
       <p className="mt-3 text-read leading-6">{job.name}</p>
       <p className="mt-2 text-label leading-5">

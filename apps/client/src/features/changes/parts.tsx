@@ -24,8 +24,8 @@ export function Counts({ file }: { file: ChangedFile }) {
 export function Totals({ added, deleted }: { added: number; deleted: number }) {
   return (
     <span className="ml-auto flex shrink-0 gap-1.5 font-mono text-small">
-      <span className="text-text tabular-nums">+{added}</span>
-      <span className="text-faint tabular-nums">−{deleted}</span>
+      <span className="text-diff-add-ink tabular-nums">+{added}</span>
+      <span className="text-diff-del-ink tabular-nums">−{deleted}</span>
     </span>
   );
 }

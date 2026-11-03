@@ -2,6 +2,8 @@
   "$schema": "https://inlang.com/schema/inlang-message-format",
   "app_name": "komo",
   "attachment_image": "Image",
+  "attachment_zoom": "View full size: {name}",
+  "attachment_zoom_close": "Close",
   "call_copy_command": "Copy command",
   "call_failed": "Failed",
   "call_inspect": "Inspect",

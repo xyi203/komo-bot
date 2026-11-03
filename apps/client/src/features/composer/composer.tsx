@@ -1,6 +1,7 @@
 import { useModels } from "@komo/api";
 import { useRef, useState, type ClipboardEvent, type DragEvent, type FormEvent, type KeyboardEvent } from "react";
 import { Icon } from "@/components/icon";
+import { ImageZoom } from "@/components/image-zoom";
 import { Spinner } from "@/components/spinner";
 import type { View } from "@/features/conversation/model";
 import { pctOf, pctText, type ContextView } from "@/features/panel/context-usage";
@@ -206,7 +207,7 @@ export function Composer({
   );
 }
 
-/** 框里待发的附件：图片是方形缩略图，其他文件是带文件名的标签；传着的半透明，传失败的标红（悬停看原因）。 */
+/** 框里待发的附件：图片是方形缩略图（点开看大图），其他文件是带文件名的标签；传着的半透明，传失败的标红（悬停看原因）。 */
 function DraftList({ drafts, onRemove }: { drafts: readonly Draft[]; onRemove: (id: string) => void }) {
   return (
     <ul className="flex flex-wrap gap-2 px-1.5 pt-1.5 pb-2">
@@ -224,7 +225,9 @@ function DraftList({ drafts, onRemove }: { drafts: readonly Draft[]; onRemove: (
             )}
           >
             {d.preview ? (
-              <img src={d.preview} alt={d.name} className="size-16 rounded-inner object-cover" />
+              <ImageZoom src={d.preview} name={d.name} className="rounded-inner">
+                <img src={d.preview} alt={d.name} className="size-16 rounded-inner object-cover" />
+              </ImageZoom>
             ) : (
               <span className="flex h-16 max-w-48 items-center gap-1.5 px-3 text-label text-text">
                 <Icon name="file" className="size-3.5 shrink-0 text-muted" />
@@ -232,7 +235,7 @@ function DraftList({ drafts, onRemove }: { drafts: readonly Draft[]; onRemove: (
               </span>
             )}
             {d.state === "uploading" && (
-              <span className="absolute inset-0 grid place-items-center">
+              <span className="pointer-events-none absolute inset-0 grid place-items-center">
                 <Spinner small />
               </span>
             )}

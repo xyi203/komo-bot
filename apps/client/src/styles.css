@@ -22,6 +22,15 @@
   --color-negative: #b3261e;
   --color-negative-pale: #fdf1f0;
   --color-negative-ring: #f1c9c5;
+  /* 改动对比的增删：加的绿、删的红，行底 / 行号栏 / 行内改动三档由浅到深，字仍是墨色 */
+  --color-diff-add-bg: #eaf3e0;
+  --color-diff-add-gutter: #d9e9c9;
+  --color-diff-add-hl: #c4dca9;
+  --color-diff-add-ink: #3d6b26;
+  --color-diff-del-bg: #fcefed;
+  --color-diff-del-gutter: #f7dcd8;
+  --color-diff-del-hl: #f0c0b9;
+  --color-diff-del-ink: #b3261e;
   --color-pill-bg: #eef0ea;
   --color-pill-ink: #3f4637;
   --color-pill-wait-bg: #fbf3d6;

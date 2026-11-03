@@ -7,7 +7,7 @@ import { errorText } from "@/lib/errors";
 import { formatNumber } from "@/lib/format";
 import { cn } from "@/lib/utils";
 import { m } from "@/paraglide/messages.js";
-import { homeDir, parsePatch } from "./diff";
+import { homeDir, parsePatch, type DiffRow } from "./diff";
 import { ChangeTag, Counts, PathView, sumOf } from "./parts";
 
 const DIFF_ROWS = 5000; // 一个文件最多画这么多行
@@ -64,8 +64,8 @@ export function ChangesPage({
             <h2 className="mt-1 mb-2 flex items-baseline gap-2 text-label font-medium text-text">
               <span className="shrink-0">{turn ? m.changes_turn({ n: turn }) : m.changes_turn_unknown()}</span>
               <span className="shrink-0 font-normal text-muted tabular-nums">
-                {m.changes_turn_files({ count: formatNumber(changes.total) })} · <span className="text-text">+{added}</span>{" "}
-                <span className="text-faint">−{deleted}</span>
+                {m.changes_turn_files({ count: formatNumber(changes.total) })} · <span className="text-diff-add-ink">+{added}</span>{" "}
+                <span className="text-diff-del-ink">−{deleted}</span>
               </span>
               <span title={changes.cwd} className="ml-auto min-w-0 overflow-hidden font-mono text-small font-normal text-ellipsis whitespace-nowrap text-faint">
                 {homeDir(changes.cwd)}
@@ -122,15 +122,16 @@ function Diff({ run, index }: { run: string; index: number }) {
   }
   const rows = parsePatch(data.patch ?? "");
   const shown = rows.slice(0, DIFF_ROWS);
-  // 新建的文件整段都是加的，不再逐行铺底
+  // 新建的文件整段都是加的：正文不铺绿底（整片绿反而吵），只留行号栏与符号的绿
   const whole = rows.every((r) => r.t === "+" || r.t === "@");
   const ln = "w-11 shrink-0 pr-2 text-right text-faint tabular-nums select-none max-[600px]:w-[30px] max-[600px]:pr-1";
+  const gutter = (t: DiffRow["t"]) => (t === "+" ? "bg-diff-add-gutter text-diff-add-ink" : t === "-" ? "bg-diff-del-gutter text-diff-del-ink" : undefined);
   return (
     <>
       <div className="overflow-x-auto border-t border-rule py-1 pb-1.5 font-mono text-[12.5px] leading-5">
         {shown.map((row, i) =>
           row.t === "@" ? (
-            <div key={i} className="flex min-w-max bg-raised text-faint">
+            <div key={i} className="flex min-w-max bg-raised text-muted">
               <span className={ln} />
               <span className={ln} />
               <span className="flex-1 pr-4 pl-4 whitespace-pre">{row.s}</span>
@@ -138,19 +139,35 @@ function Diff({ run, index }: { run: string; index: number }) {
           ) : (
             <div
               key={i}
-              className={cn("flex min-w-max", row.t === "+" && !whole && "bg-hover", row.t === "-" && "text-faint")}
+              className={cn("flex min-w-max", row.t === "+" && !whole && "bg-diff-add-bg", row.t === "-" && "bg-diff-del-bg")}
             >
-              <span className={cn(ln, row.t === "+" && "text-text")}>{row.a ?? ""}</span>
-              <span className={cn(ln, row.t === "+" && "text-text")}>{row.b ?? ""}</span>
-              <span aria-hidden="true" className={cn("w-4 shrink-0 text-center text-faint select-none", row.t === "+" && "text-text")}>
+              <span className={cn(ln, gutter(row.t))}>{row.a ?? ""}</span>
+              <span className={cn(ln, gutter(row.t))}>{row.b ?? ""}</span>
+              <span
+                aria-hidden="true"
+                className={cn("w-5 shrink-0 text-center font-semibold select-none", row.t === "+" ? "text-diff-add-ink" : row.t === "-" && "text-diff-del-ink")}
+              >
                 {row.t === " " ? "" : row.t === "-" ? "−" : "+"}
               </span>
-              <span className="flex-1 pr-4 whitespace-pre">{row.s || " "}</span>
+              <span className="flex-1 pr-4 whitespace-pre text-text">{row.s ? <Line row={row} /> : " "}</span>
             </div>
           ),
         )}
       </div>
       {rows.length > shown.length && <p className={note}>{m.changes_diff_truncated({ shown: DIFF_ROWS, rest: rows.length - shown.length })}</p>}
+    </>
+  );
+}
+
+/** 一行正文；配上对的删 / 加行把改了的那段铺深一档底色。 */
+function Line({ row }: { row: DiffRow }) {
+  if (!row.hl) return <>{row.s}</>;
+  const [from, to] = row.hl;
+  return (
+    <>
+      {row.s.slice(0, from)}
+      <span className={cn("rounded-xs", row.t === "+" ? "bg-diff-add-hl" : "bg-diff-del-hl")}>{row.s.slice(from, to)}</span>
+      {row.s.slice(to)}
     </>
   );
 }

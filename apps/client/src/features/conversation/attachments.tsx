@@ -1,4 +1,5 @@
 import { Icon } from "@/components/icon";
+import { ImageZoom } from "@/components/image-zoom";
 import { m } from "@/paraglide/messages.js";
 
 /**
@@ -34,21 +35,21 @@ export function splitAttachments(text: string): { attachments: Attachment[]; tex
   return { attachments, text: lines.slice(at).join("\n") };
 }
 
-/** 用户消息里的附件：图片是缩略图（取不回来的退成文件名），其他文件是一枚带文件名的标签；悬停看完整路径。 */
+/** 用户消息里的附件：图片是缩略图（取不回来的退成文件名），点开看大图；其他文件是一枚带文件名的标签；悬停看完整路径。 */
 export function AttachmentList({ attachments }: { attachments: readonly Attachment[] }) {
   if (!attachments.length) return null;
   return (
     <div className="flex max-w-[80%] flex-wrap justify-end gap-1.5 max-[600px]:max-w-[88%]">
       {attachments.map((a, i) =>
         a.kind === "image" && a.url ? (
-          <img
-            key={i}
-            src={a.url}
-            alt={m.attachment_image()}
-            title={a.path}
-            loading="lazy"
-            className="max-h-40 max-w-60 rounded-[12px] bg-raised object-cover shadow-ring"
-          />
+          <ImageZoom key={i} src={a.url} name={a.path.split(/[/\\]/).pop() ?? m.attachment_image()} title={a.path} className="rounded-[12px]">
+            <img
+              src={a.url}
+              alt={m.attachment_image()}
+              loading="lazy"
+              className="max-h-40 max-w-60 rounded-[12px] bg-raised object-cover shadow-ring"
+            />
+          </ImageZoom>
         ) : (
           <span key={i} title={a.path} className="inline-flex h-8 max-w-60 items-center gap-1.5 rounded-control bg-raised px-2.5 text-label text-text">
             <Icon name="file" className="size-3.5 shrink-0 text-muted" />

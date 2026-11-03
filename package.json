@@ -12,7 +12,7 @@
     "lint": "pnpm -r --if-present lint",
     "typecheck": "pnpm -r --if-present typecheck",
     "desktop:dev": "pnpm --filter @komo/client build && pnpm --filter @komo/desktop dev",
-    "desktop:build": "pnpm --filter @komo/desktop pack",
-    "desktop:dist": "pnpm --filter @komo/desktop dist"
+    "desktop:build": "pnpm --filter @komo/desktop run pack",
+    "desktop:dist": "pnpm --filter @komo/desktop run dist"
   }
 }

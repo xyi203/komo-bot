@@ -132,6 +132,8 @@
   "channels_state_running_for": "Running for {time}",
   "close": "Close",
   "composer_archived": "This session is archived and read-only",
+  "composer_attach": "Add attachment",
+  "composer_attach_unsupported": "Attachments aren't supported yet — paste the content or give a file path instead",
   "composer_cache": "cache hit {pct}%",
   "composer_effort": "Effort",
   "composer_interject": "↵ to interject into the running turn",

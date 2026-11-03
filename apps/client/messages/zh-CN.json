@@ -132,6 +132,8 @@
   "channels_state_running_for": "在跑 {time}",
   "close": "关闭",
   "composer_archived": "这段对话已归档，只能查看",
+  "composer_attach": "添加附件",
+  "composer_attach_unsupported": "附件还不支持，先把内容贴进对话里或写上文件路径",
   "composer_cache": "缓存命中 {pct}%",
   "composer_effort": "推理强度",
   "composer_interject": "↵ 插话，并进正在跑的这一轮",

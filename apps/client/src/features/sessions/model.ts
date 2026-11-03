@@ -57,8 +57,12 @@ export interface Grouped {
   groups: Group[];
 }
 
+/** 还没有任何事件落账的会话（建了但一句话都没发）：`applied_seq` 仍是 0。 */
+export const isEmpty = (s: SessionSummary) => s.applied_seq === 0;
+
 export function groupSessions(sessions: readonly SessionSummary[], homeId: string | undefined, mode: GroupMode, options: ListOptions): Grouped {
-  const visible = sessions.filter((s) => passes(s, options.filter));
+  // 空会话不进侧栏（主会话除外，它始终在最上）；发出第一句后 run 事件会让列表重取，它再出现
+  const visible = sessions.filter((s) => passes(s, options.filter) && (!isEmpty(s) || s.session === homeId));
   const order = bySort(options.sort);
   if (mode === "flat") return { main: undefined, groups: [{ key: "flat", kind: "flat", sessions: visible.sort(order) }] };
   // 任务会话挂在父会话下；父会话被筛掉了才自己出现在顶层

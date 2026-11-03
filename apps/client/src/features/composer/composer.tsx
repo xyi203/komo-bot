@@ -6,6 +6,7 @@ import type { View } from "@/features/conversation/model";
 import { pctOf, pctText, type ContextView } from "@/features/panel/context-usage";
 import { formatElapsed, formatTokens } from "@/lib/format";
 import { useNow } from "@/lib/hooks";
+import { showToast } from "@/lib/toast";
 import { cn } from "@/lib/utils";
 import { m } from "@/paraglide/messages.js";
 import { effortLabel, modelLabel } from "./effort";
@@ -15,7 +16,7 @@ import type { SendOptions } from "./use-send";
 let chosen: { model: string | null; effort: string } = { model: null, effort: "" };
 
 /**
- * 输入框（docs/web.md §5）：一行文字加发送；会话有 Run 在跑且输入为空时发送键变停止，输入了文字则是插话。
+ * 输入框（docs/web.md §5）：加号（附件，未接）、一行文字、发送；会话有 Run 在跑且输入为空时发送键变停止，输入了文字则是插话。
  * 框下：左边用量行（轮数、步数、tok、缓存命中；跑着时是计时），右边模型、effort 与上下文环。
  */
 export function Composer({
@@ -77,6 +78,17 @@ export function Composer({
           disabled ? "bg-raised" : "bg-surface",
         )}
       >
+        {/* 附件还没有 Gateway 接口（SubmitRunRequest 只有 text）：先放加号占位，点了说明还不支持 */}
+        <button
+          type="button"
+          aria-label={m.composer_attach()}
+          title={m.composer_attach()}
+          disabled={disabled}
+          onClick={() => showToast(m.composer_attach_unsupported())}
+          className="grid size-8 shrink-0 cursor-pointer place-items-center rounded-full text-text transition-colors hover:bg-hover-on-white disabled:cursor-not-allowed disabled:opacity-35 max-[600px]:m-1.5"
+        >
+          <Icon name="plus" />
+        </button>
         <label className="sr-only" htmlFor="composer-input">
           {m.composer_label()}
         </label>

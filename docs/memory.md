@@ -606,7 +606,7 @@ komo 的写入路径已经是一个轻量版 graphiti：逐字相同合并 → �
 | 条目 | 状态 |
 |---|---|
 | B.4.1 索引自动补齐 | 已实现（`9709e932`，§9.5） |
-| B.4.2 按 Run 召回 | 已实现（2026-10-28）：每个 Run 一条 `komo.memory.recall` 追加在输入之后，遗忘用 `komo.memory.revoke` 改写旧块（§9.4）；`prepare_segment` 只剩旧单测在用 |
+| B.4.2 按 Run 召回 | 已实现（2026-10-28）：每个 Run 一条 `komo.memory.recall` 追加在输入之后，遗忘用 `komo.memory.revoke` 改写旧块（§9.4）；按段钉住的 `prepare_segment` 与注入锚已删（2026-11-10） |
 | B.4.3 稳定偏好常驻 | 未实现 |
 | B.4.4 提取证据输入 | 部分：`memory-extract/v3`（`c8022df1`）给工具结果标出产生它的调用；外置正文与工具输出的读取没有核对 |
 | B.4.5 整理与诊断 | 存量整理由 §9.8 接手；诊断未实现 |
@@ -702,6 +702,8 @@ komo memory list --limit 1000 --full
 
 #### B.3.2 对话段的缓存优化限制了任务召回
 
+（已过时：按段钉住随 B.4.2 按 Run 召回退役，`prepare_segment` 已于 2026-11-10 删除；下面是当时的分析。）
+
 `prepare_segment` 优先复用内存或日志里的注入块，连空结果也固定。换话题、增加新记忆、修改
 已有正文，通常都等到 `/new` 才重新选择；版本变化本身不会让有效的注入锚失效。
 
@@ -709,7 +711,7 @@ komo memory list --limit 1000 --full
 最后一条用户输入，没有真正结合项目与必要语境，短句、代词和“继续”尤其容易失去含义。
 
 依据：[召回装配](../crates/komo-gateway/src/service/context_sources.rs)、
-[`prepare_segment` 与 `pin_still_valid`](../crates/komo-runtime/src/memory/mod.rs)。
+`prepare_segment` 与 `pin_still_valid`（已删）。
 
 #### B.3.3 提取材料过于简化
 

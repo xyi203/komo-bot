@@ -9,7 +9,7 @@ import type {
   SessionSummary,
   WireEvent,
 } from "@komo/protocol";
-import { useQuery, useQueryClient, type QueryClient } from "@tanstack/react-query";
+import { useInfiniteQuery, useQuery, useQueryClient, type InfiniteData, type QueryClient } from "@tanstack/react-query";
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
   fetchEventPage,
@@ -27,8 +27,19 @@ import { subscribeSession, type StreamState } from "./sse";
 import type { SessionTree } from "./types";
 
 export const fetchHealth = () => get<HealthResponse>("/healthz");
+/** 全部会话，一次取完（不带 `limit`）。 */
 export const fetchSessions = (all = false) =>
   get<SessionListResponse>("/v1/sessions", { all: all || undefined });
+
+/** 会话列表一页的条数。 */
+export const SESSION_PAGE = 50;
+
+/** 会话列表的一页（最新创建的在前）；`cursor` 是上一页的 `next_cursor`。 */
+export const fetchSessionPage = (all = false, cursor?: string, limit = SESSION_PAGE) =>
+  get<SessionListResponse>("/v1/sessions", { all: all || undefined, limit, cursor });
+
+/** 会话列表缓存的形状（按页）。 */
+export type SessionPages = InfiniteData<SessionListResponse, string | undefined>;
 
 /** 配对码换会话 cookie（`Set-Cookie` 由浏览器收下，响应体为空对象）。 */
 export const redeemPairCode = (code: string) => post<Record<string, never>>("/v1/web/session", { code } satisfies PairRequest);
@@ -46,12 +57,19 @@ export function sessionUnfinished(session: SessionSummary): boolean {
 /** 列表里有会话在跑时每 4 秒重取一次：别的会话（比如派出去的任务）的进展不走当前会话的事件流。 */
 const LIVE_POLL_MS = 4000;
 
+/**
+ * 会话列表，按页取（每页 {@link SESSION_PAGE} 条，最新创建的在前）；`data` 是已取到的各页拼起来的数组，
+ * `hasNextPage` / `fetchNextPage` 接着取下一页。重取时从第一页按新的游标逐页重来，不会漏掉被挤下去的会话。
+ */
 export function useSessions(all = false) {
-  return useQuery({
+  return useInfiniteQuery({
     queryKey: keys.sessions.list(all),
-    queryFn: () => fetchSessions(all),
-    select: (data) => data.sessions,
-    refetchInterval: (query) => (query.state.data?.sessions.some(sessionUnfinished) ? LIVE_POLL_MS : false),
+    queryFn: ({ pageParam }) => fetchSessionPage(all, pageParam),
+    initialPageParam: undefined as string | undefined,
+    getNextPageParam: (last) => last.next_cursor ?? undefined,
+    select: (data) => data.pages.flatMap((page) => page.sessions),
+    refetchInterval: (query) =>
+      query.state.data?.pages.some((page) => page.sessions.some(sessionUnfinished)) ? LIVE_POLL_MS : false,
   });
 }
 

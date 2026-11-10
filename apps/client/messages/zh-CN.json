@@ -1236,7 +1236,9 @@
     }
   ],
   "sessions_kids_live": "{count} 个在跑",
+  "sessions_load_more": "加载更早的会话",
   "sessions_loading": "正在加载会话…",
+  "sessions_loading_more": "加载中…",
   "sessions_none_active": "没有活跃的会话。",
   "sessions_none_all": "还没有会话。",
   "sessions_none_archived": "没有已归档的会话。",

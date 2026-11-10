@@ -141,11 +141,17 @@ enum Command {
 
 #[derive(Subcommand)]
 enum SessionCommand {
-    /// 查看会话列表和状态；`--all` 才列出已逻辑删除的（§8.10）。
+    /// 查看会话列表和状态（最新的在前，一次一页）；`--all` 才列出已逻辑删除的（§8.10）。
     List {
         /// 把已逻辑删除（closing / deleted）的会话也列出来。
         #[arg(long)]
         all: bool,
+        /// 一页几条；0 = 不分页，一次列完。
+        #[arg(long, default_value_t = 50)]
+        limit: u32,
+        /// 从上一页末尾印出的位置接着列。
+        #[arg(long)]
+        cursor: Option<String>,
     },
     /// 在各会话的标题与正文里找关键词（空白分开的几个词要在同一条消息里），给出会话、片段与能接着查的 ID。
     Search {
@@ -726,7 +732,9 @@ async fn operator(
     };
     match command {
         Command::Session { action } => match action {
-            SessionCommand::List { all } => commands::session_list(client, all).await,
+            SessionCommand::List { all, limit, cursor } => {
+                commands::session_list(client, all, limit, cursor).await
+            }
             SessionCommand::Search { query, limit } => {
                 commands::session_search(client, &query, limit).await
             }

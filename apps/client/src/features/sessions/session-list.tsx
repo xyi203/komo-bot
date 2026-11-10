@@ -133,6 +133,16 @@ function SessionList({ prefs }: { prefs: ViewPrefs }) {
           }
         />
       ))}
+      {sessions.hasNextPage && (
+        <button
+          type="button"
+          disabled={sessions.isFetchingNextPage}
+          onClick={() => void sessions.fetchNextPage()}
+          className="mx-2 mt-3 cursor-pointer text-label font-medium text-muted underline underline-offset-3 disabled:cursor-default disabled:no-underline"
+        >
+          {sessions.isFetchingNextPage ? m.sessions_loading_more() : m.sessions_load_more()}
+        </button>
+      )}
     </div>
   );
 }

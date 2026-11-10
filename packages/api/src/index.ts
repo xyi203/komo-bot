@@ -5,8 +5,10 @@ export { keys } from "./keys";
 export { subscribeSession, type StreamState, type SubscribeOptions } from "./sse";
 export {
   fetchHealth,
+  fetchSessionPage,
   fetchSessions,
   redeemPairCode,
+  SESSION_PAGE,
   sessionUnfinished,
   useHealth,
   useHomeSession,
@@ -19,6 +21,7 @@ export {
   useSessions,
   useSessionTree,
   type Delta,
+  type SessionPages,
   type EventsStatus,
 } from "./queries";
 export type {

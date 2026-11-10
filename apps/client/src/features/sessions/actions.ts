@@ -1,5 +1,5 @@
-import { archiveSession, createSession, forkSession, keys, purgeSession, renameSession } from "@komo/api";
-import type { SessionListResponse, SessionSummary } from "@komo/protocol";
+import { archiveSession, createSession, forkSession, keys, purgeSession, renameSession, type SessionPages } from "@komo/api";
+import type { SessionSummary } from "@komo/protocol";
 import { useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "@tanstack/react-router";
 import { errorText } from "@/lib/errors";
@@ -23,8 +23,16 @@ export function useSessionActions() {
         const session = await createSession({ request_key: `web:new:${crypto.randomUUID()}`, ...(workdir ? { workdir } : {}) });
         // 先放进列表缓存，目标页马上认得它的标题，再让列表重取
         for (const all of [true, false]) {
-          queryClient.setQueryData<SessionListResponse>(keys.sessions.list(all), (previous) =>
-            previous ? { sessions: [session, ...previous.sessions.filter((s) => s.session !== session.session)] } : previous,
+          queryClient.setQueryData<SessionPages>(keys.sessions.list(all), (previous) =>
+            previous
+              ? {
+                  ...previous,
+                  pages: previous.pages.map((page, i) => ({
+                    ...page,
+                    sessions: [...(i === 0 ? [session] : []), ...page.sessions.filter((s) => s.session !== session.session)],
+                  })),
+                }
+              : previous,
           );
         }
         void refresh();
@@ -48,8 +56,16 @@ export function useSessionActions() {
       if (!trimmed || trimmed === session.title) return;
       // 先改列表缓存里的标题（顶栏、侧栏马上换上新名，不闪回旧的），失败了重取回到原样
       for (const all of [true, false]) {
-        queryClient.setQueryData<SessionListResponse>(keys.sessions.list(all), (previous) =>
-          previous ? { sessions: previous.sessions.map((s) => (s.session === session.session ? { ...s, title: trimmed } : s)) } : previous,
+        queryClient.setQueryData<SessionPages>(keys.sessions.list(all), (previous) =>
+          previous
+            ? {
+                ...previous,
+                pages: previous.pages.map((page) => ({
+                  ...page,
+                  sessions: page.sessions.map((s) => (s.session === session.session ? { ...s, title: trimmed } : s)),
+                })),
+              }
+            : previous,
         );
       }
       try {

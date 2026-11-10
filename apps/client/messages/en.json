@@ -1244,7 +1244,9 @@
     }
   ],
   "sessions_kids_live": "{count} running",
+  "sessions_load_more": "Load older sessions",
   "sessions_loading": "Loading sessions…",
+  "sessions_loading_more": "Loading…",
   "sessions_none_active": "No active sessions.",
   "sessions_none_all": "No sessions yet.",
   "sessions_none_archived": "No archived sessions.",

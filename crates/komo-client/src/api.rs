@@ -298,6 +298,12 @@ impl KomoClient {
         if query.all {
             params.push(("all", "true".into()));
         }
+        if let Some(limit) = query.limit {
+            params.push(("limit", limit.to_string()));
+        }
+        if let Some(cursor) = &query.cursor {
+            params.push(("cursor", cursor.clone()));
+        }
         self.get_with("/v1/sessions", &params).await
     }
 
@@ -1666,10 +1672,30 @@ mod wire_tests {
 
         server
             .client()
-            .list_sessions(&SessionListQuery { all: true })
+            .list_sessions(&SessionListQuery {
+                all: true,
+                ..SessionListQuery::default()
+            })
             .await
             .unwrap();
         assert_eq!(server.requests()[1].param("all").as_deref(), Some("true"));
+
+        // 分页参数原样带上（不带就不分页，老 Gateway 也认）。
+        server
+            .client()
+            .list_sessions(&SessionListQuery {
+                all: false,
+                limit: Some(50),
+                cursor: Some("6162".into()),
+            })
+            .await
+            .unwrap();
+        assert_eq!(server.requests()[2].param("limit").as_deref(), Some("50"));
+        assert_eq!(
+            server.requests()[2].param("cursor").as_deref(),
+            Some("6162")
+        );
+        assert_eq!(server.requests()[2].param("all"), None);
     }
 
     #[tokio::test]

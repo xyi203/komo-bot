@@ -32,15 +32,34 @@ fn failed(error: impl std::fmt::Display) -> String {
 
 // ---------------------------------------------------------------- 会话与运行
 
-pub async fn session_list(client: &KomoClient, all: bool) -> Outcome {
+/// `komo session list`：默认一页 50 条，还有下一页时末尾印出接着列的命令；`limit = 0` 不分页。
+pub async fn session_list(
+    client: &KomoClient,
+    all: bool,
+    limit: u32,
+    cursor: Option<String>,
+) -> Outcome {
     let response = client
-        .list_sessions(&SessionListQuery { all })
+        .list_sessions(&SessionListQuery {
+            all,
+            limit: (limit > 0).then_some(limit),
+            cursor: cursor.filter(|_| limit > 0),
+        })
         .await
         .map_err(failed)?;
-    Ok(render::session_list(
-        &response,
-        time::OffsetDateTime::now_utc(),
-    ))
+    let mut out = render::session_list(&response, time::OffsetDateTime::now_utc());
+    if let Some(next) = &response.next_cursor {
+        out.push_str(&format!(
+            "\n\n还有更多：komo session list{}{} --cursor {next}（--limit 0 一次列完）",
+            if all { " --all" } else { "" },
+            if limit == 50 {
+                String::new()
+            } else {
+                format!(" --limit {limit}")
+            },
+        ));
+    }
+    Ok(out)
 }
 
 /// `komo session search`：跨会话找回（只读，roadmap-muse S3）。

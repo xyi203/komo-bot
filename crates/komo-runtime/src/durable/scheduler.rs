@@ -721,10 +721,6 @@ impl Sched {
                             .collect()
                     };
                     for record in candidates {
-                        // 崩溃循环保护：连续被崩溃打断到了上限，run 与 abort 都不起，等操作者放行。
-                        if restart_limited(&record, sched.restart_limit) {
-                            continue;
-                        }
                         // 还在等的（`on` 里有活的 / 有标记时名下有活的工作）：回来之前不跑。
                         let (waiting, cancelled) = {
                             let st = sched.st();
@@ -750,7 +746,15 @@ impl Sched {
                             sched.schedule_reconcile();
                             continue;
                         }
-                        match sched.resolve(&record, &snapshot) {
+                        // 崩溃循环保护：连续被崩溃打断到了上限，任务代码一律不起（abort handler 也可能
+                        // 就是崩溃的原因），等操作者放行；有人请求取消就照"阻塞"的规矩直接判 orphaned，
+                        // 取消因此不会一直等下去。
+                        let resolution = if restart_limited(&record, sched.restart_limit) {
+                            Resolution::Blocked(BlockedReason::RestartLimit)
+                        } else {
+                            sched.resolve(&record, &snapshot)
+                        };
+                        match resolution {
                             Resolution::Blocked(reason) => {
                                 // 重启放弃的任务等定义回来，好让它的 abort handler 收尾。
                                 if mode == InvocationMode::Abort && record.abort_reason.is_none() {

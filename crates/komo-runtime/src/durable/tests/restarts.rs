@@ -301,3 +301,58 @@ async fn a_blocked_task_can_be_faulted_without_running_its_code() {
     assert_eq!(log.count("run"), RESTART_LIMIT as usize);
     engine.close().await.unwrap();
 }
+
+/// 有人取消停住的任务（`/cancel`、删除会话）：不起 abort handler，照阻塞任务的规矩直接 `orphaned`，
+/// 取消不会一直等下去。
+#[tokio::test(start_paused = true)]
+async fn cancelling_a_blocked_task_orphans_it_without_running_its_code() {
+    let env = Env::new();
+    let log = Log::default();
+    let abort_log = log.clone();
+    let k = kind("hanging")
+        .phase("start", {
+            let log = log.clone();
+            move |_task, rt| {
+                let log = log.clone();
+                async move {
+                    log.push("run");
+                    rt.cancelled().cancelled().await;
+                    Ok(())
+                }
+            }
+        })
+        .on_abort(move |_task, rt| {
+            let log = abort_log.clone();
+            async move {
+                log.push("abort handler");
+                rt.commit_next(aborted()).await?;
+                Ok(())
+            }
+        })
+        .build();
+    env.install(&k);
+    let engine = env.open_running().await;
+    let id = spawn(&engine, &k, json!({})).await;
+    until(|| log.count("run") == 1).await;
+    drop(engine);
+    for runs in 2..=RESTART_LIMIT as usize {
+        run_then_crash(&env, &log, runs).await;
+    }
+    let engine = env.open_running().await;
+    assert!(matches!(
+        inspected(&engine, id),
+        TaskInspectionState::Blocked { .. }
+    ));
+    engine.abort_task(id).await.unwrap();
+    let settled = settle(&engine, id).await;
+    assert!(
+        matches!(
+            outcome_of(&settled),
+            komo_kernel::durable::TaskOutcome::Orphaned { reason } if reason == "restart_limit"
+        ),
+        "{settled:?}"
+    );
+    assert_eq!(log.count("abort handler"), 0);
+    assert_eq!(log.count("run"), RESTART_LIMIT as usize);
+    engine.close().await.unwrap();
+}

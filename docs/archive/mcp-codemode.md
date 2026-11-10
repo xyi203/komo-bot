@@ -1,6 +1,8 @@
 # MCP 与 codemode 接入方案
 
-> 状态：设计草案，待确认。日期：2026-10-08。
+> 历史设计，已被取代，现状见 [`docs/mcp.md`](../mcp.md) 与 [`docs/codemode.md`](../codemode.md)（2026-11-10 移入 `docs/archive/`）。
+>
+> 原状态：设计草案，待确认。日期：2026-10-08。
 > 本文提出对 `docs/komo_bot.md` 的变更，不覆盖当前正式设计，也不表示已经实现。
 > 对照 pi 提交：`1cedd32724abfcb0915f76cc61b6827e2c16dbad`。
 > 后来落地的是 `docs/mcp.md` 与 `docs/codemode.md`（Monty 里的 Python，不是 QuickJS），两处冲突以那两份为准。

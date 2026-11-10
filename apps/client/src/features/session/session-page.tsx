@@ -172,7 +172,15 @@ function SessionBody({ sessionId, tab, setTab }: { sessionId: string; tab: Tab; 
             <Trigger value="chat">{m.tab_chat()}</Trigger>
             <Trigger value="trace">{m.tab_trace()}</Trigger>
           </TabsList>
+          {/* 顺序照 Claude Code 桌面版：右栏开关在最前，各面板开关其次，动作（分叉）放最后。 */}
           <div className="ml-auto flex gap-1">
+            <IconButton
+              name="details"
+              label={panel.open ? m.topbar_panel_close() : m.topbar_panel_open()}
+              aria-expanded={panel.open}
+              onClick={panel.toggle}
+              className={cn("max-[600px]:size-11", panel.open && "bg-active text-text")}
+            />
             <Tooltip
               label={
                 <>
@@ -192,7 +200,6 @@ function SessionBody({ sessionId, tab, setTab }: { sessionId: string; tab: Tab; 
                 className={cn("max-[600px]:size-11", tab === "changes" && "bg-active text-text")}
               />
             </Tooltip>
-            <IconButton name="branch" label={m.topbar_fork()} onClick={() => void actions.fork(sessionId)} className="max-[600px]:size-11" />
             {browserApi && (
               <IconButton
                 name="globe"
@@ -202,13 +209,7 @@ function SessionBody({ sessionId, tab, setTab }: { sessionId: string; tab: Tab; 
                 className={cn("max-[600px]:hidden", showBrowser && "bg-active text-text")}
               />
             )}
-            <IconButton
-              name="details"
-              label={panel.open ? m.topbar_panel_close() : m.topbar_panel_open()}
-              aria-expanded={panel.open}
-              onClick={panel.toggle}
-              className={cn("max-[600px]:size-11", panel.open && "bg-active text-text")}
-            />
+            <IconButton name="branch" label={m.topbar_fork()} onClick={() => void actions.fork(sessionId)} className="max-[600px]:size-11" />
           </div>
         </header>
         <div

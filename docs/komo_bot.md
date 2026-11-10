@@ -83,7 +83,7 @@ Gateway 持有模型连接、数据库与提交线、工具环境、运行状态
 | `komo`                                       | 确保本机 Gateway 就绪，进入 TUI 聊天。**会话在第一条消息送出之前才创建**——空跑一眼就退出，不在库和磁盘上留下空壳 |
 | `komo resume SESSION_ID`                     | 连接原会话并查看进度或处理待办；恢复调度由 Gateway 自动进行，不重复创建 Run |
 | `komo web [--no-open]`                       | 在浏览器里打开网页版（`docs/clients.md`）：经 Bearer 向 Gateway 要一个一次性配对码（`POST /v1/web/pair-code`，只在内存、两分钟失效、用一次作废），打开 `http://<Gateway>/pair#code=<码>`（码在 fragment 里，不进服务器日志），网页把码 POST 回去换 `HttpOnly; SameSite=Strict` 的会话 cookie。`--no-open` 只打印链接。会话 cookie 只在 Gateway 内存里，**Gateway 重启后要重新运行**。需要 Gateway 在跑（同 `komo`，没起就拉起） |
-| `komo session list`                          | 查看会话列表和状态；`--all` 才列出已逻辑删除的会话（§8.10）                  |
+| `komo session list [--all] [--limit N] [--cursor C]` | 查看会话列表和状态（最新创建的在前）；`--all` 才列出已逻辑删除的会话（§8.10）。一页 50 条，还有更多时末尾印出接着列的 `--cursor`；`--limit 0` 一次列完 |
 | `komo session search 关键词 [--limit N]`         | 跨会话找回：在会话标题与正文里找，给会话、片段与能接着查的 ID（§8.11「跨会话找回」） |
 | `komo monitor list [--all]`                   | 监听清单（`monitor` 挂的与转后台的 bash）：短号、已跑多久、距截止、标题、挂它的会话、脚本；只读（`docs/monitor.md`） |
 | `komo session delete/purge SESSION_ID`       | 逻辑删除（`closing` → `deleted`）与回收（`purged`）。**删除只有这一条路**：`--now` 把未完成 Run 各写一条明确取消，`purge` 前先算引用（§8.10） |
@@ -1066,7 +1066,7 @@ CLI 通过 HTTP 发命令，通过 SSE 观察运行。Gateway 内部采用函数
 | -------------------------------- | ---------------------------------------------- |
 | GET /healthz                     | 最小健康检查与实例标识                         |
 | POST /v1/sessions                | 创建会话                                       |
-| GET /v1/sessions                 | 列出会话（默认不含已逻辑删除的，`?all=1` 才列） |
+| GET /v1/sessions                 | 列出会话，最新创建的在前（默认不含已逻辑删除的，`?all=1` 才列）。可选 `limit`（1–500）分页：响应在还有下一页时带不透明的 `next_cursor`，下一次放进 `cursor`；**不带 `limit` 返回全部**，与分页之前相同 |
 | GET /v1/sessions/{id}            | 会话详情与运行状态                             |
 | GET /v1/sessions/{id}/events     | 按游标获取或订阅事件                           |
 | POST /v1/sessions/{id}/runs      | 提交新输入；会话不在 `active` 时 409 并说清是 `closing` / `deleted` / `purged` |

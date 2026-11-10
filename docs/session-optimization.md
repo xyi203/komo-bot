@@ -1,6 +1,6 @@
 # Session 读写路径优化方案（存储重写之后）
 
-> 状态：部分实施。**A–G 大部分已实施**（2026-11-10，分支 `feature/optimize`），逐项见下面的进度表；未做的部分写了原因。
+> 状态：部分实施。**A–G 大部分已实施**（2026-11-10，分支 `feature/optimize`；E 的列表分页同日在 `feature/hardening` 补上），逐项见下面的进度表；未做的部分写了原因。
 > 方案写于 2026-10-28，基线 HEAD `799d5e4f`。
 > 与 `docs/storage-durable-perf.md` 的关系：那份是存储层优化清单（P1 上下文读取已做）；本文只收 **Gateway 的 session 层**
 > 读写路径。§3.4 / §3.6 与那份 §3、§5 是同一件事，这里给出具体落点，实施时以那份的进度表为准、两边互相引用，不各记一份。
@@ -15,7 +15,7 @@
 | B | 已实施（之前） | `04d15bbd` | `sessions.request_key` / `request_hash` 与唯一索引，`create_session_idempotent` |
 | C | 已实施（之前） | `8136b940` | clone / fork 提交前复核 + blob 清单 |
 | D | 已实施 | `a039dfeb`（之前）、`126dd935` | 外层结果只为返回的事件读；重连补读优先取 feed 内存里最近推过的事件，见下方"D 的落法" |
-| E | 部分实施 | `e116b31e` | 查询下推与列表概览有界并发已做；**列表分页没做**，原因见下方 |
+| E | 已实施 | `e116b31e`、`3383c72a`、`41620ef1`、`00493eed` | 查询下推与列表概览有界并发；列表分页只做加法（不带 `limit` 返回全部），见下方"E 的落法" |
 | F | 部分实施 | `ff454855` | 快照按 `partial_interval` 节流已做；工具参数传原始字符串、sink 改 `Arc` 没做，原因见下方 |
 | G | 已实施（之前） | `e13bf1e3` | 空闲时限、连续无数据超时不再耗完预算；`~/.komo/config.toml` 的临时 `timeout_secs = 600` 可以删 |
 
@@ -32,11 +32,23 @@ hub，HTTP 先订阅再取，重叠靠 seq 去重。游标在覆盖范围内时�
 被淘汰、purge、覆盖不到时照旧全量补读。冷补读的结果**没有**放回缓存（要和 feed 任务的投影状态协调），所以 Gateway 起来后
 没动过的会话第一次重连仍是全量。
 
-**E 没做的部分**：`GET /v1/sessions` 分页要改协议（`cursor` / `next`）、TS 绑定和三个客户端（CLI、TUI、web），
-"旧客户端不带 cursor 时返回第一页"会让没升级的客户端只看到前 50 条；默认 `limit` 也还是待确认。这是产品与协议取舍，
-留给单独一轮。已做的：`sessions` 加 `source` / `kind` / `agent` 三列（开库时从 `record` 回填老行）与
+**E 的落法**：先做的是 `sessions` 加 `source` / `kind` / `agent` 三列（开库时从 `record` 回填老行）与
 `sessions_by_source (source, lifecycle, id)`、`sessions_by_kind_agent (kind, agent, lifecycle, id)` 两个索引，
 `SessionQuery` 加同名条件；`main_session` / `session_for_source` 在提交线里只读命中的行；列表逐条读概览改成 2 路并发、保持次序。
+
+列表分页（`3383c72a`、`41620ef1`、`00493eed`）按"只做加法"定：`GET /v1/sessions` 加可选 `limit`（1–500，超过按 500，`0` 是 400）与 `cursor`，
+响应加 `next_cursor`（没有下一页时缺省）。**不带 `limit` 时返回全部、响应只有 `sessions`**，`cursor` 被忽略——没升级的客户端
+（含桌面壳托盘的轮询）不会被截断；`session_list_pages_add_up_to_the_unpaged_list` 锁住这一点（响应的键、次序、坏参数 400）。
+次序沿用原来的"id 降序"（UUIDv7 = 创建序倒排；id 唯一，不需要再加决胜键），游标就是上一页末条的 id、十六进制编码给客户端
+（不透明，只原样带回）；续扫 `id < cursor`，翻页期间新建的会话 id 更大，只会出现在第一页之前，不会挤进后面的页造成重复或漏项；
+翻页期间被删 / 状态变了的只是不再出现。`SessionQuery` 加 `lifecycles`（"几种之一"）：Turso 每种生命周期各走一次
+`sessions_by_lifecycle (lifecycle, id)`（`EXPLAIN QUERY PLAN` 是 `SEARCH … USING INDEX sessions_by_lifecycle (lifecycle=? AND id<?)`；
+`IN (…)` 会退成排序器、读全部匹配行）、各取 `limit + 1` 再归并，一页最多读 3 ×（limit + 1）行，与总会话数无关，**不加索引**。
+概览（live / inbox / tail）只对当页做。内部调用方（`komo session search`、任务清单、监听对账）仍调 `list_sessions` 读全量，
+渠道的 `ensure_session` 走自己的条件扫描，都不受分页影响。客户端：CLI `komo session list` 默认 `--limit 50`，还有更多时末尾印出
+带 `--cursor` 的下一条命令，`--limit 0` 一次列完；web 侧栏按页取（`useInfiniteQuery`），末尾"加载更早的会话"。TUI 没有会话选择
+列表（只有 `komo resume SESSION_ID`），不用改。**取舍**：服务端次序是创建序，web 侧栏默认按"最近更新"排，所以一个很早创建、
+最近才动过的会话要等翻到它那一页才出现；按更新时间分页要给 `changed_at` 抽列加索引，这次没做。
 
 **F 的落法与没做的部分**：没有把 `ModelStream::progress` 改成拉取（签名要动三家 provider 和十来个测试替身）。
 `RequestOptions` 加 `progress_interval`（harness 给 `partial_interval`）：首块立刻造快照，之后每间隔最多一份；间隔内到的块
@@ -202,6 +214,7 @@ sequenceDiagram
 - `list_sessions` 加游标分页（`SessionCursor` 已存在）；`list` 路由按页取，每页的 `session_summary` 用有界并发
   （与 feed 的补读并发上限一样，限在读连接池的一半以内），不无限并发。
 - CLI `komo session list` 与 TUI 的会话列表跟着支持翻页；协议加 `cursor` / `next` 字段，旧客户端不带 cursor 时返回第一页。
+  **实施时改了**：旧客户端不带 `limit` 时返回全部（不截断），响应字段叫 `next_cursor`；TUI 没有会话列表。见 §0"E 的落法"。
 
 ### 3.6 F：流式快照节流
 
@@ -250,7 +263,7 @@ sequenceDiagram
 | 接口 | 变更 |
 |---|---|
 | `POST /v1/sessions` | 行为变化：请求键幂等改为持久；同键不同内容 409 `RequestKeyConflict`（字段不变） |
-| `GET /v1/sessions` | 新增查询参数 `cursor`（可选）、`limit`（可选，默认 50，**待确认**）；响应新增 `next`（可选） |
+| `GET /v1/sessions` | 新增查询参数 `limit`（可选，1–500）、`cursor`（可选，不透明）；响应新增 `next_cursor`（可选）。**不带 `limit` 返回全部**（兼容旧客户端）；客户端默认传 50 |
 | `POST /v1/sessions/{id}/fork` | 新增错误：源会话在复制期间被删除 / 改动 → 409 |
 | SSE `/v1/sessions/{id}/events` | 无契约变化；帧序列与现在逐帧相同 |
 
@@ -336,7 +349,7 @@ sequenceDiagram
 
 - ~~§4.1 `submissions` 的 session 级请求键查询~~：经 conversation 映射（Turso 一条 join），不加列。
 - §3.3 从 entry 里收集 blob 引用的方式（C 已按 `8136b940` 的写法实施）。
-- §4.2 会话列表默认 `limit`。
+- ~~§4.2 会话列表默认 `limit`~~：服务端不带 `limit` 不分页；CLI 与 web 默认传 50。
 - §5 观测指标名与面板。
 - 全部性能项的改动前基线数字（需要在本机长会话上实测）。
 - G：任务 4231 那 23 次超时到底是流在出数据只是太慢，还是上游没响应——加了 `first_byte_ms` 之后再遇到就能分清。

@@ -797,7 +797,7 @@ fn check_peer_id(platform: ChannelPlatform, peer: &PeerId) -> Result<(), String>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::testing::snapshot_fixture;
+    use crate::testing::snapshot_fixture;
     use komo_kernel::protocol::config::{McpServerConfig, McpTransport};
     use komo_kernel::types::model::Effort;
 

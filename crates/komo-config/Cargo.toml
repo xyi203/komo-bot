@@ -1,0 +1,37 @@
+[package]
+name = "komo-config"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# §13.4：config.toml / .env 的解析、校验、热重载持有者（§3）与在原文上改配置。
+# 依赖 kernel 与 komo-llm（生成协议名、effort 声明表、凭证的值），不碰 store。
+[features]
+# 跨 crate 的配置夹具（`testing::Fixture`）：只作为 dev-dependency 打开。
+test-support = ["komo-kernel/test-support"]
+
+[dependencies]
+komo-kernel = { workspace = true }
+komo-llm = { workspace = true }
+# 校验 endpoint 只用 `reqwest::Url` 解析。
+reqwest = { workspace = true }
+# `ConfigHolder` 的编辑锁。
+tokio = { workspace = true }
+# §3 热重载的唯一 `Arc<ConfigSnapshot>` 原子替换。
+arc-swap = { workspace = true }
+toml = { workspace = true }
+# §3「从 Web 改模型配置」：在原文上改并保留注释与键序。
+toml_edit = { workspace = true }
+# §3 的「不认识的键只警告」。
+serde_ignored = { workspace = true }
+dotenvy = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+time = { workspace = true }
+thiserror = { workspace = true }
+# config.toml / .env 的原子写（临时文件 + rename）。
+tempfile = { workspace = true }
+
+[dev-dependencies]
+komo-kernel = { workspace = true, features = ["test-support"] }

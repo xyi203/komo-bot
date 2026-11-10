@@ -2,7 +2,6 @@
 
 pub mod cancel;
 pub mod codemode;
-pub mod config;
 pub mod durable;
 pub mod executor;
 pub mod limits;

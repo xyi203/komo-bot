@@ -143,7 +143,7 @@ pub fn env_template() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{ConfigError, ConfigHolder, LoadOptions};
+    use crate::{ConfigError, ConfigHolder, LoadOptions};
     use komo_kernel::protocol::config::IssueSeverity;
 
     fn filled_env(key: &str) -> String {

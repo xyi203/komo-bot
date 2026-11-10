@@ -11,6 +11,7 @@ komo-kernel = { workspace = true }
 komo-channel = { workspace = true }
 komo-runtime = { workspace = true }
 komo-llm = { workspace = true }
+komo-config = { workspace = true }
 # 目标/领域 HTTP 接口按本机时区解释日期（§13.4）。
 jiff = { workspace = true }
 komo-agent = { workspace = true }

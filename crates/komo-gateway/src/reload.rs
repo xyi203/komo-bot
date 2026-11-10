@@ -14,10 +14,10 @@
 
 use std::sync::Arc;
 
+use komo_config::ConfigError;
 use komo_kernel::protocol::config::KeyPath;
 use komo_kernel::protocol::http::{ConfigReloadResponse, McpServerStatus};
 use komo_kernel::types::chat::Outbound;
-use komo_runtime::config::ConfigError;
 
 use crate::http::error::ApiFailure;
 use crate::service::state::GatewayState;
@@ -142,14 +142,13 @@ async fn apply(state: &Arc<GatewayState>, changed: &[KeyPath]) -> Vec<McpServerS
                         .any(|key| key.as_str() == format!("credentials.{name}"))
                 })
             });
-        let legacy_credentials_changed =
-            komo_runtime::config::channel_credentials(platform.clone())
-                .iter()
-                .any(|name| {
-                    changed
-                        .iter()
-                        .any(|key| key.as_str() == format!("credentials.{name}"))
-                });
+        let legacy_credentials_changed = komo_config::channel_credentials(platform.clone())
+            .iter()
+            .any(|name| {
+                changed
+                    .iter()
+                    .any(|key| key.as_str() == format!("credentials.{name}"))
+            });
         if credentials_changed
             || legacy_credentials_changed
             || changed.iter().any(|changed| {

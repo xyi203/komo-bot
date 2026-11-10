@@ -52,7 +52,7 @@ fn executable(platform: &ChannelPlatform) -> Result<PathBuf, String> {
 /// 插件能拿到哪些凭证由宿主定：官方渠道固定的那几个，加上 `plugin.env` 授权的。插件 describe
 /// 里写的只是它要什么；换了 `plugin.command` 的官方渠道同样受这份清单约束。
 fn granted_credentials(platform: &ChannelPlatform, plugin: Option<&ChannelPlugin>) -> Vec<String> {
-    let mut names: Vec<String> = komo_runtime::config::channel_credentials(platform.clone())
+    let mut names: Vec<String> = komo_config::channel_credentials(platform.clone())
         .iter()
         .map(|s| s.to_string())
         .collect();
@@ -64,7 +64,7 @@ fn granted_credentials(platform: &ChannelPlatform, plugin: Option<&ChannelPlugin
 
 pub async fn login(home: &Path, platform: ChannelPlatform) -> Result<String, String> {
     let (settings, secrets) =
-        komo_runtime::config::channel_login_config(home, &platform).map_err(|e| e.to_string())?;
+        komo_config::channel_login_config(home, &platform).map_err(|e| e.to_string())?;
     let plugin = settings.as_ref();
     let path = match plugin {
         Some(p) => p.command.clone(),

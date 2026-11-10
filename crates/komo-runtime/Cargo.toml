@@ -14,6 +14,7 @@ test-support = ["komo-kernel/test-support", "komo-llm/test-support"]
 komo-kernel = { workspace = true }
 komo-store = { workspace = true }
 komo-llm = { workspace = true }
+komo-config = { workspace = true }
 reqwest = { workspace = true }
 # "net"：`komo auth mcp login` 的本机回调（mcp_auth）；gateway 早已把它带进图里。
 tokio = { workspace = true, features = ["rt-multi-thread", "fs", "process", "io-util", "net", "sync"] }
@@ -31,10 +32,6 @@ time = { workspace = true }
 thiserror = { workspace = true }
 async-trait = { workspace = true }
 tracing = { workspace = true }
-toml = { workspace = true }
-toml_edit = { workspace = true }
-serde_ignored = { workspace = true }
-dotenvy = { workspace = true }
 jiff = { workspace = true }
 futures-util = { workspace = true }
 tokio-util = { workspace = true }
@@ -58,6 +55,8 @@ libc = { workspace = true }
 komo-kernel = { workspace = true, features = ["test-support"] }
 # 测试要 `telemetry::capture` 抓 span 与指标事件。
 komo-llm = { workspace = true, features = ["test-support"] }
+# 配置夹具（`komo_config::testing`）。
+komo-config = { workspace = true, features = ["test-support"] }
 # 真机验收（`--ignored`）要自己发 HTTPS 请求，而 `reqwest` 是 rustls-no-provider：装
 # provider 是**进程**的事（§13.4，bin 的 `main` 里那一行），测试进程得自己装一次。
 rustls = { workspace = true }

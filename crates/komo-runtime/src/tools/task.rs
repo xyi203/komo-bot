@@ -34,7 +34,7 @@ use komo_kernel::types::tool::{ToolContext, ToolDefinition, ToolError, ToolOutpu
 use serde::{Deserialize, Serialize};
 
 use super::{normalized, parse_args, plan_time};
-use crate::config::ConfigHolder;
+use komo_config::ConfigHolder;
 
 /// 模型给的参数。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -346,8 +346,8 @@ impl Tool for TaskTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::testing::Fixture;
     use crate::tools::test_support::{context, writer};
+    use komo_config::testing::Fixture;
 
     fn tool(fixture: &Fixture) -> TaskTool {
         TaskTool::new(Arc::new(fixture.holder()))

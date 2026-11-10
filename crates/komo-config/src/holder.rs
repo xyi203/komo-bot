@@ -256,7 +256,7 @@ fn write_atomic(path: &std::path::Path, text: &str, mode: Option<u32>) -> std::i
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::testing::{Fixture, write};
+    use crate::testing::{Fixture, write};
 
     #[test]
     fn a_broken_edit_leaves_the_old_snapshot_in_place() {

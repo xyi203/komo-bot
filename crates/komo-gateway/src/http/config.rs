@@ -4,6 +4,7 @@
 
 use axum::Json;
 use axum::extract::{Path, State};
+use komo_config::{CatalogRow, EditError, EmbeddingFields, ModelFields, ProviderFields};
 use komo_kernel::protocol::http::{
     ConfigCheckResponse, ConfigEditResponse, ConfigEnvResponse, ConfigModelsResponse,
     ConfigReloadResponse, ConfigSettingsResponse, ConfigVersionRequest, DefaultModelRequest,
@@ -12,7 +13,6 @@ use komo_kernel::protocol::http::{
     SettingRequest,
 };
 use komo_kernel::types::model::{CatalogModel, ModelConfig};
-use komo_runtime::config::{CatalogRow, EditError, EmbeddingFields, ModelFields, ProviderFields};
 
 use super::Api;
 use super::error::{ApiFailure, ApiResult};
@@ -80,17 +80,13 @@ fn entry(api: &Api, alias: &str, model: &CatalogModel, default: bool) -> ModelMe
 /// `GET /v1/config/check`：只读，**不改变运行中的 Gateway**（§3 的命令表）。
 pub async fn check(State(api): State<Api>) -> Json<ConfigCheckResponse> {
     let snapshot = api.state.snapshot();
-    let mut issues = komo_runtime::config::validate_with(&snapshot, &api.state.caps);
+    let mut issues = komo_config::validate_with(&snapshot, &api.state.caps);
     // 加载时的警告也要看得见（被忽略的键、还留着的 `policy.toml`，§3 / §7）：它们不在快照
     // 上，校验那一步看不到。`policy.toml` 那一条按文件**此刻**在不在：删掉之后不必等一次
     // 重载才不报。
-    let retired = api
-        .state
-        .home
-        .join(komo_runtime::config::RETIRED_POLICY_FILE);
+    let retired = api.state.home.join(komo_config::RETIRED_POLICY_FILE);
     for warning in api.state.config.warnings() {
-        let stale =
-            warning.key.as_str() == komo_runtime::config::RETIRED_POLICY_FILE && !retired.exists();
+        let stale = warning.key.as_str() == komo_config::RETIRED_POLICY_FILE && !retired.exists();
         if !stale && !issues.contains(&warning) {
             issues.push(warning);
         }
@@ -145,10 +141,10 @@ pub async fn put_provider(
             api_key: request.api_key.as_deref(),
         };
         let (config, id) = match request.rename.as_deref().filter(|to| *to != id) {
-            Some(to) => (komo_runtime::config::rename_provider(config, &id, to)?, to),
+            Some(to) => (komo_config::rename_provider(config, &id, to)?, to),
             None => (config.to_string(), id.as_str()),
         };
-        let (mut config, env) = komo_runtime::config::upsert_provider(&config, env, id, &fields)?;
+        let (mut config, env) = komo_config::upsert_provider(&config, env, id, &fields)?;
         if let Some(models) = &request.models {
             let rows: Vec<CatalogRow<'_>> = models
                 .iter()
@@ -162,7 +158,7 @@ pub async fn put_provider(
                     dimensions: m.dimensions,
                 })
                 .collect();
-            config = komo_runtime::config::set_provider_models(&config, id, &rows)?;
+            config = komo_config::set_provider_models(&config, id, &rows)?;
         }
         Ok((Some(config), env))
     })
@@ -256,10 +252,7 @@ pub async fn delete_provider(
     Json(request): Json<ConfigVersionRequest>,
 ) -> ApiResult<Json<ConfigEditResponse>> {
     edit(&api, &request.version, |config, _| {
-        Ok((
-            Some(komo_runtime::config::remove_provider(config, &id)?),
-            None,
-        ))
+        Ok((Some(komo_config::remove_provider(config, &id)?), None))
     })
     .await
 }
@@ -280,7 +273,7 @@ pub async fn put_model(
             context_window: request.context_window,
         };
         Ok((
-            Some(komo_runtime::config::upsert_model(config, &alias, &fields)?),
+            Some(komo_config::upsert_model(config, &alias, &fields)?),
             None,
         ))
     })
@@ -305,14 +298,10 @@ pub async fn put_embedding_model(
             api_key: request.api_key.as_deref(),
         };
         let (config, alias) = match request.rename.as_deref().filter(|to| *to != alias) {
-            Some(to) => (
-                komo_runtime::config::rename_embedding_model(config, &alias, to)?,
-                to,
-            ),
+            Some(to) => (komo_config::rename_embedding_model(config, &alias, to)?, to),
             None => (config.to_string(), alias.as_str()),
         };
-        let (config, env) =
-            komo_runtime::config::upsert_embedding_model(&config, env, alias, &fields)?;
+        let (config, env) = komo_config::upsert_embedding_model(&config, env, alias, &fields)?;
         Ok((Some(config), env))
     })
     .await
@@ -326,9 +315,7 @@ pub async fn delete_embedding_model(
 ) -> ApiResult<Json<ConfigEditResponse>> {
     edit(&api, &request.version, |config, _| {
         Ok((
-            Some(komo_runtime::config::remove_embedding_model(
-                config, &alias,
-            )?),
+            Some(komo_config::remove_embedding_model(config, &alias)?),
             None,
         ))
     })
@@ -342,10 +329,7 @@ pub async fn delete_model(
     Json(request): Json<ConfigVersionRequest>,
 ) -> ApiResult<Json<ConfigEditResponse>> {
     edit(&api, &request.version, |config, _| {
-        Ok((
-            Some(komo_runtime::config::remove_model(config, &alias)?),
-            None,
-        ))
+        Ok((Some(komo_config::remove_model(config, &alias)?), None))
     })
     .await
 }
@@ -357,10 +341,7 @@ pub async fn put_default_model(
 ) -> ApiResult<Json<ConfigEditResponse>> {
     edit(&api, &request.version, |config, _| {
         Ok((
-            Some(komo_runtime::config::set_default_model(
-                config,
-                &request.alias,
-            )?),
+            Some(komo_config::set_default_model(config, &request.alias)?),
             None,
         ))
     })
@@ -381,7 +362,7 @@ pub async fn put_setting(
 ) -> ApiResult<Json<ConfigEditResponse>> {
     edit(&api, &request.version, |config, _| {
         Ok((
-            Some(komo_runtime::config::set_setting(
+            Some(komo_config::set_setting(
                 config,
                 &key,
                 request.value.as_ref(),
@@ -408,7 +389,7 @@ pub async fn put_env(
             .vars
             .iter()
             .map(|v| (v.name.as_str(), v.value.as_str()));
-        Ok((None, Some(komo_runtime::config::set_env_values(env, vars)?)))
+        Ok((None, Some(komo_config::set_env_values(env, vars)?)))
     })
     .await
 }
@@ -422,7 +403,7 @@ pub async fn delete_env(
     edit(&api, &request.version, |config, env| {
         Ok((
             None,
-            Some(komo_runtime::config::remove_env_value(config, env, &name)?),
+            Some(komo_config::remove_env_value(config, env, &name)?),
         ))
     })
     .await
@@ -437,7 +418,7 @@ where
     let holder = &api.state.config;
     let _writing = holder.edit_lock().lock().await;
     let (config, env) = holder.read_texts().map_err(io_failure)?;
-    if komo_runtime::config::config_version(&config, &env) != version {
+    if komo_config::config_version(&config, &env) != version {
         return Err(ApiFailure::new(
             ErrorCode::VersionConflict,
             "配置文件在你打开之后被改过了（编辑器里，或另一个窗口）：刷新再改",
@@ -472,25 +453,24 @@ where
 }
 
 fn secrets(api: &Api, env: &str) -> ApiResult<komo_llm::Secrets> {
-    komo_runtime::config::secrets_from_text(Some(env), &api.state.config.sources().env)
-        .map_err(io_failure)
+    komo_config::secrets_from_text(Some(env), &api.state.config.sources().env).map_err(io_failure)
 }
 
 fn settings_view(api: &Api, config: &str, env: &str) -> ApiResult<ConfigSettingsResponse> {
-    komo_runtime::config::settings_view(
+    komo_config::settings_view(
         config,
         &api.state.config.current(),
-        komo_runtime::config::config_version(config, env),
+        komo_config::config_version(config, env),
     )
     .map_err(edit_failure)
 }
 
 fn env_view(api: &Api, config: &str, env: &str) -> ApiResult<ConfigEnvResponse> {
-    komo_runtime::config::env_view(
+    komo_config::env_view(
         config,
         env,
         &secrets(api, env)?,
-        komo_runtime::config::config_version(config, env),
+        komo_config::config_version(config, env),
     )
     .map_err(edit_failure)
 }
@@ -498,10 +478,10 @@ fn env_view(api: &Api, config: &str, env: &str) -> ApiResult<ConfigEnvResponse> 
 fn view(api: &Api, config: &str, env: &str) -> ApiResult<ConfigModelsResponse> {
     let sources = api.state.config.sources();
     let secrets = secrets(api, env)?;
-    komo_runtime::config::models_view(
+    komo_config::models_view(
         config,
         &secrets,
-        komo_runtime::config::config_version(config, env),
+        komo_config::config_version(config, env),
         sources.config.display().to_string(),
         sources.env.display().to_string(),
     )

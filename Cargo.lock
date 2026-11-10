@@ -2713,6 +2713,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "komo-config"
+version = "0.8.0"
+dependencies = [
+ "arc-swap",
+ "dotenvy",
+ "komo-kernel",
+ "komo-llm",
+ "reqwest",
+ "serde",
+ "serde_ignored",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+ "time",
+ "tokio",
+ "toml",
+ "toml_edit",
+]
+
+[[package]]
 name = "komo-gateway"
 version = "0.8.0"
 dependencies = [
@@ -2725,6 +2745,7 @@ dependencies = [
  "komo-agent",
  "komo-channel",
  "komo-client",
+ "komo-config",
  "komo-gateway",
  "komo-kernel",
  "komo-llm",
@@ -2787,11 +2808,11 @@ dependencies = [
  "arc-swap",
  "async-trait",
  "base64 0.23.1",
- "dotenvy",
  "futures-util",
  "grep",
  "ignore",
  "jiff",
+ "komo-config",
  "komo-kernel",
  "komo-llm",
  "komo-store",
@@ -2804,15 +2825,12 @@ dependencies = [
  "rmcp",
  "rustls",
  "serde",
- "serde_ignored",
  "serde_json",
  "tempfile",
  "thiserror 2.0.21",
  "time",
  "tokio",
  "tokio-util",
- "toml",
- "toml_edit",
  "tracing",
  "uuid",
 ]

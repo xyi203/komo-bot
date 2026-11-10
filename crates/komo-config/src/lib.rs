@@ -228,8 +228,8 @@ fn retired_policy(home: &Path) -> Option<ConfigIssue> {
     })
 }
 
-#[cfg(test)]
-pub(crate) mod testing;
+#[cfg(any(test, feature = "test-support"))]
+pub mod testing;
 
 #[cfg(test)]
 mod tests;

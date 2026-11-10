@@ -22,7 +22,7 @@ const MEMORY_TICK: std::time::Duration = std::time::Duration::from_secs(30);
 /// `MemoryManager` 在 Durable 下要的两个接缝。`config` 供提取时按会话的 Agent 取记忆模式。
 pub fn seams(
     core: &Arc<DurableCore>,
-    config: &Arc<komo_runtime::config::ConfigHolder>,
+    config: &Arc<komo_config::ConfigHolder>,
     clock: &Arc<dyn Clock>,
 ) -> (Arc<dyn SessionEvents>, Arc<dyn MemoryWorkLog>) {
     let events: Arc<dyn SessionEvents> =

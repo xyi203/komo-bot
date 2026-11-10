@@ -8,12 +8,12 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use komo_config::ConfigHolder;
 use komo_kernel::protocol::config::ConfigSnapshot;
 use komo_kernel::traits::{Clock, CronRepo, EmbeddingClient, GatewayError, LlmClient, MemoryRepo};
 use komo_kernel::types::ids::{ExecutorId, RunId};
 use komo_kernel::types::turn::{LlmError, TurnRequest};
 use komo_llm::EffortCapabilities;
-use komo_runtime::config::ConfigHolder;
 use komo_runtime::durable::harness::RetryPolicy;
 use komo_runtime::executor::ToolExecutor;
 use komo_runtime::matter::MatterManager;
@@ -751,7 +751,7 @@ fn skills_registry(
 ) -> komo_agent::skills::SkillRegistry {
     let home = match shared_home {
         Some(home) => Some(home.to_path_buf()),
-        None => komo_runtime::config::user_home().ok(),
+        None => komo_config::user_home().ok(),
     };
     komo_agent::skills::SkillRegistry::from_snapshot(snapshot, home.as_deref())
 }

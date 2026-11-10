@@ -771,7 +771,7 @@ pub async fn doctor(home: &Path, reconcile: bool) -> Outcome {
 // ---------------------------------------------------------------- 不经 Gateway
 
 /// `komo init`：在数据目录生成最小 `config.toml` 与 `.env` 模板（§3）。逻辑在
-/// `komo_runtime::config::init_home`；这里只把结果和下一步印出来。
+/// `komo_config::init_home`；这里只把结果和下一步印出来。
 pub fn init(home: &Path) -> Outcome {
     use komo_gateway::config::{InitError, init_home};
 

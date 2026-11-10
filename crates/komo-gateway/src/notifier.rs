@@ -14,11 +14,11 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use komo_config::ConfigHolder;
 use komo_kernel::protocol::config::ConfigSnapshot;
 use komo_kernel::protocol::http::InterventionSummary;
 use komo_kernel::traits::{DeliverError, Notifier};
 use komo_kernel::types::chat::{ChannelPeer, ChannelPlatform, Delivery, DeliveryTarget, Outbound};
-use komo_runtime::config::ConfigHolder;
 
 use crate::deliveries::DeliveryLog;
 

@@ -31,9 +31,9 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use komo_config::{ConfigHolder, LoadOptions};
 use komo_kernel::traits::{Clock, Inbound, LlmClient, Shutdown, Tool};
 use komo_llm::EffortCapabilities;
-use komo_runtime::config::{ConfigHolder, LoadOptions};
 use komo_store::Db;
 
 use crate::channels::ChannelFactory;
@@ -49,7 +49,7 @@ const DRAIN: std::time::Duration = std::time::Duration::from_secs(10);
 #[derive(Debug, thiserror::Error)]
 pub enum ServiceError {
     #[error(transparent)]
-    Config(#[from] komo_runtime::config::ConfigError),
+    Config(#[from] komo_config::ConfigError),
     #[error(transparent)]
     Lock(#[from] LockError),
     #[error("打不开数据库：{0}")]

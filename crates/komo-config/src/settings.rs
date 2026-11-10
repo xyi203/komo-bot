@@ -255,7 +255,7 @@ fn checked(doc: &DocumentMut, s: &Spec, v: &Value) -> Result<Item, EditError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::testing;
+    use crate::testing;
 
     const CONFIG: &str = r#"default_agent = "assistant"
 

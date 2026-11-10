@@ -111,5 +111,5 @@ home_chat = "oc_home"
 }
 
 /// 跨 crate 的测试替身按 §13.4 住在 kernel 的 `test-support` 里（`komo-agent` 的测试也
-/// 要它）。这里只转一道，保持 `crate::config::testing::snapshot_fixture` 的调用点不动。
+/// 要它）。这里只转一道，保持 `crate::testing::snapshot_fixture` 的调用点不动。
 pub use komo_kernel::test_support::snapshot_fixture;

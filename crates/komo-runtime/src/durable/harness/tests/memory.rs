@@ -17,7 +17,7 @@ use super::super::SubmissionDraft;
 use super::support::*;
 use crate::durable::memory::{DurableMemoryWork, DurableSessionEvents};
 use crate::durable::tx::ConversationOwnership;
-use crate::memory::{MemoryManager, MemoryParts};
+use komo_memory::{MemoryManager, MemoryParts};
 use komo_tools::codemode::Worker;
 use komo_tools::tools::{bash::BashTool, codemode::CodemodeTool, write::WriteTool};
 

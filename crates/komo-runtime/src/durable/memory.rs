@@ -38,7 +38,7 @@ use komo_store::models::SessionKind;
 use serde::{Deserialize, Serialize};
 
 use crate::durable::Engine;
-use crate::memory::{MemoryBatch, MemoryError, MemoryWorkItem, MemoryWorkLog, SessionEvents};
+use komo_memory::{MemoryBatch, MemoryError, MemoryWorkItem, MemoryWorkLog, SessionEvents};
 
 const SCAN_PAGE: usize = 512;
 

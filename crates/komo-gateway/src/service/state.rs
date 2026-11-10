@@ -14,9 +14,9 @@ use komo_kernel::traits::{Clock, CronRepo, EmbeddingClient, GatewayError, LlmCli
 use komo_kernel::types::ids::{ExecutorId, RunId};
 use komo_kernel::types::turn::{LlmError, TurnRequest};
 use komo_llm::EffortCapabilities;
+use komo_memory::matter::MatterManager;
+use komo_memory::{MemoryManager, MemoryParts};
 use komo_runtime::durable::harness::RetryPolicy;
-use komo_runtime::matter::MatterManager;
-use komo_runtime::memory::{MemoryManager, MemoryParts};
 use komo_store::{Db, TursoCronRepo, TursoDeliveryRepo, TursoMatterRepo, TursoMemoryRepo};
 use komo_tools::executor::ToolExecutor;
 use time::OffsetDateTime;
@@ -719,7 +719,7 @@ fn spawn_embedding_probe(memories: Arc<MemoryManager>, config: Arc<ConfigHolder>
 fn build_reranker(
     snapshot: &ConfigSnapshot,
     config: &ConfigHolder,
-) -> Option<komo_runtime::memory::Reranker> {
+) -> Option<komo_memory::Reranker> {
     if !snapshot.memory.retrieval.rerank {
         return None;
     }
@@ -728,7 +728,7 @@ fn build_reranker(
         &config.secrets(),
         komo_llm::default_transport(),
     ) {
-        Ok(backend) => Some(komo_runtime::memory::Reranker {
+        Ok(backend) => Some(komo_memory::Reranker {
             backend,
             model: snapshot.typesafe.model.clone(),
         }),

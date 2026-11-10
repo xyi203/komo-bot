@@ -21,7 +21,7 @@ use komo_kernel::protocol::http::{
 };
 use komo_kernel::types::ids::{MemoryId, SessionId};
 use komo_kernel::types::memory::{MemoryScope, MemoryState, scope_allowed};
-use komo_runtime::memory::{BelongsChange, MemoryError};
+use komo_memory::{BelongsChange, MemoryError};
 
 use super::Api;
 use super::error::{ApiFailure, ApiResult};
@@ -170,7 +170,7 @@ pub async fn confirm(
 /// `POST /v1/memories`：手动记一条（§9.3「手动记一条」）。
 ///
 /// 带 `session` + `run` 的是 Agent 在 Run 里替用户记的，记成未确认；都不带的是操作者
-/// 自己记的，记成已确认（[`komo_runtime::memory::MemoryManager::add`]）。**后台任务会话不能替用户记**：那里
+/// 自己记的，记成已确认（[`komo_memory::MemoryManager::add`]）。**后台任务会话不能替用户记**：那里
 /// 的「用户输入」是主 Agent 写的任务正文，不是用户原话。记下之后像 restore 一样提交一次
 /// 索引补齐。
 pub async fn add(

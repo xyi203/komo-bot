@@ -26,12 +26,12 @@ use komo_kernel::types::model::Effort;
 use komo_kernel::types::plan::ExecutionPlan;
 use komo_kernel::types::tool::{ToolContext, ToolDefinition, ToolError, ToolOutput};
 use komo_kernel::types::turn::MemoryUse;
+use komo_memory::matter::Caller;
 use komo_runtime::durable::harness::orchestration::store_task_doc;
 use komo_runtime::durable::harness::{
     AgentHooks, ContextRequest, HookError, OrchestrationHooks, SubmissionDraft, TaskDoc,
 };
 use komo_runtime::durable::{ConversationOwnership, EntryDraft};
-use komo_runtime::matter::Caller;
 
 use super::GatewayHooks;
 use crate::service::durable::agent_doc::{self, AgentDoc};

@@ -267,7 +267,7 @@ async fn an_old_generation_is_never_mixed_in() {
     let repo = komo_store::TursoMemoryRepo::new(gateway.state().db.clone());
     let mut other = gateway.state().memories.space().expect("有空间");
     other.model = "someone-else".into();
-    let other_generation = komo_runtime::memory::IndexBuilder::generation_id(&other);
+    let other_generation = komo_memory::IndexBuilder::generation_id(&other);
     repo.put_generation(
         &other_generation,
         Some(&other),

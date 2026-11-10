@@ -6,7 +6,7 @@ use komo_kernel::types::matter::{Matter, MatterKind, MatterState, NewMatter};
 use komo_store::TursoMatterRepo;
 
 use super::*;
-use crate::memory::consolidate::Consolidator;
+use crate::consolidate::Consolidator;
 
 struct Rig {
     manager: Arc<MemoryManager>,

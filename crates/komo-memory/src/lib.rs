@@ -28,6 +28,7 @@ mod belongs;
 mod consolidate;
 mod extract;
 mod index;
+pub mod matter;
 mod offline;
 mod rerank;
 mod stale;

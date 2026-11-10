@@ -3,7 +3,7 @@
 //! 事项属于操作者本人，不按渠道或会话归属（§2）；带会话来的调用先过一道闸：这个会话的
 //! Agent 若是 `memory = private` 或 `off`（给别人用的 Agent），读写一律拒——别人的话不进
 //! 操作者的清单，操作者的清单也不成为别人的注入通道。后台任务会话能推进、不能改承诺，
-//! 那一条在 [`komo_runtime::matter`]。
+//! 那一条在 [`komo_memory::matter`]。
 //!
 //! 每个响应都带 Gateway 本地时区的今天：超期是读出来的（`Matter::is_overdue`），读的人不拿
 //! 自己的时区再算一遍。
@@ -18,7 +18,7 @@ use komo_kernel::protocol::http::{
 use komo_kernel::types::agent::MemoryMode;
 use komo_kernel::types::ids::{MatterId, SessionId};
 use komo_kernel::types::matter::{MatterError, MatterVerb};
-use komo_runtime::matter::{Caller, MatterFailure};
+use komo_memory::matter::{Caller, MatterFailure};
 use time::{Date, Month, OffsetDateTime};
 
 use super::Api;
@@ -146,7 +146,7 @@ pub async fn act(
 /// 结案归档 / 重开恢复（`memory.md` §9.6「结案归档」）：事项写完之后，按事项**现在**的状态
 /// 把它名下的记忆理一遍。看状态而不看这次动词，所以对已在目标状态上的重复请求（上一次
 /// 事项写完、归档没跑完）也会补上；归档本身幂等。结案与归档不在同一个 aux.db 事务里（事项与
-/// 记忆是两个仓储），差别见 `komo_runtime::memory::belongs` 的模块注释。
+/// 记忆是两个仓储），差别见 `komo_memory::belongs` 的模块注释。
 async fn settle_memories(
     api: &Api,
     matter: &komo_kernel::types::matter::Matter,
@@ -176,7 +176,7 @@ async fn settle_memories(
     Ok(None)
 }
 
-fn closure_of(outcome: komo_runtime::memory::BelongsOutcome) -> MatterClosure {
+fn closure_of(outcome: komo_memory::BelongsOutcome) -> MatterClosure {
     MatterClosure {
         archived: outcome.archived,
         restored: outcome.restored,

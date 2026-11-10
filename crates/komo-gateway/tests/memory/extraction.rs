@@ -45,7 +45,7 @@ async fn run_and_learn(scripts: Vec<Vec<Round>>, text: &str) -> (TestGateway, Sc
     gateway
         .state()
         .memories
-        .process_pending(komo_runtime::memory::WORK_BATCH)
+        .process_pending(komo_memory::WORK_BATCH)
         .await
         .expect("这一轮提取跑得动");
     (gateway, llm)
@@ -401,7 +401,7 @@ async fn extraction_follows_the_memory_mode_at_extraction_time() {
     let report = gateway
         .state()
         .memories
-        .process_pending(komo_runtime::memory::WORK_BATCH)
+        .process_pending(komo_memory::WORK_BATCH)
         .await
         .expect("这一轮提取跑得动");
     assert_eq!(report.skipped, 1, "{report:?}");
@@ -424,7 +424,7 @@ async fn read_events(
     gateway: &TestGateway,
     session: &komo_kernel::types::ids::SessionId,
 ) -> Vec<komo_kernel::events::Event> {
-    use komo_runtime::memory::SessionEvents;
+    use komo_memory::SessionEvents;
     komo_runtime::durable::memory::DurableSessionEvents::new(std::sync::Arc::clone(
         &komo_gateway::service::test_support::driver_stream::core(gateway).storage,
     ))
@@ -441,11 +441,11 @@ async fn read_events(
 /// 模型换了一段脚本。
 async fn learn_with(gateway: &TestGateway, llm: ScriptedLlm) {
     use komo_kernel::traits::LlmClient;
-    use komo_runtime::memory::{MemoryManager, MemoryParts};
+    use komo_memory::{MemoryManager, MemoryParts};
     let state = gateway.state();
     let snapshot = state.snapshot();
     let repo: Arc<dyn MemoryRepo> = Arc::clone(&state.memory);
-    let catalog: Arc<dyn komo_runtime::memory::MemoryCatalog> =
+    let catalog: Arc<dyn komo_memory::MemoryCatalog> =
         Arc::new(komo_store::TursoMemoryRepo::new(state.db.clone()));
     let (events, work) = komo_gateway::service::durable::memory::seams(
         &komo_gateway::service::test_support::driver_stream::core(gateway),

@@ -21,9 +21,7 @@ use komo_kernel::types::matter::{
 };
 use komo_kernel::types::memory::Evidence;
 
-use crate::memory::{
-    MAX_CONTENT_CHARS, MemoryError, SessionEvents, looks_like_secret, run_user_evidence,
-};
+use crate::{MAX_CONTENT_CHARS, MemoryError, SessionEvents, looks_like_secret, run_user_evidence};
 
 /// 事项操作的失败。
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]

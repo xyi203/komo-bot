@@ -1,0 +1,32 @@
+[package]
+name = "komo-memory"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# §13.4：记忆（MemoryManager、提取与合并、索引与代次，§9）与事项（goals / areas 的操作，
+# `docs/goals.md`）。仓储在 komo-store 的 aux.db；它不认识 durable 的引擎——Durable 上的两个
+# 接缝在 runtime（`durable::memory`）。
+[dependencies]
+komo-kernel = { workspace = true }
+komo-store = { workspace = true }
+# 模型调用的埋点（`telemetry`）与取 JSON 的帮手（`parse_json_object`）。
+komo-llm = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+time = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }
+jiff = { workspace = true }
+
+[dev-dependencies]
+komo-kernel = { workspace = true, features = ["test-support"] }
+komo-store = { workspace = true, features = ["test-support"] }
+komo-llm = { workspace = true, features = ["test-support"] }
+# 真机验收（`--ignored`）要自己发 HTTPS 请求，而 `reqwest` 是 rustls-no-provider（§13.4）。
+rustls = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }

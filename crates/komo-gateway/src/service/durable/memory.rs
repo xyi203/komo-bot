@@ -9,8 +9,8 @@ use std::sync::Arc;
 
 use komo_kernel::traits::Clock;
 use komo_kernel::types::agent::MemoryMode;
+use komo_memory::{MemoryWorkLog, SessionEvents, WORK_BATCH};
 use komo_runtime::durable::memory::{DurableMemoryWork, DurableSessionEvents, MemoryModes};
-use komo_runtime::memory::{MemoryWorkLog, SessionEvents, WORK_BATCH};
 
 use super::DurableCore;
 use crate::service::state::GatewayState;

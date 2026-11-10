@@ -2750,6 +2750,7 @@ dependencies = [
  "komo-gateway",
  "komo-kernel",
  "komo-llm",
+ "komo-memory",
  "komo-runtime",
  "komo-store",
  "komo-tools",
@@ -2804,6 +2805,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "komo-memory"
+version = "0.8.0"
+dependencies = [
+ "async-trait",
+ "jiff",
+ "komo-kernel",
+ "komo-llm",
+ "komo-store",
+ "rustls",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+ "time",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "komo-runtime"
 version = "0.8.0"
 dependencies = [
@@ -2814,9 +2834,9 @@ dependencies = [
  "komo-config",
  "komo-kernel",
  "komo-llm",
+ "komo-memory",
  "komo-store",
  "komo-tools",
- "rustls",
  "serde",
  "serde_json",
  "tempfile",

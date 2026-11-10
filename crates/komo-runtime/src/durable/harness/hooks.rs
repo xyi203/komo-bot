@@ -372,11 +372,6 @@ impl HarnessDeps {
         self
     }
 
-    pub fn with_settings(self, settings: HarnessSettings) -> Self {
-        self.settings.store(Arc::new(settings));
-        self
-    }
-
     /// 当前设置：每个决定点现读。
     pub fn settings(&self) -> Arc<HarnessSettings> {
         self.settings.load_full()

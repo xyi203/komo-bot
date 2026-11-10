@@ -136,22 +136,6 @@ impl EffortCapabilities {
         self.embedding_providers.contains_key(provider)
     }
 
-    /// 补一个 provider 的声明。
-    pub fn with_provider(mut self, provider: impl Into<String>, support: EffortSupport) -> Self {
-        self.providers.insert(provider.into(), support);
-        self
-    }
-
-    /// 补一个**向量**后端的声明。
-    pub fn with_embedding_provider(
-        mut self,
-        provider: impl Into<String>,
-        support: EffortSupport,
-    ) -> Self {
-        self.embedding_providers.insert(provider.into(), support);
-        self
-    }
-
     /// 补一个模型前缀的声明。它比 provider 的声明更具体，先匹配。
     pub fn with_model(mut self, prefix: impl Into<String>, support: EffortSupport) -> Self {
         self.model_prefixes.push((prefix.into(), support));
@@ -333,16 +317,5 @@ mod tests {
             "声明里没有就是没有：{error}"
         );
         assert!(error.to_string().contains("low"), "{error}");
-    }
-
-    #[test]
-    fn a_caller_can_declare_a_backend_the_builtin_table_does_not_know() {
-        let caps = EffortCapabilities::builtin()
-            .with_provider("brand_new", EffortSupport::new(["low", "high"]));
-        assert!(caps.check(&model("brand_new", "m", Some("low"))).is_ok());
-        assert!(
-            caps.check(&model("brand_new", "m", Some("medium")))
-                .is_err()
-        );
     }
 }

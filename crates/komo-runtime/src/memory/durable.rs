@@ -48,8 +48,6 @@ const SCAN_PAGE: usize = 512;
 /// 升级前的会话钉住的那一块记忆注入的 uses（conversation 级 document）。按 Run 召回之后不再写，
 /// 旧会话里的那份只给提取与 run 详情补旧 Run 的注入（`docs/memory.md` §9.4）。
 pub const MEMORY_DOC_KIND: &str = "komo.memory";
-pub const MEMORY_DOC_VERSION: u32 = 1;
-
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MemoryDoc {

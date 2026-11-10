@@ -59,16 +59,6 @@ impl RoutingStream {
         })
     }
 
-    /// 只有一个后端时。
-    pub fn single(config: &ModelConfig, factory: LlmFactory) -> Result<Self, LlmBuildError> {
-        let backend = factory.build_stream(config, ModelRole::Main)?;
-        Ok(Self {
-            factory,
-            backends: Mutex::new(BTreeMap::from([(model_key(config), backend)])),
-            roles: BTreeMap::from([(model_key(config), ModelRole::Main)]),
-        })
-    }
-
     /// 没有预建后端，按需建（测试里再用 [`Self::with_backend`] 指定）。
     pub fn lazy(factory: LlmFactory) -> Self {
         Self {

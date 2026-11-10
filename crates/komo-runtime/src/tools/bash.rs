@@ -33,7 +33,7 @@ use super::{normalized, parse_args, plan_time};
 /// 一条命令默认跑多久。
 pub const DEFAULT_TIMEOUT_SECS: u64 = 120;
 /// 默认把输出完整写进已有的 `tool-output`；模型视图的 30 KiB / 2000 行限制在 kernel
-/// 投影里执行。测试和嵌入方仍可通过 `with_limits` 明确设置存储上限。
+/// 投影里执行。
 pub const DEFAULT_OUTPUT_LIMIT: u64 = u64::MAX;
 /// 用户插话后，前台命令至少跑这么久才提前转后台：几秒就完的命令照常跑完。
 const INTERJECT_GRACE: Duration = Duration::from_secs(3);
@@ -254,12 +254,6 @@ impl BashTool {
     /// 把这些路径只读挂上再跑命令；bwrap 用不了时照旧直接跑（启动时探一次）。
     pub fn protecting(mut self, paths: Vec<PathBuf>) -> Self {
         self.sandbox = Sandbox::probe(Protected::new(paths));
-        self
-    }
-
-    pub fn with_limits(mut self, timeout: Duration, output_limit: u64) -> Self {
-        self.default_timeout = timeout;
-        self.output_limit = output_limit;
         self
     }
 

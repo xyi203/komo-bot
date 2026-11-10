@@ -19,7 +19,7 @@
 use std::collections::HashMap;
 
 use komo_kernel::durable::{
-    ContentBlock, ContextEdit, ContextView, EntryId, EntryRecord, Message, Sections, SystemMessage,
+    ContextEdit, ContextView, EntryId, EntryRecord, Message, Sections, SystemMessage,
 };
 use komo_kernel::types::tool::ToolDefinition;
 use serde_json::{Value, json};
@@ -243,18 +243,6 @@ pub fn plan_system_entries(
         .enumerate()
         .map(|(index, patch)| {
             system_entry(Some(patch), (index == last).then_some(&changes), timestamp)
-        })
-        .collect()
-}
-
-/// 一条 assistant 消息里的工具调用，按调用顺序：`(id, name, arguments)`。
-pub fn tool_calls_of(message: &komo_kernel::durable::AssistantMessage) -> Vec<(String, String)> {
-    message
-        .content
-        .iter()
-        .filter_map(|block| match block {
-            ContentBlock::ToolCall { id, name, .. } => Some((id.clone(), name.clone())),
-            _ => None,
         })
         .collect()
 }

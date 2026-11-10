@@ -424,16 +424,6 @@ impl RoutingLlm {
         })
     }
 
-    /// 只有一个后端时。
-    pub fn single(config: &ModelConfig, factory: LlmFactory) -> Result<Self, LlmBuildError> {
-        let client = factory.build(config, ModelRole::Main)?;
-        Ok(RoutingLlm {
-            factory,
-            clients: Mutex::new(BTreeMap::from([(model_key(config), client)])),
-            roles: BTreeMap::from([(model_key(config), ModelRole::Main)]),
-        })
-    }
-
     fn client_for(&self, config: &ModelConfig) -> Result<Arc<dyn LlmClient>, LlmBuildError> {
         let key = model_key(config);
         if let Some(client) = self.clients.lock().expect("路由表").get(&key) {

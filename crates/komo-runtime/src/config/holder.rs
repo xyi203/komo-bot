@@ -35,11 +35,6 @@ pub struct ReloadReport {
 }
 
 impl ReloadReport {
-    /// 什么都没变——重载照样发生了，但没有需要重建的东西。
-    pub fn is_noop(&self) -> bool {
-        self.changed.is_empty()
-    }
-
     /// 给操作者看的一行话。
     pub fn summary(&self) -> String {
         if self.changed.is_empty() {
@@ -423,7 +418,7 @@ mod tests {
         let fixture = Fixture::valid();
         let holder = fixture.holder();
         let report = holder.reload().unwrap();
-        assert!(report.is_noop(), "{report:?}");
+        assert!(report.changed.is_empty(), "{report:?}");
         assert!(report.summary().contains("没有键发生变化"));
     }
 

@@ -17,8 +17,6 @@ use crate::durable::error::TaskError;
 use crate::durable::runtime::TaskRuntime;
 
 pub const CONFIRM_KIND: &str = "komo.confirm";
-pub const CONFIRM_VERSION: u32 = 1;
-
 /// 不是人打的字起的 Run（`docs/confirm.md` §3）。`cron.input` 是 gateway 的 kind，这里只认名字。
 const UNATTENDED_INPUTS: [&str; 4] = [
     "cron.input",

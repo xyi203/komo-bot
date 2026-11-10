@@ -27,42 +27,6 @@ impl TursoCronRepo {
     pub fn new(db: Db) -> Self {
         Self { db }
     }
-
-    /// 给一条触发记录补上它产生的 Session / Run。
-    pub async fn attach_run(
-        &self,
-        job: &CronJobId,
-        scheduled_at: OffsetDateTime,
-        session: &SessionId,
-        run: &RunId,
-    ) -> Result<(), RepoError> {
-        let id = firing_id(job, scheduled_at);
-        let (session, run) = (session.to_string(), run.to_string());
-        self.db
-            .with_write_retry(move |ex| {
-                let (id, session, run) = (id.clone(), session.clone(), run.clone());
-                Box::pin(async move {
-                    let Some(mut row) = CronFiringRow::filter_by_id(&id)
-                        .first()
-                        .exec(ex)
-                        .await
-                        .map_err(map_toasty)?
-                    else {
-                        return Err(StoreError::NotFound {
-                            what: format!("cron firing {id}"),
-                        });
-                    };
-                    row.update()
-                        .session_id(Some(session))
-                        .run_id(Some(run))
-                        .exec(ex)
-                        .await
-                        .map_err(map_toasty)
-                }) as BoxFuture<'_, Result<(), StoreError>>
-            })
-            .await
-            .map_err(RepoError::from)
-    }
 }
 
 /// 唯一键 `job_id + scheduled_at` 的确定性行 ID。
@@ -692,29 +656,6 @@ mod tests {
         assert!(!repo.remove(&id).await.unwrap());
         assert!(repo.get(&id).await.unwrap().is_none());
         assert_eq!(repo.firings(&id, 10).await.unwrap().len(), 1, "历史保留");
-    }
-
-    /// 触发记录事后能指回它产生的 Session / Run。
-    #[tokio::test]
-    async fn a_firing_can_be_linked_to_the_run_it_produced() {
-        let (db, _dir) = temp().await;
-        let repo = TursoCronRepo::new(db);
-        repo.put(job("job-1")).await.unwrap();
-        let id = CronJobId::from_raw("job-1");
-        repo.claim_firing(firing(&id, NOW)).await.unwrap();
-
-        repo.attach_run(
-            &id,
-            NOW,
-            &SessionId::from_raw("sess-1"),
-            &RunId::from_raw("run-1"),
-        )
-        .await
-        .unwrap();
-
-        let firings = repo.firings(&id, 10).await.unwrap();
-        assert_eq!(firings[0].session.as_ref().unwrap().as_str(), "sess-1");
-        assert_eq!(firings[0].run.as_ref().unwrap().as_str(), "run-1");
     }
 
     /// 一行读不出来的 Job 只是被跳过，不该把整张清单带走（§10）。

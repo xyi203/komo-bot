@@ -204,10 +204,6 @@ impl Db {
         self.path.as_deref()
     }
 
-    pub fn retry_config(&self) -> RetryConfig {
-        self.retry
-    }
-
     /// 一个可以直接 `exec` 的 toasty 句柄（克隆自同一个池）。
     ///
     /// 只给**读**用。写一律走 [`Db::with_write_retry`]。

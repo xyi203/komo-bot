@@ -32,7 +32,7 @@
 - **Grafana 看板**（`docs/grafana/komo.json`）的"模型"一组只剩辅助调用，"Run""工具"两组、主对话的重试、`invoke_agent` 链路面板全空。
   §9 末尾的 §14 待验证项（压缩值不值、缓存命中、CJK 估算偏差）现在没有数据可看。
 - **effort 两头都没记**：assistant 消息的附加字段只有 `api` / `provider` / `model` / `usage` / `providerBlocks`
-  （`llm/model_stream.rs:480`），档位只在生成任务的 checkpoint 里；无状态 provider 的完成日志（`anthropic/stateless.rs:137` 等）
+  （`komo-llm/src/model_stream.rs:480`），档位只在生成任务的 checkpoint 里；无状态 provider 的完成日志（`komo-llm/src/anthropic/stateless.rs:137` 等）
   也没有 `effort` 字段，旧 driver 是有的（`llm/anthropic.rs:434`、`llm/responses.rs:356`）——§13.3"实际用的强度记进日志"在新路径上失效。
   pi 在 `d5b3de22d` 补的是同一件事（assistant 消息记 `thinkingLevel`）。
 - **引擎报告被吞**：gateway 起引擎用 `EngineOptions::default()` 的 `report`（空函数，`service/durable/core.rs:69`）。调度器自己的报告另写
@@ -134,7 +134,7 @@ komo.submit                    一次受理（一条输入 / write）：受理�
 | `chat` | `telemetry::stream`（新）：包住 `ModelStream::stream`，由 generation 的 `request` 与 compaction 的摘要请求调用；辅助调用仍走 `turn` / `ask` | `gen_ai.operation.name`、`gen_ai.request.model`、`gen_ai.response.model`、`gen_ai.response.id`、`gen_ai.usage.input_tokens`、`gen_ai.usage.output_tokens`、`komo.usage.cache_read_tokens`、`komo.usage.cache_write_tokens`、`komo.usage.reasoning_tokens`、`komo.llm.role`、`komo.llm.effort`、`komo.llm.attempt`（checkpoint 里的 `attempt`，从 1 起）、`error.type`（HTTP 状态码 / timeout / incomplete / transport / unsupported_effort / unknown，与 `telemetry::error_type` 相同；另加 `context_overflow`——`LlmError` 没有这个变体，取 `is_context_overflow` 识别出的超长） |
 | `embeddings` | `telemetry::embed`（不变） | 同第一版 |
 | `execute_tool` | 工具任务 `execute` 阶段执行一次尝试处（`harness/tool.rs`）；被拒、不认识的工具名、编排调用（`task` / `monitor` 走 `orchestrate`）不开 | `gen_ai.operation.name`、`gen_ai.tool.name`、`gen_ai.tool.call.id`、`komo.tool.attempt`、`komo.tool.status`（completed / failed / uncertain）、`komo.tool.exit_code`、`komo.tool.output_bytes`、`error.type` |
-| 后台 span | 不变（`memory/mod.rs:999`、`memory/offline.rs:185`、`service/durable/background/cron_watch.rs:39`、`deliveries.rs:113`、`mcp.rs:649`） | 同第一版 |
+| 后台 span | 不变（`komo-memory/src/lib.rs:999`、`komo-memory/src/offline.rs:185`、`service/durable/background/cron_watch.rs:39`、`deliveries.rs:113`、`mcp.rs:649`） | 同第一版 |
 
 | 事件 | 发在 | 属性 |
 |---|---|---|
@@ -224,7 +224,7 @@ otlp_endpoint = "http://127.0.0.1:4318"
 | 项 | 状态 |
 |---|---|
 | `run inspect` 与 `/v1/runs/{id}` | 在（D5 在新存储上重做，`service/durable/sessions/runs.rs`）：`model`、`duration_ms`、`failure`、`tokens`（没人报的缺席，不是 0）、`compactions`、`recall`、`memories` |
-| **assistant 消息记 effort**（新） | 无状态 provider 造最终消息（`llm/model_stream.rs` 的 `final_message`）时，配置里**显式**给了档位就在附加字段写 `effort`（与 §13.3 的 `EffortSetting` 一致：没配置 = 服务端默认，不写，不虚构）。生成任务恢复后重发也带着它（档位在 `request` checkpoint 的 `ModelConfig` 里）。`run inspect` 的 `model` 旁边显示它；导出照带（pi 的 `thinkingLevel` 是同一件事，取值不同，不改名） |
+| **assistant 消息记 effort**（新） | 无状态 provider 造最终消息（`komo-llm/src/model_stream.rs` 的 `final_message`）时，配置里**显式**给了档位就在附加字段写 `effort`（与 §13.3 的 `EffortSetting` 一致：没配置 = 服务端默认，不写，不虚构）。生成任务恢复后重发也带着它（档位在 `request` checkpoint 的 `ModelConfig` 里）。`run inspect` 的 `model` 旁边显示它；导出照带（pi 的 `thinkingLevel` 是同一件事，取值不同，不改名） |
 | **provider 完成日志带 effort**（新） | `llm/*/stateless.rs` 的 "model stream completed / failed" 日志加 `effort` 字段，恢复 §13.3 的要求 |
 | 投递 | 不加命令；投递失败进 `komo.delivery` span 与指标 |
 

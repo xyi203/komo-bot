@@ -172,9 +172,9 @@
 
 三家 provider 的无状态流在**每个网络块**之后都造一份完整的部分消息交给 `progress`：
 
-- `llm/anthropic/stateless.rs:191`、`llm/chat/stateless.rs:184`、`llm/responses/stateless.rs:193`：
+- `komo-llm/src/anthropic/stateless.rs:191`、`komo-llm/src/chat/stateless.rs:184`、`komo-llm/src/responses/stateless.rs:193`：
   `progress(&partial_message(.., assembled.content_so_far()))`。`content_so_far` 克隆已收到的全部文本与思考，
-  工具调用的参数用 `lenient_arguments`（`llm/model_stream.rs:525`）对整段半截 JSON 做一次 `serde_json::from_str`
+  工具调用的参数用 `lenient_arguments`（`komo-llm/src/model_stream.rs:525`）对整段半截 JSON 做一次 `serde_json::from_str`
   （没收齐时失败、给 `{}`，但也已经扫了一遍）。
 - 回调（`harness/generation.rs:578`）再 `partial.clone()` 一次放进 `latest`；`commit_partials` 每 250 ms 才取一次。
   也就是说，绝大多数快照造出来就被下一份覆盖了。

@@ -357,14 +357,14 @@ BM25 在 Monty 里做完（原来 `driver.py` 的那份，逻辑未动），不�
 | 位置 | 内容 |
 |---|---|
 | `komo-kernel` `types/plan.rs` | `Operation::Codemode` |
-| `komo-runtime` `codemode/mod.rs` | `Worker`：起 worker 进程、协议对话、墙钟 / 内存看门狗 / 杀进程；`ScriptCatalog` |
-| `komo-runtime` `codemode/worker.rs` | worker 本体（`komo __codemode-worker` 的函数体）：握手、跑 Monty、翻译暂停、只读文件挂载与状态名单、时钟 / 熵问宿主 |
-| `komo-runtime` `codemode/convert.rs` | `serde_json::Value` ↔ `MontyObject` |
-| `komo-runtime` `codemode/prelude.py` | 拼在脚本前面：`ToolError`、`tools` / `atools`、`settle`、BM25 发现函数 |
-| `komo-runtime` `limits.rs` | `resident_bytes`：worker 的常驻内存读数 |
-| `komo-runtime` `tools/protect.rs` | `Protected`：komo 自己的状态名单，`write` / `edit` / `bash` 与 codemode worker 共用 |
-| `komo-runtime` `tools/codemode.rs` | `CodemodeTool`：定义 + `prepare`；`execute` 不该被走到（与 `task` 同一模式） |
-| `komo-runtime` `executor/codemode.rs` | `ToolExecutor::codemode_fingerprint` 与摘要 / 失败首部等共用函数（执行本身在 `durable/harness/codemode.rs`） |
+| `komo-tools` `codemode/mod.rs` | `Worker`：起 worker 进程、协议对话、墙钟 / 内存看门狗 / 杀进程；`ScriptCatalog` |
+| `komo-tools` `codemode/worker.rs` | worker 本体（`komo __codemode-worker` 的函数体）：握手、跑 Monty、翻译暂停、只读文件挂载与状态名单、时钟 / 熵问宿主 |
+| `komo-tools` `codemode/convert.rs` | `serde_json::Value` ↔ `MontyObject` |
+| `komo-tools` `codemode/prelude.py` | 拼在脚本前面：`ToolError`、`tools` / `atools`、`settle`、BM25 发现函数 |
+| `komo-tools` `limits.rs` | `resident_bytes`：worker 的常驻内存读数 |
+| `komo-tools` `tools/protect.rs` | `Protected`：komo 自己的状态名单，`write` / `edit` / `bash` 与 codemode worker 共用 |
+| `komo-tools` `tools/codemode.rs` | `CodemodeTool`：定义 + `prepare`；`execute` 不该被走到（与 `task` 同一模式） |
+| `komo-tools` `executor/mod.rs` | `ToolExecutor::codemode_fingerprint` 与摘要 / 失败首部等共用函数（执行本身在 `durable/harness/codemode.rs`） |
 | `komo-runtime` `durable/harness/codemode.rs` | 外层脚本任务：`codemode.start` memo、worker 对话、时钟 / 熵 memo、按 key 回放 `komo.nested`、`abort_owned` 收尾 |
 | `komo-runtime` `durable/harness/nested.rs` | `komo.nested` 槽位与 `commit_nested`（嵌套任务终结 + 交付结果同一次提交）、`nested::reusable` |
 | `komo-runtime` `durable/harness/tool.rs` | `kind: "nested"` 分支：共用 `call → execute → probe → 结果` 与进度提交，槽位在 `komo.live.nestedTools` |

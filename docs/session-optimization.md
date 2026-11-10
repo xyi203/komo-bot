@@ -58,8 +58,8 @@ hub，HTTP 先订阅再取，重叠靠 seq 去重。游标在覆盖范围内时�
 | C | `/clone` `/fork` 只在开始时检查源会话，复制 blob 与提交之间不复核；源目录在复制前被 purge 时 `copy_blobs` 静默成功，仍提交引用 blob 的 entry | 正确性（数据完整性） | `service/durable/sessions/copy.rs:186`、`:104–108` |
 | D | SSE 补读整份投影后才按 `seq > after` 过滤，过滤前还读所有历史 codemode 的外层结果 | 性能，重连成本 O(历史) | `service/durable/feed/mod.rs:137–147`、`nested_view.rs:40` |
 | E | 会话列表与按来源找会话全表扫描；渠道的 `ensure_session` 在提交线里扫；列表再逐条串行读 live / inbox / tail | 性能，随会话数线性增长 | `sessions.rs:219`、`:264`、`:325`；`http/v2/sessions.rs:60–69` |
-| F | 流式生成每个网络块都构造完整部分消息并再 clone 一次；未收齐的工具参数反复整段���析 | 性能，长回复 / 大参数时 CPU 与分配 | `llm/responses/stateless.rs:193`、`durable/harness/generation.rs:584`、`llm/model_stream.rs:525` |
-| G | 模型请求的 `timeout_secs` 是整条请求（含流式正文）的总时限；超时后原样重发同一请求，同样超时，直到 10 次预算用完，每次失败还在会话里留一条空 assistant entry | 可用性，大上下文的会话整轮失败 | `llm/transport.rs:186`、`komo-kernel/src/types/model.rs:260`、`durable/harness/generation.rs:661–699`、`durable/harness/hooks.rs:76` |
+| F | 流式生成每个网络块都构造完整部分消息并再 clone 一次；未收齐的工具参数反复整段���析 | 性能，长回复 / 大参数时 CPU 与分配 | `komo-llm/src/responses/stateless.rs:193`、`durable/harness/generation.rs:584`、`komo-llm/src/model_stream.rs:525` |
+| G | 模型请求的 `timeout_secs` 是整条请求（含流式正文）的总时限；超时后原样重发同一请求，同样超时，直到 10 次预算用完，每次失败还在会话里留一条空 assistant entry | 可用性，大上下文的会话整轮失败 | `komo-llm/src/transport.rs:186`、`komo-kernel/src/types/model.rs:260`、`durable/harness/generation.rs:661–699`、`durable/harness/hooks.rs:76` |
 
 A 的展开：`land()` 的闭包在 `Line::commit` 持有 `gate` 期间执行。闭包里先 `load_tree`（分页读全部分支的全部 entry），再按请求键
 **逐分支**调 `submission_by_request`，然后 `busy_reason`、`realize`、写 submission。会话越长、分支越多，这次提交持锁越久，
@@ -72,7 +72,7 @@ C 的时序：clone 读完源树 → 另一请求 delete + purge 源会话（目
 G 的现场（2026-10-28，会话 `01a18089…`，任务 4231）：`send()` 用的是 reqwest 的 `RequestBuilder::timeout`，计时从发请求一直到读完响应体；
 没配时 `timeout_secs` 默认 120。这个会话用 `codex/gpt-6.1-sol` 连续失败 23 次，gateway 日志里每次 `elapsed_ms` 都在 120000–120003，
 `error=超时`。同一时段 sol 的小请求（memory.extract / title）4–11s 就完成了，近两天 sol 成功的 204 次里最慢的不到 90s，
-所以上游没挂，是这个会话的请求在 120s 内跑不完。超时属于 `RetryCause::Transport`（`llm/mod.rs:118`），重发的还是同一份上下文，
+所以上游没挂，是这个会话的请求在 120s 内跑不完。超时属于 `RetryCause::Transport`（`komo-llm/src/lib.rs:118`），重发的还是同一份上下文，
 结果每次都一样，10 次加上退避一共烧掉约 30 分钟。导出的会话里留下了 10 条 `content: []`、`stopReason: error` 的 assistant entry。
 **没法判断**这几次是流一直在吐字节只是总时长超了，还是上游根本没返回数据：komo 不记首字节时间，magpie 代理在本机也没有日志。
 临时处置：`~/.komo/config.toml` 的 `[model_providers.magpie]` 已加 `timeout_secs = 600`。

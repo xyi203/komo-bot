@@ -138,7 +138,7 @@ MCP，不起 `run_child_detachable` 的子进程，所以也用不上 `probe`"�
 
 | 位置 | 内容 |
 |---|---|
-| `komo-runtime` `tools/codemode.rs` | `NOT_IN_SCRIPTS` 去掉 `bash`；工具说明与 `CODEMODE_DOC` 里"bash 只能在脚本外调"改成只列 `edit` / `write` / 编排；`refused_calls` 的测试改例子 |
+| `komo-tools` `tools/codemode.rs` | `NOT_IN_SCRIPTS` 去掉 `bash`；工具说明与 `CODEMODE_DOC` 里"bash 只能在脚本外调"改成只列 `edit` / `write` / 编排；`refused_calls` 的测试改例子 |
 | `komo-runtime` `durable/harness/live.rs` | `NestedToolSlot` 或给 `ToolSlot` 加 `parent_task_id`；`LiveState.nested_tools`；`slot` / `slot_mut` 两表查找；删外层名下行的函数 |
 | `komo-runtime` `durable/harness/codemode.rs` | 建嵌套任务的提交里推 `pending` 槽位 |
 | `komo-runtime` `durable/harness/tool.rs` | 嵌套放行 `ShellCommand`；意图、重跑、`commit_output` 去掉 `slotted` 分支；外层收尾删行 |

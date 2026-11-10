@@ -45,11 +45,11 @@ pi 的"一个文件里多分支"在 pi-durable 里没有原生对应，对应物
 | `POST …/compact` | `/compact [指示]` |
 | `GET …/export` | `komo session export`（pi v3 JSONL，leaf 落在文件末尾） |
 
-实现：`komo-gateway/src/service/durable/{sessions,submit,tree,copy}.rs`（服务层，`impl DurableCore`）与 `http/v2/{sessions,tree,runs,export}.rs`；`SessionError` → `ApiFailure` 在 `http/error.rs`（404 / 400 / 409）。
+实现：`komo-gateway/src/service/durable/sessions/{mod,tree,copy}.rs`、`submit/mod.rs`（服务层，`impl DurableCore`）与 `http/v2/{sessions,tree,runs,export}.rs`；`SessionError` → `ApiFailure` 在 `http/error.rs`（404 / 400 / 409）。
 
 ## 4. 自动化验证
 
-`komo-gateway/src/http/session_tree/tests.rs`（走真实 `service::start`、真实 HTTP、真实 `durable.db`，模型是脚本化替身；`seed` 经 `DurableCore` 提交并返回真实 entry ID）：
+`komo-gateway/src/http/v2/tree_tests.rs`（走真实 `service::start`、真实 HTTP、真实 `durable.db`，模型是脚本化替身；`seed` 经 `DurableCore` 提交并返回真实 entry ID）：
 
 | 场景 | 测试 |
 |---|---|

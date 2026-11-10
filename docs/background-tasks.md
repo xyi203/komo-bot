@@ -64,7 +64,7 @@
 
 - **记号。** 回答整段是 `NO_REPLY`（kernel `types::chat::SILENT_REPLY`；`is_silent_reply` 去首尾空白、再去一层反引号 / 引号后整段相等才算，夹在话里不算）。
 - **对话会话**（看客 `watch.rs` 的 `finish`）：回答是记号、且这条 run 的输入**全是内部输入**（首个输入，以及并进来、与它共用同一条回答 entry 的那些都是 `task.result` / `monitor.event` / `monitor.end`）时：不投递（渠道与 home chat 都不投）、不起标题。entry 照常落、Run 照常收尾，审计不丢；TUI 在事件流里看得到那一轮（显示的就是记号本身，没有单独的"未转告"样式）。有一条是用户说的话（聊天、TUI、认不出来源）就照原样投——有人在等回答。
-- **Cron prompt Job**（`durable/cron_watch.rs`）：回答是记号时触发照记 `ok`、不投，与命令型 Job 的空 stdout 一样（`docs/komo_bot.md` §10）。Job 的 prompt 自己写明"没事就只回 NO_REPLY"；宿主不往 Cron 的输入里补这句（输入正文带内容哈希，不动它）。
+- **Cron prompt Job**（`service/durable/background/cron_watch.rs`）：回答是记号时触发照记 `ok`、不投，与命令型 Job 的空 stdout 一样（`docs/komo_bot.md` §10）。Job 的 prompt 自己写明"没事就只回 NO_REPLY"；宿主不往 Cron 的输入里补这句（输入正文带内容哈希，不动它）。
 - **谁会被告知可以不说话。** 监听事件、监听结束、后台命令结束三处附注与 `monitor` 工具说明写了"不值得转告就整段只回 NO_REPLY"。`task.result` 的附注**不加**：派任务是用户要的事，结论得转告。任务会话的回答是记号时不交回，见 §2e（S2）。
 - 验收：`watch_tests.rs` 的 `a_silent_reply_to_an_internal_input_is_not_delivered_but_one_to_the_user_is`，`tests/cron/notify.rs` 的 `a_silent_reply_settles_ok_but_delivers_nothing`，kernel 的 `only_a_reply_that_is_the_marker_alone_is_silent`。
 

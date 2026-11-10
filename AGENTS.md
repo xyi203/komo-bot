@@ -207,19 +207,30 @@ commands run, terminal output when CLI behavior changes.
 
 ## Repo docs
 
+Each doc opens with its status: current spec, implemented record, partly
+implemented, unapproved draft, or superseded.
+
 - Design: `docs/komo_bot.md` (§14 has the acceptance table and the
   "pending verification" list — write verified facts back there).
 - Storage and agent loop (the pi-durable commit model): `docs/storage-durable.md`
   (derivation, deviations, progress), `docs/storage-durable-d5.md` (gateway wiring) and
-  `docs/storage-durable-perf.md` (P1, §3 SSE backfill, §5, §7 implemented; §4, §6 pending — see its §11);
-  `docs/session-tree.md`, `docs/background-tasks.md`, `docs/monitor.md`,
+  `docs/session-tree.md` are implemented records; `docs/storage-durable-perf.md`
+  (P1, §3 SSE backfill, §5, §7 implemented; §4, §6 pending — see its §11) and
+  `docs/session-optimization.md` (Gateway session read/write path; progress in its §0)
+  are partly implemented. `docs/background-tasks.md`, `docs/monitor.md`,
   `docs/codemode.md` and `docs/codemode-bash.md` describe the pieces on top of it
   (including implemented nested bash calls and live slots). `docs/handoff.md`
   proposes a model-initiated reset that keeps the run going; not implemented yet.
+- Tools: `docs/mcp.md` (MCP servers, codemode exposure) and `docs/confirm.md`
+  (trigger-started Runs confirm `outward` tools) are current specs.
+- Agent layer: `docs/bot.md` and `docs/agent.md` record the implemented
+  `komo-agent` refactor; code comments cite their sections, but their
+  descriptions of the old Gateway code (`segment.rs`, `prepare_segment`) are stale.
 - Memory: `docs/memory.md` — §9 spec, planned memory designs, and memory
   research/analysis appendices. Memory changes update this file, not a new one.
 - Observability: `docs/observability.md` — OpenTelemetry traces/metrics, logs,
   operator views. Telemetry is never a source of truth; nothing reads it back.
+  The first version is live; the 2026-10-26 rewrite for the new store is not.
 - Goals and areas: `docs/goals.md` — PARA/GTD-style goals (next action,
   waiting, parked) and areas, memory belongs-to and archive on close; spec
   approved 2026-10-29, implemented in slices P1a–P1e.
@@ -229,11 +240,14 @@ commands run, terminal output when CLI behavior changes.
   (TanStack Start SPA served by the Gateway; dev: `pnpm --filter @komo/client dev`),
   what it reads from the Gateway, and the Gateway gaps found. The W0 prototype
   (`apps/web`, `serve.mjs`) was deleted in C1. Visual tokens are summarized in `DESIGN.md`.
-- Clients: `docs/clients.md` — draft plan to rebuild the web client on TanStack
+- Clients: `docs/clients.md` — plan to rebuild the web client on TanStack
   Start (SPA mode, served by the Gateway) and extend it to macOS (Electron) and
-  phones (PWA, then Capacitor); supersedes roadmap-muse §4.4.
+  phones (PWA, then Capacitor); C0–C2 implemented, C3–C4 not; supersedes roadmap-muse §4.4.
 - Direction: `docs/roadmap-muse.md` — gaps and phases toward a Muse-style
   proactive personal agent (PARA-style goals and areas, proactivity,
   outward-action confirmation);
   draft, not approved. Approved pieces move into the specs above.
+- Superseded: `docs/komo_observation.md` (stays in place because tests cite it)
+  and `docs/archive/` (`mcp-codemode.md`). Move a superseded design into
+  `docs/archive/` unless code still cites its path.
 - Work plan: `.scratch/komo-v08-rewrite/PLAN.md`, progress in `STATUS.md`.

@@ -144,7 +144,9 @@ depend on `store`; `client` knows only protocol types.
   firing) do the same: effect and checkpoint advance in one commit, the result
   in the next.
 - **Recovery follows the §5 table of `docs/storage-durable.md` (§8.4, §8.6):**
-  `running` tasks go back to `pending` and resume at their checkpoint phase;
+  `running` tasks go back to `pending` and resume at their checkpoint phase (after an unclean
+  shutdown — no `closed: true` in the `komo.engine` document — each also counts a restart; at 5 in a
+  row it is blocked until an operator answers `resolve` / `abandon`);
   a tool task at `execute` first reuses a complete, hash-checked `output.json`,
   then reruns only when both the stored replay policy and the tool's current
   `Tool::replay` are `Safe` (default `Unsafe`), otherwise it settles as
@@ -215,7 +217,7 @@ implemented, unapproved draft, or superseded.
 - Storage and agent loop (the pi-durable commit model): `docs/storage-durable.md`
   (derivation, deviations, progress), `docs/storage-durable-d5.md` (gateway wiring) and
   `docs/session-tree.md` are implemented records; `docs/storage-durable-perf.md`
-  (P1, §3 SSE backfill, §5, §7 implemented; §4, §6 pending — see its §11) and
+  (P1, §3 SSE backfill, §5, §6, §7 implemented; §4 pending — see its §11) and
   `docs/session-optimization.md` (Gateway session read/write path; progress in its §0)
   are partly implemented. `docs/background-tasks.md`, `docs/monitor.md`,
   `docs/codemode.md` and `docs/codemode-bash.md` describe the pieces on top of it

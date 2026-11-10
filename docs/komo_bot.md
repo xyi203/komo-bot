@@ -123,7 +123,7 @@ Gateway 持有模型连接、数据库与提交线、工具环境、运行状态
 4. 等待服务就绪，超时则返回具体诊断信息。
 5. 建立聊天连接。**新会话在这里还没有创建**：它在第一条消息送出之前才建，订阅也才在那一刻建立（`komo resume` / `komo home` 手里本来就有会话，照旧先补读历史再订阅）。
 
-Gateway 获得数据目录进程锁并完成存储校验后，引擎自动恢复未完成的任务；不必等用户打开 CLI 或发送 resume。恢复与新请求共用调度器，恢复本身不等待全部旧任务完成才提供服务。恢复就是 §8.4 的那张表加 §8.9 的 blob 引用检查：`running` 一律回 `pending`，从 checkpoint 所在阶段接着跑；被引用的 blob 读不到的工具任务写成 faulted，在下一次调度之前判定完（§8.7）。
+Gateway 获得数据目录进程锁并完成存储校验后，引擎自动恢复未完成的任务；不必等用户打开 CLI 或发送 resume。恢复与新请求共用调度器，恢复本身不等待全部旧任务完成才提供服务。恢复就是 §8.4 的那张表加 §8.9 的 blob 引用检查：`running` 一律回 `pending`，从 checkpoint 所在阶段接着跑（上一代不是干净关闭时记一次崩溃，连续 5 次就停住等人，§8.4）；被引用的 blob 读不到的工具任务写成 faulted，在下一次调度之前判定完（§8.7）。
 
 **就绪不等投递补发。** 上一次没送到的投递（§11.4）在"Gateway 就绪"**之后**的后台补发，不压住第 4 步的等待：补发是网络 I/O，一条 pending 一个平台往返，积压多少条就等多久——线上十来个卡住的投递是几秒，上百条会拖过客户端的就绪超时。补发晚一步没有代价：投递记录先写后发，按 `DeliveryId` 幂等，重来一次也不会重复发。**顺序上唯一的硬要求是渠道登记之后**——渠道没登记时冲刷等于什么都没干。
 
@@ -521,10 +521,11 @@ project_files = false              # 省略 = true
 
 - **子进程探不出是否结束**：工具任务的 `probe` 阶段每轮自动重探，不必等人（§8.7）。
 - **blob 引用损坏**（被引用的 `output.json` / stdout / stderr 读不到或对不上，§8.9）：该工具任务写成 **faulted**（pi-durable spec §10.1"用户代码只让自己那个单元失败"），run 的输入 `unanswered`，原因写明缺哪个文件。
+- **崩溃循环保护停住的任务**（2026-11-10，§8.4）：一个任务连续 5 次在执行中被 Gateway 崩溃打断，就不再自动恢复。它还是活任务（`pending`），所在会话一直忙着；清单里同样是 `Blocked`，句柄 = 任务 ID，问题写明被打断了几次，结论两个：`resolve` 放行（计数归零、照常调度，再崩到上限还会停住）、`abandon` 放弃（先记 ack，再不跑任务代码直接写 `faulted`，run 照 faulted 收尾）。它是调度器的派生状态（`Engine::inspect` 的 `Blocked { RestartLimit }`），不在 `FaultIndex` 里；只在开库时出现，所以 NeedsAttention 在 Gateway 启动时投一次（键按任务与起跑时刻，幂等）。
 
 **待确认的对外调用（2026-10-29）** 也在这份清单里：`kind = confirm`，句柄 = 停在 `confirm` 阶段的工具任务 ID，结论 `approve` / `reject`，答复写进 conversation 级 document `komo.confirm`（谁、什么时候、什么结论），由 `ConfirmIndex` 同样按提交订阅维护（`docs/confirm.md` §6）。
 
-**清单是 faulted 任务的派生视图，不是另一张表**：`GET /v1/interventions` / `komo intervention list | show | answer` / TUI 的待处理清单 / 聊天里的 `/pending` 与 `/answer`（§11.3）都读它。协议冻结，映射为：faulted terminal 任务 → `Blocked`，句柄 = 任务 ID，问题 = fault 原因，**可答的结论只有 `abandon`**（其余 422）；`abandon` 记在 Session 级 document `komo.interventions.ack`（`{abandoned: [任务 ID]}`），重复答复回原结论，未知句柄 404；清单由 `FaultIndex`（开库时接提交订阅，首次用时全扫 terminal 任务一次，TODO：任务表没有结局索引）提供。**不再有"我说它发生了"这种结论**：没有 `satisfied` / `not_performed` / `resolve`——结果不明本来就交给模型判断（§8.6）。
+**清单是 faulted 任务的派生视图，不是另一张表**：`GET /v1/interventions` / `komo intervention list | show | answer` / TUI 的待处理清单 / 聊天里的 `/pending` 与 `/answer`（§11.3）都读它。协议冻结，映射为：faulted terminal 任务 → `Blocked`，句柄 = 任务 ID，问题 = fault 原因，**可答的结论只有 `abandon`**（其余 422；崩溃循环保护停住的任务另有 `resolve`，见上）；`abandon` 记在 Session 级 document `komo.interventions.ack`（`{abandoned: [任务 ID]}`），重复答复回原结论，未知句柄 404；清单由 `FaultIndex`（开库时接提交订阅，首次用时全扫 terminal 任务一次，TODO：任务表没有结局索引）提供。**不再有"我说它发生了"这种结论**：没有 `satisfied` / `not_performed`，faulted 任务也没有 `resolve`——结果不明本来就交给模型判断（§8.6）；`resolve` 只用来放行停住的任务（它没有结局，放行就是让它接着跑）。
 
 投递沿用 §11.4：faulted 出现时按来源对端（渠道会话 `chat:{peer}`；主会话取路径上最近带 peer 的输入；任务会话沿父会话）与 home 投一条 NeedsAttention（逻辑键 `intervention_key`），**没有界面在看这个会话时进 home chat**——那是任务在问，不是在报告（§10）；cron 会话没有来源对端、不看 `notify`，照投 home。订阅在 `core.resume()` 之前建好，任务里先回放全部未确认的再等新的。
 
@@ -601,6 +602,7 @@ project_files = false              # 省略 = true
 | 重启前停在哪里 | 处理 |
 |---|---|
 | 任务 `running` | 回 `pending`，checkpoint 与 abort 标记保留，从 checkpoint 所在阶段重跑 |
+| 任务 `running`，上一代没有干净关闭（崩溃、被杀、断电） | 同上，另给它的 `restarts` 加一；任务自己提交新状态就归零。连续到 5 次（`restartLimit`）就**停住**：不再起它（run 与 abort 都不起），会话一直忙着，进 intervention 清单（§7.5）等 `resolve` 放行或 `abandon` 放弃。干净关闭的标记是 `durable.db` 里的库级 document `komo.engine`（`docs/storage-durable-perf.md` §6）；从没有过这份标记（第一次升级）不算崩溃 |
 | 生成任务在 `request` | 已提交的部分回复转成 `aborted` 的 assistant entry；按已提交上下文重发（丢弃未完成的流式输出，可能再次产生模型费用） |
 | 生成任务在 `retry` | 沿用已持久化的次数与到点时刻（`until`），到点再尝试 |
 | 工具任务在 `call`（意图未提交） | 确定没执行过，正常执行 |
@@ -1080,9 +1082,9 @@ CLI 通过 HTTP 发命令，通过 SSE 观察运行。Gateway 内部采用函数
 | GET /v1/runs/{id}/changes        | 这条 Run 改了哪些文件与增删行数；还没收尾就等它（至多 20 秒）。只活在 Gateway 进程里，没记过是 404（`docs/web.md` §16） |
 | GET /v1/runs/{id}/changes/{index} | 其中一个文件开始与收尾两份之间的 unified diff |
 | GET /v1/sessions/{id}/changes    | 这个会话里还记得的、改了文件的各条 Run |
-| GET /v1/interventions            | 待处理清单：faulted 的任务（§7.5）。每条带句柄、问题与可答的结论 |
+| GET /v1/interventions            | 待处理清单：faulted 的任务与崩溃循环保护停住的任务（§7.5）。每条带句柄、问题与可答的结论 |
 | GET /v1/interventions/{handle}   | 单项详情：问题（fault 原因）与可答的结论 |
-| POST /v1/interventions/{handle}/answer | 答复：只有 `abandon`（其余 422）；已答复的返回原结论，不报错 |
+| POST /v1/interventions/{handle}/answer | 答复：faulted 只有 `abandon`，停住的任务 `resolve` / `abandon`（其余 422）；已答复的返回原结论，不报错 |
 | GET /v1/cron                     | 列出定时任务                                   |
 | POST /v1/cron                    | 创建定时任务                                   |
 | POST /v1/cron/{id}/run           | 手动触发                                       |
@@ -1579,7 +1581,7 @@ load average 11–40，绝对数只能看相对。拆分前用 `git archive 1f36
 | `Clock` | 系统时钟 | 可拨时钟 | Cron 到期、`valid_until`、重试退避全部依赖时间 |
 | `ZoneResolver` | tzdb 实现（runtime，W3 选 crate） | `ScriptedZoneResolver`（可编脚本的假时区）/ `FixedOffsetZone`（降级） | §10 的夏令时两条规则要在无 tzdb 下测；kernel 不带时区数据库 |
 
-不是 trait 的东西：`Harness`（loop）、`ToolExecutor`、`Engine`（Task 引擎与恢复）、`MemoryManager`、`SkillRegistry`、`Dispatcher`——各只有一个实现，依赖上表的 trait 就可测。**Intervention 不需要 `Approver` trait**：清单（§7.5）是 faulted 任务上的查询，没有需要注入的第二实现。Telegram / WeChat / 飞书的 `/answer`、TUI 的待处理清单、CLI 子命令都打到 `POST /v1/interventions/{handle}/answer`；可答的结论只有 `abandon`（记在 `komo.interventions.ack`，§7.5）。渠道之间的差别只在渲染（§11.3），不在决策。（2026-10-11 之前这里还有 `Policy` trait 与 `ApprovalRepo`，随 Policy 删掉，§7。）
+不是 trait 的东西：`Harness`（loop）、`ToolExecutor`、`Engine`（Task 引擎与恢复）、`MemoryManager`、`SkillRegistry`、`Dispatcher`——各只有一个实现，依赖上表的 trait 就可测。**Intervention 不需要 `Approver` trait**：清单（§7.5）是 faulted 任务上的查询，没有需要注入的第二实现。Telegram / WeChat / 飞书的 `/answer`、TUI 的待处理清单、CLI 子命令都打到 `POST /v1/interventions/{handle}/answer`；faulted 任务可答的结论只有 `abandon`（记在 `komo.interventions.ack`），崩溃循环保护停住的任务另有 `resolve`（§7.5）。渠道之间的差别只在渲染（§11.3），不在决策。（2026-10-11 之前这里还有 `Policy` trait 与 `ApprovalRepo`，随 Policy 删掉，§7。）
 
 关键签名（接口示意，辅助类型省略；`Tool` 见 §4）：
 

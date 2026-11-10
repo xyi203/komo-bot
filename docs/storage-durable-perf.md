@@ -1,7 +1,7 @@
 # 新存储的优化清单（D7 之后）
 
-> 状态：部分实施。**P1（§1、§2）已实施**（2026-10-26，见 §10）；**§3 的 SSE 补读、§5、§7 已实施**（2026-11-10，见 §11）；
-> §3 的 run 日志与放宽 `READ_PERMITS`、§4、§6 未做，原因见 §11。§1.1、§2.1 保留优化前的现状。
+> 状态：部分实施。**P1（§1、§2）已实施**（2026-10-26，见 §10）；**§3 的 SSE 补读、§5、§6、§7 已实施**（2026-11-10，见 §11；
+> §6 在 `feature/hardening`）；§3 的 run 日志与放宽 `READ_PERMITS`、§4 未做，原因见 §11。§1.1、§2.1 保留优化前的现状。
 > 对象是 `docs/storage-durable.md` 落地后的 `durable.db` 读写路径与生成的流式进度。
 >
 > 对照：本机 `../pi` 提交 **`d5b3de22d`**（2026-10-25）的 `packages/durable`。移植基线 `8efd314fa`（2026-10-16）
@@ -27,7 +27,7 @@
 | P2 | §3 gateway 读路径（SSE 补读、run 状态、任务进度）复用 §1 的缓存与已有的增量投影 | 性能（D5 已记为缺口） | gateway `service/durable/{feed,runs}.rs` — **SSE 补读已实施，run 日志未做**（§11） |
 | P2 | §5 流式快照：每个网络块都复制整段回复、重解析工具参数 | CPU，单次生成 O(n²) | runtime `llm/*/stateless.rs`、`harness/generation.rs` — **已实施**（§11） |
 | P3 | §4 `komo.live` 的进度提交：整值重写，每 250 ms 一个事务 | 先测；超标照 pi 的 deferred 提交 | runtime `harness/live.rs`、`durable/line.rs` — **未测、未做** |
-| P3 | §6 崩溃循环保护（`restartLimit`） | 健壮性：反复打死进程的任务不再无限重跑 | kernel `durable/task/`、runtime scheduler — **未做**，前提不成立（§11） |
+| P3 | §6 崩溃循环保护（`restartLimit`） | 健壮性：反复打死进程的任务不再无限重跑 | kernel `durable/task/`、runtime scheduler / engine、gateway interventions — **已实施**（干净关闭标记，§6、§11） |
 | P3 | §7 退役 document 的值 | 库增长 | store `durable/write.rs` — **已实施**（§11） |
 
 不做的见 §8，顺序与测量见 §9。
@@ -202,6 +202,37 @@ pi 的 #9265（`f715a15c1`）修的就是这个：`StreamingJsonParser` 每个 d
 - komo 落法：`TaskRecord` 加 `restarts`（serde 默认 0，旧记录照读），在开库对账里加一；超限的任务进
   `komo intervention list`（现在列 faulted 任务的那张清单），`komo intervention answer` 或新子命令放行。
   要先确认 gateway 的正常关闭会把 `running` 写回 `pending` 而不计数（对应 pi 的"close is not a crash"）。
+  **实施时**这条前提不成立（`Engine::close` 后任务留在 `running`），改用干净关闭标记，见下面"实施"。
+
+### 6.1 实施（2026-11-10，`570d8649`、`faa2097f`）
+
+- **干净关闭标记**放在 `durable.db` 里：库级单例 document `komo.engine`（`DocumentScope::Session`、没有 key，
+  与 `komo.monitors` 同一种作用域），值 `{ "closed": bool }`。不加 `Storage` 接口、不动 schema（document 表现成），
+  经提交线写、走结构性提交（`synchronous=FULL`）。没放进 `durable_meta`：那张表是存储自己的（格式版本、seq、
+  ID 高水位），要给它开 `Storage` 读写接口和新的 `StorageWrite`，四个实现与 conformance 都得跟着改，换来的是同一个承诺。
+- **次序**：开库那一笔提交里先读标记、再给幸存的 `running` 回 `pending`（`closed` 不是 `true` 时 `restarts + 1`）、
+  同时把标记写成 `closed: false`——清标记与计数原子落盘，且先于任何任务恢复（恢复在之后的 reservation 提交里）。
+  `Engine::close` 封线、等 invocation 全部走完之后，在 `Line::finish_close_with` 里持着线落最后一笔 `closed: true`
+  （不发布给订阅者），再关存储。`Engine::close` 原有的被测行为（不写结局、任务留在 `running`、不起新阶段）不变。
+- **为什么只会偏保守**：读到 `closed: true` 只可能是上一代确实走到了关闭的最后一笔、此时已没有任务代码在跑；
+  关闭没落下（被杀、断电、`close` 之前线已失败——这时不写标记，存储状态不可信）读到的都是 `false`，按崩溃多算一次。
+  不存在"崩了却读到 `true`"的路径：`true` 之后同一代不会再跑任务，下一代开库第一笔就把它清掉。
+- **第一次升级**：库里从没有这份 document（新库，或老版本留下的库）时不算崩溃——存量 `running` 不知道上一代
+  怎么停的，不凭空记一次；同一笔提交写下 `closed: false`，从这一代起照常计数。
+- **计数与归零**：`reconcile_on_open(record, crashed)` 只给 `running` 加一（`pending` / `waiting` 没在跑，打断不到）；
+  `commit_state`（任务自己提交新 checkpoint、等待、结局）归零；reservation、abort 标记、handover 不算进展。
+- **停住**：`restarts >= restart_limit`（`EngineOptions::restart_limit`，默认 `RESTART_LIMIT = 5`，不进配置文件）时
+  reservation 跳过它——run 与 abort 都不起（abort handler 自己也可能是崩溃的原因）；`Engine::inspect` 给
+  `Blocked { RestartLimit }`；开库时刚到上限的报告一次（`report`）。任务仍是 `pending`，会话保持忙（同 pi）。
+- **出路**：pi 是 `Harness.retryTask(id)`。komo 的 intervention 协议本来就有 `resolve` 这个结论（faulted 任务
+  不用），拿它当放行：`Engine::retry_task` 只把 `restarts` 清零，调度照常；`abandon` 先记 `komo.interventions.ack`，
+  再 `Engine::fault_idle_task` 写 `faulted`（不跑任务代码），之后照 faulted 收尾、不再列出。没有新加协议字段、
+  子命令或界面：`komo intervention list|show|answer`、TUI `/pending`、聊天 `/answer`、web 待处理页都沿用已有的
+  `verdicts` 渲染。NeedsAttention 在 Gateway 启动时投一次（停住只发生在开库时）。
+- **测试**：runtime `durable/tests/restarts.rs`（崩溃逐次计数、干净关闭不计、到上限停住且不再起、只报一次、
+  有进展归零、第一次升级不计、线失败后的关闭按崩溃算、放行与放弃）；kernel `reconcile` / `records` 的单测；
+  gateway `tests/recovery/crash_loop.rs`（真 Gateway 停机后改库造出"又一次崩溃"，重启后列进清单、投提醒、
+  `approve` 422、`resolve` 后 run 收尾、`abandon` 后写 `faulted` 且不再列出）。
 
 ## 7. 退役 document 的值（P3）
 
@@ -302,10 +333,10 @@ pi 的 #9265（`f715a15c1`）修的就是这个：`StreamingJsonParser` 每个 d
   `komo.nested` 一类，540 行、`value` 合计 3.2 MB；活的 220 行 68 KB；entry 4577 行 18.7 MB。`RetireDocument` 改成同一条 UPDATE
   把 `value` 写成 `'null'`，同批建了又退役的直接写 `'null'`；行、id、`retired_seq` 都留着。已有的退役行不回收（下次 purge 或
   VACUUM 才有空间）。内存实现照旧留值（没有读者，行为不可见）。
-- **§6 没做**：§6 的前提"正常关闭会把 `running` 写回 `pending` 而不计数"在 komo **不成立**——`Engine::close` 先封线再等
+- **§6 当时没做的原因**：§6 的前提"正常关闭会把 `running` 写回 `pending` 而不计数"在 komo **不成立**——`Engine::close` 先封线再等
   invocation，`step` 在关闭中被拒，任务留在 `running`（`durable/tests/lifecycle.rs` 的
   `close_writes_no_outcome_and_starts_no_fresh_phase` 钉着这一点）。开库时按 `running` 计数会把每次正常重启（`komo update`、
-  `install-local.sh`、`gateway restart`）都算成崩溃，跑着长任务的会话重启 5 次就被停住。要做得先定一件设计上的事：关闭时
-  补一笔"running → pending 不计数"的提交（改关闭次序），还是在 `durable_meta` 记一个干净关闭的标记（`Storage` 要加元数据接口）。
-  另外被停住的任务要能放行，而 intervention 只有 `abandon` 一个 verdict（协议冻结），放行要加协议或新子命令。
+  `install-local.sh`、`gateway restart`）都算成崩溃。**之后（`feature/hardening`）按"干净关闭标记"做了**：不改任务状态语义、
+  不改 `Engine::close` 的被测行为，标记是 `durable.db` 里的 document 而不是 `durable_meta`（不加 `Storage` 接口）；放行用协议里
+  已有的 `resolve` 结论。落法见 §6.1。
 - **§4 没做**：方案写明"先测"，这次没有做长回复 / 并发流下的 WAL 与事务率测量，没有依据就不动。

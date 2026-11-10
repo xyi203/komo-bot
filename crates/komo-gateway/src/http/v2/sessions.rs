@@ -27,8 +27,8 @@ use crate::http::error::{ApiFailure, ApiResult};
 use crate::http::idempotency::body_hash;
 use crate::service::durable::DurableCore;
 use crate::service::durable::hooks;
-use crate::service::durable::sessions::NewSession;
 use crate::service::durable::sessions::lifecycle;
+use crate::service::durable::sessions::{NewSession, SessionError, SessionPageCursor};
 use crate::service::durable::submit::shell;
 use crate::service::durable::submit::{Accepted, InputRequest, ModelOverride};
 
@@ -61,14 +61,42 @@ fn flag(query: &str, name: &str) -> bool {
 /// 会话列表并发读概览的上限。
 const SUMMARY_READS: usize = 2;
 
+/// 会话列表一页的上限：再大就按它给。
+const MAX_PAGE: u32 = 500;
+
+/// `GET /v1/sessions` 的分页参数（`all` 走 [`flag`]，这里只认这两个，其余 serde 忽略）。
+#[derive(serde::Deserialize)]
+struct ListPaging {
+    limit: Option<u32>,
+    cursor: Option<String>,
+}
+
 /// `GET /v1/sessions`：默认只列 `active` 与 `closing`；`?all=1` 带上 `deleted`；`purged` 不列。
+///
+/// 分页只做加法：**不带 `limit` 就是全部**（与分页之前逐字节相同，老客户端不被截断，`cursor` 被忽略）；
+/// 带 `limit` 按页给，还有下一页时回 `next_cursor`。概览（live / inbox / 末条 entry）只读当页的。
 async fn list(
     State(api): State<Api>,
     uri: axum::http::Uri,
+    Query(paging): Query<ListPaging>,
 ) -> ApiResult<Json<SessionListResponse>> {
     let core = api.state.core()?;
     let all = flag(uri.query().unwrap_or_default(), "all");
-    let records = core.list_sessions(all).await?;
+    let (records, next_cursor) = match paging.limit {
+        None => (core.list_sessions(all).await?, None),
+        Some(0) => return Err(SessionError::Invalid("limit 至少是 1".into()).into()),
+        Some(limit) => {
+            let after = paging
+                .cursor
+                .as_deref()
+                .map(SessionPageCursor::decode)
+                .transpose()?;
+            let page = core
+                .list_sessions_page(all, limit.min(MAX_PAGE) as usize, after.as_ref())
+                .await?;
+            (page.records, page.next.map(|next| next.encode()))
+        }
+    };
     // 每条概览是几次点查（live / inbox / 末条 entry）：有界并发、保持次序。上限取读连接池
     // （`TursoStorage` 4 条）的一半，与 feed 补读同一个口径，给提交线留出空连接。
     let sessions = futures_util::stream::iter(records)
@@ -79,7 +107,10 @@ async fn list(
         .buffered(SUMMARY_READS)
         .try_collect()
         .await?;
-    Ok(Json(SessionListResponse { sessions }))
+    Ok(Json(SessionListResponse {
+        sessions,
+        next_cursor,
+    }))
 }
 
 /// `GET /v1/session-search?q=…&limit=…`：跨会话找回（`komo session search`，roadmap-muse S3）。

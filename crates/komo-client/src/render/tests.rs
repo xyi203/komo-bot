@@ -133,6 +133,7 @@ fn a_session_list_shows_status_and_title() {
                 task: None,
             },
         ],
+        next_cursor: None,
     };
     let printed = session_list(&response, NOW);
     insta_like(
@@ -190,6 +191,7 @@ fn a_task_session_is_marked_with_its_short_id() {
                     task: None,
                 },
             ],
+            next_cursor: None,
         },
         NOW,
     );
@@ -226,6 +228,7 @@ fn a_session_list_says_when_a_run_is_waiting_on_an_earlier_one() {
                 home: None,
                 task: None,
             }],
+            next_cursor: None,
         },
         NOW,
     );
@@ -259,6 +262,7 @@ fn a_session_list_marks_every_state_that_is_not_active() {
                 session(SessionState::Deleted),
                 session(SessionState::Purged),
             ],
+            next_cursor: None,
         },
         NOW,
     );

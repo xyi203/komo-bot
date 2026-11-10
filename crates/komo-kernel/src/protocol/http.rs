@@ -238,17 +238,30 @@ fn session_kind_default() -> String {
 }
 
 /// `GET /v1/sessions` 的 query。逻辑删除过的会话默认不列（§8.10）。
+///
+/// 分页只做加法：**不带 `limit` 时返回全部**（老客户端不会被截断）；带了才按页给，并在还有下一页时
+/// 回 `next_cursor`，下一次原样放进 `cursor`。
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionListQuery {
     /// 把已逻辑删除的也列出来（`closing` / `deleted`；`purged` 只在显式查看单个会话时可见）。
     #[serde(default)]
     pub all: bool,
+    /// 一页最多几条（1–500，超过按 500）。没给 = 不分页。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+    /// 上一页的 `next_cursor`，不透明；只在给了 `limit` 时有意义。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(optional_fields))]
 pub struct SessionListResponse {
     pub sessions: Vec<SessionSummary>,
+    /// 还有下一页时的续扫位置（带 `limit` 请求才可能有）；没有更多就缺省。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
 }
 
 /// `GET /v1/session-search` 的 query（`komo session search`，roadmap-muse S3）。

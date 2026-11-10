@@ -75,6 +75,133 @@ async fn durable_mode_serves_shared_routes_and_leaves_session_routes_to_v2() {
     assert_eq!(status, 200, "v2 的 interventions 路由（W4a）：{body}");
 }
 
+async fn get_json(gateway: &TestGateway, path: &str) -> (u16, serde_json::Value) {
+    let (status, body) = gateway.get(path).await;
+    (
+        status,
+        serde_json::from_str(&body).unwrap_or(serde_json::Value::String(body)),
+    )
+}
+
+async fn post_json(
+    gateway: &TestGateway,
+    path: &str,
+    body: serde_json::Value,
+) -> (u16, serde_json::Value) {
+    let (status, body) = gateway.post(path, body).await;
+    (
+        status,
+        serde_json::from_str(&body).unwrap_or(serde_json::Value::String(body)),
+    )
+}
+
+/// 读完 `/v1/sessions` 的全部页（`query` 不含 `limit` / `cursor`），返回会话 ID 与每页条数。
+async fn session_pages(gateway: &TestGateway, query: &str, limit: u32) -> (Vec<String>, usize) {
+    let mut ids = Vec::new();
+    let mut pages = 0;
+    let mut cursor: Option<String> = None;
+    loop {
+        let mut path = format!("/v1/sessions?limit={limit}{query}");
+        if let Some(cursor) = &cursor {
+            path.push_str(&format!("&cursor={cursor}"));
+        }
+        let (status, body) = get_json(gateway, &path).await;
+        assert_eq!(status, 200, "{body}");
+        let page = body["sessions"].as_array().expect("sessions");
+        assert!(page.len() <= limit as usize, "{body}");
+        pages += 1;
+        ids.extend(
+            page.iter()
+                .map(|s| s["session"].as_str().unwrap().to_owned()),
+        );
+        match body.get("next_cursor").and_then(|c| c.as_str()) {
+            Some(next) => cursor = Some(next.to_owned()),
+            None => return (ids, pages),
+        }
+    }
+}
+
+fn session_ids(body: &serde_json::Value) -> Vec<String> {
+    body["sessions"]
+        .as_array()
+        .expect("sessions")
+        .iter()
+        .map(|s| s["session"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+/// 会话列表分页只做加法（`docs/session-optimization.md` E）：不带 `limit` 与之前一样给全部、没有
+/// `next_cursor`；带了就按页给，各页拼起来等于全量（同样的次序、不丢不重）；翻页期间新建的会话
+/// 不会挤进后面的页；坏参数 400。
+#[tokio::test]
+async fn session_list_pages_add_up_to_the_unpaged_list() {
+    let gateway = TestGateway::with(&config_toml(""), FakeLlm::finisher("好")).await;
+    let mut created = Vec::new();
+    for _ in 0..7 {
+        let (status, body) = post_json(&gateway, "/v1/sessions", serde_json::json!({})).await;
+        assert_eq!(status, 200, "{body}");
+        created.push(body["session"].as_str().unwrap().to_owned());
+    }
+    let (status, body) = post_json(
+        &gateway,
+        &format!("/v1/sessions/{}/delete", created[2]),
+        serde_json::json!({ "now": true }),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+
+    // 老客户端：不带 limit，全部，字段只有 `sessions`。
+    let (status, unpaged) = get_json(&gateway, "/v1/sessions").await;
+    assert_eq!(status, 200, "{unpaged}");
+    assert_eq!(
+        unpaged.as_object().unwrap().keys().collect::<Vec<_>>(),
+        ["sessions"],
+        "不带 limit 的响应形状不变：{unpaged}"
+    );
+    let everything = session_ids(&unpaged);
+    let mut newest_first = created.clone();
+    newest_first.remove(2);
+    newest_first.reverse();
+    assert_eq!(everything, newest_first, "最新的在前，逻辑删除的默认不列");
+    // `cursor` 不带 `limit` 时被忽略：还是全部。
+    let (_, ignored) = get_json(&gateway, "/v1/sessions?cursor=zz").await;
+    assert_eq!(session_ids(&ignored), everything);
+
+    for limit in [1, 2, 3, 6, 7, 50] {
+        let (ids, pages) = session_pages(&gateway, "", limit).await;
+        assert_eq!(ids, everything, "limit {limit}");
+        assert_eq!(pages, everything.len().div_ceil(limit as usize).max(1));
+    }
+    let (_, all) = get_json(&gateway, "/v1/sessions?all=1").await;
+    assert_eq!(
+        session_pages(&gateway, "&all=1", 2).await.0,
+        session_ids(&all)
+    );
+    assert!(session_ids(&all).contains(&created[2]));
+
+    // 翻页期间新建：第一页之后的页不重复、不漏掉原来的。
+    let (_, first) = get_json(&gateway, "/v1/sessions?limit=2").await;
+    let cursor = first["next_cursor"].as_str().unwrap().to_owned();
+    let (_, body) = post_json(&gateway, "/v1/sessions", serde_json::json!({})).await;
+    let fresh = body["session"].as_str().unwrap().to_owned();
+    let (_, rest) = get_json(&gateway, &format!("/v1/sessions?limit=50&cursor={cursor}")).await;
+    let mut stitched = session_ids(&first);
+    stitched.extend(session_ids(&rest));
+    assert_eq!(stitched, everything);
+    assert!(!stitched.contains(&fresh));
+    assert!(rest.get("next_cursor").is_none(), "{rest}");
+
+    for bad in [
+        "/v1/sessions?limit=0",
+        "/v1/sessions?limit=2&cursor=zz",
+        "/v1/sessions?limit=2&cursor=abc",
+        "/v1/sessions?limit=many",
+    ] {
+        let (status, body) = gateway.get(bad).await;
+        assert_eq!(status, 400, "{bad}: {body}");
+    }
+}
+
 #[test]
 fn write_refuses_the_durable_databases() {
     use komo_tools::tools::protect::Protected;

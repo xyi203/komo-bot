@@ -251,27 +251,62 @@ async fn first_session(
     }
 }
 
-/// 读完全部 Session 行（升序，即创建序）。会话列表还是全表扫描（分页见
-/// `docs/session-optimization.md` §3.5，未做）。
-pub(super) async fn scan_all_sessions(
-    storage: &dyn Storage,
-) -> Result<Vec<SessionRecord>, StorageError> {
-    let query = SessionQuery {
-        lifecycle: None,
-        order: Some(ScanOrder::Ascending),
+/// 会话列表要的生命周期：默认 `active` 与 `closing`；`all` 再带上 `deleted`。`purged` 两种都不列
+/// （只在显式查看单个会话时可见，§8.10）。
+fn listed_lifecycles(all: bool) -> Vec<SessionLifecycle> {
+    let mut wanted = vec![SessionLifecycle::Active, SessionLifecycle::Closing];
+    if all {
+        wanted.push(SessionLifecycle::Deleted);
+    }
+    wanted
+}
+
+/// 会话列表的查询：最新的在前（id 是 UUIDv7，降序就是创建序倒排，且 id 唯一，次序完全确定）。
+fn list_query(all: bool) -> SessionQuery {
+    SessionQuery {
+        lifecycles: listed_lifecycles(all),
+        order: Some(ScanOrder::Descending),
         ..SessionQuery::default()
-    };
-    let mut all = Vec::new();
-    let mut cursor: Option<SessionCursor> = None;
-    loop {
-        let page = storage
-            .scan_sessions(&query, SCAN_PAGE, cursor.as_ref())
-            .await?;
-        all.extend(page.items);
-        match page.next {
-            Some(next) => cursor = Some(next),
-            None => return Ok(all),
+    }
+}
+
+/// 会话列表的一页：`after` 是上一页的续扫位置（不透明，见 [`SessionPageCursor`]）。
+pub struct SessionListPage {
+    pub records: Vec<SessionRecord>,
+    pub next: Option<SessionPageCursor>,
+}
+
+/// 会话列表对外的续扫位置。里面是上一页最后一条的 id（降序续扫 `id < after`）：之后新建的会话 id
+/// 更大，只会出现在第一页之前，不会挤进后面的页造成重复或漏项；翻页期间被删的只是不再出现。
+/// 编码成十六进制，客户端只原样带回，不解读。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionPageCursor(SessionCursor);
+
+impl SessionPageCursor {
+    pub fn encode(&self) -> String {
+        self.0
+            .after()
+            .bytes()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+
+    /// 解不出来（不是偶数位十六进制、不是 UTF-8、空）是 [`SessionError::Invalid`]。
+    pub fn decode(text: &str) -> Result<Self, SessionError> {
+        let invalid = || SessionError::Invalid("cursor 无效".into());
+        if text.is_empty() || text.len() % 2 != 0 {
+            return Err(invalid());
         }
+        let bytes = (0..text.len())
+            .step_by(2)
+            .map(|at| {
+                text.get(at..at + 2)
+                    .and_then(|pair| u8::from_str_radix(pair, 16).ok())
+            })
+            .collect::<Option<Vec<u8>>>()
+            .ok_or_else(invalid)?;
+        let after = String::from_utf8(bytes).map_err(|_| invalid())?;
+        Ok(Self(SessionCursor::new(after, ScanOrder::Descending)))
     }
 }
 
@@ -332,19 +367,41 @@ impl DurableCore {
     }
 
     /// 会话列表（最新的在前）。默认只列 `active` 与 `closing`；`all` 把 `deleted` 也带上。
-    /// `purged` 两种都不列（只在显式查看单个会话时可见，§8.10）。
+    /// `purged` 两种都不列（只在显式查看单个会话时可见，§8.10）。全部读完：内部调用方（找回、
+    /// 任务清单、监听）要的是全量，不受列表分页影响。
     pub async fn list_sessions(&self, all: bool) -> Result<Vec<SessionRecord>, SessionError> {
-        let mut records: Vec<SessionRecord> = scan_all_sessions(&*self.storage)
-            .await?
-            .into_iter()
-            .filter(|record| match record.lifecycle {
-                SessionLifecycle::Active | SessionLifecycle::Closing => true,
-                SessionLifecycle::Deleted => all,
-                SessionLifecycle::Purged => false,
-            })
-            .collect();
-        records.reverse();
-        Ok(records)
+        let query = list_query(all);
+        let mut records = Vec::new();
+        let mut cursor: Option<SessionCursor> = None;
+        loop {
+            let page = self
+                .storage
+                .scan_sessions(&query, SCAN_PAGE, cursor.as_ref())
+                .await?;
+            records.extend(page.items);
+            match page.next {
+                Some(next) => cursor = Some(next),
+                None => return Ok(records),
+            }
+        }
+    }
+
+    /// 会话列表的一页（次序与 [`Self::list_sessions`] 相同）。条件下推到存储：每种生命周期各走一次
+    /// `(lifecycle, id)` 索引，一页的读取量只和 `limit` 有关。
+    pub async fn list_sessions_page(
+        &self,
+        all: bool,
+        limit: usize,
+        after: Option<&SessionPageCursor>,
+    ) -> Result<SessionListPage, SessionError> {
+        let page = self
+            .storage
+            .scan_sessions(&list_query(all), limit, after.map(|cursor| &cursor.0))
+            .await?;
+        Ok(SessionListPage {
+            records: page.items,
+            next: page.next.map(SessionPageCursor),
+        })
     }
 
     /// 这个会话现在接不接受新输入，以及不接受时那**一种**状态（§8.10）。会话不存在是 `NotFound`。

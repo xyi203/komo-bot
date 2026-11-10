@@ -342,7 +342,6 @@ fn compaction_context_edit_and_decay_agree_with_derive_context() {
         .map(|entry| entry.id.as_str())
         .collect();
     assert_eq!(edits, ["9", "9:1"]);
-    assert_eq!(entry_of("9:1"), Some(eid(9)));
     // 基线 system 是 Custom，它的 omit edit 紧跟其后。
     assert!(matches!(
         tree.entries
@@ -436,11 +435,6 @@ fn input_entries_of_custom_kinds_are_messages() {
 }
 
 #[test]
-fn pi_ids_decode_only_in_canonical_form() {
+fn pi_ids_are_the_decimal_entry_id() {
     assert_eq!(pi_id(eid(42)), "42");
-    assert_eq!(entry_of("42"), Some(eid(42)));
-    assert_eq!(entry_of("42:3"), Some(eid(42)));
-    for bad in ["", "042", "+1", "x", "1-fork", ":1"] {
-        assert_eq!(entry_of(bad), None, "{bad:?}");
-    }
 }

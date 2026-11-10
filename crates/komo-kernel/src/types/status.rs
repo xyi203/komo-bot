@@ -92,16 +92,6 @@ impl RunState {
         matches!(self, RunState::Accepted | RunState::Queued)
     }
 
-    /// 停在等待上——让出执行名额，但**仍然挡住同 Session 后面的 Run**。
-    pub fn is_waiting(self) -> bool {
-        matches!(self, RunState::Waiting)
-    }
-
-    /// 可以被调度器领取。
-    pub fn is_claimable(self) -> bool {
-        matches!(self, RunState::Queued)
-    }
-
     /// 数据库那一列（`runs.state`）与日志里的写法。
     pub fn as_str(self) -> &'static str {
         match self {
@@ -159,17 +149,6 @@ impl SessionState {
         matches!(self, SessionState::Active)
     }
 
-    /// 还在服务范围里——reconcile 用它决定"这条 Run 能不能按 §8.4 继续"（§8.9）。
-    /// `Closing` 仍然服务：它只是不再收新活，手里的活要跑完。
-    pub fn serves(self) -> bool {
-        matches!(self, SessionState::Active | SessionState::Closing)
-    }
-
-    /// 内容还应该在吗。`Purged` 之外都在：逻辑删除不碰内容（§8.10）。
-    pub fn content_expected(self) -> bool {
-        !matches!(self, SessionState::Purged)
-    }
-
     pub fn as_str(self) -> &'static str {
         match self {
             SessionState::Active => "active",
@@ -210,11 +189,6 @@ pub enum ToolCallState {
 impl ToolCallState {
     pub fn is_terminal(self) -> bool {
         matches!(self, ToolCallState::Completed | ToolCallState::Failed)
-    }
-
-    /// 需要走 §8.6 的核对流程。
-    pub fn needs_verification(self) -> bool {
-        matches!(self, ToolCallState::Started | ToolCallState::Uncertain)
     }
 }
 
@@ -339,14 +313,6 @@ impl WaitReason {
         }
     }
 
-    /// `runs.wake_at`：到点才能再跑的那一种等待。
-    pub fn wake_at(&self) -> Option<OffsetDateTime> {
-        match self {
-            WaitReason::Retry { not_before, .. } => Some(*not_before),
-            _ => None,
-        }
-    }
-
     /// 这一种等待**要不要人**。它决定这条 Run 进不进 §7.5 的清单：只有 `Intervention`
     /// 进；`Retry`（等时钟）、`Dependency`（等前一条 Run）与旧的 `Approval`（启动时自动
     /// 续跑，D2）都不进。
@@ -399,14 +365,6 @@ mod tests {
             ]
         );
         assert!(all.iter().all(|s| s.is_terminal() != s.is_unfinished()));
-        let waiting: Vec<_> = all.into_iter().filter(|s| s.is_waiting()).collect();
-        assert_eq!(waiting, vec![RunState::Waiting], "停着等人的只有这一档");
-        let claimable: Vec<_> = all.into_iter().filter(|s| s.is_claimable()).collect();
-        assert_eq!(
-            claimable,
-            vec![RunState::Queued],
-            "Accepted 的正文还没落全，不许领"
-        );
     }
 
     /// §8.4：`Queued` = 现在就能跑；`Waiting` = 现在不能跑**且说得出在等什么**。
@@ -420,7 +378,6 @@ mod tests {
         };
         assert!(!retry.needs_a_person(), "等时钟不是等人");
         assert_eq!(retry.reference(), None, "退避的进度是次数 + 到点时刻");
-        assert_eq!(retry.wake_at(), Some(datetime!(2026-09-15 08:05:00 UTC)));
 
         let dependency = WaitReason::Dependency {
             run: RunId::from_raw("run-1"),
@@ -453,7 +410,6 @@ mod tests {
         assert_eq!(old.kind(), "approval");
         assert_eq!(old.reference().as_deref(), Some("ap-1"));
         assert_eq!(old.state(), RunState::Waiting);
-        assert!(old.wake_at().is_none());
         assert!(!old.needs_a_person(), "旧审批启动时自动续跑，不进清单");
     }
 
@@ -472,14 +428,6 @@ mod tests {
             Some(RetryCause::RateLimited)
         );
         assert_eq!(RetryCause::parse("teapot"), None);
-    }
-
-    #[test]
-    fn started_and_uncertain_calls_both_need_verification() {
-        assert!(ToolCallState::Started.needs_verification());
-        assert!(ToolCallState::Uncertain.needs_verification());
-        assert!(!ToolCallState::Completed.needs_verification());
-        assert!(!ToolCallState::Planned.needs_verification());
     }
 
     /// 状态词的往返：认不出的状态词不许默认成"能跑"。
@@ -504,26 +452,13 @@ mod tests {
         let _ = ToolCallId::from_raw("call-1");
     }
 
-    /// §8.10：只有 `active` 收新输入；`closing` 仍然服务（手里的活要跑完）；
-    /// **只有 `purged` 才意味着内容不该还在**——逻辑删除不碰内容。
+    /// §8.10：只有 `active` 收新输入；状态词往返。
     #[test]
-    fn the_session_ladder_separates_input_service_and_content() {
+    fn only_an_active_session_accepts_input_and_its_words_round_trip() {
         use SessionState::*;
         let all = [Active, Closing, Deleted, Purged];
         let accepts: Vec<_> = all.iter().copied().filter(|s| s.accepts_input()).collect();
         assert_eq!(accepts, vec![Active], "只有活着的会话收新输入");
-        let serves: Vec<_> = all.iter().copied().filter(|s| s.serves()).collect();
-        assert_eq!(serves, vec![Active, Closing], "closing 手里的活要跑完");
-        let content: Vec<_> = all
-            .iter()
-            .copied()
-            .filter(|s| s.content_expected())
-            .collect();
-        assert_eq!(
-            content,
-            vec![Active, Closing, Deleted],
-            "逻辑删除不碰内容，回收才碰"
-        );
 
         assert_eq!(SessionState::parse("closing"), Some(Closing));
         assert_eq!(SessionState::parse(" archived "), None, "认不出就是认不出");

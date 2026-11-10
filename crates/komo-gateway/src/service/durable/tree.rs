@@ -582,7 +582,7 @@ pub fn entry_id_text(id: EntryId) -> String {
 }
 
 /// 客户端给的 entry id → `EntryId`。认 `"12"` 与 `"12:1"`（pi 投影里一条 durable entry 展开成
-/// 多条时是 `"{id}:{k}"`，规则同 kernel `pi_tree::entry_of`）；不是规范写法 / 不存在是 `NotFound`。
+/// 多条时是 `"{id}:{k}"`，见 kernel `pi_tree`）；不是规范写法 / 不存在是 `NotFound`。
 pub fn parse_entry_id(text: &str) -> Result<EntryId, SessionError> {
     let base = text.split_once(':').map_or(text, |(base, _)| base);
     let value: u64 = base

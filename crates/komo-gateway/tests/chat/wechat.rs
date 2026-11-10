@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use komo_gateway::channels::ChannelSender;
 use komo_kernel::traits::Channel;
-use komo_kernel::types::chat::{ChannelPeer, ChannelPlatform, DeliveryState, Outbound};
+use komo_kernel::types::chat::{ChannelPlatform, DeliveryState, Outbound};
 
 use crate::harness::{
     FakeLlm, FixedFactory, GatewayBuilder, TestGateway, config_toml, eventually, wechat_block,
@@ -184,13 +184,4 @@ async fn a_wechat_stranger_is_refused_but_can_still_ask_for_its_id() {
     eventually("`/id` 也答了", move || fake.sent_texts().len() >= 2).await;
     let id = wired.fake.sent_texts().remove(1);
     assert!(id.contains("wechat:wxid_other"), "{id}");
-}
-
-/// `ChannelPlatform::supports_unsolicited_push`：微信是唯一答 `false` 的（§11.4）。
-#[tokio::test]
-async fn only_wechat_cannot_push_unsolicited() {
-    assert!(!ChannelPlatform::Wechat.supports_unsolicited_push());
-    assert!(ChannelPlatform::Feishu.supports_unsolicited_push());
-    assert!(ChannelPlatform::Telegram.supports_unsolicited_push());
-    let _ = ChannelPeer::new(ChannelPlatform::Wechat, "wxid_op");
 }

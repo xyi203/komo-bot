@@ -106,41 +106,6 @@ impl Surface {
         &self.messages[self.replay_from.min(self.messages.len())..]
     }
 
-    /// 这个 Run **还没有结果的调用**，按它们被要到的次序。
-    ///
-    /// 与 `runs[..].calls` 里那些非终态的不是一回事：`calls` 要等到 `tool.planned` 才有
-    /// 那一行（计划是执行到它才 `prepare` 的），而**一轮里前一个调用停下时，后面的调用
-    /// 连计划都还没有**（§8.3 把一轮的回复与全部调用计划当一个逻辑事件，但计划落盘是后
-    /// 来的事）。只看 `calls`，续跑就只跑完前一个，模型下一轮拿到"要了两次、只回了一次
-    /// 输出"的转写——provider 直接 400（`No tool output found for tool call …`）。
-    pub fn open_calls(&self, run: &RunId) -> Vec<ToolCallId> {
-        let mut open: Vec<ToolCallId> = Vec::new();
-        for message in self.replay() {
-            if message.run.as_ref() == Some(run) {
-                for call in &message.tool_calls {
-                    open.push(call.call_id.clone());
-                }
-            }
-            // 结果按调用号销账，不按它落在哪条消息上。
-            for result in &message.tool_results {
-                open.retain(|call| call != &result.call);
-            }
-        }
-        open
-    }
-
-    /// 回放窗口里用户侧与助手侧是否交替。
-    pub fn replay_alternates(&self) -> bool {
-        let mut previous: Option<Role> = None;
-        for message in self.replay() {
-            if previous.is_some_and(|last| last.is_user_side() == message.role.is_user_side()) {
-                return false;
-            }
-            previous = Some(message.role);
-        }
-        true
-    }
-
     /// 还没有终态的 Run。
     pub fn unfinished_runs(&self) -> impl Iterator<Item = &RunView> {
         self.runs.values().filter(|run| run.status.is_unfinished())
@@ -713,7 +678,6 @@ mod tests {
         assert_eq!(call.state, ToolCallState::Completed);
         assert_eq!(call.attempts, 1);
         assert!(call.output.is_some());
-        assert!(surface.replay_alternates());
     }
 
     #[test]
@@ -747,7 +711,6 @@ mod tests {
         assert_eq!(results.len(), 1, "一个 call_id 只回放一份输出");
         assert_eq!(results[0].status, ToolResultStatus::Completed);
         assert_eq!(results[0].preview.as_deref(), Some("介入裁定：已完成"));
-        assert!(surface.replay_alternates());
     }
 
     #[test]
@@ -776,7 +739,6 @@ mod tests {
         assert_eq!(surface.messages.len(), 5, "整段会话还在");
         assert_eq!(surface.replay().len(), 1, "回放只从边界之后开始");
         assert_eq!(surface.replay()[0].text.as_deref(), Some("新话题"));
-        assert!(surface.replay_alternates());
     }
 
     fn injected(seq: u64, text: &str) -> Event {
@@ -911,7 +873,6 @@ mod tests {
                 role: Role::User
             }]
         );
-        assert!(!surface.replay_alternates());
     }
 
     #[test]

@@ -13,8 +13,6 @@ use crate::types::refs::{ContentRef, OutputRef, PayloadRef, ToolResultStatus};
 use crate::types::status::{RunState, ToolCallState, WaitReason};
 use crate::types::turn::{Role, ToolCallRequest};
 
-use super::Surface;
-
 /// 会话消息面上的一条消息。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SurfaceMessage {
@@ -140,19 +138,6 @@ pub struct CompactionView {
     pub first_kept: Seq,
     /// 摘要，作为一条用户侧消息：`text` 内联或 `text_ref` 外置，读法与别的消息一样。
     pub message: SurfaceMessage,
-}
-
-impl RunView {
-    /// 还有没有未完成的调用——§8.4 的"从未完成的 ToolCall 继续"。
-    pub fn unfinished_calls<'a>(
-        &'a self,
-        surface: &'a Surface,
-    ) -> impl Iterator<Item = &'a ToolCallView> {
-        self.calls
-            .iter()
-            .filter_map(move |id| surface.calls.get(id))
-            .filter(|call| !call.state.is_terminal())
-    }
 }
 
 /// 一个 ToolCall 的最新状态。

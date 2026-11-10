@@ -218,15 +218,6 @@ pub struct CompactionDebt {
 }
 
 impl CompactionDecision {
-    /// 切不出可以收成摘要的那一段时，把"压"改成不压。不压的决策原样返回。
-    pub fn mark_not_compactable(mut self) -> Self {
-        if self.compact {
-            self.compact = false;
-            self.reason = CompactionReason::NativeNotCompactable;
-        }
-        self
-    }
-
     /// provider 已经以上下文超长拒了请求：不看账，按窗口保护压——不压这条 Run 就失败了，
     /// 缓存账没有意义。摘要不比被收掉的那一段小（`non_positive_saving`）照旧不压。
     pub fn forced_by_overflow(mut self) -> Self {
@@ -655,26 +646,6 @@ mod tests {
             &CompactionEconomics::default(),
         );
         assert_eq!((d.compact, d.reason), (true, CompactionReason::Economic));
-    }
-
-    #[test]
-    fn a_compaction_with_nothing_to_cut_is_marked_not_compactable() {
-        let economics = CompactionEconomics::default();
-        let d = decide(&base(), &economics).mark_not_compactable();
-        assert_eq!(
-            (d.compact, d.reason),
-            (false, CompactionReason::NativeNotCompactable)
-        );
-
-        let deferred = decide(
-            &CompactionInput {
-                cache_write_read_ratio: None,
-                ..base()
-            },
-            &economics,
-        )
-        .mark_not_compactable();
-        assert_eq!(deferred.reason, CompactionReason::CacheRatioUnavailable);
     }
 
     #[test]

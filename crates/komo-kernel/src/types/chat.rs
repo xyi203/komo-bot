@@ -29,9 +29,6 @@ impl ChannelPlatform {
             Self::Custom(id) => id,
         }
     }
-    pub fn supports_unsolicited_push(&self) -> bool {
-        !matches!(self, Self::Wechat)
-    }
     pub fn parse(raw: &str) -> Option<Self> {
         Some(match raw {
             "feishu" => Self::Feishu,
@@ -465,12 +462,5 @@ mod tests {
         let json = serde_json::to_string(&absorbed).unwrap();
         assert!(json.contains(r#""kind":"run_absorbed""#), "{json}");
         assert_eq!(Outbound::from_stored(&json).unwrap(), Some(absorbed));
-    }
-
-    #[test]
-    fn wechat_cannot_push_unsolicited() {
-        assert!(!ChannelPlatform::Wechat.supports_unsolicited_push());
-        assert!(ChannelPlatform::Feishu.supports_unsolicited_push());
-        assert!(ChannelPlatform::Telegram.supports_unsolicited_push());
     }
 }

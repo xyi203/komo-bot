@@ -154,19 +154,7 @@ pub enum Operation {
     Codemode { code: String },
 }
 
-impl Operation {
-    /// 只读动作。
-    pub fn is_read_only(&self) -> bool {
-        matches!(
-            self,
-            Operation::ReadFile
-                | Operation::McpCall {
-                    read_only: true,
-                    ..
-                }
-        )
-    }
-}
+impl Operation {}
 
 /// 计划触及的一个目标（§六）：**本地路径，或者一个资源 URI**。
 ///
@@ -213,11 +201,6 @@ impl PlanTarget {
     /// 逻辑资源入口（本地路径没有）。
     pub fn uri(&self) -> Option<&ResourceUri> {
         self.target.uri()
-    }
-
-    /// 没有磁盘目标的那一类。
-    pub fn is_virtual(&self) -> bool {
-        self.target.is_virtual()
     }
 }
 

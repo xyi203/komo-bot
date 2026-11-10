@@ -267,24 +267,6 @@ pub struct ResumedCall {
     // 2026-10-13 之前这里还有 `verification`（核对梯子的结论）。旧线格式带着它也解得出来。
 }
 
-impl ResumedCall {
-    /// 确定这次动作还没发生过——§8.4 第 6 行（planned 而没有 started）。
-    pub fn is_known_not_to_have_run(&self) -> bool {
-        self.previous_state == ToolCallState::Planned
-    }
-}
-
-impl ToolContext {
-    /// 这个路径落在哪个已知的根里。落不进任何一个 → None（工具按需决定怎么说，例如
-    /// 标成"根外"）。
-    pub fn root_for(&self, path: &std::path::Path) -> Option<&WorkspaceRoot> {
-        self.roots
-            .iter()
-            .filter(|root| path.starts_with(&root.path))
-            .max_by_key(|root| root.path.as_os_str().len())
-    }
-}
-
 /// 一个已知的根目录。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkspaceRoot {
@@ -331,69 +313,22 @@ mod tests {
     }
 
     #[test]
-    fn the_longest_matching_root_wins() {
-        let ctx = ToolContext {
-            session: SessionId::from_raw("s"),
-            run: RunId::from_raw("r"),
-            input_run: Some(RunId::from_raw("r")),
-            call: ToolCallId::from_raw("c"),
-            attempt: AttemptId::from_raw("a"),
-            source: PlanSource::Interactive {
-                session: SessionId::from_raw("s"),
-            },
-            cwd: PathBuf::from("/home/u/ws"),
-            call_timeout: std::time::Duration::from_secs(60),
-            detach_after: None,
-            interjected: InterjectSignal::new(),
-            conversation: false,
-            mounts: ResourceMounts::default(),
-            roots: vec![
-                WorkspaceRoot {
-                    path: PathBuf::from("/home/u"),
-                    writable: false,
-                    label: "home".into(),
-                },
-                WorkspaceRoot {
-                    path: PathBuf::from("/home/u/ws"),
-                    writable: true,
-                    label: "workspace".into(),
-                },
-            ],
-            resumed: None,
-            cancel: CancelToken::new(),
-        };
-        let root = ctx
-            .root_for(std::path::Path::new("/home/u/ws/a.txt"))
-            .unwrap();
-        assert!(root.writable);
-        assert!(ctx.root_for(std::path::Path::new("/etc/passwd")).is_none());
-    }
-
-    #[test]
     fn a_first_attempt_has_no_resumed_marker() {
         let json = r#"{"previous_state":"planned"}"#;
         let resumed: ResumedCall = serde_json::from_str(json).unwrap();
         assert_eq!(resumed.attempts_so_far, 0);
         assert!(resumed.previous_attempt.is_none());
-        assert!(
-            resumed.is_known_not_to_have_run(),
-            "planned 就是 §8.4 第 6 行的「确定尚未执行」"
-        );
     }
 
     #[test]
-    fn a_started_call_is_never_known_not_to_have_run() {
-        // 旧线格式带着已经退役的 `verification` 也解得出来，而且它不再改变判断。
+    fn an_old_resumed_marker_with_verification_still_decodes() {
+        // 旧线格式带着已经退役的 `verification` 也解得出来。
         let json = r#"{"previous_attempt":"attempt-1","previous_state":"started",
             "attempts_so_far":1,"verification":{"kind":"not_performed","evidence":"x"}}"#;
         let resumed: ResumedCall = serde_json::from_str(json).unwrap();
         assert_eq!(
             resumed.previous_attempt,
             Some(AttemptId::from_raw("attempt-1"))
-        );
-        assert!(
-            !resumed.is_known_not_to_have_run(),
-            "started 本身证明不了什么"
         );
     }
 }

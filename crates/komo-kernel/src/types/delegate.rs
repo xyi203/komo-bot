@@ -55,11 +55,6 @@ impl DelegateSpec {
         }
     }
 
-    pub fn with_contract(mut self, schema: serde_json::Value, mode: SchemaMode) -> Self {
-        self.contract = Some(DelegateContract { schema, mode });
-        self
-    }
-
     /// 接着哪一条子 Run（§4）：这条线上的上一环。
     pub fn with_resumes(mut self, target: RunId) -> Self {
         self.resumes = Some(target);

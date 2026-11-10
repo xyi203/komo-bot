@@ -1395,14 +1395,6 @@ pub struct RebuildIndexResponse {
     pub accepted: bool,
 }
 
-/// `GET /v1/memories/{id}` 的 404、`POST .../confirm` 的 409 都用同一个错误体，见
-/// [`ErrorBody`]。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MemoryRef {
-    pub memory: MemoryId,
-    pub revision: u32,
-}
-
 // ---- GET /v1/models ----
 
 /// 可选模型清单里的一项。

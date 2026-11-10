@@ -370,34 +370,6 @@ impl TaskGraph {
         None
     }
 
-    /// 已结束的普通工作 `node` 之上最近的活任务：它曾被这份工作拖住。后台任务及其下面的工作
-    /// 不拖住任何人。
-    pub fn nearest_live_above(
-        &self,
-        node: &TaskNode,
-        overlay: Option<&Overlay>,
-    ) -> Option<TaskRecord> {
-        let mut current = *node;
-        while !current.background {
-            let owner = match current.owner {
-                Some(owner) => owner,
-                None => match self.edge_in(current.conversation, overlay) {
-                    Some(Some(owner)) => owner,
-                    _ => return None,
-                },
-            };
-            if let Some(record) = overlay
-                .and_then(|o| o.tasks.get(&owner))
-                .or_else(|| self.live.get(&owner))
-                && is_live(record)
-            {
-                return Some(record.clone());
-            }
-            current = self.node_in(owner, overlay)?;
-        }
-        None
-    }
-
     /// 这次等待会不会成环：返回从 `on` 里某个成员回到 `task` 的路径。边：X→Y 表示 X 不能
     /// 先于 Y 终结——Y 在不带 abort 标记的 waiting X 的 `on` 里，或 Y 是 X 活的普通所有的
     /// 工作（它会把 X 拖在 `completing`）。每个任务只访问一次。
@@ -675,20 +647,6 @@ mod tests {
             "work owned by a background task is behind a boundary"
         );
         assert_eq!(graph.cancelling_owner(Node::Task(TaskId::new(22))), None);
-    }
-
-    #[test]
-    fn nearest_live_above_passes_ended_tasks_and_stops_at_background() {
-        let graph = graph(&[
-            task(10, 1, None, false),
-            ended(task(11, 1, Some(10), false)),
-            task(12, 1, Some(11), false),
-            task(13, 1, Some(10), true),
-        ]);
-        let above = graph.nearest_live_above(&TaskNode::of(&task(12, 1, Some(11), false)), None);
-        assert_eq!(above.map(|r| r.id), Some(TaskId::new(10)));
-        let none = graph.nearest_live_above(&TaskNode::of(&task(13, 1, Some(10), true)), None);
-        assert!(none.is_none(), "background work holds nothing above it");
     }
 
     fn waiting(mut record: TaskRecord, on: &[u64]) -> TaskRecord {

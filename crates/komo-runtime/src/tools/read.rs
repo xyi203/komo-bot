@@ -553,7 +553,7 @@ mod tests {
             .prepare(serde_json::json!({ "path": "tool://read/schema" }), &ctx)
             .await
             .unwrap();
-        assert!(plan.targets[0].is_virtual());
+        assert!(plan.targets[0].target.is_virtual());
         assert_eq!(plan.targets[0].path(), None, "虚拟入口不给它编路径");
         assert_eq!(plan.targets[0].describe(), "tool://read/schema");
         let result = read_result(&tool.execute(plan, &ctx, &mut writer(&ctx)).await.unwrap());

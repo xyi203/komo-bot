@@ -8,7 +8,7 @@
 //! # ID 与父子
 //!
 //! - pi entry 的 `id` = 十进制 entry ID（[`pi_id`]）。一条 entry 可能展开成几条 pi entry（见下），
-//!   第一条用基础 ID，其余是 `"{基础ID}:{序号}"`；[`entry_of`] 把任一种还原成 entry ID。
+//!   第一条用基础 ID，其余是 `"{基础ID}:{序号}"`；gateway 的 `parse_entry_id` 把任一种还原成 entry ID。
 //! - `parentId` = 同一个 conversation 上一条 entry 的**最后一条**展开；fork 出来的 conversation 的
 //!   第一条指向 `parent.at` 的最后一条展开；没有父的 conversation 的第一条是新根（`null`）。
 //! - 追加序 = 全局 entry ID 序。fork 点的 ID 永远小于子 conversation 的任何 entry，所以父总在子前。
@@ -96,13 +96,6 @@ impl PiTree {
 /// entry 的 pi ID（十进制）。
 pub fn pi_id(entry: EntryId) -> String {
     entry.get().to_string()
-}
-
-/// pi ID 对应的 entry ID：基础 ID 与 `"{基础ID}:{序号}"` 两种写法都认；别的返回 `None`。
-pub fn entry_of(pi_id: &str) -> Option<EntryId> {
-    let base = pi_id.split_once(':').map_or(pi_id, |(base, _)| base);
-    let value: u64 = base.parse().ok()?;
-    (value.to_string() == base).then(|| EntryId::new(value))
 }
 
 /// 把 Session 投影成 pi 树。`current_branch` 只在没给 `leaf` 时用来定 `leaf_id`。

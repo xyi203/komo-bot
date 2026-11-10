@@ -96,15 +96,6 @@ pub struct Projected {
     pub decayed: Option<String>,
 }
 
-/// 已经完整给过 `sends_so_far` 次的这条结果，有没有资格换成短视图：有 decayed 视图、
-/// 且完整给够了次数。次数 = 这条 Run 在它之后记了几条 `message.assistant`。
-pub fn decay_eligible(projected: &Projected, sends_so_far: u32, ctx: &ProjectionContext) -> bool {
-    projected.decayed.is_some()
-        && ctx
-            .decay
-            .is_some_and(|policy| sends_so_far >= policy.full_sends)
-}
-
 /// 按已经记下的决定给正文：换过的给 decayed（没有 decayed 视图时仍是 full）。刚跑完与
 /// 回放都从这里过，所以两边给出同一份字节。
 pub fn select(projected: Projected, decayed: bool) -> String {
@@ -934,19 +925,6 @@ mod tests {
         let views = project_views(&facts(Some(&barely), None), &decaying(64 * 1024));
         assert!(views.full.len() > POLICY.threshold_bytes);
         assert_eq!(views.decayed, None, "{}", views.full.len());
-    }
-
-    #[test]
-    fn a_result_is_eligible_only_after_its_full_sends() {
-        let ctx = decaying(64 * 1024);
-        let views = project_views(&facts(Some(&lines(400)), None), &ctx);
-        assert!(!decay_eligible(&views, 0, &ctx));
-        assert!(!decay_eligible(&views, 1, &ctx));
-        assert!(decay_eligible(&views, 2, &ctx));
-
-        // 没有 decayed 视图就永远没资格。
-        let small = project_views(&facts(Some(&lines(60)), None), &ctx);
-        assert!(!decay_eligible(&small, 5, &ctx));
     }
 
     #[test]

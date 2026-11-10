@@ -1,10 +1,48 @@
 # Session 读写路径优化方案（存储重写之后）
 
-> 状态：**方案，未实施**（2026-10-28）。基线 HEAD `799d5e4f`。
+> 状态：**A–G 大部分已实施**（2026-11-10，分支 `feature/optimize`），逐项见下面的进度表；未做的部分写了原因。
+> 方案写于 2026-10-28，基线 HEAD `799d5e4f`。
 > 与 `docs/storage-durable-perf.md` 的关系：那份是存储层优化清单（P1 上下文读取已做）；本文只收 **Gateway 的 session 层**
 > 读写路径。§3.4 / §3.6 与那份 §3、§5 是同一件事，这里给出具体落点，实施时以那份的进度表为准、两边互相引用，不各记一份。
 >
 > 文中的性能影响全部来自调用链静态分析，**没有实测数字**；并发问题是代码确认的竞争窗口，没有运行时复现。
+
+## 0. 进度
+
+| # | 状态 | 提交 | 说明 |
+|---|---|---|---|
+| A | 已实施 | `4319fcec` | 见下方"A 的落法"。`land()` 与线外预检都不再 `load_tree`（`leaf` 不为空时才读树） |
+| B | 已实施（之前） | `04d15bbd` | `sessions.request_key` / `request_hash` 与唯一索引，`create_session_idempotent` |
+| C | 已实施（之前） | `8136b940` | clone / fork 提交前复核 + blob 清单 |
+| D | 已实施 | `a039dfeb`（之前）、`126dd935` | 外层结果只为返回的事件读；重连补读优先取 feed 内存里最近推过的事件，见下方"D 的落法" |
+| E | 部分实施 | `e116b31e` | 查询下推与列表概览有界并发已做；**列表分页没做**，原因见下方 |
+| F | 部分实施 | `ff454855` | 快照按 `partial_interval` 节流已做；工具参数传原始字符串、sink 改 `Arc` 没做，原因见下方 |
+| G | 已实施（之前） | `e13bf1e3` | 空闲时限、连续无数据超时不再耗完预算；`~/.komo/config.toml` 的临时 `timeout_secs = 600` 可以删 |
+
+**A 的落法**：请求键去重用新的 `Storage::submission_by_session_request(session, key)`——默认实现逐 conversation
+点查，Turso 一条 `conversations ⋈ submissions` 的 join（走 `conversations_by_session` 与 `submissions_by_request`），
+所以 §4.1 `submissions` 那一行不用加列（"待确认"的结论）。双路径比对没有放进生产代码：`DurableCore` 有一个仅测试用的
+`full_tree_landing` 开关，`landing_without_the_tree_matches_landing_with_it_over_random_sequences` 在 6 个种子、
+每个 24 步（导航 / 新键提交 / 旧键重发同内容与不同内容）上比对两条路径的落点、去重结果与树形。§5 的持锁时长基线与
+"长会话扫描期间另一会话提交不被阻塞"的用例**没做**（快速路径里已经没有随历史增长的读）。
+
+**D 的落法**：方案写的"从投影里取 `seq > after`"与代码不符——`Projection` 只有折叠状态，不留事件。改成 feed 给每个有投影的
+Session 留一段最近推过的事件（`feed::RecentEvents`，每 Session 512 KiB，从头丢，记下丢掉的最大 seq）；事件先记进这段再推
+hub，HTTP 先订阅再取，重叠靠 seq 去重。游标在覆盖范围内时补读（SSE 首连、落后重补、JSON 分页）都不读存储；冷会话、
+被淘汰、purge、覆盖不到时照旧全量补读。冷补读的结果**没有**放回缓存（要和 feed 任务的投影状态协调），所以 Gateway 起来后
+没动过的会话第一次重连仍是全量。
+
+**E 没做的部分**：`GET /v1/sessions` 分页要改协议（`cursor` / `next`）、TS 绑定和三个客户端（CLI、TUI、web），
+"旧客户端不带 cursor 时返回第一页"会让没升级的客户端只看到前 50 条；默认 `limit` 也还是待确认。这是产品与协议取舍，
+留给单独一轮。已做的：`sessions` 加 `source` / `kind` / `agent` 三列（开库时从 `record` 回填老行）与
+`sessions_by_source (source, lifecycle, id)`、`sessions_by_kind_agent (kind, agent, lifecycle, id)` 两个索引，
+`SessionQuery` 加同名条件；`main_session` / `session_for_source` 在提交线里只读命中的行；列表逐条读概览改成 2 路并发、保持次序。
+
+**F 的落法与没做的部分**：没有把 `ModelStream::progress` 改成拉取（签名要动三家 provider 和十来个测试替身）。
+`RequestOptions` 加 `progress_interval`（harness 给 `partial_interval`）：首块立刻造快照，之后每间隔最多一份；间隔内到的块
+记成欠一份，流停顿到点也补一份，显示不会停在旧内容上。快照次数 ≤ 时长 / 间隔 + 2，终态消息不变（stream 测试锁住）。
+压缩任务不看进度，仍是 `None`（逐块）。`lenient_arguments` 改原始字符串会改变 `komo.live` 里部分回复的形状（SSE / 客户端
+在读），节流后它已经降到每间隔一次，没做；sink 的 `Arc` 同理。
 
 ## 1. 需求背景
 
@@ -202,8 +240,8 @@ sequenceDiagram
 |---|---|---|
 | `sessions` | 加列 `request_key TEXT`（可空）、`request_hash TEXT`（可空） | 从 `record.request_key` 抽出成列；新建会话写入，老行留空 |
 | `sessions` | 加唯一索引 `sessions_by_request_key (request_key) WHERE request_key IS NOT NULL` | B 的兜底 |
-| `sessions` | 加列 `source TEXT`、`kind TEXT`、`agent TEXT`（可空）+ 索引 `(source, kind, lifecycle)` | E 的查询下推；老行启动时一次性回填 |
-| `submissions` | 加 session 级请求键查询所需的列或索引（`session_id, request_id`） | A 的一次点查；若 submission 行没有 session 列则经 conversation → session 的映射，**待确认**哪种代价更小 |
+| `sessions` | 加列 `source TEXT`、`kind TEXT`、`agent TEXT`（可空）+ 索引 `(source, lifecycle, id)`、`(kind, agent, lifecycle, id)` | E 的查询下推；老行开库时回填（`kind IS NULL` 的行）。已实施 |
+| `submissions` | 不变 | A 的 Session 级请求键查询经 `conversations_by_session` join `submissions_by_request`（已实施，不加列） |
 
 均为加列 / 加索引，配 `*_TABLE_DDL` 的字节一致测试；`TableSpec.columns` 同步追加。
 
@@ -296,8 +334,8 @@ sequenceDiagram
 
 ## 待确认
 
-- §4.1 `submissions` 的 session 级请求键查询：加 `session_id` 列，还是经 conversation 映射。
-- §3.3 从 entry 里收集 blob 引用的方式。
+- ~~§4.1 `submissions` 的 session 级请求键查询~~：经 conversation 映射（Turso 一条 join），不加列。
+- §3.3 从 entry 里收集 blob 引用的方式（C 已按 `8136b940` 的写法实施）。
 - §4.2 会话列表默认 `limit`。
 - §5 观测指标名与面板。
 - 全部性能项的改动前基线数字（需要在本机长会话上实测）。

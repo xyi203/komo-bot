@@ -1,6 +1,7 @@
 # 新存储的优化清单（D7 之后）
 
-> 状态：**P1（§1、§2）已实施，其余待实施**（2026-10-26）。实施细节与验收见 §10；§1.1、§2.1 保留优化前的现状。
+> 状态：**P1（§1、§2）已实施**（2026-10-26，见 §10）；**§3 的 SSE 补读、§5、§7 已实施**（2026-11-10，见 §11）；
+> §3 的 run 日志与放宽 `READ_PERMITS`、§4、§6 未做，原因见 §11。§1.1、§2.1 保留优化前的现状。
 > 对象是 `docs/storage-durable.md` 落地后的 `durable.db` 读写路径与生成的流式进度。
 >
 > 对照：本机 `../pi` 提交 **`d5b3de22d`**（2026-10-25）的 `packages/durable`。移植基线 `8efd314fa`（2026-10-16）
@@ -23,11 +24,11 @@
 |---|---|---|---|
 | P1 | §1 上下文读取：只读活动范围 + 按 conversation 增量缓存，持线时间缩到两次点查 | 性能（O(历史) → O(窗口)），解除跨 conversation 的阻塞 | runtime `durable/runtime.rs`、`harness/{generation,compaction,orchestration}`、gateway `submit.rs` |
 | P1 | §2 macOS 上打开 `PRAGMA fullfsync` | **正确性**：兑现"返回即已落盘" | store `durable/schema.rs` |
-| P2 | §3 gateway 读路径（SSE 补读、run 状态、任务进度）复用 §1 的缓存与已有的增量投影 | 性能（D5 已记为缺口） | gateway `service/durable/{feed,runs}.rs` |
-| P2 | §5 流式快照：每个网络块都复制整段回复、重解析工具参数 | CPU，单次生成 O(n²) | runtime `llm/*/stateless.rs`、`harness/generation.rs` |
-| P3 | §4 `komo.live` 的进度提交：整值重写，每 250 ms 一个事务 | 先测；超标照 pi 的 deferred 提交 | runtime `harness/live.rs`、`durable/line.rs` |
-| P3 | §6 崩溃循环保护（`restartLimit`） | 健壮性：反复打死进程的任务不再无限重跑 | kernel `durable/task/`、runtime scheduler |
-| P3 | §7 退役 document 的值 | 库增长 | store `durable/write.rs` |
+| P2 | §3 gateway 读路径（SSE 补读、run 状态、任务进度）复用 §1 的缓存与已有的增量投影 | 性能（D5 已记为缺口） | gateway `service/durable/{feed,runs}.rs` — **SSE 补读已实施，run 日志未做**（§11） |
+| P2 | §5 流式快照：每个网络块都复制整段回复、重解析工具参数 | CPU，单次生成 O(n²) | runtime `llm/*/stateless.rs`、`harness/generation.rs` — **已实施**（§11） |
+| P3 | §4 `komo.live` 的进度提交：整值重写，每 250 ms 一个事务 | 先测；超标照 pi 的 deferred 提交 | runtime `harness/live.rs`、`durable/line.rs` — **未测、未做** |
+| P3 | §6 崩溃循环保护（`restartLimit`） | 健壮性：反复打死进程的任务不再无限重跑 | kernel `durable/task/`、runtime scheduler — **未做**，前提不成立（§11） |
+| P3 | §7 退役 document 的值 | 库增长 | store `durable/write.rs` — **已实施**（§11） |
 
 不做的见 §8，顺序与测量见 §9。
 
@@ -278,5 +279,33 @@ pi 的 #9265（`f715a15c1`）修的就是这个：`StreamingJsonParser` 每个 d
 一万条历史的分页读取被刻意暂停时，另一个 conversation 的提交和上下文读取仍完成；暂停期间的新 entry 不进入已捕获范围。
 完整测试、编译计时与同步基准数字记在 `storage-durable.md` §10 / §13.4。
 
-**后续范围**：§3 的 SSE / run 投影缓存、§5 的流式快照尚未实施；§4 的真实 `komo.live` 长回复 / 并发 WAL 测量也还没有。
+**后续范围**（2026-10-26 时）：§3 的 SSE / run 投影缓存、§5 的流式快照尚未实施；§4 的真实 `komo.live` 长回复 / 并发 WAL 测量也还没有。
 §6、§7 继续排在这些之后。此次微基准只比较同步档位，不能据此决定 deferred 提交或放宽 `READ_PERMITS`。
+之后的进度见 §11。
+
+## 11. P2 / P3 实施记录（2026-11-10，分支 `feature/optimize`）
+
+与 `docs/session-optimization.md` 的 D、F 是同一件事，那边的进度表记了提交与偏差，这里只记存储侧的结论。
+
+- **§3 SSE 补读（`126dd935`）**：没有复用 §1 的上下文缓存（SSE 投影要的是 entry + submission 的旧事件，不是模型上下文）。
+  feed 给每个有投影的 Session 留一段最近推过的事件（`feed::RecentEvents`，每 Session 512 KiB，从头丢），先记再推 hub；
+  重连游标在覆盖范围内时补读不读存储、不重投影。冷会话（Gateway 起来后没动过）、被 `MAX_SESSIONS` 淘汰、purge、覆盖不到时
+  照旧全量补读，冷补读的结果不回填。直播与补读逐帧相同（`live_frames_equal_backfill_frames` 加了内存这段的断言）。
+  submission 可变、`submissions` 表没有 `commit_seq` 列，所以没有做"只读之后的记录"的增量冷读。
+- **§3 没做的**：`runs.rs` 的 `load_log` 仍整段读、整段投影（run 日志要整条 run 的事件，可能早于内存那段）；
+  `READ_PERMITS = 2` 没放宽——冷补读还是全量投影，没有新的 W5 测量，不改。
+- **§5 流式快照（`ff454855`）**：没改 `ModelStream::progress` 的签名（推改拉要动三家 provider 和十来个测试替身），
+  改成 `RequestOptions::progress_interval` 由 provider 节流：首块立刻造，之后每间隔最多一份，间隔内的块欠着、停顿到点补一份。
+  快照次数 ≤ 时长 / 间隔 + 2，终态消息逐字节不变。部分回复里的工具参数仍是 `lenient_arguments` 解析后的值（改原始字符串会
+  改 `komo.live` 里部分回复的形状），节流后它也降到每间隔一次。
+- **§7 退役 document 的值（`1d4d7522`）**：先在本机库的副本上量了（2026-11-06 的 `durable.db`，31 MB）：退役 document 只有
+  `komo.nested` 一类，540 行、`value` 合计 3.2 MB；活的 220 行 68 KB；entry 4577 行 18.7 MB。`RetireDocument` 改成同一条 UPDATE
+  把 `value` 写成 `'null'`，同批建了又退役的直接写 `'null'`；行、id、`retired_seq` 都留着。已有的退役行不回收（下次 purge 或
+  VACUUM 才有空间）。内存实现照旧留值（没有读者，行为不可见）。
+- **§6 没做**：§6 的前提"正常关闭会把 `running` 写回 `pending` 而不计数"在 komo **不成立**——`Engine::close` 先封线再等
+  invocation，`step` 在关闭中被拒，任务留在 `running`（`durable/tests/lifecycle.rs` 的
+  `close_writes_no_outcome_and_starts_no_fresh_phase` 钉着这一点）。开库时按 `running` 计数会把每次正常重启（`komo update`、
+  `install-local.sh`、`gateway restart`）都算成崩溃，跑着长任务的会话重启 5 次就被停住。要做得先定一件设计上的事：关闭时
+  补一笔"running → pending 不计数"的提交（改关闭次序），还是在 `durable_meta` 记一个干净关闭的标记（`Storage` 要加元数据接口）。
+  另外被停住的任务要能放行，而 intervention 只有 `abandon` 一个 verdict（协议冻结），放行要加协议或新子命令。
+- **§4 没做**：方案写明"先测"，这次没有做长回复 / 并发流下的 WAL 与事务率测量，没有依据就不动。

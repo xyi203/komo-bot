@@ -198,7 +198,7 @@ commands run, terminal output when CLI behavior changes.
   "pending verification" list — write verified facts back there).
 - Storage and agent loop (the pi-durable commit model): `docs/storage-durable.md`
   (derivation, deviations, progress), `docs/storage-durable-d5.md` (gateway wiring) and
-  `docs/storage-durable-perf.md` (P1 implemented; later optimizations pending);
+  `docs/storage-durable-perf.md` (P1, §3 SSE backfill, §5, §7 implemented; §4, §6 pending — see its §11);
   `docs/session-tree.md`, `docs/background-tasks.md`, `docs/monitor.md`,
   `docs/codemode.md` and `docs/codemode-bash.md` describe the pieces on top of it
   (including implemented nested bash calls and live slots). `docs/handoff.md`

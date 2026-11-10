@@ -2,8 +2,12 @@
 
 use std::sync::Arc;
 
-use komo_kernel::durable::{ConversationId, Storage, TaskId, TaskRecord};
+use komo_kernel::durable::task::RESTART_LIMIT;
+use komo_kernel::durable::{
+    ConversationId, DocumentAddress, DocumentScope, Storage, TaskId, TaskRecord,
+};
 use komo_kernel::traits::Clock;
+use serde_json::{Value, json};
 
 use super::error::DurableError;
 use super::kind::{NoHooks, Registry, Reporter, TaskHooks};
@@ -16,6 +20,8 @@ pub struct EngineOptions {
     pub close_storage: bool,
     pub report: Reporter,
     pub hooks: Arc<dyn TaskHooks>,
+    /// 崩溃循环保护：一个任务连续被崩溃打断这么多次就停住（`BlockedReason::RestartLimit`）。
+    pub restart_limit: u32,
 }
 
 impl Default for EngineOptions {
@@ -24,8 +30,37 @@ impl Default for EngineOptions {
             close_storage: true,
             report: Arc::new(|_| {}),
             hooks: Arc::new(NoHooks),
+            restart_limit: RESTART_LIMIT,
         }
     }
+}
+
+/// 引擎自己的状态（库级单例 document，Session 作用域、没有 key）：`{ "closed": bool }`。
+///
+/// 崩溃循环保护靠它分辨"上一代是干净关闭的"：开库时读出来、在同一笔提交里改成 `closed: false`
+/// （先于任何任务恢复落盘），[`Engine::close`] 等 invocation 全部走完后在最后一笔提交里写回
+/// `closed: true`。所以读到 `true` 只可能是上一代确实走完了关闭；关闭没落下（被杀、断电、线失败）
+/// 读到的就是 `false`，按崩溃给幸存的 `running` 任务多算一次——标记丢失只会偏保守，不会漏算。
+/// 从没有过这份 document（新库，或第一次升级到带这个保护的版本）不算崩溃：存量的 `running`
+/// 不知道上一代是怎么停的，不给它们凭空记一次。
+pub const ENGINE_KIND: &str = "komo.engine";
+pub const ENGINE_VERSION: u32 = 1;
+
+pub fn engine_address() -> DocumentAddress {
+    DocumentAddress {
+        kind: ENGINE_KIND.to_owned(),
+        scope: DocumentScope::Session,
+        key: None,
+    }
+}
+
+/// 读到的引擎状态说明上一代崩溃了吗（见 [`ENGINE_KIND`]）。
+pub fn crashed_before(state: Option<&Value>) -> bool {
+    state.is_some_and(|value| value.get("closed").and_then(Value::as_bool) != Some(true))
+}
+
+pub fn engine_state(closed: bool) -> Value {
+    json!({ "closed": closed })
 }
 
 pub struct Engine {
@@ -44,7 +79,13 @@ impl Engine {
         options: EngineOptions,
     ) -> Result<Self, DurableError> {
         let line = Line::new(storage, clock);
-        let sched = Sched::new(line.clone(), registry, options.report, options.hooks);
+        let sched = Sched::new(
+            line.clone(),
+            registry,
+            options.report,
+            options.hooks,
+            options.restart_limit,
+        );
         if let Err(error) = sched.open().await {
             line.seal();
             return Err(error);
@@ -92,6 +133,12 @@ impl Engine {
         self.sched.abort(id, false).await
     }
 
+    /// 放行一个因崩溃循环保护停住的任务（pi 的 `retryTask`）：计数归零，回到可调度。不是被停住的
+    /// （没到上限、已终结、不存在）返回 `false`，什么都不写。
+    pub async fn retry_task(&self, id: TaskId) -> Result<bool, DurableError> {
+        self.sched.retry(id).await
+    }
+
     /// 给没有 invocation 在跑的活任务写 `faulted`（见 `Sched::fault_idle`）。
     pub async fn fault_idle_task(
         &self,
@@ -130,10 +177,18 @@ impl Engine {
     }
 
     /// 关闭：封住受理与 reservation，通知 invocation，等已受理的提交结算、invocation 走完，
-    /// 再（按选项）关存储。不写任何任务结局，重开后从 checkpoint 继续。
+    /// 记下干净关闭（[`ENGINE_KIND`]），再（按选项）关存储。不写任何任务结局，任务留在
+    /// `running`，重开后从 checkpoint 继续，且不算被崩溃打断。
     pub async fn close(&self) -> Result<(), DurableError> {
         self.line.seal();
         self.sched.join().await;
-        self.line.finish_close(self.close_storage).await
+        self.line
+            .finish_close_with(self.close_storage, |tx| {
+                Box::pin(async move {
+                    tx.put_document(engine_address(), ENGINE_VERSION, engine_state(true))
+                        .await
+                })
+            })
+            .await
     }
 }

@@ -11,17 +11,32 @@ use super::graph::{Node, Overlay, TaskGraph};
 use super::state::{cancellation_intent, failed_outcome, with_state};
 
 /// 开库：幸存的 `running` 一律回 `pending`，checkpoint 与 abort 标记原样保留；其余状态
-/// 不动（`waiting` 与 `completing` 另行重新评估）。返回要写的新记录。
-pub fn reconcile_on_open(record: &TaskRecord) -> Option<TaskRecord> {
+/// 不动（`waiting` 与 `completing` 另行重新评估）。`crashed`（上一代没有干净关闭）时它是被崩溃
+/// 打断的，`restarts` 加一（spec §5.4 "Restarts"）；干净关闭留下的 `running` 不算。返回要写的新记录。
+pub fn reconcile_on_open(record: &TaskRecord, crashed: bool) -> Option<TaskRecord> {
     match &record.state {
-        TaskState::Running { checkpoint } => Some(with_state(
-            record,
-            TaskState::Pending {
-                checkpoint: checkpoint.clone(),
-            },
-        )),
+        TaskState::Running { checkpoint } => {
+            let mut next = with_state(
+                record,
+                TaskState::Pending {
+                    checkpoint: checkpoint.clone(),
+                },
+            );
+            if crashed {
+                next.restarts = next.restarts.saturating_add(1);
+            }
+            Some(next)
+        }
         _ => None,
     }
+}
+
+/// 崩溃循环保护的默认上限（pi 的 `restartLimit`）：连续被崩溃打断这么多次就停住。
+pub const RESTART_LIMIT: u32 = 5;
+
+/// 被崩溃打断的次数到了上限：不再 reserve（run 与 abort 都不起），等操作者重试或放弃。
+pub fn restart_limited(record: &TaskRecord, limit: u32) -> bool {
+    record.restarts >= limit
 }
 
 /// 一条任务下次 invocation 之前还在等的活任务：带 abort 标记时是它活的普通所有的工作
@@ -198,11 +213,12 @@ mod tests {
         let mut record = task(1, None, running());
         record.abort_requested = true;
         record.memos = Some(BTreeMap::from([("m".to_owned(), json!(1))]));
-        let back = reconcile_on_open(&record).unwrap();
+        let back = reconcile_on_open(&record, false).unwrap();
         assert_eq!(back.state, pending());
         assert!(back.abort_requested);
         assert_eq!(back.memos, record.memos, "memos survive a restart");
-        assert!(reconcile_on_open(&task(2, None, pending())).is_none());
+        assert_eq!(back.restarts, 0, "a clean close is not a crash");
+        assert!(reconcile_on_open(&task(2, None, pending()), true).is_none());
         let waiting = task(
             3,
             None,
@@ -212,7 +228,23 @@ mod tests {
                 policy: JoinPolicy::AllSettled,
             },
         );
-        assert!(reconcile_on_open(&waiting).is_none());
+        assert!(reconcile_on_open(&waiting, true).is_none());
+    }
+
+    #[test]
+    fn a_crash_counts_only_against_tasks_it_interrupted_while_running() {
+        let mut record = task(1, None, running());
+        record.restarts = 3;
+        let back = reconcile_on_open(&record, true).unwrap();
+        assert_eq!(back.restarts, 4);
+        assert!(!restart_limited(&back, RESTART_LIMIT));
+        let back = reconcile_on_open(&with_state(&back, running()), true).unwrap();
+        assert_eq!(back.restarts, RESTART_LIMIT);
+        assert!(restart_limited(&back, RESTART_LIMIT));
+        // pending / waiting 的任务没在跑，崩溃打断不到它们。
+        let mut idle = task(2, None, pending());
+        idle.restarts = 2;
+        assert!(reconcile_on_open(&idle, true).is_none());
     }
 
     #[test]

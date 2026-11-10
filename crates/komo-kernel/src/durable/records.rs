@@ -292,6 +292,14 @@ pub struct TaskRecord {
     pub state: TaskState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memos: Option<BTreeMap<String, Value>>,
+    /// 连续几次在 `running` 时被进程崩溃打断（spec §5.4 "Restarts"，崩溃循环保护）：开库时上一代
+    /// 没有干净关闭才加一，任务自己提交新状态就归零，到上限就停住不再恢复。老记录没有这一格，读作 0。
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub restarts: u32,
+}
+
+fn is_zero(value: &u32) -> bool {
+    *value == 0
 }
 
 impl TaskRecord {
@@ -318,6 +326,7 @@ impl TaskRecord {
             ended_at: None,
             state: TaskState::Pending { checkpoint },
             memos: None,
+            restarts: 0,
         }
     }
 }
@@ -611,6 +620,28 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    /// `restarts` 是后加的一格：老记录没有它读作 0，为 0 时也不写出来（老 Gateway 读新记录不受影响）。
+    #[test]
+    fn task_restarts_default_to_zero_and_are_written_only_when_counted() {
+        let mut record = TaskRecord::pending(
+            TaskId::new(3),
+            ConversationId::new(1),
+            "k",
+            json!({}),
+            json!({"phase": "a"}),
+        );
+        let plain = serde_json::to_value(&record).unwrap();
+        assert!(plain.get("restarts").is_none(), "{plain}");
+        assert_eq!(serde_json::from_value::<TaskRecord>(plain).unwrap(), record);
+        record.restarts = 2;
+        let counted = serde_json::to_value(&record).unwrap();
+        assert_eq!(counted["restarts"], 2);
+        assert_eq!(
+            serde_json::from_value::<TaskRecord>(counted).unwrap(),
+            record
+        );
+    }
 
     #[test]
     fn submission_records_round_trip_in_a_flat_shape() {

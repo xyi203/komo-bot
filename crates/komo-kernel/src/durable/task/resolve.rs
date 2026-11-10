@@ -13,6 +13,8 @@ pub enum BlockedReason {
     MissingTask,
     TaskTooOld,
     MigrationFailed,
+    /// 连续被崩溃打断到了上限（`reconcile::RESTART_LIMIT`）；与定义无关，操作者放行前不跑。
+    RestartLimit,
 }
 
 impl BlockedReason {
@@ -22,6 +24,7 @@ impl BlockedReason {
             BlockedReason::MissingTask => "missing_task",
             BlockedReason::TaskTooOld => "task_too_old",
             BlockedReason::MigrationFailed => "migration_failed",
+            BlockedReason::RestartLimit => "restart_limit",
         }
     }
 }
@@ -126,5 +129,6 @@ mod tests {
         assert_eq!(BlockedReason::MissingTask.as_str(), "missing_task");
         assert_eq!(BlockedReason::TaskTooOld.as_str(), "task_too_old");
         assert_eq!(BlockedReason::MigrationFailed.as_str(), "migration_failed");
+        assert_eq!(BlockedReason::RestartLimit.as_str(), "restart_limit");
     }
 }

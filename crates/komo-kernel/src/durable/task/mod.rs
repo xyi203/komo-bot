@@ -12,7 +12,8 @@ pub mod step;
 
 pub use graph::{Node, Overlay, TaskGraph, TaskNode, Walked};
 pub use reconcile::{
-    AbortMark, abort_marks, fail_fast_targets, finalizable, reconcile_on_open, waiting_on,
+    AbortMark, RESTART_LIMIT, abort_marks, fail_fast_targets, finalizable, reconcile_on_open,
+    restart_limited, waiting_on,
 };
 pub use resolve::{BlockedReason, DefinitionInfo, Fit, can_reserve, fit};
 pub use state::{

@@ -173,12 +173,42 @@ impl Line {
 
     /// 等已受理的提交结算完；`close_storage` 时再关存储。
     pub async fn finish_close(&self, close_storage: bool) -> Result<(), DurableError> {
+        self.finish_close_with(close_storage, |_| Box::pin(async { Ok(()) }))
+            .await
+    }
+
+    /// 同 [`Line::finish_close`]，但在关存储之前、仍持着线时再落最后一笔结构性提交（引擎的干净关闭
+    /// 标记）。它排在所有已受理的提交之后，不发布给订阅者（关闭中已没有人该再对它做反应）。线已失败
+    /// 时不写：存储的状态不可信，标记缺失只会让下一次开库按崩溃多算一次。这一笔写不下去同样按存储
+    /// 故障让线失败，关存储照做，错误返回给调用方。
+    pub async fn finish_close_with(
+        &self,
+        close_storage: bool,
+        last: impl for<'a> FnOnce(&'a mut Tx) -> TxFuture<'a, ()> + Send,
+    ) -> Result<(), DurableError> {
         self.seal();
         let _gate = self.shared.gate.lock().await;
+        let mut result = Ok(());
+        if self.failure().is_none() {
+            let mut tx = Tx::new(self.shared.storage.clone(), self.now_ms(), None);
+            result = match last(&mut tx).await {
+                Ok(()) => match tx.assemble().await {
+                    Ok(writes) if writes.is_empty() => Ok(()),
+                    Ok(writes) => self
+                        .commit_to_storage(&writes, false)
+                        .await
+                        .map(|_| ())
+                        .map_err(DurableError::from),
+                    Err(error) => Err(error),
+                },
+                Err(error) => Err(error),
+            }
+            .map_err(|error| self.settle_error(error));
+        }
         if close_storage {
             self.shared.storage.close().await?;
         }
-        Ok(())
+        result
     }
 
     fn admit(&self) -> Result<(), DurableError> {

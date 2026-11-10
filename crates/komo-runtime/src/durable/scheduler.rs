@@ -28,12 +28,14 @@ use komo_kernel::durable::task::{
     BlockedReason, Fit, InvocationMode, NextTaskState, Node, Overlay, PhaseReturn, Replacement,
     RunningTask, StepDecision, StepInput, TaskGraph, TaskNode, abort_marks, can_reserve,
     check_checkpoint, check_next_state, check_replacement, decide_step, failed_outcome,
-    finalizable, fit, is_live, reconcile_on_open, waiting_on, with_abort_mark, with_state,
+    finalizable, fit, is_live, reconcile_on_open, restart_limited, waiting_on, with_abort_mark,
+    with_state,
 };
 use komo_kernel::durable::{
     ConversationId, Storage, StorageWrite, TaskId, TaskRecord, TaskState, TaskStatus,
 };
 
+use super::engine::{ENGINE_VERSION, crashed_before, engine_address, engine_state};
 use super::error::DurableError;
 use super::kind::{Registry, RegistrySnapshot, Reporter, TaskHooks, TaskKind, identity};
 use super::line::{Line, Publication, TxFuture};
@@ -169,6 +171,8 @@ pub(super) struct Sched {
     pub registry: Registry,
     pub report: Reporter,
     hooks: Arc<dyn TaskHooks>,
+    /// 崩溃循环保护的上限（`EngineOptions::restart_limit`）。
+    restart_limit: u32,
     state: Mutex<State>,
 }
 
@@ -206,6 +210,7 @@ impl Sched {
         registry: Registry,
         report: Reporter,
         hooks: Arc<dyn TaskHooks>,
+        restart_limit: u32,
     ) -> Arc<Self> {
         let storage = line.storage().clone();
         Arc::new(Self {
@@ -215,6 +220,7 @@ impl Sched {
             registry,
             report,
             hooks,
+            restart_limit,
             state: Mutex::new(State::default()),
         })
     }
@@ -230,7 +236,8 @@ impl Sched {
 
     // ------------------------------------------------------------------ 开关
 
-    /// 读出活任务、把幸存的 `running` 改回 `pending`；不调度任何东西。
+    /// 读出活任务、把幸存的 `running` 改回 `pending`（上一代没干净关闭时给它们的崩溃计数加一，
+    /// 见 `engine::ENGINE_KIND`）；不调度任何东西。
     pub async fn open(self: &Arc<Self>) -> Result<(), DurableError> {
         let weak = Arc::downgrade(self);
         self.line.subscribe_commits({
@@ -259,7 +266,8 @@ impl Sched {
         });
         self.st().registry_sub = Some(sub);
         let sched = self.clone();
-        self.line
+        let stopped = self
+            .line
             .commit(None, move |tx| {
                 Box::pin(async move {
                     // 所有表读都在第一次写之前。
@@ -272,6 +280,9 @@ impl Sched {
                     ] {
                         scans.push(tx.all_tasks(status).await?);
                     }
+                    let previous = tx.document(&engine_address()).await?;
+                    let crashed = crashed_before(previous.as_ref().map(|(_, value)| value));
+                    let mut stopped = Vec::new();
                     for record in scans.into_iter().flatten() {
                         {
                             let mut st = sched.st();
@@ -280,14 +291,28 @@ impl Sched {
                                 st.abandoned.insert(record.id);
                             }
                         }
-                        if let Some(pending) = reconcile_on_open(&record) {
+                        if let Some(pending) = reconcile_on_open(&record, crashed) {
+                            if pending.restarts == sched.restart_limit {
+                                stopped.push((pending.id, pending.kind.clone()));
+                            }
                             sched.write_task(tx, pending).await?;
                         }
                     }
-                    Ok(())
+                    // 清掉干净关闭的标记：与上面的计数同一笔提交，先于任何任务恢复落盘——这一代
+                    // 之后再崩，下一次开库读到的就是 `closed: false`。
+                    tx.put_document(engine_address(), ENGINE_VERSION, engine_state(false))
+                        .await?;
+                    Ok(stopped)
                 })
             })
             .await?;
+        for (id, kind) in stopped {
+            self.report_text(&format!(
+                "task {id} ({kind}) was interrupted by {} crashes in a row; it is blocked \
+                 (restart_limit) until it is retried or abandoned",
+                self.restart_limit
+            ));
+        }
         // 崩溃前没来得及落的取消级联、没收尾的 `completing`，都由 reconcile 重新推出。
         self.schedule_reconcile();
         let weak = Arc::downgrade(self);
@@ -696,6 +721,10 @@ impl Sched {
                             .collect()
                     };
                     for record in candidates {
+                        // 崩溃循环保护：连续被崩溃打断到了上限，run 与 abort 都不起，等操作者放行。
+                        if restart_limited(&record, sched.restart_limit) {
+                            continue;
+                        }
                         // 还在等的（`on` 里有活的 / 有标记时名下有活的工作）：回来之前不跑。
                         let (waiting, cancelled) = {
                             let st = sched.st();
@@ -1128,6 +1157,10 @@ impl Sched {
             self.validate_wait(tx, invocation, current, on, *policy)
                 .await?;
         }
+        // 任务自己提交了新状态，就是有进展：崩溃计数归零。
+        let mut current = current.clone();
+        current.restarts = 0;
+        let current = &current;
         if let NextTaskState::Terminal { outcome } = &next {
             self.load_scopes().await?;
             let overlay = tx.overlay();
@@ -1416,6 +1449,29 @@ impl Sched {
     /// 读不到时用，D5 W4a）。返回写了没有：已经 terminal、或有 invocation 在跑（它自己会走完或失败，
     /// 外面不该替它判）都是 `false`。同 `abort` 的"没有 invocation"那一支，经 `terminate` 写结局，所以
     /// 名下有活工作时先 `completing`、Harness 清理（槽位、run 收尾）照常发生。
+    /// 放行一个被崩溃循环保护停住的活任务：只把 `restarts` 归零（状态、checkpoint、标记都不动），
+    /// 提交后调度器照常 reserve 它。没到上限的不写。
+    pub async fn retry(self: &Arc<Self>, id: TaskId) -> Result<bool, DurableError> {
+        let sched = self.clone();
+        self.line
+            .commit(None, move |tx| {
+                Box::pin(async move {
+                    let current = sched.st().graph.live_record(id).cloned();
+                    let Some(current) = current else {
+                        return Ok(false);
+                    };
+                    if !restart_limited(&current, sched.restart_limit) {
+                        return Ok(false);
+                    }
+                    let mut next = current;
+                    next.restarts = 0;
+                    sched.write_task(tx, next).await?;
+                    Ok(true)
+                })
+            })
+            .await
+    }
+
     pub async fn fault_idle(
         self: &Arc<Self>,
         id: TaskId,
@@ -1565,6 +1621,10 @@ impl Sched {
                     TaskInspectionState::Running
                 } else if record.state.status() == TaskStatus::Completing {
                     TaskInspectionState::Completing
+                } else if restart_limited(record, self.restart_limit) {
+                    TaskInspectionState::Blocked {
+                        reason: BlockedReason::RestartLimit,
+                    }
                 } else {
                     let on = waiting_on(&st.graph, record, false);
                     if !on.is_empty() {

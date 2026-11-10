@@ -1225,6 +1225,7 @@ impl World {
                 close_storage: self.turso_dir.is_some(),
                 report: Arc::new(move |text| reports.push(text)),
                 hooks: self.harness.hooks(),
+                ..EngineOptions::default()
             },
         )
         .await

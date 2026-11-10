@@ -132,7 +132,7 @@ exposure = "direct"
 
     /// `komo auth mcp login secure` 落盘的样子：一份带 access token、没有 refresh token 的凭证。
     fn log_in(&self, home: &Home, token: &str) {
-        let path = komo_runtime::mcp_auth::credentials_path(home.path(), "secure");
+        let path = komo_tools::mcp_auth::credentials_path(home.path(), "secure");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         let body = serde_json::json!({
             "client_id": "komo-test",

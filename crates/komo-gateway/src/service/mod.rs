@@ -175,7 +175,7 @@ pub async fn start(options: ServiceOptions) -> Result<Running, ServiceError> {
 
     // 4. 装配。
     // 转后台的接手方要等整份状态才造得出来：`bash` 先拿着空槽，`wire` 再接上。
-    let detach_slot = Arc::new(komo_runtime::tools::detach::DetachSlot::default());
+    let detach_slot = Arc::new(komo_tools::tools::detach::DetachSlot::default());
     let (tools, codemode, mcp) = build_tools(&config, &instance_id, &detach_slot).await;
 
     // 钩子要等 `GatewayState` 造好才找得到它，环用槽断开（`durable::assemble`）。
@@ -343,8 +343,8 @@ pub fn agent_config_file(config: &ConfigHolder) -> PathBuf {
 /// codemode 的 worker：当前这个可执行文件的 `__codemode-worker` 子命令，启动时解析一次
 /// （`docs/codemode.md` §3）。测试进程自己不是 `komo`，用进程内 worker。
 #[cfg(not(any(test, feature = "test-support")))]
-fn codemode_worker() -> Option<komo_runtime::codemode::Worker> {
-    match komo_runtime::codemode::Worker::current_exe() {
+fn codemode_worker() -> Option<komo_tools::codemode::Worker> {
+    match komo_tools::codemode::Worker::current_exe() {
         Ok(worker) => Some(worker),
         Err(error) => {
             tracing::warn!(%error, "找不到自己的可执行文件：这台 Gateway 不挂 codemode");
@@ -354,30 +354,30 @@ fn codemode_worker() -> Option<komo_runtime::codemode::Worker> {
 }
 
 #[cfg(any(test, feature = "test-support"))]
-fn codemode_worker() -> Option<komo_runtime::codemode::Worker> {
-    Some(komo_runtime::codemode::Worker::in_process())
+fn codemode_worker() -> Option<komo_tools::codemode::Worker> {
+    Some(komo_tools::codemode::Worker::in_process())
 }
 
 /// 六个基础工具（§4）与那条编排操作。`codemode` 随 worker 一起装配（`docs/codemode.md` §3），worker 交给执行器。
-/// MCP 的连接留在 [`komo_runtime::mcp::McpHub`] 里，后台连：连上的服务器受理 Run 时再把工具挂进来。
+/// MCP 的连接留在 [`komo_tools::mcp::McpHub`] 里，后台连：连上的服务器受理 Run 时再把工具挂进来。
 async fn build_tools(
     config: &Arc<ConfigHolder>,
     instance_id: &str,
-    detach_slot: &Arc<komo_runtime::tools::detach::DetachSlot>,
+    detach_slot: &Arc<komo_tools::tools::detach::DetachSlot>,
 ) -> (
     Vec<Arc<dyn Tool>>,
-    Option<komo_runtime::codemode::Worker>,
-    Arc<komo_runtime::mcp::McpHub>,
+    Option<komo_tools::codemode::Worker>,
+    Arc<komo_tools::mcp::McpHub>,
 ) {
-    use komo_runtime::tools::{
+    use komo_tools::tools::{
         BashTool, EditTool, MonitorStopTool, MonitorTool, ReadTool, RgTool, TaskTool, WriteTool,
     };
 
     let snapshot = config.current();
-    let registry = Arc::new(komo_runtime::recovery::ChildRegistry::new(
+    let registry = Arc::new(komo_tools::recovery::ChildRegistry::new(
         snapshot.paths.runtime_dir.join("children"),
     ));
-    let registration = komo_runtime::tools::process::ChildRegistration {
+    let registration = komo_tools::tools::process::ChildRegistration {
         registry: Arc::clone(&registry),
         executor: komo_kernel::types::ids::ExecutorId::from_raw(instance_id.to_string()),
     };
@@ -411,7 +411,7 @@ async fn build_tools(
     // MCP（`docs/mcp.md` §2.2）：启动时每台服务器后台连，**不等握手**，这里一个 MCP 工具也不挂。
     // 连上的工具在受理 Run 时挂进同一份目录（`GatewayState::refresh_mcp`），之后与内置工具走
     // 同一条落账的路；被接续的 Run 调到时执行器自己等（`ToolExecutor::await_mcp`）。
-    let mcp = Arc::new(komo_runtime::mcp::McpHub::start(
+    let mcp = Arc::new(komo_tools::mcp::McpHub::start(
         &snapshot.mcp,
         &config.secrets(),
         config.home(),
@@ -425,7 +425,7 @@ async fn build_tools(
     let unreadable = state::codemode_unreadable_paths(&snapshot, config.home());
     let codemode = codemode_worker().map(|worker| worker.protecting(unreadable));
     if codemode.is_some() {
-        tools.push(Arc::new(komo_runtime::tools::CodemodeTool::new()));
+        tools.push(Arc::new(komo_tools::tools::CodemodeTool::new()));
     }
     (tools, codemode, mcp)
 }
@@ -433,7 +433,7 @@ async fn build_tools(
 /// `komo gateway --foreground` 的主流程：起来，等停机信号，收尾。
 pub async fn run(options: ServiceOptions) -> Result<(), ServiceError> {
     // 在起任何子进程之前：shell / 监听继承这个上限。
-    match komo_runtime::limits::raise_open_files() {
+    match komo_tools::limits::raise_open_files() {
         Ok(raised) if raised.after > raised.before => {
             tracing::info!(
                 before = raised.before,

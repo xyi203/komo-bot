@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use komo_runtime::codemode::{ScriptCatalog, Worker, worker::compile_check};
+use komo_tools::codemode::{ScriptCatalog, Worker, worker::compile_check};
 use serde_json::{Value, json};
 
 #[tokio::main]

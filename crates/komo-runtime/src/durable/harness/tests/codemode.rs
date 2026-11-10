@@ -17,9 +17,9 @@ use tokio::sync::Notify;
 use super::super::hooks::{AgentHooks, AgentSetup, HookError, ToolSet};
 use super::super::{Harness, HarnessDeps, SubmissionDraft};
 use super::support::*;
-use crate::codemode::Worker;
 use crate::durable::tests::support::Log;
-use crate::tools::codemode::CodemodeTool;
+use komo_tools::codemode::Worker;
+use komo_tools::tools::codemode::CodemodeTool;
 
 /// 有副作用的 MCP 工具（脚本里放行，中断后不重做）。
 fn mcp_writer(name: &'static str, log: &Log) -> TestTool {
@@ -916,7 +916,7 @@ async fn a_bash_view_is_bounded_in_the_nested_receipt_while_the_complete_stdout_
 
 #[tokio::test]
 async fn an_unsafe_nested_bash_probes_a_surviving_child_before_becoming_uncertain() {
-    use crate::recovery::Liveness;
+    use komo_tools::recovery::Liveness;
     let world = World::new();
     let bash = Arc::new(
         TestTool::writer("bash", &world.log)
@@ -955,8 +955,8 @@ async fn an_unsafe_nested_bash_probes_a_surviving_child_before_becoming_uncertai
 
 #[tokio::test]
 async fn cancelling_a_nested_bash_in_probe_records_its_surviving_pid_and_clears_slots() {
-    use crate::recovery::Liveness;
     use komo_kernel::traits::ToolOutputStore;
+    use komo_tools::recovery::Liveness;
     let world = World::new();
     let bash = Arc::new(
         TestTool::writer("bash", &world.log)
@@ -994,8 +994,8 @@ async fn cancelling_a_nested_bash_in_probe_records_its_surviving_pid_and_clears_
 #[tokio::test]
 async fn a_complete_truncated_bash_output_is_reused_from_disk_before_probing_the_child() {
     use super::super::nested::{NestedDoc, NestedResult, nested_address};
-    use crate::recovery::Liveness;
     use komo_kernel::types::refs::{ToolResultBody, ToolResultStatus};
+    use komo_tools::recovery::Liveness;
     let dir = tempfile::tempdir().unwrap();
     let world = World::turso(dir.path());
     let gate = Arc::new(Notify::new());
@@ -1111,7 +1111,7 @@ async fn a_nested_host_timeout_stays_uncertain_on_disk_and_stops_following_calls
 
 #[tokio::test]
 async fn a_safe_nested_call_reruns_after_probe_and_clears_the_old_attempts_progress() {
-    use crate::recovery::Liveness;
+    use komo_tools::recovery::Liveness;
     let world = World::new();
     let gate = Arc::new(Notify::new());
     let read = Arc::new(

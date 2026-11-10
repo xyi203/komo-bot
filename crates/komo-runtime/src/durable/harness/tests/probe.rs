@@ -12,7 +12,7 @@ use komo_kernel::types::refs::{AttemptRef, InterruptedOutput, ToolResultBody, To
 use serde_json::{Value, json};
 
 use super::support::*;
-use crate::recovery::Liveness;
+use komo_tools::recovery::Liveness;
 
 const PID: u32 = 4242;
 

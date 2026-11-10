@@ -29,8 +29,8 @@ use serde::{Deserialize, Serialize};
 use super::compaction::{CompactionSetup, SummaryPrompt};
 use super::orchestration::{NoOrchestration, OrchestrationHooks};
 use crate::durable::EntryDraft;
-use crate::recovery::{IdentityProbe, ProcessProbe};
 use komo_llm::ImageResolver;
+use komo_tools::recovery::{IdentityProbe, ProcessProbe};
 
 /// 钩子的失败。
 #[derive(Debug, Clone, thiserror::Error)]
@@ -218,7 +218,7 @@ impl ToolSet {
         match self.get(name) {
             None => true,
             Some(tool) => {
-                name != crate::tools::codemode::CODEMODE_TOOL && tool.replay() == Replay::Safe
+                name != komo_tools::tools::codemode::CODEMODE_TOOL && tool.replay() == Replay::Safe
             }
         }
     }
@@ -339,7 +339,7 @@ pub struct HarnessDeps {
     pub probe: Arc<dyn ProcessProbe>,
     /// codemode 的 worker 怎么起（`docs/codemode.md` §4）；`None` = 这台 Gateway 没有接 codemode，
     /// `codemode` 工具的任务以 Failed 收场。热换：Gateway 重装配时 [`Self::set_codemode`]。
-    codemode: arc_swap::ArcSwapOption<crate::codemode::Worker>,
+    codemode: arc_swap::ArcSwapOption<komo_tools::codemode::Worker>,
     /// `task` / `monitor` 要 agent / gateway 侧才有的东西（`orchestration`）；默认什么都没装配。
     pub orchestration: Arc<dyn OrchestrationHooks>,
     settings: arc_swap::ArcSwap<HarnessSettings>,
@@ -362,7 +362,7 @@ impl HarnessDeps {
         self
     }
 
-    pub fn with_codemode(self, worker: Option<crate::codemode::Worker>) -> Self {
+    pub fn with_codemode(self, worker: Option<komo_tools::codemode::Worker>) -> Self {
         self.set_codemode(worker);
         self
     }
@@ -378,11 +378,11 @@ impl HarnessDeps {
     }
 
     /// codemode 的 worker：每次脚本现读。
-    pub fn codemode(&self) -> Option<crate::codemode::Worker> {
+    pub fn codemode(&self) -> Option<komo_tools::codemode::Worker> {
         self.codemode.load_full().map(|worker| (*worker).clone())
     }
 
-    pub fn set_codemode(&self, worker: Option<crate::codemode::Worker>) {
+    pub fn set_codemode(&self, worker: Option<komo_tools::codemode::Worker>) {
         self.codemode.store(worker.map(Arc::new));
     }
 

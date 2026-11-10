@@ -15,10 +15,10 @@ use komo_kernel::types::ids::{ExecutorId, RunId};
 use komo_kernel::types::turn::{LlmError, TurnRequest};
 use komo_llm::EffortCapabilities;
 use komo_runtime::durable::harness::RetryPolicy;
-use komo_runtime::executor::ToolExecutor;
 use komo_runtime::matter::MatterManager;
 use komo_runtime::memory::{MemoryManager, MemoryParts};
 use komo_store::{Db, TursoCronRepo, TursoDeliveryRepo, TursoMatterRepo, TursoMemoryRepo};
+use komo_tools::executor::ToolExecutor;
 use time::OffsetDateTime;
 
 use crate::channels::ChannelFactory;
@@ -146,7 +146,7 @@ pub struct GatewayState {
     pub reload_notice: Mutex<Option<String>>,
     /// MCP 服务器的连接（`docs/mcp.md` §2.2）：受理 Run 前问它一次，登录后才连上的服务器的
     /// 工具从这里挂进执行器。
-    pub mcp: Arc<komo_runtime::mcp::McpHub>,
+    pub mcp: Arc<komo_tools::mcp::McpHub>,
     /// 工具目录本身：MCP 工具的挂上 / 撤下与工具名清单都经它。
     pub tool_executor: Arc<ToolExecutor>,
     /// §5.6 那份**活的** skill 注册表。与 [`GatewayState::segments`] 共用一个 `Arc`。
@@ -207,9 +207,9 @@ pub struct Assembly {
     pub shared_home: Option<PathBuf>,
     pub tools: Vec<Arc<dyn komo_kernel::traits::Tool>>,
     /// codemode 的 worker（`docs/codemode.md`）；`None` = 没装配，`codemode` 也不在 `tools` 里。
-    pub codemode: Option<komo_runtime::codemode::Worker>,
+    pub codemode: Option<komo_tools::codemode::Worker>,
     /// MCP 连接，后台连着；`tools` 里没有 MCP 工具，受理 Run 时才挂进来。
-    pub mcp: Arc<komo_runtime::mcp::McpHub>,
+    pub mcp: Arc<komo_tools::mcp::McpHub>,
     /// 渠道工厂：热重载时按平台重造（§3 第 3 步）。
     pub channels: Vec<Arc<dyn ChannelFactory>>,
 }

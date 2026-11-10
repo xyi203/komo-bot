@@ -35,8 +35,8 @@ use tokio::sync::Notify;
 
 use crate::durable::tests::support::{Log, TokioClock};
 use crate::durable::{Engine, EngineOptions, Registry};
-use crate::recovery::{ChildProcess, IdentityProbe, Liveness, ProcessProbe};
 use komo_llm::{ModelRequest, ModelStream};
+use komo_tools::recovery::{ChildProcess, IdentityProbe, Liveness, ProcessProbe};
 
 use super::super::hooks::{
     AgentHooks, AgentSetup, HarnessDeps, HookError, PromptSection, RunBudget, ToolEnv, ToolSet,
@@ -734,7 +734,7 @@ impl Tool for TestTool {
 // ------------------------------------------------------------ 子进程探测替身
 
 /// `ProcessProbe` 的替身：答案由测试定，并记下每次被问到的子进程。`delegate` 时交给真正的
-/// [`IdentityProbe`](crate::recovery::IdentityProbe)。
+/// [`IdentityProbe`](komo_tools::recovery::IdentityProbe)。
 #[derive(Debug)]
 pub struct FakeProbe {
     answer: Mutex<Option<Liveness>>,

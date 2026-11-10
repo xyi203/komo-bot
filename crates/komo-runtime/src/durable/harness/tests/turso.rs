@@ -11,7 +11,7 @@ use serde_json::json;
 
 use super::super::{HarnessSettings, SlotStatus};
 use super::support::*;
-use crate::recovery::Liveness;
+use komo_tools::recovery::Liveness;
 
 fn input_state(record: &komo_kernel::durable::SubmissionRecord) -> InputState {
     match &record.kind {

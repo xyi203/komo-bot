@@ -191,7 +191,7 @@ async fn shell_result(
     state: &Arc<GatewayState>,
     session: &SessionId,
     submission: komo_kernel::durable::SubmissionId,
-) -> Option<komo_runtime::tools::bash::BashResult> {
+) -> Option<komo_tools::tools::bash::BashResult> {
     let core = state.core().ok()?;
     let record = core.storage.submission(submission).await.ok()??;
     let komo_kernel::durable::SubmissionKind::Write {

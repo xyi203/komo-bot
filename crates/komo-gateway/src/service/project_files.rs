@@ -87,7 +87,7 @@ mod tests {
     #[test]
     fn walks_up_to_the_root_outermost_first() {
         let dir = tempfile::tempdir().unwrap();
-        let root = komo_runtime::tools::paths::real_root(dir.path());
+        let root = komo_tools::tools::paths::real_root(dir.path());
         let inner = root.join("repo").join("crate");
         std::fs::create_dir_all(&inner).unwrap();
         std::fs::write(root.join("AGENTS.md"), "外层").unwrap();
@@ -108,7 +108,7 @@ mod tests {
     #[test]
     fn one_file_per_directory_in_candidate_order() {
         let dir = tempfile::tempdir().unwrap();
-        let root = komo_runtime::tools::paths::real_root(dir.path());
+        let root = komo_tools::tools::paths::real_root(dir.path());
         std::fs::write(root.join("AGENTS.md"), "规范").unwrap();
         std::fs::write(root.join("CLAUDE.md"), "另一份").unwrap();
         std::fs::write(root.join("AGENTS.override.md"), "本地覆盖").unwrap();
@@ -123,7 +123,7 @@ mod tests {
     #[test]
     fn skips_non_files_and_strips_the_bom() {
         let dir = tempfile::tempdir().unwrap();
-        let root = komo_runtime::tools::paths::real_root(dir.path());
+        let root = komo_tools::tools::paths::real_root(dir.path());
         // 叫 `AGENTS.md` 的目录不算：换下一个候选。
         std::fs::create_dir(root.join("AGENTS.md")).unwrap();
         std::fs::write(root.join("CLAUDE.md"), "\u{feff}正文").unwrap();

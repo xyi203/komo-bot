@@ -154,7 +154,7 @@ pub trait OrchestrationHooks: Send + Sync {
     /// 接手 `bash` 转后台的活子进程的一方（`docs/monitor.md` §8；`BashTool` 的 `DetachSlot` 里装它）。
     /// 接手之后进程和监听同一套：gateway 用 [`Harness::register_monitor`](super::Harness::register_monitor)
     /// 登记、结束时 `finish_monitor`。默认没有——`bash` 不转后台。
-    fn detacher(&self) -> Option<Arc<dyn crate::tools::detach::Detacher>> {
+    fn detacher(&self) -> Option<Arc<dyn komo_tools::tools::detach::Detacher>> {
         None
     }
 

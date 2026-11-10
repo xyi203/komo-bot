@@ -258,7 +258,7 @@ async fn setup_resolves_task_doc_model_names_against_current_config() {
 #[tokio::test]
 async fn setup_falls_back_to_the_default_agent_and_honours_the_agent_doc() {
     let dir = tempfile::tempdir().unwrap();
-    let workdir = komo_runtime::tools::paths::real_root(dir.path());
+    let workdir = komo_tools::tools::paths::real_root(dir.path());
     let world = World::new(
         &config_with("instructions = \"默认人格\"", NO_MEMORY),
         finisher(),
@@ -477,7 +477,7 @@ const KEYWORD_MEMORY: &str = "[memory]\nenabled = true\n\n[memory.retrieval]\nmo
 #[tokio::test]
 async fn project_section_is_pinned_until_the_next_head() {
     let dir = tempfile::tempdir().unwrap();
-    let workdir = komo_runtime::tools::paths::real_root(dir.path());
+    let workdir = komo_tools::tools::paths::real_root(dir.path());
     std::fs::write(workdir.join("AGENTS.md"), "规范一").unwrap();
     let world = World::new(&config_with("", KEYWORD_MEMORY), finisher()).await;
     world
@@ -1299,7 +1299,7 @@ async fn skills_section_is_pinned_until_the_next_head() {
 #[tokio::test]
 async fn the_system_sections_follow_the_prompt_order() {
     let dir = tempfile::tempdir().unwrap();
-    let workdir = komo_runtime::tools::paths::real_root(dir.path());
+    let workdir = komo_tools::tools::paths::real_root(dir.path());
     std::fs::write(workdir.join("AGENTS.md"), "项目规范\n").unwrap();
     let skills = dir.path().join("skills/demo");
     std::fs::create_dir_all(&skills).unwrap();
@@ -1609,7 +1609,7 @@ async fn the_contract_block_is_komo_agents_and_monitor_fails_cleanly_when_unasse
 #[tokio::test]
 async fn a_durable_turn_runs_on_the_hooks_prompt_tools_and_model() {
     let dir = tempfile::tempdir().unwrap();
-    let workdir = komo_runtime::tools::paths::real_root(dir.path());
+    let workdir = komo_tools::tools::paths::real_root(dir.path());
     std::fs::write(workdir.join("notes.txt"), "钩子端到端").unwrap();
     std::fs::write(workdir.join("AGENTS.md"), "先读再答").unwrap();
     let llm = FakeLlm::new(vec![vec![

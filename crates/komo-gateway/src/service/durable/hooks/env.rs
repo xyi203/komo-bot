@@ -16,8 +16,8 @@ use komo_kernel::types::surface::AgentSurface;
 use komo_kernel::types::tool::WorkspaceRoot;
 use komo_llm::{ImageLoadError, ImageRef, ImageResolver};
 use komo_runtime::durable::harness::ToolEnv;
-use komo_runtime::tools::paths;
 use komo_store::SessionPaths;
+use komo_tools::tools::paths;
 
 use super::setup::Resolved;
 use crate::service::state::GatewayState;

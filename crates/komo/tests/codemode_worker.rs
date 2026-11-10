@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-use komo_runtime::codemode::{ScriptCatalog, ScriptOutcome, ScriptTool, Worker};
+use komo_tools::codemode::{ScriptCatalog, ScriptOutcome, ScriptTool, Worker};
 use serde_json::json;
 
 fn exe() -> PathBuf {
@@ -159,7 +159,7 @@ async fn a_worker_from_another_build_is_refused_before_the_script_runs() {
     // 刚写完就 exec：同进程别的测试线程此刻 fork，会带着还开着的写句柄让 execve 得到
     // ETXTBSY（worker 没起来，就看不到握手）。先试跑一次、遇到就退避重试；成功之后写句柄
     // 已全部关掉，下面 Worker 的 spawn 不会再撞上。
-    komo_runtime::spawn::retry_text_file_busy(|| {
+    komo_tools::spawn::retry_text_file_busy(|| {
         std::process::Command::new(&fake)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())

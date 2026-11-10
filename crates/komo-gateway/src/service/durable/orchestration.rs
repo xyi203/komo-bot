@@ -15,7 +15,7 @@ use komo_kernel::durable::ConversationId;
 use komo_kernel::types::delegate::DelegateContract;
 use komo_kernel::types::model::Effort;
 use komo_runtime::durable::harness::{MonitorError, MonitorLaunch, OrchestrationHooks};
-use komo_runtime::tools::detach::Detacher;
+use komo_tools::tools::detach::Detacher;
 
 use super::assemble::StateSlot;
 use super::hooks::{self, state_of};

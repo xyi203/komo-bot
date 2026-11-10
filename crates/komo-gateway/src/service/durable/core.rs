@@ -13,10 +13,10 @@ use komo_kernel::durable::{ConversationId, Storage, SubmissionId, SubmissionReco
 use komo_kernel::traits::Clock;
 use komo_kernel::types::tool::InterjectSignal;
 use komo_llm::ModelStream;
-use komo_runtime::codemode::Worker;
 use komo_runtime::durable::harness::{AgentHooks, Harness, HarnessDeps, OrchestrationHooks};
 use komo_runtime::durable::{DurableError, Engine, EngineOptions, Registry};
 use komo_store::durable::TursoStorage;
+use komo_tools::codemode::Worker;
 
 pub struct DurableCore {
     pub engine: Arc<Engine>,

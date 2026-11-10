@@ -70,7 +70,7 @@ impl ToolExecutor {
     /// `start` 记下的指纹：脚本、引擎与 worker 协议版本、能力表、cwd 任一变了，恢复就是分歧。
     /// 升级前（CPython driver 时代）在途的调用指纹里是 `driver` / `env`，对不上，按分歧返回
     /// uncertain。
-    pub(crate) fn codemode_fingerprint(
+    pub fn codemode_fingerprint(
         code: &str,
         names: &[String],
         ctx: &ToolContext,

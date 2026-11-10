@@ -7,6 +7,7 @@ members = [
     "crates/komo-store",
     "crates/komo-llm",
     "crates/komo-config",
+    "crates/komo-tools",
     "crates/komo-runtime",
     "crates/komo-gateway",
     "crates/komo-client",
@@ -23,7 +24,7 @@ license = "MIT"
 # `workspace = true`（必要时按 §13.4 的 crate 行补自己需要的可加特性）。
 # 不引入 image / strum / derive_more / bon。
 [workspace.dependencies]
-# 内部 crate，依赖只向下：kernel ← store ← runtime ← gateway；kernel ← llm ← config ← runtime；
+# 内部 crate，依赖只向下：kernel ← store ← runtime ← gateway；kernel ← llm ← config ← tools ← runtime；
 # kernel ← agent ← gateway；kernel ← client。
 komo-channel = { path = "crates/komo-channel", default-features = false }
 komo-kernel = { path = "crates/komo-kernel" }
@@ -31,6 +32,7 @@ komo-agent = { path = "crates/komo-agent" }
 komo-store = { path = "crates/komo-store" }
 komo-llm = { path = "crates/komo-llm" }
 komo-config = { path = "crates/komo-config" }
+komo-tools = { path = "crates/komo-tools" }
 komo-runtime = { path = "crates/komo-runtime" }
 komo-gateway = { path = "crates/komo-gateway", default-features = false }
 komo-client = { path = "crates/komo-client" }

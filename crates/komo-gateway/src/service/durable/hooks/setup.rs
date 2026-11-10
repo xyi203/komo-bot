@@ -25,7 +25,7 @@ use komo_kernel::types::agent::AgentProfile;
 use komo_kernel::types::ids::SessionId;
 use komo_kernel::types::model::{Effort, ModelConfig};
 use komo_runtime::durable::harness::{HookError, RetryPolicy, RunBudget, TaskDoc, task_doc};
-use komo_runtime::tools::paths;
+use komo_tools::tools::paths;
 
 use crate::service::durable::agent_doc::{self, AgentDoc};
 use crate::service::state::GatewayState;

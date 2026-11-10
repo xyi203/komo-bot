@@ -1,0 +1,57 @@
+[package]
+name = "komo-tools"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# §13.4：tools/{read,write,edit,rg,bash,…}、工具目录（`ToolExecutor`）、codemode（Monty worker，
+# `komo __codemode-worker` 的函数体也在这里）、MCP 客户端与登录、子进程登记。不碰 store，
+# 冷编时与 turso 并行；工具任务由 runtime 的 harness 驱动。
+[features]
+# 测试专用的注入口（codemode 的假 worker 等）：只给下游的测试脚手架开，生产构建里没有。
+test-support = ["komo-kernel/test-support"]
+
+[dependencies]
+komo-kernel = { workspace = true }
+# `Secrets`（MCP 的凭证）。
+komo-llm = { workspace = true }
+# `task` 工具按当前配置解析模型（`ConfigHolder`）。
+komo-config = { workspace = true }
+# MCP 的 HTTP 传输与 OAuth 登录（mcp_auth）。
+reqwest = { workspace = true }
+# "net"：`komo auth mcp login` 的本机回调（mcp_auth）。
+tokio = { workspace = true, features = ["rt-multi-thread", "fs", "process", "io-util", "net", "sync"] }
+# §13.4：`rg` 工具（内嵌 ripgrep 的搜索库，不起子进程）。
+grep = { workspace = true }
+ignore = { workspace = true }
+# MCP 客户端（docs/mcp.md）。
+rmcp = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+time = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }
+jiff = { workspace = true }
+futures-util = { workspace = true }
+base64 = { workspace = true }
+tempfile = { workspace = true }
+# codemode 的脚本引擎（docs/codemode.md §2）；num-bigint 是 Monty 的大整数与 JSON 之间的桥。
+monty = { workspace = true }
+monty-types = { workspace = true }
+monty-fs = { workspace = true }
+num-bigint = { workspace = true }
+
+# Gateway 起来时抬"能开的文件数"软上限（limits.rs，launchd 默认只有 256）；codemode worker 的
+# RSS 看门狗与 SIGKILL；子进程登记的存活探测。
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
+[dev-dependencies]
+komo-kernel = { workspace = true, features = ["test-support"] }
+# MCP 的测试要 `telemetry::capture` 抓 span。
+komo-llm = { workspace = true, features = ["test-support"] }
+# 配置夹具（`komo_config::testing`）。
+komo-config = { workspace = true, features = ["test-support"] }
+tokio = { workspace = true, features = ["test-util"] }

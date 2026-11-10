@@ -26,8 +26,8 @@ use super::super::orchestration::{
 };
 use super::super::{InboxItem, SubmissionDraft};
 use super::support::*;
-use crate::tools::{MonitorStopTool, MonitorTool, TaskTool};
 use komo_config::testing::Fixture;
+use komo_tools::tools::{MonitorStopTool, MonitorTool, TaskTool};
 
 // ------------------------------------------------------------ 脚手架
 

@@ -21,7 +21,7 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use komo_runtime::recovery::{ChildProcess, Liveness, ProcessProbe, SysProcessProbe};
+use komo_tools::recovery::{ChildProcess, Liveness, ProcessProbe, SysProcessProbe};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 

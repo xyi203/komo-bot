@@ -589,7 +589,7 @@ async fn main() {
 /// 跑一条命令。`Ok(None)` = 这条命令自己管输出（TUI、前台 Gateway）。
 async fn dispatch(cli: Cli, home: &Path) -> Result<Option<String>, String> {
     match cli.command {
-        Some(Command::CodemodeWorker) => std::process::exit(komo_runtime::codemode::worker::run()),
+        Some(Command::CodemodeWorker) => std::process::exit(komo_tools::codemode::worker::run()),
         // `komo`：确保本机 Gateway 就绪，进入 TUI 聊天（§3）。**会话不在这里建**——
         // TUI 里发出第一条消息时才铸：看一眼、一个字没发就退出，不该在账本和磁盘上
         // 留下一个空壳会话。

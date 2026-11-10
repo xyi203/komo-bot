@@ -81,7 +81,6 @@ use super::live::{self, SlotStatus};
 use super::nested::{self, NestedMeta, NestedResult};
 use super::orchestration;
 use super::outcome::{aborted, completed, failed, running};
-use crate::cancel::race;
 use crate::durable::error::TaskError;
 use crate::durable::harness::landing::{
     INTERRUPTED_TAIL_BYTES, REAP_GRACE, interrupted_message, result_body, store_images,
@@ -90,8 +89,9 @@ use crate::durable::harness::landing::{
 use crate::durable::kind::TaskKind;
 use crate::durable::runtime::TaskRuntime;
 use crate::durable::tx::EntryDraft;
-use crate::recovery::{ChildProcess, Liveness};
-use crate::tools::codemode::NOT_IN_SCRIPTS;
+use komo_tools::cancel::race;
+use komo_tools::recovery::{ChildProcess, Liveness};
+use komo_tools::tools::codemode::NOT_IN_SCRIPTS;
 
 /// 输入：模型发起的调用，或 codemode 脚本里的嵌套调用。
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -750,7 +750,7 @@ impl ToolTask {
                     // 组合调用：改动 → 核对 → 命令，一条结果（`tools::fusion`）。
                     Some(_) => match set.get("bash") {
                         Some(shell) => {
-                            crate::tools::fusion::execute_fused(
+                            komo_tools::tools::fusion::execute_fused(
                                 &*tool,
                                 plan.clone(),
                                 &**shell,

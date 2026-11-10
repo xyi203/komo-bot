@@ -35,15 +35,15 @@ use super::hooks::ToolSet;
 use super::live::{self as progress, NestedToolSlot, ToolSlot};
 use super::nested::{NESTED_VERSION, NestedDoc, NestedResult, nested_address, nested_key};
 use super::tool::{Call, ToolTask};
-use crate::codemode::{Nondet, ScriptCatalog, ScriptTool, live};
 use crate::durable::error::DurableError;
 use crate::durable::harness::codemode_text::{
     ARGS_PREVIEW, NestedCall, failure_prefix, join_outputs, summary, truncate,
 };
 use crate::durable::runtime::TaskRuntime;
 use crate::durable::tx::{Ownership, TaskOptions};
-use crate::executor::ToolExecutor;
-use crate::tools::codemode::NOT_IN_SCRIPTS;
+use komo_tools::codemode::{Nondet, ScriptCatalog, ScriptTool, live};
+use komo_tools::executor::ToolExecutor;
+use komo_tools::tools::codemode::NOT_IN_SCRIPTS;
 
 /// 指纹 memo 的名字。
 const START_MEMO: &str = "codemode.start";

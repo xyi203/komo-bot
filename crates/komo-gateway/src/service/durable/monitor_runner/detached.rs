@@ -28,9 +28,9 @@ use komo_kernel::types::resource::{OutputFile, ResourceUri};
 use komo_kernel::types::tool::CancelToken;
 use komo_runtime::durable::harness::orchestration::monitor;
 use komo_runtime::durable::harness::{MonitorRecord, MonitorState};
-use komo_runtime::recovery::ChildProcess;
-use komo_runtime::tools::detach::{Detached, DetachedCall, Detacher};
-use komo_runtime::tools::process::{ChildOutcome, Driven, LiveChild, drive};
+use komo_tools::recovery::ChildProcess;
+use komo_tools::tools::detach::{Detached, DetachedCall, Detacher};
+use komo_tools::tools::process::{ChildOutcome, Driven, LiveChild, drive};
 
 use super::{
     Ctx, Ending, GatewayMonitorRunner, HEAD_LINES, Live, MAX_EVENT_LINES, STDERR_TAIL_LINES,

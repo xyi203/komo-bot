@@ -9,7 +9,7 @@
 use std::sync::{Arc, OnceLock, Weak};
 
 use komo_runtime::durable::harness::{AgentHooks, OrchestrationHooks};
-use komo_runtime::tools::detach::DetachSlot;
+use komo_tools::tools::detach::DetachSlot;
 
 use super::{hooks, monitor_runner, orchestration};
 use crate::service::state::GatewayState;

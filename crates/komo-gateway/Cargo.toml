@@ -12,6 +12,7 @@ komo-channel = { workspace = true }
 komo-runtime = { workspace = true }
 komo-llm = { workspace = true }
 komo-config = { workspace = true }
+komo-tools = { workspace = true }
 # 目标/领域 HTTP 接口按本机时区解释日期（§13.4）。
 jiff = { workspace = true }
 komo-agent = { workspace = true }
@@ -44,8 +45,8 @@ default = []
 # `service::test_support` 里的注入表，生产构建里那张表根本不存在。
 test-support = [
     "komo-kernel/test-support",
-    "komo-runtime/test-support",
     "komo-llm/test-support",
+    "komo-tools/test-support",
     "komo-store/test-support",
     "dep:tempfile",
     "dep:rustls",

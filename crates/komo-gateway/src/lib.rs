@@ -26,7 +26,7 @@ pub use komo_config as config;
 pub use komo_llm::codex_auth;
 /// `komo auth mcp login|status`（`docs/mcp.md` §2.1）：同上，OAuth 登录与凭证文件在
 /// `komo-runtime`。
-pub use komo_runtime::mcp_auth;
+pub use komo_tools::mcp_auth;
 
 pub use dispatcher::Dispatcher;
 pub use lock::{DiscoveryFile, GatewayDiscovery, InstanceLock};

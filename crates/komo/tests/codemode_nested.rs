@@ -28,13 +28,13 @@ use komo_kernel::types::surface::AgentSurface;
 use komo_kernel::types::tool::{ToolContext, ToolDefinition, ToolError, ToolOutput};
 use komo_kernel::types::turn::LlmError;
 use komo_llm::{ModelRequest, ModelStream};
-use komo_runtime::codemode::Worker;
 use komo_runtime::durable::harness::{
     AgentHooks, AgentSetup, Harness, HarnessDeps, HookError, PromptSection, RunBudget,
     SubmissionDraft, ToolEnv, ToolSet,
 };
 use komo_runtime::durable::{Engine, EngineOptions, Registry};
-use komo_runtime::tools::{CodemodeTool, ReadTool};
+use komo_tools::codemode::Worker;
+use komo_tools::tools::{CodemodeTool, ReadTool};
 use serde_json::{Value, json};
 use time::OffsetDateTime;
 
@@ -231,7 +231,7 @@ impl World {
             tools: vec![
                 Arc::new(CodemodeTool::new()),
                 Arc::new(ReadTool::new()),
-                Arc::new(komo_runtime::tools::BashTool::new()),
+                Arc::new(komo_tools::tools::BashTool::new()),
                 tick,
             ],
             env,

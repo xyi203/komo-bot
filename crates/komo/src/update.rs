@@ -504,7 +504,7 @@ fn set_executable(path: &Path) -> Result<(), String> {
 /// 刚写完就执行，同进程里别的线程此刻 fork 会带走还开着的写句柄，execve 得到
 /// `ETXTBSY`——所以试跑遇到它要退避重试，而不是把它当成"新二进制坏了"。
 fn probe(staged: &Path, tag: &str) -> Result<(), String> {
-    let output = komo_runtime::spawn::retry_text_file_busy(|| {
+    let output = komo_tools::spawn::retry_text_file_busy(|| {
         std::process::Command::new(staged).arg("--version").output()
     })
     .map_err(|error| format!("试跑 {} 失败：{error}", staged.display()))?;

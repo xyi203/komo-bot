@@ -77,7 +77,7 @@ async fn durable_mode_serves_shared_routes_and_leaves_session_routes_to_v2() {
 
 #[test]
 fn write_refuses_the_durable_databases() {
-    use komo_runtime::tools::protect::Protected;
+    use komo_tools::tools::protect::Protected;
     let dir = tempfile::tempdir().unwrap();
     // `Protected::denies` 接收真实路径；macOS 的 /var 指向 /private/var。
     let canonical_home = dir.path().canonicalize().unwrap();

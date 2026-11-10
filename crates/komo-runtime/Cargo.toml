@@ -5,25 +5,15 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
-# §13.4：日常改动落在这里；它从不重新展开 toasty 宏。
-[features]
-# 测试专用的注入口（`telemetry::capture` 等）：只给 gateway 的集成测试脚手架开，生产构建里没有。
-test-support = ["komo-kernel/test-support", "komo-llm/test-support"]
-
+# §13.4：Task 引擎与 harness（agent loop）、记忆的 durable 接缝、cron 调度。日常改动落在这里；
+# 它从不重新展开 toasty 宏。
 [dependencies]
 komo-kernel = { workspace = true }
 komo-store = { workspace = true }
 komo-llm = { workspace = true }
-komo-config = { workspace = true }
-reqwest = { workspace = true }
-# "net"：`komo auth mcp login` 的本机回调（mcp_auth）；gateway 早已把它带进图里。
-tokio = { workspace = true, features = ["rt-multi-thread", "fs", "process", "io-util", "net", "sync"] }
+komo-tools = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "fs", "sync"] }
 arc-swap = { workspace = true }
-# §13.4：`rg` 工具（内嵌 ripgrep 的搜索库，不起子进程）。
-grep = { workspace = true }
-ignore = { workspace = true }
-# MCP 客户端（docs/mcp.md）。
-rmcp = { workspace = true }
 
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -35,21 +25,6 @@ tracing = { workspace = true }
 jiff = { workspace = true }
 futures-util = { workspace = true }
 tokio-util = { workspace = true }
-# ChatGPT OAuth 凭证的 JWT payload 解码（§13.3）。
-base64 = { workspace = true }
-# ChatGPT OAuth 凭证文件的原子写（临时文件 + rename，§13.3）。
-tempfile = { workspace = true }
-
-# codemode 的脚本引擎（docs/codemode.md §2）；num-bigint 是 Monty 的大整数与 JSON 之间的桥。
-monty = { workspace = true }
-monty-types = { workspace = true }
-monty-fs = { workspace = true }
-num-bigint = { workspace = true }
-
-# Gateway 起来时抬"能开的文件数"软上限（limits.rs，launchd 默认只有 256）；codemode worker 的
-# RSS 看门狗与 SIGKILL。
-[target.'cfg(unix)'.dependencies]
-libc = { workspace = true }
 
 [dev-dependencies]
 komo-kernel = { workspace = true, features = ["test-support"] }
@@ -57,9 +32,12 @@ komo-kernel = { workspace = true, features = ["test-support"] }
 komo-llm = { workspace = true, features = ["test-support"] }
 # 配置夹具（`komo_config::testing`）。
 komo-config = { workspace = true, features = ["test-support"] }
+# codemode 的测试替身。
+komo-tools = { workspace = true, features = ["test-support"] }
 # 真机验收（`--ignored`）要自己发 HTTPS 请求，而 `reqwest` 是 rustls-no-provider：装
 # provider 是**进程**的事（§13.4，bin 的 `main` 里那一行），测试进程得自己装一次。
 rustls = { workspace = true }
+tempfile = { workspace = true }
 # 心跳的测试要拨表：`#[tokio::test(start_paused = true)]` 需要 `test-util`。它只在
 # dev 构建里开，生产的 tokio 特性集合不变（§13.4 的编译预算）。
 tokio = { workspace = true, features = ["test-util"] }

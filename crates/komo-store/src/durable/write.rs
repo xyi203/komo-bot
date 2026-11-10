@@ -193,6 +193,9 @@ pub(crate) struct Batch<'a> {
     ephemeral: HashSet<i64>,
 }
 
+/// 退役 document 留下的值（`documents.value` 非空且须是合法 JSON）。
+const RETIRED_VALUE: &str = "null";
+
 pub(crate) fn ordered(writes: &[Write]) -> Batch<'_> {
     let created: HashSet<i64> = writes
         .iter()
@@ -448,7 +451,9 @@ impl Write {
                 value,
             } => {
                 claim(conn, *id, "document", false).await?;
-                let retired = if batch.ephemeral.contains(id) {
+                // 同一批建了又退役：退役的值没有读者（见 `RetireDocument`），只占 id 与地址。
+                let ephemeral = batch.ephemeral.contains(id);
+                let retired = if ephemeral {
                     int(seq)
                 } else {
                     let live = rows(
@@ -475,7 +480,7 @@ impl Write {
                         int(*version),
                         int(seq),
                         retired,
-                        text(value),
+                        text(if ephemeral { RETIRED_VALUE } else { value }),
                     ],
                 )
                 .await
@@ -503,11 +508,14 @@ impl Write {
                     Some(Some(_)) => return Err(rejected(format!("document {id} 已退役"))),
                     Some(None) => {}
                 }
+                // 退役的同时丢掉值：所有 document 读都带 `retired_seq IS NULL`，komo 也不做按 asOf
+                // 的 fork（`docs/storage-durable.md` §13.2），退役后的值没有读者，留着只让库变大
+                // （大头是 codemode 的 `komo.nested`）。行留着：id 仍占号，地址冲突判断不变。
                 exec(
                     conn,
                     what,
-                    "UPDATE documents SET retired_seq = ?2 WHERE id = ?1",
-                    vec![int(*id), int(seq)],
+                    "UPDATE documents SET retired_seq = ?2, value = ?3 WHERE id = ?1",
+                    vec![int(*id), int(seq), text(RETIRED_VALUE)],
                 )
                 .await
             }

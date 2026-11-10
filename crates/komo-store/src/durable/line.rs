@@ -784,6 +784,15 @@ mod tests {
             count(&line, "SELECT retired_seq FROM documents WHERE id = 6").await,
             4
         );
+        // 退役时值一并丢掉（没有读者），行与 id 留着。
+        assert_eq!(
+            count(
+                &line,
+                "SELECT COUNT(*) FROM documents WHERE id = 6 AND value = 'null'"
+            )
+            .await,
+            1
+        );
         assert_eq!(
             count(
                 &line,
@@ -805,6 +814,33 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(error, LineError::Rejected(_)));
+    }
+
+    #[tokio::test]
+    async fn a_document_created_and_retired_in_one_batch_keeps_no_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let line = Line::open(dir.path()).await.unwrap();
+        line.commit(
+            CommitKind::Structural,
+            vec![
+                doc(7, "{\"big\":\"body\"}"),
+                Write::RetireDocument { id: 7 },
+            ],
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            count(
+                &line,
+                "SELECT COUNT(*) FROM documents WHERE id = 7 AND value = 'null' AND retired_seq IS NOT NULL"
+            )
+            .await,
+            1
+        );
+        // 地址上没有活的 incarnation，可以再建。
+        line.commit(CommitKind::Structural, vec![doc(8, "{}")])
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

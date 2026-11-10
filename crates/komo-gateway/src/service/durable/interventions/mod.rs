@@ -13,6 +13,13 @@
 //! | `verdicts` | 只有 `abandon`（决定 13；`resolve` 在新存储里没有意义——没有"等前提处理好"的 Run） |
 //! | `run` / `call` | 尽力而为：工具任务按它的 assistant entry 在投影里找所属 run；找不到就是 `None` |
 //!
+//! 另一类是**崩溃循环保护停住的活任务**（`BlockedReason::RestartLimit`，`docs/storage-durable-perf.md` §6）：
+//! 连续被进程崩溃打断到上限，调度器不再起它，它所在的会话一直忙着。同样以 `Blocked` 列出（句柄是任务
+//! ID），`question` 说它被打断了几次；结论两个：`resolve` = 放行（`Engine::retry_task`，计数归零、照常
+//! 调度，再崩照样会再停住），`abandon` = 放弃（先记进 ack，再 `fault_idle_task` 写 `faulted`，不跑任务
+//! 代码；ack 在前，所以随后出现的 faulted 记录不会再被列出或投递）。它是从调度器的派生状态
+//! （`Engine::inspect`）算的，不进 [`FaultIndex`]。
+//!
 //! # 清单是派生视图
 //!
 //! 清单从 `durable.db` 的 faulted 任务算出来，没有另一张表：[`FaultIndex`] 开库后第一次用时全扫一遍
@@ -35,6 +42,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use komo_kernel::durable::storage::TaskQuery;
+use komo_kernel::durable::task::BlockedReason;
 use komo_kernel::durable::{
     ConversationId, Cursor, DocumentAddress, DocumentScope, EntryId, ScanOrder, SessionKind,
     SessionLifecycle, SessionRecord, Storage, StorageWrite, TaskId, TaskOutcome, TaskRecord,
@@ -47,6 +55,7 @@ use komo_kernel::protocol::http::{
 use komo_kernel::traits::{GatewayError, Shutdown};
 use komo_kernel::types::chat::{ChannelPeer, DeliveryTarget, Outbound};
 use komo_kernel::types::ids::{RunId, SessionId, ToolCallId};
+use komo_runtime::durable::TaskInspectionState;
 use komo_runtime::durable::harness::{COMPACTION_KIND, GENERATION_KIND, TOOL_KIND};
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
@@ -215,12 +224,22 @@ impl FaultIndex {
 
 // ------------------------------------------------------------------- 清单
 
-/// 一个未确认的 faulted 任务，连同它所在的 Session。
+/// 一个未确认的 faulted 任务（或崩溃循环保护停住的活任务，`stopped`），连同它所在的 Session。
 #[derive(Debug, Clone)]
 pub struct Faulted {
     pub task: TaskRecord,
     pub session: SessionRecord,
     pub message: String,
+    /// 不是 faulted 结局，而是连续被崩溃打断、停住的活任务：能放行（`resolve`）也能放弃。
+    pub stopped: bool,
+}
+
+/// 停住的任务给人看的原因。
+fn stopped_message(task: &TaskRecord) -> String {
+    format!(
+        "连续 {} 次在执行中被 Gateway 崩溃打断，已停住不再自动恢复（崩溃循环保护）；`resolve` 清零重试，`abandon` 放弃",
+        task.restarts
+    )
 }
 
 impl Faulted {
@@ -299,9 +318,80 @@ impl DurableCore {
                 task,
                 session,
                 message,
+                stopped: false,
             });
         }
         Ok(out)
+    }
+
+    /// 崩溃循环保护停住的活任务（调度器的派生状态，按任务 ID 升序）。`only` 与会话生命周期的过滤同
+    /// [`Self::faulted`]。
+    pub async fn stopped(&self, only: Option<&str>) -> Result<Vec<Faulted>, SessionError> {
+        let mut tasks: Vec<TaskRecord> = self
+            .engine
+            .inspect()
+            .into_iter()
+            .filter(|inspection| {
+                inspection.state
+                    == TaskInspectionState::Blocked {
+                        reason: BlockedReason::RestartLimit,
+                    }
+            })
+            .map(|inspection| inspection.record)
+            .collect();
+        tasks.sort_by_key(|task| task.id);
+        let mut out = Vec::new();
+        for task in tasks {
+            let Some(session) = self.session_of_conversation(task.conversation).await? else {
+                continue;
+            };
+            if only.is_some_and(|only| only != session.id)
+                || !matches!(
+                    session.lifecycle,
+                    SessionLifecycle::Active | SessionLifecycle::Closing
+                )
+            {
+                continue;
+            }
+            out.push(Faulted {
+                message: stopped_message(&task),
+                task,
+                session,
+                stopped: true,
+            });
+        }
+        Ok(out)
+    }
+
+    /// 句柄 → 停住的活任务。
+    async fn find_stopped(&self, handle: &str) -> Result<Option<Faulted>, SessionError> {
+        let Ok(id) = handle.trim().parse::<u64>() else {
+            return Ok(None);
+        };
+        let Some(task) = self
+            .engine
+            .inspect()
+            .into_iter()
+            .find(|inspection| {
+                inspection.record.id.get() == id
+                    && inspection.state
+                        == TaskInspectionState::Blocked {
+                            reason: BlockedReason::RestartLimit,
+                        }
+            })
+            .map(|inspection| inspection.record)
+        else {
+            return Ok(None);
+        };
+        let Some(session) = self.session_of_conversation(task.conversation).await? else {
+            return Ok(None);
+        };
+        Ok(Some(Faulted {
+            message: stopped_message(&task),
+            task,
+            session,
+            stopped: true,
+        }))
     }
 
     /// conversation 属于哪个 Session（行读得出才算）。
@@ -333,6 +423,9 @@ impl DurableCore {
         if query.kind != Some(InterventionKind::Confirm) {
             for faulted in self.faulted(only).await? {
                 all.push(self.summary_of(&faulted, &mut runs).await);
+            }
+            for stopped in self.stopped(only).await? {
+                all.push(self.summary_of(&stopped, &mut runs).await);
             }
         }
         if query.kind != Some(InterventionKind::Blocked) {
@@ -371,6 +464,13 @@ impl DurableCore {
         if let Some(found) = self.find_confirming(handle).await? {
             return Ok(Some(self.confirm_detail(&found).await));
         }
+        if let Some(stopped) = self.find_stopped(handle).await? {
+            let summary = self.summary_of(&stopped, &mut RunLookup::default()).await;
+            return Ok(Some(InterventionDetail::Blocked {
+                reason: stopped.message.clone(),
+                summary,
+            }));
+        }
         let Some(faulted) = self.find_faulted(handle).await? else {
             return Ok(None);
         };
@@ -408,6 +508,7 @@ impl DurableCore {
             task,
             session,
             message,
+            stopped: false,
         }))
     }
 
@@ -429,9 +530,88 @@ impl DurableCore {
             run,
             call,
             question: faulted.message.clone(),
-            verdicts: vec![InterventionVerdict::Abandon],
-            created_at: time_of(task.ended_at.unwrap_or(0)),
+            verdicts: if faulted.stopped {
+                vec![InterventionVerdict::Resolve, InterventionVerdict::Abandon]
+            } else {
+                vec![InterventionVerdict::Abandon]
+            },
+            // 停住的任务没有结束时刻；用第一次起跑的时刻（稳定，提醒的幂等键靠它）。
+            created_at: time_of(if faulted.stopped {
+                task.started_at.unwrap_or(0)
+            } else {
+                task.ended_at.unwrap_or(0)
+            }),
         }
+    }
+
+    /// 答复一条停住的任务：`resolve` 放行，`abandon` 先记 ack 再写 `faulted`（见模块文档）。
+    async fn answer_stopped(
+        &self,
+        handle: &str,
+        stopped: &Faulted,
+        verdict: InterventionVerdict,
+    ) -> Result<InterventionAnswerResponse, GatewayError> {
+        let internal =
+            |error: komo_runtime::durable::DurableError| GatewayError::Internal(error.to_string());
+        let id = stopped.task.id;
+        let note = match verdict {
+            InterventionVerdict::Resolve => {
+                self.engine.retry_task(id).await.map_err(internal)?;
+                format!(
+                    "{handle}（{}）已放行：崩溃计数清零，重新调度；再连续崩溃到上限还会停住。",
+                    stopped.what()
+                )
+            }
+            InterventionVerdict::Abandon => {
+                let session = stopped.session.id.clone();
+                let raw = id.get();
+                self.engine
+                    .commit(move |tx| {
+                        Box::pin(async move {
+                            let address = ack_address(&session);
+                            let mut set = match tx.document(&address).await? {
+                                Some((_, value)) => decode_ack(&value),
+                                None => BTreeSet::new(),
+                            };
+                            set.insert(raw);
+                            let ids: Vec<u64> = set.into_iter().collect();
+                            tx.put_document(address, ACK_VERSION, json!({ "abandoned": ids }))
+                                .await
+                        })
+                    })
+                    .await
+                    .map_err(internal)?;
+                self.engine
+                    .fault_idle_task(
+                        id,
+                        format!(
+                            "操作者放弃：连续 {} 次被崩溃打断后停住",
+                            stopped.task.restarts
+                        ),
+                    )
+                    .await
+                    .map_err(internal)?;
+                format!(
+                    "{handle}（{}）已放弃：不再跑它的代码，按出错收尾。",
+                    stopped.what()
+                )
+            }
+            other => {
+                return Err(GatewayError::InvalidRequest(format!(
+                    "这条是 blocked（{}），答不了 `{}`；它此刻能答的是：`resolve`、`abandon`",
+                    stopped.message,
+                    other.as_str()
+                )));
+            }
+        };
+        Ok(InterventionAnswerResponse {
+            handle: handle.to_owned(),
+            kind: InterventionKind::Blocked,
+            verdict,
+            run_state: None,
+            note,
+            already_answered: false,
+        })
     }
 
     /// 答复。待确认的调用答 `approve` / `reject`（`confirms`，`by` 记谁答的：渠道 peer 或 `cli`）；
@@ -447,6 +627,9 @@ impl DurableCore {
         let gateway = |error: SessionError| GatewayError::Internal(error.to_string());
         if let Some(found) = self.find_confirming(handle).await.map_err(gateway)? {
             return self.answer_confirm(&found, verdict, by).await;
+        }
+        if let Some(stopped) = self.find_stopped(handle).await.map_err(gateway)? {
+            return self.answer_stopped(handle, &stopped, verdict).await;
         }
         let Some(faulted) = self.find_faulted(handle).await.map_err(gateway)? else {
             return Err(GatewayError::NotFound {
@@ -579,6 +762,15 @@ pub fn spawn_attention(state: &Arc<GatewayState>, shutdown: &Shutdown) {
                 }
                 Err(error) => tracing::warn!(%error, "读不出 faulted 任务，启动时的提醒补投没做成"),
             }
+            // 崩溃循环保护只在开库时停住任务，所以启动时投一次就是"报告一次"（键按任务与起跑时刻，幂等）。
+            match core.stopped(None).await {
+                Ok(all) => {
+                    for stopped in all {
+                        announce(&state, &stopped).await;
+                    }
+                }
+                Err(error) => tracing::warn!(%error, "读不出停住的任务，启动时的提醒没投"),
+            }
         }
         loop {
             let received = tokio::time::timeout(SHUTDOWN_POLL, receiver.recv()).await;
@@ -631,7 +823,11 @@ async fn announce(state: &Arc<GatewayState>, faulted: &Faulted) {
         _ => None,
     }
     .unwrap_or_default();
-    let reason = format!("{label}{}出错：{}", faulted.what(), faulted.message);
+    let reason = if faulted.stopped {
+        format!("{label}{}停住了：{}", faulted.what(), faulted.message)
+    } else {
+        format!("{label}{}出错：{}", faulted.what(), faulted.message)
+    };
     let message = Outbound::NeedsAttention {
         session: SessionId::from_raw(faulted.session.id.clone()),
         run: summary

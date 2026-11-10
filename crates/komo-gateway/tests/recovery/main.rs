@@ -20,6 +20,7 @@
 mod bash;
 mod blob;
 mod chat;
+mod crash_loop;
 mod e2e;
 mod task;
 

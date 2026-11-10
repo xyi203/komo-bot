@@ -148,9 +148,7 @@ pub struct GatewayState {
     /// MCP 服务器的连接（`docs/mcp.md` §2.2）：受理 Run 前问它一次，登录后才连上的服务器的
     /// 工具从这里挂进执行器。
     pub mcp: Arc<komo_runtime::mcp::McpHub>,
-    /// 执行器本身。留一份具名的 `Arc`，只为了 [`Self::wire_task_spawner`]——`dispatch` /
-    /// `follow` 的接缝（`TaskSpawner`）要一份 `Arc<GatewayState>`，而执行器是在这份状态
-    /// 存在**之前**造出来的，只能在这里回头接上（`docs/background-tasks.md`）。
+    /// 工具目录本身：MCP 工具的挂上 / 撤下与工具名清单都经它。
     pub tool_executor: Arc<ToolExecutor>,
     /// §5.6 那份**活的** skill 注册表。与 [`GatewayState::segments`] 共用一个 `Arc`。
     ///

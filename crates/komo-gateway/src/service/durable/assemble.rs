@@ -1,8 +1,8 @@
 //! 钩子与编排的装配，以及它们与 `GatewayState` 的断环。
 //!
 //! 钩子要读配置、技能、记忆——都在 `GatewayState` 上；而 `GatewayState` 要握着
-//! `DurableCore`，`DurableCore` 又握着钩子。环用 `OnceLock<Weak<GatewayState>>` 断开，
-//! 接法照 [`GatewayState::wire_task_spawner`]：`service::start` 先建空槽、造钩子与
+//! `DurableCore`，`DurableCore` 又握着钩子。环用 `OnceLock<Weak<GatewayState>>` 断开：
+//! `service::start` 先建空槽、造钩子与
 //! `DurableCore`、装配 `GatewayState`，**之后**才 [`wire`] 把弱引用填进去。填之前钩子被问到
 //! 就干净地失败（调度此刻也还是暂停的，不会被问到）。
 

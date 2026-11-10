@@ -9,9 +9,9 @@
 //!
 //! 两件**不在这里**发生的事：
 //!
-//! - **执行不在工具里。** 建任务会话、提交输入在 executor（`Operation::Task` 的分流），
-//!   因为那要一份 [`komo_kernel::traits::TaskSpawner`]——工具只有
-//!   [`komo_kernel::types::tool::ToolContext`]，够不到它。
+//! - **执行不在工具里。** 建任务会话、提交输入在 harness 的编排阶段
+//!   （`durable/harness/orchestration`）——工具只有
+//!   [`komo_kernel::types::tool::ToolContext`]，够不到提交线。
 //! - **结果不在这里交回。** 任务的 Run 进终态时 Gateway 把结果当作一条内部输入交回派它的
 //!   会话。
 //!

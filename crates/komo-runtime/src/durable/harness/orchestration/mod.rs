@@ -1,8 +1,7 @@
 //! 编排工具 `task` / `monitor` / `monitor_stop` 在新 harness 上的执行路径（D4c；
 //! `docs/storage-durable.md` §4.6、§12.4；pi-durable spec §5.4–§5.5、§7.3 的 subagent 两节）。
 //!
-//! 旧路径里这几个工具的 `prepare` 之后由 executor 的"编排操作"分流到 gateway 的
-//! `TaskSpawner` / `Monitors`；新路径里它们和别的工具一样是 `komo.tool` 任务，只是 `call` 阶段
+//! 这几个工具和别的工具一样是 `komo.tool` 任务，只是 `call` 阶段
 //! 在 `Tool::prepare` 之后**不进入通用的 intent → execute**，而是转到这里（`tool.rs` 里就一个
 //! 分支）：`Tool::execute` 对这几个工具恒为错误，执行本来就不在工具里。
 //!

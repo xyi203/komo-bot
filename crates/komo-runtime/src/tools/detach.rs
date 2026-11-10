@@ -1,7 +1,7 @@
 //! 长命令自动转后台（`docs/monitor.md` §8）。
 //!
 //! `bash` 在对话会话里跑过 `detach_after_secs` 还没完，就把还活着的子进程（管道、进程组、
-//! 已收到的输出）交给接手的一方——生产里是 Gateway 的 `GatewayMonitors`——自己带着"已转
+//! 已收到的输出）交给接手的一方——生产里是 Gateway 的监听运行器——自己带着"已转
 //! 后台 #id"收尾这次调用。接缝放在 runtime 而不是 kernel：交出去的是一个活的
 //! [`LiveChild`]，kernel 没有 tokio，也不该有。
 //!

@@ -400,12 +400,11 @@ async fn build_tools(
         Arc::new(RgTool::new()),
     ];
     // task：**编排**，不是第七个基础能力（§4），把耗时的事派给独立的任务会话
-    // （`docs/background-tasks.md`）。放行之后由 executor 调 `TaskSpawner`——没有装配它时
-    // （`ToolExecutor::set_spawner` 没被叫过）按"这台 Gateway 没有接任务分发"干净失败。
+    // （`docs/background-tasks.md`）。放行之后由 harness 的编排阶段建任务会话。
     // model / effort 在 `prepare` 里按当前配置快照校验，所以它拿着配置。
     tools.push(Arc::new(TaskTool::new(Arc::clone(config))));
-    // monitor / monitor_stop：同一类编排操作，脚本的进程归 Gateway 的 `GatewayMonitors`
-    // （`docs/monitor.md`）。
+    // monitor / monitor_stop：同一类编排操作，脚本的进程归 Gateway 的监听运行器
+    // （`service/durable/monitor_runner.rs`，`docs/monitor.md`）。
     tools.push(Arc::new(MonitorTool::new()));
     tools.push(Arc::new(MonitorStopTool::new()));
     // MCP（`docs/mcp.md` §2.2）：启动时每台服务器后台连，**不等握手**，这里一个 MCP 工具也不挂。

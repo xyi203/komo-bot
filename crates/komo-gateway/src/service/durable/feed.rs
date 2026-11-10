@@ -27,13 +27,21 @@
 //! `floor` 靠"ID 全局单调、都是在提交线上铸的"：feed 起来时铸一个新 ID 当初值，之后每个批次的所有记录
 //! ID（entry / submission / task / conversation / document）都抬高它。新记录的 ID 一定大于见过的一切。
 //!
+//! # 重连补读走内存
+//!
+//! feed 给每个有投影的 Session 留一段最近推过的事件（[`RecentEvents`]，按字节限额从头丢）。客户端带
+//! `after` 重连、且这段覆盖了 `after` 之后的全部事件时，补读直接从内存取，不读存储、不重投影
+//! （`docs/session-optimization.md` §3.4）。直播与补读逐帧相同（`live_frames_equal_backfill_frames`），
+//! 所以两个来源可以互换。事件**先记进这段、再推进 hub**；HTTP 那边先订阅 hub 再取这段，重叠的帧靠
+//! seq 去重。没投影（冷启动、被淘汰、purge）或覆盖不到 `after` 时照旧从存储补读。
+//!
 //! # 并发读
 //!
 //! 补读不进提交线：读已提交状态（`Storage` 的读口），所以补读再多也不占提交线。
 //! `TursoStorage` 的读口目前只有一条连接（`docs/storage-durable-d5.md` §9 的风险），
 //! 并发补读的开销由 `concurrent_backfills_do_not_stall_commits` 量。
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::time::Duration;
@@ -72,6 +80,8 @@ const SCAN_PAGE: usize = 512;
 /// 池 + 不限 → 7.2–7.4ms（补读吞吐是限 2 路的 2.8 倍）。多出来的补读只是在抢 CPU（每次全量投影），
 /// 提交延迟更要紧，所以保留 2。补读本身只是排队等，不丢也不乱序。
 const READ_PERMITS: usize = 2;
+/// 每个 Session 在内存里留多少字节最近推过的事件（按事件 JSON 的长度算）。
+const RECENT_BYTES: usize = 512 * 1024;
 /// 轮询停机旗子的间隔（`Shutdown` 只是个标志，不能 await）。
 const SHUTDOWN_POLL: Duration = Duration::from_millis(250);
 
@@ -197,6 +207,93 @@ where
     events
 }
 
+// ------------------------------------------------------------------- 最近的事件
+
+/// 每个 Session 最近推过的事件（见模块文档"重连补读走内存"）。feed 任务写，HTTP 补读读。
+#[derive(Debug, Default)]
+pub struct RecentEvents {
+    sessions: Mutex<HashMap<String, Recent>>,
+}
+
+#[derive(Debug, Default)]
+struct Recent {
+    events: VecDeque<(Event, usize)>,
+    bytes: usize,
+    /// 已经丢掉的事件里最大的 seq：`after` 不小于它，这段才覆盖 `after` 之后的全部。
+    dropped: u64,
+}
+
+impl Recent {
+    fn push(&mut self, event: &Event) {
+        let size = serde_json::to_vec(event).map_or(0, |bytes| bytes.len());
+        self.events.push_back((event.clone(), size));
+        self.bytes += size;
+        while self.bytes > RECENT_BYTES {
+            let Some((dropped, size)) = self.events.pop_front() else {
+                break;
+            };
+            self.bytes -= size;
+            self.dropped = self.dropped.max(dropped.seq.0);
+        }
+    }
+}
+
+impl RecentEvents {
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, Recent>> {
+        self.sessions.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// 从会话开头投影出的全部事件（懒建）：只留预算内的尾巴。
+    fn reset(&self, session: &str, events: &[Event]) {
+        let mut recent = Recent::default();
+        for event in events {
+            recent.push(event);
+        }
+        self.lock().insert(session.to_owned(), recent);
+    }
+
+    /// 接在已有的后面；这个 Session 没有（没懒建过、被丢了）就不记，免得留下一段有缺口的。
+    fn push(&self, session: &str, event: &Event) {
+        if let Some(recent) = self.lock().get_mut(session) {
+            recent.push(event);
+        }
+    }
+
+    fn remove(&self, session: &str) {
+        self.lock().remove(session);
+    }
+
+    /// `seq > after` 的全部事件；内存里这段覆盖不到 `after` 就是 `None`（调用方从存储补读）。
+    pub fn since(&self, session: &str, after: Seq) -> Option<Vec<Event>> {
+        let sessions = self.lock();
+        let recent = sessions.get(session)?;
+        if recent.dropped > after.0 {
+            return None;
+        }
+        Some(
+            recent
+                .events
+                .iter()
+                .filter(|(event, _)| event.seq > after)
+                .map(|(event, _)| event.clone())
+                .collect(),
+        )
+    }
+}
+
+/// 补读：内存里那段覆盖得到就用它，否则从存储（[`backfill_with`]）。
+pub async fn backfill_recent(
+    core: &DurableCore,
+    sessions_dir: Option<&Path>,
+    session: &str,
+    after: Seq,
+) -> Result<Vec<Event>, SessionError> {
+    if let Some(events) = core.recent.since(session, after) {
+        return Ok(events);
+    }
+    backfill_with(&*core.storage, sessions_dir, session, after).await
+}
+
 // ------------------------------------------------------------------- 启动
 
 /// 已经起了 feed 的 `DurableCore`（弱引用）。重复 `spawn` 同一个 core 不再起第二份，否则每一帧推两遍。
@@ -246,7 +343,13 @@ pub async fn spawn(core: &Arc<DurableCore>, hub: &SharedHub, shutdown: &Shutdown
             });
         }
     });
-    let feed = Feed::new(storage, Arc::downgrade(core), Arc::clone(hub), floor);
+    let feed = Feed::new(
+        storage,
+        Arc::downgrade(core),
+        Arc::clone(hub),
+        floor,
+        Arc::clone(&core.recent),
+    );
     let shutdown = shutdown.clone();
     tokio::spawn(async move {
         feed.run(receiver, line, shutdown).await;
@@ -282,11 +385,20 @@ struct Feed {
     /// 见过的最大记录 ID（见模块文档）。
     floor: u64,
     tick: u64,
+    /// 每个有投影的 Session 最近推过的事件（与 `sessions` 同进同出）。
+    recent: Arc<RecentEvents>,
 }
 
 impl Feed {
-    fn new(storage: Arc<dyn Storage>, core: Weak<DurableCore>, hub: SharedHub, floor: u64) -> Self {
+    fn new(
+        storage: Arc<dyn Storage>,
+        core: Weak<DurableCore>,
+        hub: SharedHub,
+        floor: u64,
+        recent: Arc<RecentEvents>,
+    ) -> Self {
         Feed {
+            recent,
             storage,
             core,
             hub,
@@ -413,6 +525,8 @@ impl Feed {
                     }
                     for event in feed.projection.project(&records) {
                         feed.last_seq = feed.last_seq.max(event.seq.0);
+                        // 先记再推：取这段的人已经订阅了 hub，重叠的帧靠 seq 去重。
+                        self.recent.push(&session, &event);
                         hub.publish_event(&event);
                     }
                 }
@@ -431,6 +545,7 @@ impl Feed {
         for conversation in purged {
             if let Some(Some(session)) = self.conversations.remove(&conversation) {
                 self.sessions.remove(&session);
+                self.recent.remove(&session);
             }
             self.partials.remove(&conversation);
             self.nested.remove(&conversation);
@@ -496,6 +611,12 @@ impl Feed {
             .collect();
         let frames = projection.project(&all);
         let last_seq = frames.last().map_or(0, |event| event.seq.0);
+        // 没有 Session 目录时投影里缺 codemode 的外层结果，与存储补读不同：不留。
+        if sessions_dir.is_some() {
+            self.recent.reset(session, &frames);
+        } else {
+            self.recent.remove(session);
+        }
         for event in &frames {
             if record_of(event.seq) > floor {
                 self.hub.publish_event(event);
@@ -627,6 +748,7 @@ impl Feed {
                 return;
             };
             self.sessions.remove(&oldest);
+            self.recent.remove(&oldest);
         }
     }
 }
@@ -765,6 +887,44 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn recent_events_drop_from_the_front_and_only_answer_cursors_they_cover() {
+        use komo_kernel::durable::legacy_events::legacy_events;
+        use komo_kernel::durable::{EntryId, Message};
+        let conversation = ConversationId::new(1);
+        // 每条约 100 KiB：预算里放得下 5 条左右。
+        let body = "x".repeat(100 * 1024);
+        let entries: Vec<EntryRecord> = (2..14)
+            .map(|id| {
+                EntryRecord::new(EntryId::new(id), conversation, "komo.user")
+                    .with_model(vec![Message::user(body.clone(), 0)])
+            })
+            .collect();
+        let events = legacy_events("s", &entries, &[]);
+        assert!(events.len() >= 12);
+        let recent = RecentEvents::default();
+        // 没懒建过的 Session：直播的帧不记，补读走存储。
+        recent.push("s", &events[0]);
+        assert!(recent.since("s", Seq::ZERO).is_none());
+
+        recent.reset("s", &events[..6]);
+        for event in &events[6..] {
+            recent.push("s", event);
+        }
+        let kept = recent.since("s", events[events.len() - 3].seq).unwrap();
+        assert_eq!(kept.len(), 2);
+        assert_eq!(kept[1].seq, events.last().unwrap().seq);
+        // 最早的几条已经丢了：覆盖不到从头开始的游标。
+        assert!(recent.since("s", Seq::ZERO).is_none());
+        let bytes: usize = {
+            let sessions = recent.lock();
+            sessions["s"].events.iter().map(|(_, size)| size).sum()
+        };
+        assert!(bytes <= RECENT_BYTES);
+        recent.remove("s");
+        assert!(recent.since("s", events.last().unwrap().seq).is_none());
     }
 
     #[test]

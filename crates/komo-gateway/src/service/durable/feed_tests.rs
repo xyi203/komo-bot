@@ -155,10 +155,20 @@ async fn live_frames_equal_backfill_frames() {
             .cloned()
             .collect();
         assert_eq!(
-            serde_json::to_value(suffix).unwrap(),
+            serde_json::to_value(&suffix).unwrap(),
             serde_json::to_value(expected).unwrap()
         );
+        // feed 在内存里留的那段与存储补读逐帧相同：重连时不读存储。
+        let recent = core.recent.since(&session, after).expect("内存里有这段");
+        assert_eq!(
+            serde_json::to_value(recent).unwrap(),
+            serde_json::to_value(&suffix).unwrap()
+        );
     }
+    assert_eq!(
+        serde_json::to_value(core.recent.since(&session, Seq::ZERO).unwrap()).unwrap(),
+        serde_json::to_value(&backfill).unwrap()
+    );
     let seqs: Vec<u64> = live.iter().map(|event| event.seq.0).collect();
     assert!(seqs.windows(2).all(|pair| pair[0] < pair[1]), "{seqs:?}");
 

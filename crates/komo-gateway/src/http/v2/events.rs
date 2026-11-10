@@ -3,8 +3,9 @@
 //! 路径、`Accept` 分派、游标写法（`?from=` 与 `Last-Event-ID`，头优先）沿用冻结的协议：
 //!
 //! - 非 `text/event-stream`：一页 JSON（[`EventPage`]），`seq > from` 的前 `limit` 条；
-//! - `text/event-stream`：**先订阅 hub 再补读**，补读之后接直播。补读来自存储（投影与 feed 同一个
-//!   纯函数，见 [`feed::backfill`]），直播来自 [`feed`] 推进 hub 的帧。两段重叠的部分靠 seq 去重
+//! - `text/event-stream`：**先订阅 hub 再补读**，补读之后接直播。补读先看 feed 在内存里留的最近事件，
+//!   覆盖不到才读存储（投影与 feed 同一个纯函数，见 [`feed::backfill_recent`]），直播来自 [`feed`] 推进
+//!   hub 的帧。两段重叠的部分靠 seq 去重
 //!   （只对原始事件，见 [`already_sent`]），所以不重不漏。
 //!
 //! 直播连接落后（hub 的广播缓冲溢出）时，在连接上**当场补读**落下的那一段原始事件再接着直播
@@ -33,7 +34,7 @@ use komo_kernel::types::ids::{Seq, SessionId};
 
 use crate::http::Api;
 use crate::http::error::{ApiFailure, ApiResult};
-use crate::service::durable::SessionError;
+use crate::service::durable::{DurableCore, SessionError};
 use crate::service::durable::{feed, nested_view};
 use crate::sse::{HEARTBEAT, already_sent, cursor_from, encode_frame, heartbeat};
 
@@ -102,7 +103,7 @@ async fn stream(
             .limit
             .filter(|limit| *limit > 0)
             .map_or(PAGE, |limit| limit as usize);
-        let mut events = feed::backfill_with(&*storage, Some(&sessions_dir), &id, from)
+        let mut events = feed::backfill_recent(core, Some(&sessions_dir), &id, from)
             .await
             .map_err(failure)?;
         let more = events.len() > limit;
@@ -123,7 +124,7 @@ async fn stream(
     // 记一笔"有人在看"（介入的周期兜底靠它）；守卫跟着响应体走，连接断了自动减一。
     let watching = api.state.hub.watch(&session);
     let mut history: VecDeque<SseFrame> =
-        feed::backfill_with(&*storage, Some(&sessions_dir), &id, from)
+        feed::backfill_recent(core, Some(&sessions_dir), &id, from)
             .await
             .map_err(failure)?
             .into_iter()
@@ -132,7 +133,7 @@ async fn stream(
     let last = history.back().map_or(from, |frame| frame.id);
     history.extend(nested_frames(&*storage, &id, last).await);
 
-    let stream = frames(storage, sessions_dir, id, history, live, from);
+    let stream = frames(Arc::clone(core), sessions_dir, id, history, live, from);
     let body = Body::from_stream(stream.map(move |item| {
         let _ = &watching;
         item
@@ -146,7 +147,7 @@ async fn stream(
 }
 
 struct State_ {
-    storage: Arc<dyn Storage>,
+    core: Arc<DurableCore>,
     sessions_dir: std::path::PathBuf,
     session: String,
     live: tokio::sync::broadcast::Receiver<SseFrame>,
@@ -158,7 +159,7 @@ struct State_ {
 
 /// 历史 → 直播 → 心跳。
 fn frames(
-    storage: Arc<dyn Storage>,
+    core: Arc<DurableCore>,
     sessions_dir: std::path::PathBuf,
     session: String,
     history: VecDeque<SseFrame>,
@@ -166,7 +167,7 @@ fn frames(
     from: Seq,
 ) -> impl Stream<Item = Result<String, Infallible>> {
     let state = State_ {
-        storage,
+        core,
         sessions_dir,
         session,
         live,
@@ -193,14 +194,14 @@ fn frames(
                     // 落后了：当场把落下的原始事件从存储补上，再接着直播。
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                         let dir = Some(state.sessions_dir.as_path());
-                        match feed::backfill_with(&*state.storage, dir, &state.session, state.last)
+                        match feed::backfill_recent(&state.core, dir, &state.session, state.last)
                             .await
                         {
                             Ok(events) => {
                                 state.queue.extend(events.into_iter().map(frame_of));
                                 let last = state.queue.back().map_or(state.last, |frame| frame.id);
                                 let snapshot =
-                                    nested_frames(&*state.storage, &state.session, last).await;
+                                    nested_frames(&*state.core.storage, &state.session, last).await;
                                 state.queue.extend(snapshot);
                             }
                             Err(error) => {

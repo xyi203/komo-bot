@@ -38,6 +38,8 @@ pub struct DurableCore {
     state: OnceLock<super::assemble::StateSlot>,
     /// 还没落账的 `!` 命令（只在内存里，`shell`）：停机时先终止它们、等它们落账，再关提交线。
     pub(super) shells: super::shell::RunningShells,
+    /// feed 推过的最近事件：重连补读先看它（`feed::backfill_recent`）。
+    pub(super) recent: Arc<super::feed::RecentEvents>,
     /// 测试用：受理一律走读整棵树的落点路径，好与快速路径比对（`submit::land`）。
     #[cfg(test)]
     pub(super) full_tree_landing: AtomicBool,
@@ -106,6 +108,7 @@ impl DurableCore {
             confirms,
             state: OnceLock::new(),
             shells: super::shell::RunningShells::default(),
+            recent: Arc::default(),
             #[cfg(test)]
             full_tree_landing: AtomicBool::new(false),
         }))

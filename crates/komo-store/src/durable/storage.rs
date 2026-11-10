@@ -28,8 +28,8 @@ use std::path::Path;
 use komo_kernel::durable::fork::{ForkError, ForkSegment, fork_chain, is_visible};
 use komo_kernel::durable::ids::{ConversationId, DocumentId, EntryId, Seq, SubmissionId, TaskId};
 use komo_kernel::durable::records::{
-    ConversationRecord, DocumentAddress, DocumentRecord, DocumentScope, EntryRecord, SessionRecord,
-    SubmissionRecord, TaskRecord,
+    ConversationRecord, DocumentAddress, DocumentRecord, DocumentScope, EntryRecord,
+    SessionLifecycle, SessionRecord, SubmissionRecord, TaskRecord,
 };
 use komo_kernel::durable::storage::{
     ConversationQuery, Cursor, DocumentQuery, EntryQuery, MAX_ID, Page, ScanOrder, ScanStart,
@@ -943,38 +943,55 @@ impl Storage for TursoStorage {
         check_limit(limit)?;
         self.check_open().await?;
         let (order, after) = session_scan_start(query.order, cursor)?;
-        let mut filter = Filter::default();
-        if let Some(lifecycle) = query.lifecycle {
-            filter.eq("lifecycle", text(tag(&lifecycle)?));
+        // 几种生命周期之一：每种各走一次 `sessions_by_lifecycle (lifecycle, id)`、各取 `limit + 1`，
+        // 再按 id 归并。`IN (…)` 加 `ORDER BY id` 会退成主键序扫描、边扫边丢别的生命周期，读量随
+        // 被跳过的行数增长；拆开之后一页最多读 种数 ×（limit + 1）行，与总会话数无关。
+        let lifecycles: Vec<Option<SessionLifecycle>> = match query.lifecycle {
+            Some(one) if query.lifecycles.is_empty() || query.lifecycles.contains(&one) => {
+                vec![Some(one)]
+            }
+            Some(_) => Vec::new(),
+            None if query.lifecycles.is_empty() => vec![None],
+            None => query.lifecycles.iter().copied().map(Some).collect(),
+        };
+        let mut values = Vec::new();
+        for lifecycle in lifecycles {
+            let mut filter = Filter::default();
+            if let Some(lifecycle) = lifecycle {
+                filter.eq("lifecycle", text(tag(&lifecycle)?));
+            }
+            if let Some(source) = &query.source {
+                filter.eq("source", text(source));
+            }
+            if let Some(kind) = query.kind {
+                filter.eq("kind", text(tag(&kind)?));
+            }
+            if let Some(agent) = &query.agent {
+                filter.eq("agent", text(agent));
+            }
+            if let Some(after) = &after {
+                let op = match order {
+                    ScanOrder::Ascending => ">",
+                    ScanOrder::Descending => "<",
+                };
+                filter.cmp("id", op, text(after));
+            }
+            let sql = format!(
+                "SELECT record FROM sessions{} ORDER BY id {} LIMIT {}",
+                filter.where_sql(),
+                direction(order),
+                take(limit)
+            );
+            for row in self.query(&sql, filter.params).await? {
+                values.push(decode::<SessionRecord>(&row[0])?);
+            }
         }
-        if let Some(source) = &query.source {
-            filter.eq("source", text(source));
-        }
-        if let Some(kind) = query.kind {
-            filter.eq("kind", text(tag(&kind)?));
-        }
-        if let Some(agent) = &query.agent {
-            filter.eq("agent", text(agent));
-        }
-        if let Some(after) = after {
-            let op = match order {
-                ScanOrder::Ascending => ">",
-                ScanOrder::Descending => "<",
-            };
-            filter.cmp("id", op, text(after));
-        }
-        let sql = format!(
-            "SELECT record FROM sessions{} ORDER BY id {} LIMIT {}",
-            filter.where_sql(),
-            direction(order),
-            take(limit)
-        );
-        let values = self
-            .query(&sql, filter.params)
-            .await?
-            .iter()
-            .map(|row| decode(&row[0]))
-            .collect::<StorageResult<Vec<SessionRecord>>>()?;
+        values.sort_by(|a, b| match order {
+            ScanOrder::Ascending => a.id.cmp(&b.id),
+            ScanOrder::Descending => b.id.cmp(&a.id),
+        });
+        values.dedup_by(|a, b| a.id == b.id);
+        values.truncate(limit.saturating_add(1));
         Ok(session_page_of(values, limit, order))
     }
 

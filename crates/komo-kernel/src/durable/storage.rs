@@ -221,6 +221,8 @@ pub struct SessionQuery {
     pub kind: Option<SessionKind>,
     /// 只要这个 Agent 的（`SessionRecord::agent`）。
     pub agent: Option<String>,
+    /// 非空时生命周期须是其中之一（会话列表的"活着的"/"连逻辑删除的一起"），与 `lifecycle` 取交集。
+    pub lifecycles: Vec<SessionLifecycle>,
 }
 
 impl SessionQuery {
@@ -228,6 +230,7 @@ impl SessionQuery {
     pub fn matches(&self, record: &SessionRecord) -> bool {
         self.lifecycle
             .is_none_or(|wanted| record.lifecycle == wanted)
+            && (self.lifecycles.is_empty() || self.lifecycles.contains(&record.lifecycle))
             && self.kind.is_none_or(|wanted| record.kind == wanted)
             && self
                 .source

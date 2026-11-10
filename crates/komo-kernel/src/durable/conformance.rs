@@ -72,6 +72,7 @@ pub fn cases() -> Vec<Case> {
         case!(progress_commits_only_replace_document_values),
         case!(sessions_replace_whole_and_scan_by_lifecycle),
         case!(sessions_scan_by_source_kind_and_agent),
+        case!(sessions_scan_by_any_of_several_lifecycles),
         case!(session_and_progress_operations_are_rejected_after_close),
     ]
 }
@@ -2349,6 +2350,90 @@ async fn sessions_scan_by_source_kind_and_agent(storage: &dyn Storage) {
         })
         .await,
         ["s3"]
+    );
+}
+
+/// 会话列表的"几种生命周期之一"：降序、分页拼起来等于逐条过滤的全量，不丢不重；与 `lifecycle` 取交集。
+async fn sessions_scan_by_any_of_several_lifecycles(storage: &dyn Storage) {
+    let lifecycles = [
+        SessionLifecycle::Active,
+        SessionLifecycle::Deleted,
+        SessionLifecycle::Closing,
+        SessionLifecycle::Purged,
+        SessionLifecycle::Active,
+        SessionLifecycle::Deleted,
+        SessionLifecycle::Active,
+        SessionLifecycle::Purged,
+        SessionLifecycle::Closing,
+    ];
+    let writes = lifecycles
+        .iter()
+        .enumerate()
+        .map(|(i, lifecycle)| StorageWrite::Session(session(&format!("s{i}"), *lifecycle, 1)))
+        .collect();
+    commit(storage, writes).await;
+    let pages = |query: SessionQuery, limit: usize| async move {
+        let mut found = Vec::new();
+        let mut cursor = None;
+        loop {
+            let page = storage
+                .scan_sessions(&query, limit, cursor.as_ref())
+                .await
+                .unwrap();
+            assert!(page.items.len() <= limit);
+            found.extend(page.items.into_iter().map(|record| record.id));
+            match page.next {
+                Some(next) => cursor = Some(next),
+                None => return found,
+            }
+        }
+    };
+    let live = SessionQuery {
+        lifecycles: vec![SessionLifecycle::Active, SessionLifecycle::Closing],
+        ..SessionQuery::default()
+    };
+    for limit in [1, 2, 3, 10] {
+        assert_eq!(
+            pages(live.clone(), limit).await,
+            ["s8", "s6", "s4", "s2", "s0"],
+            "limit {limit}"
+        );
+    }
+    let visible = SessionQuery {
+        lifecycles: vec![
+            SessionLifecycle::Active,
+            SessionLifecycle::Closing,
+            SessionLifecycle::Deleted,
+        ],
+        order: Some(ScanOrder::Ascending),
+        ..SessionQuery::default()
+    };
+    assert_eq!(
+        pages(visible, 2).await,
+        ["s0", "s1", "s2", "s4", "s5", "s6", "s8"]
+    );
+    // 与 `lifecycle` 取交集：在集合里就只剩它，不在就什么都没有。
+    assert_eq!(
+        pages(
+            SessionQuery {
+                lifecycle: Some(SessionLifecycle::Closing),
+                ..live.clone()
+            },
+            1
+        )
+        .await,
+        ["s8", "s2"]
+    );
+    assert_eq!(
+        pages(
+            SessionQuery {
+                lifecycle: Some(SessionLifecycle::Purged),
+                ..live
+            },
+            1
+        )
+        .await,
+        Vec::<String>::new()
     );
 }
 

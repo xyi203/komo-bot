@@ -290,7 +290,7 @@ Monty worker 进程、只读挂载、受保护路径都不变。
 | 重启前停在哪里 | 处理 |
 |---|---|
 | 任务 `running` | 回 `pending`，checkpoint 与 abort 标记保留，从 checkpoint 所在阶段重跑 |
-| 任务 `running`，上一代没有干净关闭 | 同上，`restarts` 加一（崩溃循环保护，pi spec §5.4 "Restarts"）；任务提交新状态归零；到 5 次停住（`Blocked { RestartLimit }`，不起 run 也不起 abort），进 intervention 清单等 `resolve` / `abandon`。干净关闭标记是库级 document `komo.engine`（开库时同一笔提交里清掉，`Engine::close` 等 invocation 走完后写回）；没有这份标记（第一次升级）不算崩溃。见 `storage-durable-perf.md` §6 |
+| 任务 `running`，上一代没有干净关闭 | 同上，`restarts` 加一（崩溃循环保护，pi spec §5.4 "Restarts"）；任务提交新状态归零；到 5 次停住（`Blocked { RestartLimit }`，不起 run 也不起 abort handler；被请求取消时直接 `orphaned`），进 intervention 清单等 `resolve` / `abandon`。干净关闭标记是库级 document `komo.engine`（开库时同一笔提交里清掉，`Engine::close` 等 invocation 走完后写回）；没有这份标记（第一次升级）不算崩溃。见 `storage-durable-perf.md` §6 |
 | 生成任务在 `request` | 已提交的部分回复转成 `aborted` entry；按已提交上下文重发 |
 | 工具任务在 `call`（意图未提交） | 确定没执行过，正常执行 |
 | 工具任务在 `execute`，盘上有身份齐全、哈希对得上的 `output.json` | 补提交结果 entry，复用原输出（今天 §8.4 第 5 行的那一类，现在只因"blob 写完、结果没提交就崩"出现） |

@@ -602,7 +602,7 @@ project_files = false              # 省略 = true
 | 重启前停在哪里 | 处理 |
 |---|---|
 | 任务 `running` | 回 `pending`，checkpoint 与 abort 标记保留，从 checkpoint 所在阶段重跑 |
-| 任务 `running`，上一代没有干净关闭（崩溃、被杀、断电） | 同上，另给它的 `restarts` 加一；任务自己提交新状态就归零。连续到 5 次（`restartLimit`）就**停住**：不再起它（run 与 abort 都不起），会话一直忙着，进 intervention 清单（§7.5）等 `resolve` 放行或 `abandon` 放弃。干净关闭的标记是 `durable.db` 里的库级 document `komo.engine`（`docs/storage-durable-perf.md` §6）；从没有过这份标记（第一次升级）不算崩溃 |
+| 任务 `running`，上一代没有干净关闭（崩溃、被杀、断电） | 同上，另给它的 `restarts` 加一；任务自己提交新状态就归零。连续到 5 次（`restartLimit`）就**停住**：不再起它的任何代码（run 与 abort handler 都不起），会话一直忙着，进 intervention 清单（§7.5）等 `resolve` 放行或 `abandon` 放弃；有人取消它（`/cancel`、删除会话）就直接判 `orphaned`，不等。干净关闭的标记是 `durable.db` 里的库级 document `komo.engine`（`docs/storage-durable-perf.md` §6）；从没有过这份标记（第一次升级）不算崩溃 |
 | 生成任务在 `request` | 已提交的部分回复转成 `aborted` 的 assistant entry；按已提交上下文重发（丢弃未完成的流式输出，可能再次产生模型费用） |
 | 生成任务在 `retry` | 沿用已持久化的次数与到点时刻（`until`），到点再尝试 |
 | 工具任务在 `call`（意图未提交） | 确定没执行过，正常执行 |

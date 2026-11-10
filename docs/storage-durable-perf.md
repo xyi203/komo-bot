@@ -204,7 +204,7 @@ pi 的 #9265（`f715a15c1`）修的就是这个：`StreamingJsonParser` 每个 d
   要先确认 gateway 的正常关闭会把 `running` 写回 `pending` 而不计数（对应 pi 的"close is not a crash"）。
   **实施时**这条前提不成立（`Engine::close` 后任务留在 `running`），改用干净关闭标记，见下面"实施"。
 
-### 6.1 实施（2026-11-10，`570d8649`、`faa2097f`）
+### 6.1 实施（2026-11-10，`570d8649`、`faa2097f`、`81c13493`）
 
 - **干净关闭标记**放在 `durable.db` 里：库级单例 document `komo.engine`（`DocumentScope::Session`、没有 key，
   与 `komo.monitors` 同一种作用域），值 `{ "closed": bool }`。不加 `Storage` 接口、不动 schema（document 表现成），
@@ -222,15 +222,17 @@ pi 的 #9265（`f715a15c1`）修的就是这个：`StreamingJsonParser` 每个 d
 - **计数与归零**：`reconcile_on_open(record, crashed)` 只给 `running` 加一（`pending` / `waiting` 没在跑，打断不到）；
   `commit_state`（任务自己提交新 checkpoint、等待、结局）归零；reservation、abort 标记、handover 不算进展。
 - **停住**：`restarts >= restart_limit`（`EngineOptions::restart_limit`，默认 `RESTART_LIMIT = 5`，不进配置文件）时
-  reservation 跳过它——run 与 abort 都不起（abort handler 自己也可能是崩溃的原因）；`Engine::inspect` 给
-  `Blocked { RestartLimit }`；开库时刚到上限的报告一次（`report`）。任务仍是 `pending`，会话保持忙（同 pi）。
+  reservation 不起它的任何代码——run 与 abort handler 都不起（abort handler 自己也可能是崩溃的原因）；`Engine::inspect`
+  给 `Blocked { RestartLimit }`；开库时刚到上限的报告一次（`report`）。任务仍是 `pending`，会话保持忙（同 pi）。
+  有人请求取消它（`/cancel`、删除会话的级联）时照已有的"阻塞任务被请求 abort"规矩直接判 `orphaned { reason: "restart_limit" }`，
+  不跑代码，取消不会一直等下去；重启放弃（`abandon_on_restart`）的标记不算请求，仍停住。
 - **出路**：pi 是 `Harness.retryTask(id)`。komo 的 intervention 协议本来就有 `resolve` 这个结论（faulted 任务
   不用），拿它当放行：`Engine::retry_task` 只把 `restarts` 清零，调度照常；`abandon` 先记 `komo.interventions.ack`，
   再 `Engine::fault_idle_task` 写 `faulted`（不跑任务代码），之后照 faulted 收尾、不再列出。没有新加协议字段、
   子命令或界面：`komo intervention list|show|answer`、TUI `/pending`、聊天 `/answer`、web 待处理页都沿用已有的
   `verdicts` 渲染。NeedsAttention 在 Gateway 启动时投一次（停住只发生在开库时）。
 - **测试**：runtime `durable/tests/restarts.rs`（崩溃逐次计数、干净关闭不计、到上限停住且不再起、只报一次、
-  有进展归零、第一次升级不计、线失败后的关闭按崩溃算、放行与放弃）；kernel `reconcile` / `records` 的单测；
+  有进展归零、第一次升级不计、线失败后的关闭按崩溃算、放行、放弃、被取消时 orphaned 且不起 abort handler）；kernel `reconcile` / `records` 的单测；
   gateway `tests/recovery/crash_loop.rs`（真 Gateway 停机后改库造出"又一次崩溃"，重启后列进清单、投提醒、
   `approve` 422、`resolve` 后 run 收尾、`abandon` 后写 `faulted` 且不再列出）。
 

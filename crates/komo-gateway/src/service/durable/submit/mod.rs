@@ -26,6 +26,8 @@
 //! （同一次提交里受理要先于它：受理读已提交状态，不能排在这个 conversation 的表写之后）；它没有
 //! `model`，不进上下文，所以次序只影响展示。
 
+pub mod shell;
+
 use komo_kernel::durable::legacy_events::PROJECT_UPDATE_AT;
 use komo_kernel::durable::{
     Content, ConversationId, InputState, Message, SubmissionId, SubmissionKind, SubmissionRecord,
@@ -39,9 +41,11 @@ use komo_runtime::durable::harness::{Harness, InboxItem, InputEntry, SubmissionD
 use serde_json::{Value, json};
 
 use super::DurableCore;
-use super::agent_doc::{self, AgentDoc};
+use super::sessions::agent_doc::{self, AgentDoc};
+use super::sessions::tree::{
+    MODEL_CHANGE_ENTRY, Placement, busy_reason, load_tree, placement, realize,
+};
 use super::sessions::{SessionError, ensure_open};
-use super::tree::{MODEL_CHANGE_ENTRY, Placement, busy_reason, load_tree, placement, realize};
 
 /// 输入没指明来源时放置成的 entry kind（§2：gateway 写的 `cli.input`）。
 pub const DEFAULT_INPUT_KIND: &str = "cli.input";
@@ -500,7 +504,7 @@ impl DurableCore {
                         .title
                         .as_deref()
                         .is_none_or(|title| title.trim().is_empty())
-                        && let Some(title) = super::titles::title_for(&text)
+                        && let Some(title) = super::sessions::titles::title_for(&text)
                     {
                         record.title = Some(title);
                         record.title_provisional = true;

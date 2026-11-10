@@ -38,8 +38,8 @@ use komo_kernel::protocol::sse::SseEvent;
 use komo_kernel::types::chat::{ChannelPeer, DeliveryTarget, Outbound, is_silent_reply};
 use komo_kernel::types::ids::{RunId, SessionId};
 
-use super::DurableCore;
-use super::tree::load_tree;
+use super::super::DurableCore;
+use super::super::sessions::tree::load_tree;
 use crate::service::state::GatewayState;
 
 /// 聊天输入 entry 的 kind（`data {peer, principal}`）。
@@ -65,7 +65,7 @@ pub enum Source {
 }
 
 /// 一条 entry 的来源。
-pub(super) fn source_of_entry(entry: &EntryRecord) -> Source {
+pub(in crate::service::durable) fn source_of_entry(entry: &EntryRecord) -> Source {
     if entry.kind == CHAT_INPUT {
         return entry
             .data
@@ -264,7 +264,7 @@ async fn finish(state: &Arc<GatewayState>, session: &str, run: &RunId, outcome: 
                 return;
             }
         } else {
-            super::titles::spawn(state, session, run, text);
+            super::super::sessions::titles::spawn(state, session, run, text);
         }
     }
     let Some(destination) = destination(core, session, first).await else {

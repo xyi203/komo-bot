@@ -34,9 +34,9 @@ use komo_runtime::durable::harness::{
 use komo_runtime::durable::{ConversationOwnership, EntryDraft};
 
 use super::GatewayHooks;
-use crate::service::durable::agent_doc::{self, AgentDoc};
 use crate::service::durable::assemble::{self as assemble_slot, StateSlot};
 use crate::service::durable::orchestration::{GatewayOrchestration, MonitorRunner};
+use crate::service::durable::sessions::agent_doc::{self, AgentDoc};
 use crate::service::test_support::TestGateway;
 use crate::service::test_support::harness::{FakeLlm, call_round, text_round};
 

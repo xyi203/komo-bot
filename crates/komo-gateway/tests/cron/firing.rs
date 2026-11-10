@@ -207,7 +207,7 @@ async fn the_list_shows_the_last_firing_and_the_next_slot() {
 /// `maxRounds` 与工作目录，输入 entry 是 `cron.input`（`data {job, slot}`）。
 #[tokio::test]
 async fn a_firing_creates_a_cron_session_carrying_the_job_overrides() {
-    use komo_gateway::service::durable::agent_doc;
+    use komo_gateway::service::durable::sessions::agent_doc;
     use komo_kernel::durable::SessionKind;
 
     let home = Home::new();

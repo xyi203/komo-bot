@@ -27,7 +27,7 @@ use komo_kernel::types::model::{Effort, ModelConfig};
 use komo_runtime::durable::harness::{HookError, RetryPolicy, RunBudget, TaskDoc, task_doc};
 use komo_tools::tools::paths;
 
-use crate::service::durable::agent_doc::{self, AgentDoc};
+use crate::service::durable::sessions::agent_doc::{self, AgentDoc};
 use crate::service::state::GatewayState;
 
 /// 任务链最多往上找几层（`komo.task.parent`；任务里不能再派任务，所以正常只有一层）。

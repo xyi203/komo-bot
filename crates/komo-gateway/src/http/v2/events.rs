@@ -34,8 +34,8 @@ use komo_kernel::types::ids::{Seq, SessionId};
 
 use crate::http::Api;
 use crate::http::error::{ApiFailure, ApiResult};
+use crate::service::durable::feed::{self, nested_view};
 use crate::service::durable::{DurableCore, SessionError};
-use crate::service::durable::{feed, nested_view};
 use crate::sse::{HEARTBEAT, already_sent, cursor_from, encode_frame, heartbeat};
 
 /// 一页最多多少条（`limit` 不给时）。

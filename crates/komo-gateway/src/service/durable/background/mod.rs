@@ -9,6 +9,14 @@
 //! **次序**（W4a）：`feed::spawn`、`interventions::spawn_attention`、`lifecycle::boot`、`watch::reattach`
 //! 都在 `service::start` 里排在 `core.resume()` **之前**；本文件的 `spawn` 在 resume 之后。
 
+pub mod cron;
+pub mod cron_watch;
+pub mod memory;
+pub mod monitor_runner;
+pub mod watch;
+#[cfg(test)]
+mod watch_tests;
+
 use std::sync::Arc;
 
 use komo_kernel::traits::Shutdown;
@@ -34,14 +42,14 @@ pub fn spawn(state: &Arc<GatewayState>, shutdown: &Shutdown) {
     // 这里只补"已结算、投递前崩溃"的那一窗（`watch::replay_recent`，判据的评估见它的文档）。
     {
         let state = Arc::clone(state);
-        tokio::spawn(async move { super::watch::replay_recent(&state).await });
+        tokio::spawn(async move { watch::replay_recent(&state).await });
     }
     // W4a：把停在 `closing` 的删除做完（启动一次，之后每几秒）。
-    super::lifecycle::spawn(state, shutdown);
+    super::sessions::lifecycle::spawn(state, shutdown);
     // W3b：cron——启动补做上一代没做完的触发，再一分钟一扫。
-    super::cron::spawn(state, shutdown);
+    cron::spawn(state, shutdown);
     // W3c：记忆的后台领取（`MEMORY_TICK`）。
-    super::memory::spawn_tick(state, shutdown);
+    memory::spawn_tick(state, shutdown);
 }
 
 /// 启动时收掉上一代留下的监听（`docs/monitor.md` §5）：先让编排钩子核对并终止遗留的进程组、

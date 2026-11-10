@@ -6,8 +6,8 @@ use komo_kernel::protocol::InboundAck;
 use komo_kernel::types::chat::{ChannelPlatform, Outbound};
 use komo_runtime::durable::harness::{InputEntry, WhenBusy};
 
-use super::sessions::NewSession;
-use super::submit::InputRequest;
+use super::super::sessions::NewSession;
+use super::super::submit::InputRequest;
 use super::watch;
 use crate::channels::ChannelSender;
 use crate::service::test_support::Gate;

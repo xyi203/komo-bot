@@ -729,7 +729,7 @@ async fn cancel_stops_a_run_that_is_still_inside_a_call() {
     // 取消是异步的：等这条 run 的输入结算，它的状态是已取消（`aborted`），门没有开过。
     let record = gateway.wait_run(&run).await;
     assert_eq!(
-        komo_gateway::service::durable::runs::state_of_submission(&record),
+        komo_gateway::service::durable::sessions::runs::state_of_submission(&record),
         RunState::Cancelled,
         "没取消掉：{record:?}"
     );
@@ -740,7 +740,7 @@ async fn cancel_stops_a_run_that_is_still_inside_a_call() {
 /// 让这个 Session 当前分支的下一条输入 fault：把 `komo.agent` 写成读不出来的值，钩子 `setup` 读它失败
 /// （`HookError::Failed`）→ 生成任务 faulted。（faulted 是新存储里"要人处理"的唯一来源。）
 async fn poison_agent_doc(gateway: &TestGateway, session: &str) {
-    use komo_gateway::service::durable::agent_doc::{AGENT_DOC_VERSION, address};
+    use komo_gateway::service::durable::sessions::agent_doc::{AGENT_DOC_VERSION, address};
     let core = Arc::clone(gateway.state().core().expect("Durable 模式"));
     let branch = core.session(session).await.expect("会话").current_branch;
     core.engine

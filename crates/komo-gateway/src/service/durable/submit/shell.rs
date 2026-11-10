@@ -43,10 +43,10 @@ use komo_runtime::durable::harness::{SubmissionDraft, WriteDraft};
 use komo_store::{FileToolOutputStore, SessionPaths};
 use serde_json::{Value, json};
 
-use super::DurableCore;
-use super::hooks::{self, env, tools};
-use super::sessions::SessionError;
-use super::submit::{Accepted, Landing};
+use super::super::DurableCore;
+use super::super::hooks::{self, env, tools};
+use super::super::sessions::SessionError;
+use super::{Accepted, Landing};
 use crate::service::state::GatewayState;
 
 /// `!` 命令放进会话的 entry 的 kind（`docs/storage-durable-d5.md` §2：gateway 写的 `shell.command`）。
@@ -440,7 +440,7 @@ pub async fn submit_shell(
         return Ok(ShellReceipt::Landed(accepted));
     }
     let record = core.session(session).await?;
-    super::sessions::ensure_open(&record)?;
+    super::super::sessions::ensure_open(&record)?;
 
     let detach_after = state.snapshot().execution.detach_after_secs;
     let job = {
@@ -548,12 +548,14 @@ async fn run_and_land(
 
 impl DurableCore {
     /// 一条 `shell.command` write 的 entry → 它的输出（`run_detail` 用）。
-    pub(super) fn shell_view(entry: &komo_kernel::durable::EntryRecord) -> Option<String> {
+    pub(in crate::service::durable) fn shell_view(
+        entry: &komo_kernel::durable::EntryRecord,
+    ) -> Option<String> {
         let text = entry
             .model
             .as_ref()?
             .iter()
-            .find_map(super::runs::user_text_of)?;
+            .find_map(super::super::sessions::runs::user_text_of)?;
         Some(view_of(&text).to_owned())
     }
 }

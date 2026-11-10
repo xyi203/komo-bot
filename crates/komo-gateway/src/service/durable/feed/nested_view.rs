@@ -25,7 +25,7 @@ use komo_store::{FileToolOutputStore, SessionPaths};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::tree::load_tree;
+use super::super::sessions::tree::load_tree;
 
 /// 这些 entry 里要读外层结果的那几条（codemode 的结果 entry）与它们的输出引用。
 pub fn wanted<'a>(entries: impl IntoIterator<Item = &'a EntryRecord>) -> Vec<(EntryId, OutputRef)> {

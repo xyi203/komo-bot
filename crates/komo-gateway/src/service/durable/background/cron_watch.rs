@@ -25,7 +25,7 @@ use komo_kernel::types::refs::OutputRef;
 use komo_store::{FileToolOutputStore, SessionPaths};
 use tracing::Instrument;
 
-use super::feed;
+use super::super::feed;
 use crate::service::cron_watch::{Watched, notify, settle};
 use crate::service::state::GatewayState;
 

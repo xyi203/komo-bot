@@ -447,7 +447,7 @@ async fn learn_with(gateway: &TestGateway, llm: ScriptedLlm) {
     let repo: Arc<dyn MemoryRepo> = Arc::clone(&state.memory);
     let catalog: Arc<dyn komo_memory::MemoryCatalog> =
         Arc::new(komo_store::TursoMemoryRepo::new(state.db.clone()));
-    let (events, work) = komo_gateway::service::durable::memory::seams(
+    let (events, work) = komo_gateway::service::durable::background::memory::seams(
         &komo_gateway::service::test_support::driver_stream::core(gateway),
         &state.config,
         &state.clock,

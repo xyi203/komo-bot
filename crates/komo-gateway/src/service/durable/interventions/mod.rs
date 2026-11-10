@@ -28,6 +28,8 @@
 //! 启动时回放（上一代崩在投递前）与帧路径对同一个任务各投一次也只有一条。cron 会话没有来源对端，
 //! 照投 home，**不看 `notify: never`**——旧语义"faulted 不能静默"（W3b 的 `cron_watch` 只管 run 的终态）。
 
+pub mod confirms;
+
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
@@ -50,9 +52,9 @@ use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
 use super::DurableCore;
+use super::background::watch::{Source, source_of_entry};
+use super::sessions::tree::load_tree;
 use super::sessions::{SessionError, time_of};
-use super::tree::load_tree;
-use super::watch::{Source, source_of_entry};
 use crate::service::state::GatewayState;
 
 /// Session 级 document 的种类：key 是 komo Session ID，值 `{ abandoned: [任务 ID] }`。

@@ -43,9 +43,9 @@ use komo_runtime::durable::harness::{Harness, InboxItem, TOOL_KIND, WithdrawResu
 use komo_store::SessionPaths;
 use serde_json::Value;
 
-use super::DurableCore;
+use super::super::DurableCore;
+use super::SessionError;
 use super::runs::session_conversations;
-use super::sessions::SessionError;
 use crate::service::state::GatewayState;
 
 /// 补做 `closing → deleted` 的间隔。
@@ -506,7 +506,7 @@ pub async fn purge(
         SessionLifecycle::Active | SessionLifecycle::Closing => {
             return Err(SessionError::Conflict(format!(
                 "会话 {id} 现在是 {}：先 delete（purge 只从 `deleted` 起步，不替人做上一步）",
-                super::sessions::state_of(record.lifecycle).as_str()
+                super::state_of(record.lifecycle).as_str()
             )));
         }
         SessionLifecycle::Purged => {
@@ -542,7 +542,7 @@ pub async fn purge(
                         "会话 {session} 不再是 deleted，purge 取消"
                     )));
                 }
-                tx.retire_document(&super::interventions::ack_address(&session))
+                tx.retire_document(&super::super::interventions::ack_address(&session))
                     .await?;
                 tx.purge_conversations(purged_ids);
                 record.lifecycle = SessionLifecycle::Purged;

@@ -45,9 +45,9 @@ use komo_runtime::durable::harness::Harness;
 use komo_runtime::durable::{ConversationOwnership, DurableError, EntryDraft, Tx};
 use serde_json::{Value, json};
 
-use super::DurableCore;
+use super::super::DurableCore;
 use super::agent_doc;
-use super::sessions::{SessionError, ensure_open};
+use super::{SessionError, ensure_open};
 
 /// gateway 写的展示 entry 的 kind（`docs/storage-durable-d5.md` §2）。
 // entry kind 只有一份定义：kernel 的 `pi_tree` 按它们投影，这里写入用同一组常量。
@@ -275,7 +275,7 @@ pub async fn load_tree(storage: &dyn Storage, id: &str) -> Result<TreeData, Sess
 // ------------------------------------------------------------------- 忙时守卫
 
 /// 这个 conversation 为什么忙；空闲是 `None`。忙 = 有 run、收件箱非空、压缩进行中。
-pub(super) async fn busy_reason(
+pub(in crate::service::durable) async fn busy_reason(
     storage: &dyn Storage,
     conversation: ConversationId,
 ) -> Result<Option<&'static str>, SessionError> {
@@ -297,7 +297,7 @@ pub(super) async fn busy_reason(
 }
 
 /// 任一分支忙就是 [`SessionError::Busy`]（409）。
-pub(super) async fn ensure_idle(
+pub(in crate::service::durable) async fn ensure_idle(
     storage: &dyn Storage,
     tree: &TreeData,
 ) -> Result<(), SessionError> {
@@ -349,7 +349,7 @@ pub fn placement(tree: &TreeData, pos: LeafPos) -> Placement {
 
 /// 在提交里造出落点（表写：新 conversation；document 写：`komo.agent` 复制）。必须排在这次提交
 /// 的任何表读之前。返回要追加到的 conversation。
-pub(super) async fn realize(
+pub(in crate::service::durable) async fn realize(
     tx: &mut Tx,
     session: &str,
     current: ConversationId,
@@ -376,7 +376,7 @@ pub(super) async fn realize(
 
 /// 提交开始前的校验：会话还开着、结构没被别处改过（`current_branch` 与 `leaf` 和操作开始时读到的
 /// 一致）、所有分支空闲。在提交闭包里用——线上串行，读到的就是提交那一刻的状态。
-pub(super) async fn verify(
+pub(in crate::service::durable) async fn verify(
     storage: &dyn Storage,
     id: &str,
     expect: &Expect,
@@ -394,13 +394,13 @@ pub(super) async fn verify(
 
 /// 操作开始时读到的结构，提交时核对。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct Expect {
+pub(in crate::service::durable) struct Expect {
     pub current_branch: ConversationId,
     pub leaf: Option<EntryId>,
 }
 
 impl Expect {
-    pub(super) fn of(tree: &TreeData) -> Self {
+    pub(in crate::service::durable) fn of(tree: &TreeData) -> Self {
         Expect {
             current_branch: tree.session.current_branch,
             leaf: tree.session.leaf,
@@ -444,7 +444,7 @@ pub fn input_text(entry: &EntryRecord) -> Option<String> {
     }
 }
 
-pub(super) fn content_text(content: &Content) -> String {
+pub(in crate::service::durable) fn content_text(content: &Content) -> String {
     match content {
         Content::Text(text) => text.clone(),
         Content::Blocks(blocks) => blocks
@@ -602,14 +602,17 @@ impl DurableCore {
     }
 
     /// 读树并要求会话开着、所有分支空闲（树操作的前置）。
-    pub(super) async fn editable_tree(&self, session: &str) -> Result<TreeData, SessionError> {
+    pub(in crate::service::durable) async fn editable_tree(
+        &self,
+        session: &str,
+    ) -> Result<TreeData, SessionError> {
         let tree = load_tree(&*self.storage, session).await?;
         ensure_open(&tree.session)?;
         ensure_idle(&*self.storage, &tree).await?;
         Ok(tree)
     }
 
-    pub(super) fn entry_in<'a>(
+    pub(in crate::service::durable) fn entry_in<'a>(
         &self,
         tree: &'a TreeData,
         id: EntryId,
@@ -756,7 +759,7 @@ impl DurableCore {
 
     /// 在当前位置追加若干展示 / write entry（label、name、context-edit 共用）：leaf 不在末端先落分支，
     /// `current_branch` 改到落点、`leaf` 清掉；`rename` 同提交更新 `sessions.title`。
-    pub(super) async fn append_at_leaf(
+    pub(in crate::service::durable) async fn append_at_leaf(
         &self,
         session: &str,
         expect: Expect,

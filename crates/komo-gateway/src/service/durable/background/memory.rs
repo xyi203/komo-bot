@@ -12,7 +12,7 @@ use komo_kernel::types::agent::MemoryMode;
 use komo_memory::{MemoryWorkLog, SessionEvents, WORK_BATCH};
 use komo_runtime::durable::memory::{DurableMemoryWork, DurableSessionEvents, MemoryModes};
 
-use super::DurableCore;
+use super::super::DurableCore;
 use crate::service::state::GatewayState;
 use komo_kernel::traits::Shutdown;
 

@@ -1,7 +1,7 @@
 //! Durable 模式的会话树路由（`docs/storage-durable-d5.md` §7）：tree / navigate / fork /
 //! context-edit / label / name / compact。
 //!
-//! 服务层在 `service::durable::{tree, copy}`；这里只做协议翻译：
+//! 服务层在 `service::durable::sessions::{tree, copy}`；这里只做协议翻译：
 //!
 //! - `/tree` = `pi_tree(各 conversation 自己的 entry, current_branch, session.leaf)`——传**原始的**
 //!   `session.leaf`（`None` 跟末端，`Some(BEFORE_FIRST)` 在第一条之前），不传解出来的 `TreeData.leaf`。
@@ -22,8 +22,8 @@ use komo_kernel::types::ids::SessionId;
 
 use crate::http::Api;
 use crate::http::error::ApiResult;
-use crate::service::durable::copy::ForkRequest;
-use crate::service::durable::tree::{NavigateRequest, Summarizer, parse_entry_id};
+use crate::service::durable::sessions::copy::ForkRequest;
+use crate::service::durable::sessions::tree::{NavigateRequest, Summarizer, parse_entry_id};
 
 pub fn routes() -> Router<Api> {
     Router::new()

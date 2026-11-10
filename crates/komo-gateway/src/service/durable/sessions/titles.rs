@@ -57,7 +57,7 @@ async fn retitle(
         return Ok(());
     }
     let first = legacy_ids::submission_of(run).ok_or("不是 Durable 的 RunId")?;
-    let (_, entry) = super::watch::source_of(core, first).await;
+    let (_, entry) = super::super::background::watch::source_of(core, first).await;
     let entry = entry.ok_or("输入没有放置过")?;
     let stored = core
         .storage
@@ -121,7 +121,7 @@ async fn retitle(
 
 /// 标题还是 `expected`（且仍是临时值）才换：在一次提交里读改写。
 async fn replace_title_if(
-    core: &super::DurableCore,
+    core: &super::super::DurableCore,
     session: &str,
     expected: &str,
     title: &str,

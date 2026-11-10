@@ -16,7 +16,7 @@ use komo_kernel::traits::GatewayError;
 use crate::http::Api;
 use crate::http::error::{ApiFailure, ApiResult};
 use crate::http::idempotency::body_hash;
-use crate::service::durable::lifecycle;
+use crate::service::durable::sessions::lifecycle;
 
 pub fn routes() -> Router<Api> {
     Router::new()

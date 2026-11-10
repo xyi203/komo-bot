@@ -20,8 +20,8 @@ use komo_kernel::durable::{ConversationId, SessionKind, SessionLifecycle, Sessio
 use komo_kernel::types::handle::{self as short, short_handle};
 use komo_runtime::durable::harness::{Harness, task_doc};
 
-use super::DurableCore;
-use super::sessions::SessionError;
+use super::super::DurableCore;
+use super::SessionError;
 
 /// 任务短号：`#` 加子 conversation 的 6 位短号。
 pub fn handle(conversation: ConversationId) -> String {

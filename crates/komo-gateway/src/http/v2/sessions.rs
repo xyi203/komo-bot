@@ -27,9 +27,9 @@ use crate::http::error::{ApiFailure, ApiResult};
 use crate::http::idempotency::body_hash;
 use crate::service::durable::DurableCore;
 use crate::service::durable::hooks;
-use crate::service::durable::lifecycle;
 use crate::service::durable::sessions::NewSession;
-use crate::service::durable::shell;
+use crate::service::durable::sessions::lifecycle;
+use crate::service::durable::submit::shell;
 use crate::service::durable::submit::{Accepted, InputRequest, ModelOverride};
 
 pub fn routes() -> Router<Api> {
@@ -253,7 +253,7 @@ async fn submit(
         input = input.model(model);
     }
     // W3a：先挂看客再提交（标题、聊天来源的内部输入回复都靠它）。
-    crate::service::durable::watch::ensure(&api.state, &id);
+    crate::service::durable::background::watch::ensure(&api.state, &id);
     let accepted = core.submit_input(&id, input).await?;
     receipt(core, accepted).await
 }

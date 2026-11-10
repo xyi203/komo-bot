@@ -41,6 +41,10 @@
 //! `TursoStorage` 的读口目前只有一条连接（`docs/storage-durable-d5.md` §9 的风险），
 //! 并发补读的开销由 `concurrent_backfills_do_not_stall_commits` 量。
 
+#[cfg(test)]
+mod feed_tests;
+pub mod nested_view;
+
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError, Weak};
@@ -65,10 +69,10 @@ use serde_json::Value;
 use tokio::sync::mpsc;
 
 use super::DurableCore;
-use super::nested_view::{self, LiveNested};
 use super::sessions::SessionError;
-use super::tree::load_tree;
+use super::sessions::tree::load_tree;
 use crate::sse::SharedHub;
+use nested_view::LiveNested;
 
 /// 内存里同时留多少个 Session 的投影；超出就丢最久没动的（下次碰到时重新补读，不丢帧）。
 const MAX_SESSIONS: usize = 128;

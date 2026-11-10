@@ -9,7 +9,7 @@
 //!
 //! 存储只有一套（`docs/storage-durable.md`）：`durable.db`（harness 的 entry / task / submission）与
 //! `aux.db`（cron / 投递 / memory / 幂等键等辅助表）。恢复由引擎开库时的 reconciliation 与
-//! [`durable::lifecycle::boot`] 负责，后台循环在 [`durable::background`]。
+//! [`durable::sessions::lifecycle::boot`] 负责，后台循环在 [`durable::background`]。
 
 pub mod changes;
 pub mod channels;
@@ -241,9 +241,9 @@ pub async fn start(options: ServiceOptions) -> Result<Running, ServiceError> {
     //   4. 看客与未结算输入的小任务（`wait_submission` 内部会 `resume`，所以排在 3 之后）。
     durable::feed::spawn(&core, &state.hub, &shutdown).await;
     durable::interventions::spawn_attention(&state, &shutdown);
-    durable::confirms::spawn_confirm_attention(&state, &shutdown);
-    durable::lifecycle::boot(&state).await;
-    durable::watch::reattach(&state).await;
+    durable::interventions::confirms::spawn_confirm_attention(&state, &shutdown);
+    durable::sessions::lifecycle::boot(&state).await;
+    durable::background::watch::reattach(&state).await;
     core.resume();
     // 窗口探测放后台，不挡 `Gateway 就绪`。
     state.spawn_window_probes();

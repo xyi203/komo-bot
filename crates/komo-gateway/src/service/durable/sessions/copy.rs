@@ -28,12 +28,12 @@ use komo_kernel::types::refs::ContentRef;
 use komo_runtime::durable::{DraftHead, EntryDraft};
 use serde_json::{Value, json};
 
-use super::DurableCore;
+use super::super::DurableCore;
 use super::agent_doc::{self, AgentDoc};
-use super::sessions::{NewSession, SessionError, create_in};
 use super::tree::{
     BRANCH_SUMMARY_ENTRY, Expect, LABEL_ENTRY, entry_id_text, input_text, parse_entry_id, verify,
 };
+use super::{NewSession, SessionError, create_in};
 
 /// 整份复制的 blob 子目录。
 const BLOB_DIRS: [&str; 3] = ["tool-output", "artifacts", "payloads"];
@@ -242,7 +242,7 @@ fn redraft(entry: &EntryRecord, map: &HashMap<EntryId, EntryId>) -> EntryDraft {
 }
 
 #[cfg(test)]
-pub(super) type CopyHook =
+pub(in crate::service::durable) type CopyHook =
     Box<dyn FnOnce() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send>;
 
 impl DurableCore {
@@ -262,7 +262,7 @@ impl DurableCore {
     }
 
     #[cfg(test)]
-    pub(super) async fn fork_session_with_hook(
+    pub(in crate::service::durable) async fn fork_session_with_hook(
         &self,
         source: &str,
         request: ForkRequest,

@@ -32,12 +32,12 @@ pub struct DurableCore {
     /// faulted 任务的索引（W4a，`interventions`）：开库时接上提交订阅。
     pub(super) faults: Arc<super::interventions::FaultIndex>,
     /// 停在 `confirm` 的工具任务的索引（`confirms`）：同样开库时接上提交订阅。
-    pub(super) confirms: Arc<super::confirms::ConfirmIndex>,
+    pub(super) confirms: Arc<super::interventions::confirms::ConfirmIndex>,
     /// `GatewayState` 的槽（`assemble::wire` 填）：提交输入时核对规范文件是不是改过要读配置与工作目录，
     /// 这些在 `GatewayState` 上，而 `DurableCore` 先于它造出来。
     state: OnceLock<super::assemble::StateSlot>,
     /// 还没落账的 `!` 命令（只在内存里，`shell`）：停机时先终止它们、等它们落账，再关提交线。
-    pub(super) shells: super::shell::RunningShells,
+    pub(super) shells: super::submit::shell::RunningShells,
     /// feed 推过的最近事件：重连补读先看它（`feed::backfill_recent`）。
     pub(super) recent: Arc<super::feed::RecentEvents>,
     /// 测试用：受理一律走读整棵树的落点路径，好与快速路径比对（`submit::land`）。
@@ -89,7 +89,7 @@ impl DurableCore {
                 .line()
                 .subscribe_commits(move |publication| faults.observe(&publication.writes));
         }
-        let confirms = Arc::new(super::confirms::ConfirmIndex::default());
+        let confirms = Arc::new(super::interventions::confirms::ConfirmIndex::default());
         {
             let confirms = Arc::clone(&confirms);
             let _ = engine
@@ -107,7 +107,7 @@ impl DurableCore {
             faults,
             confirms,
             state: OnceLock::new(),
-            shells: super::shell::RunningShells::default(),
+            shells: super::submit::shell::RunningShells::default(),
             recent: Arc::default(),
             #[cfg(test)]
             full_tree_landing: AtomicBool::new(false),

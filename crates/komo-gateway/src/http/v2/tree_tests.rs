@@ -135,7 +135,7 @@ async fn navigating_and_editing_an_input_creates_a_sibling_that_alone_reaches_th
     let storage = komo_store::durable::TursoStorage::open(&home)
         .await
         .unwrap();
-    let data = crate::service::durable::tree::load_tree(&storage, session.as_str())
+    let data = crate::service::durable::sessions::tree::load_tree(&storage, session.as_str())
         .await
         .unwrap();
     let conversations: Vec<_> = data

@@ -23,7 +23,7 @@ use komo_runtime::durable::EntryDraft;
 use serde_json::{Value, json};
 
 use super::setup::Resolved;
-use crate::service::durable::watch::{self, Source};
+use crate::service::durable::background::watch::{self, Source};
 use crate::service::state::GatewayState;
 
 /// 渠道附注 entry 的 kind（`data {submission, platform?}`）。

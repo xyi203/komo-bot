@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use komo_gateway::service::durable::tasks::TaskLine;
+use komo_gateway::service::durable::sessions::tasks::TaskLine;
 use komo_gateway::service::test_support::driver_stream::{
     DriverStream, answer_of, core, say, submit, wait_keyed,
 };

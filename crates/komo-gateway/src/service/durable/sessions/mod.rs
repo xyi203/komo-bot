@@ -8,6 +8,21 @@
 //! 错误统一用 [`SessionError`]：调用方（HTTP 层）按变体映射状态码——`NotFound` 404、`Invalid` 400、
 //! `NotOpen` / `Busy` / `Conflict` / `RequestKeyConflict` 409、`Internal` 500。
 
+pub mod agent_doc;
+pub mod copy;
+pub mod lifecycle;
+#[cfg(test)]
+mod lifecycle_tests;
+#[cfg(test)]
+mod run_tests;
+pub mod runs;
+pub mod search;
+#[cfg(test)]
+mod session_tests;
+pub mod tasks;
+pub mod titles;
+pub mod tree;
+
 use komo_kernel::durable::storage::{EntryQuery, SessionQuery};
 use komo_kernel::durable::{
     ConversationId, EntryId, ScanOrder, SessionCursor, SessionKind, SessionLifecycle,
@@ -21,7 +36,7 @@ use komo_runtime::durable::{ConversationOwnership, DurableError, Tx};
 use time::OffsetDateTime;
 
 use super::DurableCore;
-use super::agent_doc::{self, AgentDoc};
+use agent_doc::AgentDoc;
 
 /// 来源 `home`：主会话的 `source`（旧 komo 的 `HOME_ORIGIN`）。
 pub const HOME_SOURCE: &str = "home";
@@ -424,7 +439,7 @@ impl DurableCore {
         let (current_run, current_state, current_wait) = match &live.run {
             Some(run) => {
                 let first = run.inputs.first().copied();
-                match live.generation.as_ref().and_then(super::runs::retry_wait) {
+                match live.generation.as_ref().and_then(runs::retry_wait) {
                     Some(wait) => (first, Some(RunState::Waiting), Some(wait)),
                     None => (first, Some(RunState::Running), None),
                 }

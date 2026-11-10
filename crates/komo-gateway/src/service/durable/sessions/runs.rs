@@ -41,14 +41,14 @@ use komo_runtime::durable::harness::{GenerationLive, Harness, WithdrawResult};
 use serde_json::Value;
 use time::OffsetDateTime;
 
-use super::DurableCore;
-use super::sessions::{SessionError, time_of};
-use super::shell::SHELL_ENTRY;
+use super::super::DurableCore;
+use super::super::submit::shell::SHELL_ENTRY;
+use super::{SessionError, time_of};
 
 const SCAN_PAGE: usize = 512;
 
 /// 一个 `Message` 若是 user 消息，它的文字（块里的文本拼起来）。
-pub(super) fn user_text_of(message: &Message) -> Option<String> {
+pub(in crate::service::durable) fn user_text_of(message: &Message) -> Option<String> {
     match message {
         Message::User(user) => Some(super::tree::content_text(&user.content)),
         _ => None,
@@ -56,7 +56,7 @@ pub(super) fn user_text_of(message: &Message) -> Option<String> {
 }
 
 /// 等重试的那一格：重试到点时刻、已用次数（`RunState::Waiting` 的 `wait`）。
-pub(super) fn retry_wait(generation: &GenerationLive) -> Option<WaitReason> {
+pub(in crate::service::durable) fn retry_wait(generation: &GenerationLive) -> Option<WaitReason> {
     let retry = generation.retry.as_ref()?;
     Some(WaitReason::Retry {
         attempts: generation.attempt,
@@ -141,7 +141,7 @@ async fn load_log(
 }
 
 /// 一个 Session 的全部 conversation（按 ID 升序）。
-pub(super) async fn session_conversations(
+pub(in crate::service::durable) async fn session_conversations(
     storage: &dyn Storage,
     session: &str,
 ) -> Result<Vec<ConversationRecord>, SessionError> {

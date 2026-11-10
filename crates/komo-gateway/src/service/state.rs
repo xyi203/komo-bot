@@ -260,7 +260,7 @@ impl GatewayState {
         // 后台探测。配置热重载会换掉它（`GatewayState::refresh_reranker`）。
         let reranker = build_reranker(&snapshot, &config);
         // 事件与工作队列走新存储（W3c）。
-        let (events, work) = super::durable::memory::seams(&durable, &config, &clock);
+        let (events, work) = super::durable::background::memory::seams(&durable, &config, &clock);
         // 事项的承诺类操作与 `memory add` 读同一份事件找用户原话（`docs/goals.md` §4）。
         let matter_repo: Arc<dyn komo_kernel::traits::MatterRepo> =
             Arc::new(TursoMatterRepo::new(db.clone()));
@@ -534,7 +534,7 @@ impl GatewayState {
         scheduled: bool,
     ) {
         let watched = super::cron_watch::Watched::of(fired, job, scheduled);
-        super::durable::cron_watch::watch(Arc::clone(self), watched);
+        super::durable::background::cron_watch::watch(Arc::clone(self), watched);
     }
 
     /// 模型 / 凭证变了：换掉实例。**正在跑的 Run 不换**——它握着自己那一个 driver。

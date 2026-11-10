@@ -11,11 +11,11 @@
 //! - **「更新本次触发状态」**：终态 → `ok` / `error`。手动 run 没有触发记录，`settle`
 //!   什么都不写（§10：手动 run 不冒充定时触发）。
 //!
-//! **订阅那一层在 [`super::durable::cron_watch`]**：等 submission 结算再读终态帧。这里是
+//! **订阅那一层在 [`super::durable::background::cron_watch`]**：等 submission 结算再读终态帧。这里是
 //! Cron 自己的那两件事——回写触发状态与按 `notify` 过滤结果。
 //!
 //! 它**不是**恢复机制：重启后靠 `deliveries` 表里那一行 pending 补发（§11.4）与
-//! `durable::cron::recover` 重挂看客，不靠这里再看一遍。
+//! `durable::background::cron::recover` 重挂看客，不靠这里再看一遍。
 
 use std::sync::Arc;
 
@@ -39,7 +39,7 @@ pub struct Watched {
     /// 手动 run 没有触发记录，不回写状态（§10）。
     pub scheduled: bool,
     /// 这个 Job 是不是命令直跑模式（§10）：是的话，终态的 ok / error 与投递正文不看模型
-    /// 回复，改读 `shell.command` 落下的那次 `bash` 结果（`durable::cron_watch`）。
+    /// 回复，改读 `shell.command` 落下的那次 `bash` 结果（`durable::background::cron_watch`）。
     pub is_command: bool,
 }
 

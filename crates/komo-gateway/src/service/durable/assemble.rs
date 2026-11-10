@@ -11,7 +11,8 @@ use std::sync::{Arc, OnceLock, Weak};
 use komo_runtime::durable::harness::{AgentHooks, OrchestrationHooks};
 use komo_tools::tools::detach::DetachSlot;
 
-use super::{hooks, monitor_runner, orchestration};
+use super::background::monitor_runner;
+use super::{hooks, orchestration};
 use crate::service::state::GatewayState;
 
 /// 钩子拿到 `GatewayState` 的槽。

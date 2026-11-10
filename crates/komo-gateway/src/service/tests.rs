@@ -1361,7 +1361,7 @@ mod chat {
             .iter()
             .flat_map(|branch| branch.entries.iter())
             .filter(|entry| entry.kind == "chat.input")
-            .find_map(crate::service::durable::tree::input_text)
+            .find_map(crate::service::durable::sessions::tree::input_text)
             .expect("这条输入放置过");
         assert!(text.starts_with("> 【话题上下文】"), "{text}");
         assert!(

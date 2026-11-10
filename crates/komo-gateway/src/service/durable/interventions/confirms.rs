@@ -28,9 +28,9 @@ use komo_runtime::durable::harness::{ConfirmAnswer, ConfirmVerdict, TOOL_KIND, c
 use serde_json::Value;
 use tokio::sync::mpsc;
 
-use super::DurableCore;
-use super::interventions::{RunLookup, deliver_attention, task_entry};
-use super::sessions::{SessionError, time_of};
+use super::super::DurableCore;
+use super::super::sessions::{SessionError, time_of};
+use super::{RunLookup, deliver_attention, task_entry};
 use crate::service::state::GatewayState;
 
 const SCAN_PAGE: usize = 512;
@@ -300,7 +300,7 @@ impl DurableCore {
         Ok(serde_json::from_value(record.value).ok())
     }
 
-    pub(super) async fn confirm_summary(
+    pub(in crate::service::durable) async fn confirm_summary(
         &self,
         found: &Confirming,
         runs: &mut RunLookup,
@@ -327,7 +327,10 @@ impl DurableCore {
         }
     }
 
-    pub(super) async fn confirm_detail(&self, found: &Confirming) -> InterventionDetail {
+    pub(in crate::service::durable) async fn confirm_detail(
+        &self,
+        found: &Confirming,
+    ) -> InterventionDetail {
         InterventionDetail::Confirm {
             summary: self.confirm_summary(found, &mut RunLookup::default()).await,
             tool: found.tool.clone(),
@@ -337,7 +340,7 @@ impl DurableCore {
     }
 
     /// 答复一张确认卡：写 `komo.confirm`（谁、什么时候、什么结论）。已经答过返回原结论。
-    pub(super) async fn answer_confirm(
+    pub(in crate::service::durable) async fn answer_confirm(
         &self,
         found: &Confirming,
         verdict: InterventionVerdict,
@@ -459,8 +462,7 @@ pub fn spawn_confirm_attention(state: &Arc<GatewayState>, shutdown: &Shutdown) {
             }
         }
         loop {
-            let received =
-                tokio::time::timeout(super::interventions::SHUTDOWN_POLL, receiver.recv()).await;
+            let received = tokio::time::timeout(super::SHUTDOWN_POLL, receiver.recv()).await;
             if shutdown.is_cancelled() {
                 return;
             }

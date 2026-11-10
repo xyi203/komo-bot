@@ -44,8 +44,8 @@ use serde_json::{Value, json};
 
 use super::sections::recall_scopes;
 use super::setup::Resolved;
-use crate::service::durable::cron::CRON_INPUT;
-use crate::service::durable::watch;
+use crate::service::durable::background::cron::CRON_INPUT;
+use crate::service::durable::background::watch;
 use crate::service::state::GatewayState;
 
 /// 视图里一个还展示着条目的召回块。

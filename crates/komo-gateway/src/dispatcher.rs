@@ -47,7 +47,7 @@ use komo_kernel::types::status::{RunState, WaitReason};
 use komo_runtime::durable::harness::{Harness, InputEntry, WhenBusy};
 use serde_json::json;
 
-use crate::service::durable::watch::{self, CHAT_INPUT, Source};
+use crate::service::durable::background::watch::{self, CHAT_INPUT, Source};
 use crate::service::durable::{DurableCore, SessionError};
 use crate::service::state::GatewayState;
 

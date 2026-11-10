@@ -17,9 +17,9 @@ use komo_kernel::types::status::RunState;
 use komo_runtime::durable::harness::live::{self, GenerationLive, LiveState, RunControl};
 use tokio::sync::broadcast::Receiver;
 
-use super::feed;
-use super::sessions::NewSession;
-use super::submit::InputRequest;
+use super::super::sessions::NewSession;
+use super::super::submit::InputRequest;
+use crate::service::durable::feed;
 use crate::service::test_support::harness::{FakeLlm, call_round, text_round};
 use crate::service::test_support::{TestGateway, config_toml};
 
@@ -371,7 +371,7 @@ async fn concurrent_backfills_do_not_stall_commits() {
     }
 
     async fn commits(
-        core: &super::DurableCore,
+        core: &super::super::DurableCore,
         conversation: ConversationId,
         n: usize,
     ) -> Duration {

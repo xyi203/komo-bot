@@ -1,5 +1,7 @@
 # Session 树（pi 对齐）：用 fork 表达，实现说明与待验证项
 
+> 状态：已实施的方案记录（2026-10-25 换成 fork 后的实现、验证与待验证项）；用户行为的规格在 `docs/komo_bot.md` §8.11。
+
 用户行为的设计决策在 `docs/komo_bot.md` §8.11；本文记录**新存储（pi-durable 提交模型，`docs/storage-durable.md`）下已经实现了什么、怎么验证、还差什么**。对照基线是 pi coding-agent 1.4.0（`core/session-manager`、`AgentSession.navigateTree`）。状态截至 2026-10-25。
 
 2026-10-23 的第一版把树存成 events.jsonl 里带 `parentId` 的 pi v3 entry（`SessionEntry` 记录加 `komo` 执行元数据、`TreeState`、`tree_codec`）；2026-10-25 随存储重写**整体换成 fork**，用户行为、HTTP 路由与 TUI 命令不变，旧的 JSONL 树实现已在 v0.8 存储重写中移除，也不读旧会话。

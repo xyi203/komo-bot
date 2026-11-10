@@ -1,6 +1,6 @@
 # Handoff：由模型发起的"交接后换上下文"
 
-> 状态：**提议，未实施**（2026-10-26）。来源：pi-durable 的工具控制 `control.handoff`（本机 `../pi`
+> 状态：**草案未批准，未实施**（2026-10-26 提议；2026-11-10 核对，代码里仍没有 `handoff` 工具）。来源：pi-durable 的工具控制 `control.handoff`（本机 `../pi`
 > 提交 `d5b3de22d`：spec §7.3、§8.1、§8.5，README "Reset and Handoff"；`38ff99177` 修正为"run 继续"），
 > 以及 pi coding-agent 的 `/handoff` 扩展示例（`packages/coding-agent/examples/extensions/handoff.ts`）。
 > 文中 §x 不带文件名时指 `komo_bot.md`。

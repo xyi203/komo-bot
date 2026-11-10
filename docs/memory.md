@@ -1,6 +1,6 @@
 # komo Memory
 
-> 状态：§9.1–§9.7 是 Memory 的**规格**，2026-10-19 从 [`komo_bot.md`](komo_bot.md) §9 原样迁来，小节号不变——代码注释与其他文档里的 §9.x 照旧指这里。§9.8–§9.10 已实现（§9.10 含 `used` 采纳）。各节标"2026-10-28，附录 F"的段落（约定与线索、相关度门槛、注入分组、索引输入含条件、`classify`）已于 2026-10-28 实现并通过验收（见 §9.4「附录 F 的实现与验收」）。附录 A–F 是调研、分析与评估，不是规格；与正文冲突时以正文为准，任何一条要落地，先改正文。
+> 状态：现行规格。§9.1–§9.7 是 Memory 的**规格**，2026-10-19 从 [`komo_bot.md`](komo_bot.md) §9 原样迁来，小节号不变——代码注释与其他文档里的 §9.x 照旧指这里。§9.8–§9.10 已实现（§9.10 含 `used` 采纳）。各节标"2026-10-28，附录 F"的段落（约定与线索、相关度门槛、注入分组、索引输入含条件、`classify`）已于 2026-10-28 实现并通过验收（见 §9.4「附录 F 的实现与验收」）。附录 A–F 是调研、分析与评估，不是规格；与正文冲突时以正文为准，任何一条要落地，先改正文。
 > 2026-10-25 起 Memory 跑在新存储上（`docs/storage-durable.md`）：条目 / 证据 / 索引 / 采纳计数在 `aux.db`（toasty，与 `durable.db` 分库），会话内容是 `durable.db` 的 entry，证据引用仍是 `Seq` / `RunId`（新编码，`komo-kernel/src/durable/legacy_ids.rs`）；注入是每个 Run 一条 `komo.memory.recall` entry（2026-10-28 修订，§9.4；此前是系统段 `memory` + 会话级 document `komo.memory`），提取游标是 document `komo.memory_cursor`，提取读的是 entry / submission 经 `legacy_events` 投影出的事件。正文里仍写"事件""Run""`memory.injected`"的地方指这层投影的词汇，不再是 JSONL 事件。
 > 文中不带文件名的其他章节号（§3、§8.2、§8.5、§10 …）指 [`komo_bot.md`](komo_bot.md)。附录内的编号只在本附录内有效。
 

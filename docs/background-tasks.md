@@ -1,6 +1,6 @@
 # 后台任务：结果交回 home
 
-> 状态：已落地（2026-10-08），2026-10-25 起跑在新存储（pi-durable 提交模型）上。取代 `docs/home-dispatcher.md` 那套"home 改成分发器"的设计；
+> 状态：现行规格，已落地（2026-10-08），2026-10-25 起跑在新存储（pi-durable 提交模型）上。取代 `docs/home-dispatcher.md` 那套"home 改成分发器"的设计；
 > 与 `docs/komo_bot.md` 冲突处以本文为准。
 > 2026-10-16 定并落地：`dispatch` + `follow` 合成 `task`，同步 `delegate` 删掉，加 `model` / `effort` / `contract`，交回的结果在宿主还在跑时并入（§2a）。
 > 2026-10-23 定并落地：`context: "fork"`，任务带着父会话的上下文起步、复用父的提示缓存（§2b）。

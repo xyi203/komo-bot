@@ -1,3 +1,5 @@
+> 状态：已实施的方案记录（依据旧 `main` `27ae66c` 的审阅建议）。§八 的批次 0–3 已落地：`komo-agent`（2026-09-22）、多 Agent 与会话归属、Run 冻结身份与能力面、`skill://` / `tool://` / `artifact://` 只读入口；“独立批次：工具并发”在新存储上的现状未核实。文中引用的旧代码位置（`segment`、Ledger、Policy / 审批）已不存在；代码注释仍引用本文 §四。
+>
 > 2026-10-11 起没有 Policy 与审批（`docs/komo_bot.md` §7）：模型要的调用过了工具自己的 `prepare` 与
 > AgentSurface 就执行，唯一的硬限制是 write / edit 拒绝 komo 自己的状态目录。下文描述旧代码处（Policy、
 > 审批仓库、`VerificationGate`）是当时的事实，按建议写到 Policy / 审批的地方已改写或加注。

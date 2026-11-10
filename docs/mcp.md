@@ -1,6 +1,6 @@
 # MCP
 
-> 状态：已落地（2026-10-08）。与 `docs/komo_bot.md` 冲突处以本文为准。codemode 见
+> 状态：现行规格，已落地（2026-10-08）。与 `docs/komo_bot.md` 冲突处以本文为准。codemode 见
 > `docs/codemode.md`。2026-10-14 起 MCP 工具默认只在 codemode 里调（§3，照 pi 的 exposure）。
 
 ## 1. 形状

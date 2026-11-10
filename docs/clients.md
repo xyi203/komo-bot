@@ -1,6 +1,6 @@
 # 客户端：网页、macOS、手机
 
-> 状态：草案（2026-11-01）；**C0 已实现（2026-11-02，§6.1）、C1 已实现（2026-11-03，§6.2）、C2 已实现（§6.3，未签名）**。已由操作者拍板的有三条：前端栈用 TanStack Start、macOS 用 Electron、网页由 Gateway 托管
+> 状态：部分实施。草案（2026-11-01）；**C0 已实现（2026-11-02，§6.1）、C1 已实现（2026-11-03，§6.2）、C2 已实现（§6.3，未签名）**，C3（远程访问、设备配对、PWA 与 Web Push）、C4 未做。已由操作者拍板的有三条：前端栈用 TanStack Start、macOS 用 Electron、网页由 Gateway 托管
 > （借鉴 Hermes Agent 与 DeepSeek Harness，见 §7）；2026-11-02 补拍板：新版界面要多语言，语言偏好只存在各端（D9）；
 > 同日操作者认可按 §2 的建议做 D1–D6、D9（文案表用 Paraglide JS）。D7、D8 仍是建议。
 > 取代 [`roadmap-muse.md`](roadmap-muse.md) §4.4"手机端先用飞书，不做原生 App"。界面规格在 [`web.md`](web.md)（C1 起是新版的规格），

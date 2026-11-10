@@ -1,6 +1,6 @@
 # komo 可观测性
 
-> 状态：2026-10-19 认可第一版；**2026-10-26 按新存储与 pi-durable 的遥测重写 §1、§3、§5、§9**（提议，未实施）。
+> 状态：部分实施。2026-10-19 认可第一版；**2026-10-26 按新存储与 pi-durable 的遥测重写 §1、§3、§5、§9**（提议，未实施；2026-11-10 核对，`komo-runtime/src/durable/` 仍没有 span）。
 > 第一版已实现、现在仍在工作的：依赖、`[telemetry]`、`init_tracing` 接 OTel 层、`komo doctor` 的导出状态、日志单写轮转与
 > 空闲降级（§4、§6）；后台 span（`komo.memory.extract` · `komo.memory.consolidate` · `komo.cron.firing` · `komo.delivery` ·
 > `komo.mcp.connect`）与记忆 / 投递 / Cron / MCP 指标；辅助模型调用（记忆、重排、标题、分支摘要、embedding）的 `chat` /

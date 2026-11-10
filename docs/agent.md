@@ -1,5 +1,7 @@
 # Komo Agent 层收口重构设计
 
+> 状态：已实施的方案记录。系统段装配（§5、§10、§11）、记忆渲染（§13.2）与 skills 目录（§14）已按本文落在 `komo-agent`，代码注释仍引用这些小节。§1、§1.1、§17 与 §20 的 Phase 0 / 2 / 4 描述的是收口前的旧代码：`komo-gateway/src/service/segment.rs`、`context_sources.rs` 已随存储重写删除（2026-10-25，gateway 侧装配现在在 `service/durable/hooks/`），`MemoryManager::prepare_segment` 已于 2026-11-10 删除，Phase 2 计划的 `komo-agent/src/context/history.rs` 没有建（历史回放换成了 kernel 的上下文推导，见 `docs/storage-durable.md`）。
+
 ## 1. 结论
 
 当前 Komo 的主干架构已经基本稳定：

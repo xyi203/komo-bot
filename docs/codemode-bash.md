@@ -1,6 +1,6 @@
 # codemode 脚本里调 bash：嵌套调用的 live 槽位
 
-> 状态：**已实施**（2026-10-26），验收记录见 §7，TUI 画子调用见 §8，§1 保留实施前的现状。来源：pi-durable 的嵌套调用（本机 `../pi` 提交 `d5b3de22d`：
+> 状态：**已实施的方案记录**（2026-10-26），验收记录见 §7，TUI 画子调用见 §8，§1 保留实施前的现状。来源：pi-durable 的嵌套调用（本机 `../pi` 提交 `d5b3de22d`：
 > `packages/durable/docs/spec.md` §7.3「nested calls」、`src/harness/tool.ts` 的 `pi.live.nestedTools`、
 > `src/codemode/codemode.ts` 对 bash 非零退出的处理）。文中 §x 不带文件名时指 `codemode.md`。
 

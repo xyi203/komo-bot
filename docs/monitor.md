@@ -1,6 +1,6 @@
 # 监听：脚本每出一行，就交回会话一条
 
-> 状态：已落地（2026-10-14）；长 `bash` 自动转后台与对话会话禁 `sleep` 等待见 §8（2026-10-19）。与 `docs/komo_bot.md` 冲突处以本文为准。
+> 状态：现行规格，已落地（2026-10-14）；长 `bash` 自动转后台与对话会话禁 `sleep` 等待见 §8（2026-10-19）。与 `docs/komo_bot.md` 冲突处以本文为准。
 > 新存储上：监听的登记、工具任务的起停与恢复、结束 / 中断消息的原子交回、重启对账在 runtime（`docs/storage-durable.md` §13.2，`harness/orchestration/monitor.rs`），进程与泵留在 gateway（D5）；§5 的登记是 `komo.monitors` document，重启对账是 `Harness::reconcile_monitors`；旧的 `runtime/monitors/<id>.json` 登记已移除。
 
 ## 1. 问题

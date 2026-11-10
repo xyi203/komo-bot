@@ -1,6 +1,6 @@
 # codemode：Monty 里的 Python 脚本
 
-> 状态：已实现 Monty 引擎与持久化子调用（2026-10-15 起引擎由"CPython + 操作系统沙箱"换成 pydantic
+> 状态：现行规格。已实现 Monty 引擎与持久化子调用（2026-10-15 起引擎由"CPython + 操作系统沙箱"换成 pydantic
 > Monty；此前的实现见 git 历史）。脚本在 komo 自己起的 worker 子进程里跑，工具调用由宿主执行；
 > 允许 read / rg、`write` / `edit`、bash 及有副作用 MCP（照 pi，2026-10-26 起 `write` / `edit` 也能在脚本里调）；
 > Monty 自身的文件访问仍然**只读**，写文件只经 `tools.write` / `tools.edit`。

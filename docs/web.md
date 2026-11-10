@@ -1,6 +1,6 @@
 # Web 客户端
 
-> 状态：新版（C1 完成，2026-11-03），代码在 `apps/client/`（TanStack Start SPA 模式），接真实 Gateway、无样例数据。W0 原型（`apps/web`、`serve.mjs`）已删除。本文是界面行为的规格：每一节标出新版代码的位置；原型有、新版有意不搬或改了的，写在 §17。与 `docs/komo_bot.md` 冲突处以设计文档为准。
+> 状态：现行规格。新版（C1 完成，2026-11-03），代码在 `apps/client/`（TanStack Start SPA 模式），接真实 Gateway、无样例数据。W0 原型（`apps/web`、`serve.mjs`）已删除。本文是界面行为的规格：每一节标出新版代码的位置；原型有、新版有意不搬或改了的，写在 §17。与 `docs/komo_bot.md` 冲突处以设计文档为准。
 
 ## 1. 定位
 

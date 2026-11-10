@@ -1,6 +1,8 @@
 # Komo Observation / Artifact 与 Context Projection 设计
 
-> Status: Proposal —— **一半已落地（2026-09-21），按请求投影（衰减）与在线压缩已落地（2026-10-09），衰减 2026-10-10 改为缓存优先**，见下面「落地情况」
+> 状态：历史设计，已被取代。现状见 `docs/komo_bot.md` §8.3（工具结果正文与投影）、§6（衰减与压缩）和 `docs/storage-durable.md`（新存储上的 `komo.decay` / `komo.compaction`）。下面「落地情况」写于旧存储（`tool.result` / `context.compacted` 事件、`model_result_bytes` 默认 8 KiB 等），其中的事件名、默认值与路径已经变了。`crates/komo-gateway/tests/observation/` 的注释引用本文 M1–M3，所以留在原路径、不移进 `docs/archive/`。
+>
+> 原 Status: Proposal —— **一半已落地（2026-09-21），按请求投影（衰减）与在线压缩已落地（2026-10-09），衰减 2026-10-10 改为缓存优先**，见下面「落地情况」
 > Scope: Tool Result、Blob/Artifact、Context Projection、Observation Recall
 > Inspired by: SoL-Pi ObservationPack / Evidence-Preserving Reducer
 > Target: Komo first production-ready harness

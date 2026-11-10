@@ -16,9 +16,9 @@ use serde_json::{Map, Value, json};
 
 use super::{Assembled, Credential, OpenAiResponsesLlm, check_effort, replay, wire};
 use crate::llm::model_stream::{
-    API_RESPONSES, ModelRequest, ModelStream, UserPart, assistant_replay, final_message,
-    lenient_arguments, partial_message, plain_text, replay_system, stop_reason, thinking_block,
-    tool_result_run, transport_error, user_parts,
+    API_RESPONSES, ModelRequest, ModelStream, Next, ProgressThrottle, UserPart, assistant_replay,
+    final_message, lenient_arguments, partial_message, plain_text, replay_system, stop_reason,
+    thinking_block, tool_result_run, transport_error, user_parts,
 };
 use crate::llm::sse::SseDecoder;
 use crate::llm::transport::HttpRequest;
@@ -134,7 +134,14 @@ impl ModelStream for OpenAiResponsesLlm {
         let started = Instant::now();
         let mut stats = (None, 0usize);
         let outcome = self
-            .stream_round_trip(model, http, progress, started, &mut stats)
+            .stream_round_trip(
+                model,
+                http,
+                progress,
+                request.options.progress_interval,
+                started,
+                &mut stats,
+            )
             .await;
         let elapsed_ms = started.elapsed().as_millis() as u64;
         match &outcome {
@@ -170,6 +177,7 @@ impl OpenAiResponsesLlm {
         model: &ModelConfig,
         http: HttpRequest,
         progress: &mut F,
+        progress_interval: Option<Duration>,
         started: Instant,
         stats: &mut (Option<u64>, usize),
     ) -> Result<AssistantMessage, LlmError> {
@@ -209,7 +217,20 @@ impl OpenAiResponsesLlm {
         let mut stream = response.body;
         let mut decoder = SseDecoder::new();
         let mut assembled = Assembled::default();
-        while let Some(chunk) = stream.next().await {
+        let mut throttle = ProgressThrottle::new(progress_interval);
+        loop {
+            let chunk = match throttle.next(&mut stream).await {
+                Next::Item(Some(chunk)) => chunk,
+                Next::Item(None) => break,
+                Next::Due => {
+                    progress(&partial_message(
+                        model,
+                        API_RESPONSES,
+                        assembled.content_so_far(),
+                    ));
+                    continue;
+                }
+            };
             let chunk = chunk.map_err(transport_error)?;
             if !chunk.is_empty() {
                 stats.0.get_or_insert(started.elapsed().as_millis() as u64);
@@ -223,7 +244,7 @@ impl OpenAiResponsesLlm {
             if assembled.settled() {
                 break;
             }
-            if changed {
+            if changed && throttle.changed() {
                 progress(&partial_message(
                     model,
                     API_RESPONSES,

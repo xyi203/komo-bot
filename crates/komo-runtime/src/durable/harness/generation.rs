@@ -611,6 +611,8 @@ impl GenerationTask {
                 cache_key: request.cache_key.as_deref(),
                 max_output_tokens: request.max_output_tokens,
                 revised_from: request.revised_from,
+                // 快照只有 `commit_partials` 每个间隔取一次，多造的直接被覆盖。
+                progress_interval: Some(interval),
             });
         let sink = latest.clone();
         let mut progress = move |partial: &AssistantMessage| {

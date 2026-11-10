@@ -287,6 +287,7 @@ impl CompactionTask {
                 cache_key: request.cache_key.as_deref(),
                 max_output_tokens: request.max_tokens,
                 revised_from: None,
+                progress_interval: None,
             });
         let mut progress = |_: &AssistantMessage| {};
         let cancelled = rt.cancelled();

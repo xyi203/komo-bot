@@ -21,7 +21,7 @@
 //! `api` 但形状对得上）就把 `providerBlocks` 原样放回，否则只从 `content` 重建文字与调用
 //! ——和旧 driver 的 `ReplayMessage::provider_blocks` 同一条规则。
 
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use komo_kernel::durable::{
@@ -109,6 +109,10 @@ pub struct RequestOptions<'a> {
     /// （衰减）时，给最早被换的那条的下标。旧 driver 的 `revised_from`：缓存断点要补在它
     /// 之前最后一条 user 消息上，换视图那一轮才不会整段缓存重写。不给 = 没有衰减发生。
     pub revised_from: Option<usize>,
+    /// 部分消息最快多久造一份交给 `progress`（调用方的节流间隔，harness 给 `partial_interval`）。
+    /// 每份快照都要克隆已收到的全部文字、重解析工具参数，逐块造是平方成本；给了间隔就最多每
+    /// 间隔一份，中间到的块欠着，到点没有新块也补一份（显示不会停在旧内容上）。不给 = 每块一份。
+    pub progress_interval: Option<Duration>,
 }
 
 /// 消息里的图片引用 `{mime, path, hash}`（§3.5 第 4 条：base64 不进任何记录）。
@@ -522,6 +526,72 @@ pub(super) fn thinking_block(thinking: String, extra: Map<String, Value>) -> Con
     ContentBlock::Thinking { thinking, extra }
 }
 
+/// 部分消息的节流（[`RequestOptions::progress_interval`]）：首块立刻造，之后每间隔最多一份；
+/// 间隔内到的块记成"欠一份"，到点（[`Self::next`] 等块等到截止）补上。
+pub(super) struct ProgressThrottle {
+    interval: Option<Duration>,
+    last: Option<tokio::time::Instant>,
+    owed: bool,
+}
+
+/// [`ProgressThrottle::next`] 等到的东西。
+pub(super) enum Next<T> {
+    /// 流里的下一项（`None`：流完了）。
+    Item(Option<T>),
+    /// 欠着的那份到点了：现在造一份快照。
+    Due,
+}
+
+impl ProgressThrottle {
+    pub(super) fn new(interval: Option<Duration>) -> Self {
+        ProgressThrottle {
+            interval,
+            last: None,
+            owed: false,
+        }
+    }
+
+    /// 收到了新内容：现在该造快照就返回 `true`（记作已造），否则记下欠一份。
+    pub(super) fn changed(&mut self) -> bool {
+        let now = tokio::time::Instant::now();
+        let due = match (self.interval, self.last) {
+            (Some(interval), Some(last)) => now.duration_since(last) >= interval,
+            _ => true,
+        };
+        if due {
+            self.last = Some(now);
+            self.owed = false;
+        } else {
+            self.owed = true;
+        }
+        due
+    }
+
+    /// 等流的下一项；欠着一份时最多等到截止，到点返回 [`Next::Due`]（记作已造）。
+    /// `StreamExt::next` 可以中途丢弃，超时不丢块。
+    pub(super) async fn next<S>(&mut self, stream: &mut S) -> Next<S::Item>
+    where
+        S: futures_util::Stream + Unpin,
+    {
+        use futures_util::StreamExt;
+        let deadline = match (self.owed, self.interval, self.last) {
+            (true, Some(interval), Some(last)) => last.checked_add(interval),
+            _ => None,
+        };
+        let Some(deadline) = deadline else {
+            return Next::Item(stream.next().await);
+        };
+        match tokio::time::timeout_at(deadline, stream.next()).await {
+            Ok(item) => Next::Item(item),
+            Err(_) => {
+                self.last = Some(tokio::time::Instant::now());
+                self.owed = false;
+                Next::Due
+            }
+        }
+    }
+}
+
 /// 参数 JSON 文本 → 值；还没收齐（流进行中）就给空对象。
 pub(super) fn lenient_arguments(raw: &str) -> Value {
     serde_json::from_str(raw).unwrap_or_else(|_| json!({}))
@@ -575,5 +645,58 @@ impl LlmFactory {
                 provider: other.to_string(),
             }),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use futures_util::StreamExt;
+
+    use super::{Next, ProgressThrottle};
+
+    /// 每项之前先睡给定的毫秒数（暂停的时钟上，时间只靠 sleep 推进）。
+    fn paced(gaps: &'static [u64]) -> impl futures_util::Stream<Item = usize> + Unpin {
+        futures_util::stream::iter(gaps.iter().enumerate())
+            .then(|(index, gap)| async move {
+                tokio::time::sleep(Duration::from_millis(*gap)).await;
+                index
+            })
+            .boxed()
+    }
+
+    /// 跑完一条流，记下每次造快照时已经收到了几项。
+    async fn snapshots(interval: Option<u64>, gaps: &'static [u64]) -> Vec<usize> {
+        let mut stream = paced(gaps);
+        let mut throttle = ProgressThrottle::new(interval.map(Duration::from_millis));
+        let mut received = 0;
+        let mut built = Vec::new();
+        loop {
+            match throttle.next(&mut stream).await {
+                Next::Item(Some(_)) => {
+                    received += 1;
+                    if throttle.changed() {
+                        built.push(received);
+                    }
+                }
+                Next::Item(None) => return built,
+                Next::Due => built.push(received),
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn snapshots_follow_the_interval_and_a_stall_still_gets_the_latest_content() {
+        // 不给间隔：逐项一份。
+        assert_eq!(snapshots(None, &[0, 10, 10, 10]).await, [1, 2, 3, 4]);
+        // 250ms 间隔、每 10ms 一项：首项立刻，之后每 250ms 一份（到点补的是那时已收到的全部）。
+        let gaps: &'static [u64] = &[10; 60];
+        let built = snapshots(Some(250), gaps).await;
+        assert_eq!(built.first(), Some(&1));
+        assert!(built.len() <= 600 / 250 + 2, "{built:?}");
+        assert!(built.windows(2).all(|pair| pair[0] < pair[1]), "{built:?}");
+        // 第 2 项落在间隔里欠着，之后停顿 1s：到点补一份，不等第 3 项。
+        assert_eq!(snapshots(Some(250), &[0, 10, 1000]).await, [1, 2, 3]);
     }
 }

@@ -556,6 +556,7 @@ async fn run_both(case: &Case) -> Outcome {
             cache_key: Some("s-1"),
             max_output_tokens: None,
             revised_from,
+            progress_interval: None,
         });
         let assistant = stream
             .stream(&request, &mut |_| {})
@@ -1180,6 +1181,49 @@ async fn progress_sees_partial_messages_and_the_final_one_is_only_returned() {
         assert!(seen.iter().any(|m| text_of(m).contains("你好")), "{p:?}");
         assert_eq!(calls_of(&done).len(), 1);
         assert!(done.extra.contains_key(PROVIDER_BLOCKS));
+    }
+}
+
+#[tokio::test]
+async fn a_throttled_stream_builds_one_snapshot_per_interval_and_the_same_final_message() {
+    for p in ALL {
+        let config = p.config(None);
+        let say = Say {
+            thinking: Some("想"),
+            text: Some("你好世界"),
+            calls: vec![("call_1", "read", json!({ "path": "a.txt" }))],
+        };
+        let messages = vec![Message::user("hi", 0)];
+        let run = |interval| {
+            let transport = ScriptedTransport::new(vec![p.reply(&say, 0)]);
+            let config = config.clone();
+            let messages = messages.clone();
+            async move {
+                let stream = factory(&transport)
+                    .build_stream(&config, ModelRole::Main)
+                    .unwrap();
+                let mut seen = 0usize;
+                let done = stream
+                    .stream(
+                        &ModelRequest::new(&config, &messages).with_options(RequestOptions {
+                            progress_interval: interval,
+                            ..RequestOptions::default()
+                        }),
+                        &mut |_| seen += 1,
+                    )
+                    .await
+                    .unwrap();
+                (seen, done)
+            }
+        };
+        let (every, plain) = run(None).await;
+        // 脚本里的块是一下子到齐的：一小时的间隔里只有首块造了快照，收尾不补（终态是返回值）。
+        let (throttled, done) = run(Some(std::time::Duration::from_secs(3600))).await;
+        assert!(every > 1, "{p:?} 不节流时逐块造");
+        assert_eq!(throttled, 1, "{p:?}");
+        assert_eq!(text_of(&done), text_of(&plain), "{p:?}");
+        assert_eq!(calls_of(&done), calls_of(&plain), "{p:?}");
+        assert_eq!(done.content, plain.content, "{p:?}");
     }
 }
 

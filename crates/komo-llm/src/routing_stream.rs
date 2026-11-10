@@ -109,7 +109,7 @@ mod tests {
     use komo_kernel::durable::{ContentBlock, StopReason};
 
     use super::*;
-    use crate::llm::{EffortCapabilities, Secrets};
+    use crate::{EffortCapabilities, Secrets};
 
     struct Fixed(&'static str);
 

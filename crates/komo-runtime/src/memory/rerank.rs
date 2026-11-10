@@ -56,7 +56,8 @@ pub(super) async fn order(
         )]),
     };
 
-    let response = crate::telemetry::ask(backend, request, crate::telemetry::role::RERANK).await?;
+    let response =
+        komo_llm::telemetry::ask(backend, request, komo_llm::telemetry::role::RERANK).await?;
     let Some(Answer::Choice {
         choice,
         probabilities,
@@ -139,7 +140,7 @@ mod live {
     };
 
     use super::*;
-    use crate::llm::Secrets;
+    use komo_llm::Secrets;
 
     fn item(id: &str, content: &str) -> MemoryItem {
         MemoryItem {
@@ -180,7 +181,7 @@ mod live {
             ..TypesafeConfig::default()
         };
         let secrets = Secrets::from_pairs([("TYPESAFE_API_KEY", key.as_str())]);
-        let backend = crate::typesafe::connect(&config, &secrets, crate::llm::default_transport())
+        let backend = komo_llm::typesafe::connect(&config, &secrets, komo_llm::default_transport())
             .expect("配好了就造得出来");
 
         let items = vec![

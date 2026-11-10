@@ -47,6 +47,7 @@ tar = { workspace = true }
 # 来写测试用的工具 / 模型 / 钩子（都已在工作区里，不是新 crate）。
 async-trait = { workspace = true }
 komo-kernel = { workspace = true, features = ["test-support"] }
+komo-llm = { workspace = true }
 # 假 GitHub：一个真的 HTTP 服务端，跑在 loopback 上（与渠道的 fake 同一种做法）。
 axum = { workspace = true }
 tempfile = { workspace = true }

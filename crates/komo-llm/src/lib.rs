@@ -7,6 +7,10 @@
 //! 主模型与记忆模型是**同一个 trait 的两个实例**（§13.3），按各自的 [`ModelConfig`]
 //! 构造；[`RoutingLlm`] 按每个 Run 固定下来的那份配置挑实例，所以配置热重载不会在半路
 //! 换掉正在跑的那个（§3 第 2 步）。
+//!
+//! 这个 crate（`komo-llm`，§13.4）还装着同一层的几样：向量后端（[`embedding`]）、判断后端
+//! （[`typesafe`]）、模型调用的埋点（[`telemetry`]）、effort 声明表与凭证的值（[`Secrets`]）。
+//! 只依赖 kernel，不碰 store。
 
 mod anthropic;
 mod chat;
@@ -21,6 +25,10 @@ mod secrets;
 mod sse;
 pub mod transport;
 mod wire;
+
+pub mod embedding;
+pub mod telemetry;
+pub mod typesafe;
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;

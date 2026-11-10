@@ -77,7 +77,7 @@ use crate::durable::error::{DurableError, TaskError};
 use crate::durable::kind::TaskKind;
 use crate::durable::runtime::TaskRuntime;
 use crate::durable::tx::{EntryDraft, Ownership, TaskOptions};
-use crate::llm::{ModelRequest, RequestOptions, is_context_overflow, retry_cause, usage_of};
+use komo_llm::{ModelRequest, RequestOptions, is_context_overflow, retry_cause, usage_of};
 
 /// 被截断的回复失败时的文字（沿用 `AgentLoop` 的）。
 const TRUNCATED: &str = "模型回复被截断，调用参数未收齐——不按半轮调用执行";

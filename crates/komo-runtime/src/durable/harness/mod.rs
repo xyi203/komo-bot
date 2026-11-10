@@ -21,7 +21,7 @@
 //!
 //! - **runtime 不依赖 komo-agent**：系统段、工具与能力面、模型配置、预算都由钩子
 //!   [`AgentHooks`] 给（D5 在 gateway 里实现，装配上下文的逻辑在钩子背后）。
-//! - 模型调用是 D4a 的无状态 [`ModelStream`](crate::llm::ModelStream)；工具是今天的
+//! - 模型调用是 D4a 的无状态 [`ModelStream`](komo_llm::ModelStream)；工具是今天的
 //!   [`Tool`](komo_kernel::traits::Tool)（`prepare` / `execute` / `replay`）；完整输出落盘走
 //!   [`ToolOutputStore`](komo_kernel::traits::ToolOutputStore)，模型视图由
 //!   `komo_kernel::projection` 在收尾时算一次、存进结果 entry。

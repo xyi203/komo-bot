@@ -8,8 +8,8 @@ use std::collections::BTreeMap;
 use komo_kernel::types::systemone::{Answer, Question, SystemOneError, SystemOneRequest};
 
 use super::*;
-use crate::llm::Secrets;
-use crate::llm::transport::testing::{Reply, ScriptedTransport};
+use crate::Secrets;
+use crate::transport::testing::{Reply, ScriptedTransport};
 
 fn config() -> TypesafeConfig {
     TypesafeConfig {

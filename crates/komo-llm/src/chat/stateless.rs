@@ -14,14 +14,14 @@ use komo_kernel::types::turn::{LlmError, ReplayMessage, Role, Round};
 use serde_json::{Map, Value, json};
 
 use super::{ChatAssembled, ChatCompletionsLlm, check_effort, replay, request_body};
-use crate::llm::model_stream::{
+use crate::model_stream::{
     API_CHAT, ImageResolver, ModelRequest, ModelStream, Next, ProgressThrottle, UserPart,
     assistant_replay, final_message, lenient_arguments, partial_message, plain_text, replay_system,
     stop_reason, thinking_block, tool_result_run, transport_error, user_parts,
 };
-use crate::llm::sse::SseDecoder;
-use crate::llm::transport::HttpRequest;
-use crate::llm::wire;
+use crate::sse::SseDecoder;
+use crate::transport::HttpRequest;
+use crate::wire;
 
 /// 原生 assistant message 的形状：一个 `role: "assistant"` 的对象。
 fn is_native(value: &Value) -> bool {
@@ -39,7 +39,7 @@ fn user_with_images(parts: &[UserPart]) -> Value {
                     "url": format!(
                         "data:{};base64,{}",
                         image.mime,
-                        crate::llm::image_base64(image)
+                        crate::image_base64(image)
                     ),
                 },
             }),

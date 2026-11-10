@@ -29,7 +29,7 @@ use komo_gateway::service::test_support::harness::{
 use komo_kernel::events::{ContextCompacted, Event, EventPayload, ToolResult};
 use komo_kernel::types::resource::{ResourceUri, output_file_path};
 use komo_kernel::types::status::RunState;
-use komo_runtime::llm::ModelStream;
+use komo_llm::ModelStream;
 
 use super::{fed_back, replayed};
 

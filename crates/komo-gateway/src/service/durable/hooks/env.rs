@@ -14,8 +14,8 @@ use komo_kernel::types::plan::PlanSource;
 use komo_kernel::types::resource::{ResourceMounts, SkillMount};
 use komo_kernel::types::surface::AgentSurface;
 use komo_kernel::types::tool::WorkspaceRoot;
+use komo_llm::{ImageLoadError, ImageRef, ImageResolver};
 use komo_runtime::durable::harness::ToolEnv;
-use komo_runtime::llm::{ImageLoadError, ImageRef, ImageResolver};
 use komo_runtime::tools::paths;
 use komo_store::SessionPaths;
 

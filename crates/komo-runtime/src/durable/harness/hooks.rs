@@ -29,8 +29,8 @@ use serde::{Deserialize, Serialize};
 use super::compaction::{CompactionSetup, SummaryPrompt};
 use super::orchestration::{NoOrchestration, OrchestrationHooks};
 use crate::durable::EntryDraft;
-use crate::llm::ImageResolver;
 use crate::recovery::{IdentityProbe, ProcessProbe};
+use komo_llm::ImageResolver;
 
 /// 钩子的失败。
 #[derive(Debug, Clone, thiserror::Error)]
@@ -333,8 +333,8 @@ impl Default for HarnessSettings {
 /// 生成与工具任务共用的依赖：钩子、无状态的模型调用、子进程探测、设置。
 pub struct HarnessDeps {
     pub hooks: Arc<dyn AgentHooks>,
-    /// 按模型配置路由（生产是 [`RoutingStream`](crate::llm::RoutingStream)）。
-    pub stream: Arc<dyn crate::llm::ModelStream>,
+    /// 按模型配置路由（生产是 [`RoutingStream`](komo_llm::RoutingStream)）。
+    pub stream: Arc<dyn komo_llm::ModelStream>,
     /// 工具任务 `probe` 阶段探子进程用的（生产是带身份核对的 [`IdentityProbe`]，测试里换替身）。
     pub probe: Arc<dyn ProcessProbe>,
     /// codemode 的 worker 怎么起（`docs/codemode.md` §4）；`None` = 这台 Gateway 没有接 codemode，
@@ -346,7 +346,7 @@ pub struct HarnessDeps {
 }
 
 impl HarnessDeps {
-    pub fn new(hooks: Arc<dyn AgentHooks>, stream: Arc<dyn crate::llm::ModelStream>) -> Self {
+    pub fn new(hooks: Arc<dyn AgentHooks>, stream: Arc<dyn komo_llm::ModelStream>) -> Self {
         Self {
             hooks,
             stream,

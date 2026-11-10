@@ -9,7 +9,7 @@ use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
 use super::Backend;
-use crate::llm::transport::HttpTransport;
+use crate::transport::HttpTransport;
 
 pub struct OpenAiEmbeddings {
     backend: Backend,

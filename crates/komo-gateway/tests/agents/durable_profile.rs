@@ -169,11 +169,10 @@ async fn editing_a_profile_applies_from_the_next_request_of_a_run_in_flight() {
         // 改完 Profile 之后新受理的那一条：只要一句话。
         vec![text_round(1, "好。")],
     ]);
-    let recording =
-        RecordingStream::new(Arc::clone(&llm) as Arc<dyn komo_runtime::llm::ModelStream>);
+    let recording = RecordingStream::new(Arc::clone(&llm) as Arc<dyn komo_llm::ModelStream>);
     let mut gateway = GatewayBuilder::new(&gated(FIRST, "gpt-test"))
         .fake_llm(Arc::clone(&llm))
-        .stream(Arc::clone(&recording) as Arc<dyn komo_runtime::llm::ModelStream>)
+        .stream(Arc::clone(&recording) as Arc<dyn komo_llm::ModelStream>)
         .tool(gate.tool())
         .start()
         .await;
@@ -228,12 +227,11 @@ async fn project_files_are_pinned_until_the_next_head_and_updates_ride_on_the_ne
         vec![text_round(1, "好。")],
         vec![text_round(1, "好。")],
     ]);
-    let recording =
-        RecordingStream::new(Arc::clone(&llm) as Arc<dyn komo_runtime::llm::ModelStream>);
+    let recording = RecordingStream::new(Arc::clone(&llm) as Arc<dyn komo_llm::ModelStream>);
     let home = Home::with_config(&gated(FIRST, "gpt-test"));
     let mut gateway = GatewayBuilder::new(&gated(FIRST, "gpt-test"))
         .fake_llm(Arc::clone(&llm))
-        .stream(Arc::clone(&recording) as Arc<dyn komo_runtime::llm::ModelStream>)
+        .stream(Arc::clone(&recording) as Arc<dyn komo_llm::ModelStream>)
         .tool(gate.tool())
         .at(home.path())
         .start()
@@ -415,11 +413,11 @@ async fn user_entries(
 #[tokio::test]
 async fn a_restart_resumes_an_in_flight_request_on_its_frozen_model_and_prompt() {
     let llm = FakeLlm::new(vec![vec![text_round(1, "不该走到这里")]]);
-    let held = RecordingStream::new(Arc::clone(&llm) as Arc<dyn komo_runtime::llm::ModelStream>);
+    let held = RecordingStream::new(Arc::clone(&llm) as Arc<dyn komo_llm::ModelStream>);
     held.hold_next();
     let mut first = GatewayBuilder::new(&gated(FIRST, "gpt-test"))
         .fake_llm(Arc::clone(&llm))
-        .stream(Arc::clone(&held) as Arc<dyn komo_runtime::llm::ModelStream>)
+        .stream(Arc::clone(&held) as Arc<dyn komo_llm::ModelStream>)
         .start()
         .await;
     let session = open_session(&first).await;
@@ -439,10 +437,10 @@ async fn a_restart_resumes_an_in_flight_request_on_its_frozen_model_and_prompt()
         text_round(2, "跑完了。"),
     ]]);
     let recording =
-        RecordingStream::new(Arc::clone(&resumed_llm) as Arc<dyn komo_runtime::llm::ModelStream>);
+        RecordingStream::new(Arc::clone(&resumed_llm) as Arc<dyn komo_llm::ModelStream>);
     let mut second = GatewayBuilder::new(&gated(SECOND, "gpt-test-2"))
         .fake_llm(Arc::clone(&resumed_llm))
-        .stream(Arc::clone(&recording) as Arc<dyn komo_runtime::llm::ModelStream>)
+        .stream(Arc::clone(&recording) as Arc<dyn komo_llm::ModelStream>)
         .at(&first.home)
         .start()
         .await;

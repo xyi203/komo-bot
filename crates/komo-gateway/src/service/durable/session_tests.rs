@@ -21,13 +21,13 @@ use komo_kernel::types::ids::SessionId;
 use komo_kernel::types::plan::PlanSource;
 use komo_kernel::types::resource::ResourceMounts;
 use komo_kernel::types::surface::AgentSurface;
+use komo_llm::{ModelRequest, ModelStream};
 use komo_runtime::durable::EntryDraft;
 use komo_runtime::durable::harness::{
     AgentHooks, AgentSetup, CompactionSettings, CompactionSetup, HookError, NoOrchestration,
     PromptSection, RetryPolicy, RunBudget, SubmissionDraft, SummaryPrompt, ToolEnv, ToolSet,
     WhenBusy,
 };
-use komo_runtime::llm::{ModelRequest, ModelStream};
 use serde_json::json;
 use tokio::sync::Semaphore;
 

@@ -24,7 +24,7 @@
 //! - `select`：问钩子拿设置与摘要模型，切点（`select_cut`）；没有可收的就 `completed {}`。否则一次
 //!   提交把摘要请求**钉**进 checkpoint（模型、提示、`tail`、`firstKept`），重启后重发的是同一个请求。
 //! - `summarize`：从 `tail`（不可变）处重新推导出要概括的消息，序列化成 `<conversation>` 文本，
-//!   发无状态的 [`ModelStream`](crate::llm::ModelStream)——**没有工具，两条消息**：系统提示与
+//!   发无状态的 [`ModelStream`](komo_llm::ModelStream)——**没有工具，两条消息**：系统提示与
 //!   这段文本。干净的 `stop` 且有文字、没有调用 = 摘要，一次提交里放置并 `completed`；可重试的
 //!   错误按有界退避进 `retry`；其余（含被截断的 `length`，摘要不完整）`failed`。
 //! - 失败（`model_error` / `no_model`）的提交移除状态、记下 `komo.live.compactionFailure`；调度
@@ -64,7 +64,7 @@ use crate::durable::error::{DurableError, TaskError};
 use crate::durable::kind::TaskKind;
 use crate::durable::runtime::TaskRuntime;
 use crate::durable::tx::{DraftHead, EntryDraft, Ownership, TaskOptions, Tx};
-use crate::llm::{ModelRequest, RequestOptions, retry_cause};
+use komo_llm::{ModelRequest, RequestOptions, retry_cause};
 
 /// 为什么压。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

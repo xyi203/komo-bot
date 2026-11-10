@@ -1,0 +1,41 @@
+[package]
+name = "komo-llm"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# §13.4：模型这一层——生成协议适配器（无状态 `ModelStream` + `RoutingStream`）、向量与判断后端、
+# 模型调用的埋点、effort 声明表与凭证的值。只依赖 kernel，不碰 store，冷编时与 turso 并行。
+[features]
+# 测试专用的注入口（`telemetry::capture`）：只给下游的测试脚手架开，生产构建里没有。
+test-support = ["dep:tracing-subscriber"]
+
+[dependencies]
+komo-kernel = { workspace = true }
+reqwest = { workspace = true }
+tokio = { workspace = true }
+# 上下文超长的报错文本匹配（`is_context_overflow`）：与 `rg` 工具同一个正则引擎。
+grep = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+time = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }
+futures-util = { workspace = true }
+# ChatGPT OAuth 凭证的 JWT payload 解码（§13.3）。
+base64 = { workspace = true }
+# ChatGPT OAuth 凭证文件的原子写（临时文件 + rename，§13.3）。
+tempfile = { workspace = true }
+# 只在 test-support 下：telemetry::capture 让下游的测试也能抓 span 与指标事件。
+tracing-subscriber = { workspace = true, optional = true }
+
+[dev-dependencies]
+komo-kernel = { workspace = true, features = ["test-support"] }
+# §47 / §48 的指标只进 trace：验收要把那两行抓出来数一数。
+tracing-subscriber = { workspace = true }
+# 真机验收（`--ignored`）要自己发 HTTPS 请求，而 `reqwest` 是 rustls-no-provider（§13.4）。
+rustls = { workspace = true }
+# 假服务端（`transport::testing`）与拨表的测试。
+tokio = { workspace = true, features = ["io-util", "net", "test-util"] }

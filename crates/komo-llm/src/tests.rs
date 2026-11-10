@@ -14,7 +14,7 @@ use serde_json::{Value, json};
 
 use super::transport::testing::{Reply, ScriptedTransport};
 use super::*;
-use crate::llm::{EffortCapabilities, Secrets};
+use crate::{EffortCapabilities, Secrets};
 
 fn model(effort: Option<&str>) -> ModelConfig {
     ModelConfig {

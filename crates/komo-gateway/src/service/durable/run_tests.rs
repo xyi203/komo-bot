@@ -10,7 +10,7 @@ use komo_kernel::protocol::http::{
 use komo_kernel::types::ids::{RunId, SessionId};
 use komo_kernel::types::status::RunState;
 use komo_kernel::types::turn::LlmError;
-use komo_runtime::llm::{ModelRequest, ModelStream};
+use komo_llm::{ModelRequest, ModelStream};
 use tokio::sync::Semaphore;
 
 use crate::service::test_support::harness::{FakeLlm, GatewayBuilder, TestGateway};

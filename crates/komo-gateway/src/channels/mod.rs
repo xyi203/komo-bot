@@ -12,7 +12,7 @@ use komo_kernel::traits::{Channel, DeliverError};
 use komo_kernel::types::chat::ChannelPlatform;
 #[cfg(any(test, feature = "test-support"))]
 use komo_kernel::types::chat::{ChannelPeer, Outbound};
-use komo_runtime::llm::Secrets;
+use komo_llm::Secrets;
 
 pub use komo_channel::{BuiltChannel, ChannelSender, SendOutcome};
 

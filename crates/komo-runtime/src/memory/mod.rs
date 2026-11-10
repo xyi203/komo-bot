@@ -756,7 +756,7 @@ impl MemoryManager {
         }
         // 查询侧用查询侧的输入规则——同一空间规定的那一套（§9.5）。
         let mut vectors =
-            crate::telemetry::embed(client, InputKind::Query, &[text.to_string()]).await?;
+            komo_llm::telemetry::embed(client, InputKind::Query, &[text.to_string()]).await?;
         match vectors.pop() {
             Some(vector) if vector.is_usable(client.space().dimensions) => Ok(Some(vector)),
             Some(_) => Err(EmbedError::InvalidVector("查询向量不合法".into())),

@@ -6,7 +6,7 @@ use komo_kernel::durable::{
     UserMessage,
 };
 use komo_kernel::types::turn::{Role, RoundInput};
-use komo_runtime::llm::{ModelRequest, ModelStream};
+use komo_llm::{ModelRequest, ModelStream};
 
 use crate::service::state::{codemode_unreadable_paths, protected_paths};
 use crate::service::test_support::harness::{

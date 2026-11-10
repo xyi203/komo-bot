@@ -35,7 +35,7 @@ use komo_kernel::types::model::{CatalogModel, ModelCatalog, ModelConfig};
 use crate::channels::{ChannelSender, test_channel::MemChannel};
 
 #[cfg(test)]
-use komo_runtime::llm::ModelStream;
+use komo_llm::ModelStream;
 
 #[cfg(test)]
 use super::{Running, ServiceOptions, start};

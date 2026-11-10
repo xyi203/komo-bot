@@ -12,7 +12,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use super::Backend;
-use crate::llm::transport::HttpTransport;
+use crate::transport::HttpTransport;
 
 pub struct OllamaEmbeddings {
     backend: Backend,

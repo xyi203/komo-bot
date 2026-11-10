@@ -199,8 +199,8 @@ mod tests {
 
     use super::super::transport::testing::{Reply, ScriptedTransport};
     use super::*;
-    use crate::llm::codex_auth::{self, CodexAuth};
-    use crate::llm::{EffortCapabilities, Secrets};
+    use crate::codex_auth::{self, CodexAuth};
+    use crate::{EffortCapabilities, Secrets};
 
     fn config(provider: &str, base_url: &str, model: &str) -> ModelConfig {
         ModelConfig {

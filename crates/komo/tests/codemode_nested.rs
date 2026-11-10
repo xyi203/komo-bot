@@ -27,13 +27,13 @@ use komo_kernel::types::resource::ResourceMounts;
 use komo_kernel::types::surface::AgentSurface;
 use komo_kernel::types::tool::{ToolContext, ToolDefinition, ToolError, ToolOutput};
 use komo_kernel::types::turn::LlmError;
+use komo_llm::{ModelRequest, ModelStream};
 use komo_runtime::codemode::Worker;
 use komo_runtime::durable::harness::{
     AgentHooks, AgentSetup, Harness, HarnessDeps, HookError, PromptSection, RunBudget,
     SubmissionDraft, ToolEnv, ToolSet,
 };
 use komo_runtime::durable::{Engine, EngineOptions, Registry};
-use komo_runtime::llm::{ModelRequest, ModelStream};
 use komo_runtime::tools::{CodemodeTool, ReadTool};
 use serde_json::{Value, json};
 use time::OffsetDateTime;

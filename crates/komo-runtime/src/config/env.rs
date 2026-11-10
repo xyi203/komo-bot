@@ -5,7 +5,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::llm::Secrets;
+use komo_llm::Secrets;
 
 /// 数据目录的环境变量。**唯一直接读的那个**（§12：「数据目录可通过配置或 KOMO_HOME
 /// 改变」）。

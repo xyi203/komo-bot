@@ -217,7 +217,7 @@ async fn a_tool_not_declared_outward_runs_in_an_unattended_run() {
 
 /// 第一次请求里模型看得见的工具名（system entry 回放出的工具表）。
 fn declared(world: &World) -> Vec<String> {
-    crate::llm::replay_system(&world.script.requests()[0])
+    komo_llm::replay_system(&world.script.requests()[0])
         .tools
         .into_iter()
         .map(|tool| tool.name)

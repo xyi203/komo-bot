@@ -39,8 +39,8 @@ use komo_kernel::types::turn::{
     LlmError, ProviderToolCall, ReplayMessage, Role, Round, RoundInput, ToolCallRequest,
     ToolResultForModel, TurnRequest,
 };
-use komo_runtime::llm::Secrets;
-use komo_runtime::llm::{ModelRequest, ModelStream, replay_system};
+use komo_llm::Secrets;
+use komo_llm::{ModelRequest, ModelStream, replay_system};
 
 use crate::channels::{BuiltChannel, ChannelFactory, ChannelRegistry, ChannelSender, SendOutcome};
 use crate::service::state::GatewayState;
@@ -713,9 +713,9 @@ pub(super) fn assistant_of(
     extra.insert("api".into(), serde_json::json!("openai-responses"));
     extra.insert("provider".into(), serde_json::json!(model.provider));
     extra.insert("model".into(), serde_json::json!(model.model));
-    extra.insert("usage".into(), komo_runtime::llm::usage_json(&round.usage));
+    extra.insert("usage".into(), komo_llm::usage_json(&round.usage));
     if let Some(blocks) = &round.provider_blocks {
-        extra.insert(komo_runtime::llm::PROVIDER_BLOCKS.into(), blocks.clone());
+        extra.insert(komo_llm::PROVIDER_BLOCKS.into(), blocks.clone());
     }
     // 回复的时间戳取现在：缓存冷不冷看的是上一条回复离现在多久（0 = 1970 年，等于"缓存早就冷了"，
     // 压缩 / 衰减会因此误判成 `cache_cold`）。

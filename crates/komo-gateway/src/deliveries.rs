@@ -381,7 +381,7 @@ mod tests {
     /// 送到了不记；span 与指标里没有 id 与正文。
     #[tokio::test]
     async fn each_attempt_has_a_span_and_failures_are_counted_by_channel() {
-        use komo_runtime::telemetry::capture::Capture;
+        use komo_llm::telemetry::capture::Capture;
         let capture = Capture::default();
         let _guard = capture.install();
         let store = TempStore::open().await.unwrap();

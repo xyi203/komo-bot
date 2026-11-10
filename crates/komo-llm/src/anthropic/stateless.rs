@@ -20,14 +20,14 @@ use super::{
     DEFAULT_MAX_TOKENS, PartialBlock, RESPONSE_HEADROOM, append_message, assistant_message,
     check_effort, request_body, thinking_budget, tool_results_message, user_message,
 };
-use crate::llm::model_stream::{
+use crate::model_stream::{
     API_ANTHROPIC, ImageResolver, ModelRequest, ModelStream, Next, ProgressThrottle, UserPart,
     assistant_replay, final_message, lenient_arguments, partial_message, plain_text, replay_system,
     stop_reason, thinking_block, tool_result_run, transport_error, user_parts,
 };
-use crate::llm::sse::SseDecoder;
-use crate::llm::transport::HttpRequest;
-use crate::llm::wire;
+use crate::sse::SseDecoder;
+use crate::transport::HttpRequest;
+use crate::wire;
 
 /// 一条 user 消息，带图片时是文字块 + base64 图片块（和工具结果里的图片同一个表达）。
 fn user_with_images(parts: &[UserPart]) -> Value {
@@ -40,7 +40,7 @@ fn user_with_images(parts: &[UserPart]) -> Value {
                 "source": {
                     "type": "base64",
                     "media_type": image.mime,
-                    "data": crate::llm::image_base64(image),
+                    "data": crate::image_base64(image),
                 },
             }),
         })

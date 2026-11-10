@@ -18,8 +18,8 @@ use komo_kernel::types::model::{
     DistanceRule, EmbeddingConfig, EmbeddingSpace, InputKind, ModelConfig, Vector,
 };
 
-use crate::llm::Secrets;
-use crate::llm::transport::{HttpRequest, HttpResponse, HttpTransport, TransportError};
+use crate::Secrets;
+use crate::transport::{HttpRequest, HttpResponse, HttpTransport, TransportError};
 
 pub use ollama::OllamaEmbeddings;
 pub use openai::OpenAiEmbeddings;

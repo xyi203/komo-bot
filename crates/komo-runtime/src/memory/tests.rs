@@ -3213,7 +3213,7 @@ async fn extraction_still_records_another_kind_said_in_the_same_breath() {
 /// 一批一个 `komo.memory.extract` span，带条数；跳过的批记跳过原因与计数，指标里没有 id 与正文。
 #[tokio::test]
 async fn each_batch_emits_one_extract_span_and_skips_are_counted_by_reason() {
-    use crate::telemetry::capture::Capture;
+    use komo_llm::telemetry::capture::Capture;
     let capture = Capture::default();
     let _guard = capture.install();
 
@@ -3262,7 +3262,7 @@ async fn each_batch_emits_one_extract_span_and_skips_are_counted_by_reason() {
 /// 失败的批：span 的原因是低基数的 `failed`，错误正文不进 span 与指标。
 #[tokio::test]
 async fn a_failed_batch_reports_a_reason_label_not_the_error_text() {
-    use crate::telemetry::capture::Capture;
+    use komo_llm::telemetry::capture::Capture;
     let capture = Capture::default();
     let _guard = capture.install();
 

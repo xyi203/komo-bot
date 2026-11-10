@@ -130,7 +130,7 @@ async fn a_non_zero_exit_delivers_an_error_summary() {
 /// 指标里没有 Run / 会话 id。
 #[tokio::test]
 async fn a_failed_firing_emits_its_span_and_counts_a_failure() {
-    let capture = komo_runtime::telemetry::capture::Capture::default();
+    let capture = komo_llm::telemetry::capture::Capture::default();
     let _guard = capture.install();
     let home = Home::new();
     let gw = home.start(FakeLlm::new(vec![])).await;

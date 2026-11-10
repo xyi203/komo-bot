@@ -35,8 +35,8 @@ use tokio::sync::Notify;
 
 use crate::durable::tests::support::{Log, TokioClock};
 use crate::durable::{Engine, EngineOptions, Registry};
-use crate::llm::{ModelRequest, ModelStream};
 use crate::recovery::{ChildProcess, IdentityProbe, Liveness, ProcessProbe};
+use komo_llm::{ModelRequest, ModelStream};
 
 use super::super::hooks::{
     AgentHooks, AgentSetup, HarnessDeps, HookError, PromptSection, RunBudget, ToolEnv, ToolSet,

@@ -41,8 +41,8 @@ use rmcp::transport::streamable_http_client::{
 };
 use rmcp::transport::{StreamableHttpClientTransport, TokioChildProcess};
 
-use crate::llm::Secrets;
 use crate::tools::McpTool;
+use komo_llm::Secrets;
 
 /// 连接 + 握手 + 列工具的总时限：卡住的服务器到点算连不上，下一次用到时再连。
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -1545,7 +1545,7 @@ for line in sys.stdin:
     /// 每次连接一个 `komo.mcp.connect` span 带服务器名与结果；连不上才记失败计数（维度只有服务器名）。
     #[tokio::test]
     async fn each_connect_has_a_span_and_only_failures_are_counted() {
-        let capture = crate::telemetry::capture::Capture::default();
+        let capture = komo_llm::telemetry::capture::Capture::default();
         let _guard = capture.install();
         let fixture = Fixture::new();
         let mut broken = fixture.server("b", &[]);

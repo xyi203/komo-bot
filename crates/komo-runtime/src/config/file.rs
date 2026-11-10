@@ -22,7 +22,7 @@ use serde::Deserialize;
 use time::OffsetDateTime;
 
 use super::error::ConfigError;
-use crate::llm::Secrets;
+use komo_llm::Secrets;
 
 /// 默认监听地址：回环（§3「默认监听回环地址」）。端口取 kernel 示例里的那个。
 pub const DEFAULT_LISTEN: &str = "127.0.0.1:7777";
@@ -935,12 +935,12 @@ fn credential_fingerprints(
     let uses_chatgpt_auth = catalog
         .entries
         .values()
-        .any(|model| model.common().auth.as_deref() == Some(crate::llm::CHATGPT_AUTH));
+        .any(|model| model.common().auth.as_deref() == Some(komo_llm::CHATGPT_AUTH));
     if uses_chatgpt_auth {
-        let path = crate::llm::codex_auth::credentials_path(data_dir);
-        if let Some(hash) = crate::llm::codex_auth::fingerprint(&path) {
+        let path = komo_llm::codex_auth::credentials_path(data_dir);
+        if let Some(hash) = komo_llm::codex_auth::fingerprint(&path) {
             fingerprints.insert(
-                crate::llm::codex_auth::CREDENTIAL_FINGERPRINT_KEY.to_string(),
+                komo_llm::codex_auth::CREDENTIAL_FINGERPRINT_KEY.to_string(),
                 hash,
             );
         }

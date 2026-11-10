@@ -27,7 +27,7 @@ use serde_json::{Value, json};
 use super::entries::SYSTEM;
 use super::hooks::PromptSection;
 use crate::durable::tx::EntryDraft;
-use crate::llm::replay_system;
+use komo_llm::replay_system;
 
 /// 回放 `messages` 里的 system 消息之后生效的段：按名字原位替换，`null` 删除，重加追加。
 pub fn replay_sections(messages: &[Message]) -> Vec<(String, String)> {

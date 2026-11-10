@@ -15,13 +15,13 @@ use komo_kernel::types::turn::{LlmError, ReplayMessage, Role, Round};
 use serde_json::{Map, Value, json};
 
 use super::{Assembled, Credential, OpenAiResponsesLlm, check_effort, replay, wire};
-use crate::llm::model_stream::{
+use crate::model_stream::{
     API_RESPONSES, ModelRequest, ModelStream, Next, ProgressThrottle, UserPart, assistant_replay,
     final_message, lenient_arguments, partial_message, plain_text, replay_system, stop_reason,
     thinking_block, tool_result_run, transport_error, user_parts,
 };
-use crate::llm::sse::SseDecoder;
-use crate::llm::transport::HttpRequest;
+use crate::sse::SseDecoder;
+use crate::transport::HttpRequest;
 
 /// 带图片的 user 消息：`input_text` / `input_image`（data URL）按次序。
 fn user_with_images(parts: &[UserPart]) -> Value {
@@ -34,7 +34,7 @@ fn user_with_images(parts: &[UserPart]) -> Value {
                 "image_url": format!(
                     "data:{};base64,{}",
                     image.mime,
-                    crate::llm::image_base64(image)
+                    crate::image_base64(image)
                 ),
             }),
         })
@@ -45,7 +45,7 @@ fn user_with_images(parts: &[UserPart]) -> Value {
 /// `messages` → `input` items。
 fn build_input(
     messages: &[Message],
-    resolver: Option<&dyn crate::llm::model_stream::ImageResolver>,
+    resolver: Option<&dyn crate::model_stream::ImageResolver>,
 ) -> Vec<Value> {
     let mut input = Vec::new();
     let mut i = 0;

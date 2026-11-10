@@ -16,7 +16,7 @@ use komo_kernel::types::chat::ChannelPlatform;
 use komo_kernel::types::digest::ContentHash;
 use toml_edit::{Array, DocumentMut, Item, Table, value};
 
-use crate::llm::Secrets;
+use komo_llm::Secrets;
 
 /// 改不成的原因。HTTP 层按种类给状态码。
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -464,15 +464,15 @@ pub fn upsert_embedding_model(
     let api_backend = line("api_backend", fields.api_backend)?;
     if let Some(backend) = &api_backend
         && ![
-            crate::embedding::OLLAMA,
-            crate::embedding::OPENAI_COMPATIBLE,
+            komo_llm::embedding::OLLAMA,
+            komo_llm::embedding::OPENAI_COMPATIBLE,
         ]
         .contains(&backend.as_str())
     {
         return Err(EditError::Invalid(format!(
             "向量协议只认 `{}` 与 `{}`，不认 `{backend}`",
-            crate::embedding::OLLAMA,
-            crate::embedding::OPENAI_COMPATIBLE
+            komo_llm::embedding::OLLAMA,
+            komo_llm::embedding::OPENAI_COMPATIBLE
         )));
     }
     let name = line("name", fields.name)?;
@@ -590,8 +590,8 @@ pub fn set_provider_models(
     };
     let embedding = str_of(table, "api_backend").is_some_and(|backend| {
         [
-            crate::embedding::OLLAMA,
-            crate::embedding::OPENAI_COMPATIBLE,
+            komo_llm::embedding::OLLAMA,
+            komo_llm::embedding::OPENAI_COMPATIBLE,
         ]
         .contains(&backend.as_str())
     });

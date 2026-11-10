@@ -138,7 +138,8 @@ impl IndexBuilder {
             let texts: Vec<String> = batch.iter().map(|item| item.content.clone()).collect();
             // 文档侧用文档侧的输入规则（§9.5）。这一步在事务外。
             let vectors =
-                match crate::telemetry::embed(&*self.embeddings, InputKind::Document, &texts).await
+                match komo_llm::telemetry::embed(&*self.embeddings, InputKind::Document, &texts)
+                    .await
                 {
                     Ok(vectors) => vectors,
                     Err(error) => {

@@ -16,7 +16,7 @@ use komo_kernel::types::memory::{MemoryScope, RetrievalMode};
 use komo_kernel::types::model::{CatalogModel, EmbeddingConfig, ModelConfig};
 
 use super::file::channel_credentials;
-use crate::llm::EffortCapabilities;
+use komo_llm::EffortCapabilities;
 
 /// 向量维度的可信范围。小于 1 是结构错误，大得离谱的是打字错误——两者都会在第一次
 /// 建索引时才炸，而那时人已经走了。
@@ -185,14 +185,14 @@ fn check_model(
         let expected = match role {
             Role::Chat => format!(
                 "生成协议只有 `{}`、`{}` 与 `{}`",
-                crate::llm::CHAT_COMPLETIONS,
-                crate::llm::RESPONSES,
-                crate::llm::ANTHROPIC_MESSAGES,
+                komo_llm::CHAT_COMPLETIONS,
+                komo_llm::RESPONSES,
+                komo_llm::ANTHROPIC_MESSAGES,
             ),
             Role::Embedding => format!(
                 "向量后端只有 `{}` 与 `{}`",
-                crate::embedding::OPENAI_COMPATIBLE,
-                crate::embedding::OLLAMA
+                komo_llm::embedding::OPENAI_COMPATIBLE,
+                komo_llm::embedding::OLLAMA
             ),
         };
         issues.push(error(
@@ -207,31 +207,31 @@ fn check_model(
     }
 
     match model.auth.as_deref() {
-        Some(crate::llm::CHATGPT_AUTH) => {
+        Some(komo_llm::CHATGPT_AUTH) => {
             if !model.api_key_env.trim().is_empty() {
                 issues.push(error(
                     &format!("{key}.auth"),
                     "auth = \"chatgpt\" 与 env_key / api_key_env 不能同时配置",
                 ));
             }
-            if provider != crate::llm::RESPONSES {
+            if provider != komo_llm::RESPONSES {
                 issues.push(error(
                     &format!("{key}.auth"),
                     format!(
                         "auth = \"chatgpt\" 只允许 api_backend = \"{}\"",
-                        crate::llm::RESPONSES
+                        komo_llm::RESPONSES
                     ),
                 ));
             }
             if !snapshot
                 .credentials
-                .contains_key(crate::llm::codex_auth::CREDENTIAL_FINGERPRINT_KEY)
+                .contains_key(komo_llm::codex_auth::CREDENTIAL_FINGERPRINT_KEY)
             {
                 issues.push(error(
                     &format!("{key}.auth"),
                     format!(
                         "找不到 ChatGPT 凭证文件（{}）；先跑 `komo auth codex login`",
-                        crate::llm::codex_auth::credentials_path(&snapshot.start_only.data_dir)
+                        komo_llm::codex_auth::credentials_path(&snapshot.start_only.data_dir)
                             .display()
                     ),
                 ));
@@ -242,7 +242,7 @@ fn check_model(
                 &format!("{key}.auth"),
                 format!(
                     "不认识的 auth `{other}`：只有 \"{}\"",
-                    crate::llm::CHATGPT_AUTH
+                    komo_llm::CHATGPT_AUTH
                 ),
             ));
         }
@@ -1111,10 +1111,10 @@ mod tests {
     fn a_chatgpt_auth_model_with_its_credential_file_present_has_no_issues() {
         let mut snapshot = snapshot_fixture();
         let model = snapshot.model_catalog.completion_mut("chat").unwrap();
-        model.auth = Some(crate::llm::CHATGPT_AUTH.into());
+        model.auth = Some(komo_llm::CHATGPT_AUTH.into());
         model.api_key_env = String::new();
         snapshot.credentials.insert(
-            crate::llm::codex_auth::CREDENTIAL_FINGERPRINT_KEY.into(),
+            komo_llm::codex_auth::CREDENTIAL_FINGERPRINT_KEY.into(),
             komo_kernel::types::digest::ContentHash::of_str("token-file-contents"),
         );
         assert_eq!(validate(&snapshot), vec![]);
@@ -1124,7 +1124,7 @@ mod tests {
     fn a_chatgpt_auth_model_without_its_credential_file_names_the_login_command() {
         let mut snapshot = snapshot_fixture();
         let model = snapshot.model_catalog.completion_mut("chat").unwrap();
-        model.auth = Some(crate::llm::CHATGPT_AUTH.into());
+        model.auth = Some(komo_llm::CHATGPT_AUTH.into());
         model.api_key_env = String::new();
         let issues = validate(&snapshot);
         assert_eq!(keys(&issues), vec!["model.chat.auth"]);
@@ -1139,9 +1139,9 @@ mod tests {
     fn auth_and_env_key_together_is_refused() {
         let mut snapshot = snapshot_fixture();
         let model = snapshot.model_catalog.completion_mut("chat").unwrap();
-        model.auth = Some(crate::llm::CHATGPT_AUTH.into());
+        model.auth = Some(komo_llm::CHATGPT_AUTH.into());
         snapshot.credentials.insert(
-            crate::llm::codex_auth::CREDENTIAL_FINGERPRINT_KEY.into(),
+            komo_llm::codex_auth::CREDENTIAL_FINGERPRINT_KEY.into(),
             komo_kernel::types::digest::ContentHash::of_str("token-file-contents"),
         );
         let issues = validate(&snapshot);
@@ -1153,11 +1153,11 @@ mod tests {
     fn chatgpt_auth_only_works_with_the_responses_backend() {
         let mut snapshot = snapshot_fixture();
         let model = snapshot.model_catalog.completion_mut("chat").unwrap();
-        model.auth = Some(crate::llm::CHATGPT_AUTH.into());
+        model.auth = Some(komo_llm::CHATGPT_AUTH.into());
         model.api_key_env = String::new();
-        model.provider = crate::llm::CHAT_COMPLETIONS.into();
+        model.provider = komo_llm::CHAT_COMPLETIONS.into();
         snapshot.credentials.insert(
-            crate::llm::codex_auth::CREDENTIAL_FINGERPRINT_KEY.into(),
+            komo_llm::codex_auth::CREDENTIAL_FINGERPRINT_KEY.into(),
             komo_kernel::types::digest::ContentHash::of_str("token-file-contents"),
         );
         let issues = validate(&snapshot);

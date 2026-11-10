@@ -32,8 +32,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use komo_kernel::traits::{Clock, Inbound, LlmClient, Shutdown, Tool};
+use komo_llm::EffortCapabilities;
 use komo_runtime::config::{ConfigHolder, LoadOptions};
-use komo_runtime::llm::EffortCapabilities;
 use komo_store::Db;
 
 use crate::channels::ChannelFactory;
@@ -72,8 +72,8 @@ pub struct ServiceOptions {
     /// 测试注入的模型后端。
     pub llm: Option<Arc<dyn LlmClient>>,
     /// 测试注入的无状态模型后端（harness 的主模型）；`None` = 按配置造
-    /// [`RoutingStream`](komo_runtime::llm::RoutingStream)。
-    pub stream: Option<Arc<dyn komo_runtime::llm::ModelStream>>,
+    /// [`RoutingStream`](komo_llm::RoutingStream)。
+    pub stream: Option<Arc<dyn komo_llm::ModelStream>>,
     /// 测试注入的向量后端；`None` = 按 `memory.embedding` alias 造。
     pub embeddings: Option<Arc<dyn komo_kernel::traits::EmbeddingClient>>,
     /// 共享 agent 目录（`~/.agents/skills`）按**哪个家目录**算；

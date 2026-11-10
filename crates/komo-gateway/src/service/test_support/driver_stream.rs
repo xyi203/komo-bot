@@ -26,7 +26,7 @@ use komo_kernel::durable::{
 use komo_kernel::traits::{LlmClient, TurnDriver};
 use komo_kernel::types::ids::RunId;
 use komo_kernel::types::turn::{LlmError, RoundInput};
-use komo_runtime::llm::{ModelRequest, ModelStream};
+use komo_llm::{ModelRequest, ModelStream};
 
 use super::harness::{TestGateway, assistant_of, stream_key, trailing_tool_results, turn_request};
 use crate::service::durable::DurableCore;
@@ -174,7 +174,7 @@ impl ModelStream for RecordingStream {
         request: &ModelRequest<'_>,
         progress: &mut (dyn for<'m> FnMut(&'m AssistantMessage) + Send),
     ) -> Result<AssistantMessage, LlmError> {
-        let system = komo_runtime::llm::replay_system(request.messages);
+        let system = komo_llm::replay_system(request.messages);
         let continuing = matches!(
             request
                 .messages

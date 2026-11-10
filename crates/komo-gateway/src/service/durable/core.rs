@@ -12,10 +12,10 @@ use std::sync::{Arc, Mutex, OnceLock};
 use komo_kernel::durable::{ConversationId, Storage, SubmissionId, SubmissionRecord};
 use komo_kernel::traits::Clock;
 use komo_kernel::types::tool::InterjectSignal;
+use komo_llm::ModelStream;
 use komo_runtime::codemode::Worker;
 use komo_runtime::durable::harness::{AgentHooks, Harness, HarnessDeps, OrchestrationHooks};
 use komo_runtime::durable::{DurableError, Engine, EngineOptions, Registry};
-use komo_runtime::llm::ModelStream;
 use komo_store::durable::TursoStorage;
 
 pub struct DurableCore {

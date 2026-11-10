@@ -7,8 +7,8 @@ use komo_kernel::types::model::{Effort, EmbeddingConfig, InputKind, ModelConfig}
 use serde_json::json;
 
 use super::*;
-use crate::llm::Secrets;
-use crate::llm::transport::testing::{Reply, ScriptedTransport};
+use crate::Secrets;
+use crate::transport::testing::{Reply, ScriptedTransport};
 
 fn config(provider: &str, dimensions: Option<u32>) -> EmbeddingConfig {
     EmbeddingConfig {

@@ -12,7 +12,7 @@ use komo_kernel::{
     traits::{Channel, ChannelError, DeliverError, Inbound, Shutdown},
     types::chat::{ChannelPeer, ChannelPlatform, Outbound},
 };
-use komo_runtime::llm::Secrets;
+use komo_llm::Secrets;
 use serde_json::Value;
 use std::{
     path::{Path, PathBuf},

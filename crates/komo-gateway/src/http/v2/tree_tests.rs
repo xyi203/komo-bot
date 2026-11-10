@@ -357,7 +357,7 @@ async fn summaries_and_compaction_are_entries_on_the_new_path() {
 use crate::service::test_support::{install_crypto, telegram_config};
 use crate::service::{Running, ServiceOptions, start};
 use komo_kernel::traits::LlmClient;
-use komo_runtime::llm::{ModelRequest, ModelStream};
+use komo_llm::{ModelRequest, ModelStream};
 
 struct Home {
     dir: tempfile::TempDir,

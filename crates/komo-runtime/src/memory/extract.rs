@@ -921,10 +921,10 @@ impl LearningPass {
         };
 
         let mut driver = self.llm.begin_turn(request).await?;
-        let round = crate::telemetry::turn(
+        let round = komo_llm::telemetry::turn(
             &mut *driver,
             RoundInput::First,
-            crate::telemetry::role::MEMORY_EXTRACT,
+            komo_llm::telemetry::role::MEMORY_EXTRACT,
             &self.model,
             1,
         )
@@ -939,7 +939,7 @@ impl LearningPass {
 
 /// 从模型正文里解出观察列表。容忍 ```json 围栏与前后的闲话。
 pub fn parse_extraction(text: &str) -> Result<RawExtraction, MemoryError> {
-    let Some(json) = crate::llm::parse_json_object(text) else {
+    let Some(json) = komo_llm::parse_json_object(text) else {
         return Err(MemoryError::Invalid(format!(
             "回复里找不到 JSON 对象：{}",
             one_line(&text.chars().take(200).collect::<String>())

@@ -104,10 +104,10 @@ async fn retitle(
         .begin_turn(request)
         .await
         .map_err(|error| error.to_string())?;
-    let round = komo_runtime::telemetry::turn(
+    let round = komo_llm::telemetry::turn(
         &mut *driver,
         RoundInput::First,
-        komo_runtime::telemetry::role::TITLE,
+        komo_llm::telemetry::role::TITLE,
         &model,
         1,
     )

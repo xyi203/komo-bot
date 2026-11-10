@@ -93,7 +93,7 @@ impl EffortCapabilities {
         EffortCapabilities {
             providers: BTreeMap::from([
                 (
-                    crate::llm::RESPONSES.to_string(),
+                    crate::RESPONSES.to_string(),
                     EffortSupport::new(["none", "minimal", "low", "medium", "high"]),
                 ),
                 (
@@ -101,11 +101,11 @@ impl EffortCapabilities {
                     EffortSupport::new(["none", "minimal", "low", "medium", "high"]),
                 ),
                 (
-                    crate::llm::CHAT_COMPLETIONS.to_string(),
+                    crate::CHAT_COMPLETIONS.to_string(),
                     EffortSupport::new(["none", "minimal", "low", "medium", "high"]),
                 ),
                 (
-                    crate::llm::ANTHROPIC_MESSAGES.to_string(),
+                    crate::ANTHROPIC_MESSAGES.to_string(),
                     EffortSupport::new(["none", "low", "medium", "high", "max"]),
                 ),
             ]),

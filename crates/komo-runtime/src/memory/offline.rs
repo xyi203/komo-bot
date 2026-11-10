@@ -366,10 +366,10 @@ impl MemoryManager {
             cache_session: None,
         };
         let mut driver = llm.begin_turn(request).await?;
-        let round = crate::telemetry::turn(
+        let round = komo_llm::telemetry::turn(
             &mut *driver,
             RoundInput::First,
-            crate::telemetry::role::MEMORY_CONSOLIDATE,
+            komo_llm::telemetry::role::MEMORY_CONSOLIDATE,
             &model,
             1,
         )
@@ -546,7 +546,7 @@ fn index_of(value: &serde_json::Value, len: usize) -> Option<usize> {
 }
 
 fn parse_actions(text: &str, len: usize) -> Result<Vec<RawAction>, MemoryError> {
-    let body = crate::llm::parse_json_object(text)
+    let body = komo_llm::parse_json_object(text)
         .ok_or_else(|| MemoryError::Invalid("整理判定里找不到 JSON 对象".into()))?;
     let wire: WireActions = serde_json::from_str(body)
         .map_err(|error| MemoryError::Invalid(format!("整理判定的 JSON 解不开：{error}")))?;

@@ -212,7 +212,7 @@ pub async fn provider_models(
         .filter(|k| !k.is_empty());
     let (secrets, key_env) = match typed {
         Some(key) => (
-            std::sync::Arc::new(komo_runtime::llm::Secrets::from_pairs([(PROBE_KEY, key)])),
+            std::sync::Arc::new(komo_llm::Secrets::from_pairs([(PROBE_KEY, key)])),
             PROBE_KEY.to_string(),
         ),
         None => (
@@ -224,8 +224,8 @@ pub async fn provider_models(
             .unwrap_or_default(),
         ),
     };
-    let factory = komo_runtime::llm::LlmFactory::new(secrets, api.state.caps.clone())
-        .with_chatgpt_credentials_path(komo_runtime::llm::codex_auth::credentials_path(
+    let factory = komo_llm::LlmFactory::new(secrets, api.state.caps.clone())
+        .with_chatgpt_credentials_path(komo_llm::codex_auth::credentials_path(
             &api.state.snapshot().start_only.data_dir,
         ));
     let config = ModelConfig {
@@ -243,7 +243,7 @@ pub async fn provider_models(
         timeout_secs: 10,
         context_window: None,
     };
-    let models = komo_runtime::llm::list_models(&factory, &config)
+    let models = komo_llm::list_models(&factory, &config)
         .await
         .map_err(|e| ApiFailure::invalid(format!("没取到模型列表：{e}")))?;
     Ok(Json(ProviderModelsResponse { models }))
@@ -471,7 +471,7 @@ where
     }))
 }
 
-fn secrets(api: &Api, env: &str) -> ApiResult<komo_runtime::llm::Secrets> {
+fn secrets(api: &Api, env: &str) -> ApiResult<komo_llm::Secrets> {
     komo_runtime::config::secrets_from_text(Some(env), &api.state.config.sources().env)
         .map_err(io_failure)
 }

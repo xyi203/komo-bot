@@ -18,7 +18,7 @@ use time::OffsetDateTime;
 use super::error::ConfigError;
 use super::file::Sources;
 use super::{LoadOptions, Loaded, check_candidate, load_config};
-use crate::llm::{EffortCapabilities, Secrets};
+use komo_llm::{EffortCapabilities, Secrets};
 
 /// 一次重载的结果。**只有键名**——值不进来，凭证更不进来（§3 第 3 步）。
 #[derive(Debug, Clone, PartialEq, Eq)]

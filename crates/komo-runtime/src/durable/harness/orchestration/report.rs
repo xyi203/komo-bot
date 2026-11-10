@@ -424,7 +424,7 @@ pub fn check_contract(
     contract: &DelegateContract,
     text: &str,
 ) -> Result<(serde_json::Value, Validation), String> {
-    let Some(json) = crate::llm::parse_json_object(text) else {
+    let Some(json) = komo_llm::parse_json_object(text) else {
         return Err("最后一条回复里找不到 JSON 对象".into());
     };
     let value: serde_json::Value = serde_json::from_str(json)

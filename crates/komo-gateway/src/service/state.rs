@@ -12,10 +12,10 @@ use komo_kernel::protocol::config::ConfigSnapshot;
 use komo_kernel::traits::{Clock, CronRepo, EmbeddingClient, GatewayError, LlmClient, MemoryRepo};
 use komo_kernel::types::ids::{ExecutorId, RunId};
 use komo_kernel::types::turn::{LlmError, TurnRequest};
+use komo_llm::EffortCapabilities;
 use komo_runtime::config::ConfigHolder;
 use komo_runtime::durable::harness::RetryPolicy;
 use komo_runtime::executor::ToolExecutor;
-use komo_runtime::llm::EffortCapabilities;
 use komo_runtime::matter::MatterManager;
 use komo_runtime::memory::{MemoryManager, MemoryParts};
 use komo_store::{Db, TursoCronRepo, TursoDeliveryRepo, TursoMatterRepo, TursoMemoryRepo};
@@ -570,7 +570,7 @@ impl GatewayState {
             let alias = alias.to_string();
             let factory = llm_factory(&snapshot, &self.config, &self.caps);
             tokio::spawn(async move {
-                let result = komo_runtime::llm::probe_context_window(&factory, &config).await;
+                let result = komo_llm::probe_context_window(&factory, &config).await;
                 let outcome = match result {
                     Ok(Some(window)) => super::windows::WindowState::Found(window),
                     Ok(None) => super::windows::WindowState::Missing,
@@ -640,11 +640,10 @@ fn llm_factory(
     snapshot: &ConfigSnapshot,
     config: &ConfigHolder,
     caps: &EffortCapabilities,
-) -> komo_runtime::llm::LlmFactory {
-    komo_runtime::llm::LlmFactory::new(config.secrets(), caps.clone())
-        .with_chatgpt_credentials_path(komo_runtime::llm::codex_auth::credentials_path(
-            &snapshot.start_only.data_dir,
-        ))
+) -> komo_llm::LlmFactory {
+    komo_llm::LlmFactory::new(config.secrets(), caps.clone()).with_chatgpt_credentials_path(
+        komo_llm::codex_auth::credentials_path(&snapshot.start_only.data_dir),
+    )
 }
 
 /// 记忆提取 / 冲突整理用的那个后端。
@@ -662,7 +661,7 @@ fn llm_for_memory(
         return Arc::clone(client);
     }
     let factory = llm_factory(snapshot, config, caps);
-    match komo_runtime::llm::RoutingLlm::from_snapshot(snapshot, factory) {
+    match komo_llm::RoutingLlm::from_snapshot(snapshot, factory) {
         Ok(routing) => Arc::new(routing),
         Err(error) => Arc::new(UnconfiguredLlm::new(error.to_string())),
     }
@@ -689,9 +688,8 @@ fn spawn_embedding_probe(memories: Arc<MemoryManager>, config: Arc<ConfigHolder>
         let Some(embedding) = snapshot.memory.embedding.clone() else {
             return;
         };
-        let transport = komo_runtime::llm::default_transport();
-        match komo_runtime::embedding::connect_embedding(&embedding, &config.secrets(), transport)
-            .await
+        let transport = komo_llm::default_transport();
+        match komo_llm::embedding::connect_embedding(&embedding, &config.secrets(), transport).await
         {
             Ok(client) => {
                 tracing::info!(
@@ -725,10 +723,10 @@ fn build_reranker(
     if !snapshot.memory.retrieval.rerank {
         return None;
     }
-    match komo_runtime::typesafe::connect(
+    match komo_llm::typesafe::connect(
         &snapshot.typesafe,
         &config.secrets(),
-        komo_runtime::llm::default_transport(),
+        komo_llm::default_transport(),
     ) {
         Ok(backend) => Some(komo_runtime::memory::Reranker {
             backend,
@@ -779,7 +777,7 @@ fn build_llm(
     caps: &EffortCapabilities,
 ) -> Arc<dyn LlmClient> {
     let factory = llm_factory(snapshot, config, caps);
-    match komo_runtime::llm::RoutingLlm::from_snapshot(snapshot, factory) {
+    match komo_llm::RoutingLlm::from_snapshot(snapshot, factory) {
         Ok(routing) => Arc::new(routing),
         Err(error) => {
             tracing::warn!(%error, "模型后端造不出来：Gateway 照常启动，模型调用会报这个错");
@@ -796,13 +794,13 @@ pub(crate) fn build_stream(
     snapshot: &ConfigSnapshot,
     config: &ConfigHolder,
     caps: &EffortCapabilities,
-) -> Arc<dyn komo_runtime::llm::ModelStream> {
+) -> Arc<dyn komo_llm::ModelStream> {
     let factory = llm_factory(snapshot, config, caps);
-    match komo_runtime::llm::RoutingStream::from_snapshot(snapshot, factory) {
+    match komo_llm::RoutingStream::from_snapshot(snapshot, factory) {
         Ok(routing) => Arc::new(routing),
         Err(error) => {
             tracing::warn!(%error, "模型后端造不出来：Gateway 照常启动，模型调用会报这个错");
-            Arc::new(komo_runtime::llm::RoutingStream::lazy(llm_factory(
+            Arc::new(komo_llm::RoutingStream::lazy(llm_factory(
                 snapshot, config, caps,
             )))
         }

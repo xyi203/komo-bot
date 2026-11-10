@@ -27,7 +27,7 @@ use std::sync::Arc;
 use komo_kernel::protocol::config::{ConfigIssue, ConfigSnapshot, IssueSeverity, KeyPath};
 use time::OffsetDateTime;
 
-use crate::llm::{EffortCapabilities, Secrets};
+use komo_llm::{EffortCapabilities, Secrets};
 
 pub use edit::{
     CatalogRow, EditError, EmbeddingFields, ModelFields, ProviderFields, config_version, env_view,

@@ -14,8 +14,8 @@ use komo_kernel::protocol::config::TypesafeConfig;
 use komo_kernel::traits::SystemOne;
 use komo_kernel::types::systemone::{SystemOneError, SystemOneRequest, SystemOneResponse};
 
-use crate::llm::Secrets;
-use crate::llm::transport::{HttpRequest, HttpTransport, TransportError};
+use crate::Secrets;
+use crate::transport::{HttpRequest, HttpTransport, TransportError};
 
 /// 一次判断最多试几次（含第一次）。4xx 不重试，429 / 5xx 与传输失败重试。
 const MAX_ATTEMPTS: u32 = 3;
@@ -99,7 +99,7 @@ impl SystemOne for Client {
 
 /// 读一次响应：状态码 → 错误，正文 → 值。
 async fn read(
-    response: crate::llm::transport::HttpResponse,
+    response: crate::transport::HttpResponse,
 ) -> Result<SystemOneResponse, SystemOneError> {
     let status = response.status;
     let text = response

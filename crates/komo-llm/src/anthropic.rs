@@ -861,7 +861,7 @@ mod tests {
 
     fn factory(transport: &ScriptedTransport) -> super::super::LlmFactory {
         super::super::LlmFactory::new(
-            Arc::new(crate::llm::Secrets::from_pairs([("KEY", "sk-test")])),
+            Arc::new(crate::Secrets::from_pairs([("KEY", "sk-test")])),
             EffortCapabilities::builtin(),
         )
         .with_transport(Arc::new(transport.clone()))
@@ -1917,7 +1917,7 @@ mod live {
             config.clone(),
             ModelRole::Main,
             Some(token),
-            crate::llm::default_transport(),
+            crate::default_transport(),
             EffortCapabilities::builtin(),
         )
         .expect("effort=low 是声明过的档位");

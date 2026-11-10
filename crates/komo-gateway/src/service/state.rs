@@ -9,9 +9,7 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use komo_kernel::protocol::config::ConfigSnapshot;
-use komo_kernel::traits::{
-    Clock, CronRepo, EmbeddingClient, GatewayError, LlmClient, MemoryRepo, RepoError,
-};
+use komo_kernel::traits::{Clock, CronRepo, EmbeddingClient, GatewayError, LlmClient, MemoryRepo};
 use komo_kernel::types::ids::{ExecutorId, RunId};
 use komo_kernel::types::turn::{LlmError, TurnRequest};
 use komo_runtime::config::{ConfigHolder, EffortCapabilities};
@@ -808,9 +806,4 @@ pub(crate) fn build_stream(
             )))
         }
     }
-}
-
-/// `RepoError` / `StoreError` 到 Gateway 错误。
-pub fn repo_error(error: RepoError) -> GatewayError {
-    GatewayError::Repo(error)
 }

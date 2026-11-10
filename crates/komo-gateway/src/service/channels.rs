@@ -202,10 +202,6 @@ impl ChannelSupervisor {
         self.running.lock().await.keys().cloned().collect()
     }
 
-    pub fn factories(&self) -> &[Arc<dyn ChannelFactory>] {
-        &self.factories
-    }
-
     /// 这个平台的工厂：官方三个在表里，其余（自定义渠道）走通用的进程工厂。
     pub fn factory(&self, platform: &ChannelPlatform) -> Arc<dyn ChannelFactory> {
         self.factories

@@ -7,8 +7,7 @@
 use std::sync::Arc;
 
 use komo_kernel::protocol::http::{
-    InterventionAnswerResponse, InterventionDetail, InterventionListQuery, InterventionSummary,
-    InterventionVerdict,
+    InterventionAnswerResponse, InterventionListQuery, InterventionSummary, InterventionVerdict,
 };
 use komo_kernel::traits::GatewayError;
 use komo_kernel::types::chat::PeerId;
@@ -23,17 +22,6 @@ impl GatewayState {
     ) -> Result<Vec<InterventionSummary>, GatewayError> {
         self.durable
             .interventions(query)
-            .await
-            .map_err(|error| GatewayError::Internal(error.to_string()))
-    }
-
-    /// 按句柄取一条详情。
-    pub async fn intervention(
-        &self,
-        handle: &str,
-    ) -> Result<Option<InterventionDetail>, GatewayError> {
-        self.durable
-            .intervention(handle)
             .await
             .map_err(|error| GatewayError::Internal(error.to_string()))
     }

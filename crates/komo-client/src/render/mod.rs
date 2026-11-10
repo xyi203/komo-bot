@@ -13,9 +13,9 @@ use komo_kernel::protocol::http::{
     ConsolidateGroupStatus, ConsolidateOutcome, CronListResponse, HealthResponse, IndexState,
     InterventionDetail, InterventionListResponse, InterventionSummary, McpReconnectResponse,
     McpServerState, McpServerStatus, MemoryConsolidateResponse, MemoryIndexStatus,
-    MemoryListResponse, MemorySweepResponse, ModelWindow, ModelsResponse, MonitorListResponse,
-    RunDetail, SessionListResponse, SessionSearchResponse, SessionSummary, SweepRule,
-    TelemetryHealth, ToolCallSummary, WindowSource,
+    MemoryListResponse, MemorySweepResponse, ModelWindow, MonitorListResponse, RunDetail,
+    SessionListResponse, SessionSearchResponse, SessionSummary, SweepRule, TelemetryHealth,
+    ToolCallSummary, WindowSource,
 };
 use komo_kernel::types::memory::{
     ArmScore, Confirmation, MemoryItem, MemoryKind, MemoryScope, MemoryState, Provenance,
@@ -1211,34 +1211,6 @@ pub fn config_error(error: &crate::error::ClientError) -> String {
     if error.is(komo_kernel::protocol::http::ErrorCode::ConfigInvalid) {
         // §3 第 1 步：校验不过的配置永远不会被装上，哪怕只错一个键。
         out.push("运行中的 Gateway 保留原配置".into());
-    }
-    out.join("\n")
-}
-
-/// `komo model list`：每个模型支持哪几档 effort（§13.3）。
-pub fn model_list(response: &ModelsResponse) -> String {
-    if response.models.is_empty() {
-        return "没有可选模型".into();
-    }
-    let mut out = vec![format!("{:<30} {:<14} {}", "MODEL", "PROVIDER", "EFFORT")];
-    for entry in &response.models {
-        let efforts = if entry.efforts.is_empty() {
-            // 空表 = 一档都不支持，不是「还不知道」。
-            "（不接受显式 effort）".to_string()
-        } else {
-            entry
-                .efforts
-                .iter()
-                .map(|e| e.to_string())
-                .collect::<Vec<_>>()
-                .join(" · ")
-        };
-        out.push(format!(
-            "{:<30} {:<14} {efforts}{}",
-            entry.id,
-            entry.provider,
-            if entry.default { "   ← 当前" } else { "" }
-        ));
     }
     out.join("\n")
 }

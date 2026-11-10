@@ -5,9 +5,7 @@ use crate::tui::test_support as fixture;
 use komo_kernel::cron::{CronJob, TimeZone, Trigger};
 use komo_kernel::protocol::PROTOCOL_VERSION;
 use komo_kernel::protocol::config::{KeyPath, SourceFile};
-use komo_kernel::protocol::http::{
-    InterventionKind, ModelMenuEntry, RunSummary, SessionSummary, ToolCallSummary,
-};
+use komo_kernel::protocol::http::{InterventionKind, RunSummary, SessionSummary, ToolCallSummary};
 use komo_kernel::types::digest::ContentHash;
 use komo_kernel::types::ids::{CronJobId, MemoryId, RunId, Seq, SessionId};
 use komo_kernel::types::memory::{Evidence, EvidenceRef, ExtractionMetadata, MemoryUsage};
@@ -1079,39 +1077,6 @@ fn a_rejected_reload_prints_the_keys_and_says_the_old_config_stands() {
             "缺少 base_url",
             "memory.embedding.base_url",
             "运行中的 Gateway 保留原配置",
-        ],
-    );
-}
-
-#[test]
-fn a_model_list_says_which_efforts_each_model_takes() {
-    let printed = model_list(&ModelsResponse {
-        models: vec![
-            ModelMenuEntry {
-                id: "chat-a".into(),
-                provider: "openai_compatible".into(),
-                efforts: vec![Effort::new("low"), Effort::new("high")],
-                default: true,
-                ..ModelMenuEntry::default()
-            },
-            ModelMenuEntry {
-                id: "chat-b".into(),
-                provider: "anthropic".into(),
-                efforts: vec![],
-                default: false,
-                ..ModelMenuEntry::default()
-            },
-        ],
-    });
-    insta_like(
-        &printed,
-        &[
-            "chat-a",
-            "low · high",
-            "← 当前",
-            "chat-b",
-            // 空表 = 一档都不支持，不是「还不知道」。
-            "（不接受显式 effort）",
         ],
     );
 }

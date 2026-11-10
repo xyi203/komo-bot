@@ -35,10 +35,6 @@ impl ModelPicker {
         self.selected = moved.min(self.entries.len().saturating_sub(1));
     }
 
-    pub fn selected_entry(&self) -> Option<&ModelMenuEntry> {
-        self.entries.get(self.selected)
-    }
-
     /// 第 `index` 行（0 起）的直通键：前九行是 `1`–`9`，再往后没有。
     pub fn shortcut(index: usize) -> Option<char> {
         (index < 9).then(|| char::from(b'1' + index as u8))

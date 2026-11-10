@@ -68,9 +68,6 @@ pub struct InputRequest {
     /// 忙时怎么办：排队（默认）、插话、拒绝。
     pub when_busy: WhenBusy,
     pub model: Option<ModelOverride>,
-    /// 规范文件（AGENTS.md 一类）变了时的 `project_update_block`：补在输入正文**后面**，
-    /// 展示的是同一条 entry。
-    pub project_update: Option<String>,
     /// 用户在 TUI 里插话（`interject: true`）：输入排在忙着的会话后面时，前台正跑着的长 `bash`
     /// 提前转后台，别让这句话等它跑完（`docs/monitor.md` §8）。只有 HTTP 的插话带它——渠道里的
     /// steer、监听事件与任务交回不带。
@@ -85,7 +82,6 @@ impl InputRequest {
             entry: None,
             when_busy: WhenBusy::FollowUp,
             model: None,
-            project_update: None,
             interject: false,
         }
     }
@@ -107,11 +103,6 @@ impl InputRequest {
 
     pub fn model(mut self, model: ModelOverride) -> Self {
         self.model = Some(model);
-        self
-    }
-
-    pub fn project_update(mut self, block: impl Into<String>) -> Self {
-        self.project_update = Some(block.into());
         self
     }
 
@@ -252,14 +243,11 @@ impl DurableCore {
             .clone()
             .unwrap_or_else(|| InputEntry::new(DEFAULT_INPUT_KIND, None));
         entry.data = Some(with_hash(entry.data.take(), &hash));
-        // 调用方没给就自己核对：规范文件在本会话中改过，新的那一版补在输入正文后面（系统段里的 `project`
-        // 钉在已展示的那份，改动要等下一次 head 才换，见 `hooks/sections.rs`）。
-        let project_update = match request.project_update.clone() {
-            Some(update) => Some(update),
-            None => match self.session(session).await {
-                Ok(record) => self.project_update_for(record.current_branch).await,
-                Err(_) => None,
-            },
+        // 规范文件（AGENTS.md 一类）在本会话中改过，新的那一版补在输入正文后面，展示的是同一条
+        // entry（系统段里的 `project` 钉在已展示的那份，改动要等下一次 head 才换，见 `hooks/sections.rs`）。
+        let project_update = match self.session(session).await {
+            Ok(record) => self.project_update_for(record.current_branch).await,
+            Err(_) => None,
         };
         let body = match project_update.as_deref() {
             Some(update) if !update.trim().is_empty() => {

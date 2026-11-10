@@ -71,6 +71,7 @@ pub fn cases() -> Vec<Case> {
         case!(every_operation_is_rejected_after_close),
         case!(progress_commits_only_replace_document_values),
         case!(sessions_replace_whole_and_scan_by_lifecycle),
+        case!(sessions_scan_by_source_kind_and_agent),
         case!(session_and_progress_operations_are_rejected_after_close),
     ]
 }
@@ -2212,6 +2213,7 @@ async fn sessions_replace_whole_and_scan_by_lifecycle(storage: &dyn Storage) {
                 &SessionQuery {
                     lifecycle: None,
                     order: Some(ScanOrder::Ascending),
+                    ..SessionQuery::default()
                 },
                 2,
                 Some(&cursor),
@@ -2223,12 +2225,14 @@ async fn sessions_replace_whole_and_scan_by_lifecycle(storage: &dyn Storage) {
     let active = SessionQuery {
         lifecycle: Some(SessionLifecycle::Active),
         order: Some(ScanOrder::Ascending),
+        ..SessionQuery::default()
     };
     let page = storage.scan_sessions(&active, 10, None).await.unwrap();
     assert_eq!(names(&page.items), ["s1", "s2", "s3", "s5"]);
     let closing = SessionQuery {
         lifecycle: Some(SessionLifecycle::Closing),
         order: None,
+        ..SessionQuery::default()
     };
     let page = storage.scan_sessions(&closing, 10, None).await.unwrap();
     assert_eq!(names(&page.items), ["s4"]);
@@ -2240,6 +2244,112 @@ async fn sessions_replace_whole_and_scan_by_lifecycle(storage: &dyn Storage) {
         .unwrap();
     assert_eq!(names(&page.items), ["s1", "s2", "s3"]);
     assert_eq!(names(&rest.items), ["s5"]);
+}
+
+async fn sessions_scan_by_source_kind_and_agent(storage: &dyn Storage) {
+    let make = |id: &str, kind: SessionKind, source: Option<&str>, agent: &str| SessionRecord {
+        kind,
+        source: source.map(str::to_owned),
+        agent: Some(agent.to_owned()),
+        ..SessionRecord::new(id, ROOT)
+    };
+    let mut gone = make("s4", SessionKind::Normal, Some("chat:a"), "assistant");
+    gone.lifecycle = SessionLifecycle::Deleted;
+    commit(
+        storage,
+        vec![
+            StorageWrite::Session(make("s1", SessionKind::Main, Some("home"), "assistant")),
+            StorageWrite::Session(make("s2", SessionKind::Main, Some("home"), "coder")),
+            StorageWrite::Session(make("s3", SessionKind::Normal, Some("chat:a"), "assistant")),
+            StorageWrite::Session(gone),
+            StorageWrite::Session(make("s5", SessionKind::Normal, Some("chat:a"), "coder")),
+            StorageWrite::Session(make("s6", SessionKind::Normal, None, "assistant")),
+        ],
+    )
+    .await;
+    let names = |query: SessionQuery| async move {
+        let mut found = Vec::new();
+        let mut cursor = None;
+        loop {
+            let page = storage
+                .scan_sessions(&query, 1, cursor.as_ref())
+                .await
+                .unwrap();
+            found.extend(page.items.into_iter().map(|record| record.id));
+            match page.next {
+                Some(next) => cursor = Some(next),
+                None => return found,
+            }
+        }
+    };
+    let ascending = SessionQuery {
+        order: Some(ScanOrder::Ascending),
+        ..SessionQuery::default()
+    };
+    assert_eq!(
+        names(SessionQuery {
+            source: Some("chat:a".into()),
+            ..ascending.clone()
+        })
+        .await,
+        ["s3", "s4", "s5"]
+    );
+    // 条件之间是交集，分页一次一条不丢不重。
+    assert_eq!(
+        names(SessionQuery {
+            source: Some("chat:a".into()),
+            lifecycle: Some(SessionLifecycle::Active),
+            ..ascending.clone()
+        })
+        .await,
+        ["s3", "s5"]
+    );
+    assert_eq!(
+        names(SessionQuery {
+            kind: Some(SessionKind::Main),
+            agent: Some("coder".into()),
+            ..ascending.clone()
+        })
+        .await,
+        ["s2"]
+    );
+    assert_eq!(
+        names(SessionQuery {
+            agent: Some("assistant".into()),
+            order: None,
+            ..SessionQuery::default()
+        })
+        .await,
+        ["s6", "s4", "s3", "s1"]
+    );
+    assert_eq!(
+        names(SessionQuery {
+            source: Some("nowhere".into()),
+            ..ascending.clone()
+        })
+        .await,
+        Vec::<String>::new()
+    );
+    // 整条替换之后条件跟着新值走。
+    let mut moved = make("s3", SessionKind::Normal, Some("chat:b"), "assistant");
+    moved.lifecycle = SessionLifecycle::Active;
+    commit(storage, vec![StorageWrite::Session(moved)]).await;
+    assert_eq!(
+        names(SessionQuery {
+            source: Some("chat:a".into()),
+            ..ascending.clone()
+        })
+        .await,
+        ["s4", "s5"]
+    );
+    assert_eq!(
+        names(SessionQuery {
+            source: Some("chat:b".into()),
+            ..ascending
+        })
+        .await,
+        ["s3"]
+    );
 }
 
 async fn session_and_progress_operations_are_rejected_after_close(storage: &dyn Storage) {

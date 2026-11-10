@@ -947,6 +947,15 @@ impl Storage for TursoStorage {
         if let Some(lifecycle) = query.lifecycle {
             filter.eq("lifecycle", text(tag(&lifecycle)?));
         }
+        if let Some(source) = &query.source {
+            filter.eq("source", text(source));
+        }
+        if let Some(kind) = query.kind {
+            filter.eq("kind", text(tag(&kind)?));
+        }
+        if let Some(agent) = &query.agent {
+            filter.eq("agent", text(agent));
+        }
         if let Some(after) = after {
             let op = match order {
                 ScanOrder::Ascending => ">",

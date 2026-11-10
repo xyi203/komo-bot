@@ -104,7 +104,10 @@ pub const SESSIONS_TABLE_DDL: &str = "CREATE TABLE sessions (
     root_conversation INTEGER NOT NULL,
     record TEXT NOT NULL CHECK (json_valid(record)),
     request_key TEXT,
-    request_hash TEXT
+    request_hash TEXT,
+    source TEXT,
+    kind TEXT,
+    agent TEXT
 ) STRICT";
 
 /// 一列的补列材料：`ALTER TABLE ADD COLUMN` 的子句（类型 + 约束，须可空或带默认值）。
@@ -209,6 +212,9 @@ pub const TABLES: &[TableSpec] = &[
             col("record", "TEXT NOT NULL DEFAULT '{}'"),
             col("request_key", "TEXT"),
             col("request_hash", "TEXT"),
+            col("source", "TEXT"),
+            col("kind", "TEXT"),
+            col("agent", "TEXT"),
         ],
     },
 ];
@@ -291,6 +297,15 @@ pub const INDEXES: &[(&str, &str)] = &[
     (
         "sessions_by_lifecycle",
         "CREATE INDEX sessions_by_lifecycle ON sessions (lifecycle, id)",
+    ),
+    // 渠道入口按来源 / 主会话找会话（`ensure_session`，在提交线里）：只读命中的那一行。
+    (
+        "sessions_by_source",
+        "CREATE INDEX sessions_by_source ON sessions (source, lifecycle, id)",
+    ),
+    (
+        "sessions_by_kind_agent",
+        "CREATE INDEX sessions_by_kind_agent ON sessions (kind, agent, lifecycle, id)",
     ),
 ];
 
@@ -470,6 +485,21 @@ async fn add_missing(conn: &Connection, tables: &[String]) -> Result<(), LineErr
             conn.execute(*sql, ()).await.map_err(db_err)?;
         }
     }
+    backfill_session_columns(conn).await
+}
+
+/// `source` / `kind` / `agent` 是后补的查询列，取自 `record`。补列之前写的行（以及旧版本写的行）
+/// 这三列是空的：开库时从 `record` 抽一次。新代码写的行 `kind` 一定非空（`SessionKind` 总会序列化），
+/// 所以 `kind IS NULL` 只挑出没回填的行，走 `sessions_by_kind_agent`。
+async fn backfill_session_columns(conn: &Connection) -> Result<(), LineError> {
+    conn.execute(
+        "UPDATE sessions SET source = json_extract(record, '$.source'), \
+         kind = COALESCE(json_extract(record, '$.kind'), 'normal'), \
+         agent = json_extract(record, '$.agent') WHERE kind IS NULL",
+        (),
+    )
+    .await
+    .map_err(db_err)?;
     Ok(())
 }
 
@@ -671,6 +701,56 @@ mod tests {
                 if found == FORMAT_VERSION + 1 && supported == FORMAT_VERSION),
             "{error:?}"
         );
+    }
+
+    /// 补 `source` / `kind` / `agent` 之前的库：重开后补列并从 `record` 回填，查询列与记录一致。
+    #[tokio::test]
+    async fn reopening_fills_the_session_query_columns_from_the_record() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let (_db, conn) = fresh(dir.path()).await;
+            for index in ["sessions_by_source", "sessions_by_kind_agent"] {
+                conn.execute(&format!("DROP INDEX {index}"), ())
+                    .await
+                    .unwrap();
+            }
+            for column in ["source", "kind", "agent"] {
+                conn.execute(&format!("ALTER TABLE sessions DROP COLUMN {column}"), ())
+                    .await
+                    .unwrap();
+            }
+            conn.execute(
+                "INSERT INTO sessions (id, lifecycle, root_conversation, record) VALUES \
+                 ('s1', 'active', 1, '{\"source\":\"chat:a\",\"kind\":\"main\",\"agent\":\"coder\"}'), \
+                 ('s2', 'active', 1, '{}')",
+                (),
+            )
+            .await
+            .unwrap();
+        }
+        let (_db, conn) = fresh(dir.path()).await;
+        let row = |id: &'static str| {
+            let conn = &conn;
+            async move {
+                column_one(
+                    conn,
+                    &format!(
+                        "SELECT COALESCE(source, '-') || '|' || kind || '|' || COALESCE(agent, '-') \
+                         FROM sessions WHERE id = '{id}'"
+                    ),
+                )
+                .await
+                .unwrap()
+            }
+        };
+        assert_eq!(row("s1").await, ["chat:a|main|coder"]);
+        // 记录里没有 kind 的旧行按 serde 默认算 normal。
+        assert_eq!(row("s2").await, ["-|normal|-"]);
+        let indexes = column_one(&conn, "SELECT name FROM sqlite_schema WHERE type = 'index'")
+            .await
+            .unwrap();
+        assert!(indexes.iter().any(|i| i == "sessions_by_source"));
+        assert!(indexes.iter().any(|i| i == "sessions_by_kind_agent"));
     }
 
     /// 旧形状：少一列、少一个索引。重开后补齐，且已有行保留。

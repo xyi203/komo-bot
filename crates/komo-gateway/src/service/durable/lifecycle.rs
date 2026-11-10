@@ -322,6 +322,7 @@ impl DurableCore {
         let query = SessionQuery {
             lifecycle: Some(SessionLifecycle::Closing),
             order: None,
+            ..SessionQuery::default()
         };
         let mut closing = Vec::new();
         let mut cursor: Option<SessionCursor> = None;
@@ -458,6 +459,7 @@ async fn finish_purged(core: &DurableCore, sessions_dir: &Path) -> Result<u32, S
     let query = SessionQuery {
         lifecycle: Some(SessionLifecycle::Purged),
         order: None,
+        ..SessionQuery::default()
     };
     let mut purged = Vec::new();
     let mut cursor: Option<SessionCursor> = None;

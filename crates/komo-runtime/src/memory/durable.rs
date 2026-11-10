@@ -453,6 +453,7 @@ impl MemoryWorkLog for DurableMemoryWork {
                     &SessionQuery {
                         lifecycle: Some(SessionLifecycle::Active),
                         order: Some(ScanOrder::Ascending),
+                        ..SessionQuery::default()
                     },
                     SCAN_PAGE,
                     cursor.as_ref(),

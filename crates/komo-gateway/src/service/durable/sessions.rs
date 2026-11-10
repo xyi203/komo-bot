@@ -217,14 +217,34 @@ pub async fn create_in(
     Ok(record)
 }
 
-/// 读完全部 Session 行（升序，即创建序）。会话列表与按来源找会话都是全表扫描——
-/// TODO：会话多了以后给 `source` / `kind` 建索引（`docs/storage-durable-d5.md` §9 的风险）。
+/// 过 `query` 的会话里第一条也满足 `matches` 的（按 `query.order`）。
+async fn first_session(
+    storage: &dyn Storage,
+    query: &SessionQuery,
+    matches: impl Fn(&SessionRecord) -> bool,
+) -> Result<Option<SessionRecord>, StorageError> {
+    let mut cursor: Option<SessionCursor> = None;
+    loop {
+        let page = storage.scan_sessions(query, 16, cursor.as_ref()).await?;
+        if let Some(found) = page.items.into_iter().find(|record| matches(record)) {
+            return Ok(Some(found));
+        }
+        match page.next {
+            Some(next) => cursor = Some(next),
+            None => return Ok(None),
+        }
+    }
+}
+
+/// 读完全部 Session 行（升序，即创建序）。会话列表还是全表扫描（分页见
+/// `docs/session-optimization.md` §3.5，未做）。
 pub(super) async fn scan_all_sessions(
     storage: &dyn Storage,
 ) -> Result<Vec<SessionRecord>, StorageError> {
     let query = SessionQuery {
         lifecycle: None,
         order: Some(ScanOrder::Ascending),
+        ..SessionQuery::default()
     };
     let mut all = Vec::new();
     let mut cursor: Option<SessionCursor> = None;
@@ -324,17 +344,15 @@ impl DurableCore {
     ///
     /// 只认还收输入的会话；同一个 Agent 有多条时取最早的那条。
     pub async fn main_session(&self, agent: &str) -> Result<(SessionRecord, bool), SessionError> {
-        let wanted = agent.to_owned();
         let spec = NewSession::new(agent)
             .kind(SessionKind::Main)
             .source(HOME_SOURCE);
-        self.ensure_session(
-            move |record| {
-                record.kind == SessionKind::Main && record.agent.as_deref() == Some(wanted.as_str())
-            },
-            spec,
-        )
-        .await
+        let query = SessionQuery {
+            kind: Some(SessionKind::Main),
+            agent: Some(agent.to_owned()),
+            ..SessionQuery::default()
+        };
+        self.ensure_session(query, |_| true, spec).await
     }
 
     /// 一个来源（`chat:telegram:123` 这类群 / 话题 / 带话题的私聊）对应的会话：不存在就建一个
@@ -345,38 +363,37 @@ impl DurableCore {
         source: &str,
         agent: &str,
     ) -> Result<(SessionRecord, bool), SessionError> {
-        let wanted = source.to_owned();
         let spec = NewSession::new(agent).source(source);
-        self.ensure_session(
-            move |record| {
-                record.kind != SessionKind::Main
-                    && record.source.as_deref() == Some(wanted.as_str())
-            },
-            spec,
-        )
-        .await
+        let query = SessionQuery {
+            source: Some(source.to_owned()),
+            ..SessionQuery::default()
+        };
+        self.ensure_session(query, |record| record.kind != SessionKind::Main, spec)
+            .await
     }
 
-    /// 找到第一个（创建序最早的）还收输入、`matches` 的会话；没有就按 `spec` 建。同一次提交，
-    /// 所以找与建之间不会有第二个入口插进来。
+    /// 找到第一个（创建序最早的）还收输入、过 `query` 且 `matches` 的会话；没有就按 `spec` 建。
+    /// 同一次提交，所以找与建之间不会有第二个入口插进来。`query` 下推成带索引的条件，提交线里
+    /// 只读命中的那几行，不扫全表。
     async fn ensure_session(
         &self,
+        query: SessionQuery,
         matches: impl Fn(&SessionRecord) -> bool + Send + 'static,
         spec: NewSession,
     ) -> Result<(SessionRecord, bool), SessionError> {
         let storage = self.storage.clone();
         let id = self.fresh_session_id();
+        let query = SessionQuery {
+            lifecycle: Some(SessionLifecycle::Active),
+            order: Some(ScanOrder::Ascending),
+            ..query
+        };
         Ok(self
             .engine
             .commit(move |tx| {
                 Box::pin(async move {
                     // 先读后写：扫描读的是已提交状态，必须排在这次提交的第一次表写之前。
-                    let found = scan_all_sessions(&*storage)
-                        .await?
-                        .into_iter()
-                        .find(|record| {
-                            record.lifecycle == SessionLifecycle::Active && matches(record)
-                        });
+                    let found = first_session(&*storage, &query, matches).await?;
                     match found {
                         Some(record) => Ok((record, false)),
                         None => Ok((create_in(tx, &spec, &id).await?, true)),

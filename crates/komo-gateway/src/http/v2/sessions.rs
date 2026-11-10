@@ -9,6 +9,7 @@
 use axum::extract::{Path, Query, State};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use futures_util::{StreamExt, TryStreamExt};
 use komo_kernel::durable::legacy_ids;
 use komo_kernel::protocol::http::{
     BoundaryRequest, BoundaryResponse, CreateSessionRequest, DeleteSessionRequest, PurgeBlocked,
@@ -57,6 +58,9 @@ fn flag(query: &str, name: &str) -> bool {
     })
 }
 
+/// 会话列表并发读概览的上限。
+const SUMMARY_READS: usize = 2;
+
 /// `GET /v1/sessions`：默认只列 `active` 与 `closing`；`?all=1` 带上 `deleted`；`purged` 不列。
 async fn list(
     State(api): State<Api>,
@@ -65,10 +69,16 @@ async fn list(
     let core = api.state.core()?;
     let all = flag(uri.query().unwrap_or_default(), "all");
     let records = core.list_sessions(all).await?;
-    let mut sessions = Vec::with_capacity(records.len());
-    for record in &records {
-        sessions.push(core.session_summary(record).await?);
-    }
+    // 每条概览是几次点查（live / inbox / 末条 entry）：有界并发、保持次序。上限取读连接池
+    // （`TursoStorage` 4 条）的一半，与 feed 补读同一个口径，给提交线留出空连接。
+    let sessions = futures_util::stream::iter(records)
+        .map(|record| {
+            let core = core.clone();
+            async move { core.session_summary(&record).await }
+        })
+        .buffered(SUMMARY_READS)
+        .try_collect()
+        .await?;
     Ok(Json(SessionListResponse { sessions }))
 }
 

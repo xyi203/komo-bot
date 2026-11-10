@@ -537,9 +537,11 @@ impl Write {
                 exec(
                     conn,
                     what,
-                    "INSERT INTO sessions (id, lifecycle, current_branch, root_conversation, record, request_key, request_hash) VALUES (?1, ?2, ?3, ?4, ?5, CASE WHEN json_extract(?5, '$.requestHash') IS NOT NULL THEN json_extract(?5, '$.requestKey') END, json_extract(?5, '$.requestHash')) \
+                    "INSERT INTO sessions (id, lifecycle, current_branch, root_conversation, record, request_key, request_hash, source, kind, agent) VALUES (?1, ?2, ?3, ?4, ?5, CASE WHEN json_extract(?5, '$.requestHash') IS NOT NULL THEN json_extract(?5, '$.requestKey') END, json_extract(?5, '$.requestHash'), \
+                     json_extract(?5, '$.source'), COALESCE(json_extract(?5, '$.kind'), 'normal'), json_extract(?5, '$.agent')) \
                      ON CONFLICT(id) DO UPDATE SET lifecycle = excluded.lifecycle, current_branch = excluded.current_branch, \
-                     root_conversation = excluded.root_conversation, record = excluded.record, request_key = excluded.request_key, request_hash = excluded.request_hash",
+                     root_conversation = excluded.root_conversation, record = excluded.record, request_key = excluded.request_key, request_hash = excluded.request_hash, \
+                     source = excluded.source, kind = excluded.kind, agent = excluded.agent",
                     vec![
                         text(id),
                         text(lifecycle),

@@ -416,6 +416,50 @@ async fn the_main_session_and_source_sessions_are_found_before_they_are_created(
     ));
 }
 
+#[tokio::test]
+async fn a_source_finds_its_earliest_active_session_and_never_a_main_one() {
+    let fx = Fixture::new(FakeLlm::finisher("好")).await;
+    let (main, _) = fx.core.main_session("assistant").await.unwrap();
+    let mut made = Vec::new();
+    for _ in 0..3 {
+        made.push(
+            fx.core
+                .create_session(NewSession::new("assistant").source("chat:a"))
+                .await
+                .unwrap(),
+        );
+    }
+    // 最早的那条被删了：不再接消息，找第二早的。
+    let mut gone = made[0].clone();
+    gone.lifecycle = SessionLifecycle::Deleted;
+    fx.core
+        .engine
+        .commit(move |tx| {
+            Box::pin(async move {
+                tx.put_session(gone);
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+    let (found, created) = fx
+        .core
+        .session_for_source("chat:a", "assistant")
+        .await
+        .unwrap();
+    assert!(!created);
+    assert_eq!(found.id, made[1].id);
+    // 主会话的来源也是 home，但按来源找不会认它。
+    let (home, created) = fx
+        .core
+        .session_for_source(main.source.as_deref().unwrap(), "assistant")
+        .await
+        .unwrap();
+    assert!(created && home.id != main.id);
+    let (again, created) = fx.core.main_session("assistant").await.unwrap();
+    assert!(!created && again.id == main.id);
+}
+
 // ------------------------------------------------------------------ 导航与分支
 
 #[tokio::test]

@@ -738,11 +738,7 @@ impl Storage for MemoryStorage {
         check_limit(limit)?;
         let state = self.open()?;
         let (order, after) = session_scan_start(query.order, cursor)?;
-        let keep = |record: &&SessionRecord| {
-            query
-                .lifecycle
-                .is_none_or(|wanted| record.lifecycle == wanted)
-        };
+        let keep = |record: &&SessionRecord| query.matches(record);
         let values: Vec<SessionRecord> = match order {
             ScanOrder::Ascending => {
                 let lower = after.as_deref().map_or(Bound::Unbounded, Bound::Excluded);

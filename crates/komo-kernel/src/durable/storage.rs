@@ -12,7 +12,7 @@ use serde_json::Value;
 
 use super::ids::{ConversationId, DocumentId, EntityId, EntryId, Seq, SubmissionId, TaskId};
 use super::records::{
-    ConversationRecord, DocumentAddress, DocumentRecord, DocumentScope, EntryRecord,
+    ConversationRecord, DocumentAddress, DocumentRecord, DocumentScope, EntryRecord, SessionKind,
     SessionLifecycle, SessionRecord, SubmissionRecord, SubmissionStatus, TaskRecord, TaskStatus,
 };
 
@@ -216,6 +216,28 @@ pub struct DocumentQuery {
 pub struct SessionQuery {
     pub lifecycle: Option<SessionLifecycle>,
     pub order: Option<ScanOrder>,
+    /// 只要这个来源的（`SessionRecord::source`）。
+    pub source: Option<String>,
+    pub kind: Option<SessionKind>,
+    /// 只要这个 Agent 的（`SessionRecord::agent`）。
+    pub agent: Option<String>,
+}
+
+impl SessionQuery {
+    /// 一条记录过不过这个查询的过滤（不看 `order`）。
+    pub fn matches(&self, record: &SessionRecord) -> bool {
+        self.lifecycle
+            .is_none_or(|wanted| record.lifecycle == wanted)
+            && self.kind.is_none_or(|wanted| record.kind == wanted)
+            && self
+                .source
+                .as_deref()
+                .is_none_or(|wanted| record.source.as_deref() == Some(wanted))
+            && self
+                .agent
+                .as_deref()
+                .is_none_or(|wanted| record.agent.as_deref() == Some(wanted))
+    }
 }
 
 /// Session 扫描的续扫位置：Session 的 id 是字符串，不能用数字 [`Cursor`]。
@@ -488,8 +510,8 @@ pub trait Storage: Send + Sync {
     /// 按创建请求键查已提交的会话。
     async fn session_by_request(&self, key: &str) -> StorageResult<Option<SessionRecord>> {
         let query = SessionQuery {
-            lifecycle: None,
             order: Some(ScanOrder::Ascending),
+            ..SessionQuery::default()
         };
         let mut cursor = None;
         loop {

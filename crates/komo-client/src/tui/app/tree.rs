@@ -238,9 +238,7 @@ impl App {
                         _ => continue, // system checkpoints are context, not spoken history.
                     };
                     let text = content_text(&message["content"]);
-                    let mut displayed = display_message(&entry.id, seq, role, text);
-                    displayed.run = self.entry_runs.get(&entry.id).cloned();
-                    messages.push(displayed);
+                    messages.push(display_message(&entry.id, seq, role, text));
                     if role == Role::Assistant {
                         for block in message["content"].as_array().into_iter().flatten() {
                             if block["type"] != "toolCall" {
@@ -254,13 +252,11 @@ impl App {
                                 .get(id)
                                 .cloned()
                                 .unwrap_or_else(|| ToolCallId::from_raw(id));
-                            let mut tool = self.tools.get(&call).cloned().unwrap_or_else(|| {
-                                blank_tool(
-                                    call.clone(),
-                                    self.entry_runs.get(&entry.id).cloned(),
-                                    seq,
-                                )
-                            });
+                            let mut tool = self
+                                .tools
+                                .get(&call)
+                                .cloned()
+                                .unwrap_or_else(|| blank_tool(call.clone(), None, seq));
                             tool.seq = seq;
                             tool.tool = block["name"].as_str().unwrap_or("?").into();
                             tool.args = block["arguments"].clone();

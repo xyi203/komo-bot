@@ -231,7 +231,6 @@ mod tests {
 
     fn completed(seq: u64) -> Event {
         Event {
-            entry: None,
             v: 1,
             seq: Seq(seq),
             event_id: EventId::from_raw(format!("evt-{seq}")),
@@ -388,7 +387,6 @@ mod tests {
     fn a_waiting_run_pushes_one_waiting_frame_whatever_it_waits_for() {
         let run = RunId::from_raw("run-1");
         let waiting = |reason: komo_kernel::types::status::WaitReason| Event {
-            entry: None,
             v: 1,
             seq: Seq(3),
             event_id: EventId::from_raw("evt-3"),
@@ -434,7 +432,6 @@ mod tests {
     #[test]
     fn a_reclaim_audit_pushes_no_state_frame() {
         let event = Event {
-            entry: None,
             v: 1,
             seq: Seq(4),
             event_id: EventId::from_raw("evt-4"),

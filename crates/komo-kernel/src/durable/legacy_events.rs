@@ -792,7 +792,6 @@ impl Frame {
             run,
             ts: self.ts,
             payload,
-            entry: None,
         });
         event_id
     }

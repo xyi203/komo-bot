@@ -382,7 +382,6 @@ pub struct App {
     pub runs: BTreeMap<RunId, RunMeta>,
     tools: BTreeMap<ToolCallId, ToolLine>,
     provider_calls: BTreeMap<String, ToolCallId>,
-    entry_runs: BTreeMap<String, RunId>,
     /// 下一个 Run 的模型 / effort 覆盖（`/model` `/effort`）。
     pub model: Option<String>,
     pub effort: Option<Effort>,
@@ -454,7 +453,6 @@ impl App {
             runs: BTreeMap::new(),
             tools: BTreeMap::new(),
             provider_calls: BTreeMap::new(),
-            entry_runs: BTreeMap::new(),
             model: None,
             effort: None,
             model_menu: Vec::new(),

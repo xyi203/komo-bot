@@ -407,7 +407,6 @@ mod tests {
                     project_update: false,
                     shell: None,
                 }),
-                entry: None,
             }])
         }
     }

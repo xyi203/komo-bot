@@ -129,7 +129,6 @@ pub fn inject_memory_events(events: &mut Vec<Event>, doc: &MemoryDoc) {
             uses: doc.uses.clone(),
             recall: doc.recall.clone(),
         }),
-        entry: None,
     };
     events.insert(position + 1, injected);
 }

@@ -41,7 +41,6 @@ pub fn event(seq: u64, run: Option<RunId>, payload: EventPayload) -> Event {
         run,
         ts: T0 + time::Duration::seconds(seq as i64),
         payload,
-        entry: None,
     }
 }
 

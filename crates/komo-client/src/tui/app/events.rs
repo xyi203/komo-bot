@@ -327,7 +327,7 @@ impl App {
                         | EventPayload::RunAbsorbed(_)
                         | EventPayload::ContextCompacted(_)
                         | EventPayload::ConfigChanged(_)
-                ) || event.entry.is_some();
+                );
                 self.absorb(&event);
                 if refresh {
                     self.refresh_tree()
@@ -419,21 +419,6 @@ impl App {
         // 补读与订阅各读各的一段（订阅从游标之后起），照理不会重叠；真重了也不能把用量
         // 加两遍——**只有没见过的那一条才计数**。游标不能当这个记号：它在别处（`frame`）
         // 就已经推过了，等走到这里永远是"见过"。
-        if event.entry.is_some() && self.branch_messages.is_none() {
-            // A tree record cannot be rendered as linear event history while its
-            // authoritative path is still loading (or the tree request failed).
-            self.branch_messages = Some(Vec::new());
-        }
-        if let (Some(entry), Some(run)) = (&event.entry, &event.run) {
-            if self
-                .entry_runs
-                .insert(entry.id.clone(), run.clone())
-                .as_ref()
-                != Some(run)
-            {
-                self.tree_projection_dirty = true;
-            }
-        }
         let fresh = event.seq > self.counted;
         self.counted = self.counted.max(event.seq);
         self.surface.extend([event]);

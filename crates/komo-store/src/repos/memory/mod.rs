@@ -811,7 +811,9 @@ enum VectorArm {
         cosines: std::collections::BTreeMap<String, f32>,
         covered: f32,
     },
-    Unavailable { reason: String },
+    Unavailable {
+        reason: String,
+    },
 }
 
 /// 向量臂：当前代次内的**精确**余弦（§9.4「由 Rust 在作用域过滤后做精确余弦检索」）。
@@ -2259,9 +2261,14 @@ mod tests {
         assert_eq!(ids_of(&kept), vec!["m-1", "m-2"]);
 
         // 给 m-1 一条与查询正交的向量：关键词分照样过 0.5，但余弦 0 < 0.5。
-        repo.put_vector(&MemoryId::from_raw("m-1"), 1, "gen-1", Vector(vec![0.0, 1.0]))
-            .await
-            .unwrap();
+        repo.put_vector(
+            &MemoryId::from_raw("m-1"),
+            1,
+            "gen-1",
+            Vector(vec![0.0, 1.0]),
+        )
+        .await
+        .unwrap();
         let vetoed = repo.recall(&with_cosine_floor(0.5)).await.unwrap();
         assert_eq!(ids_of(&vetoed), vec!["m-2"], "向量反对，关键词门槛不算过");
         assert_eq!(vetoed.dropped_by_threshold, Some(2));

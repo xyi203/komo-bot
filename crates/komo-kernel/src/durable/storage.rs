@@ -438,6 +438,38 @@ pub trait Storage: Send + Sync {
         conversation: ConversationId,
         request_id: &str,
     ) -> StorageResult<Option<SubmissionRecord>>;
+    /// Session 内按 `request_id` 找 submission：在这个 Session 的全部 conversation 里找，
+    /// 多个命中取 conversation ID 最小的那条。gateway 受理输入的请求键去重用它，不必读整棵树。
+    /// 默认实现逐 conversation 点查；Turso 一条 join。
+    async fn submission_by_session_request(
+        &self,
+        session: &str,
+        request_id: &str,
+    ) -> StorageResult<Option<SubmissionRecord>> {
+        let query = ConversationQuery {
+            session: Some(session.to_owned()),
+            order: Some(ScanOrder::Ascending),
+            ..ConversationQuery::default()
+        };
+        let mut cursor = None;
+        loop {
+            let page = self
+                .scan_conversations(&query, 256, cursor.as_ref())
+                .await?;
+            for conversation in &page.items {
+                if let Some(found) = self
+                    .submission_by_request(conversation.id, request_id)
+                    .await?
+                {
+                    return Ok(Some(found));
+                }
+            }
+            match page.next {
+                Some(next) => cursor = Some(next),
+                None => return Ok(None),
+            }
+        }
+    }
 
     /// 一个逻辑地址上当前活着的 document；退役了的读不到。
     async fn find_document(

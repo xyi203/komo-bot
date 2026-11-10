@@ -798,6 +798,27 @@ impl Storage for TursoStorage {
         }
     }
 
+    async fn submission_by_session_request(
+        &self,
+        session: &str,
+        request_id: &str,
+    ) -> StorageResult<Option<SubmissionRecord>> {
+        // conversations_by_session 找出分支，submissions_by_request 逐个点查：一条语句，
+        // 不读 entry。
+        match self
+            .one(
+                "SELECT s.record FROM conversations c \
+                 JOIN submissions s ON s.conversation_id = c.id AND s.request_id = ?2 \
+                 WHERE c.session_id = ?1 ORDER BY c.id LIMIT 1",
+                vec![text(session), text(request_id)],
+            )
+            .await?
+        {
+            Some(row) => Ok(Some(decode(&row[0])?)),
+            None => Ok(None),
+        }
+    }
+
     async fn find_document(
         &self,
         address: &DocumentAddress,

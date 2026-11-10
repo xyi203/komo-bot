@@ -60,6 +60,7 @@ pub fn cases() -> Vec<Case> {
         case!(owned_waiting_and_completing_tasks_scan_by_status),
         case!(request_ids_index_per_conversation_and_replace_whole_submissions),
         case!(request_ids_are_unique_within_a_conversation),
+        case!(request_ids_are_found_across_a_sessions_conversations),
         case!(write_submissions_store_without_input_only_states),
         case!(documents_store_whole_values_and_read_only_live_incarnations),
         case!(documents_enforce_one_live_incarnation_per_address),
@@ -1484,6 +1485,80 @@ async fn request_ids_index_per_conversation_and_replace_whole_submissions(storag
         all(query(Some(other), Some(SubmissionStatus::Placed)))
             .await
             .is_empty()
+    );
+}
+
+async fn request_ids_are_found_across_a_sessions_conversations(storage: &dyn Storage) {
+    let root = create_root(storage).await;
+    let a_root: ConversationId = mint(storage).await;
+    let a_entry: EntryId = mint(storage).await;
+    let a_fork: ConversationId = mint(storage).await;
+    let b_root: ConversationId = mint(storage).await;
+    commit(
+        storage,
+        vec![
+            StorageWrite::Conversation(ConversationRecord::root(a_root).in_session("a")),
+            put(entry(a_entry, a_root)),
+            StorageWrite::Conversation(ConversationRecord::root(b_root).in_session("b")),
+        ],
+    )
+    .await;
+    commit(
+        storage,
+        vec![StorageWrite::Conversation(
+            ConversationRecord::fork(a_fork, a_root, a_entry).in_session("a"),
+        )],
+    )
+    .await;
+    let on_fork = input(mint(storage).await, a_fork, Some("k"));
+    let on_b = input(mint(storage).await, b_root, Some("k"));
+    let outside = input(mint(storage).await, root, Some("loose"));
+    commit(
+        storage,
+        [&on_fork, &on_b, &outside]
+            .map(|record| StorageWrite::Submission(record.clone()))
+            .to_vec(),
+    )
+    .await;
+    // 键落在 fork 出来的分支上也找得到；别的 Session 的同名键不串。
+    assert_eq!(
+        storage
+            .submission_by_session_request("a", "k")
+            .await
+            .unwrap(),
+        Some(on_fork.clone())
+    );
+    assert_eq!(
+        storage
+            .submission_by_session_request("b", "k")
+            .await
+            .unwrap(),
+        Some(on_b)
+    );
+    assert_eq!(
+        storage
+            .submission_by_session_request("a", "missing")
+            .await
+            .unwrap(),
+        None
+    );
+    // 不属于任何 Session 的 conversation 不参与。
+    assert_eq!(
+        storage
+            .submission_by_session_request("a", "loose")
+            .await
+            .unwrap(),
+        None
+    );
+    // 两个分支都有同一个键时取 conversation ID 小的那条。
+    let on_root = input(mint(storage).await, a_root, Some("k"));
+    commit(storage, vec![StorageWrite::Submission(on_root.clone())]).await;
+    assert_eq!(
+        storage
+            .submission_by_session_request("a", "k")
+            .await
+            .unwrap(),
+        Some(on_root)
     );
 }
 

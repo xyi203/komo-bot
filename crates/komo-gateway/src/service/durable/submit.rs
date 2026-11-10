@@ -41,7 +41,7 @@ use serde_json::{Value, json};
 use super::DurableCore;
 use super::agent_doc::{self, AgentDoc};
 use super::sessions::{SessionError, ensure_open};
-use super::tree::{MODEL_CHANGE_ENTRY, busy_reason, load_tree, placement, realize};
+use super::tree::{MODEL_CHANGE_ENTRY, Placement, busy_reason, load_tree, placement, realize};
 
 /// 输入没指明来源时放置成的 entry kind（§2：gateway 写的 `cli.input`）。
 pub const DEFAULT_INPUT_KIND: &str = "cli.input";
@@ -346,26 +346,24 @@ impl DurableCore {
         key: &str,
         hash: &str,
     ) -> Result<Option<Accepted>, SessionError> {
-        let tree = load_tree(&*self.storage, session).await?;
-        ensure_open(&tree.session)?;
-        for branch in &tree.branches {
-            let found = self
-                .storage
-                .submission_by_request(branch.conversation.id, key)
-                .await?;
-            if let Some(existing) = found {
-                same_input(&*self.storage, &existing, hash, key).await?;
-                return Ok(Some(Accepted {
-                    session: session.to_owned(),
-                    conversation: existing.conversation,
-                    submission: existing.id,
-                    run: legacy_ids::run_id(existing.id),
-                    deduplicated: true,
-                    status: existing.status(),
-                }));
-            }
-        }
-        Ok(None)
+        let record = self.session(session).await?;
+        ensure_open(&record)?;
+        let Some(existing) = self
+            .storage
+            .submission_by_session_request(session, key)
+            .await?
+        else {
+            return Ok(None);
+        };
+        same_input(&*self.storage, &existing, hash, key).await?;
+        Ok(Some(Accepted {
+            session: session.to_owned(),
+            conversation: existing.conversation,
+            submission: existing.id,
+            run: legacy_ids::run_id(existing.id),
+            deduplicated: true,
+            status: existing.status(),
+        }))
     }
 
     /// 受理一个 submission 的共用一步（输入与 `!` 命令的 write 都走它）：路由到 `current_branch`
@@ -391,42 +389,53 @@ impl DurableCore {
         let storage = self.storage.clone();
         let harness = self.harness.clone();
         let id = session.to_owned();
+        #[cfg(test)]
+        let full_tree = self
+            .full_tree_landing
+            .load(std::sync::atomic::Ordering::SeqCst);
+        #[cfg(not(test))]
+        let full_tree = false;
         self.engine.resume();
         let landed = self
             .engine
             .commit(move |tx| {
                 Box::pin(async move {
                     // 先读后写：下面读的都是已提交状态，在这次提交的第一次表写之前。
-                    let tree = match load_tree(&*storage, &id).await {
-                        Ok(tree) => tree,
-                        Err(error) => return Ok(Err(error)),
+                    // 这段在提交线里，所以只做点查：会话行、Session 级请求键；`leaf` 跟着末端
+                    // （日常的绝大多数提交）时落点就是 `current_branch`，不读树。导航 / 编辑后的
+                    // 第一次提交才读整棵树找 fork 点。
+                    let session = match storage.session(&id).await {
+                        Ok(Some(record)) => record,
+                        Ok(None) => {
+                            return Ok(Err(SessionError::NotFound(format!("会话 {id}"))));
+                        }
+                        Err(error) => return Ok(Err(error.into())),
                     };
-                    if let Err(error) = ensure_open(&tree.session) {
+                    if let Err(error) = ensure_open(&session) {
                         return Ok(Err(error));
                     }
                     if let Some(key) = &request_id {
-                        for branch in &tree.branches {
-                            let found = tx
-                                .submission_by_request(branch.conversation.id, key)
-                                .await?;
-                            if let Some(existing) = found {
-                                if let Err(error) =
-                                    same_input(&*storage, &existing, &hash, key).await
-                                {
-                                    return Ok(Err(error));
-                                }
-                                return Ok(Ok(Landed {
-                                    conversation: existing.conversation,
-                                    submission: existing.id,
-                                    deduplicated: true,
-                                }));
+                        let found = storage.submission_by_session_request(&id, key).await?;
+                        if let Some(existing) = found {
+                            if let Err(error) = same_input(&*storage, &existing, &hash, key).await {
+                                return Ok(Err(error));
                             }
+                            return Ok(Ok(Landed {
+                                conversation: existing.conversation,
+                                submission: existing.id,
+                                deduplicated: true,
+                            }));
                         }
                     }
-                    let place = placement(&tree, tree.leaf_pos());
-                    if reject_when_busy
-                        && let super::tree::Placement::Existing(conversation) = place
-                    {
+                    let place = if session.leaf.is_none() && !full_tree {
+                        Placement::Existing(session.current_branch)
+                    } else {
+                        match load_tree(&*storage, &id).await {
+                            Ok(tree) => placement(&tree, tree.leaf_pos()),
+                            Err(error) => return Ok(Err(error)),
+                        }
+                    };
+                    if reject_when_busy && let Placement::Existing(conversation) = place {
                         match busy_reason(&*storage, conversation).await {
                             Ok(Some(why)) => {
                                 return Ok(Err(SessionError::Busy(format!(
@@ -438,7 +447,7 @@ impl DurableCore {
                         }
                     }
 
-                    let current = tree.session.current_branch;
+                    let current = session.current_branch;
                     let conversation = realize(tx, &id, current, place).await?;
 
                     // sticky 的 model / effort 覆盖：写进 komo.agent，值变了才留 model.change。
@@ -446,7 +455,7 @@ impl DurableCore {
                     if let Some(over) = &model {
                         let mut doc = match agent_doc::read_in(tx, conversation).await? {
                             Some(doc) => doc,
-                            None => AgentDoc::new(tree.session.agent.clone().unwrap_or_default()),
+                            None => AgentDoc::new(session.agent.clone().unwrap_or_default()),
                         };
                         let mut changed = false;
                         if let Some(alias) = &over.alias
@@ -495,7 +504,7 @@ impl DurableCore {
                         .await?;
                     }
 
-                    let mut record = tree.session.clone();
+                    let mut record = session;
                     record.current_branch = conversation;
                     record.leaf = None;
                     record.changed_at = tx.now();

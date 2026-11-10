@@ -1589,3 +1589,119 @@ async fn boundary_and_cancel_act_on_the_current_branch() {
             .is_some()
     );
 }
+
+/// 一步随机操作在一个 core 上的结果（落点、去重、导航位置），加上操作后的树形（不含时间与会话 ID）。
+async fn landing_trace(full_tree: bool, seed_value: u64, steps: usize) -> Vec<String> {
+    let fx = Fixture::new(FakeLlm::finisher("好")).await;
+    fx.core
+        .full_tree_landing
+        .store(full_tree, std::sync::atomic::Ordering::SeqCst);
+    let (session, _) = fx
+        .session_with(&[user("q1"), assistant("a1"), user("q2"), assistant("a2")])
+        .await;
+    // 不引依赖的小 LCG：同一个种子两条路径走同一串操作。
+    let mut state = seed_value.wrapping_mul(6364136223846793005).wrapping_add(1);
+    let mut next = |bound: usize| {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        ((state >> 33) as usize) % bound
+    };
+    let mut keys: Vec<(String, String)> = Vec::new();
+    let mut trace = Vec::new();
+    for step in 0..steps {
+        let tree = fx.tree(&session).await;
+        let outcome = match next(4) {
+            // 导航到树里任意一条 entry（含输入：落在它的上一条）。
+            0 => {
+                let all: Vec<EntryId> = tree
+                    .branches
+                    .iter()
+                    .flat_map(|branch| branch.entries.iter().map(|entry| entry.id))
+                    .collect();
+                let target = all[next(all.len())];
+                match fx
+                    .core
+                    .navigate(&session, NavigateRequest::to(target))
+                    .await
+                {
+                    Ok(outcome) => format!("nav {target:?} -> {:?}", outcome.leaf),
+                    Err(error) => format!("nav {target:?} err {error}"),
+                }
+            }
+            // 用旧键重发：同内容去重，不同内容冲突。
+            1 if !keys.is_empty() => {
+                let (key, text) = keys[next(keys.len())].clone();
+                let text = if next(2) == 0 {
+                    text
+                } else {
+                    format!("{text}!")
+                };
+                match fx
+                    .core
+                    .submit_input(&session, InputRequest::new(text).request_id(key))
+                    .await
+                {
+                    Ok(accepted) => format!(
+                        "replay {:?} {:?} dedup={}",
+                        accepted.conversation, accepted.submission, accepted.deduplicated
+                    ),
+                    Err(error) => format!("replay err {error}"),
+                }
+            }
+            _ => {
+                let key = format!("k{step}");
+                let text = format!("input {step}");
+                keys.push((key.clone(), text.clone()));
+                let accepted = fx
+                    .say(&session, InputRequest::new(text).request_id(key))
+                    .await;
+                format!(
+                    "say {:?} {:?} dedup={}",
+                    accepted.conversation, accepted.submission, accepted.deduplicated
+                )
+            }
+        };
+        let tree = fx.tree(&session).await;
+        let shape: Vec<String> = tree
+            .branches
+            .iter()
+            .map(|branch| {
+                let entries: Vec<String> = branch
+                    .entries
+                    .iter()
+                    .map(|entry| format!("{}:{}", entry.id.get(), entry.kind))
+                    .collect();
+                format!(
+                    "{:?}<{:?}>[{}]",
+                    branch.conversation.id,
+                    branch.conversation.parent.map(|p| (p.conversation, p.at)),
+                    entries.join(",")
+                )
+            })
+            .collect();
+        trace.push(format!(
+            "{outcome} | current={:?} leaf={:?} | {}",
+            tree.session.current_branch,
+            tree.session.leaf,
+            shape.join(" ")
+        ));
+    }
+    fx.core.close().await.unwrap();
+    trace
+}
+
+#[tokio::test]
+async fn landing_without_the_tree_matches_landing_with_it_over_random_sequences() {
+    for seed_value in 0..6 {
+        let fast = landing_trace(false, seed_value, 24).await;
+        let full = landing_trace(true, seed_value, 24).await;
+        for (step, (fast, full)) in fast.iter().zip(&full).enumerate() {
+            assert_eq!(fast, full, "种子 {seed_value} 第 {step} 步");
+        }
+        assert!(
+            fast.iter().any(|line| line.starts_with("nav")),
+            "种子 {seed_value} 没有导航"
+        );
+    }
+}

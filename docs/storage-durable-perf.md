@@ -48,7 +48,7 @@
 - **整段扫描在线上进行**：`entries` 走 `read_on_line`（`durable/line.rs:203`），持有与提交共用的 FIFO
   `gate` 直到最后一页读完。提交也在 `gate` 里等 fsync，所以一个长会话读历史期间，**所有 conversation 的
   提交都在排队**。这与设计 §3.1"读不经过线"不一致（偏离未登记）。
-- gateway 每条用户输入还有一次整段读：`project_update_for`（`crates/komo-gateway/src/service/durable/submit.rs:294`）
+- gateway 每条用户输入还有一次整段读：`project_update_for`（`crates/komo-gateway/src/service/durable/submit/mod.rs:294`）
   只为取当前展示的 `project` 段，读全部 entry 再 `derive_context`。
 
 代价随会话长度线性增长，一个会话累计是平方：第 n 轮读 n 轮的历史。压缩只减少发给模型的东西，不减少读的东西。
@@ -127,7 +127,7 @@
 
 ## 3. gateway 读路径（P2，D5 已记的缺口）
 
-- SSE 补读（`service/durable/feed.rs` 的 `backfill`）每次读整个 Session 的 entry 与 submission，全量
+- SSE 补读（`service/durable/feed/mod.rs` 的 `backfill`）每次读整个 Session 的 entry 与 submission，全量
   `legacy_events` 投影，再丢掉 `seq <= cursor` 的帧（D5 W2b 偏离②）。`runs.rs` 的 `load_log` 同样整段读、整段投影。
 - `legacy_events` 已有增量入口（`Projection::project`，feed 直播在用）。做法：按 Session 缓存投影状态与已见的最大
   记录 ID，补读只投影之后的记录；冷启动仍全量一次。entry 部分与 §1 的缓存共用；submission 是可变记录，以 `commit_seq` 判新旧。

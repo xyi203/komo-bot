@@ -3,9 +3,9 @@
 //!
 //! 只依赖 `komo-kernel`。它是完整的 **Agent Context Boundary**：回答"这次运行是谁、能用
 //! 什么、这一刻模型应该看到什么"，不回答"这件事怎样受控地发生"——后者（进程、落盘、
-//! 恢复核对、记忆检索）在 `komo-runtime`，而 `runtime` **不依赖这个 crate**。两边都
-//! 在 `komo-gateway` 组装起来：Gateway 收集事实（`ContextInput`），这里纯装配
-//! （`AgentContext`）。
+//! 恢复核对、记忆检索）在 `komo-runtime` 及其下的 `komo-tools` / `komo-memory`，它们都
+//! **不依赖这个 crate**。两边都在 `komo-gateway` 组装起来：Gateway 收集事实
+//! （`ContextInput`），这里纯装配（`AgentContext`）。
 //!
 //! ```text
 //! surface   Profile 在工具目录里挑出来的能力面（§4 末）+ 编排操作名

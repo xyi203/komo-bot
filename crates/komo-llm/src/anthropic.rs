@@ -1862,7 +1862,7 @@ mod live {
     //! 一个工具，第二轮把 thinking 原样回放 + tool_result 发回去拿最终答复。
     //!
     //! ```text
-    //! KOMO_ANTHROPIC_LIVE_PROBE=1 cargo test -p komo-runtime --lib -- --ignored live_probe
+    //! KOMO_ANTHROPIC_LIVE_PROBE=1 cargo test -p komo-llm --lib -- --ignored live_probe
     //! ```
     //!
     //! 才会打到真的中转。凭证从 `~/.komo/.env` 的 `OPENCODE_RELAY_TOKEN` 读，**不打印**。

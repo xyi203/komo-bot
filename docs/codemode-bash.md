@@ -129,7 +129,7 @@ MCP，不起 `run_child_detachable` 的子进程，所以也用不上 `probe`"�
 - **转后台**：嵌套调用的 `detach_after` 仍是 `None`。转后台的结果要交回一个已经结束的工具调用，脚本此时
   还在等这次答复，没有接手方。
 - **并发**：codemode 本来就是同一轮里的屏障（`docs/komo_bot.md` §6），不变。
-- **TUI**：槽位让嵌套调用的进度有了数据，但 SSE feed（`service/durable/feed.rs`）当时只把 `komo.live`
+- **TUI**：槽位让嵌套调用的进度有了数据，但 SSE feed（`service/durable/feed/mod.rs`）当时只把 `komo.live`
   里的部分回复投成 `AssistantDelta`，顶层工具的输出尾巴也没有投，TUI 也还不画 codemode 的子调用
   （`docs/komo_bot.md` §11，工具调用怎么画那一段）。子调用的展示已在 §8 补上；把工具的输出尾巴（顶层
   与嵌套）接到 SSE 仍是另一件事。
@@ -200,7 +200,7 @@ Alive / Unknown / Gone 的 probe、取消结果里的 pid、安全重跑、完�
   再看宿主 `ok` 与工具 status），错误留 500 字节，最多 256 个（与子调用上限一致）。
 - **跑完的**：runtime 的 `NestedCall` 多存一份收窄后的 `arguments` 与 `uncertain`，进外层 `output.json` 的
   `result.calls`。gateway 投影 codemode 的 `komo.tool-result` 时先读这份 `output.json`（哈希核对，
-  `service/durable/nested_view.rs`），经 `legacy_events_with` / `Projection::attach_result` 收窄后放进事件
+  `service/durable/feed/nested_view.rs`），经 `legacy_events_with` / `Projection::attach_result` 收窄后放进事件
   `body.result = {calls, error?}`。补读（JSON 分页与 SSE 重连）和直播走同一条路，所以两边逐帧相同。
   只在事件上，不进模型 transcript：模型看到的仍是脚本输出加一句计数。
 - **还在跑的**：新增只在 SSE 上的 `SseEvent::NestedCalls {run, call, calls}`，每帧是一个外层调用的整份快照。

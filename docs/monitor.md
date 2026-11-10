@@ -200,7 +200,7 @@
   `user_statement`（`docs/memory.md` §9.10）。
 - **TUI 的 `!` 命令（2026-11-01）。** 用同一个阈值 `detach_after_secs`，但**不走上面这条路**：不登记
   `komo.monitors`、没有 `#短号`、`monitor_stop` 停不掉、结束时不交回 `bash-done:` 输入、不起模型 Run。
-  整条命令本来就跑在 Gateway 的后台任务里（`service/durable/shell.rs`），HTTP 请求到点先回一张
+  整条命令本来就跑在 Gateway 的后台任务里（`service/durable/submit/shell.rs`），HTTP 请求到点先回一张
   `detached: true` 的回执，TUI 显示「已转后台」；命令跑完照常提交那条 `shell.command` write（下一轮模型
   看得见）。起因：TUI 里 `!scripts/install-local.sh` 的 release 构建超过 120 s，被同步时限杀掉、什么都没装上。
   硬上限是整个 `call_timeout_secs`（默认 1800，`!` 给 `bash` 传 `timeout_secs`，与模型能要到的上限同一个），

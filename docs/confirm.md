@@ -137,7 +137,7 @@ system entry 的增量换一次工具表。有人值守的 Run 里嵌套调用�
 | 片 | 内容 | 主要位置 |
 |---|---|---|
 | P3a | `attended` 判定与 `ToolEnv.source`；`Tool::outward`、MCP `outward` 配置；`Checkpoint::Confirm` 与等待、超时、拒绝 | kernel `traits` / `types::tool` / `protocol::config`；runtime `durable/harness/tool.rs`、`tools/mcp.rs`、config |
-| P3b | `InterventionKind::Confirm`、列表、回答写 `komo.confirm` 与 entry、投递与卡正文、`/answer` 与 CLI | kernel `protocol::http`；gateway `service/durable/interventions.rs`、`dispatcher.rs`、render；client；bin |
+| P3b | `InterventionKind::Confirm`、列表、回答写 `komo.confirm` 与 entry、投递与卡正文、`/answer` 与 CLI | kernel `protocol::http`；gateway `service/durable/interventions/mod.rs`、`dispatcher.rs`、render；client；bin |
 | P3c | codemode 嵌套调用的拒绝；`doctor` / `config check` 的 home chat 报警；文档（§7、§7.5、§11.4、`mcp.md`） | runtime codemode 宿主；gateway config；docs |
 
 ## 10. 实现记录（2026-10-29）

@@ -37,10 +37,10 @@ komo-gateway/src/service/segment.rs
     replay / window / message_text                        历史 → ReplayMessage
     skills_block                                          只是转手调 komo-agent
 
-komo-runtime/src/memory/preamble.rs
+komo-memory/src/preamble.rs
     render_injection                                      记忆注入段（含 token 预算截断）
 
-komo-runtime/src/llm/{responses,chat,anthropic}.rs
+komo-llm/src/{responses,chat,anthropic}.rs
     SystemPreamble 钩子                                    在适配器里把记忆段追加到系统提示后面
 ```
 
@@ -112,7 +112,7 @@ Memory 是唯一需要碰 runtime 的地方，单独放在最后一个阶段（�
 | 历史回放 | `segment.rs` `replay` / `window` / `message_text` | 输入是 kernel 的 `Surface`（`fold` 的结果），不是原始事件 |
 | 工具结果正文 | `komo-kernel/src/projection.rs` `project` | 唯一一处投影；`replay` 负责从 `ToolOutputStore` 取 `body.preview` 与 artifacts 喂给它 |
 | 记忆召回与钉住 | `komo-runtime` `MemoryManager::prepare_segment` | 按 `boundary` 钉在进程内 `pins` 表里，检查点记 `MemoryUse`。返回值 `Injection { text, uses }` **已经带着正文**，但 `segment.rs` 的 `recall_for` 只取了 `.uses` |
-| 记忆渲染 | `komo-runtime/src/memory/preamble.rs` `render_injection` | 抬头 + 每行带来源、确认状态、时间与版本 + 按渲染后的行长截断预算 |
+| 记忆渲染 | `komo-memory/src/preamble.rs` `render_injection` | 抬头 + 每行带来源、确认状态、时间与版本 + 按渲染后的行长截断预算 |
 | 记忆进系统提示 | 各 LLM 适配器的 `SystemPreamble` 钩子 | 正文绕了一圈：`settle_selection` 写进 `selections` 表 → `MemoryPreamble` 按 run 取 → 三个适配器各自 `"\n\n"` 追加。`TurnRequest.system_prompt` **不是**最终发出去的系统提示 |
 | 子代理隔离 | `segment()` | 不召回记忆、`ReplayScope::Thread`、`without_delegate`。已经在上游做了，符合 §12 |
 | `skill://` 挂载 | `segment()` 里的 `ResourceMounts.skills` | 用的是 `SkillRegistry::list()`（全部 skill，含被盖住、被 disable 的），**不是**提示里那份目录。两者本来就不是同一个集合 |
@@ -918,7 +918,7 @@ pub struct Injection {
 // komo-agent/src/context/memory.rs（render_injection 及其 HEADER / render_line 搬过来）
 pub fn render(items: &[MemoryItem], max_tokens: u32) -> Injection;
 
-// komo-runtime/src/memory/mod.rs
+// komo-memory/src/lib.rs
 pub type RenderInjection = fn(&[MemoryItem], u32) -> Injection;
 pub struct MemoryParts {
     ...

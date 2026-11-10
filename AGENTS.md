@@ -61,17 +61,26 @@ komo-store     `durable/`: `Line` (the single commit line), Turso `Storage`, DDL
                deliveries, memory) · tool_output · session_dir / purge (Session directory
                paths, pre-purge reference check). The only crate that sees
                toasty/turso.
+komo-llm       Model layer: protocol adapters (stateless `ModelStream`, `RoutingStream`,
+               `codex_auth`) · embedding · typesafe judge · telemetry (model-call spans) ·
+               effort table · `Secrets` (credential values). Depends on kernel only.
+komo-config    config.toml / .env parse + validate · `ConfigHolder` (hot reload) · `edit`.
+               Depends on kernel + llm.
+komo-tools     tools/{read,write,edit,rg,bash,task,monitor,…} · tool catalog
+               (`executor::ToolExecutor`) · codemode (Monty worker) · MCP client + login ·
+               child-process registry. Depends on kernel + llm + config; no store, no
+               durable engine (the harness drives tool tasks).
+komo-memory    MemoryManager (§9) · matters (goals / areas). Depends on kernel + store + llm;
+               the two Durable seams live in runtime `durable::memory`.
 komo-runtime   `durable/`: Task engine + harness (generation / tool / inbox /
-               compaction / orchestration / codemode, the agent loop organised
-               by pi's hooks) · tools/{read,write,edit,rg,bash} ·
-               codemode (Monty worker) · memory · llm (stateless `ModelStream`) ·
-               embedding · cron scheduler · config.
+               compaction / orchestration / codemode / landing, the agent loop organised
+               by pi's hooks) · `durable::memory` · cron scheduler.
 komo-agent     AgentProfile → 能力面选择 · skills 发现与目录 · 编排操作名 ·
                系统段装配（context：system_sections、task_contract_block、project_update_block，压缩摘要提示）。
                只依赖 kernel，不执行；runtime 不依赖它，Gateway 组装两边。
                值类型（AgentProfile/AgentSurface）留在 kernel。
-komo-gateway   axum routes (`http/v2`) · `service/durable` (DurableCore: hooks,
-               sessions/tree, feed, lifecycle) · SSE · auth · lock/discovery ·
+komo-gateway   axum routes (`http/v2`) · `service/durable` (DurableCore + hooks;
+               sessions/ · submit/ · interventions/ · feed/ · background/) · SSE · auth · lock/discovery ·
                web (Host guard · pairing → cookie · static shell) · launchd/systemd · Dispatcher · generic channel process host ·
                Notifier · deliveries · intervention rendering · config reload.
 komo-channel  Shared protocol, runner and image inbox, plus feature-gated
@@ -81,15 +90,19 @@ komo-channel  Shared protocol, runner and image inbox, plus feature-gated
 komo-client    HTTP + SSE client · discovery · ratatui TUI · command output.
                Depends on kernel only.
 komo (bin)     clap dispatch only (incl. the hidden `__codemode-worker`, whose
-               body is `komo_runtime::codemode::worker::run`).
+               body is `komo_tools::codemode::worker::run`).
 ```
 
-Dependencies point downward only: `kernel ← store ← runtime ← gateway`,
-`kernel ← agent ← gateway`, and `kernel ← client`, meeting in the bin. Channel plugins are a separate branch:
+Dependencies point downward only: `kernel ← llm ← config ← tools ← runtime`,
+`kernel ← store ← memory ← runtime` (memory also uses llm), `runtime ← gateway`,
+`kernel ← agent ← gateway`, and `kernel ← client`, meeting in the bin (which also
+takes `komo-tools` for `__codemode-worker`). Gateway uses llm / config / tools / memory
+types directly. Channel plugins are a separate branch:
 `kernel ← channel`; Gateway uses its common protocol with platform features disabled.
 Build plugins separately with `-p komo-channel --features feishu,telegram,wechat`.
-`gateway` never sees toasty or ratatui; `runtime` never sees axum and never
-depends on `agent`; `client` knows only protocol types.
+`gateway` never sees toasty or ratatui; `runtime` and the four crates under it never
+see axum and never depend on `agent`; only `memory` and `runtime` (besides gateway)
+depend on `store`; `client` knows only protocol types.
 
 ## Rules that are structural, not stylistic
 

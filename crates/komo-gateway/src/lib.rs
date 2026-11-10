@@ -17,15 +17,16 @@ pub mod web;
 /// bin 要的几样**不经 Gateway** 的东西（§3 的命令表：`komo channel list|probe` 与
 /// `komo skills *` 只读文件系统与配置）。
 ///
-/// 从这里再导一次，而不是让 bin 直接依赖 `komo-runtime` / `komo-agent`：§13.4 给 bin
-/// 的依赖是 client / gateway / clap 三条，加更多会把二进制挪到另一条依赖边上。
+/// 从这里再导一次，而不是让 bin 直接依赖 `komo-config` / `komo-llm` / `komo-agent`：§13.4 给 bin
+/// 的依赖是 client / gateway / clap（外加 `__codemode-worker` 要的 komo-tools），加更多会把
+/// 二进制挪到另一条依赖边上。
 pub use komo_agent::skills;
 pub use komo_config as config;
 /// `komo auth codex login|status`（§3、§13.3）：设备码登录与凭证文件，全部实现在
 /// `komo-llm`（不碰 axum / ratatui，只要 reqwest），这里只转一道给 bin。
 pub use komo_llm::codex_auth;
 /// `komo auth mcp login|status`（`docs/mcp.md` §2.1）：同上，OAuth 登录与凭证文件在
-/// `komo-runtime`。
+/// `komo-tools`。
 pub use komo_tools::mcp_auth;
 
 pub use dispatcher::Dispatcher;

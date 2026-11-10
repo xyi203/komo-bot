@@ -49,8 +49,8 @@ MCP 是能力来源；codemode 是组合入口；Python 保留现有计算、文
 |---|---|---|
 | Run 冻结 `AgentSurface` | `komo-kernel/src/types/agent.rs` | 继续作为能力上限 |
 | schema 与可执行工具来自同一集合 | `komo-gateway/src/service/segment.rs` | 改为同一能力目录的两个投影 |
-| `tool://` 提供说明和 schema | `komo-runtime/src/tools/resources.rs` | 扩展为按需发现入口 |
-| 统一 prepare、能力面、执行、落账 | `komo-runtime/src/executor/mod.rs` | 外层和每个子调用都复用 |
+| `tool://` 提供说明和 schema | `komo-tools/src/tools/resources.rs` | 扩展为按需发现入口 |
+| 统一 prepare、能力面、执行、落账 | `komo-tools/src/executor/mod.rs` | 外层和每个子调用都复用 |
 | Python 每次调用独立进程 | `komo-runtime/src/python_runtime/` | 保持现状，不在里面增加隐式 MCP 连接 |
 | 工具模型视图只有一处投影 | `komo-kernel/src/projection.rs` | codemode 最终结果仍走同一投影 |
 | 恢复原请求依赖 assistant 事件 | `komo-gateway/src/service/segment.rs` | 子调用改从自己的请求事件恢复 |

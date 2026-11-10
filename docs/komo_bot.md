@@ -4,7 +4,7 @@
 
 本文定义一个全新项目。Komo 是程序名称；架构只依据本文的需求与约束。
 
-v0.8 相对 v0.7 的变化：状态数据库改为 Turso + toasty（§8.2；2026-10-25 起会话存储整个换成 pi-durable 的提交模型，见下）；工程结构为八个 crate（2026-09-22 抽出 `komo-agent`，2026-10-30 抽出 `komo-channel`），编译预算列为验收项（§13.4）；飞书 / Telegram / WeChat 聊天入口与 TUI 进入首版，需要人判断的事主要在聊天里回答（§11）；新增 Skills（§5.6）；补齐 trait 清单（§13.5）；渠道的身份匹配（谁是操作者、哪个会话是 home chat）只放 config.toml / .env，不进数据库（§11.2）；配置热重载，改 config.toml / .env 不重启 Gateway（§3）。全新实现，不迁移旧代码与旧数据。
+v0.8 相对 v0.7 的变化：状态数据库改为 Turso + toasty（§8.2；2026-10-25 起会话存储整个换成 pi-durable 的提交模型，见下）；工程结构为十二个 crate（2026-09-22 抽出 `komo-agent`，2026-10-30 抽出 `komo-channel`，2026-11-10 从 runtime 抽出 `komo-llm` / `komo-config` / `komo-tools` / `komo-memory`），编译预算列为验收项（§13.4）；飞书 / Telegram / WeChat 聊天入口与 TUI 进入首版，需要人判断的事主要在聊天里回答（§11）；新增 Skills（§5.6）；补齐 trait 清单（§13.5）；渠道的身份匹配（谁是操作者、哪个会话是 home chat）只放 config.toml / .env，不进数据库（§11.2）；配置热重载，改 config.toml / .env 不重启 Gateway（§3）。全新实现，不迁移旧代码与旧数据。
 
 2026-10-25：存储与 agent loop 整套采用 pi-durable 的提交模型（`docs/storage-durable.md`）：`durable.db` 是唯一权威（entry 不可变、task / submission / document、一条提交线、effect sandwich），events.jsonl 退成导出格式，会话树用 fork 表达，loop 按 pi 的钩子组织、跑在 Task 引擎上（§6、§8）。不迁移旧数据：旧 `sessions/*/events.jsonl` 与 `state.db*` 原地留着，新版本不读。§6、§8 与下文凡写到存储的地方都按新存储；被替换的旧机制已在 v0.8 存储重写中移除。
 
@@ -374,7 +374,7 @@ Skills 是**人写的程序性说明**——"做 X 时按这几步、跑这个�
 
 ## 6. Agent Loop
 
-**loop 的形状照 pi 的 `runLoop`：一个函数、一份消息数组、一组钩子**（2026-10-23 定、10-25 落地，`docs/storage-durable.md` §12）。loop 不知道存储、不知道压缩算法、不知道收件箱，全是钩子；钩子由存储层实现，**每个钩子边界就是一次提交**。执行跑在通用的 **Task 引擎**上（pending / running / waiting / completing / terminal，整值 checkpoint，所有权与自底向上 abort，`komo-kernel/src/durable/task/`、`komo-runtime/src/durable/{engine,scheduler}.rs`）：loop 不是一个长跑的 async 函数，而是**拆在提交点上**的几种任务，重启后 `running` 回 `pending`，从 checkpoint 写明的阶段接着跑，不靠"看尾巴猜"。模型这一侧是**无状态**的：`ModelStream::stream(request, progress) -> AssistantMessage`，每次给完整 context（`komo-runtime/src/llm/model_stream.rs`，三家 provider 各一个 `stateless.rs`，`RoutingStream` 按模型配置路由）。
+**loop 的形状照 pi 的 `runLoop`：一个函数、一份消息数组、一组钩子**（2026-10-23 定、10-25 落地，`docs/storage-durable.md` §12）。loop 不知道存储、不知道压缩算法、不知道收件箱，全是钩子；钩子由存储层实现，**每个钩子边界就是一次提交**。执行跑在通用的 **Task 引擎**上（pending / running / waiting / completing / terminal，整值 checkpoint，所有权与自底向上 abort，`komo-kernel/src/durable/task/`、`komo-runtime/src/durable/{engine,scheduler}.rs`）：loop 不是一个长跑的 async 函数，而是**拆在提交点上**的几种任务，重启后 `running` 回 `pending`，从 checkpoint 写明的阶段接着跑，不靠"看尾巴猜"。模型这一侧是**无状态**的：`ModelStream::stream(request, progress) -> AssistantMessage`，每次给完整 context（`komo-llm/src/model_stream.rs`，三家 provider 各一个 `stateless.rs`，`RoutingStream` 按模型配置路由）。
 
 ```text
 一次提交：输入 submission 受理（请求键去重）
@@ -412,7 +412,7 @@ komo.generation（一轮）
 
 **在线压缩（`[compaction]`，默认关）。** 判断在 `prepare`（`compaction::decide`，`komo-runtime/src/durable/harness/compaction/plan.rs`）：**只按上下文窗口触发**——估计的上下文贴着窗口（`context_window − window_reserve_tokens` 与 `max_context_tokens`（默认 150k）先到的那个；字节 / 4 的估计与实报用量取大）才判，贴着窗口不看账（窗口保护），冷却、旧债照记。决定压时建一个**阻塞压缩**（`komo.compaction` 任务，生成拥有的子任务）并 `waiting`，压完回到 `prepare` 读一次结局再接着这一轮；摘要请求两条消息、没有工具（pi 的 `serializeConversation` 格式：`<conversation>…</conversation>` + 指令，思考块与 system 消息不进，工具结果截 2000 字符），默认提示是 pi 的结构化检查点格式，gateway 经 `AgentHooks::compaction` 换成 komo-agent 的；模型、提示、`tail`、`firstKept`、时间戳钉在 checkpoint，重启后重发逐字节相同。切点用 pi 的 `selectCut`（以 entry 为单位，候选是以 user / assistant 消息开头的 entry，工具结果与 system entry 从不是候选，调用永远不和结果分开），近期至少留 `keep_recent_tokens`；结果是一条 `komo.compaction` entry，`head` = 第一条保留的 entry，**摘要取代切点之前的一切**（不再单独钉住开头那句任务）。**决定不压时一切原样**：下一次请求与关着压缩时逐字节相同，提示缓存照样命中。**后台压缩**：`CompactionSettings.background_tokens`（`[compaction] background_tokens`，0 / 省略 = 不启用）——到了 `阻塞阈值 − background_tokens` 就在后台起一个压缩，不挡当前轮，只要求摘要比被收的那段小、压完在阻塞阈值之下，不看旧的经济账。在线状态（请求次数、上下文增量、缓存债、冷却）**从 entry 折出来**（`durable::compaction::online_state`：用量读 assistant 消息，压缩 / 衰减欠下的债记在各自 entry 的 `data.debt`，`head` 指自己的 entry 即 `/new` 归零），重启、fork 之后重折一遍就回来，没有第二份真相；唯一不在 entry 里的是"刚压失败过"（`komo.live.compactionFailure`，之后出现一条完成的工具结果就解除）。手动压缩（`/compact`）是 `Harness::compact`（conversation 所有、不是 background、`instructions` 可选）。摘要请求的 token 不进累计用量（`komo.usage` 未做）。
 
-**溢出恢复：provider 以上下文超长拒了请求，强制压一次再接着跑。** 估计是字节 / 4，可能比 provider 的分词低，窗口保护会来不及。识别只看错误文本（`is_context_overflow`，`komo-runtime/src/llm`：先排除限流类，再匹配各家措辞，两张表移植自 pi 的 `utils/overflow.ts`），**识别先于重试判断**——有的代理把超长包成 500，照 5xx 退避只会把同一份超长的上下文再发几遍。`request` 收到超长、这个生成还没压过（checkpoint 里的 `compacted`）、"压成摘要之后至少有一次成功请求"也满足时，追加错误 entry、建阻塞压缩（`reason: overflow`，决策记 `context_overflow: true`）并 `waiting`，回到 `prepare`；不看缓存账、不看冷却、不判压完贴不贴窗口；这次恢复请求不算重试预算。**只救一次**：压过之后又超长、压不出摘要（只剩最后一轮、摘要不比被收的那段小）、摘要请求失败，都照原错误 `model_error` 失败。**不受 `[compaction] enabled` 管**（不压的话 Run 反正失败）。只因输出到了 `max_tokens` 而截断的回复不在此列：那是输出上限，压缩救不回来；被截断的回复记成一条失败的 assistant entry，run 以 `model_error` 收场，不按半轮调用执行。
+**溢出恢复：provider 以上下文超长拒了请求，强制压一次再接着跑。** 估计是字节 / 4，可能比 provider 的分词低，窗口保护会来不及。识别只看错误文本（`is_context_overflow`，`komo-llm/src`：先排除限流类，再匹配各家措辞，两张表移植自 pi 的 `utils/overflow.ts`），**识别先于重试判断**——有的代理把超长包成 500，照 5xx 退避只会把同一份超长的上下文再发几遍。`request` 收到超长、这个生成还没压过（checkpoint 里的 `compacted`）、"压成摘要之后至少有一次成功请求"也满足时，追加错误 entry、建阻塞压缩（`reason: overflow`，决策记 `context_overflow: true`）并 `waiting`，回到 `prepare`；不看缓存账、不看冷却、不判压完贴不贴窗口；这次恢复请求不算重试预算。**只救一次**：压过之后又超长、压不出摘要（只剩最后一轮、摘要不比被收的那段小）、摘要请求失败，都照原错误 `model_error` 失败。**不受 `[compaction] enabled` 管**（不压的话 Run 反正失败）。只因输出到了 `max_tokens` 而截断的回复不在此列：那是输出上限，压缩救不回来；被截断的回复记成一条失败的 assistant entry，run 以 `model_error` 收场，不按半轮调用执行。
 
 **衰减共用这个决策点。** 工具结果换短视图（§8.3）是对前缀的改写，与压缩同一本缓存账，由 `compaction::decide` 一并判断，时机的优先级：**缓存已冷**（距上一次 provider 请求超过 5 分钟，改写不欠债，有资格的全换）> **贴着窗口**（先换短视图，没有可换的才压缩）。其余时候前缀只追加。**资格**（`projection::decay_eligible`）：成功、full 超过 `[execution] decay_threshold_bytes`、短视图至少省 1 KiB、且已完整给过 `decay_full_sends` 次（= 它之后的 assistant 消息数）；失败与结果不明的结果**从不衰减**——那是模型要对着改的正文。换的时候一次换一批，提交**一条 `komo.decay` write entry**：只带 `edits`（每个目标 = `replace` 成"原结果 + 正文换成 `data.decayed`、图片块留着"的消息）与 `data { decayed: [entry id], debt, decision }`，和 `komo.system` 同一次提交追加，所以 `cutoff` 之后的请求就带短视图；这一轮的 `revised_from`（第一条被换的结果在请求里的下标，Anthropic 要在被改消息前补一个缓存断点）写进 `request` 的 checkpoint，重启后重发带同一个值。回放按 edits 选视图，决定是记下来的、不是重算的：刚跑完与回放逐字节相同。**改写代价按后端算**：Anthropic Messages 有显式断点，代价 = 从最早被改那条消息到末尾；Responses / Chat Completions / 代理是自动前缀缓存，按全部消息算。估高只会少换，符合缓存优先。
 
@@ -735,7 +735,7 @@ Session 不是只能追加的对象。pi-durable 没有删除，komo 保留三�
 
 规则：
 
-1. **状态权威是 `sessions` 行的生命周期字段**（`lifecycle`），`closing → deleted` 的推进是 CAS。删除（`service/durable/lifecycle.rs`）：`closing` → 撤回全部 conversation 里排队的 steer / followUp（**含内部输入**，否则 abort 之后仍会起后继 run）→（`--now`）`engine.abort_conversation(.., background = true)` → 循环到没有 run / 排队 / 活任务 → `deleted`。不带 `--now` 只撤回排队的，在跑的跑完，后台补做（启动 + 每 5 秒）推进；`cancelled` = 删除时没结束的 run（含排队的）。
+1. **状态权威是 `sessions` 行的生命周期字段**（`lifecycle`），`closing → deleted` 的推进是 CAS。删除（`service/durable/sessions/lifecycle.rs`）：`closing` → 撤回全部 conversation 里排队的 steer / followUp（**含内部输入**，否则 abort 之后仍会起后继 run）→（`--now`）`engine.abort_conversation(.., background = true)` → 循环到没有 run / 排队 / 活任务 → `deleted`。不带 `--now` 只撤回排队的，在跑的跑完，后台补做（启动 + 每 5 秒）推进；`cancelled` = 删除时没结束的 run（含排队的）。
 2. **`purge` 要求已 `deleted`**（否则 409，不自动先删）。阻挡项 = 未结束工作（run / 排队输入 / 活任务 / 监听）+ `aux.db` 的记忆证据 / 投递 / cron 触发（先处置：停用无法再验证的记忆条目、把投递标成终止）；引用检查不过就 409 并列出要先处置什么。**一次提交 `PurgeConversations`**（删该 Session 所有 conversation 的 entry / task / submission / document 行与 conversation 行）+ 退役 ack document + 墓碑 `purged`，**之后**删 Session 目录；已 `purged` 再来只收残留目录（幂等：删一半被杀也不会留下说不清的状态）。**删不掉就说清楚，不假装成功**。`purged` 之后任何试图往该 Session 写内容的路径都是 bug，不是"重新开始"。purge 不级联任务子会话。
 3. **跨 Session 永远没有共享**：被别的 conversation 用 `parent.at` 引用的不许 purge，所以 `/fork` 与 `/clone` 都**复制** entry 与 blob，只有同一 Session 内的分支用 `parent.at`（§8.11）——purge 的判据只有一条。
 4. **禁止直接 `rm`。** 命令层——删除只有一条路（`komo session delete` / `purge`）；工具层——`write` / `edit` 拒绝写数据目录下的 `sessions/`、`durable.db*`、`aux.db*`、`runtime/`、`.env`（§7.2），bash 拦不住；对账层——blob 被删了会被 §8.9 报成 faulted 任务，而不是等下一轮模型对着空上下文说话。
@@ -786,7 +786,7 @@ Session 不是只能追加的对象。pi-durable 没有删除，komo 保留三�
 
 #### 跨会话找回（`komo session search`，2026-10-31，roadmap-muse S3）
 
-飞书一个话题一个 Session、私聊进 home，彼此看不到；记忆提取不保证带上链接、ID 这类细节。`GET /v1/session-search?q=…&limit=…`（`komo-gateway` `service/durable/search.rs`）只读：在 `active` / `closing` 会话的标题与 entry 正文（用户的话、助手的回答、工具结果；宿主附上的召回块、渠道附注与 system 消息不看）里按关键词找，空白分开的几个词要在同一条消息里都出现（不分大小写），空关键词 400。每个 conversation 只看它自己的 entry（fork 祖先的算在祖先所在的会话里）。按最近一条命中的时刻倒序，默认 10 个会话、上限 50，每个会话给命中条数与最近 3 个片段（`用户：…` / `助手：…` / `工具 bash：…` / `标题：…`），带能接着查的 ID：会话 ID、任务会话的短号与派它的会话、还在跑的监听。可见性同 `komo memory search`：会话的 Agent 是 `memory = private` / `off` 的不出现（任务会话没记 Agent 时看父会话）。实现是逐会话扫 entry，个人用的量够了；慢了再加索引。系统提示「komo 自查」那段教模型在用户提到别的会话、别的渠道里的事时用它，不再 export 整个会话去 grep。要看全文仍用 `komo session export`。
+飞书一个话题一个 Session、私聊进 home，彼此看不到；记忆提取不保证带上链接、ID 这类细节。`GET /v1/session-search?q=…&limit=…`（`komo-gateway` `service/durable/sessions/search.rs`）只读：在 `active` / `closing` 会话的标题与 entry 正文（用户的话、助手的回答、工具结果；宿主附上的召回块、渠道附注与 system 消息不看）里按关键词找，空白分开的几个词要在同一条消息里都出现（不分大小写），空关键词 400。每个 conversation 只看它自己的 entry（fork 祖先的算在祖先所在的会话里）。按最近一条命中的时刻倒序，默认 10 个会话、上限 50，每个会话给命中条数与最近 3 个片段（`用户：…` / `助手：…` / `工具 bash：…` / `标题：…`），带能接着查的 ID：会话 ID、任务会话的短号与派它的会话、还在跑的监听。可见性同 `komo memory search`：会话的 Agent 是 `memory = private` / `off` 的不出现（任务会话没记 Agent 时看父会话）。实现是逐会话扫 entry，个人用的量够了；慢了再加索引。系统提示「komo 自查」那段教模型在用户提到别的会话、别的渠道里的事时用它，不再 export 整个会话去 grep。要看全文仍用 `komo session export`。
 
 #### 导出（`komo session export`）
 
@@ -872,7 +872,7 @@ komo cron add --name nightly-backup \
 komo cron list   # 命令 Job 那一行下面多印一行 `[命令] tar czf ...`（过长截断）
 ```
 
-**命令 Job 不建 harness run，也不碰模型。** 触发时一次提交建好 Session（`kind = cron`），之后由 gateway 直接用 `bash` 工具跑那条命令（`service/durable/shell.rs` 的 `run_command`，与 TUI 的 `!` 命令共用；工作目录就是 Session 的 `cwd`，已经从 Job 的 `workdir` 落到 Session 上），输出落 `tool-output/` 下的 blob，再提交一条 `shell.command` write entry 落账（RunId = 那条 write submission 的 ID）；**不做崩溃重放**——命令跑到一半崩溃，重启后 `recover` 只补做"queued 的触发记录"：有 Run 重挂看客、有 Session 无 Run 补投、都没有记 error，不会再跑一遍命令。**全程零模型请求**，也不触发记忆提取（没有对话可提取，提取本身还要发一次模型请求，会打破"零模型请求"这条硬约束，§9.3）。命令照样过 `bash` 的 `prepare`（受保护路径等）。
+**命令 Job 不建 harness run，也不碰模型。** 触发时一次提交建好 Session（`kind = cron`），之后由 gateway 直接用 `bash` 工具跑那条命令（`service/durable/submit/shell.rs` 的 `run_command`，与 TUI 的 `!` 命令共用；工作目录就是 Session 的 `cwd`，已经从 Job 的 `workdir` 落到 Session 上），输出落 `tool-output/` 下的 blob，再提交一条 `shell.command` write entry 落账（RunId = 那条 write submission 的 ID）；**不做崩溃重放**——命令跑到一半崩溃，重启后 `recover` 只补做"queued 的触发记录"：有 Run 重挂看客、有 Session 无 Run 补投、都没有记 error，不会再跑一遍命令。**全程零模型请求**，也不触发记忆提取（没有对话可提取，提取本身还要发一次模型请求，会打破"零模型请求"这条硬约束，§9.3）。命令照样过 `bash` 的 `prepare`（受保护路径等）。
 目前没有 `cron edit`：命令改了要 remove 重建。`remove` 只删 `cron_jobs` 那一行
 （§13.1「移除后续调度，已有执行历史保留」）。
 
@@ -1386,13 +1386,32 @@ komo-store     `durable/`：`Line`（一条提交线，唯一写连接）、Turs
                session_dir（`SessionPaths` 与落盘小工具）、purge（回收前的引用检查与删目录）。
                唯一依赖 toasty/turso 的 crate。deps: kernel, toasty(turso only), turso, tokio(fs, sync)
 
+komo-llm       模型这一层：生成协议适配器（无状态 `ModelStream` + `RoutingStream`、ChatGPT OAuth 的 `codex_auth`）、
+               向量（`embedding`）与判断（`typesafe`）后端、模型调用的埋点（`telemetry`）、effort 声明表、
+               凭证的值（`Secrets`）、从模型回复取 JSON 的帮手。只依赖 kernel，不碰 store，冷编时与 turso 并行。
+               deps: kernel, reqwest, tokio, grep（上下文超长的报错匹配）, base64, tempfile, futures-util
+
+komo-config    config.toml / .env 的解析与校验、`ConfigHolder`（§3 热重载）、在原文上改配置（`edit`）。
+               deps: kernel, komo-llm（生成协议名、effort 声明表、`Secrets`）, toml, toml_edit, serde_ignored,
+               dotenvy, arc-swap, reqwest（只用 `Url`）
+
+komo-tools     tools/{read,write,edit,rg,bash,task,monitor,…}、工具目录（`executor::ToolExecutor`）、
+               codemode（Monty worker 与协议，`komo __codemode-worker` 的函数体也在这里）、MCP 客户端与登录
+               （`mcp` / `mcp_auth`）、子进程登记（`recovery`）、`limits` / `spawn` / `cancel` 小件。
+               不碰 store，也不认识 durable 引擎：工具任务由 runtime 的 harness 驱动。
+               deps: kernel, komo-llm, komo-config, reqwest, tokio, grep + ignore（`rg` 工具）, rmcp,
+               monty + monty-fs（codemode 的脚本引擎与只读文件挂载）, num-bigint, libc（unix）
+
+komo-memory    记忆（MemoryManager、提取与合并、索引、代次，§9）与事项（goals / areas 的操作，`matter`）。
+               仓储在 store 的 aux.db；Durable 上的两个接缝（`SessionEvents` / `MemoryWorkLog` 的实现）要
+               durable 引擎，留在 runtime 的 `durable::memory`。deps: kernel, store, komo-llm, jiff
+
 komo-runtime   `durable/`：Task 引擎（`engine` / `scheduler` / `runtime` / `tx` / `line`）与 harness
-               （`harness/{generation,tool,inbox,live,system,compaction,orchestration,codemode,nested,…}`，
-               按 pi 的钩子组织的 agent loop，§6）、tools/{read,write,edit,rg,bash}、executor（工具目录 `ToolExecutor` 与结果落地的小函数、`check_contract` 复验）、
-               codemode（Monty worker 与协议，`komo __codemode-worker` 的函数体也在这里）、
-               memory（MemoryManager、索引、代次）、llm（无状态 `ModelStream` + `RoutingStream`）与 embedding 适配器、
-               cron scheduler、config。日常改动落在这里；它从不重新展开 toasty 宏。
-               deps: kernel, store, reqwest, tokio, grep + ignore（`rg` 工具）、arc-swap、monty + monty-fs（codemode 的脚本引擎与只读文件挂载）。
+               （`harness/{generation,tool,inbox,live,system,compaction,orchestration,codemode,nested,landing,…}`，
+               按 pi 的钩子组织的 agent loop，§6；`landing` 是工具结果落地的小函数，`orchestration::report`
+               里有 `task` 交回前的 `check_contract` 复验）、记忆的 durable 接缝（`durable::memory`）、
+               cron scheduler。日常改动落在这里；它从不重新展开 toasty 宏。
+               deps: kernel, store, komo-llm, komo-tools, komo-memory, tokio, arc-swap, jiff。
                不依赖 komo-agent。
 
 komo-agent     Agent 的身份、能力与上下文装配（`docs/bot.md` 批次 1，2026-09-22 抽出）：
@@ -1407,7 +1426,7 @@ komo-agent     Agent 的身份、能力与上下文装配（`docs/bot.md` 批次
 komo-gateway   axum 路由（§13.1）、SSE、认证、进程锁与发现文件、launchd/systemd 集成、
                Dispatcher、`service/durable/`（`DurableCore`：引擎 + harness + 钩子装配、会话与树服务、feed / watch / lifecycle / interventions / cron / memory 接线）、`http/v2/`、通用渠道进程宿主、Notifier 实现、deliveries；平台渲染归各插件。
                组装 runtime 与 agent（两者互不依赖）。
-               deps: kernel, runtime, agent, channel (no platform features), axum, tower-http, reqwest
+               deps: kernel, runtime, llm, config, tools, memory, agent, channel (no platform features), axum, tower-http, reqwest
 
 komo-channel   公共渠道契约、私有管道 RPC、进程 runner、共享图片收件箱；
                feishu / telegram / wechat feature 模块包含各平台 SDK、渲染与登录，
@@ -1421,18 +1440,26 @@ komo-client    HTTP + SSE 客户端、发现文件读取、ratatui 聊天 TUI（
 
 komo (bin)     clap 分发：`komo` / `komo resume` → client 的 TUI；操作子命令 → client；`komo gateway` → gateway；
                `komo update`（§13.6）是 bin 里唯一自己发 HTTP 的地方。
-               deps: client, gateway, clap, reqwest, flate2, tar
+               deps: client, gateway, komo-tools（`__codemode-worker` 与 `spawn`）, clap, reqwest, flate2, tar
 ```
 
 依赖只向下，三条支线在 bin 汇合：
 
 ```text
-kernel ← store ← runtime ← gateway ─┐
-kernel ← agent ←──────── gateway ───┤
-kernel ← client ────────────────────┴─ komo (bin)
+kernel ← llm ← config ← tools ──┐
+kernel ← store ← memory (← llm) ┴─ runtime ← gateway ─┐
+kernel ← agent ←───────────────────────────── gateway ─┤
+kernel ← client ───────────────────────────────────────┴─ komo (bin)
 ```
 
-`gateway` 看不到 toasty 类型（store 只通过 runtime 的构造函数暴露）也看不到 ratatui；`runtime` 看不到 axum，也**不依赖 agent**（装配是 gateway 的事）；`client` 只认协议类型。改 TUI 不重编服务端，改服务端不重编 TUI；冷编时三条支线并行。什么时候再拆：runtime 里 memory 一旦超过 8k 行或引入自己的重依赖，拆成 `komo-memory`；触发条件是编译时间实测，不是模块数。
+gateway 除了 runtime 也直接用 llm / config / tools / memory 的类型（装配是它的事）；bin 只为
+`__codemode-worker` 多依赖一条 komo-tools。
+
+`gateway` 看不到 toasty 类型（store 只通过 runtime 的构造函数暴露）也看不到 ratatui；`runtime` 看不到 axum，也**不依赖 agent**（装配是 gateway 的事）；`client` 只认协议类型。改 TUI 不重编服务端，改服务端不重编 TUI；冷编时三条支线并行。2026-11-10 把 runtime 拆成五块（llm、config、tools、memory 抽出，runtime 留 durable 引擎与 harness）：
+先实测模块间引用，只拆没有环、不需要新 trait、几乎不用放宽可见性的部分（全程只有
+`ToolExecutor::codemode_fingerprint` 一处改成 `pub`）。llm 与 config 原本互相引用，靠把 effort 声明表与 `Secrets`
+挪进 llm 断开；工具结果落地的小函数与契约复验只有 harness 用，挪回 harness，tools 因此不认识 durable。
+durable 引擎（约 1.5 万行生产代码）与 harness 是汇聚点，没有再拆。前后实测见编译预算表下的记录。
 
 依赖清单与禁用项：
 
@@ -1442,20 +1469,20 @@ kernel ← client ────────────────────�
 | `turso` | 与 `toasty-driver-turso` 同 major，工作区唯一 | mimalloc 全局分配器只能有一个 |
 | `reqwest` | `default-features = false, features = ["rustls-no-provider", "json", "stream", "charset", "form"]` | `rustls` 特性 = `__rustls-aws-lc-rs`；`no-provider` 后由 komo 在 `main` 里 `rustls::crypto::ring::default_provider().install_default()`，且必须在飞书 ws 线程启动之前。`form` 是 ChatGPT OAuth 的 token 端点要的 `application/x-www-form-urlencoded`（§13.3），只多拉 `serde_urlencoded` 一个纯 Rust 包 |
 | `rustls` | `default-features = false, features = ["ring"]` | 同上 |
-| `base64` | `0.22`，仅 komo-runtime | ChatGPT OAuth 的 access_token / id_token 是 JWT：只 base64url 解 payload，不验签（§13.3）。0.22.1 已经是依赖树里被拉得最多的一份（reqwest 等间接拉入），钉住它不再添一份重复版本；reqwest 自己另拉一份 0.23.1，是既有的重复，与本次改动无关 |
-| `tempfile` | 已在工作区（此前只在各 crate 的 `[dev-dependencies]` 里）；komo-runtime 的 `[dependencies]` 新增一行 | ChatGPT 凭证文件的原子写（临时文件 + rename，§13.3）——不引新包，只是把已有的测试依赖也用到生产代码里 |
+| `base64` | `0.22`；komo-llm（JWT）与 komo-tools（图片、codemode 的字节） | ChatGPT OAuth 的 access_token / id_token 是 JWT：只 base64url 解 payload，不验签（§13.3）。0.22.1 已经是依赖树里被拉得最多的一份（reqwest 等间接拉入），钉住它不再添一份重复版本；reqwest 自己另拉一份 0.23.1，是既有的重复，与本次改动无关 |
+| `tempfile` | 已在工作区（此前只在各 crate 的 `[dev-dependencies]` 里）；komo-llm、komo-config、komo-tools 的 `[dependencies]` | 凭证与配置文件的原子写（临时文件 + rename，§13.3、§3）——不引新包，只是把已有的测试依赖也用到生产代码里 |
 | `tokio` | 按需特性，不用 `full` | kernel 不依赖 tokio |
 | `axum` | 默认 + `tower-http/cors` | 仅 gateway；gateway 自己直接声明 `tokio`（`rt-multi-thread`, `signal`, `fs`），不靠 axum 传递 |
 | `tower-http` | `0.6`，`default-features = false, features = ["cors"]` | 与 reqwest 对齐（两个大版本都要 `^0.6`）；选 0.7 只会多一条自找的重复版本 |
 | `sha2` | `0.10` | openlark-core 用 0.10；选 0.11 会把 `digest` / `block-buffer` / `crypto-common` / `cpufeatures` 一起劈成两份 |
 | `croner` | `default-features = false`（W2 确认无 chrono 时的时刻表达） | kernel 已有 `time`，不要第二套日期时间库；croner 4 默认特性拉进 chrono + derive_builder / darling / strum |
-| `grep` + `ignore` | `0.4`，`default-features = false`；仅 komo-runtime（`rg` 工具） | 内嵌 ripgrep 的搜索与遍历，不起子进程：外部 `rg` 要么没装、要么各家版本不同，而遍历规则（隐藏文件、`.gitignore`、覆盖 glob）本来就该用这套实现。默认特性集是空的，写出来是钉住两件事：**不开 `pcre2`**（"正则语法 = Rust regex"是对模型可见的契约）与不引 SIMD 的 `avx-accel`。带进来的 13 个包（`globset`、`walkdir`、`termcolor`、`crossbeam-deque`、`encoding_rs_io`、`memmap2`、`bstr` 等）全是纯 Rust、无 C 工具链，且没有新的重复版本（2026-09-21 对 `cargo tree -d` 核过） |
-| `jiff` | `0.2`，默认特性（系统 tzdb + 系统时区）；komo-runtime、komo-client、komo-gateway 与 komo-channel 的飞书模块 | runtime：cron 的 `ZoneResolver`（IANA 区名 → 偏移，§10）。client：CLI 的时刻一律印成本机墙钟 + 偏移（`2026-09-25 14:00:00 +08:00`），偏移按每个时刻各自取，夏令时两侧不同。gateway：目标/领域接口的本地日期；飞书插件：话题上下文里每条消息的 `HH:MM`（§11.3，本机时区）；不用 `time` 的 `local-offset`，它只能取"现在"的偏移，且在多线程进程里拒绝返回。kernel 仍只用 `time` |
-| `arc-swap` | 默认；仅 komo-runtime（`config`） | §3 热重载的唯一 `Arc<ConfigSnapshot>` 原子替换 |
-| `toml_edit` | `0.25`，默认特性；仅 komo-runtime（`config::edit`） | §3「从 Web 改模型配置」：在 `config.toml` 原文上改并保留注释与键序。与 `toml 1.1` 共用 `toml_parser` / `toml_datetime` / `toml_writer`，不多出重复版本 |
-| `serde_ignored` | `0.1`，默认；仅 komo-runtime（`config`） | §3 的「不认识的键只警告」：包住 `toml::Deserializer`，把每个被忽略的键路径交给回调。只依赖 `serde`，不进别的 crate 的图 |
+| `grep` + `ignore` | `0.4`，`default-features = false`；komo-tools（`rg` 工具），`grep` 另有 komo-llm（上下文超长的报错匹配） | 内嵌 ripgrep 的搜索与遍历，不起子进程：外部 `rg` 要么没装、要么各家版本不同，而遍历规则（隐藏文件、`.gitignore`、覆盖 glob）本来就该用这套实现。默认特性集是空的，写出来是钉住两件事：**不开 `pcre2`**（"正则语法 = Rust regex"是对模型可见的契约）与不引 SIMD 的 `avx-accel`。带进来的 13 个包（`globset`、`walkdir`、`termcolor`、`crossbeam-deque`、`encoding_rs_io`、`memmap2`、`bstr` 等）全是纯 Rust、无 C 工具链，且没有新的重复版本（2026-09-21 对 `cargo tree -d` 核过） |
+| `jiff` | `0.2`，默认特性（系统 tzdb + 系统时区）；komo-runtime、komo-memory、komo-tools、komo-client、komo-gateway 与 komo-channel 的飞书模块 | runtime：cron 的 `ZoneResolver`（IANA 区名 → 偏移，§10）；memory 与 tools（codemode）：本地日期与时刻。client：CLI 的时刻一律印成本机墙钟 + 偏移（`2026-09-25 14:00:00 +08:00`），偏移按每个时刻各自取，夏令时两侧不同。gateway：目标/领域接口的本地日期；飞书插件：话题上下文里每条消息的 `HH:MM`（§11.3，本机时区）；不用 `time` 的 `local-offset`，它只能取"现在"的偏移，且在多线程进程里拒绝返回。kernel 仍只用 `time` |
+| `arc-swap` | 默认；komo-config（`ConfigHolder`）与 komo-runtime（harness 钩子） | §3 热重载的唯一 `Arc<ConfigSnapshot>` 原子替换 |
+| `toml_edit` | `0.25`，默认特性；仅 komo-config（`edit`） | §3「从 Web 改模型配置」：在 `config.toml` 原文上改并保留注释与键序。与 `toml 1.1` 共用 `toml_parser` / `toml_datetime` / `toml_writer`，不多出重复版本 |
+| `serde_ignored` | `0.1`，默认；仅 komo-config | §3 的「不认识的键只警告」：包住 `toml::Deserializer`，把每个被忽略的键路径交给回调。只依赖 `serde`，不进别的 crate 的图 |
 | 判断后端（TypeSafe「System One」） | **不新增依赖**：走已有的 `reqwest`（`rustls-no-provider`）+ 同一个 ring provider；凭证只从 `.env` 的 `TYPESAFE_API_KEY` 读 | §9.4 的可选重排用它。默认关；开着时才会发请求，且会把候选记忆的正文（截到 200 字符）发给第三方端点 |
-| `tracing-subscriber` / `rustls`（**dev-only**） | 仅 komo-runtime 的 `[dev-dependencies]` | 前者用来抓 §47/§48 的行内指标做断言，后者让真机验收测试自己装一次 crypto provider（装 provider 是进程的事，见上面 `reqwest` 行）。**不进发布构建** |
+| `tracing-subscriber` / `rustls`（**dev-only**） | komo-llm / komo-memory 的 `[dev-dependencies]`；`tracing-subscriber` 另在 komo-llm 的 `test-support` 后面（`telemetry::capture`） | 前者用来抓 §47/§48 的行内指标做断言，后者让真机验收测试自己装一次 crypto provider（装 provider 是进程的事，见上面 `reqwest` 行）。**不进发布构建** |
 | `opentelemetry` / `opentelemetry_sdk` | `0.33`；sdk `default-features = false, features = ["trace", "metrics"]`；仅 bin | 遥测（`docs/observability.md` §4）。SDK 只在 bin 初始化，runtime / gateway 只写 `tracing`。实测编译（2026-10-19，`cargo clean -p` 这几个包后 `--timings`，与别的构建并发、含等锁）：opentelemetry 12.7s、opentelemetry_sdk 13.1s |
 | `opentelemetry-otlp` | `0.33`，`default-features = false, features = ["http-proto", "reqwest-blocking-client", "trace", "metrics"]`；仅 bin | OTLP/HTTP + protobuf，走工作区同一份 reqwest 0.13（多开其 `blocking` 特性）；不开 `grpc-tonic` / `logs`。**blocking 而非 async 客户端**：SDK 在无 tokio reactor 的线程上 `block_on` 导出。`opentelemetry-otlp` 12.7s、`opentelemetry-http` 25.9s、`opentelemetry-proto` 6.9s；`cargo tree -d` 重复项与加之前逐条相同（95 个根），无新重复 |
 | `tracing-opentelemetry` | `0.34`，默认特性（含 `metrics`）；仅 bin | `OpenTelemetryLayer` + `MetricsLayer`（6.1s） |
@@ -1468,10 +1495,10 @@ kernel ← client ────────────────────�
 | `openlark` | 仅 komo-channel，feature `feishu`（默认关闭），`default-features = false, features = ["websocket"]` | 只要 ws 长连接；事件负载用 `register_raw` 拿原始 JSON、自己的宽容 serde 结构解析。带来 `prost 0.13`（turso 同步引擎用 0.14）和一份 `tokio-tungstenite` 重复——接受，不再自己额外引入 tungstenite |
 | `wechatbot` | 仅 komo-channel，feature `wechat`（默认关闭）；**`[patch.crates-io]` 指向 `vendor/wechatbot`**（0.4.0 原样复制，只改 `Cargo.toml` 一行：reqwest `0.12` 默认特性 → `0.13`，`default-features = false, features = ["json", "rustls-no-provider", "http2", "charset"]`） | 上游所有发布版本都写 `reqwest = { version = "0.12", features = ["json"] }`，默认特性开着 = native-tls = openssl-sys，自己一个 feature 都没有；cargo 特性只加不减，工作区里无论怎么声明都关不掉。patch 后复用 komo `main` 装的同一个 ring provider，openssl / native-tls / hyper-tls 整条 C 构建链消失，**构建不再依赖任何系统库**（Fedora 不必 `openssl-devel`，Mac 不必 `brew install openssl@3`），且 reqwest 只剩 0.13 一份（wechatbot 用到的 reqwest API 面极小，0.13 全保留；2026-09-16 实测默认特性全量构建通过）。不选 vendored openssl：OpenSSL 3.6.3、1210 个 .c，`make depend` / `install_dev` 串行，估 2–3 分钟且在 wechat 关键路径起点，会取代 turso 链成为新关键路径。升级 wechatbot = 重新复制 + 重打这一行，见 `vendor/README.md` |
 | `qrcode` | `default-features = false`；微信登录二维码渲染为终端字符 | 不需要 `image` |
-| `libc` | `0.2`，仅 komo-runtime 的 unix 目标 | Gateway 起来时 `setrlimit` 抬能开的文件数（`limits.rs`，launchd 默认软上限 256，子进程跑 `cargo test` 不够）；codemode worker 的内存看门狗读 RSS（macOS `proc_pid_rusage`、Linux `/proc/<pid>/statm` 的页大小）。原本就被 tokio 等拉进依赖树，不新增包、不新增重复版本。（2026-10-15 之前还用于 codemode 的 Linux 沙箱：Landlock / seccomp 的系统调用号，随沙箱删除。） |
-| `monty` / `monty-types` / `monty-fs` | `=1.1.0`（精确钉版本）；仅 komo-runtime | codemode 的脚本引擎（`docs/codemode.md` §2）：pydantic 的 Python 子集解释器，语言层没有文件 / 网络 / 子进程。精确钉：快照格式与 `monty_types::unstable`（JSON 转换用的节点访问器）没有兼容保证，升级必须重跑回放集。**不用 `monty-alloc`**：它要占 `#[global_allocator]`，与 turso 的 `mimalloc` 冲突（`the #[global_allocator] in this crate conflicts with global allocator in: turso`），内存限制改用 Monty 的 `max_memory` 软限 + 宿主的 RSS 看门狗。`monty-fs`（只读文件挂载，`=1.1.0`，同样精确钉；带进 `cap-std` 一族）。没用 `monty-pool`（进程池）。带进来约 76 个新包（ruff 解析栈、`unicode_names2` 等），新增重复版本见下 |
-| `num-bigint` | `0.4`；仅 komo-runtime | Monty 的大整数与 JSON 之间的转换（`codemode/convert.rs`）；已在依赖树里（Monty 与 toasty 一侧都拉），不新增包 |
-| `rmcp` | `3.x`，`default-features = false, features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest", "reqwest-tls-no-provider", "auth"]`；仅 komo-runtime | MCP 客户端（`docs/mcp.md`），官方 Rust SDK。HTTP 走工作区同一个 reqwest 0.13（rustls-no-provider），不开 server 与宏。`auth`（2026-10-14，`oauth = true` 的服务器，`docs/mcp.md` §2.1）新拉 `oauth2 5.0`（不开默认特性），它的 chrono / rand / url 等依赖图里已有，Cargo.lock 只多这一个包。新拉 `process-wrap`、`sse-stream`、`futures`，新增一条重复版本 `nix 0.31`（process-wrap；既有 0.29）。实测（2026-10-08，增量重编）：rmcp 2.8s + 构建脚本 0.3s + process-wrap / sse-stream 各 0.2–0.3s |
+| `libc` | `0.2`，仅 komo-tools 的 unix 目标 | Gateway 起来时 `setrlimit` 抬能开的文件数（`limits.rs`，launchd 默认软上限 256，子进程跑 `cargo test` 不够）；codemode worker 的内存看门狗读 RSS（macOS `proc_pid_rusage`、Linux `/proc/<pid>/statm` 的页大小）。原本就被 tokio 等拉进依赖树，不新增包、不新增重复版本。（2026-10-15 之前还用于 codemode 的 Linux 沙箱：Landlock / seccomp 的系统调用号，随沙箱删除。） |
+| `monty` / `monty-types` / `monty-fs` | `=1.1.0`（精确钉版本）；仅 komo-tools | codemode 的脚本引擎（`docs/codemode.md` §2）：pydantic 的 Python 子集解释器，语言层没有文件 / 网络 / 子进程。精确钉：快照格式与 `monty_types::unstable`（JSON 转换用的节点访问器）没有兼容保证，升级必须重跑回放集。**不用 `monty-alloc`**：它要占 `#[global_allocator]`，与 turso 的 `mimalloc` 冲突（`the #[global_allocator] in this crate conflicts with global allocator in: turso`），内存限制改用 Monty 的 `max_memory` 软限 + 宿主的 RSS 看门狗。`monty-fs`（只读文件挂载，`=1.1.0`，同样精确钉；带进 `cap-std` 一族）。没用 `monty-pool`（进程池）。带进来约 76 个新包（ruff 解析栈、`unicode_names2` 等），新增重复版本见下 |
+| `num-bigint` | `0.4`；仅 komo-tools | Monty 的大整数与 JSON 之间的转换（`codemode/convert.rs`）；已在依赖树里（Monty 与 toasty 一侧都拉），不新增包 |
+| `rmcp` | `3.x`，`default-features = false, features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest", "reqwest-tls-no-provider", "auth"]`；仅 komo-tools | MCP 客户端（`docs/mcp.md`），官方 Rust SDK。HTTP 走工作区同一个 reqwest 0.13（rustls-no-provider），不开 server 与宏。`auth`（2026-10-14，`oauth = true` 的服务器，`docs/mcp.md` §2.1）新拉 `oauth2 5.0`（不开默认特性），它的 chrono / rand / url 等依赖图里已有，Cargo.lock 只多这一个包。新拉 `process-wrap`、`sse-stream`、`futures`，新增一条重复版本 `nix 0.31`（process-wrap；既有 0.29）。实测（2026-10-08，增量重编）：rmcp 2.8s + 构建脚本 0.3s + process-wrap / sse-stream 各 0.2–0.3s |
 | **不引入** | image | — |
 | `tantivy` / `zstd-sys`（经 `turso` 默认特性 `fts`） | **已做**：工作区的 `turso` 写 `default-features = false, features = ["mimalloc"]`；`toasty-driver-turso` 0.11 起上游自己对 `turso` 关了默认特性，原先 `vendor/toasty-driver-turso` 那份补丁（只改 manifest 里 `turso` 那几行）已删 | 实测（2026-09-16）：冷编 71.5s → 64.2s，编译单元 577 → 515，单元耗时总和 −36s CPU，`tantivy` / `zstd` / `lz4_flex` 从依赖树消失，少一条 C 工具链。墙钟只省 7s 是因为它们与 `aws-lc-sys` 并行、不在关键路径。功能零损失：turso 的 FTS 是索引方法，MVCC 直接拒绝。升级 toasty 时核对驱动对 `turso` 的版本与特性，CI 用 `cargo tree -e features -i turso` 断言只剩 `mimalloc`；见 `vendor/README.md` |
 
@@ -1771,9 +1798,9 @@ Memory 与模型验收覆盖：
 | 模型一轮里提了两个调用、其中一个没有结果时，会话后面的新 Run 会不会被毒住 | §8.3 回放窗口 | **已实测（2026-09-20，真实 provider）：会。** 旧二进制下模型一轮提了两个调用，一个被拒/没执行，那条 `message.assistant` 留在会话里；其后**同一会话的每一条新 Run** 首个模型请求都被 provider 400 拒（`No tool output found for tool call call_00_…`），且会连着重试。当时用"回放窗口按 Run 过滤"（`service/segment.rs` 的 `window(surface, Some(run))`）挡住了它——**那是拿对话连续性换的**（见本节末与下一行）。**已改（2026-09-21）**：窗口改回"这一段对话"，毒化由两件事挡住——① 正跑的那条 Run 之外的消息**不带协议**（历史 Run 只发布用户正文与它最后答的正文），"有调用、没结果"的半轮因此进不了新请求；② `fail_call` 与按引用恢复让每一次调用都真的有个结果（下面那句）。回归测试：`service::segment::tests::a_later_run_still_reads_what_the_earlier_one_said`（历史那轮的 `tool_calls` / `provider_blocks` 一条都不出现）、`the_running_run_keeps_its_whole_protocol`（正跑的那条一个都不能少）。**已修（2026-09-20，本机真实会话复盘）**：线上那次 400 的调用是两次 `delegate`——两个漏法都补上了。①`resumed()` 重建调用时不按引用读回外置的 `arguments` / `plan`（§8.3 原话要求"读取历史或恢复调用时按引用加载需要的内容"）：委派的任务正文 6 KB 被外置，重 `prepare` 拿到的是一份 `null` 参数，当场失败。②`execute_one` 的"未知工具 / prepare 失败 / 放行被拒 / 子代理不能再委派"四条分支把结论**只交给模型、不写账本**（`Ledger::fail_call` 就是补这一笔）：那次调用于是永远悬着，父的窗口里两个 `function_call` 一前一后，provider 报的是前面那个。回归测试：`service::segment::tests::an_externalized_argument_and_plan_come_back_by_reference`、`service::tests::a_delegated_task_over_the_inline_limit_still_settles_the_parent_call`（去掉任一处的回填就失败）、`service::tests::a_call_that_cannot_run_still_gets_a_result_in_the_ledger`（去掉 `fail_call` 就失败）。 |
 | 超限的**正文**（`run.accepted.text` / `message.assistant.text` 过 4 KiB）在回放窗口里是不是也需要按引用读回 | §8.3 的"读取历史或恢复调用时按引用加载" | **已核实（2026-09-20，真实会话）**：会外置（本次会话里两条子 Run 的 `run.accepted` 与一条 `message.assistant` 都是 `text: null` + `text_ref`），而当时全仓**没有任何一处**读 `text_ref`——`replay()` 交给模型的用户消息因此是空的（没炸只是因为子代理的任务正文同时也在它的系统提示里，正常 Run 的用户输入很少过 4 KiB）。**已做（2026-09-21）**：`replay()` 现在按引用读回正文（`segment.rs` 的 `message_text`：内联优先、`text_ref` 次之，哈希由 `PayloadStore::open` 校验，读不出来或不是 UTF-8 都算会话缺内容 → 停下来报告而不是发一条空消息）。回归测试：`service::segment::tests::an_externalized_message_comes_back_by_reference`（用户输入与模型回复两条路）、`a_payload_that_cannot_be_read_stops_the_segment`。 |
 | 内嵌 `grep` + `ignore` 之后冷编还在不在 60s 预算内 | §13.4 的编译预算 | **已实测（2026-09-21，本机 macOS M5，`cargo build --timings`、空 target 目录）：加之前 1m10s（`/tmp` 里 HEAD 的干净 worktree），加之后 1m10s——差值落在噪声里。** 新带进来的 13 个包（`globset` / `walkdir` / `termcolor` / `crossbeam-deque` / `memmap2` / `bstr` / `encoding_rs_io` 等）与 `turso_core` / `aws-lc-sys` 并行，不在关键路径上。**顺带发现：60s 这个预算当时就已经超了**（§13.4 记的 2026-09-16 是 64.2s），与这次改动无关——要么把预算调到实测值，要么回去找关键路径，待办。 |
-| 工具结果的正文该给模型多少、由谁渲染 | §8.3 的投影与预算 | **已做（2026-09-21）**：`[execution] model_result_bytes`（默认 50 KiB，2000 行上限，按 RunSnapshot 冻结）+ `komo-kernel/src/projection.rs` 一处纯函数；事实只有落盘的（事件 + `output.json` 里的 `body.preview`），所以"刚跑完"与"回放"逐字节相同（`komo-gateway/tests/observation` 里有断言）。**已调（2026-10-26）**：默认从 50 KiB 降到 30 KiB 并成为上限，放不下只给开头 2 KiB 预览加裁剪说明（理由见 §8.3：模型后端超过约 25000 token 会把整条结果换掉）。**未核实**：30 KiB / 2 KiB 对真实任务是否最优——要等真实会话的 recall 次数（§49 的指标）出来再调。**已补（2026-09-21）**：那四个数现在有得数了——每份观察落盘多少字节（`tool_output_bytes`）、产物多少（`artifact_bytes`）、投影给模型多少（`projected_bytes`），以及"模型回头 `read` 我们落盘的观察"的次数（`observation_recall_count`，判据是路径落在本 Session 的 `tool-output/` 或 `artifacts/` 底下）。四者都只进 trace（`komo::observation`），不进事件流（§47）；抓取与断言见 `komo-runtime/src/executor/tests.rs` 里那两条（`the_projection_reports_how_many_bytes_it_kept_and_stored`、`reading_back_an_observation_counts_as_a_recall`）。**已接（2026-09-24）**：§6 同句里的"活动执行时限"进了配置——`[execution] call_timeout_secs`（默认 1800，热生效，走 `CallEnv` / `ToolContext`）。起因是一次真实会话：模型给 `cargo test --workspace && cargo build --release` 传了 `timeout_secs: 1800`，执行器写死的 300s 先到点，shell 判成 `uncertain`，Run 停下等人核对。现在 shell 的超时取 `min(请求, 上限)`，由工具自己杀进程组报 `Timeout`；执行器的兜底计时器在上限之外多等 15s（进程组 TERM/KILL 回收各 5s），不再与工具抢同一个时刻。回归测试：`tools::shell::tests::a_requested_timeout_beyond_the_call_limit_is_clamped_to_it`、`config::tests::the_call_timeout_is_read_from_the_execution_section`。2026-10-11 那条 `python` 沿用 `call_timeout` 的改动随 `python` 工具于 2026-10-15 删除，对应的两条回归测试一并删掉；`bash` 的时限仍取 `call_timeout`（上一句）。 |
+| 工具结果的正文该给模型多少、由谁渲染 | §8.3 的投影与预算 | **已做（2026-09-21）**：`[execution] model_result_bytes`（默认 50 KiB，2000 行上限，按 RunSnapshot 冻结）+ `komo-kernel/src/projection.rs` 一处纯函数；事实只有落盘的（事件 + `output.json` 里的 `body.preview`），所以"刚跑完"与"回放"逐字节相同（`komo-gateway/tests/observation` 里有断言）。**已调（2026-10-26）**：默认从 50 KiB 降到 30 KiB 并成为上限，放不下只给开头 2 KiB 预览加裁剪说明（理由见 §8.3：模型后端超过约 25000 token 会把整条结果换掉）。**未核实**：30 KiB / 2 KiB 对真实任务是否最优——要等真实会话的 recall 次数（§49 的指标）出来再调。**已补（2026-09-21）**：那四个数现在有得数了——每份观察落盘多少字节（`tool_output_bytes`）、产物多少（`artifact_bytes`）、投影给模型多少（`projected_bytes`），以及"模型回头 `read` 我们落盘的观察"的次数（`observation_recall_count`，判据是路径落在本 Session 的 `tool-output/` 或 `artifacts/` 底下）。四者都只进 trace（`komo::observation`），不进事件流（§47）；抓取与断言见 `komo-tools/src/executor/tests.rs` 里那两条（`the_projection_reports_how_many_bytes_it_kept_and_stored`、`reading_back_an_observation_counts_as_a_recall`）。**已接（2026-09-24）**：§6 同句里的"活动执行时限"进了配置——`[execution] call_timeout_secs`（默认 1800，热生效，走 `CallEnv` / `ToolContext`）。起因是一次真实会话：模型给 `cargo test --workspace && cargo build --release` 传了 `timeout_secs: 1800`，执行器写死的 300s 先到点，shell 判成 `uncertain`，Run 停下等人核对。现在 shell 的超时取 `min(请求, 上限)`，由工具自己杀进程组报 `Timeout`；执行器的兜底计时器在上限之外多等 15s（进程组 TERM/KILL 回收各 5s），不再与工具抢同一个时刻。回归测试：`tools::shell::tests::a_requested_timeout_beyond_the_call_limit_is_clamped_to_it`、`config::tests::the_call_timeout_is_read_from_the_execution_section`。2026-10-11 那条 `python` 沿用 `call_timeout` 的改动随 `python` 工具于 2026-10-15 删除，对应的两条回归测试一并删掉；`bash` 的时限仍取 `call_timeout`（上一句）。 |
 | `read` 一次读回来的正文够不够模型用 | §4 与 §8.3 | **已做（2026-09-21）**：`read` 交给模型的那一段从 400 字符改到 8 KiB（`read::PREVIEW_BYTES`），投影再按预算收。**未核实**：真实仓库里"读一个文件要几次 `read`"——如果还是很多次，说明该按结构切（一次给整段函数）而不是按字节。 |
-| 记忆召回的重排值不值（一次判断请求换来的排序） | §9.4 的可选重排 | **已做（2026-09-21）**：`[typesafe]` + `memory.retrieval.rerank` / `rerank_shortlist`——短名单（比 `top_k` 宽，校验拦「一样宽」的组合）交给一条 `Choice`，按回来的概率表排序，再照旧按 `top_k` 截；**只重排不增删**，挑中 `none` 或后端不可用都保持融合顺序。**已实测（2026-09-21，本机真机，4 条候选 / 中文输入）**：`jev-1.13.0` 一次 0.6s、约 650 输入 token，顺序 `[m-4, m-1, m-2, m-3]`——热水器与空调那两条排到了前面。离线验收在 `komo-runtime/src/memory/tests.rs`（抬高本来排不进的条目、`none` 不采纳、后端坏了照常召回、开关关着不发请求），真机那条是 `memory/rerank.rs` 里的 `mod live`（`--ignored`，要 `TYPESAFE_API_KEY`）。**未核实**：真实规模（成百上千条）下短名单取多宽、这一次请求值不值——按真实会话的命中率调，别凭感觉改 |
+| 记忆召回的重排值不值（一次判断请求换来的排序） | §9.4 的可选重排 | **已做（2026-09-21）**：`[typesafe]` + `memory.retrieval.rerank` / `rerank_shortlist`——短名单（比 `top_k` 宽，校验拦「一样宽」的组合）交给一条 `Choice`，按回来的概率表排序，再照旧按 `top_k` 截；**只重排不增删**，挑中 `none` 或后端不可用都保持融合顺序。**已实测（2026-09-21，本机真机，4 条候选 / 中文输入）**：`jev-1.13.0` 一次 0.6s、约 650 输入 token，顺序 `[m-4, m-1, m-2, m-3]`——热水器与空调那两条排到了前面。离线验收在 `komo-memory/src/tests.rs`（抬高本来排不进的条目、`none` 不采纳、后端坏了照常召回、开关关着不发请求），真机那条是 `memory/rerank.rs` 里的 `mod live`（`--ignored`，要 `TYPESAFE_API_KEY`）。**未核实**：真实规模（成百上千条）下短名单取多宽、这一次请求值不值——按真实会话的命中率调，别凭感觉改 |
 | 系统提示里的 skill 目录行够不够用（166 个 skill 的机器） | §5.6 的目录行 | **已实测（2026-09-21，本机真实语料 + `komo skills list`）：不够，而且坏在两处。** ① `description: >` / `|` 这些 YAML 块标量没有解析——取值是字面量 `>`，325 份 `SKILL.md` 里 111 份的描述是这么写的，目录行长成 `- log-diagnosis：>`；② 2000 字符的预算按目录序 `continue` 丢弃，166 个不同名字里只剩 16 条进提示。真实会话里模型的第一批调用是读 `cart-loong-diff` / `ask-user`（正是那 16 条里的两条），找 `log-diagnosis` 靠的是 `ls` 整个目录，多花了好几轮。**已做（2026-09-21）**：frontmatter 支持块标量（`>` 折行 / `|` 字面，含 chomping，描述里的冒号不再被当成键）；目录改成**整批**定形状——描述装得下就是"名字 + 一句描述"，装不下就只留名字（166 条名字 2752 字符），名字都装不下时末尾写"另有 N 条没列出来"；默认上限 2000 → 4000。回归测试：`frontmatter::tests::a_folded_description_is_joined_into_one_sentence`、`skills::tests::every_skill_keeps_its_name_when_the_descriptions_do_not_fit`、`a_folded_description_becomes_one_catalog_line`。**未做**：按当前输入排序的 top-K——排序块不能进 system 前缀（§9.4 的前缀缓存），先看补全之后还错不错。 |
 | 在线压缩在真实会话上多久触发一次、省下多少（§6 的 `[compaction]`） | 默认值（`keep_recent_tokens` 20000、`cache_write_read_ratio` 12.5、冷却 2 次）与"默认关"能不能翻成默认开 | **未验证（2026-10-09 落地，默认关）。** 要看的数都在 `context.compacted` 里：每次的 `decision`（`archive_tokens`、`post_compaction_tokens`、`breakeven_requests`、`reason`）、`skipped` 的理由分布、摘要请求的 `usage`；对照同一会话之后几次请求的 `cache_read` / `cache_write`（`message.assistant` 逐轮记着）算实际回本。触发太频繁就调大冷却或 `keep_recent_tokens`；2026-10-16 起只按窗口触发（`update_plan` 退役），几乎不触发就看 `max_context_tokens` 是不是定得太高。**缓存读数在主力模型上拿得到（2026-10-11 实测）**：DeepSeek 的 Responses（`input_tokens_details.cached_tokens`）与 Chat Completions（`prompt_tokens_details.cached_tokens`，另有 `prompt_cache_hit_tokens` 同值）都报，同一前缀第二次请求命中 1280/1479，现有解析两条路都读得到；10-09 之前的会话没有这一格只是因为字段那天才加 |
 | 在用的 provider 超长时报什么、溢出恢复认不认得出 | §6 的溢出恢复（`is_context_overflow`） | **未验证（2026-10-21 落地）。** 模式表照搬 pi，只用单测里的样例文本核对过；magpie、DeepSeek、opencode relay、Codex ChatGPT 后端真实超长时的状态码与措辞没有实测。认不出时 Run 照旧失败、不退避重试（只有 5xx 包装的超长会被白白退避）；看日志里失败 Run 的 `run.failed` 理由，有漏网的措辞就补进表里。另外要看救回来之后压一次够不够：`context.compacted` 里 `context_overflow: true` 之后紧跟一次失败，说明 `keep_recent_tokens` 留的近期段本身就超窗口 |

@@ -53,10 +53,10 @@ hub，HTTP 先订阅再取，重叠靠 seq 去重。游标在覆盖范围内时�
 
 | # | 问题 | 性质 | 代码位置 |
 |---|---|---|---|
-| A | 每次受理输入都在提交线（全局 `gate`）里 `load_tree`：读 session 全部 conversation + 每个分支的全部 entry | 性能，阻塞其他会话的提交 | `service/durable/submit.rs:400`、`tree.rs:215`、`komo-runtime/src/durable/line.rs:223` |
+| A | 每次受理输入都在提交线（全局 `gate`）里 `load_tree`：读 session 全部 conversation + 每个分支的全部 entry | 性能，阻塞其他会话的提交 | `service/durable/submit/mod.rs:400`、`tree.rs:215`、`komo-runtime/src/durable/line.rs:223` |
 | B | 建会话的请求键幂等只在进程内表里"先查后写"，并发同键会建两个；重启后失效 | 正确性 | `http/v2/sessions.rs:83`、`:101`；`sessions` 表无请求键列（`komo-store/src/durable/schema.rs:100`） |
-| C | `/clone` `/fork` 只在开始时检查源会话，复制 blob 与提交之间不复核；源目录在复制前被 purge 时 `copy_blobs` 静默成功，仍提交引用 blob 的 entry | 正确性（数据完整性） | `service/durable/copy.rs:186`、`:104–108` |
-| D | SSE 补读整份投影后才按 `seq > after` 过滤，过滤前还读所有历史 codemode 的外层结果 | 性能，重连成本 O(历史) | `service/durable/feed.rs:137–147`、`nested_view.rs:40` |
+| C | `/clone` `/fork` 只在开始时检查源会话，复制 blob 与提交之间不复核；源目录在复制前被 purge 时 `copy_blobs` 静默成功，仍提交引用 blob 的 entry | 正确性（数据完整性） | `service/durable/sessions/copy.rs:186`、`:104–108` |
+| D | SSE 补读整份投影后才按 `seq > after` 过滤，过滤前还读所有历史 codemode 的外层结果 | 性能，重连成本 O(历史) | `service/durable/feed/mod.rs:137–147`、`nested_view.rs:40` |
 | E | 会话列表与按来源找会话全表扫描；渠道的 `ensure_session` 在提交线里扫；列表再逐条串行读 live / inbox / tail | 性能，随会话数线性增长 | `sessions.rs:219`、`:264`、`:325`；`http/v2/sessions.rs:60–69` |
 | F | 流式生成每个网络块都构造完整部分消息并再 clone 一次；未收齐的工具参数反复整段���析 | 性能，长回复 / 大参数时 CPU 与分配 | `llm/responses/stateless.rs:193`、`durable/harness/generation.rs:584`、`llm/model_stream.rs:525` |
 | G | 模型请求的 `timeout_secs` 是整条请求（含流式正文）的总时限；超时后原样重发同一请求，同样超时，直到 10 次预算用完，每次失败还在会话里留一条空 assistant entry | 可用性，大上下文的会话整轮失败 | `llm/transport.rs:186`、`komo-kernel/src/types/model.rs:260`、`durable/harness/generation.rs:661–699`、`durable/harness/hooks.rs:76` |

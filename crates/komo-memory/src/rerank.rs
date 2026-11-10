@@ -125,7 +125,7 @@ mod tests {
 
 #[cfg(test)]
 mod live {
-    //! 真机验收：`cargo test -p komo-runtime --all-features --lib rerank::live -- --ignored`。
+    //! 真机验收：`cargo test -p komo-memory --all-features --lib rerank::live -- --ignored`。
     //!
     //! 需要网络与 `.env` 里的 `TYPESAFE_API_KEY`（用它 `export`，测试不从文件里读凭证）。
     //! 它证明的是**整条路**：真的 Jev 把"该想起来的那条"挑了出来，而不是只有 HTTP 通。

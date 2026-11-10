@@ -470,7 +470,7 @@ impl Drop for ForgetOnDrop {
 ///
 /// 没有 `libc` 依赖（§13.4 的依赖清单里没有它，而 Cargo.toml 不归运行时改），所以走
 /// `kill(1)`：`kill -TERM -- -<pgid>` 的负数 PID 就是"这个进程组"。
-// TODO(decide: 想要 libc::killpg 就要在 komo-runtime 的 Cargo.toml 里加 libc——
+// TODO(decide: 想要 libc::killpg 就要在 komo-tools 的 Cargo.toml 里加 libc——
 // 编排者拍板前用 kill(1)，行为一致，代价是每次取消多起一个进程)。
 pub async fn kill_process_group(pgid: u32, signal: &str) {
     for program in ["/usr/bin/kill", "/bin/kill", "kill"] {

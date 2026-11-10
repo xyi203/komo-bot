@@ -6,7 +6,7 @@
 ## 1. 形状
 
 MCP 服务器是**操作者接进来的工具来源**，不是第七个基础工具。每个 MCP 工具注册成一个普通的
-`Tool`（`komo-runtime/src/tools/mcp.rs`），与内置工具走同一条路：`prepare` 出计划 → 能力面核对 →
+`Tool`（`komo-tools/src/tools/mcp.rs`），与内置工具走同一条路：`prepare` 出计划 → 能力面核对 →
 `start_call` → 执行 → 落账（2026-10-11 起没有 Policy 与审批，见 `docs/komo_bot.md` §7）。没有第二条执行路径。
 
 ```text
@@ -68,7 +68,7 @@ oauth = true                           # 与 bearer_token_env 只能写一个
 - `komo auth mcp status`：每个 `oauth = true` 的服务器一行——登录与否、过期时间、能否自动刷新；
   不打印 token。
 - Gateway 连接时用这份文件装 rmcp 的 `AuthorizationManager`（`FileCredentialStore`，
-  `komo-runtime/src/mcp_auth.rs`）；没登录过就记 warn、这台服务器等登录（§2.2），报错指名要跑的命令。
+  `komo-tools/src/mcp_auth.rs`）；没登录过就记 warn、这台服务器等登录（§2.2），报错指名要跑的命令。
   取用与刷新交给 rmcp：每次请求从文件取 token，快过期时用 refresh token 换新并写回；服务器拒绝
   token 时静默刷新重试一次。服务器不发 refresh token 时，过期后要重新 `login`。
 
@@ -100,7 +100,7 @@ oauth = true                           # 与 bearer_token_env 只能写一个
   "下一次用到时再连"永远不会发生，只能 `komo gateway restart`（实测：magpie 代理晚 13 分钟起来，
   devops-mcp-prod 与 cloudflare 一直不可用）。配置一字未改的 `komo config reload` 仍不重连它，也不需要。
   连上过、后来断了的不走这条：工具已经挂着，调用时自己重连。
-- 实现：`komo-runtime/src/mcp.rs`（`McpHub` / `McpConnection`）、`GatewayState::refresh_mcp`。
+- 实现：`komo-tools/src/mcp.rs`（`McpHub` / `McpConnection`）、`GatewayState::refresh_mcp`。
 
 ### 2.3 改 `[mcp.servers]` 热重载即生效（2026-10-17，照 pi）
 

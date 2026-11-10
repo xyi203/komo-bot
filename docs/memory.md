@@ -467,7 +467,7 @@ Memory 内容以带来源的数据进入上下文，不能成为系统指令或�
 
 **落地前的现状与数据。** 提取以 Run 为单位：Gateway 每 30 秒（`MEMORY_TICK`）领最多 8 个结束的 Run（`WORK_BATCH`），每个 Run 调一次提取，得到最多 5 条观察；每条观察不是逐字重复、又召回到相关条目时，再调一次 `classify`（§9.9）。一个 Run 最多 6 次模型调用。本机 2026-10-19：94 个会话、426 个 Run，只有一个 Run 的会话 40 个（只占 Run 的 9%），其余 54 个会话平均约 7 个 Run；v3 上线（10-16）后处理的 152 个 Run 里 102 个什么都没留下。
 
-**触发：会话空闲后整批处理。** 领取按会话：一个会话所有输入都已结算，且最后一个 Run 结束已满 `[memory].extract_idle`（初值 10 分钟），才一次领走它全部待提取的 Run（`DurableMemoryWork`，`komo-runtime/src/memory/durable.rs`；工作 = 输入 submission 经投影得到终态的 run，处理游标在 document `komo.memory_cursor`，领取只在进程内）；失败时这一批 Run 都放回待处理，游标不推进。领取每拍扫全部 Session（`quiet` 表让没有新结算输入的会话只扫一次 submission；待处理索引是 TODO）。会话之后又被 resume，新 Run 等下一次空闲再成一批。会话没有"结束"这个事件——`resume`、`task(prompt, task_id)` 随时接着做——所以不按 Run 终态触发；一次性任务跑完就不再有动静，空闲后正好处理一次。**记忆模式与 Agent 按提取那一刻的配置**（`MemoryWorkItem.frozen`，由领取方给；`SessionRecord.agent` 给 Agent，模式取当前 Profile）：新存储没有受理快照，也**不**把模式冻进 `komo.agent`——提取要等会话空闲之后，这段空窗里把记忆关掉应立即生效，而不是让已说过的话在关掉之后又入库。测试 `extraction_follows_the_memory_mode_at_extraction_time`。
+**触发：会话空闲后整批处理。** 领取按会话：一个会话所有输入都已结算，且最后一个 Run 结束已满 `[memory].extract_idle`（初值 10 分钟），才一次领走它全部待提取的 Run（`DurableMemoryWork`，`komo-runtime/src/durable/memory.rs`；工作 = 输入 submission 经投影得到终态的 run，处理游标在 document `komo.memory_cursor`，领取只在进程内）；失败时这一批 Run 都放回待处理，游标不推进。领取每拍扫全部 Session（`quiet` 表让没有新结算输入的会话只扫一次 submission；待处理索引是 TODO）。会话之后又被 resume，新 Run 等下一次空闲再成一批。会话没有"结束"这个事件——`resume`、`task(prompt, task_id)` 随时接着做——所以不按 Run 终态触发；一次性任务跑完就不再有动静，空闲后正好处理一次。**记忆模式与 Agent 按提取那一刻的配置**（`MemoryWorkItem.frozen`，由领取方给；`SessionRecord.agent` 给 Agent，模式取当前 Profile）：新存储没有受理快照，也**不**把模式冻进 `komo.agent`——提取要等会话空闲之后，这段空窗里把记忆关掉应立即生效，而不是让已说过的话在关掉之后又入库。测试 `extraction_follows_the_memory_mode_at_extraction_time`。
 
 **不调模型就跳过。** 领到后先按确定性规则筛，命中的 Run 标 `done`、游标推进到末尾，日志写明原因：
 
@@ -697,8 +697,8 @@ komo memory list --limit 1000 --full
 因此，配置了 embedding 仍可能长期只有关键词召回。正文持续增长，也不意味着向量持续更新。
 
 依据：[启动探测](../crates/komo-gateway/src/service/state.rs)、
-[提取与重建入口](../crates/komo-runtime/src/memory/mod.rs)、
-[索引器](../crates/komo-runtime/src/memory/index.rs)。
+[提取与重建入口](../crates/komo-memory/src/lib.rs)、
+[索引器](../crates/komo-memory/src/index.rs)。
 
 #### B.3.2 对话段的缓存优化限制了任务召回
 
@@ -721,7 +721,7 @@ komo memory list --limit 1000 --full
 这能控制成本，但会丢失跨轮指代、命令与结果之间的关系，以及排查经验所需的条件和验证边界。
 来源校验只能证明引用事件存在，不能自动证明提取结论准确。
 
-依据：[extract.rs](../crates/komo-runtime/src/memory/extract.rs)。
+依据：[extract.rs](../crates/komo-memory/src/extract.rs)。
 
 #### B.3.4 稳定偏好、临时状态与项目知识竞争同一预算
 
@@ -735,7 +735,7 @@ komo memory list --limit 1000 --full
 这可能让普通表达偏好也变成额外确认，需按内容用途区分。
 
 依据：[渲染](../crates/komo-agent/src/context/memory.rs)、
-[合并与冲突处理](../crates/komo-runtime/src/memory/consolidate.rs)。
+[合并与冲突处理](../crates/komo-memory/src/consolidate.rs)。
 
 #### B.3.5 现有指标不能解释收益
 
@@ -758,8 +758,8 @@ komo memory list --limit 1000 --full
 另外，`never_used` / `idle` 清理依据也是注入时更新的 `usage`。因此无关但反复注入的记忆
 可能一直保留，而因索引不可用或召回失准未被选中的有效经验，可能被当作长期无用而遗忘。
 
-依据：[路径检查](../crates/komo-runtime/src/memory/stale.rs)、
-[清理规则](../crates/komo-runtime/src/memory/sweep.rs)。
+依据：[路径检查](../crates/komo-memory/src/stale.rs)、
+[清理规则](../crates/komo-memory/src/sweep.rs)。
 
 ### B.4 推荐方案
 
@@ -1072,7 +1072,7 @@ N、T 进 `[memory]` 配置，初值 3 次 / 90 天。判断放在 `merge` 之�
 
 #### C.3.3 P1 · shell 子进程不带 KOMO_HOME
 
-**现象。** `komo-runtime/src/tools/bash.rs` 的 `INHERITED` 是
+**现象。** `komo-tools/src/tools/bash.rs` 的 `INHERITED` 是
 `PATH, HOME, LANG, LC_ALL, TZ, USER, TMPDIR`，`process.rs` 先 `env_clear()`。子进程里的
 `komo` 按 `komo-client/src/discovery.rs` `komo_home()` 找数据目录：没有 `KOMO_HOME` 就用
 `$HOME/.komo`。默认实例没问题；**非默认数据目录的实例里，模型跑 `komo memory search`

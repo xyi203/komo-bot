@@ -1546,6 +1546,21 @@ codegen-units = 16
 - 2026-10-15 再加 `monty-fs`（脚本文件只读挂载）：`Cargo.lock` +10 个包（`monty-fs`、`cap-std`、`cap-primitives`、`ambient-authority`、`fs-set-times`、`io-extras`、`maybe-owned`、`rustix-linux-procfs`、`winx`，加两份 `io-lifetimes`）；`cargo tree -d` 99 → 101 行，新增的重复版本只有 `io-lifetimes 2.0.4` 与 `3.0.1`（`cap-primitives` / `io-extras` / `fs-set-times` 各取一个大版本，都来自 `monty-fs` 的 `cap-std`）。其余（`rustix` 等）与树里原有的同版本，没有再多出一份。
 
 
+**2026-11-10 拆 runtime 的构建账**（本机 macOS M 系 10 核，`cargo build --timings`；测量时机器被别的进程占满，
+load average 11–40，绝对数只能看相对。拆分前用 `git archive 1f36bdea` 导出的同一棵树、各自独立的 target 目录，
+前后交替各跑两次）：
+
+- 冷编（空 target，`cargo build`）：拆前 227.0s / 250.8s，拆后 226.8s / 250.3s——**整体墙钟没有可见差别**，关键路径
+  仍是 `turso_core` → store → … → gateway → bin，这一段由第三方依赖与机器负载决定。komo 自己的单元：拆前 runtime
+  37.1s / 17.5s、gateway 36.1s / 23.1s；拆后 llm 14.3 / 17.9s、config 9.6 / 9.4s、tools 29.9 / 13.4s（这三个在 store 之前
+  与 turso 并行编完）、memory 7.8 / 5.4s、runtime 11.2 / 7.5s、gateway 31.9 / 30.7s。
+- 改 llm 一行（`sse.rs` 插一条无用语句）后 `cargo build`：拆前 20.9s / 32.1s，拆后 15.6s / 23.5s（llm → memory / config /
+  tools → runtime → gateway 依次重编，每个都小；bin 链接 4–7s 两边一样）。
+- 同一改动后 `cargo test -p <所在 crate>`：编测试目标拆前（komo-runtime）11.8s / 16.6s，拆后（komo-llm）2.4s / 3.1s；
+  跑测试拆前 905 条约 19–23s，拆后 163 条约 2–3s。
+- `cargo tree -d`：没有新的重复版本（少了 toml 一族同版本按特性分开的四行）。全量 `cargo test --workspace`
+  2597 通过 / 0 失败 / 12 忽略，与拆前相同。
+
 ### 13.5 trait 边界
 
 一个 trait 只在两种情况下存在：**有第二个实现**（生产之外还有测试替身，或有多个后端），或**要做编译防火墙**（上层依赖 trait 就够，不需要看到 toasty / reqwest / axum 类型）。其余组件是具体类型，直接构造、直接测；不为"以后可能换"预留 trait。所有 trait 定义在 kernel，实现散布在 store / runtime / gateway。接缝上一律 `Arc<dyn Trait>` / `Box<dyn Trait>`，异步 trait 用 `async_trait`（对象安全，一次堆分配相对模型往返可忽略）。

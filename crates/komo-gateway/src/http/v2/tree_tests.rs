@@ -565,7 +565,6 @@ async fn tree_changes_are_refused_while_a_run_is_unfinished() {
     for (route, body) in [
         ("navigate", json!({"targetId": target})),
         ("compact", json!({})),
-        ("name", json!({"name": "x"})),
         ("fork", json!({"clone": true})),
     ] {
         let (status, text) = call(
@@ -577,6 +576,23 @@ async fn tree_changes_are_refused_while_a_run_is_unfinished() {
         .await;
         assert_eq!(status, 409, "{route}: {text}");
     }
+    // 改名不等 Run：忙时只改 sessions.title，不动树（`DurableCore::name`）。
+    let (status, text) = call(
+        &running,
+        reqwest::Method::POST,
+        &format!("/v1/sessions/{session}/name"),
+        Some(json!({"name": "x"})),
+    )
+    .await;
+    assert_eq!(status, 200, "name: {text}");
+    assert_eq!(
+        tree_of(&running, &session)
+            .await
+            .leaf_id
+            .unwrap_or_default(),
+        target,
+        "忙时改名不追加 entry"
+    );
     release.notify_waiters();
     running.stop().await;
 }

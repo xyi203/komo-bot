@@ -29,11 +29,11 @@ use komo_kernel::types::turn::{
 };
 use serde_json::{Value, json};
 
+use super::EffortCapabilities;
 use super::codex_auth::{CodexAuthError, CodexTokenSource};
 use super::sse::SseDecoder;
 use super::transport::{HttpRequest, HttpTransport, TransportError};
 use super::wire::{self, EventPayload};
-use crate::config::EffortCapabilities;
 
 mod stateless;
 

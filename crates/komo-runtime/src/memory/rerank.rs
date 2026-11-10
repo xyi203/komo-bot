@@ -139,7 +139,7 @@ mod live {
     };
 
     use super::*;
-    use crate::config::Secrets;
+    use crate::llm::Secrets;
 
     fn item(id: &str, content: &str) -> MemoryItem {
         MemoryItem {

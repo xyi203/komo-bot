@@ -10,6 +10,7 @@ pub mod error;
 pub mod harness;
 pub mod kind;
 pub mod line;
+pub mod memory;
 pub mod runtime;
 pub mod scheduler;
 pub mod tx;

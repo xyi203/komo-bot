@@ -16,8 +16,8 @@ use time::OffsetDateTime;
 use super::super::SubmissionDraft;
 use super::support::*;
 use crate::codemode::Worker;
+use crate::durable::memory::{DurableMemoryWork, DurableSessionEvents};
 use crate::durable::tx::ConversationOwnership;
-use crate::memory::durable::{DurableMemoryWork, DurableSessionEvents};
 use crate::memory::{MemoryManager, MemoryParts};
 use crate::tools::{bash::BashTool, codemode::CodemodeTool, write::WriteTool};
 

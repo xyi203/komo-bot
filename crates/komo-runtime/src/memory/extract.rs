@@ -939,7 +939,7 @@ impl LearningPass {
 
 /// 从模型正文里解出观察列表。容忍 ```json 围栏与前后的闲话。
 pub fn parse_extraction(text: &str) -> Result<RawExtraction, MemoryError> {
-    let Some(json) = parse_json_object(text) else {
+    let Some(json) = crate::llm::parse_json_object(text) else {
         return Err(MemoryError::Invalid(format!(
             "回复里找不到 JSON 对象：{}",
             one_line(&text.chars().take(200).collect::<String>())
@@ -947,57 +947,6 @@ pub fn parse_extraction(text: &str) -> Result<RawExtraction, MemoryError> {
     };
     serde_json::from_str(json)
         .map_err(|error| MemoryError::Invalid(format!("JSON 解不开：{error}")))
-}
-
-/// 剥掉围栏、取出第一个配平的 JSON 对象。提取与关系判断共用它——两边容忍的东西不同，
-/// 迟早会有一边的括号处理少一个分支。
-pub fn parse_json_object(text: &str) -> Option<&str> {
-    first_object(strip_fence(text))
-}
-
-fn strip_fence(text: &str) -> &str {
-    let trimmed = text.trim();
-    let Some(rest) = trimmed.strip_prefix("```") else {
-        return trimmed;
-    };
-    let rest = rest.strip_prefix("json").unwrap_or(rest);
-    rest.trim_start_matches('\n')
-        .strip_suffix("```")
-        .unwrap_or(rest)
-        .trim()
-}
-
-/// 第一个配平的 `{…}`。字符串里的括号不算。
-fn first_object(text: &str) -> Option<&str> {
-    let bytes = text.as_bytes();
-    let start = text.find('{')?;
-    let mut depth = 0usize;
-    let mut in_string = false;
-    let mut escaped = false;
-    for (index, byte) in bytes.iter().enumerate().skip(start) {
-        if in_string {
-            if escaped {
-                escaped = false;
-            } else if *byte == b'\\' {
-                escaped = true;
-            } else if *byte == b'"' {
-                in_string = false;
-            }
-            continue;
-        }
-        match byte {
-            b'"' => in_string = true,
-            b'{' => depth += 1,
-            b'}' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(&text[start..=index]);
-                }
-            }
-            _ => {}
-        }
-    }
-    None
 }
 
 /// 提取用的系统提示。

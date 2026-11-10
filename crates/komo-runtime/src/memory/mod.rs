@@ -26,7 +26,6 @@
 mod add;
 mod belongs;
 mod consolidate;
-pub mod durable;
 mod extract;
 mod index;
 mod offline;
@@ -65,9 +64,6 @@ pub use belongs::BelongsOutcome;
 pub use consolidate::{Relation, Verdict};
 pub use extract::Transcript;
 pub use extract::{Observation, PROMPT_VERSION, RawObservation, SaidBy};
-// 从子代理最后一条回复里取 JSON 的那一步与提取共用：两边都是"模型回复里那个配平的 JSON
-// 对象"，两套括号处理迟早会有一边少一个分支（`delegate` 的复验在 executor 里）。
-pub(crate) use extract::parse_json_object;
 // 事项（`crate::matter`）的文字走与记忆同一道闸：长度与凭证（`docs/goals.md` §3）。
 pub(crate) use extract::{MAX_CONTENT_CHARS, looks_like_secret};
 pub use index::{IndexBuilder, IndexOutcome, MIN_ACTIVATION_COVERAGE};

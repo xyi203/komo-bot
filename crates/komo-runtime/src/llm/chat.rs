@@ -15,10 +15,10 @@ use komo_kernel::types::turn::{
 };
 use serde_json::{Map, Value, json};
 
+use super::EffortCapabilities;
 use super::sse::SseDecoder;
 use super::transport::{HttpRequest, HttpTransport, TransportError};
 use super::wire;
-use crate::config::EffortCapabilities;
 
 mod stateless;
 

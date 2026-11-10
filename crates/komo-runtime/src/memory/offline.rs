@@ -546,7 +546,7 @@ fn index_of(value: &serde_json::Value, len: usize) -> Option<usize> {
 }
 
 fn parse_actions(text: &str, len: usize) -> Result<Vec<RawAction>, MemoryError> {
-    let body = super::extract::parse_json_object(text)
+    let body = crate::llm::parse_json_object(text)
         .ok_or_else(|| MemoryError::Invalid("整理判定里找不到 JSON 对象".into()))?;
     let wire: WireActions = serde_json::from_str(body)
         .map_err(|error| MemoryError::Invalid(format!("整理判定的 JSON 解不开：{error}")))?;

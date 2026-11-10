@@ -30,7 +30,7 @@ use komo_kernel::durable::{
     SubmissionSettlement, TaskId,
 };
 use komo_kernel::types::chat::is_silent_reply;
-use komo_kernel::types::delegate::DelegateContract;
+use komo_kernel::types::delegate::{DelegateContract, Validation, validate};
 use komo_kernel::types::handle::short_handle;
 use komo_kernel::types::task::{TASK_STATUS_BLOCKED, TASK_STATUS_DONE, duration_words};
 use serde_json::{Value, json};
@@ -169,9 +169,9 @@ fn failure_text(reason: &str, detail: Option<&Value>) -> String {
     }
 }
 
-/// 复验结论：与旧委派的父侧收尾同一份取 JSON + 校验（`executor::check_contract`）。
+/// 复验结论：与旧委派的父侧收尾同一份取 JSON + 校验（[`check_contract`]）。
 fn contract_verdict(contract: &DelegateContract, text: &str) -> String {
-    match crate::executor::check_contract(contract, text) {
+    match check_contract(contract, text) {
         Ok((_, validation)) if validation.ignored.is_empty() => "（结果契约复验：符合。）".into(),
         Ok((_, validation)) => format!(
             "（结果契约复验：符合；这些关键字没有检查：{}。）",
@@ -415,6 +415,28 @@ async fn report(
     Ok(None)
 }
 
+/// 从最后一条回复里取 JSON 并按契约验一遍：`task` 交回之前的复验（`orchestration::report`）用它。
+///
+/// 校验器来自 kernel，**两头共用同一份代码**（§8.6）：两份实现会漂移，漂移的症状是
+/// "子代理说成功、父侧说结果不合规"，而判断只能有一个出处。取 JSON 那一步与记忆提取
+/// 共用（两边都容忍围栏与前后闲话），理由相同。
+pub fn check_contract(
+    contract: &DelegateContract,
+    text: &str,
+) -> Result<(serde_json::Value, Validation), String> {
+    let Some(json) = crate::llm::parse_json_object(text) else {
+        return Err("最后一条回复里找不到 JSON 对象".into());
+    };
+    let value: serde_json::Value = serde_json::from_str(json)
+        .map_err(|error| format!("最后一条回复里的 JSON 解不开：{error}"))?;
+    let validation = validate(contract, &value);
+    if validation.is_valid() {
+        Ok((value, validation))
+    } else {
+        Err(validation.describe())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -449,5 +471,29 @@ mod tests {
         assert_eq!(status_of("状态：未完成"), Status::Unstated);
         // 状态行不在末行不算：后面又写了东西，说明它不是收尾。
         assert_eq!(status_of("状态：完成\n还有一件事没做"), Status::Unstated);
+    }
+
+    fn contract(mode: komo_kernel::types::delegate::SchemaMode) -> DelegateContract {
+        DelegateContract {
+            schema: json!({
+                "type": "object",
+                "required": ["count"],
+                "properties": { "count": { "type": "integer" } }
+            }),
+            mode,
+        }
+    }
+
+    /// 契约复验：围栏与前后闲话都容忍，不合规的报出原因。
+    #[test]
+    fn check_contract_takes_the_json_out_of_the_reply_and_validates_it() {
+        let contract = contract(komo_kernel::types::delegate::SchemaMode::Strict);
+        let (value, validation) =
+            check_contract(&contract, "数完了：\n```json\n{\"count\": 3}\n```\n以上").unwrap();
+        assert_eq!(value["count"], json!(3));
+        assert!(validation.is_valid());
+
+        assert!(check_contract(&contract, "没有 JSON").is_err());
+        assert!(check_contract(&contract, "{\"files\": []}").is_err());
     }
 }

@@ -425,7 +425,7 @@ async fn read_events(
     session: &komo_kernel::types::ids::SessionId,
 ) -> Vec<komo_kernel::events::Event> {
     use komo_runtime::memory::SessionEvents;
-    komo_runtime::memory::durable::DurableSessionEvents::new(std::sync::Arc::clone(
+    komo_runtime::durable::memory::DurableSessionEvents::new(std::sync::Arc::clone(
         &komo_gateway::service::test_support::driver_stream::core(gateway).storage,
     ))
     .events_of(session)

@@ -26,7 +26,7 @@ use komo_kernel::protocol::http::{
 };
 use komo_kernel::types::ids::CronJobId;
 use komo_kernel::types::model::{Effort, ModelConfig};
-use komo_runtime::config::EffortCapabilities;
+use komo_runtime::llm::EffortCapabilities;
 
 use super::Api;
 use super::error::{ApiFailure, ApiResult};

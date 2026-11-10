@@ -21,8 +21,8 @@ use komo_kernel::types::model::{
 use serde::Deserialize;
 use time::OffsetDateTime;
 
-use super::env::Secrets;
 use super::error::ConfigError;
+use crate::llm::Secrets;
 
 /// 默认监听地址：回环（§3「默认监听回环地址」）。端口取 kernel 示例里的那个。
 pub const DEFAULT_LISTEN: &str = "127.0.0.1:7777";

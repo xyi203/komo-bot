@@ -15,8 +15,8 @@ use komo_kernel::types::chat::{ChannelPlatform, PeerId};
 use komo_kernel::types::memory::{MemoryScope, RetrievalMode};
 use komo_kernel::types::model::{CatalogModel, EmbeddingConfig, ModelConfig};
 
-use super::effort::EffortCapabilities;
 use super::file::channel_credentials;
+use crate::llm::EffortCapabilities;
 
 /// 向量维度的可信范围。小于 1 是结构错误，大得离谱的是打字错误——两者都会在第一次
 /// 建索引时才炸，而那时人已经走了。

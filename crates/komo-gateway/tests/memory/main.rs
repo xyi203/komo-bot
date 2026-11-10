@@ -52,7 +52,7 @@ use time::OffsetDateTime;
 
 use komo_gateway::service::test_support::driver_stream::{DriverStream, core};
 use komo_kernel::traits::{EmbeddingClient, LlmClient};
-use komo_runtime::memory::durable::{RunCursor, read_cursor_doc};
+use komo_runtime::durable::memory::{RunCursor, read_cursor_doc};
 
 use harness::*;
 

@@ -14,7 +14,7 @@ use serde_json::{Value, json};
 
 use super::transport::testing::{Reply, ScriptedTransport};
 use super::*;
-use crate::config::{EffortCapabilities, Secrets};
+use crate::llm::{EffortCapabilities, Secrets};
 
 fn model(effort: Option<&str>) -> ModelConfig {
     ModelConfig {
@@ -665,7 +665,7 @@ fn an_overflow_wrapped_as_a_server_error_is_not_retried() {
 #[tokio::test]
 async fn the_router_hands_each_run_the_instance_its_own_snapshot_names() {
     let transport = ScriptedTransport::new(vec![one_word(), one_word()]);
-    let mut snapshot = crate::config::testing::snapshot_fixture();
+    let mut snapshot = komo_kernel::test_support::snapshot_fixture();
     snapshot.model = model(None);
     snapshot.memory.model = ModelConfig {
         model: "memory-a".into(),

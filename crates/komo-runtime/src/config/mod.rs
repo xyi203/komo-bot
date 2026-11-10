@@ -13,7 +13,6 @@
 //! `KOMO_HOME` 是唯一被直接读的那一个（§12）。
 
 mod edit;
-mod effort;
 mod env;
 mod error;
 mod file;
@@ -28,14 +27,15 @@ use std::sync::Arc;
 use komo_kernel::protocol::config::{ConfigIssue, ConfigSnapshot, IssueSeverity, KeyPath};
 use time::OffsetDateTime;
 
+use crate::llm::{EffortCapabilities, Secrets};
+
 pub use edit::{
     CatalogRow, EditError, EmbeddingFields, ModelFields, ProviderFields, config_version, env_view,
     models_view, remove_embedding_model, remove_env_value, remove_model, remove_provider,
     rename_embedding_model, rename_provider, set_default_model, set_env_value, set_env_values,
     set_provider_models, upsert_embedding_model, upsert_model, upsert_provider,
 };
-pub use effort::{EffortCapabilities, EffortProblem, EffortSupport};
-pub use env::{HomeError, KOMO_HOME, KOMO_LISTEN, Secrets, secrets_from_text, user_home};
+pub use env::{HomeError, KOMO_HOME, KOMO_LISTEN, secrets_from_text, user_home};
 pub use error::ConfigError;
 pub use file::{DEFAULT_LISTEN, Sources, channel_credentials};
 pub use holder::{ConfigHolder, ReloadReport};

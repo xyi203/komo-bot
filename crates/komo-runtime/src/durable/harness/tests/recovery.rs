@@ -190,7 +190,7 @@ async fn the_interrupted_result_carries_the_section_8_6_body_and_the_partial_tai
     world.harness.wait(&engine, id).await.unwrap();
 
     assert_eq!(bash.runs(), 1);
-    let expected = crate::executor::interrupted_message("bash", &left);
+    let expected = crate::durable::harness::landing::interrupted_message("bash", &left);
     let entry = &world.entries_of("komo.tool-result").await[0];
     let view = result_view(entry);
     assert!(view.contains(&expected), "{view}");

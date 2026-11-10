@@ -1,15 +1,14 @@
-//! 工具目录的验收：装、撤、按能力面渲染 schema；契约复验。
+//! 工具目录的验收：装、撤、按能力面渲染 schema。
 
 use std::sync::Arc;
 
 use komo_kernel::traits::{OutputWriter, Tool};
-use komo_kernel::types::delegate::{DelegateContract, SchemaMode};
 use komo_kernel::types::plan::ExecutionPlan;
 use komo_kernel::types::surface::AgentSurface;
 use komo_kernel::types::tool::{ToolContext, ToolDefinition, ToolError, ToolExposure, ToolOutput};
 use serde_json::json;
 
-use super::{ToolExecutor, check_contract};
+use super::ToolExecutor;
 
 /// 只有名字和曝光方式的工具：目录测试不执行它。
 #[derive(Debug)]
@@ -172,28 +171,4 @@ fn then_run_is_dropped_from_the_schema_without_bash() {
     };
     assert!(has_then_run(&AgentSurface::new(["write", "bash"])));
     assert!(!has_then_run(&AgentSurface::new(["write"])));
-}
-
-fn contract(mode: SchemaMode) -> DelegateContract {
-    DelegateContract {
-        schema: json!({
-            "type": "object",
-            "required": ["count"],
-            "properties": { "count": { "type": "integer" } }
-        }),
-        mode,
-    }
-}
-
-/// 契约复验：围栏与前后闲话都容忍，不合规的报出原因。
-#[test]
-fn check_contract_takes_the_json_out_of_the_reply_and_validates_it() {
-    let contract = contract(SchemaMode::Strict);
-    let (value, validation) =
-        check_contract(&contract, "数完了：\n```json\n{\"count\": 3}\n```\n以上").unwrap();
-    assert_eq!(value["count"], json!(3));
-    assert!(validation.is_valid());
-
-    assert!(check_contract(&contract, "没有 JSON").is_err());
-    assert!(check_contract(&contract, "{\"files\": []}").is_err());
 }

@@ -39,7 +39,7 @@ use komo_kernel::types::turn::{
     LlmError, ProviderToolCall, ReplayMessage, Role, Round, RoundInput, ToolCallRequest,
     ToolResultForModel, TurnRequest,
 };
-use komo_runtime::config::Secrets;
+use komo_runtime::llm::Secrets;
 use komo_runtime::llm::{ModelRequest, ModelStream, replay_system};
 
 use crate::channels::{BuiltChannel, ChannelFactory, ChannelRegistry, ChannelSender, SendOutcome};

@@ -18,7 +18,7 @@ use crate::recovery::{ChildProcess, ChildRegistry};
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 
-use crate::executor::cancel::cancelled;
+use crate::cancel::cancelled;
 
 /// 取消或超时后，等进程组真正消失的上限。
 const REAP_TIMEOUT: Duration = Duration::from_secs(5);

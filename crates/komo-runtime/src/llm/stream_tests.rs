@@ -30,7 +30,7 @@ use serde_json::{Map, Value, json};
 
 use super::transport::testing::{Reply, ScriptedTransport};
 use super::*;
-use crate::config::{EffortCapabilities, Secrets};
+use crate::llm::{EffortCapabilities, Secrets};
 
 // ---------------------------------------------------------------- 三家的夹具
 

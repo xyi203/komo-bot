@@ -30,10 +30,10 @@ use komo_kernel::types::turn::{
 };
 use serde_json::{Value, json};
 
+use super::EffortCapabilities;
 use super::sse::SseDecoder;
 use super::transport::{HttpRequest, HttpTransport, TransportError};
 use super::wire;
-use crate::config::EffortCapabilities;
 
 mod stateless;
 
@@ -861,7 +861,7 @@ mod tests {
 
     fn factory(transport: &ScriptedTransport) -> super::super::LlmFactory {
         super::super::LlmFactory::new(
-            Arc::new(crate::config::Secrets::from_pairs([("KEY", "sk-test")])),
+            Arc::new(crate::llm::Secrets::from_pairs([("KEY", "sk-test")])),
             EffortCapabilities::builtin(),
         )
         .with_transport(Arc::new(transport.clone()))

@@ -30,12 +30,14 @@
 //!   的子 conversation，交回结果，监听登记）在 [`orchestration`]（D4c）。
 
 pub mod codemode;
+pub mod codemode_text;
 pub mod compaction;
 pub mod confirm;
 pub mod entries;
 pub mod generation;
 pub mod hooks;
 pub mod inbox;
+pub mod landing;
 pub mod live;
 pub mod nested;
 pub mod orchestration;

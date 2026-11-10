@@ -32,7 +32,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use komo_kernel::traits::{Clock, Inbound, LlmClient, Shutdown, Tool};
-use komo_runtime::config::{ConfigHolder, EffortCapabilities, LoadOptions};
+use komo_runtime::config::{ConfigHolder, LoadOptions};
+use komo_runtime::llm::EffortCapabilities;
 use komo_store::Db;
 
 use crate::channels::ChannelFactory;

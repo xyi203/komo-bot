@@ -14,7 +14,7 @@ use komo_kernel::protocol::config::TypesafeConfig;
 use komo_kernel::traits::SystemOne;
 use komo_kernel::types::systemone::{SystemOneError, SystemOneRequest, SystemOneResponse};
 
-use crate::config::Secrets;
+use crate::llm::Secrets;
 use crate::llm::transport::{HttpRequest, HttpTransport, TransportError};
 
 /// 一次判断最多试几次（含第一次）。4xx 不重试，429 / 5xx 与传输失败重试。

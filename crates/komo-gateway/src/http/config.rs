@@ -212,9 +212,7 @@ pub async fn provider_models(
         .filter(|k| !k.is_empty());
     let (secrets, key_env) = match typed {
         Some(key) => (
-            std::sync::Arc::new(komo_runtime::config::Secrets::from_pairs([(
-                PROBE_KEY, key,
-            )])),
+            std::sync::Arc::new(komo_runtime::llm::Secrets::from_pairs([(PROBE_KEY, key)])),
             PROBE_KEY.to_string(),
         ),
         None => (
@@ -473,7 +471,7 @@ where
     }))
 }
 
-fn secrets(api: &Api, env: &str) -> ApiResult<komo_runtime::config::Secrets> {
+fn secrets(api: &Api, env: &str) -> ApiResult<komo_runtime::llm::Secrets> {
     komo_runtime::config::secrets_from_text(Some(env), &api.state.config.sources().env)
         .map_err(io_failure)
 }

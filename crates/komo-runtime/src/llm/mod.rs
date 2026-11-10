@@ -11,10 +11,13 @@
 mod anthropic;
 mod chat;
 pub mod codex_auth;
+mod effort;
 mod model_stream;
 mod models;
+mod reply;
 mod responses;
 mod routing_stream;
+mod secrets;
 mod sse;
 pub mod transport;
 mod wire;
@@ -32,17 +35,18 @@ use komo_kernel::types::turn::{LlmError, TurnRequest};
 
 pub use anthropic::AnthropicMessagesLlm;
 pub use chat::ChatCompletionsLlm;
+pub use effort::{EffortCapabilities, EffortProblem, EffortSupport};
 pub use model_stream::{
     API_ANTHROPIC, API_CHAT, API_RESPONSES, ImageLoadError, ImageRef, ImageResolver, ModelRequest,
     ModelStream, PROVIDER_BLOCKS, RequestOptions, SystemState, load_image, replay_system,
     usage_json, usage_of,
 };
 pub use models::{ProbeError, list_models, probe_context_window};
+pub use reply::parse_json_object;
 pub use responses::{Credential, OpenAiResponsesLlm};
 pub use routing_stream::RoutingStream;
+pub use secrets::Secrets;
 pub use transport::{HttpTransport, ReqwestTransport, TransportError};
-
-use crate::config::{EffortCapabilities, Secrets};
 
 /// 本 crate 认识的生成协议（§13.2）。
 pub const CHAT_COMPLETIONS: &str = "chat_completions";

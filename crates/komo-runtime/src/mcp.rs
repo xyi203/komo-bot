@@ -41,7 +41,7 @@ use rmcp::transport::streamable_http_client::{
 };
 use rmcp::transport::{StreamableHttpClientTransport, TokioChildProcess};
 
-use crate::config::Secrets;
+use crate::llm::Secrets;
 use crate::tools::McpTool;
 
 /// 连接 + 握手 + 列工具的总时限：卡住的服务器到点算连不上，下一次用到时再连。

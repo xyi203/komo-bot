@@ -81,15 +81,15 @@ use super::live::{self, SlotStatus};
 use super::nested::{self, NestedMeta, NestedResult};
 use super::orchestration;
 use super::outcome::{aborted, completed, failed, running};
+use crate::cancel::race;
 use crate::durable::error::TaskError;
-use crate::durable::kind::TaskKind;
-use crate::durable::runtime::TaskRuntime;
-use crate::durable::tx::EntryDraft;
-use crate::executor::cancel::race;
-use crate::executor::{
+use crate::durable::harness::landing::{
     INTERRUPTED_TAIL_BYTES, REAP_GRACE, interrupted_message, result_body, store_images,
     timeout_error,
 };
+use crate::durable::kind::TaskKind;
+use crate::durable::runtime::TaskRuntime;
+use crate::durable::tx::EntryDraft;
 use crate::recovery::{ChildProcess, Liveness};
 use crate::tools::codemode::NOT_IN_SCRIPTS;
 

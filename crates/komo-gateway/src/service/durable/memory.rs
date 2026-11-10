@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use komo_kernel::traits::Clock;
 use komo_kernel::types::agent::MemoryMode;
-use komo_runtime::memory::durable::{DurableMemoryWork, DurableSessionEvents, MemoryModes};
+use komo_runtime::durable::memory::{DurableMemoryWork, DurableSessionEvents, MemoryModes};
 use komo_runtime::memory::{MemoryWorkLog, SessionEvents, WORK_BATCH};
 
 use super::DurableCore;

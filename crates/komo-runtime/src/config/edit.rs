@@ -16,7 +16,7 @@ use komo_kernel::types::chat::ChannelPlatform;
 use komo_kernel::types::digest::ContentHash;
 use toml_edit::{Array, DocumentMut, Item, Table, value};
 
-use super::Secrets;
+use crate::llm::Secrets;
 
 /// 改不成的原因。HTTP 层按种类给状态码。
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]

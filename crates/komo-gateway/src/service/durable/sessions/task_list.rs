@@ -27,16 +27,22 @@
 //! 与会话列表同一个口径（`limit` / 不透明 `cursor`，不带 `limit` 就是全部）：按会话 id 降序扫
 //! `sessions`，挑出任务会话，凑够 `limit + 1` 条就停（多出来的那条只用来判断还有没有下一页）。
 //! 续扫位置是这一页最后一条的 id，所以扫过但被滤掉的 `main` 会话不会让页变短，也不会重复。
+//!
+//! # 按目标过滤
+//!
+//! 带 `goal` 时只留 `komo.task.goals` 里有这个 id 的任务；过滤发生在凑页的扫描里，所以一页仍然是
+//! `limit` 条、续扫位置照旧，不会因为滤掉的而变短或重复。这是找回与显示用的键，不参与消息路由。
+//! 每行的 `goals` 只带 id 与（目标还在时的）标题：标题由 HTTP 处理函数用目标清单补上，这里不认识目标。
 
 use std::collections::HashMap;
 
 use komo_kernel::durable::storage::{SessionCursor, SessionQuery};
 use komo_kernel::durable::{ScanOrder, SessionKind, SessionLifecycle, SessionRecord};
 use komo_kernel::protocol::http::{
-    InterventionListQuery, TaskOutcome, TaskSource, TaskState, TaskSummary,
+    InterventionListQuery, TaskGoal, TaskOutcome, TaskSource, TaskState, TaskSummary,
 };
 use komo_kernel::types::handle::short_handle;
-use komo_kernel::types::ids::SessionId;
+use komo_kernel::types::ids::{MatterId, SessionId};
 use komo_runtime::durable::harness::orchestration::monitor;
 use komo_runtime::durable::harness::{Harness, task_doc};
 
@@ -79,6 +85,17 @@ impl DurableCore {
         limit: Option<usize>,
         after: Option<&SessionPageCursor>,
     ) -> Result<TaskPage, SessionError> {
+        self.task_page_for_goal(all, None, limit, after).await
+    }
+
+    /// [`task_page`](Self::task_page)，可只要带着某个目标的键的任务。
+    pub async fn task_page_for_goal(
+        &self,
+        all: bool,
+        goal: Option<&MatterId>,
+        limit: Option<usize>,
+        after: Option<&SessionPageCursor>,
+    ) -> Result<TaskPage, SessionError> {
         let query = task_query(all);
         let mut cursor: Option<SessionCursor> = after.map(|cursor| cursor.0.clone());
         let mut records: Vec<SessionRecord> = Vec::new();
@@ -89,6 +106,11 @@ impl DurableCore {
                 .await?;
             for record in page.items {
                 if source_of(record.kind).is_none() {
+                    continue;
+                }
+                if let Some(goal) = goal
+                    && !self.carries_goal(&record, goal).await?
+                {
                     continue;
                 }
                 records.push(record);
@@ -137,6 +159,48 @@ impl DurableCore {
         Ok(TaskPage { tasks, next })
     }
 
+    /// 任务会话的 `komo.task` 是不是带着这个目标的键。非任务会话没有 document，不带。
+    async fn carries_goal(
+        &self,
+        record: &SessionRecord,
+        goal: &MatterId,
+    ) -> Result<bool, SessionError> {
+        if record.kind != SessionKind::Task {
+            return Ok(false);
+        }
+        Ok(task_doc(&*self.storage, record.root_conversation)
+            .await?
+            .is_some_and(|doc| doc.goals.iter().any(|id| id == goal.as_str())))
+    }
+
+    /// 每个目标被几个**活着的**任务带着（目标 id → 个数），`goal.list` 用。归档的任务不算，
+    /// 与 `GET /v1/tasks?goal=` 默认列出的范围一致；目标结案不影响计数（键留着，见 `TaskDoc::goals`）。
+    pub async fn goal_task_counts(&self) -> Result<HashMap<String, u32>, SessionError> {
+        let query = SessionQuery {
+            kind: Some(SessionKind::Task),
+            ..task_query(false)
+        };
+        let mut counts: HashMap<String, u32> = HashMap::new();
+        let mut cursor: Option<SessionCursor> = None;
+        loop {
+            let page = self
+                .storage
+                .scan_sessions(&query, SCAN_PAGE, cursor.as_ref())
+                .await?;
+            for record in page.items {
+                if let Some(doc) = task_doc(&*self.storage, record.root_conversation).await? {
+                    for goal in doc.goals {
+                        *counts.entry(goal).or_default() += 1;
+                    }
+                }
+            }
+            match page.next {
+                Some(next) => cursor = Some(next),
+                None => return Ok(counts),
+            }
+        }
+    }
+
     /// 这个会话是不是"后台任务"：不能替用户改承诺类的事项、不能替用户记（`docs/goals.md` §4）。任务会话
     /// 里只有带 `komo.task.reply` 的例外——它是由用户消息派出或续上的，这一轮是不是用户说的话仍由
     /// Run 里有没有用户原话来判（只由监听事件起的一轮没有，照样被拒）。`task` 工具派出的子任务没有
@@ -171,6 +235,18 @@ impl DurableCore {
         // 被用户停下的任务（`komo.task.stopped`）：不论之前交回过什么，都算"没有完成"，不是进行中，
         // 也不会因为上一次交回是完成而显示成已交回的好结果。再被 `continue` 做起来时标记清掉。
         let stopped = doc.as_ref().is_some_and(|doc| doc.stopped);
+        let goals = doc
+            .as_ref()
+            .map(|doc| {
+                doc.goals
+                    .iter()
+                    .map(|id| TaskGoal {
+                        id: MatterId::from_raw(id.clone()),
+                        title: None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         let last = doc.and_then(|doc| doc.last_run);
         let outcome = if stopped {
             Some(TaskOutcome::NotCompleted)
@@ -224,6 +300,7 @@ impl DurableCore {
                 None => last.as_ref().and_then(|last| last.rounds),
             },
             monitors,
+            goals,
         })
     }
 }

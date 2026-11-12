@@ -138,6 +138,7 @@ export type { SseFrame } from "./SseFrame";
 export type { SubmitRunRequest } from "./SubmitRunRequest";
 export type { SubmitRunResponse } from "./SubmitRunResponse";
 export type { SupersededRef } from "./SupersededRef";
+export type { TaskGoal } from "./TaskGoal";
 export type { TaskListResponse } from "./TaskListResponse";
 export type { TaskOutcome } from "./TaskOutcome";
 export type { TaskSource } from "./TaskSource";

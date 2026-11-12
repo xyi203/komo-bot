@@ -13,17 +13,19 @@ use async_trait::async_trait;
 use axum::Json;
 use axum::extract::{Path, Query, State};
 use komo_kernel::protocol::http::ErrorCode;
-use komo_kernel::types::ids::SessionId;
+use komo_kernel::types::ids::{MatterId, SessionId};
+use komo_kernel::types::matter::MatterKind;
 use komo_kernel::types::tool::ToolError;
+use komo_runtime::durable::harness::orchestration::{load_task_doc, store_task_doc};
 use komo_tools::tools::komo::{KomoCall, KomoService};
 use serde::Serialize;
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use crate::http::error::{ApiFailure, ApiResult};
 use crate::http::idempotency::Idempotency;
 use crate::http::v2::{sessions, tasks};
 use crate::http::{Api, cron, matters, memories};
-use crate::service::durable::sessions::is_group_task;
+use crate::service::durable::sessions::{SessionError, is_group_task};
 use crate::service::state::GatewayState;
 use crate::web::WebAuth;
 
@@ -71,7 +73,9 @@ impl KomoService for GatewayKomo {
                 reply(memories::forget(State(api), Path(id.to_string()), Json(request)).await)
             }
             KomoCall::GoalAdd(request) => reply(matters::add(State(api), Json(request)).await),
-            KomoCall::GoalList(query) => reply(matters::list(State(api), Query(query)).await),
+            KomoCall::GoalList(query) => goal_list(api, query).await,
+            KomoCall::GoalAttach { id } => set_task_goal(&api, caller, id, true).await,
+            KomoCall::GoalDetach { id } => set_task_goal(&api, caller, id, false).await,
             KomoCall::GoalAct { id, verb, request } => reply(
                 matters::act(
                     State(api),
@@ -102,9 +106,10 @@ impl KomoService for GatewayKomo {
                 tasks::list(
                     State(api),
                     list_uri(query.all),
-                    Query(sessions::ListPaging {
+                    Query(tasks::TaskPaging {
                         limit: query.limit,
                         cursor: query.cursor,
+                        goal: query.goal,
                     }),
                 )
                 .await,
@@ -127,6 +132,8 @@ fn group_task_refusal(call: &KomoCall) -> ToolError {
         | KomoCall::MemoryForget { .. }
         | KomoCall::GoalAdd(_)
         | KomoCall::GoalList(_)
+        | KomoCall::GoalAttach { .. }
+        | KomoCall::GoalDetach { .. }
         | KomoCall::GoalAct { .. } => "群里派出的任务不能读写个人记忆与目标",
         KomoCall::CronList
         | KomoCall::CronRun { .. }
@@ -138,6 +145,112 @@ fn group_task_refusal(call: &KomoCall) -> ToolError {
     };
     ToolError::Denied {
         reason: reason.to_owned(),
+    }
+}
+
+/// `goal.list`：路由的清单，每个目标再带上 `tasks`——有几个（活着的）任务带着它的键。计数不是目标自己的
+/// 字段（目标落在 aux.db、任务的键落在 durable.db），所以在这里补到响应里，路由与线上的 `Matter` 类型不变。
+async fn goal_list(
+    api: Api,
+    query: komo_kernel::protocol::http::MatterListQuery,
+) -> Result<Value, ToolError> {
+    let core = api.state.core().map_err(|error| refusal(error.into()))?;
+    let counts = core.goal_task_counts().await.map_err(session_failure)?;
+    let mut value = reply(matters::list(State(api), Query(query)).await)?;
+    if let Some(items) = value.get_mut("matters").and_then(Value::as_array_mut) {
+        for item in items {
+            let count = item
+                .get("id")
+                .and_then(Value::as_str)
+                .and_then(|id| counts.get(id))
+                .copied()
+                .unwrap_or(0);
+            item["tasks"] = count.into();
+        }
+    }
+    Ok(value)
+}
+
+/// `goal.attach` / `goal.detach`：改**调用它的任务自己**的 `komo.task.goals`（`docs/goals.md` 的"任务与目标的关联"）。
+///
+/// 这是任务自己的关联、不是目标的承诺，所以不走 `matters::act`、不要 Run 里的用户原话（只由监听事件起的一轮也能用）。
+/// 要求：不是 `memory = private / off` 的 Agent（同目标的所有读写，[`matters::gate`]）；当前会话是任务会话（有
+/// `komo.task`）。群里派出的任务在 [`GatewayKomo::call`] 入口就被拒了。目标完成或放弃不会清掉任务上的键——
+/// 那是有意的：历史关联仍有意义（`TaskDoc::goals`）。
+async fn set_task_goal(
+    api: &Api,
+    caller: &SessionId,
+    goal: MatterId,
+    attach: bool,
+) -> Result<Value, ToolError> {
+    matters::gate(api, caller).await.map_err(refusal)?;
+    let core = api.state.core().map_err(|error| refusal(error.into()))?;
+    let record = core
+        .session(caller.as_str())
+        .await
+        .map_err(session_failure)?;
+    let not_a_task = || ToolError::InvalidArguments {
+        message: "goal.attach / goal.detach 只有任务里能用：当前会话不是任务会话".into(),
+    };
+    if record.kind != komo_kernel::durable::SessionKind::Task {
+        return Err(not_a_task());
+    }
+    // 挂的时候目标必须存在且是目标；摘的时候不查，目标没了也要能摘掉。
+    let title =
+        if attach {
+            let matter = api.state.matters.get(&goal).await.map_err(|error| {
+                ToolError::InvalidArguments {
+                    message: error.to_string(),
+                }
+            })?;
+            if matter.kind != MatterKind::Goal {
+                return Err(ToolError::InvalidArguments {
+                    message: format!("{goal} 是领域，不是目标；任务只能挂到目标上"),
+                });
+            }
+            Some(matter.title)
+        } else {
+            None
+        };
+    let root = record.root_conversation;
+    let id = goal.as_str().to_owned();
+    let changed = core
+        .engine
+        .commit(move |tx| {
+            Box::pin(async move {
+                let Some(mut doc) = load_task_doc(tx, root).await? else {
+                    return Ok(None);
+                };
+                let present = doc.goals.contains(&id);
+                if present == attach {
+                    return Ok(Some(false));
+                }
+                if attach {
+                    doc.goals.push(id);
+                } else {
+                    doc.goals.retain(|existing| *existing != id);
+                }
+                store_task_doc(tx, root, &doc).await?;
+                Ok(Some(true))
+            })
+        })
+        .await
+        .map_err(|error| ToolError::Failed {
+            message: format!("写不了任务的目标关联：{error}"),
+        })?;
+    let Some(changed) = changed else {
+        return Err(not_a_task());
+    };
+    Ok(json!({
+        "goal": { "id": goal, "title": title },
+        "attached": attach,
+        "changed": changed,
+    }))
+}
+
+fn session_failure(error: SessionError) -> ToolError {
+    ToolError::Failed {
+        message: error.to_string(),
     }
 }
 
@@ -180,6 +293,8 @@ mod tests {
     use komo_kernel::types::tool::{CancelToken, ToolContext, ToolOutput, WorkspaceRoot};
     use komo_runtime::durable::harness::orchestration::{TaskDoc, store_task_doc};
     use serde_json::json;
+
+    use komo_kernel::durable::SessionRecord;
 
     use super::*;
     use crate::service::durable::sessions::NewSession;
@@ -290,7 +405,7 @@ mode = "keyword"
         (session, run)
     }
 
-    /// 十五个动作各走通一次，经由真的处理函数（真 aux.db / durable.db，不是桩）：返回的是各自
+    /// 十七个动作各走通一次，经由真的处理函数（真 aux.db / durable.db，不是桩）：返回的是各自
     /// 路由的响应体，状态确实落了库。
     #[tokio::test]
     async fn every_komo_action_runs_through_the_real_handlers() {
@@ -491,6 +606,7 @@ mode = "keyword"
             stopped: false,
             thread: None,
             session: None,
+            goals: Vec::new(),
         };
         let root = task.root_conversation;
         core.engine
@@ -541,6 +657,317 @@ mode = "keyword"
             panic!("{error:?}")
         };
         assert!(message.contains("找不到用户说的话"), "{message}");
+        gateway.running.stop().await;
+    }
+
+    /// 造一个任务会话（带 `komo.task`），返回会话记录；`reply` 给了就是"由用户消息派出的任务"。
+    async fn task_session(
+        core: &crate::service::durable::DurableCore,
+        parent: &komo_kernel::durable::SessionRecord,
+        title: &str,
+        reply: bool,
+    ) -> komo_kernel::durable::SessionRecord {
+        use komo_kernel::durable::{EntryId, SubmissionId};
+        use komo_runtime::durable::harness::ReplyTo;
+        let mut spec = NewSession::new("assistant")
+            .kind(SessionKind::Task)
+            .title(title);
+        spec.parent_session = Some(parent.id.clone());
+        let task = core.create_session(spec).await.unwrap();
+        let doc = TaskDoc {
+            parent: parent.root_conversation,
+            anchor: TaskId::new(1),
+            title: title.into(),
+            fork: false,
+            model: None,
+            effort: None,
+            contracts: BTreeMap::new(),
+            last_run: None,
+            continued: None,
+            reply: reply.then(|| ReplyTo {
+                peer: None,
+                origin_entry: EntryId::new(1),
+                origin_submission: SubmissionId::new(1),
+            }),
+            stopped: false,
+            thread: None,
+            session: None,
+            goals: Vec::new(),
+        };
+        let root = task.root_conversation;
+        core.engine
+            .commit(move |tx| Box::pin(async move { store_task_doc(tx, root, &doc).await }))
+            .await
+            .unwrap();
+        task
+    }
+
+    fn ctx_of(session: &SessionRecord, run: &RunId) -> ToolContext {
+        let id = SessionId::from_raw(session.id.clone());
+        context(
+            &id,
+            run,
+            PlanSource::Interactive {
+                session: id.clone(),
+            },
+        )
+    }
+
+    async fn new_matter(gateway: &Gw, kind: &str, title: &str) -> String {
+        let mut body = json!({ "kind": kind, "title": title });
+        if kind == "area" {
+            body["standard"] = json!("标准");
+        }
+        let (status, body) = gateway.post_json("/v1/matters", body).await;
+        assert_eq!(status, 200, "{body}");
+        body["matter"]["id"].as_str().unwrap().to_string()
+    }
+
+    async fn task_rows(gateway: &Gw, query: &str) -> Value {
+        let (status, body) = gateway.get_json(&format!("/v1/tasks{query}")).await;
+        assert_eq!(status, 200, "{body}");
+        body
+    }
+
+    /// 任务自己 `goal.attach` / `goal.detach`：清单行带着目标的 id 与标题；重复挂幂等；挂不存在的 id、挂领域被拒；
+    /// 没有用户原话的一轮（监听事件起的）照样能挂，因为改的是任务自己的关联、不是承诺。
+    #[tokio::test]
+    async fn a_task_attaches_and_detaches_goals_that_show_in_the_task_list() {
+        let (_home, gateway) = start().await;
+        let tool = komo_tool(&gateway);
+        let (home_session, run) = user_run(&gateway, "开始做空调巡检").await;
+        let core = gateway.state().core().unwrap().clone();
+        let parent = core.session(home_session.as_str()).await.unwrap();
+        let task = task_session(&core, &parent, "查空调", true).await;
+        let goal = new_matter(&gateway, "goal", "空调巡检").await;
+        let area = new_matter(&gateway, "area", "家里的设备").await;
+
+        let mut ctx = ctx_of(&task, &run);
+        let attached = ok(&tool, &mut ctx, "goal.attach", json!({ "id": goal })).await;
+        assert_eq!(attached["changed"], true, "{attached}");
+        assert_eq!(attached["goal"]["title"], "空调巡检", "{attached}");
+        let again = ok(&tool, &mut ctx, "goal.attach", json!({ "id": goal })).await;
+        assert_eq!(again["changed"], false, "重复挂无变化：{again}");
+
+        let rows = task_rows(&gateway, "").await;
+        let row = rows["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["session"] == task.id.as_str())
+            .unwrap_or_else(|| panic!("{rows}"));
+        assert_eq!(
+            row["goals"],
+            json!([{ "id": goal, "title": "空调巡检" }]),
+            "只挂了一次：{row}"
+        );
+
+        for (id, expect) in [("no-such-goal", "no-such-goal"), (area.as_str(), "领域")] {
+            let error = call(&tool, &mut ctx, "goal.attach", json!({ "id": id }))
+                .await
+                .unwrap_err();
+            let ToolError::InvalidArguments { message } = &error else {
+                panic!("{id}：{error:?}")
+            };
+            assert!(message.contains(expect), "{id}：{message}");
+        }
+
+        // 没有用户原话的一轮：goal.add 被拒，goal.attach 仍可用。
+        let mut quiet = ctx_of(&task, &RunId::from_raw("not-a-run-of-this-session"));
+        let error = call(&tool, &mut quiet, "goal.add", json!({ "title": "新的" }))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, ToolError::InvalidArguments { .. }),
+            "{error:?}"
+        );
+        let other = new_matter(&gateway, "goal", "换滤网").await;
+        let attached = ok(&tool, &mut quiet, "goal.attach", json!({ "id": other })).await;
+        assert_eq!(attached["changed"], true, "{attached}");
+
+        // detach：摘掉一个；没挂过的也成功。
+        let detached = ok(&tool, &mut ctx, "goal.detach", json!({ "id": goal })).await;
+        assert_eq!(detached["changed"], true, "{detached}");
+        let never = ok(
+            &tool,
+            &mut ctx,
+            "goal.detach",
+            json!({ "id": "never-attached" }),
+        )
+        .await;
+        assert_eq!(never["changed"], false, "{never}");
+        let rows = task_rows(&gateway, "").await;
+        let row = rows["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["session"] == task.id.as_str())
+            .unwrap();
+        assert_eq!(
+            row["goals"],
+            json!([{ "id": other, "title": "换滤网" }]),
+            "{row}"
+        );
+        gateway.running.stop().await;
+    }
+
+    /// 非任务会话（主会话）里调用被拒，说明只有任务里能用；群里派出的任务照旧被拒（沿用 `is_group_task`）。
+    #[tokio::test]
+    async fn goal_attach_is_refused_outside_a_task_and_in_a_group_task() {
+        let (_home, gateway) = start().await;
+        let tool = komo_tool(&gateway);
+        let (home_session, run) = user_run(&gateway, "开始做空调巡检").await;
+        let core = gateway.state().core().unwrap().clone();
+        let parent = core.session(home_session.as_str()).await.unwrap();
+        let goal = new_matter(&gateway, "goal", "空调巡检").await;
+
+        let mut ctx = ctx_of(&parent, &run);
+        for action in ["goal.attach", "goal.detach"] {
+            let error = call(&tool, &mut ctx, action, json!({ "id": goal }))
+                .await
+                .unwrap_err();
+            let ToolError::InvalidArguments { message } = &error else {
+                panic!("{action}：{error:?}")
+            };
+            assert!(message.contains("只有任务里能用"), "{action}：{message}");
+        }
+
+        // 群的线（`source = line:…`）派出的任务。
+        let group_line = core
+            .create_session(
+                NewSession::new("assistant")
+                    .kind(SessionKind::Main)
+                    .source("line:feishu:oc_g")
+                    .title("群"),
+            )
+            .await
+            .unwrap();
+        let task = task_session(&core, &group_line, "群任务", true).await;
+        let mut ctx = ctx_of(&task, &run);
+        for action in ["goal.attach", "goal.detach"] {
+            let error = call(&tool, &mut ctx, action, json!({ "id": goal }))
+                .await
+                .unwrap_err();
+            let ToolError::Denied { reason } = &error else {
+                panic!("{action}：{error:?}")
+            };
+            assert!(reason.contains("群里派出的任务"), "{action}：{reason}");
+        }
+        gateway.running.stop().await;
+    }
+
+    /// `GET /v1/tasks?goal=` 与 `task.list` 的 `goal` 只返回带着这个键的任务，分页照常；`goal.list` 带计数；
+    /// 目标完成后任务上的键还在。
+    #[tokio::test]
+    async fn the_goal_filter_counts_and_closing_a_goal_keep_the_keys() {
+        let (_home, gateway) = start().await;
+        let tool = komo_tool(&gateway);
+        let (home_session, run) = user_run(&gateway, "开始做空调巡检").await;
+        let core = gateway.state().core().unwrap().clone();
+        let parent = core.session(home_session.as_str()).await.unwrap();
+        let goal = new_matter(&gateway, "goal", "空调巡检").await;
+        let other = new_matter(&gateway, "goal", "换滤网").await;
+
+        let mut mine = Vec::new();
+        for title in ["一", "二", "三"] {
+            let task = task_session(&core, &parent, title, true).await;
+            ok(
+                &tool,
+                &mut ctx_of(&task, &run),
+                "goal.attach",
+                json!({ "id": goal }),
+            )
+            .await;
+            mine.push(task.id.clone());
+        }
+        let stray = task_session(&core, &parent, "无关", true).await;
+        let filter = task_session(&core, &parent, "别的目标", true).await;
+        ok(
+            &tool,
+            &mut ctx_of(&filter, &run),
+            "goal.attach",
+            json!({ "id": other }),
+        )
+        .await;
+
+        // HTTP：只返回带着 goal 的三个，分页走完不重复不漏。
+        let all = task_rows(&gateway, &format!("?goal={goal}")).await;
+        let mut ids: Vec<String> = all["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["session"].as_str().unwrap().to_string())
+            .collect();
+        ids.sort();
+        let mut expect = mine.clone();
+        expect.sort();
+        assert_eq!(ids, expect, "{all}");
+        assert!(!ids.contains(&stray.id));
+        let mut walked = Vec::new();
+        let mut cursor = String::new();
+        loop {
+            let page = task_rows(&gateway, &format!("?goal={goal}&limit=2{cursor}")).await;
+            let rows = page["tasks"].as_array().unwrap();
+            assert!(rows.len() <= 2, "{page}");
+            walked.extend(
+                rows.iter()
+                    .map(|row| row["session"].as_str().unwrap().to_string()),
+            );
+            match page["next_cursor"].as_str() {
+                Some(next) => cursor = format!("&cursor={next}"),
+                None => break,
+            }
+        }
+        walked.sort();
+        assert_eq!(walked, expect, "分页逐页走完");
+
+        // 工具：同样的过滤。
+        let mut ctx = context(
+            &home_session,
+            &run,
+            PlanSource::Interactive {
+                session: home_session.clone(),
+            },
+        );
+        let listed = ok(&tool, &mut ctx, "task.list", json!({ "goal": other })).await;
+        let rows = listed["tasks"].as_array().unwrap();
+        assert_eq!(rows.len(), 1, "{listed}");
+        assert_eq!(rows[0]["session"], filter.id.as_str(), "{listed}");
+
+        // goal.list 带计数。
+        let goals = ok(&tool, &mut ctx, "goal.list", json!({})).await;
+        let count = |id: &str| {
+            goals["matters"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|matter| matter["id"] == id)
+                .unwrap_or_else(|| panic!("{goals}"))["tasks"]
+                .clone()
+        };
+        assert_eq!(
+            (count(&goal), count(&other)),
+            (json!(3), json!(1)),
+            "{goals}"
+        );
+
+        // 目标完成：任务上的键原样留着（不级联清理），清单与过滤照旧。
+        let done = ok(&tool, &mut ctx, "goal.done", json!({ "id": goal })).await;
+        assert_eq!(done["matter"]["state"], "done", "{done}");
+        let after = task_rows(&gateway, &format!("?goal={goal}")).await;
+        assert_eq!(after["tasks"].as_array().unwrap().len(), 3, "{after}");
+        assert_eq!(
+            after["tasks"][0]["goals"][0]["title"], "空调巡检",
+            "{after}"
+        );
+        let goals = ok(&tool, &mut ctx, "goal.list", json!({ "all": true })).await;
+        let closed = goals["matters"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|matter| matter["id"] == goal.as_str())
+            .unwrap();
+        assert_eq!(closed["tasks"], 3, "{goals}");
         gateway.running.stop().await;
     }
 

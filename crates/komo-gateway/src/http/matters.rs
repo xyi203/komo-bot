@@ -207,7 +207,7 @@ async fn caller(
 
 /// 给别人用的 Agent（`memory = private / off`）的会话拒掉（§2）；放行时答这个会话是不是
 /// 后台任务。Profile 的判断与召回同一处（`hooks::resolve`）。
-pub(super) async fn gate(api: &Api, session: &SessionId) -> ApiResult<bool> {
+pub(crate) async fn gate(api: &Api, session: &SessionId) -> ApiResult<bool> {
     let core = api.state.core()?;
     let record = core.session(session.as_str()).await?;
     let snapshot = api.state.snapshot();

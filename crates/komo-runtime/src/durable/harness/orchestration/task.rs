@@ -350,6 +350,7 @@ pub(crate) async fn create_child(
         stopped: false,
         thread,
         session: Some(session.clone()),
+        goals: Vec::new(),
     };
     if let Some(contract) = contract {
         doc.contracts.insert(first.to_string(), contract);

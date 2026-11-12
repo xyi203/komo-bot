@@ -277,6 +277,13 @@ pub struct TaskDoc {
     /// document 没有，读成 `None`。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session: Option<String>,
+    /// 这个任务带着的目标 id（`docs/tasks.md` §4.7、`docs/goals.md` 的"任务与目标的关联"）：表示"这件事是为这些目标做的"，
+    /// 只用来找回与显示（任务清单、`task.list` 的过滤、`goal.list` 的计数）。**不参与消息路由**——路由归属只属于
+    /// 对话位置（[`thread`](Self::thread)）。由任务自己用 `komo` 的 `goal.attach` / `goal.detach` 增减，按挂上的先后、
+    /// 不重复。目标完成或放弃时这里的键**原样留着**：历史关联仍有意义，所以不做级联清理，目标被删了也不回头改。
+    /// 附加字段：旧 document 没有，读成空。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub goals: Vec<String>,
 }
 
 /// 提交里读 `komo.task`（document 读，不是表读：排在表写之后也行）。
@@ -614,4 +621,23 @@ pub(super) async fn aborted(
         Step::MonitorStop => monitor::abort_stop(&cx).await?,
     };
     cx.finish(&reply, Ending::Aborted).await
+}
+
+#[cfg(test)]
+mod task_doc_tests {
+    use super::*;
+
+    /// 加 `goals` 之前写下的 `komo.task` 没有这一格：读出来是空，且没挂目标的任务写回去也不带它。
+    #[test]
+    fn an_old_task_document_without_goals_reads_as_empty() {
+        let old = serde_json::json!({
+            "parent": 1, "anchor": 2, "title": "老任务", "session": "s-1"
+        });
+        let mut doc: TaskDoc = serde_json::from_value(old).expect("旧 document 读得出来");
+        assert!(doc.goals.is_empty());
+        assert!(serde_json::to_value(&doc).unwrap().get("goals").is_none());
+        doc.goals.push("g-1".into());
+        let round: TaskDoc = serde_json::from_value(serde_json::to_value(&doc).unwrap()).unwrap();
+        assert_eq!(round.goals, ["g-1"]);
+    }
 }

@@ -1519,6 +1519,7 @@ mod task_list {
             stopped: false,
             thread: None,
             session: None,
+            goals: Vec::new(),
         };
         let root = record.root_conversation;
         core.engine

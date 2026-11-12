@@ -275,6 +275,20 @@ pub struct TaskListQuery {
     /// 上一页的 `next_cursor`，不透明。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cursor: Option<String>,
+    /// 只要带着这个目标的键的任务（`docs/goals.md` 的"任务与目标的关联"）。目标不必还存在：
+    /// 键是任务上记下的，目标被删了照样找得回来。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal: Option<MatterId>,
+}
+
+/// 任务带着的一个目标：id 加标题；目标已经不存在时只有 id。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(optional_fields))]
+pub struct TaskGoal {
+    pub id: MatterId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
 }
 
 /// 任务现在的状态（读出来的，不落库；`docs/tasks.md` §3.2）。
@@ -353,6 +367,10 @@ pub struct TaskSummary {
     pub rounds: Option<u32>,
     /// 还活着的监听数。
     pub monitors: u32,
+    /// 带着的目标（"这件事是为这个目标做的"）；只用于找回与显示。目标已结案仍在列。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "ts", ts(as = "Option<Vec<TaskGoal>>"))]
+    pub goals: Vec<TaskGoal>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

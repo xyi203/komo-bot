@@ -154,6 +154,7 @@ impl World {
                         stopped: false,
                         thread: None,
                         session: None,
+                        goals: Vec::new(),
                     });
                     store_task_doc(tx, record.id, &doc).await?;
                     Ok(record.id)

@@ -69,6 +69,8 @@ pub enum Action {
     GoalDone,
     GoalLink,
     GoalList,
+    GoalAttach,
+    GoalDetach,
     CronList,
     CronRun,
     SessionSearch,
@@ -77,6 +79,7 @@ pub enum Action {
 }
 
 /// 一个字段：名字、是否必填、一句话说明。
+#[derive(Clone, Copy)]
 struct Field {
     name: &'static str,
     required: bool,
@@ -117,7 +120,18 @@ const PAGING: [Field; 3] = [
     ),
 ];
 
-const SPECS: [Spec; 15] = [
+const TASK_LIST_FIELDS: [Field; 4] = [
+    PAGING[0],
+    PAGING[1],
+    PAGING[2],
+    field(
+        "goal",
+        false,
+        "只要带着这个目标的键的任务（目标 id；目标已结案或已不存在也能按它找）",
+    ),
+];
+
+const SPECS: [Spec; 17] = [
     Spec {
         action: Action::MemoryAdd,
         name: "memory.add",
@@ -255,8 +269,24 @@ const SPECS: [Spec; 15] = [
         action: Action::GoalList,
         name: "goal.list",
         read_only: true,
-        summary: "列出目标（只读），带状态、下一步、截止；默认只列未结案的",
+        summary: "列出目标（只读），带状态、下一步、截止，以及每个目标被几个任务带着（tasks，不含已归档的任务）；默认只列未结案的",
         fields: &[field("all", false, "true = 带上已结案的")],
+    },
+    Spec {
+        action: Action::GoalAttach,
+        name: "goal.attach",
+        read_only: false,
+        summary: "把**当前任务**挂到一个目标上，表示这件事是为这个目标做的（只用于找回与显示，不影响消息怎么分发）。\
+                  只有任务会话里能用；不改目标本身，不需要用户原话。重复挂无变化。\
+                  只有这件事明显是在推进某个已有目标时才挂：不要为了挂而挂，也不要为此新建目标",
+        fields: &[field("id", true, "目标 id（必须存在，且是目标而不是领域）")],
+    },
+    Spec {
+        action: Action::GoalDetach,
+        name: "goal.detach",
+        read_only: false,
+        summary: "取消当前任务与一个目标的关联；没挂过也算成功。只有任务会话里能用",
+        fields: &[field("id", true, "目标 id")],
     },
     Spec {
         action: Action::CronList,
@@ -293,8 +323,8 @@ const SPECS: [Spec; 15] = [
         action: Action::TaskList,
         name: "task.list",
         read_only: true,
-        summary: "任务清单（只读）：把会话读成面向人的任务行，带状态（进行中 / 等你 / 已交回 / 空闲 / 已归档）",
-        fields: &PAGING,
+        summary: "任务清单（只读）：把会话读成面向人的任务行，带状态（进行中 / 等你 / 已交回 / 空闲 / 已归档）和带着的目标",
+        fields: &TASK_LIST_FIELDS,
     },
 ];
 
@@ -360,6 +390,13 @@ pub enum KomoCall {
     },
     GoalAdd(MatterAddRequest),
     GoalList(MatterListQuery),
+    /// 当前任务（调用的会话）挂到 / 摘下这个目标。
+    GoalAttach {
+        id: MatterId,
+    },
+    GoalDetach {
+        id: MatterId,
+    },
     GoalAct {
         id: MatterId,
         verb: MatterVerb,
@@ -437,6 +474,7 @@ fn doc() -> String {
          改承诺的写动作（goal.add、goal.done）要这个 Run 里有用户说的话作依据；`task` 工具派出的子任务、定时任务会话、\
          只由监听事件起的一轮被拒绝——把要记的在交回的结果里写明，由主会话来做（由用户消息派出或续上的任务，\
          这一轮里用户说的话算数）。\n\
+         goal.attach / goal.detach 改的是任务自己的关联、不是目标的承诺，不要用户原话；但只有任务会话里能用。\
          不在这里的：确认记忆（用户自己的动作）、Gateway 的重启与停止。\n",
     );
     for spec in &SPECS {
@@ -582,6 +620,12 @@ fn build(
             map.insert("session".into(), json!(ctx.session));
             Ok(KomoCall::GoalList(decode(spec, map)?))
         }
+        Action::GoalAttach => Ok(KomoCall::GoalAttach {
+            id: MatterId::from_raw(text_of(spec, &mut map, "id")?),
+        }),
+        Action::GoalDetach => Ok(KomoCall::GoalDetach {
+            id: MatterId::from_raw(text_of(spec, &mut map, "id")?),
+        }),
         Action::GoalNext => matter(&mut map, MatterVerb::Next),
         Action::GoalWait => matter(&mut map, MatterVerb::Wait),
         Action::GoalResume => matter(&mut map, MatterVerb::Resume),
@@ -627,7 +671,7 @@ impl Tool for KomoTool {
         ToolDefinition {
             name: KOMO_TOOL.into(),
             description: "操作 komo 自己的状态，不经 shell：记忆（memory.add / search / forget）、\
-                          目标（goal.add / list / next / wait / resume / done / link）、定时任务（cron.list / run）、\
+                          目标（goal.add / list / next / wait / resume / done / link / attach / detach）、定时任务（cron.list / run）、\
                           找会话（session.search / list）、任务清单（task.list）。\
                           用户要你记住什么、提到别的会话里的事、问有哪些定时任务或任务时用它，\
                           别去翻系统 crontab 或读数据文件。\n\
@@ -779,6 +823,8 @@ mod tests {
             ("goal.done", json!({ "id": "g-1", "revision": 3 })),
             ("goal.link", json!({ "id": "g-1", "cron": "job-1" })),
             ("goal.list", json!({ "all": true })),
+            ("goal.attach", json!({ "id": "g-1" })),
+            ("goal.detach", json!({ "id": "g-1" })),
             ("cron.list", json!({})),
             ("cron.run", json!({ "id": "job-1" })),
             ("session.search", json!({ "q": "飞书" })),
@@ -825,6 +871,35 @@ mod tests {
         assert_eq!(list.kind, Some(MatterKind::Goal));
         assert!(list.all);
         assert_eq!(list.session.as_ref().unwrap().as_str(), "sess-1");
+        assert_eq!(
+            calls[10],
+            KomoCall::GoalAttach {
+                id: MatterId::from_raw("g-1")
+            }
+        );
+        assert_eq!(
+            calls[11],
+            KomoCall::GoalDetach {
+                id: MatterId::from_raw("g-1")
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn task_list_takes_a_goal_filter() {
+        let (tool, recorder) = tool();
+        run_action(
+            &tool,
+            json!({ "action": "task.list", "params": { "goal": "g-7", "limit": 3 } }),
+        )
+        .await
+        .unwrap();
+        let calls = recorder.calls.lock().unwrap();
+        let KomoCall::TaskList(query) = &calls[0] else {
+            panic!("{:?}", calls[0])
+        };
+        assert_eq!(query.goal.as_ref().map(|goal| goal.as_str()), Some("g-7"));
+        assert_eq!(query.limit, Some(3));
     }
 
     #[tokio::test]
@@ -949,7 +1024,7 @@ mod tests {
             "goal.add" => json!({ "title": "x" }),
             "goal.next" => json!({ "id": "g", "next": "x" }),
             "goal.wait" => json!({ "id": "g", "waiting_for": "x" }),
-            "goal.resume" | "goal.done" => json!({ "id": "g" }),
+            "goal.resume" | "goal.done" | "goal.attach" | "goal.detach" => json!({ "id": "g" }),
             "goal.link" => json!({ "id": "g", "cron": "j" }),
             "cron.run" => json!({ "id": "j" }),
             "session.search" => json!({ "q": "x" }),

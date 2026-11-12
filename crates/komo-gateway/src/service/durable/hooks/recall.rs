@@ -19,6 +19,9 @@
 //! 召回块最前面的事项组（`docs/goals.md` §5）走同一套：已展示的 `id@revision` 记在 `RecallData.matters`，
 //! 每轮请求前连同记忆一起核对、改写；`memory = private` 的会话不带事项。
 //!
+//! **群的线派出的任务不召回**（`Resolved::from_group`）：记忆、约定、事项三组都不带，入口直接返回空；
+//! 同一企业的人都算操作者时，群里的同事不该借任务读到操作者的个人记忆与目标。
+//!
 //! fork 任务什么都不做：它的上下文接着父的（连父的召回块），首请求要与父的上一次逐字节同前缀。
 //!
 //! [`AgentHooks::context_entries`]: komo_runtime::durable::harness::AgentHooks::context_entries
@@ -63,6 +66,10 @@ pub(super) async fn entries(
     request: ContextRequest<'_>,
 ) -> Vec<EntryDraft> {
     if resolved.is_fork() {
+        return Vec::new();
+    }
+    // 群的线派出的任务：不注入操作者的记忆与目标，连召回都不调（这样也不会落召回记录）。
+    if resolved.from_group {
         return Vec::new();
     }
     let scopes = recall_scopes(resolved);

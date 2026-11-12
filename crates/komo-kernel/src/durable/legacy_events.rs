@@ -37,6 +37,8 @@
 //! | `komo.decay` | `ContextCompacted::Decayed`（D,0） |
 //! | `model.change` | `ConfigChanged`（M,0） |
 //! | `komo.memory.recall` | `MemoryInjected`（K,0，`run` 是 `data.submission` 所在的 run，只带 `uses` 与诊断）；正文不出 `MessageUser`，提取引不到它（`docs/memory.md` §9.4） |
+//! | `main.user`（主线 / 群的线上用户说的，没有 `model`，正文在 `data.text`） | `MessageUser`（E,0），`run` 为空 |
+//! | `main.reply`（任务的回复、清单、"好，先停了。"） | `LineReply`（E,0），`run` 为空；`origin` = 被回答那条 `main.user` 的 `MessageUser` 事件 ID，`task` 是说话的任务会话（有的话） |
 //! | 别的 entry：有 `model` 里的 user 消息、kind 不是 `komo.*`（`komo.user` 除外）与 `branch.summary` | `MessageUser`（E,0），`run` 为空——`!` 命令这类"不开启 run 的用户消息" |
 //! | 其余（`komo.system`、`label`、`session.info`、`branch.summary`、`context.edit`、不认识的 kind） | **不出帧**。不认识的 kind 在 pi 树里是 `Custom`（见 [`pi_tree`](super::pi_tree)），事件流里没有对应词汇，宁可不出也不出一个误导的帧 |
 //!
@@ -92,9 +94,9 @@ use super::records::{EditAction, EntryRecord, InputState, SubmissionKind, Submis
 use crate::compaction::{CompactionDebt, CompactionDecision, CompactionReason};
 use crate::events::{
     ConfigChanged, ContextCompacted, ConversationBoundary, EVENT_FORMAT_VERSION, Event,
-    EventPayload, MemoryInjected, MessageAssistant, MessageUser, RunAbsorbed, RunAccepted,
-    RunCancelled, RunCompleted, RunFailed, RunQueued, RunStarted, ShellCommand, ToolPlanned,
-    ToolResult, ToolStarted,
+    EventPayload, LineReply, LineReplyTask, MemoryInjected, MessageAssistant, MessageUser,
+    RunAbsorbed, RunAccepted, RunCancelled, RunCompleted, RunFailed, RunQueued, RunStarted,
+    ShellCommand, ToolPlanned, ToolResult, ToolStarted,
 };
 use crate::protocol::nested::display_result;
 use crate::types::{
@@ -106,6 +108,9 @@ use crate::types::{ContentRef, PREVIEW_LIMIT_BYTES, ToolCallRequest};
 /// `komo.settled` 的 kind（与 runtime `harness::entries::SETTLED` 一致，kernel 不依赖 runtime）。
 pub const SETTLED_ENTRY_KIND: &str = "komo.settled";
 const USER_ENTRY_KIND: &str = "komo.user";
+/// 主线 / 群的线上的展示 entry（gateway `dispatch` 与 runtime `MAIN_REPLY_ENTRY`，kernel 不依赖它们）。
+const MAIN_USER_ENTRY: &str = "main.user";
+const MAIN_REPLY_ENTRY: &str = "main.reply";
 /// `!` 命令与命令型 cron 落下的 write entry（gateway `service/durable/shell.rs`）。
 pub const SHELL_ENTRY_KIND: &str = "shell.command";
 const ASSISTANT_ENTRY_KIND: &str = "komo.assistant";
@@ -344,6 +349,7 @@ impl Projection {
                     }),
                 );
             }
+            MAIN_USER_ENTRY | MAIN_REPLY_ENTRY => self.line_message(entry, &frame, out),
             ASSISTANT_ENTRY_KIND => self.assistant(entry, &frame, out),
             TOOL_RESULT_ENTRY_KIND => self.tool_result(entry, &frame, out),
             kind => {
@@ -369,6 +375,58 @@ impl Projection {
                 }
             }
         }
+    }
+
+    /// 主线 / 群的线上的展示 entry（没有 `model`，正文在 `data.text`）：`main.user` 出 `MessageUser`，
+    /// `main.reply` 出 `LineReply`，都不挂 run。
+    fn line_message(&mut self, entry: &EntryRecord, frame: &Frame, out: &mut Vec<Event>) {
+        let Some(text) = data_str(entry, "text") else {
+            return;
+        };
+        if entry.kind == MAIN_USER_ENTRY {
+            frame.emit(
+                out,
+                0,
+                None,
+                EventPayload::MessageUser(MessageUser {
+                    text: Some(text.to_owned()),
+                    text_ref: None,
+                    project_update: false,
+                    shell: None,
+                }),
+            );
+            return;
+        }
+        let data = entry.data.as_ref();
+        // 被回答的那条用户消息的事件 ID：与 `MessageUser` 帧同一个 `seq(entry, 0)`。
+        let origin = data
+            .and_then(|data| data.pointer("/origin/entry"))
+            .and_then(Value::as_u64)
+            .map(|id| EventId::from_raw(format!("evt-{}", seq(EntryId::new(id), 0).0)));
+        let task = data.and_then(|data| data.get("task")).and_then(|task| {
+            Some(LineReplyTask {
+                session: task
+                    .get("session")
+                    .and_then(Value::as_str)
+                    .map(SessionId::from_raw),
+                handle: task.get("handle")?.as_str()?.to_owned(),
+                title: task
+                    .get("title")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned(),
+            })
+        });
+        frame.emit(
+            out,
+            0,
+            None,
+            EventPayload::LineReply(LineReply {
+                text: text.to_owned(),
+                origin,
+                task,
+            }),
+        );
     }
 
     /// conversation 里最近开的、还没结算的 run。

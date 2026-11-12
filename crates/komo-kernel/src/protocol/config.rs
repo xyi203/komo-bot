@@ -541,6 +541,14 @@ pub struct ExecutionConfig {
     /// 无人值守的 Run 调对外工具时，确认卡等多久（分钟，`docs/confirm.md` §5）。到点不执行。
     #[serde(default = "default_confirm_timeout_mins")]
     pub confirm_timeout_mins: u64,
+    /// 分发派出的任务一轮在跑、两次模型调用之间多久没有任何进展就判卡死（秒，`docs/tasks.md` §4.9 B4）。
+    /// 没有进展 = 没有新的模型调用开始 / 完成、没有工具开始 / 结束、没有进度提交。到约 80% 先给任务插
+    /// 一条提醒，到点还没动静就停掉并告诉来源对端。0 = 不检测这一段。
+    #[serde(default = "default_stall_model_secs")]
+    pub stall_model_secs: u64,
+    /// 同上，但这一轮有工具在执行（工具跑得久，阈值给得比模型调用之间宽）。0 = 不检测这一段。
+    #[serde(default = "default_stall_tool_secs")]
+    pub stall_tool_secs: u64,
 }
 
 impl ExecutionConfig {
@@ -588,6 +596,17 @@ fn default_call_timeout_secs() -> u64 {
 
 pub const DEFAULT_DETACH_AFTER_SECS: u64 = 120;
 
+pub const DEFAULT_STALL_MODEL_SECS: u64 = 450;
+pub const DEFAULT_STALL_TOOL_SECS: u64 = 1200;
+
+fn default_stall_model_secs() -> u64 {
+    DEFAULT_STALL_MODEL_SECS
+}
+
+fn default_stall_tool_secs() -> u64 {
+    DEFAULT_STALL_TOOL_SECS
+}
+
 /// 24 小时，同 monitor 的上限。
 pub const DEFAULT_CONFIRM_TIMEOUT_MINS: u64 = 1440;
 
@@ -619,6 +638,8 @@ impl Default for ExecutionConfig {
             decay_head_bytes: DEFAULT_DECAY_HEAD_BYTES,
             decay_tail_bytes: DEFAULT_DECAY_TAIL_BYTES,
             confirm_timeout_mins: DEFAULT_CONFIRM_TIMEOUT_MINS,
+            stall_model_secs: DEFAULT_STALL_MODEL_SECS,
+            stall_tool_secs: DEFAULT_STALL_TOOL_SECS,
         }
     }
 }

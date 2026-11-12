@@ -360,7 +360,8 @@ impl Surface {
             EventPayload::ContextCompacted(ContextCompacted::Skipped { .. })
             | EventPayload::Checkpoint(_)
             | EventPayload::ConfigChanged(_) => {}
-            EventPayload::CodemodeJournal(_) => {}
+            // 线上的回复只给界面看，不进 Run 的消息面。
+            EventPayload::CodemodeJournal(_) | EventPayload::LineReply(_) => {}
             EventPayload::Unknown { event_type, raw } => self.unknown.push(UnknownEvent {
                 seq: event.seq,
                 event_id: event.event_id.clone(),

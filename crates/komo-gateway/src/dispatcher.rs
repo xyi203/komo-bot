@@ -25,9 +25,12 @@
 //! - **普通文本**：`request_id` = 平台消息键（持久去重：重投返回原 run），输入 entry 是 `chat.input`，
 //!   `data {peer, principal}`；宿主 run 是**同一个 peer** 起的、还在忙时 `WhenBusy::Steer`（并进去），
 //!   别的 peer 的话排在后面（§6：对端与宿主不同就不并）。
-//! - **命令**：`/new` = `boundary`；`/cancel` = 只停当前这一轮（决定 8：`abort_run`，不撤回收件箱；
-//!   只有排队的那一条才 `withdraw`）；`/status` 带当前 run 与这个会话派出的后台任务
-//!   （`TaskLine::render`）；`/pending` 与 `/answer` 读的是 faulted 任务（W4a，只答 `abandon`）。
+//! - **命令**：旧办法开出的话题会话（`kind = normal`）里照旧：`/new` = `boundary`；`/cancel` = 只停当前这一轮
+//!   （决定 8：`abort_run`，不撤回收件箱；只有排队的那一条才 `withdraw`）；`/status` 带当前 run 与这个会话派出的
+//!   后台任务（`TaskLine::render`）。主会话与群的线不跑模型（`docs/tasks.md` §4.14），命令改为（`line_command`）：
+//!   `/new` 只回一句说明；`/status` 回这条线自己的任务清单（同分发的 `list`，不带任务号、不经模型）；`/cancel`
+//!   所在话题有归属任务就 `stop_task` 它，否则当成普通消息"先别做了"交给分发判断。`/pending` 与 `/answer`
+//!   读的是 faulted 任务与待确认的 `confirm`（任务会话里的也在），两处都不变。命令只有操作者能用。
 //!
 //! 谁在看这条 run：渠道回复由 [`watch`] 的看客投回，这里只在**提交之前**保证这个会话有看客。
 //!
@@ -53,9 +56,25 @@ use komo_runtime::durable::harness::{Harness, InputEntry, WhenBusy};
 use serde_json::json;
 
 use crate::service::durable::background::watch::{self, CHAT_INPUT, Source};
-use crate::service::durable::dispatch::MainMessage;
+use crate::service::durable::dispatch::{self, MainMessage};
 use crate::service::durable::{DurableCore, SessionError};
 use crate::service::state::GatewayState;
+
+/// 线上命令的处理结果。
+enum LineCommand {
+    /// 处理完了，回这个。
+    Done(InboundAck),
+    /// 不是线上要改的命令（或不在线上），走会话里的原处理。
+    Session,
+    /// `/cancel` 在这里没有归属任务可停：当成一条普通消息交给分发。
+    AsMessage,
+}
+
+/// 线上没有上下文可重置：`/new` 在主会话与群的线上只回这句。
+const NEW_ON_LINE: &str = "现在每件事都是单独处理的，不需要重新开始。";
+
+/// 线上 `/cancel` 没有归属任务可停时，交给分发判断的那句普通话。
+const CANCEL_AS_MESSAGE: &str = "先别做了";
 
 /// 进程内记住的去重键上限。
 const SEEN_LIMIT: usize = 4_096;
@@ -301,6 +320,48 @@ impl Dispatcher {
         }
     }
 
+    /// 主会话 / 群的线上的命令（线不跑模型，没有"当前会话的 run"可取消、没有上下文可重置）。
+    /// 结果见 [`LineCommand`]。
+    ///
+    /// - `/new`：只回一句说明，不改任何状态；
+    /// - `/status`：这条线自己的任务清单（与分发的 `list` 同一份，不带任务号、不经模型）——私聊里是私聊
+    ///   的任务，群里只有这个群的；
+    /// - `/cancel`：所在话题有归属任务就用 `stop_task` 停它；位置没有归属（私聊主线、群的线、无话题的私聊）
+    ///   返回 `None`。
+    async fn line_command(
+        &self,
+        command: &ChatCommand,
+        msg: &InboundMessage,
+        core: &DurableCore,
+        line: &SessionRecord,
+    ) -> Result<LineCommand, GatewayError> {
+        let reply = |text: &str| {
+            Ok(LineCommand::Done(InboundAck::Replied {
+                text: text.to_owned(),
+            }))
+        };
+        match command {
+            ChatCommand::New => reply(NEW_ON_LINE),
+            ChatCommand::Status => {
+                let text = dispatch::list_text(core, line)
+                    .await
+                    .map_err(gateway_error)?;
+                reply(&text)
+            }
+            ChatCommand::Cancel => {
+                let Some(task) = dispatch::owned_task(core, line, &msg.peer)
+                    .await
+                    .map_err(gateway_error)?
+                else {
+                    return Ok(LineCommand::AsMessage);
+                };
+                core.stop_task(task).await.map_err(gateway_error)?;
+                reply(dispatch::STOPPED_REPLY)
+            }
+            ChatCommand::Pending | ChatCommand::Id => Ok(LineCommand::Session),
+        }
+    }
+
     /// `/status`：当前 run、待处理数（两类合计）、这个会话派出的后台任务。
     async fn status_text(
         &self,
@@ -352,7 +413,7 @@ impl Inbound for Dispatcher {
             .map_err(|e| GatewayError::Internal(e.to_string()))
     }
 
-    async fn handle(&self, msg: InboundMessage) -> Result<InboundAck, GatewayError> {
+    async fn handle(&self, mut msg: InboundMessage) -> Result<InboundAck, GatewayError> {
         // ① 去重：平台重投命中同一个键（命令用；普通文本的去重是持久的，在请求键上）。
         if let Some(ack) = self.recall(&msg.request_key) {
             return Ok(ack);
@@ -401,11 +462,30 @@ impl Inbound for Dispatcher {
             return Ok(ack);
         }
         if let Some(command) = command {
-            let ack = self
-                .command(command, &msg, &principal, &core, &record)
-                .await?;
-            self.remember(&msg.request_key, &ack);
-            return Ok(ack);
+            // 主会话与群的线不跑模型：`/new` `/cancel` `/status` 在这里有新的含义（`line_command`）。
+            // 旧办法开出的话题会话（`kind = normal`）仍走原来的处理。
+            let line = if record.kind == SessionKind::Main {
+                self.line_command(&command, &msg, &core, &record).await?
+            } else {
+                LineCommand::Session
+            };
+            match line {
+                // 线上的命令已经处理完。
+                LineCommand::Done(ack) => {
+                    self.remember(&msg.request_key, &ack);
+                    return Ok(ack);
+                }
+                // 不是线上要改的命令：原来的命令处理。
+                LineCommand::Session => {
+                    let ack = self
+                        .command(command, &msg, &principal, &core, &record)
+                        .await?;
+                    self.remember(&msg.request_key, &ack);
+                    return Ok(ack);
+                }
+                // 没有可停的归属任务：当作一条普通消息"先别做了"交给分发判断，由 Router 决定停哪个。
+                LineCommand::AsMessage => msg.text = CANCEL_AS_MESSAGE.to_owned(),
+            }
         }
 
         // ⑥ 普通文本。**先挂看客再提交**：订阅之后才发生的终态帧才收得到。

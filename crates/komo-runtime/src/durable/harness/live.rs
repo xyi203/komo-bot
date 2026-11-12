@@ -196,6 +196,11 @@ pub struct LiveState {
     /// 也是旧实现 `compaction_refused` 的持久形式（`compaction::refused_after`）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compaction_failure: Option<CompactionFailure>,
+    /// 这条 run 最近一次有进展的提交时刻（毫秒）：[`store`] 每次写 `komo.live` 时盖章——新一轮模型调用开始 / 完成、
+    /// 工具开始 / 结束、节流的进度提交（部分回复、输出尾巴）都走那里，所以它就是"最后一次进展"。卡死检测
+    /// （`docs/tasks.md` §4.9 B4）只读它。没有 run 时不带；旧 document 没有，读成 `None`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activity_at: Option<i64>,
 }
 
 /// 一个压缩任务的展示状态：建任务的那笔提交里加，结局提交里（或调度器清理时）移除。
@@ -302,7 +307,15 @@ pub async fn store(
     if *state == LiveState::default() && tx.document(&address).await?.is_none() {
         return Ok(());
     }
-    let value = serde_json::to_value(state).expect("LiveState 可序列化");
+    let mut value = serde_json::to_value(state).expect("LiveState 可序列化");
+    // 盖"最后一次进展"的章（见 [`LiveState::activity_at`]）：值取这笔提交的时刻，不取内存里的旧值。
+    if let Some(object) = value.as_object_mut() {
+        if state.run.is_some() {
+            object.insert("activityAt".to_owned(), Value::from(tx.now()));
+        } else {
+            object.remove("activityAt");
+        }
+    }
     tx.put_document(address, LIVE_VERSION, value).await
 }
 

@@ -465,6 +465,32 @@ fn a_known_key_with_the_wrong_type_still_refuses_the_load() {
     assert!(matches!(error, ConfigError::Parse { .. }), "{error:?}");
 }
 
+/// 卡死阈值默认 450 / 1200 秒，可以写成别的，0 = 不检测（不是错误）。
+#[test]
+fn the_stall_thresholds_default_are_overridable_and_zero_turns_them_off() {
+    let fixture = Fixture::valid();
+    let text = Fixture::config_text("chat-a", "medium");
+    write(&fixture.sources().config, &text);
+    let loaded = load_config(&fixture.options()).unwrap();
+    assert_eq!(loaded.snapshot.execution.stall_model_secs, 450);
+    assert_eq!(loaded.snapshot.execution.stall_tool_secs, 1200);
+
+    let mut text = Fixture::config_text("chat-a", "medium");
+    text.push_str("\n[execution]\nstall_model_secs = 0\nstall_tool_secs = 90\n");
+    write(&fixture.sources().config, &text);
+    let loaded = load_config(&fixture.options()).unwrap();
+    assert_eq!(loaded.snapshot.execution.stall_model_secs, 0);
+    assert_eq!(loaded.snapshot.execution.stall_tool_secs, 90);
+    assert!(
+        loaded
+            .issues
+            .iter()
+            .all(|issue| !issue.key.as_str().starts_with("execution")),
+        "{:?}",
+        loaded.issues
+    );
+}
+
 #[test]
 fn the_call_timeout_is_read_from_the_execution_section() {
     let fixture = Fixture::valid();

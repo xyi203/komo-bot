@@ -1265,6 +1265,628 @@ async fn a_task_result_round_in_a_dispatched_task_is_still_a_trigger() {
     rig.gateway.stop().await;
 }
 
+/// `/pending` 与 `/answer` 在新路径下仍找得到分发派出的任务会话里待答的确认：列得出来，`/answer approve`
+/// 之后对外动作真的执行。
+#[tokio::test]
+async fn pending_and_answer_still_reach_a_confirmation_inside_a_dispatched_task() {
+    use komo_kernel::protocol::InboundAck;
+    use komo_runtime::durable::harness::TASK_RESULT_ENTRY;
+    use komo_runtime::durable::harness::inbox::{InputEntry, SubmissionDraft, WhenBusy};
+
+    let probe = komo_gateway_probe();
+    let router = FnRouter::new(|_| Ok(new_task("整理周报", "整理本周周报")));
+    let worker = FakeLlm::new(vec![
+        vec![text_round(1, "整理好了。\n状态：完成")],
+        vec![
+            call_round(1, "o1", "outward_ping", json!({})),
+            text_round(2, "NO_REPLY"),
+        ],
+    ]);
+    let rig = rig_with(router, worker, vec![probe.tool()]).await;
+    rig.say("整理周报", "telegram:1").await;
+    rig.wait_texts("回复", 1).await;
+    let task = rig.task_sessions().await.remove(0);
+    let core = rig.core();
+    core.harness
+        .submit(
+            &core.engine,
+            task.current_branch,
+            SubmissionDraft::Input {
+                content: Content::Text("[后台任务 #x「子」已完成]\n结果".into()),
+                entry: Some(InputEntry::new(TASK_RESULT_ENTRY, None)),
+                when_busy: WhenBusy::Steer,
+                request_id: Some("task-result:1:2".into()),
+                internal: true,
+            },
+        )
+        .await
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    let handle = loop {
+        let list = core
+            .interventions(&komo_kernel::protocol::http::InterventionListQuery::default())
+            .await
+            .unwrap();
+        if let Some(one) = list.first() {
+            break one.handle.clone();
+        }
+        assert!(std::time::Instant::now() < deadline, "没有停在确认上");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    };
+    assert_eq!(probe.calls(), 0, "确认之前不执行");
+
+    let command = |text: &str, key: &str| {
+        rig.gateway.handle(inbound(
+            ChannelPlatform::Telegram,
+            "111",
+            "111",
+            text,
+            key,
+            true,
+        ))
+    };
+    let pending = match command("/pending", "telegram:p1").await {
+        InboundAck::Replied { text } => text,
+        other => panic!("{other:?}"),
+    };
+    assert!(
+        pending.contains(&handle) && pending.contains("待确认"),
+        "{pending}"
+    );
+    let answered = command(&format!("/answer {handle} approve"), "telegram:p2").await;
+    assert!(
+        matches!(answered, InboundAck::Replied { ref text } if text.contains("已批准")),
+        "{answered:?}"
+    );
+    // 等确认的任务每 5 秒（`probe_interval`）看一次答复。
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while probe.calls() == 0 {
+        assert!(std::time::Instant::now() < deadline, "批准之后没有执行");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert_eq!(probe.calls(), 1);
+}
+
+/// 卡死检测（`docs/tasks.md` §4.9 B4）：按"没有进展"判。时钟是测试里拨的 `TestClock`，扫描由测试直接调
+/// `stall::sweep`，不真的睡。
+mod stall_detection {
+    use std::sync::atomic::AtomicUsize;
+
+    use komo_kernel::durable::AssistantMessage;
+    use komo_kernel::test_support::TestClock;
+    use komo_llm::{ModelRequest, ModelStream};
+    use komo_runtime::durable::harness::TASK_RESULT_ENTRY;
+    use komo_runtime::durable::harness::inbox::{InputEntry, SubmissionDraft, WhenBusy};
+
+    use super::*;
+    use crate::service::durable::dispatch::stall::sweep;
+
+    const STALLED: &str = "这件事卡住了，我先停下。要不要再试一次？";
+
+    /// 每次模型调用先等一张许可再放行给 `FakeLlm`：测试用许可一张一张放，"模型调用卡住"就是没许可。
+    struct Paced {
+        inner: Arc<FakeLlm>,
+        permits: Arc<tokio::sync::Semaphore>,
+        waiting: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl ModelStream for Paced {
+        async fn stream(
+            &self,
+            request: &ModelRequest<'_>,
+            progress: &mut (dyn for<'m> FnMut(&'m AssistantMessage) + Send),
+        ) -> Result<AssistantMessage, LlmError> {
+            self.waiting.fetch_add(1, Ordering::SeqCst);
+            let permit = self.permits.acquire().await;
+            self.waiting.fetch_sub(1, Ordering::SeqCst);
+            permit.expect("信号量没关").forget();
+            self.inner.stream(request, progress).await
+        }
+    }
+
+    struct Stalling {
+        rig: Rig,
+        clock: Arc<TestClock>,
+        permits: Arc<tokio::sync::Semaphore>,
+        waiting: Arc<AtomicUsize>,
+        started: time::OffsetDateTime,
+    }
+
+    fn config(model: u64, tool: u64) -> String {
+        format!(
+            "{}\n[execution]\nstall_model_secs = {model}\nstall_tool_secs = {tool}\n",
+            telegram_config("111")
+        )
+    }
+
+    async fn start(
+        config: &str,
+        worker: Arc<FakeLlm>,
+        permits: usize,
+        tools: Vec<Arc<dyn komo_kernel::traits::Tool>>,
+        home: Option<&std::path::Path>,
+        clock: Arc<TestClock>,
+    ) -> (Rig, Arc<tokio::sync::Semaphore>, Arc<AtomicUsize>) {
+        let sender = MemSender::new(ChannelPlatform::Telegram);
+        let permits = Arc::new(tokio::sync::Semaphore::new(permits));
+        let waiting = Arc::new(AtomicUsize::new(0));
+        let paced = Arc::new(Paced {
+            inner: worker,
+            permits: Arc::clone(&permits),
+            waiting: Arc::clone(&waiting),
+        });
+        let router = FnRouter::new(|_| Ok(new_task("跑个活", "跑一个活")));
+        let mut builder = GatewayBuilder::new(config)
+            .llm(router as Arc<dyn LlmClient>)
+            .stream(paced as Arc<dyn ModelStream>)
+            .clock(clock as Arc<dyn komo_kernel::traits::Clock>)
+            .factory(FixedFactory::sender_only(
+                Arc::clone(&sender) as Arc<dyn ChannelSender>
+            ));
+        if let Some(home) = home {
+            builder = builder.at(home);
+        }
+        for tool in tools {
+            builder = builder.tool(tool);
+        }
+        let gateway = builder.start().await;
+        (Rig { gateway, sender }, permits, waiting)
+    }
+
+    impl Stalling {
+        async fn new(model: u64, tool: u64, worker: Arc<FakeLlm>, permits: usize) -> Stalling {
+            let clock = Arc::new(TestClock::fixed());
+            let started = komo_kernel::traits::Clock::now(&*clock);
+            let (rig, permits, waiting) = start(
+                &config(model, tool),
+                worker,
+                permits,
+                vec![],
+                None,
+                Arc::clone(&clock),
+            )
+            .await;
+            Stalling {
+                rig,
+                clock,
+                permits,
+                waiting,
+                started,
+            }
+        }
+
+        fn advance_to(&self, secs: i64) {
+            self.clock.set(self.started + time::Duration::seconds(secs));
+        }
+
+        async fn sweep(&self) {
+            sweep(self.rig.gateway.state()).await.unwrap();
+        }
+
+        async fn model_waiting(&self, n: usize) {
+            let waiting = Arc::clone(&self.waiting);
+            eventually("模型调用在等许可", move || {
+                waiting.load(Ordering::SeqCst) >= n
+            })
+            .await;
+        }
+
+        /// 任务会话收件箱里排着的输入数。
+        async fn inbox(&self) -> usize {
+            let task = self.rig.task_sessions().await.remove(0);
+            komo_runtime::durable::harness::Harness::inbox(
+                &*self.rig.core().storage,
+                task.current_branch,
+            )
+            .await
+            .unwrap()
+            .items
+            .len()
+        }
+
+        async fn task_doc(&self) -> komo_runtime::durable::harness::TaskDoc {
+            let task = self.rig.task_sessions().await.remove(0);
+            task_doc_of(&self.rig, &task).await
+        }
+    }
+
+    /// 一轮卡在模型调用上：到 80% 先提醒（同一段无进展里只插一次），到点没动静就说一句普通的话、停掉；
+    /// 那句话落成线上的 `main.reply`，投给来源对端，不再多说别的。
+    #[tokio::test]
+    async fn a_round_without_progress_is_reminded_then_stopped_and_the_peer_is_told() {
+        let worker = FakeLlm::new(vec![vec![text_round(1, "做好了。\n状态：完成")]]);
+        let mut t = Stalling::new(100, 500, worker, 0).await;
+        t.rig.say("跑个活", "telegram:1").await;
+        t.model_waiting(1).await;
+
+        t.advance_to(50);
+        t.sweep().await;
+        assert_eq!(t.inbox().await, 0, "阈值的 80% 之前什么都不做");
+        assert!(t.rig.sender.texts().is_empty());
+
+        t.advance_to(85);
+        t.sweep().await;
+        assert_eq!(t.inbox().await, 1, "到 80% 插了一条提醒");
+        t.sweep().await;
+        assert_eq!(t.inbox().await, 1, "同一段无进展里不重复提醒");
+        assert!(t.rig.sender.texts().is_empty());
+
+        t.advance_to(101);
+        t.sweep().await;
+        let sent = t.rig.wait_texts("卡住的那句话", 1).await;
+        assert_eq!(sent, [STALLED]);
+        assert!(t.task_doc().await.stopped, "任务被停下了");
+        let line = t.rig.main_line().await;
+        assert_eq!(texts_of(&line, MAIN_REPLY_ENTRY), [STALLED]);
+
+        // 停掉之后不再被判：再扫、再走时间，也不会重复说。
+        t.advance_to(1000);
+        t.sweep().await;
+        t.sweep().await;
+        assert_eq!(t.rig.sender.texts(), [STALLED]);
+        t.permits.add_permits(10);
+        t.rig.gateway.stop().await;
+    }
+
+    /// 一直有进展的长任务跑多久都不被停：每次模型调用完成都是进展，累计远超阈值也没事。
+    #[tokio::test]
+    async fn a_long_task_that_keeps_making_progress_is_never_stopped() {
+        let rounds: Vec<_> = (1..=5)
+            .map(|n| call_round(n, &format!("g{n}"), "gate", json!({})))
+            .chain([text_round(6, "总算做完了。\n状态：完成")])
+            .collect();
+        let gate = Gate::new();
+        gate.release();
+        let worker = FakeLlm::new(vec![rounds]);
+        let clock = Arc::new(TestClock::fixed());
+        let started = komo_kernel::traits::Clock::now(&*clock);
+        let (mut rig, permits, waiting) = start(
+            &config(100, 500),
+            worker,
+            0,
+            vec![gate.tool()],
+            None,
+            Arc::clone(&clock),
+        )
+        .await;
+        rig.say("跑个活", "telegram:1").await;
+        let mut elapsed = 0;
+        for round in 1..=6 {
+            let waiting = Arc::clone(&waiting);
+            eventually("模型调用在等许可", move || {
+                waiting.load(Ordering::SeqCst) >= 1
+            })
+            .await;
+            // 每一轮之间过去 70 秒（低于 80%），累计 420 秒，远超 100 秒的阈值。
+            elapsed += 70;
+            clock.set(started + time::Duration::seconds(elapsed));
+            sweep(rig.gateway.state()).await.unwrap();
+            assert!(
+                rig.sender.texts().is_empty(),
+                "第 {round} 轮：不该被停或提醒"
+            );
+            permits.add_permits(1);
+            if round < 6 {
+                let gate = Arc::clone(&gate);
+                eventually("工具跑完", move || gate.entered() >= round).await;
+            }
+        }
+        let sent = rig.wait_texts("最后的回复", 1).await;
+        assert_eq!(sent, ["总算做完了。"]);
+        assert!(elapsed > 100);
+        rig.gateway.stop().await;
+    }
+
+    /// 有工具在执行用工具的阈值：模型阈值早就过了，工具阈值没到就不动；工具阈值到了照样提醒再停。
+    #[tokio::test]
+    async fn a_running_tool_is_judged_by_the_tool_threshold() {
+        let gate = Gate::new();
+        let worker = FakeLlm::new(vec![vec![call_round(1, "g1", "gate", json!({}))]]);
+        let clock = Arc::new(TestClock::fixed());
+        let started = komo_kernel::traits::Clock::now(&*clock);
+        let (mut rig, permits, _waiting) = start(
+            &config(100, 500),
+            worker,
+            1,
+            vec![gate.tool()],
+            None,
+            Arc::clone(&clock),
+        )
+        .await;
+        rig.say("跑个活", "telegram:1").await;
+        gate.wait_entered(1).await;
+        let at = |secs: i64| clock.set(started + time::Duration::seconds(secs));
+        let core = rig.core();
+        let task = rig.task_sessions().await.remove(0);
+        let inbox = || async {
+            komo_runtime::durable::harness::Harness::inbox(&*core.storage, task.current_branch)
+                .await
+                .unwrap()
+                .items
+                .len()
+        };
+
+        at(300);
+        sweep(rig.gateway.state()).await.unwrap();
+        assert_eq!(inbox().await, 0, "过了模型阈值，但这是工具在跑");
+        assert!(rig.sender.texts().is_empty());
+        at(420);
+        sweep(rig.gateway.state()).await.unwrap();
+        assert_eq!(inbox().await, 1, "到工具阈值的 80% 提醒");
+        at(501);
+        sweep(rig.gateway.state()).await.unwrap();
+        assert_eq!(rig.wait_texts("卡住的那句话", 1).await, [STALLED]);
+        gate.release();
+        permits.add_permits(10);
+        rig.gateway.stop().await;
+    }
+
+    /// 阈值 0 = 不检测（两段各自）。
+    #[tokio::test]
+    async fn a_zero_threshold_turns_detection_off() {
+        let worker = FakeLlm::new(vec![vec![text_round(1, "做好了。\n状态：完成")]]);
+        let mut t = Stalling::new(0, 0, worker, 0).await;
+        t.rig.say("跑个活", "telegram:1").await;
+        t.model_waiting(1).await;
+        t.advance_to(100_000);
+        t.sweep().await;
+        assert_eq!(t.inbox().await, 0);
+        assert!(t.rig.sender.texts().is_empty());
+        assert!(!t.task_doc().await.stopped);
+        t.permits.add_permits(10);
+        t.rig.gateway.stop().await;
+    }
+
+    /// 停在 `confirm` 上等操作者的任务不算卡死：时间走得再久也不提醒、不停。
+    #[tokio::test]
+    async fn a_task_waiting_on_a_confirmation_is_not_stalled() {
+        let probe = komo_gateway_probe();
+        let worker = FakeLlm::new(vec![
+            vec![text_round(1, "整理好了。\n状态：完成")],
+            vec![
+                call_round(1, "o1", "outward_ping", json!({})),
+                text_round(2, "NO_REPLY"),
+            ],
+        ]);
+        let clock = Arc::new(TestClock::fixed());
+        let started = komo_kernel::traits::Clock::now(&*clock);
+        let (mut rig, permits, _waiting) = start(
+            &config(100, 500),
+            worker,
+            10,
+            vec![probe.tool()],
+            None,
+            Arc::clone(&clock),
+        )
+        .await;
+        rig.say("整理周报", "telegram:1").await;
+        rig.wait_texts("回复", 1).await;
+        let task = rig.task_sessions().await.remove(0);
+        let core = rig.core();
+        core.harness
+            .submit(
+                &core.engine,
+                task.current_branch,
+                SubmissionDraft::Input {
+                    content: Content::Text("[后台任务 #x「子」已完成]\n结果".into()),
+                    entry: Some(InputEntry::new(TASK_RESULT_ENTRY, None)),
+                    when_busy: WhenBusy::Steer,
+                    request_id: Some("task-result:1:2".into()),
+                    internal: true,
+                },
+            )
+            .await
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            let waiting = !core
+                .interventions(&komo_kernel::protocol::http::InterventionListQuery::default())
+                .await
+                .unwrap()
+                .is_empty();
+            if waiting {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "没有停在确认上");
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        clock.set(started + time::Duration::seconds(100_000));
+        sweep(rig.gateway.state()).await.unwrap();
+        let texts = rig.sender.texts();
+        assert_eq!(texts.len(), 2, "只有回复与确认卡，没有卡住的话：{texts:?}");
+        assert!(texts[1].starts_with("对外动作等你确认"), "{texts:?}");
+        assert!(!task_doc_of(&rig, &task).await.stopped);
+        permits.add_permits(10);
+        rig.gateway.stop().await;
+    }
+
+    /// 重启后检测仍然有效：判断只靠已提交的 `activityAt` 与时钟。重启给一个完整的阈值（进展的下限是这一代
+    /// 起来的时刻），之后再没有进展就照样被停。
+    #[tokio::test]
+    async fn detection_still_works_after_a_restart() {
+        let worker = FakeLlm::new(vec![vec![text_round(1, "做好了。\n状态：完成")]]);
+        let mut t = Stalling::new(100, 500, worker, 0).await;
+        t.rig.say("跑个活", "telegram:1").await;
+        t.model_waiting(1).await;
+        t.advance_to(60);
+        t.rig.gateway.stop().await;
+        let home = t.rig.gateway.home.clone();
+
+        // 同一个数据目录、同一个（已拨到 60 秒的）时钟再起一台；任务被恢复、又卡在模型调用上。
+        let worker = FakeLlm::new(vec![vec![text_round(1, "做好了。\n状态：完成")]]);
+        let (mut rig, permits, waiting) = start(
+            &config(100, 500),
+            worker,
+            0,
+            vec![],
+            Some(&home),
+            Arc::clone(&t.clock),
+        )
+        .await;
+        let w = Arc::clone(&waiting);
+        eventually("恢复后的模型调用在等许可", move || {
+            w.load(Ordering::SeqCst) >= 1
+        })
+        .await;
+        t.clock.set(t.started + time::Duration::seconds(60 + 50));
+        sweep(rig.gateway.state()).await.unwrap();
+        assert!(rig.sender.texts().is_empty(), "重启后从头算：50 秒还没到");
+        t.clock.set(t.started + time::Duration::seconds(60 + 101));
+        sweep(rig.gateway.state()).await.unwrap();
+        assert_eq!(rig.wait_texts("卡住的那句话", 1).await, [STALLED]);
+        permits.add_permits(10);
+        rig.gateway.stop().await;
+    }
+}
+
+/// 线上的消息要能被客户端读到：`main.user` → `message.user`、`main.reply` → `line.reply`，都不挂 Run。
+/// 读出来的与订阅时收到的逐条一致。
+mod line_events {
+    use komo_kernel::events::{Event, EventPayload};
+    use komo_kernel::protocol::sse::SseEvent;
+    use komo_kernel::types::ids::{Seq, SessionId};
+
+    use super::*;
+
+    /// 订阅到的 `Event` 帧（只取事件本身，不取派生的状态帧）。
+    fn drain(
+        receiver: &mut tokio::sync::broadcast::Receiver<komo_kernel::protocol::sse::SseFrame>,
+    ) -> Vec<Event> {
+        let mut out = Vec::new();
+        while let Ok(frame) = receiver.try_recv() {
+            if let SseEvent::Event(event) = frame.event {
+                out.push(*event);
+            }
+        }
+        out
+    }
+
+    /// 线上事件的形状：（类型, 正文）。
+    fn spoken(events: &[Event]) -> Vec<(String, String)> {
+        events
+            .iter()
+            .filter_map(|event| match &event.payload {
+                EventPayload::MessageUser(body) => {
+                    Some(("user".to_owned(), body.text.clone().unwrap_or_default()))
+                }
+                EventPayload::LineReply(body) => Some(("reply".to_owned(), body.text.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn the_main_line_reads_back_user_messages_task_replies_and_lists_in_order() {
+        let router = FnRouter::new(|prompt| {
+            if prompt.contains("## 这条消息\n手上有什么事") {
+                return Ok(json!({ "route": "list" }).to_string());
+            }
+            Ok(new_task("整理周报", "整理本周周报"))
+        });
+        let worker = FakeLlm::new(vec![vec![text_round(1, "周报好了。\n状态：完成")]]);
+        let mut rig = rig(router, worker, None).await;
+        let session = SessionId::from_raw(rig.main().await.id);
+        let mut live = rig.gateway.state().hub.subscribe(&session);
+
+        rig.say("整理下周报", "telegram:1").await;
+        rig.wait_texts("任务回复", 1).await;
+        rig.say("手上有什么事", "telegram:2").await;
+        rig.wait_texts("清单", 2).await;
+        // 订阅者能收到的帧是异步推的：等清单那一帧到。
+        let mut seen = Vec::new();
+        for _ in 0..250 {
+            seen.extend(drain(&mut live));
+            if spoken(&seen).len() >= 4 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        let read = |gateway: &TestGateway| {
+            let core = gateway.state().core().unwrap().clone();
+            let session = session.clone();
+            async move {
+                crate::service::durable::feed::backfill(&*core.storage, session.as_str(), Seq(0))
+                    .await
+                    .unwrap()
+            }
+        };
+        let backfill = read(&rig.gateway).await;
+        assert_eq!(
+            spoken(&backfill),
+            [
+                ("user".to_owned(), "整理下周报".to_owned()),
+                ("reply".to_owned(), "周报好了。".to_owned()),
+                ("user".to_owned(), "手上有什么事".to_owned()),
+                ("reply".to_owned(), "现在手上没有事。".to_owned()),
+            ]
+        );
+        assert!(
+            backfill
+                .iter()
+                .filter(|event| matches!(
+                    event.payload,
+                    EventPayload::MessageUser(_) | EventPayload::LineReply(_)
+                ))
+                .all(|event| event.run.is_none())
+        );
+        // 任务的回复带任务会话与回的那条用户消息；清单没有任务。
+        let replies: Vec<_> = backfill
+            .iter()
+            .filter_map(|event| match &event.payload {
+                EventPayload::LineReply(body) => Some(body),
+                _ => None,
+            })
+            .collect();
+        let users: Vec<_> = backfill
+            .iter()
+            .filter(|event| matches!(event.payload, EventPayload::MessageUser(_)))
+            .collect();
+        assert_eq!(replies[0].origin.as_ref(), Some(&users[0].event_id));
+        let task = replies[0].task.as_ref().expect("任务的回复带任务");
+        assert_eq!(task.title, "整理周报");
+        let task_session = rig.task_sessions().await.remove(0).id;
+        assert_eq!(
+            task.session.as_ref().map(SessionId::as_str),
+            Some(task_session.as_str())
+        );
+        assert_eq!(replies[1].origin.as_ref(), Some(&users[1].event_id));
+        assert!(replies[1].task.is_none());
+
+        // 实时推送与读到的逐条一致（事件整体相等）。
+        let live_lines: Vec<&Event> = seen
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event.payload,
+                    EventPayload::MessageUser(_) | EventPayload::LineReply(_)
+                )
+            })
+            .collect();
+        let read_lines: Vec<&Event> = backfill
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event.payload,
+                    EventPayload::MessageUser(_) | EventPayload::LineReply(_)
+                )
+            })
+            .collect();
+        assert_eq!(live_lines, read_lines);
+
+        // 重启后回放与重启前读到的逐帧相同。
+        let (mut gateway, _sender) = restart(
+            &mut rig.gateway,
+            FnRouter::new(|_| Ok(String::new())),
+            FakeLlm::new(vec![]),
+        )
+        .await;
+        assert_eq!(read(&gateway).await, backfill);
+        gateway.stop().await;
+    }
+}
+
 /// 对话位置的路由归属、飞书私聊话题与群的线（`docs/tasks.md` §4.7、§4.13、§4.14 F5）。
 mod threads {
     use komo_kernel::durable::TaskStatus;
@@ -1279,18 +1901,38 @@ mod threads {
         "KOMO_LLM_API_KEY=test-key\nFEISHU_APP_ID=cli_test\nFEISHU_APP_SECRET=test-app-secret\n";
 
     async fn feishu_rig(router: Arc<FnRouter>, worker: Arc<FakeLlm>) -> Rig {
-        let sender = MemSender::new(ChannelPlatform::Feishu);
-        let gateway = GatewayBuilder::new(&crate::service::test_support::harness::config_toml(
+        feishu_rig_with(router, worker, Vec::new()).await
+    }
+
+    async fn feishu_rig_with(
+        router: Arc<FnRouter>,
+        worker: Arc<FakeLlm>,
+        tools: Vec<Arc<dyn komo_kernel::traits::Tool>>,
+    ) -> Rig {
+        let config = crate::service::test_support::harness::config_toml(
             &crate::service::test_support::harness::feishu_block("\"ou_op\""),
-        ))
-        .env(FEISHU_ENV)
-        .llm(router as Arc<dyn LlmClient>)
-        .stream(worker as Arc<dyn komo_llm::ModelStream>)
-        .factory(FixedFactory::sender_only(
-            Arc::clone(&sender) as Arc<dyn ChannelSender>
-        ))
-        .start()
-        .await;
+        );
+        feishu_rig_config(&config, router, worker, tools).await
+    }
+
+    async fn feishu_rig_config(
+        config: &str,
+        router: Arc<FnRouter>,
+        worker: Arc<FakeLlm>,
+        tools: Vec<Arc<dyn komo_kernel::traits::Tool>>,
+    ) -> Rig {
+        let sender = MemSender::new(ChannelPlatform::Feishu);
+        let mut builder = GatewayBuilder::new(config)
+            .env(FEISHU_ENV)
+            .llm(router as Arc<dyn LlmClient>)
+            .stream(worker as Arc<dyn komo_llm::ModelStream>)
+            .factory(FixedFactory::sender_only(
+                Arc::clone(&sender) as Arc<dyn ChannelSender>
+            ));
+        for tool in tools {
+            builder = builder.tool(tool);
+        }
+        let gateway = builder.start().await;
         Rig { gateway, sender }
     }
 
@@ -1951,6 +2593,508 @@ mod threads {
         assert_eq!(router.calls(), 1);
         assert_eq!(rig.task_sessions().await.len(), 1);
         assert_eq!(worker.turns(), 1);
+    }
+
+    /// 群的线同样能读到线上的消息，而且只有这个群的。
+    #[tokio::test]
+    async fn a_group_line_reads_back_its_own_messages_as_events() {
+        use komo_kernel::events::EventPayload;
+        let router = FnRouter::new(|_| Ok(new_task("查日志", "查一下日志")));
+        let worker = FakeLlm::new(vec![vec![text_round(1, "日志里没有异常。\n状态：完成")]]);
+        let rig = feishu_rig(router, worker).await;
+        rig.send(group("oc_g", "om_g1", "看一下日志", "feishu:g1"))
+            .await;
+        rig.wait_texts("群里的回复", 1).await;
+
+        let line = rig.line_of("oc_g").await;
+        let events = crate::service::test_support::harness::TestGateway::events_of(
+            rig.gateway.state(),
+            &komo_kernel::types::ids::SessionId::from_raw(line.id.clone()),
+        )
+        .await;
+        let lines: Vec<_> = events
+            .iter()
+            .filter_map(|event| match &event.payload {
+                EventPayload::MessageUser(body) => body.text.clone(),
+                EventPayload::LineReply(body) => Some(format!("回：{}", body.text)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(lines, ["看一下日志", "回：日志里没有异常。"]);
+    }
+
+    // ------------------------------------------------------------ 渠道命令（线不跑模型之后）
+
+    fn replied(ack: InboundAck) -> String {
+        match ack {
+            InboundAck::Replied { text } => text,
+            other => panic!("该是命令的回执：{other:?}"),
+        }
+    }
+
+    /// 话题有归属任务时，`/cancel` 就地停掉那个任务（`stop_task`）并回一句"好，先停了。"：不调 Router，
+    /// 任务不再说话。
+    #[tokio::test]
+    async fn cancel_in_an_owned_topic_stops_that_topics_task_without_the_router() {
+        let gate = Gate::new();
+        let router = FnRouter::new(|_| Ok(new_task("跑脚本", "跑一个很慢的脚本")));
+        let worker = FakeLlm::new(vec![vec![
+            call_round(1, "g1", "gate", json!({})),
+            text_round(2, "不该走到这里。"),
+        ]]);
+        let rig = feishu_rig_with(router.clone(), worker, vec![gate.tool()]).await;
+        rig.send(dm("om_a", "跑一下那个脚本", "feishu:1")).await;
+        gate.wait_entered(1).await;
+
+        let text = replied(rig.send(dm("om_a", "/cancel", "feishu:2")).await);
+        assert_eq!(text, "好，先停了。");
+        assert_eq!(router.calls(), 1, "命令没有调 Router");
+        let task = rig.task_titled("跑脚本").await;
+        assert!(task_doc_of(&rig, &task).await.stopped);
+        let core = rig.core();
+        let conversation = task.current_branch;
+        let live = move || {
+            let core = Arc::clone(&core);
+            async move {
+                komo_runtime::durable::harness::Harness::live(&*core.storage, conversation)
+                    .await
+                    .unwrap()
+                    .run
+                    .is_some()
+            }
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while live().await {
+            assert!(std::time::Instant::now() < deadline, "任务一直没被取消");
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(rig.sender.texts().is_empty(), "取消的任务不说话");
+        gate.release();
+    }
+
+    /// 没有归属的地方（私聊主线、群的线）`/cancel` 当成一条普通消息"先别做了"交给分发判断，由 Router 决定
+    /// 停哪个；群里 Router 只看这个群。
+    #[tokio::test]
+    async fn cancel_without_an_owner_is_dispatched_as_a_plain_message() {
+        let gate = Gate::new();
+        let router = FnRouter::new(|prompt| {
+            if prompt.contains("## 这条消息\n先别做了") {
+                // 群里看不到私聊的任务：候选里没有就什么都不做。
+                if !prompt.contains("跑脚本") {
+                    return Ok(json!({ "route": "ignore" }).to_string());
+                }
+                let handle = handle_of(prompt, "跑脚本");
+                return Ok(json!({ "route": "stop", "task_id": handle }).to_string());
+            }
+            Ok(new_task("跑脚本", "跑一个很慢的脚本"))
+        });
+        let worker = FakeLlm::new(vec![vec![
+            call_round(1, "g1", "gate", json!({})),
+            text_round(2, "不该走到这里。"),
+        ]]);
+        let rig = feishu_rig_with(router.clone(), worker, vec![gate.tool()]).await;
+        // 无话题的私聊：没有归属。
+        rig.send(feishu("oc_dm", None, true, "跑一下那个脚本", "feishu:1"))
+            .await;
+        gate.wait_entered(1).await;
+
+        let ack = rig
+            .send(feishu("oc_dm", None, true, "/cancel", "feishu:2"))
+            .await;
+        assert!(matches!(ack, InboundAck::Queued { .. }), "{ack:?}");
+        let sent = rig.wait_texts("停下的那句话", 1).await;
+        assert_eq!(sent, ["好，先停了。"]);
+        let line = rig.main_line().await;
+        assert_eq!(
+            texts_of(&line, MAIN_USER_ENTRY),
+            ["跑一下那个脚本", "先别做了"],
+            "落在主线上的是那句普通话，不是命令"
+        );
+        assert!(router.prompt(1).contains("## 这条消息\n先别做了"));
+        let task = rig.task_titled("跑脚本").await;
+        assert!(task_doc_of(&rig, &task).await.stopped);
+
+        // 群的线上同样：不直接停任何任务，进分发（这个群里没有任务，Router 只看得到这个群）。
+        let before = router.calls();
+        let ack = rig
+            .send(group("oc_g", "om_g1", "/cancel", "feishu:g1"))
+            .await;
+        assert_eq!(ack, InboundAck::Ignored);
+        let r = Arc::clone(&router);
+        eventually("群里的 /cancel 进了分发", move || r.calls() > before).await;
+        let prompt = router.prompt(before);
+        assert!(prompt.contains("## 这条消息\n先别做了"), "{prompt}");
+        assert!(!prompt.contains("跑脚本"), "{prompt}");
+        gate.release();
+    }
+
+    /// `/status` 在私聊里等同于 `list`，在群里只列这个群的任务；都不带任务号、不调任何模型；
+    /// 命令只有操作者能用。
+    #[tokio::test]
+    async fn status_lists_only_this_lines_tasks_without_numbers_and_without_a_model() {
+        let gate = Gate::new();
+        let router = FnRouter::new(|prompt| {
+            if prompt.contains("## 这条消息\n群里的活") {
+                return Ok(new_task("群任务", "群里的活"));
+            }
+            Ok(new_task("私聊任务", "私聊里的活"))
+        });
+        let worker = FakeLlm::new(vec![
+            vec![call_round(1, "g1", "gate", json!({}))],
+            vec![call_round(1, "g2", "gate", json!({}))],
+        ]);
+        let rig = feishu_rig_with(router.clone(), worker.clone(), vec![gate.tool()]).await;
+        rig.send(feishu("oc_dm", None, true, "私聊里的活", "feishu:1"))
+            .await;
+        gate.wait_entered(1).await;
+        rig.send(group("oc_g", "om_g1", "群里的活", "feishu:g1"))
+            .await;
+        gate.wait_entered(2).await;
+        let (routed, turns) = (router.calls(), worker.turns());
+
+        let dm_list = replied(
+            rig.send(feishu("oc_dm", None, true, "/status", "feishu:s1"))
+                .await,
+        );
+        assert_eq!(dm_list, "正在做的：\n· 私聊任务");
+        let group_list = replied(
+            rig.send(group("oc_g", "om_g1", "/status", "feishu:s2"))
+                .await,
+        );
+        assert_eq!(group_list, "正在做的：\n· 群任务");
+        for handle in [
+            handle_for("私聊任务", &rig.core()).await,
+            handle_for("群任务", &rig.core()).await,
+        ] {
+            assert!(!dm_list.contains(&handle) && !group_list.contains(&handle));
+        }
+        assert_eq!(
+            (router.calls(), worker.turns()),
+            (routed, turns),
+            "没调模型"
+        );
+
+        // 非操作者用不了命令。
+        let stranger = inbound(
+            ChannelPlatform::Feishu,
+            "oc_g",
+            "ou_stranger",
+            "/status",
+            "feishu:s3",
+            false,
+        );
+        assert!(matches!(
+            rig.send(stranger).await,
+            InboundAck::Rejected { .. }
+        ));
+        gate.release();
+    }
+
+    /// 线上 `/new` 只回说明，不改任何状态：主线上没有新增 entry、没有分发任务。
+    #[tokio::test]
+    async fn new_on_a_line_only_explains_and_changes_nothing() {
+        let router = FnRouter::new(|_| Ok(json!({ "route": "ignore" }).to_string()));
+        let rig = feishu_rig(router.clone(), FakeLlm::new(vec![])).await;
+        let line = rig.line_of("oc_g").await;
+        let before = entries_of(&rig.core(), line.current_branch).await.len();
+
+        let text = replied(rig.send(group("oc_g", "om_g1", "/new", "feishu:n1")).await);
+        assert_eq!(text, "现在每件事都是单独处理的，不需要重新开始。");
+        let text = replied(
+            rig.send(feishu("oc_dm", None, true, "/new", "feishu:n2"))
+                .await,
+        );
+        assert_eq!(text, "现在每件事都是单独处理的，不需要重新开始。");
+        assert_eq!(
+            entries_of(&rig.core(), line.current_branch).await.len(),
+            before
+        );
+        assert_eq!(router.calls(), 0);
+        assert!(rig.main_line().await.is_empty());
+    }
+
+    // ------------------------------------------------------------ 群里派出的任务不碰操作者的记忆与目标
+
+    /// 开着记忆（只走关键词检索）的飞书配置。
+    fn memory_config() -> String {
+        crate::service::test_support::harness::config_toml(
+            &crate::service::test_support::harness::feishu_block("\"ou_op\""),
+        )
+        .replacen(
+            "enabled = false",
+            "enabled = true\nmodel = \"main\"\nextract_idle = \"1h\"\n\n[memory.retrieval]\nmode = \"keyword\"",
+            1,
+        )
+    }
+
+    /// 操作者的一条个人记忆与一个目标。
+    async fn seed_personal(rig: &Rig) {
+        use komo_kernel::protocol::http::MemoryAddRequest;
+        use komo_kernel::types::memory::{MemoryKind, MemoryScope};
+        let state = rig.gateway.state();
+        state
+            .memories
+            .add(&MemoryAddRequest {
+                content: "用户的深色主题偏好是黑底白字".into(),
+                kind: MemoryKind::Preference,
+                scope: MemoryScope::Personal,
+                session: None,
+                run: None,
+                request_key: None,
+                application: None,
+                applies_when: None,
+                belongs_to: None,
+            })
+            .await
+            .unwrap();
+        state
+            .matters
+            .add(
+                &komo_kernel::protocol::matter::MatterAddRequest {
+                    kind: komo_kernel::types::matter::MatterKind::Goal,
+                    title: "空调巡检".into(),
+                    next: Some("看温度".into()),
+                    due: None,
+                    standard: None,
+                    session: None,
+                    run: None,
+                    request_key: None,
+                },
+                &komo_memory::matter::Caller::Operator,
+            )
+            .await
+            .unwrap();
+    }
+
+    /// 一次模型请求里所有消息的文字（含召回块）。
+    fn request_text(worker: &FakeLlm, n: usize) -> String {
+        worker.requests.lock().unwrap()[n]
+            .messages
+            .iter()
+            .filter_map(|message| message.text.clone())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// 群的线派出的任务的请求里没有记忆与目标；同样的话私聊派出的任务有（对照）。
+    #[tokio::test]
+    async fn a_task_dispatched_from_a_group_gets_no_memory_or_goal_injection() {
+        let router = FnRouter::new(|prompt| {
+            if prompt.contains("## 这条消息\n群里问深色主题") {
+                return Ok(new_task("群任务", "群里问深色主题"));
+            }
+            Ok(new_task("私聊任务", "私聊问深色主题"))
+        });
+        let worker = FakeLlm::new(vec![
+            vec![text_round(1, "私聊答了。\n状态：完成")],
+            vec![text_round(1, "群里答了。\n状态：完成")],
+        ]);
+        let mut rig = feishu_rig_config(&memory_config(), router, worker.clone(), vec![]).await;
+        seed_personal(&rig).await;
+
+        rig.send(feishu("oc_dm", None, true, "私聊问深色主题", "feishu:1"))
+            .await;
+        rig.wait_texts("私聊的回复", 1).await;
+        rig.send(group("oc_g", "om_g1", "群里问深色主题", "feishu:g1"))
+            .await;
+        rig.wait_texts("群里的回复", 2).await;
+
+        // 对照：私聊派出的任务带着记忆与目标。
+        let private = request_text(&worker, 0);
+        assert!(private.contains("黑底白字"), "对照没有注入记忆：{private}");
+        assert!(private.contains("空调巡检"), "对照没有注入目标：{private}");
+        // 群里派出的：请求里一个字都没有，会话里也没有召回记录。
+        let in_group = request_text(&worker, 1);
+        for leaked in ["黑底白字", "空调巡检", "看温度"] {
+            assert!(
+                !in_group.contains(leaked),
+                "{leaked} 漏进了群任务：{in_group}"
+            );
+        }
+        let task = rig.task_titled("群任务").await;
+        let entries = entries_of(&rig.core(), task.current_branch).await;
+        assert!(
+            entries
+                .iter()
+                .all(|entry| entry.kind != komo_kernel::durable::recall::MEMORY_RECALL_ENTRY_KIND),
+            "群任务不该落召回记录"
+        );
+        rig.gateway.stop().await;
+    }
+
+    fn komo_call(
+        id: &str,
+        action: &str,
+        params: Value,
+    ) -> Result<komo_kernel::types::turn::Round, LlmError> {
+        call_round(1, id, "komo", json!({ "action": action, "params": params }))
+    }
+
+    /// 工具结果里出现某句话的次数（`worker.inputs` 记着每一轮拿到的工具结果）。
+    fn seen_in_results(worker: &FakeLlm, needle: &str) -> usize {
+        format!("{:?}", worker.inputs.lock().unwrap())
+            .matches(needle)
+            .count()
+    }
+
+    /// 群里派出的任务调 `komo` 的记忆与目标动作（读和写）一律被拒；`cron.*` `session.*` `task.list` 也拒
+    /// （会带出私聊里的内容）。私聊派出的任务这些照常。
+    #[tokio::test]
+    async fn a_group_task_cannot_use_the_komo_tool_but_a_private_task_can() {
+        let router = FnRouter::new(|prompt| {
+            if prompt.contains("## 这条消息\n群里干活") {
+                return Ok(new_task("群任务", "群里干活"));
+            }
+            Ok(new_task("私聊任务", "私聊干活，顺便记个目标"))
+        });
+        let group_script = vec![
+            komo_call("a1", "memory.search", json!({ "query": "深色主题" })),
+            komo_call(
+                "a2",
+                "memory.add",
+                json!({ "content": "群里的人让我记的", "kind": "fact" }),
+            ),
+            komo_call("a3", "goal.add", json!({ "title": "群里的目标" })),
+            komo_call("a4", "goal.list", json!({})),
+            komo_call("a5", "cron.list", json!({})),
+            komo_call("a6", "session.list", json!({})),
+            komo_call("a7", "task.list", json!({})),
+            text_round(8, "试完了。\n状态：完成"),
+        ];
+        let private_script = vec![
+            komo_call("b1", "memory.search", json!({ "query": "深色主题" })),
+            komo_call("b2", "goal.list", json!({})),
+            komo_call("b3", "goal.add", json!({ "title": "私聊的目标" })),
+            komo_call("b4", "task.list", json!({})),
+            text_round(5, "好了。\n状态：完成"),
+        ];
+        // 先私聊（脚本 1）再群里（脚本 2），各自用一份。
+        let worker = FakeLlm::new(vec![private_script, group_script]);
+        let mut rig = feishu_rig_config(&memory_config(), router, worker.clone(), vec![]).await;
+        seed_personal(&rig).await;
+
+        rig.send(feishu(
+            "oc_dm",
+            None,
+            true,
+            "私聊干活，顺便记个目标",
+            "feishu:1",
+        ))
+        .await;
+        rig.wait_texts("私聊的回复", 1).await;
+        // 照常：查得到记忆与目标，新建目标也成功。
+        let seen = format!("{:?}", worker.inputs.lock().unwrap());
+        assert!(seen.contains("黑底白字"), "私聊 memory.search：{seen}");
+        assert_eq!(
+            seen_in_results(&worker, "群里派出的任务不能"),
+            0,
+            "私聊派出的任务不该被拒"
+        );
+        let after_private = goals(&rig).await;
+        assert!(
+            after_private.iter().any(|goal| goal.title == "私聊的目标"),
+            "{after_private:?}"
+        );
+
+        rig.send(group("oc_g", "om_g1", "群里干活", "feishu:g1"))
+            .await;
+        rig.wait_texts("群里的回复", 2).await;
+        // 四个记忆与目标的动作各被拒一次，三个会带出私聊内容的动作也各被拒一次。
+        assert_eq!(
+            seen_in_results(&worker, "群里派出的任务不能读写个人记忆与目标"),
+            4
+        );
+        assert_eq!(
+            seen_in_results(
+                &worker,
+                "群里派出的任务不能查看或触发定时任务、会话与任务清单"
+            ),
+            3
+        );
+        // 没有写进去：目标只有私聊那个和预置的，记忆里没有群里让记的。
+        let titles: Vec<String> = goals(&rig)
+            .await
+            .into_iter()
+            .map(|goal| goal.title)
+            .collect();
+        assert!(!titles.contains(&"群里的目标".to_owned()), "{titles:?}");
+        // `memory.add` 成功的响应里有 `created`：群里那一次没有写成。
+        assert_eq!(seen_in_results(&worker, "\\\"created\\\""), 0);
+        rig.gateway.stop().await;
+    }
+
+    /// 后台提取不从群任务里取：它是任务会话，领取出来的批次类型是任务，提取（`komo-memory`）对任务会话
+    /// 一律不调模型、记为已跳过。
+    #[tokio::test]
+    async fn memory_extraction_batches_from_a_group_task_are_task_sessions() {
+        let router = FnRouter::new(|_| Ok(new_task("群任务", "群里干活")));
+        let worker = FakeLlm::new(vec![vec![text_round(1, "好了。\n状态：完成")]]);
+        let mut rig = feishu_rig_config(&memory_config(), router, worker, vec![]).await;
+        rig.send(group("oc_g", "om_g1", "群里干活", "feishu:g1"))
+            .await;
+        rig.wait_texts("群里的回复", 1).await;
+
+        let core = rig.core();
+        let state = rig.gateway.state();
+        let (_, work) =
+            crate::service::durable::background::memory::seams(&core, &state.config, &state.clock);
+        let task = rig.task_titled("群任务").await;
+        let batches = work.claim(time::Duration::ZERO, 16).await.unwrap();
+        let ours: Vec<_> = batches
+            .iter()
+            .filter(|batch| batch.session.as_str() == task.id)
+            .collect();
+        assert!(!ours.is_empty(), "群任务应有待提取的 Run：{batches:?}");
+        assert!(
+            ours.iter()
+                .all(|batch| batch.kind == komo_store::models::SessionKind::Task),
+            "{ours:?}"
+        );
+        rig.gateway.stop().await;
+    }
+
+    /// 判断只有一处：群的线派出的任务（含它再派的子任务）是，私聊派出的、群的线自己、cron 都不是。
+    #[tokio::test]
+    async fn only_tasks_issued_by_a_group_line_count_as_group_tasks() {
+        use crate::service::durable::sessions::is_group_task;
+        let router = FnRouter::new(|prompt| {
+            if prompt.contains("群里") {
+                return Ok(new_task("群任务", "群里干活"));
+            }
+            Ok(new_task("私聊任务", "私聊干活"))
+        });
+        let worker = FakeLlm::new(vec![
+            vec![text_round(1, "私聊好了。\n状态：完成")],
+            vec![text_round(1, "群里好了。\n状态：完成")],
+        ]);
+        let mut rig = feishu_rig(router, worker).await;
+        rig.send(feishu("oc_dm", None, true, "私聊干活", "feishu:1"))
+            .await;
+        rig.wait_texts("私聊的回复", 1).await;
+        rig.send(group("oc_g", "om_g1", "群里干活", "feishu:g1"))
+            .await;
+        rig.wait_texts("群里的回复", 2).await;
+
+        let storage = Arc::clone(&rig.core().storage);
+        let private = rig.task_titled("私聊任务").await;
+        let in_group = rig.task_titled("群任务").await;
+        assert!(!is_group_task(&*storage, &private.id).await);
+        assert!(is_group_task(&*storage, &in_group.id).await);
+        assert!(
+            !is_group_task(&*storage, &rig.line_of("oc_g").await.id).await,
+            "线本身不是任务"
+        );
+        assert!(!is_group_task(&*storage, &rig.main().await.id).await);
+
+        // 群任务再派出的子任务也算（沿 parent 往上找到群的线）。
+        let core = rig.core();
+        let mut spec = crate::service::durable::sessions::NewSession::new("assistant")
+            .kind(SessionKind::Task)
+            .title("子任务");
+        spec.parent_session = Some(in_group.id.clone());
+        let child = core.create_session(spec).await.unwrap();
+        assert!(is_group_task(&*storage, &child.id).await);
+        rig.gateway.stop().await;
     }
 
     /// 操作者的主会话只认 `source = home` 的那一条：群的线（也是 `kind = main`）不会被当成它。

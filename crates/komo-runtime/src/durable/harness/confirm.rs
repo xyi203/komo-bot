@@ -13,18 +13,19 @@ use serde::{Deserialize, Serialize};
 use super::hooks::ToolEnv;
 use super::live;
 use super::orchestration::monitor::{MONITOR_END_ENTRY, MONITOR_EVENT_ENTRY};
-use super::orchestration::{TASK_CONTINUE_ENTRY, TASK_RESULT_ENTRY};
+use super::orchestration::{TASK_CONTINUE_ENTRY, TASK_RESULT_ENTRY, TASK_STALL_ENTRY};
 use super::orchestration::{TaskDoc, task_doc_address};
 use crate::durable::error::TaskError;
 use crate::durable::runtime::TaskRuntime;
 
 pub const CONFIRM_KIND: &str = "komo.confirm";
 /// 不是人打的字起的 Run（`docs/confirm.md` §3）。`cron.input` 是 gateway 的 kind，这里只认名字。
-const UNATTENDED_INPUTS: [&str; 4] = [
+const UNATTENDED_INPUTS: [&str; 5] = [
     "cron.input",
     MONITOR_EVENT_ENTRY,
     MONITOR_END_ENTRY,
     TASK_RESULT_ENTRY,
+    TASK_STALL_ENTRY,
 ];
 
 pub fn confirm_address(conversation: ConversationId, task: TaskId) -> DocumentAddress {

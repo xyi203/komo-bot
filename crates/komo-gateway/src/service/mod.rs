@@ -85,6 +85,8 @@ pub struct ServiceOptions {
     pub shared_home: Option<PathBuf>,
     /// bin 里 OTLP 导出层记结果的地方；`/healthz` 读它。`None` = 没接遥测。
     pub telemetry: Option<Arc<crate::telemetry::TelemetryStatus>>,
+    /// 测试注入的时钟（卡死检测按它判"多久没有进展"）；`None` = 系统时钟。
+    pub clock: Option<Arc<dyn Clock>>,
 }
 
 impl std::fmt::Debug for ServiceOptions {
@@ -147,7 +149,10 @@ pub async fn start(options: ServiceOptions) -> Result<Running, ServiceError> {
         tracing::warn!(key = %issue.key, message = %issue.message, "配置警告");
     }
 
-    let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+    let clock: Arc<dyn Clock> = options
+        .clock
+        .clone()
+        .unwrap_or_else(|| Arc::new(SystemClock));
     let instance_id = komo_kernel::types::ids::uuid_v7_at(clock.now()).to_string();
     let token = random_token();
 
@@ -295,6 +300,8 @@ pub async fn start(options: ServiceOptions) -> Result<Running, ServiceError> {
 
     // 8. 后台循环：feed 与看客已在 `core.resume()` 之前起好（上面），这里只起 resume 之后的。
     durable::background::spawn(&state, &shutdown);
+    // 分发派出的任务一轮没有进展就提醒、再停下（`docs/tasks.md` §4.9 B4）。
+    durable::dispatch::stall::spawn(&state, &shutdown);
 
     // 9. 渠道与 HTTP。
     //

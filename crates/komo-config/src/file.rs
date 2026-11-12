@@ -208,6 +208,8 @@ pub(super) struct ExecutionSection {
     pub decay_head_bytes: Option<usize>,
     pub decay_tail_bytes: Option<usize>,
     pub confirm_timeout_mins: Option<u64>,
+    pub stall_model_secs: Option<u64>,
+    pub stall_tool_secs: Option<u64>,
 }
 
 impl ExecutionSection {
@@ -226,6 +228,8 @@ impl ExecutionSection {
             confirm_timeout_mins: self
                 .confirm_timeout_mins
                 .unwrap_or(base.confirm_timeout_mins),
+            stall_model_secs: self.stall_model_secs.unwrap_or(base.stall_model_secs),
+            stall_tool_secs: self.stall_tool_secs.unwrap_or(base.stall_tool_secs),
         }
     }
 }

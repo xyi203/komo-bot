@@ -143,7 +143,7 @@ async fn the_backlog_is_flushed_before_the_new_message() {
         "第一条要是积压的那条投递：{texts:?}"
     );
     assert!(
-        texts[1].contains("待处理（共 0 条）"),
+        texts[1].contains("现在手上没有事"),
         "第二条才是 `/status` 的回执：{texts:?}"
     );
     assert!(

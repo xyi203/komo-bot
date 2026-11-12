@@ -256,6 +256,9 @@ event_payload! {
     ContextCompacted(ContextCompacted) => "context.compacted",
     /// 这一段对话钉住的记忆注入段（§9.4）：渲染好的正文与选中的条目，重启之后照它逐字复用。
     MemoryInjected(MemoryInjected) => "memory.injected",
+    /// 主线（或群的线）上 Agent 说的一句话：任务的回复、清单、"好，先停了。"（`main.reply` entry）。
+    /// **不挂 Run**——线本身不跑模型，客户端会丢弃没有 Run 的 `message.assistant`，所以单独一种。
+    LineReply(LineReply) => "line.reply",
 }
 
 impl EventPayload {
@@ -400,6 +403,30 @@ pub struct MessageUser {
     /// 照旧显示它），界面按这一格只画 `!命令` 与输出。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shell: Option<ShellCommand>,
+}
+
+/// 线上的一句回复（`main.reply` entry）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LineReply {
+    pub text: String,
+    /// 回的是哪条用户消息：那条 `message.user` 事件的 ID。程序自己说的话（清单等）也有；
+    /// 旧数据或没记下来的为空。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<EventId>,
+    /// 这句话来自哪个任务会话；清单与"好，先停了。"不是任务说的，为空。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task: Option<LineReplyTask>,
+}
+
+/// [`LineReply::task`]：说话的任务会话。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LineReplyTask {
+    /// 任务会话的 Session ID，客户端点进去用；没记下来（旧数据）为空。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<SessionId>,
+    /// 任务号（`#` 后面那串）。
+    pub handle: String,
+    pub title: String,
 }
 
 /// [`MessageUser::shell`]：一条 `!` 命令与它的结果。

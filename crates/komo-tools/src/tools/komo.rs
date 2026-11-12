@@ -42,7 +42,7 @@ use komo_kernel::protocol::http::{
     MemoryListQuery, MemoryRevisionRequest, SessionListQuery, SessionSearchQuery, TaskListQuery,
 };
 use komo_kernel::traits::{OutputWriter, Tool};
-use komo_kernel::types::ids::{CronJobId, MatterId, MemoryId, OperationId, RequestKey};
+use komo_kernel::types::ids::{CronJobId, MatterId, MemoryId, OperationId, RequestKey, SessionId};
 use komo_kernel::types::matter::{MatterKind, MatterTrigger, MatterVerb};
 use komo_kernel::types::memory::{MEMORY_QUERY_MARKER, MemoryScope};
 use komo_kernel::types::plan::{ExecutionPlan, Operation, PlanVersions, RecoveryMode, Replay};
@@ -381,7 +381,8 @@ pub enum KomoCall {
 /// [`ToolError`]，模型照着改。
 #[async_trait]
 pub trait KomoService: Send + Sync {
-    async fn call(&self, call: KomoCall) -> Result<Value, ToolError>;
+    /// `caller`：这次工具调用所在的会话（宿主填的身份）。Gateway 据它拒绝群里派出的任务碰操作者的东西。
+    async fn call(&self, caller: &SessionId, call: KomoCall) -> Result<Value, ToolError>;
 }
 
 /// 工具与 Gateway 之间的空槽：工具先造好，服务等整份状态有了才接上。
@@ -697,7 +698,7 @@ impl Tool for KomoTool {
         let service = self.slot.get().ok_or_else(|| ToolError::Failed {
             message: "这台 Gateway 没有接上 komo 的状态服务，komo 工具用不了".into(),
         })?;
-        let result = service.call(call).await?;
+        let result = service.call(&ctx.session, call).await?;
         let mut preview = serde_json::to_string(&result).map_err(|error| ToolError::Failed {
             message: format!("结果无法序列化：{error}"),
         })?;
@@ -743,7 +744,7 @@ mod tests {
 
     #[async_trait]
     impl KomoService for Recorder {
-        async fn call(&self, call: KomoCall) -> Result<Value, ToolError> {
+        async fn call(&self, _caller: &SessionId, call: KomoCall) -> Result<Value, ToolError> {
             self.calls.lock().unwrap().push(call);
             Ok(json!({ "ok": true }))
         }

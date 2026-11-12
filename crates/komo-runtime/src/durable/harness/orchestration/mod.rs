@@ -101,6 +101,11 @@ pub const FORK_NOTICE: &str = "（以上是派你的那个会话到此刻为止�
 /// §2c）。不带 `komo.` 前缀、`model` 是 user 消息，gateway 认它是输入。
 pub const TASK_CONTINUE_ENTRY: &str = "task.continue";
 
+/// 卡死检测给在跑的任务插的提醒输入的 entry kind（`docs/tasks.md` §4.9 B4，Gateway 的 `dispatch::stall`）。
+/// 与 [`TASK_CONTINUE_ENTRY`] 同样不带 `komo.` 前缀；它不是用户的话，**不能**把一轮变成"用户发起"
+/// （`confirm` 的 `UNATTENDED_INPUTS` 里有它），否则只由事件起的一轮会因为这条提醒免掉对外动作的确认。
+pub const TASK_STALL_ENTRY: &str = "task.stall";
+
 /// 自动续跑那条输入的正文。派它的会话只收到续跑之后的那条回复，所以要的是一份完整的最后回复。
 pub(crate) const TASK_CONTINUE_PROMPT: &str = "（这条是 komo 自动发的，不是派你的会话。）你上一条回复的末行\
 没有写「状态：完成」或「状态：受阻：原因」，所以还没交回。没做完就接着做；做完了、或者真的做不下去时，\
@@ -267,6 +272,11 @@ pub struct TaskDoc {
     /// 任务一轮做完只是空闲，归属不动。附加字段：旧 document 没有，读成 `None`。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thread: Option<String>,
+    /// 这个任务自己的 komo Session ID（建任务时写下）：线上的 `line.reply` 事件带它，客户端据此点进任务会话。
+    /// 存在 document 里是因为收尾提交里已经写过 conversation 表，不能再按表读它的 `session`。附加字段：旧
+    /// document 没有，读成 `None`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
 }
 
 /// 提交里读 `komo.task`（document 读，不是表读：排在表写之后也行）。

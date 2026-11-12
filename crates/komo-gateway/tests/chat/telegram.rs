@@ -169,34 +169,28 @@ async fn an_unregistered_group_is_answered_when_it_names_the_bot() {
     }
 }
 
-/// §11.3 命令表：`/status`、`/pending`、`/cancel` 都有回执；退役的 `/approve` 答一句帮助。
+/// §11.3 命令表：`/status`、`/pending` 都有回执；退役的 `/approve` 答一句帮助。主线上 `/cancel` 不再是
+/// "取消当前会话的 run"：没有归属任务可停时当成一条普通消息交给分发（`dispatch` 的测试里断言），不在这里。
 #[tokio::test]
 async fn the_command_table_answers_every_command() {
     let wired = wire(Behavior::default(), Vec::new()).await;
 
-    for (id, command) in [
-        (81, "/status"),
-        (82, "/pending"),
-        (83, "/cancel"),
-        (84, "/approve"),
-    ] {
+    for (id, command) in [(81, "/status"), (82, "/pending"), (84, "/approve")] {
         wired
             .fake
             .push(text_update(id, 111, "private", 111, command));
     }
 
     let fake = Arc::clone(&wired.fake);
-    eventually("四条命令都答了", move || {
-        fake.texts_to("111").len() >= 4
+    eventually("三条命令都答了", move || {
+        fake.texts_to("111").len() >= 3
     })
     .await;
 
     let texts = wired.fake.texts_to("111");
-    // §7.5：`/status` 的计数是**两类合计**，而且分得开是哪两类。
+    // 主线上 `/status` 就是任务清单（与分发的 `list` 同一份，不带任务号、不经模型）。
     assert!(
-        texts
-            .iter()
-            .any(|text| text.contains("待处理（共 0 条）：结果不明 0 · 前提没了 0")),
+        texts.iter().any(|text| text == "现在手上没有事。"),
         "/status：{texts:?}"
     );
     assert!(
@@ -204,10 +198,6 @@ async fn the_command_table_answers_every_command() {
             .iter()
             .any(|text| text.contains("现在没有待处理的 Intervention")),
         "/pending：{texts:?}"
-    );
-    assert!(
-        texts.iter().any(|text| text.contains("没有在跑的任务")),
-        "/cancel：{texts:?}"
     );
     assert!(
         texts

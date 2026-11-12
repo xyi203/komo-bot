@@ -153,7 +153,7 @@ Gateway 对数据目录持有进程锁。多个 CLI 同时启动时，只允许�
 
 **从 Web 改常用设置与环境变量（2026-10-29，认可）。** 同一套写法（带 `version`、先校验后落盘、原子写、重载、失败写回原文、同一把锁）再开放两组：
 
-- **常用设置**：一张写死的白名单，一项一个键，其余键仍只在文件里改。`default_agent`（选一个已有的 `[agents.*]`）、`[memory] enabled`、`[memory] model`（选一个 completion 模型；不写 = 跟默认模型）、`[memory.retrieval] mode`（`hybrid` / `keyword` / `vector`）、`[compaction] enabled`、`[execution] model_result_bytes`（1–30720，上限见 §8.6 的投影）、`[execution] call_timeout_secs`、`[execution] confirm_timeout_mins`。`GET /v1/config/settings` 每项给：种类（开关 / 整数 / 选项）、文件里写的值（没写为空）、当前生效的值（从快照读；`memory.model` 没写时是默认模型的 alias）、选项或范围。`PUT /v1/config/settings/{key}` 带 `value`，`null` = 删掉这一行回到默认；键不在白名单 404，类型、范围、选项不对 400。只改这一行，节不存在就建上。
+- **常用设置**：一张写死的白名单，一项一个键，其余键仍只在文件里改。`default_agent`（选一个已有的 `[agents.*]`）、`[memory] enabled`、`[memory] model`（选一个 completion 模型；不写 = 跟默认模型）、`[memory.retrieval] mode`（`hybrid` / `keyword` / `vector`）、`[compaction] enabled`、`[execution] model_result_bytes`（1–30720，上限见 §8.6 的投影）、`[execution] call_timeout_secs`、`[execution] confirm_timeout_mins`、`[execution] stall_model_secs`、`[execution] stall_tool_secs`（0–，0 = 不检测）。`GET /v1/config/settings` 每项给：种类（开关 / 整数 / 选项）、文件里写的值（没写为空）、当前生效的值（从快照读；`memory.model` 没写时是默认模型的 alias）、选项或范围。`PUT /v1/config/settings/{key}` 带 `value`，`null` = 删掉这一行回到默认；键不在白名单 404，类型、范围、选项不对 400。只改这一行，节不存在就建上。
 - **环境变量**：`GET /v1/config/env` 按 `.env` 里的顺序列出变量名，再补上配置引用了、文件里却没有的名字（provider / 模型的 `env_key`、MCP 的 `bearer_token_env` 与 `env`、启用渠道的凭证名）。每个名字带：在不在文件里、当前有没有非空值（`.env` 或进程环境）、谁在用它。**任何值都不返回**——`.env` 是凭证文件，值只进不出。`PUT /v1/config/env` 一次设一批 `{name, value}`：名字只用大写字母、数字与 `_` 且不以数字开头（与 provider 的 `env_key` 同一条规则），值非空、不含单引号与换行，已有的行就地换掉、没有的追加；`DELETE /v1/config/env/{name}` 删掉那一行，还被配置引用的 409 并说出引用方，文件里没有的 404。
 - 所有写接口（含模型那一组）都回同一个 `ConfigEditResponse`：模型、常用设置、环境变量三份视图（共用一个新 `version`）加重载报告，客户端不用再分别重读。
 - Web 不显示两份文件的路径：设置页说"配置""环境变量"，不说它们在磁盘上的哪儿。
@@ -1270,6 +1270,15 @@ model_result_bytes = 30720
 # 到这里才终止进程组）。命令型 Cron Job 仍是 bash 默认的 120 秒。
 # 热生效，对下一轮调用立即生效。省略 = 1800。
 call_timeout_secs = 1800
+# 卡死检测（docs/tasks.md §4.9 B4）：分发派出的任务一轮在跑，这么久没有任何进展（没有模型调用完成、
+# 没有工具开始或结束、没有进度提交）就判卡死——到约 80% 先给它插一条提醒，到点还没动静就停掉，并往
+# 来源对端说一句"这件事卡住了，我先停下……"。不设总时长：一直有进展，跑多久都不管。
+# stall_model_secs 管两次模型调用之间，stall_tool_secs 管有工具在执行的时候（后者宽，工具本来就慢；
+# 注意默认 1200 比 call_timeout_secs 短：一条要跑满 1800 秒的命令会在 1200 秒处被判卡死，
+# 需要的话把它调到 call_timeout_secs 以上）。等操作者确认 / 介入答复的任务不算。热生效。0 = 不检测。
+# 省略 = 450 / 1200。
+stall_model_secs = 450
+stall_tool_secs = 1200
 # 对话会话里的 bash 跑过这么久还没完，就自动转到后台：这次调用先返回「已转后台 #id」，跑完时
 # 退出码与输出尾部作为一条消息交回会话（docs/monitor.md §8）。任务会话与 Cron 的 Run 不转。
 # TUI 的 `!` 命令用同一个阈值转后台，跑完以一条 shell.command 进历史（不交回、不起模型 Run）。

@@ -55,6 +55,47 @@ pub fn group_line_source(peer: &ChannelPeer) -> String {
     )
 }
 
+/// 这个会话是不是**群的线派出的任务**（`kind = task`，派出方——沿 `parent_session` 一路往上——是 `source = line:…`
+/// 的线；任务再派出的子任务也算）。**判断只在这一处**：群里的人（可能是同一企业的同事，也算操作者）能让群里的任务
+/// 动手，但那些任务不碰操作者的个人记忆与目标、也看不到私聊里的东西（`docs/memory.md` §9.4、`docs/goals.md` §4）：
+/// 召回、`komo` 工具都问它。读不出来按"是"算（宁可少给，不能多给）。
+pub(crate) async fn is_group_task(storage: &dyn Storage, session: &str) -> bool {
+    // 任务链不会深：与 `hooks::setup` 解析 Agent 的层数上限同一个量级。
+    let mut id = session.to_owned();
+    for _ in 0..16 {
+        let record = match storage.session(&id).await {
+            Ok(Some(record)) => record,
+            Ok(None) => return false,
+            Err(error) => {
+                tracing::warn!(session = %id, %error, "读不出会话，按群里派出的任务处理");
+                return true;
+            }
+        };
+        if record.kind != SessionKind::Task {
+            return false;
+        }
+        let Some(parent) = record.parent_session else {
+            return false;
+        };
+        match storage.session(&parent).await {
+            Ok(Some(line)) if line.source.as_deref().is_some_and(is_group_line_source) => {
+                return true;
+            }
+            Ok(Some(_)) => id = parent,
+            Ok(None) => return false,
+            Err(error) => {
+                tracing::warn!(session = %parent, %error, "读不出会话，按群里派出的任务处理");
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn is_group_line_source(source: &str) -> bool {
+    source.starts_with(GROUP_LINE_PREFIX)
+}
+
 const SCAN_PAGE: usize = 256;
 
 /// 会话服务层的错误。

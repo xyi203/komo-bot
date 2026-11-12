@@ -769,6 +769,7 @@ pub struct GatewayBuilder {
     home: Option<PathBuf>,
     tools: Vec<Arc<dyn Tool>>,
     stream: Option<Arc<dyn ModelStream>>,
+    clock: Option<Arc<dyn komo_kernel::traits::Clock>>,
 }
 
 impl GatewayBuilder {
@@ -782,7 +783,14 @@ impl GatewayBuilder {
             home: None,
             tools: Vec::new(),
             stream: None,
+            clock: None,
         }
+    }
+
+    /// 注入时钟（卡死检测用，测试里拨它，不真的睡）。
+    pub fn clock(mut self, clock: Arc<dyn komo_kernel::traits::Clock>) -> Self {
+        self.clock = Some(clock);
+        self
     }
 
     /// 注入无状态的模型后端（harness 的主模型）。
@@ -856,6 +864,7 @@ impl GatewayBuilder {
             // `~/.agents/skills` 里有什么，别的测试的断言就跟着变。
             shared_home: Some(home.clone()),
             telemetry: None,
+            clock: self.clock,
         })
         .await
         .expect("Gateway 起得来");
@@ -1211,6 +1220,7 @@ impl Home {
             embeddings: None,
             shared_home: Some(self.dir.path().to_path_buf()),
             telemetry: None,
+            clock: None,
         })
         .await
         .expect("Gateway 起得来");

@@ -295,7 +295,7 @@ pub(crate) async fn create_child(
         None => tx.create_conversation_in(&session, ownership).await?,
     }
     .id;
-    let mut record = SessionRecord::new(session, child);
+    let mut record = SessionRecord::new(session.clone(), child);
     record.kind = SessionKind::Task;
     record.parent_session = parent_session;
     record.title = Some(title.to_owned()).filter(|title| !title.is_empty());
@@ -349,6 +349,7 @@ pub(crate) async fn create_child(
         reply,
         stopped: false,
         thread,
+        session: Some(session.clone()),
     };
     if let Some(contract) = contract {
         doc.contracts.insert(first.to_string(), contract);

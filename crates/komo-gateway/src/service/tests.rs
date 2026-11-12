@@ -193,6 +193,7 @@ async fn only_one_gateway_holds_a_data_directory() {
         embeddings: None,
         shared_home: None,
         telemetry: None,
+        clock: None,
     })
     .await;
     let error = second.expect_err("第二台起不来");
@@ -335,27 +336,22 @@ async fn slash_new_appends_a_boundary_to_the_same_session() {
         "{after:?}"
     );
 
-    // 聊天渠道的 `/new`：回执，落在**同一个** home session（操作者私聊就是它），又多一条边界。
+    // 聊天渠道的 `/new`：主线不跑模型、没有上下文可重置（`docs/tasks.md` §4.14），只回一句说明，
+    // 不再追加边界，home session 与历史都不变。
     let ack = gateway
         .dispatcher()
         .handle(operator_dm("/new", "telegram:2"))
         .await
         .unwrap();
     assert!(
-        matches!(&ack, InboundAck::Replied { text } if text.contains("新的一段")),
+        matches!(&ack, InboundAck::Replied { text } if text.contains("不需要重新开始")),
         "{ack:?}"
     );
     let (_, body) = gateway.get("/v1/home-session").await;
     assert_eq!(home(body), session, "聊天里的 /new 也不切 Session");
     let (_, body) = gateway.get(&format!("/v1/sessions/{session}/tree")).await;
     let after_chat = entries_of(body);
-    assert!(
-        after_chat.len() > after.len()
-            && after_chat[after.len()..]
-                .iter()
-                .any(|entry| matches!(entry.kind, EntryKind::Compaction { .. })),
-        "{after_chat:?}"
-    );
+    assert_eq!(after_chat.len(), after.len(), "{after_chat:?}");
 }
 
 // ---------------------------------------------------------------- 工具

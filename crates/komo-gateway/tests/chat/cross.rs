@@ -49,7 +49,7 @@ fn topic_message(chat: &str, text: &str, key: &str) -> komo_kernel::protocol::In
 }
 
 /// 先开出 `chat` 里那个话题的旧式会话（`kind = normal`、`source = chat:{peer}`）。
-async fn open_topic(gateway: &TestGateway, chat: &str) {
+async fn open_topic(gateway: &TestGateway, chat: &str) -> String {
     let peer = ChannelPeer::new(ChannelPlatform::Telegram, chat).in_thread("t1");
     gateway
         .state()
@@ -57,7 +57,9 @@ async fn open_topic(gateway: &TestGateway, chat: &str) {
         .unwrap()
         .session_for_source(&format!("chat:{peer}"), "assistant")
         .await
-        .expect("旧式话题会话");
+        .expect("旧式话题会话")
+        .0
+        .id
 }
 
 fn operator_dm(text: &str, key: &str) -> komo_kernel::protocol::InboundMessage {
@@ -443,9 +445,10 @@ async fn every_group_gets_its_own_line() {
     assert_eq!(gateway.origins().await.len(), 2);
 }
 
-/// §11.3：`/new` 在当前会话上追加一条边界，**不切 Session**。
+/// §11.3（`docs/tasks.md` §4.14）：主线不跑模型，没有上下文可重置——`/new` 在主线上只回一句说明，
+/// 不追加边界、不切 Session、不改任何状态。（旧办法开出的话题会话里 `/new` 仍追加边界。）
 #[tokio::test]
-async fn slash_new_appends_a_boundary_without_switching_sessions() {
+async fn slash_new_on_the_main_line_only_explains() {
     let (gateway, _sender) = TestGateway::start().await;
     let first = gateway.handle(operator_dm("在", "telegram:1")).await;
     let InboundAck::Queued { session, .. } = first else {
@@ -456,7 +459,7 @@ async fn slash_new_appends_a_boundary_without_switching_sessions() {
     let InboundAck::Replied { text } = ack else {
         panic!("{ack:?}");
     };
-    assert!(text.contains("新的一段"), "{text}");
+    assert_eq!(text, "现在每件事都是单独处理的，不需要重新开始。");
 
     let (home, _) = gateway
         .state()
@@ -468,7 +471,27 @@ async fn slash_new_appends_a_boundary_without_switching_sessions() {
     assert_eq!(home.id, session.as_str(), "还是同一个 home session");
     assert_eq!(gateway.origins().await.len(), 1);
 
-    // 事件流上有那条边界。
+    // 事件流上没有边界。
+    let events = gateway.events(session.as_str()).await;
+    assert!(
+        events
+            .iter()
+            .all(|event| event.payload.type_name() != "conversation.boundary"),
+        "{events:?}"
+    );
+}
+
+/// 旧办法开出的话题会话（`kind = normal`）里 `/new` 照旧追加一条边界、不切 Session。
+#[tokio::test]
+async fn slash_new_in_a_legacy_topic_session_still_appends_a_boundary() {
+    let (gateway, _sender) = TestGateway::start().await;
+    let session = open_topic(&gateway, "111").await;
+
+    let ack = gateway.handle(operator_chat("/new", "telegram:2")).await;
+    let InboundAck::Replied { text } = ack else {
+        panic!("{ack:?}");
+    };
+    assert!(text.contains("新的一段"), "{text}");
     let (status, body) = gateway
         .get(&format!("/v1/sessions/{session}/events?from=0"))
         .await;

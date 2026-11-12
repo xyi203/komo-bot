@@ -198,6 +198,7 @@ impl TestGateway {
             // 共享 skill 目录钉在临时数据目录上（§5.6）：测试不受这台机器上装过什么影响。
             shared_home: Some(home.path().to_path_buf()),
             telemetry: None,
+            clock: None,
         })
         .await
         .expect("Gateway 起得来");

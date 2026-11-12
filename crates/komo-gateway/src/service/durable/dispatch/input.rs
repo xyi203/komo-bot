@@ -57,6 +57,21 @@ pub(super) async fn build(
         RouteScope::Private
     };
     let limits = RouterLimits::default();
+    let (tasks, handles) = candidates(core, main).await?;
+    let recent = recent_messages(core, main, message, scope, position).await?;
+    Ok(Built {
+        input: RouterInput::new(scope, text, tasks, recent, limits),
+        handles,
+    })
+}
+
+/// 候选任务：这条线（主会话 / 群的线）自己派出的、在做的、等回话的与最近结束的。Router 的输入与 `/status`
+/// 的清单用同一份，所以两处看到的范围一致。
+pub(super) async fn candidates(
+    core: &DurableCore,
+    main: &SessionRecord,
+) -> Result<(Vec<CandidateTask>, Handles), SessionError> {
+    let limits = RouterLimits::default();
     let page = core.task_page(false, Some(SCAN_TASKS), None).await?;
     // 只要这个主会话派出的任务：分发派出的、父是它。`task` 工具在任务会话里派出的子任务、定时任务、
     // 群与话题的会话都不是私聊的候选。
@@ -91,11 +106,7 @@ pub(super) async fn build(
             last_said: last_said(core, &record).await?,
         });
     }
-    let recent = recent_messages(core, main, message, scope, position).await?;
-    Ok(Built {
-        input: RouterInput::new(scope, text, tasks, recent, limits),
-        handles,
-    })
+    Ok((tasks, handles))
 }
 
 /// 任务最近一次对外的回复：最后一条以 `stop` 收尾的 assistant 回复，去掉末行的状态行。没有就是空。

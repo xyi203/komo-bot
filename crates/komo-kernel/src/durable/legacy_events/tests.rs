@@ -766,3 +766,54 @@ fn a_project_update_appended_to_an_input_is_cut_back_to_the_spoken_text() {
         EventPayload::MessageUser(body) if body.text.as_deref() == Some("q1") && !body.project_update
     )));
 }
+
+/// 线上（主线 / 群的线）：用户消息、任务回复、清单按 entry 先后出帧，回复指回那条用户消息；
+/// 直播逐条喂与补读一次喂完逐帧相同；两种 entry 都不挂 run。
+#[test]
+fn line_messages_project_in_entry_order_and_backfill_equals_live() {
+    let entries = vec![
+        entry(10, "main.user").with_data(json!({"text": "帮我查下天气", "peer": "p"})),
+        entry(12, "main.reply").with_data(json!({
+            "text": "北京晴",
+            "origin": {"entry": 10, "submission": 9},
+            "session": SESSION,
+            "task": {"conversation": 7, "session": "task-s", "handle": "1lxxbx", "title": "查天气"},
+        })),
+        entry(14, "main.user").with_data(json!({"text": "有哪些事"})),
+        entry(16, "main.reply").with_data(json!({
+            "text": "现在没有在做的事。",
+            "origin": {"entry": 14, "submission": 13},
+        })),
+    ];
+    let backfill = legacy_events(SESSION, &entries, &[]);
+    let mut projection = Projection::new(SESSION);
+    let mut live = Vec::new();
+    for entry in &entries {
+        live.extend(projection.project(&[Record::Entry(entry)]));
+    }
+    assert_eq!(live, backfill);
+    assert!(backfill.iter().all(|event| event.run.is_none()));
+    let kinds: Vec<&str> = backfill.iter().map(|e| e.payload.type_name()).collect();
+    assert_eq!(
+        kinds,
+        ["message.user", "line.reply", "message.user", "line.reply"]
+    );
+    let EventPayload::MessageUser(first) = &backfill[0].payload else {
+        panic!()
+    };
+    assert_eq!(first.text.as_deref(), Some("帮我查下天气"));
+    let EventPayload::LineReply(reply) = &backfill[1].payload else {
+        panic!()
+    };
+    assert_eq!(reply.text, "北京晴");
+    assert_eq!(reply.origin.as_ref(), Some(&backfill[0].event_id));
+    let task = reply.task.as_ref().unwrap();
+    assert_eq!(task.handle, "1lxxbx");
+    assert_eq!(task.session.as_ref().map(|s| s.as_str()), Some("task-s"));
+    let EventPayload::LineReply(list) = &backfill[3].payload else {
+        panic!()
+    };
+    assert_eq!(list.origin.as_ref(), Some(&backfill[2].event_id));
+    assert!(list.task.is_none());
+    assert!(backfill.windows(2).all(|w| w[0].seq < w[1].seq));
+}

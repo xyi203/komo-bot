@@ -13,6 +13,7 @@ use async_trait::async_trait;
 use axum::Json;
 use axum::extract::{Path, Query, State};
 use komo_kernel::protocol::http::ErrorCode;
+use komo_kernel::types::ids::SessionId;
 use komo_kernel::types::tool::ToolError;
 use komo_tools::tools::komo::{KomoCall, KomoService};
 use serde::Serialize;
@@ -22,6 +23,7 @@ use crate::http::error::{ApiFailure, ApiResult};
 use crate::http::idempotency::Idempotency;
 use crate::http::v2::{sessions, tasks};
 use crate::http::{Api, cron, matters, memories};
+use crate::service::durable::sessions::is_group_task;
 use crate::service::state::GatewayState;
 use crate::web::WebAuth;
 
@@ -56,8 +58,12 @@ impl GatewayKomo {
 
 #[async_trait]
 impl KomoService for GatewayKomo {
-    async fn call(&self, call: KomoCall) -> Result<Value, ToolError> {
+    async fn call(&self, caller: &SessionId, call: KomoCall) -> Result<Value, ToolError> {
         let api = self.api()?;
+        // 群的线派出的任务一个动作都不能用（逐个动作的理由见 [`group_task_refusal`]）。
+        if is_group_task(&*api.state.durable.storage, caller.as_str()).await {
+            return Err(group_task_refusal(&call));
+        }
         match call {
             KomoCall::MemoryAdd(request) => reply(memories::add(State(api), Json(request)).await),
             KomoCall::MemorySearch(query) => reply(memories::list(State(api), Query(query)).await),
@@ -104,6 +110,34 @@ impl KomoService for GatewayKomo {
                 .await,
             ),
         }
+    }
+}
+
+/// 群的线派出的任务（[`is_group_task`]）调 `komo` 的任何动作都拒绝，按动作分两句话：
+///
+/// - `memory.*` / `goal.*`：操作者的个人记忆与目标，读和写都不行；
+/// - `cron.list` / `cron.run`：定时任务的清单与触发——任务说明里是操作者自己写的东西，触发它是以操作者的身份
+///   起一次 Run；`session.search` / `session.list`：搜索与列出会话——正好是操作者私聊里的内容；
+///   `task.list`：任务清单是全部任务（含私聊派出的）的标题与状态。这些都会把操作者私聊里的东西带到群里，
+///   所以也拒绝。（`task.list` 没有"只列这个群"的参数，不能放行一半。）
+fn group_task_refusal(call: &KomoCall) -> ToolError {
+    let reason = match call {
+        KomoCall::MemoryAdd(_)
+        | KomoCall::MemorySearch(_)
+        | KomoCall::MemoryForget { .. }
+        | KomoCall::GoalAdd(_)
+        | KomoCall::GoalList(_)
+        | KomoCall::GoalAct { .. } => "群里派出的任务不能读写个人记忆与目标",
+        KomoCall::CronList
+        | KomoCall::CronRun { .. }
+        | KomoCall::SessionSearch(_)
+        | KomoCall::SessionList(_)
+        | KomoCall::TaskList(_) => {
+            "群里派出的任务不能查看或触发定时任务、会话与任务清单（里面有操作者私聊里的内容）"
+        }
+    };
+    ToolError::Denied {
+        reason: reason.to_owned(),
     }
 }
 
@@ -456,6 +490,7 @@ mode = "keyword"
             reply: None,
             stopped: false,
             thread: None,
+            session: None,
         };
         let root = task.root_conversation;
         core.engine

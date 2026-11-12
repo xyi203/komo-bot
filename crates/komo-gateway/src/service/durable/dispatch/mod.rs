@@ -32,19 +32,20 @@
 pub mod deliver;
 mod input;
 mod owner;
+pub mod stall;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Weak};
 
 use async_trait::async_trait;
 use komo_agent::router::{Fallback, RecentMessage, Route, title_from};
-use komo_kernel::durable::TaskStatus;
 use komo_kernel::durable::storage::TaskQuery;
 use komo_kernel::durable::task::RunningTask;
 use komo_kernel::durable::{
     Content, ConversationId, EntryId, SessionLifecycle, SubmissionId, SubmissionKind, TaskId,
     WriteState,
 };
+use komo_kernel::durable::{SessionRecord, TaskStatus};
 use komo_kernel::types::chat::ChannelPeer;
 use komo_runtime::durable::harness::inbox::Admitted;
 use komo_runtime::durable::harness::{
@@ -216,6 +217,26 @@ pub(super) async fn create_task(
 /// 受理一次（land 的参数）。
 pub(super) struct Seed {
     pub peer: Option<String>,
+}
+
+/// `/status`：这条线（操作者私聊的主会话 / 某个群的线）自己的任务清单，与 `list` 同一份（不带任务号，不经模型）。
+pub(crate) async fn list_text(
+    core: &DurableCore,
+    line: &SessionRecord,
+) -> Result<String, SessionError> {
+    let (tasks, _) = input::candidates(core, line).await?;
+    Ok(input::render_list(&tasks))
+}
+
+/// `/cancel`：话题 `position` 在这条线上的归属任务（任务会话的根 conversation）；位置没有归属返回 `None`。
+pub(crate) async fn owned_task(
+    core: &DurableCore,
+    line: &SessionRecord,
+    position: &ChannelPeer,
+) -> Result<Option<ConversationId>, SessionError> {
+    Ok(owner::holder_of(core, &line.id, position)
+        .await?
+        .map(|holder| holder.conversation))
 }
 
 impl DurableCore {
@@ -602,7 +623,7 @@ async fn release(
 }
 
 /// 停下之后往来源对端说的话。
-const STOPPED_REPLY: &str = "好，先停了。";
+pub(crate) const STOPPED_REPLY: &str = "好，先停了。";
 
 /// 程序自己往主线说一句话（不经模型）：一条 `main.reply` 展示 entry，渠道投递由 [`deliver`] 照它做。
 /// 请求键 `key` 让同一条消息的分发重放不重复落。

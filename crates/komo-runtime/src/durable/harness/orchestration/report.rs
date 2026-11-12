@@ -429,6 +429,7 @@ async fn report(
                 parent,
                 session: parent_record.session.clone(),
                 conversation,
+                task_session: doc.session.as_deref(),
                 first,
                 title: &doc.title,
                 reply: &reply,
@@ -491,6 +492,8 @@ struct Direct<'a> {
     /// 父 conversation 属于的 komo Session（Gateway 投递时要它）。
     session: Option<String>,
     conversation: ConversationId,
+    /// 任务自己的 Session ID（`TaskDoc::session`）。
+    task_session: Option<&'a str>,
     first: SubmissionId,
     title: &'a str,
     reply: &'a super::ReplyTo,
@@ -579,6 +582,7 @@ async fn direct_reply(
         },
         "task": {
             "conversation": at.conversation,
+            "session": at.task_session,
             "handle": short_handle(at.conversation.get()),
             "title": at.title,
         },

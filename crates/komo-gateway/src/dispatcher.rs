@@ -90,7 +90,7 @@ fn gateway_error(error: SessionError) -> GatewayError {
         SessionError::NotFound(what) => GatewayError::NotFound { what },
         // 「已逻辑删除的会话拒绝新输入」（§8.10）：聊天这一侧也要说清楚是哪种状态、该怎么做。
         SessionError::NotOpen(_) => GatewayError::InvalidRequest(format!(
-            "{error}。要接着聊就在 TUI 里新建一个会话（`/new` 只是划一段边界）。"
+            "{error}。要接着聊就在网页里新建一个会话（`/new` 只是划一段边界）。"
         )),
         SessionError::Invalid(message)
         | SessionError::Busy(message)

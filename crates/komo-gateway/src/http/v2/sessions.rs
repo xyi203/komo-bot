@@ -1,5 +1,6 @@
 //! Durable 模式的 `/v1/sessions`（`docs/storage-durable-d5.md` §4 W2a）：create / list / detail /
-//! submit / boundary / resume，加 `/v1/home-session`。
+//! submit，加 `/v1/home-session`。`resume` 与 `boundary` 两条路由只有 TUI 调，2026-11-12 随 TUI 删除
+//! （渠道的 `/new` 走服务层 `DurableCore::boundary`，不经 HTTP）。
 //!
 //! delete / purge（W4a，`service::durable::lifecycle`）；`/v1/reconcile` 在 `interventions`；事件流是 W2b 的。
 //!
@@ -12,10 +13,9 @@ use axum::{Json, Router};
 use futures_util::{StreamExt, TryStreamExt};
 use komo_kernel::durable::legacy_ids;
 use komo_kernel::protocol::http::{
-    BoundaryRequest, BoundaryResponse, CreateSessionRequest, DeleteSessionRequest, PurgeBlocked,
-    PurgeSessionRequest, PurgeSessionResponse, ResumeRequest, ResumeResponse, SessionDetail,
-    SessionLifecycleResponse, SessionListResponse, SessionSearchQuery, SessionSearchResponse,
-    SessionSummary, SubmitRunRequest, SubmitRunResponse,
+    CreateSessionRequest, DeleteSessionRequest, PurgeBlocked, PurgeSessionRequest,
+    PurgeSessionResponse, SessionDetail, SessionLifecycleResponse, SessionListResponse,
+    SessionSearchQuery, SessionSearchResponse, SessionSummary, SubmitRunRequest, SubmitRunResponse,
 };
 use komo_kernel::types::ids::{RunId, Seq, SessionId};
 use komo_kernel::types::model::Effort;
@@ -39,8 +39,6 @@ pub fn routes() -> Router<Api> {
         .route("/v1/session-search", get(search))
         .route("/v1/sessions/{id}", get(detail))
         .route("/v1/sessions/{id}/runs", post(submit))
-        .route("/v1/sessions/{id}/resume", post(resume))
-        .route("/v1/sessions/{id}/boundary", post(boundary))
         .route("/v1/sessions/{id}/delete", post(delete))
         .route("/v1/sessions/{id}/purge", post(purge))
 }
@@ -303,41 +301,6 @@ async fn submit(
     crate::service::durable::background::watch::ensure(&api.state, &id);
     let accepted = core.submit_input(&id, input).await?;
     receipt(core, accepted).await
-}
-
-/// `POST /v1/sessions/{id}/resume`：现在到哪了。D5 里 run 的续跑由引擎自己做（启动与每拍的恢复），
-/// 这里只返回还没结束的 run（并叫醒调度）与待处理的 Intervention（faulted 任务）。
-async fn resume(
-    State(api): State<Api>,
-    Path(id): Path<String>,
-    Json(request): Json<ResumeRequest>,
-) -> ApiResult<Json<ResumeResponse>> {
-    // 模型覆盖属于下一次提交，不改已经在跑的那一轮。
-    let _ = request;
-    let core = api.state.core()?;
-    let resumed = core.unfinished_runs(&id).await?;
-    core.engine.resume();
-    let pending = core.pending_of(&id).await?;
-    Ok(Json(ResumeResponse {
-        session: SessionId::from_raw(id),
-        resumed,
-        pending,
-    }))
-}
-
-/// `POST /v1/sessions/{id}/boundary`：`/new`，**不切 Session**（`Harness::reset`：当前分支追加
-/// `komo.reset`，忙时排在收件箱里，在下一个 boundary 落）。
-async fn boundary(
-    State(api): State<Api>,
-    Path(id): Path<String>,
-    Json(_request): Json<BoundaryRequest>,
-) -> ApiResult<Json<BoundaryResponse>> {
-    let core = api.state.core()?;
-    let submission = core.boundary(&id, None).await?;
-    Ok(Json(BoundaryResponse {
-        session: SessionId::from_raw(id),
-        seq: legacy_ids::seq(submission, 0),
-    }))
 }
 
 /// `POST /v1/sessions/{id}/delete`（§8.10）：`closing` → 撤回排队输入（含内部输入）→（`now`）abort →

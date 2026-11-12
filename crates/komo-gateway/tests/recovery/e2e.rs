@@ -90,21 +90,15 @@ async fn the_first_end_to_end_acceptance() {
         "文件还是原来那一份"
     );
 
-    // ── 3. 现在才 resume 原会话看结果——走 CLI 那条路（`komo resume` 用的就是 `KomoClient`）。
+    // ── 3. 现在才看原会话的结果——走 CLI 那条路（`KomoClient`）。
     let base = gateway.base_url().to_owned();
     let client =
         komo_client::KomoClient::new(&base, Some(gateway.token().to_owned())).expect("客户端");
     let session_id = SessionId::from_raw(session.clone());
-    let resumed = client
-        .resume(
-            &session_id,
-            &komo_kernel::protocol::http::ResumeRequest::default(),
-        )
-        .await
-        .expect("resume 得动");
-    assert_eq!(resumed.session, session_id);
-    assert!(resumed.resumed.is_empty(), "没有没结束的 run：{resumed:?}");
-    assert!(resumed.pending.is_empty(), "没有待处理的：{resumed:?}");
+    let shown = client.session(&session_id).await.expect("读得到会话详情");
+    assert_eq!(shown.summary.session, session_id);
+    assert!(shown.unfinished.is_empty(), "没有没结束的 run：{shown:?}");
+    assert!(shown.pending.is_empty(), "没有待处理的：{shown:?}");
     let detail = client.run(&run).await.expect("读得到运行详情");
     assert_eq!(detail.summary.state, RunState::Completed);
     assert_eq!(detail.final_message.as_deref(), Some("报告写好了。"));

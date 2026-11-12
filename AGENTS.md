@@ -31,9 +31,7 @@ pnpm desktop:dev               # macOS Electron 壳（apps/desktop，docs/client
 pnpm desktop:build             # 未签名的 .app（release/mac-arm64/），本机冒烟；pnpm desktop:dist 出 dmg/zip
 
 komo init                      # write a minimal commented config.toml + 0600 .env (never overwrites)
-komo                           # start Gateway if needed, new session, TUI
-komo resume SESSION_ID
-komo web [--no-open]           # one-time pairing link → browser cookie session (Gateway serves [web] dir)
+komo web [--no-open]           # start Gateway if needed → one-time pairing link → browser cookie session (Gateway serves [web] dir); bare `komo` does the same
 komo gateway [--foreground] | gateway status|stop|restart
 komo config check | config reload
 komo channel list|probe | channel login CHANNEL  # wechat login remains an alias
@@ -88,7 +86,7 @@ komo-channel  Shared protocol, runner and image inbox, plus feature-gated
                feishu/telegram/wechat modules and their standalone plugin binaries.
                Depends on kernel; no runtime, store or Gateway dependency.
                Gateway selects no platform features; build the core and plugins separately.
-komo-client    HTTP + SSE client · discovery · ratatui TUI · command output.
+komo-client    HTTP + SSE client · discovery · command output (CLI subcommands).
                Depends on kernel only.
 komo (bin)     clap dispatch only (incl. the hidden `__codemode-worker`, whose
                body is `komo_tools::codemode::worker::run`).
@@ -101,14 +99,14 @@ takes `komo-tools` for `__codemode-worker`). Gateway uses llm / config / tools /
 types directly. Channel plugins are a separate branch:
 `kernel ← channel`; Gateway uses its common protocol with platform features disabled.
 Build plugins separately with `-p komo-channel --features feishu,telegram,wechat`.
-`gateway` never sees toasty or ratatui; `runtime` and the four crates under it never
+`gateway` never sees toasty; `runtime` and the four crates under it never
 see axum and never depend on `agent`; only `memory` and `runtime` (besides gateway)
 depend on `store`; `client` knows only protocol types.
 
 ## Rules that are structural, not stylistic
 
-- **Gateway is the only process that opens state.** CLI and TUI go over
-  HTTP/SSE; there is no direct-db path (§3).
+- **Gateway is the only process that opens state.** The CLI goes over
+  HTTP/SSE (as do the web clients); there is no direct-db path (§3).
 - **`durable.db` is the single authority** (§8.2): conversation content
   (entries), Run/call state (tasks, submissions), mutable state (documents),
   lifecycle — one commit line, one transaction per commit, nothing observable
@@ -222,8 +220,7 @@ implemented, unapproved draft, or superseded.
   `docs/session-optimization.md` (Gateway session read/write path; progress in its §0)
   are partly implemented. `docs/background-tasks.md`, `docs/monitor.md`,
   `docs/codemode.md` and `docs/codemode-bash.md` describe the pieces on top of it
-  (including implemented nested bash calls and live slots). `docs/handoff.md`
-  proposes a model-initiated reset that keeps the run going; not implemented yet.
+  (including implemented nested bash calls and live slots).
 - Tools: `docs/mcp.md` (MCP servers, codemode exposure) and `docs/confirm.md`
   (trigger-started Runs confirm `outward` tools) are current specs.
 - Agent layer: `docs/bot.md` and `docs/agent.md` record the implemented
@@ -254,6 +251,7 @@ implemented, unapproved draft, or superseded.
   outward-action confirmation);
   draft, not approved. Approved pieces move into the specs above.
 - Superseded: `docs/komo_observation.md` (stays in place because tests cite it)
-  and `docs/archive/` (`mcp-codemode.md`). Move a superseded design into
+  and `docs/archive/` (`mcp-codemode.md`; `handoff.md`, a model-initiated reset that keeps
+  the run going — never implemented, in a task model it is just dispatching a new task). Move a superseded design into
   `docs/archive/` unless code still cites its path.
 - Work plan: `.scratch/komo-v08-rewrite/PLAN.md`, progress in `STATUS.md`.

@@ -3,7 +3,7 @@ use crate::service::test_support::{TestGateway, config_toml};
 use komo_kernel::durable::{ContentBlock, Message, StopReason};
 use komo_kernel::protocol::http::*;
 use komo_kernel::session::{EntryKind, SessionTree};
-use komo_kernel::types::ids::{RunId, SessionId};
+use komo_kernel::types::ids::SessionId;
 use komo_kernel::types::turn::TurnRequest;
 use komo_runtime::durable::EntryDraft;
 use serde_json::{Value, json};
@@ -12,19 +12,12 @@ use serde_json::{Value, json};
 // 照旧，只改帮手——`seed` 经提交线写真 entry 并返回铸出来的 entry ID（pi 里就是它的十进制），
 // `finished` / `wait_done` 等 submission 结算，重启后的位置从存储里重读。
 
-async fn setup() -> (TestGateway, std::sync::Arc<FakeLlm>, SessionId) {
-    let llm = FakeLlm::finisher("model answer");
-    // Durable 的手动压缩只收"超出 `keep_recent_tokens` 之外"的旧内容，整段比它短就什么都不收
-    // （旧实现总是把整段摘掉）：这些几十字的测试历史要压得动，把它调到最小。
-    let gw = TestGateway::with(
-        &config_toml("[compaction]\nkeep_recent_tokens = 1\n"),
-        llm.clone(),
-    )
-    .await;
+async fn setup() -> (TestGateway, SessionId) {
+    let gw = TestGateway::with(&config_toml(""), FakeLlm::finisher("model answer")).await;
     let (status, body) = gw.post("/v1/sessions", json!({})).await;
     assert_eq!(status, 200, "{body}");
     let summary: SessionSummary = serde_json::from_str(&body).unwrap();
-    (gw, llm, summary.session)
+    (gw, summary.session)
 }
 
 #[tokio::test]
@@ -84,130 +77,29 @@ async fn snapshot(gw: &TestGateway, session: &SessionId) -> SessionTree {
     tree.branch(response.leaf_id.as_deref()).unwrap();
     tree
 }
-async fn finished(gw: &TestGateway, run: &RunId) {
-    let record = gw.wait_run(run).await;
-    assert_eq!(
-        record.status(),
-        komo_kernel::durable::SubmissionStatus::Done,
-        "{record:?}"
-    );
-}
-
 #[tokio::test]
-async fn navigating_and_editing_an_input_creates_a_sibling_that_alone_reaches_the_model() {
-    let (gw, llm, session) = setup().await;
-    let u1 = seed(&gw, &session, "user", "shared task").await;
-    let a1 = seed(&gw, &session, "assistant", "shared answer").await;
-    let u2 = seed(&gw, &session, "user", "abandoned direction").await;
-    let a2 = seed(&gw, &session, "assistant", "abandoned answer").await;
-    let _ = u1;
-    let (status, body) = gw
-        .post(
-            &format!("/v1/sessions/{session}/navigate"),
-            json!({"targetId":u2}),
-        )
-        .await;
-    assert_eq!(status, 200, "{body}");
-    let response: NavigateSessionResponse = serde_json::from_str(&body).unwrap();
-    assert_eq!(response.leaf_id.as_deref(), Some(a1.as_str()));
-    assert_eq!(response.editor_text.as_deref(), Some("abandoned direction"));
-    let (status, body) = gw
-        .post(
-            &format!("/v1/sessions/{session}/runs"),
-            json!({"request_key":"branch-input","text":"replacement direction"}),
-        )
-        .await;
-    assert_eq!(status, 200, "{body}");
-    let accepted: SubmitRunResponse = serde_json::from_str(&body).unwrap();
-    finished(&gw, &accepted.run).await;
-    let text = serde_json::to_string(&llm.requests.lock().unwrap()[0].messages).unwrap();
-    assert!(text.contains("shared task"));
-    assert!(text.contains("shared answer"));
-    assert!(text.contains("replacement direction"));
-    assert!(!text.contains("abandoned direction"));
-    assert!(!text.contains("abandoned answer"));
-    let tree = snapshot(&gw, &session).await;
-    assert!(tree.get(&a2).is_some());
-    // 重开存储（先停 Gateway 放掉库锁）：恢复出的位置与停机前 `/tree` 说的一样。
-    let leaf_before = tree.leaf_id().map(str::to_owned);
-    let home = gw.home.path().to_path_buf();
-    gw.running.stop().await;
-    let storage = komo_store::durable::TursoStorage::open(&home)
-        .await
-        .unwrap();
-    let data = crate::service::durable::sessions::tree::load_tree(&storage, session.as_str())
-        .await
-        .unwrap();
-    let conversations: Vec<_> = data
-        .branches
-        .iter()
-        .map(
-            |branch| komo_kernel::durable::pi_tree::ConversationEntries {
-                record: &branch.conversation,
-                entries: &branch.entries,
-            },
-        )
-        .collect();
-    let restored = komo_kernel::durable::pi_tree::pi_tree(
-        &conversations,
-        data.session.current_branch,
-        data.session.leaf,
-    );
-    assert_eq!(restored.leaf_id, leaf_before);
-}
-
-#[tokio::test]
-async fn context_edits_and_labels_preserve_raw_history_and_apply_only_on_the_selected_path() {
-    let (gw, _, session) = setup().await;
+async fn naming_a_session_is_an_entry_that_leaves_history_alone() {
+    let (gw, session) = setup().await;
     let u = seed(&gw, &session, "user", "original").await;
-    let a = seed(&gw, &session, "assistant", "answer").await;
-    for (route, body) in [
-        (
-            "context-edit",
-            json!({"targetId":u,"replacement":{"content":"replacement"}}),
-        ),
-        ("label", json!({"targetId":a,"label":"checkpoint"})),
-        ("name", json!({"name":"tree session"})),
-    ] {
-        let (status, body) = gw
-            .post(&format!("/v1/sessions/{session}/{route}"), body)
-            .await;
-        assert_eq!(status, 200, "{body}");
-    }
+    seed(&gw, &session, "assistant", "answer").await;
+    let (status, body) = gw
+        .post(
+            &format!("/v1/sessions/{session}/name"),
+            json!({"name":"tree session"}),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
     let tree = snapshot(&gw, &session).await;
-    assert_eq!(tree.label(&a), Some("checkpoint"));
     assert_eq!(tree.name(), Some("tree session"));
-    assert!(
-        tree.project()
-            .unwrap()
-            .messages
-            .iter()
-            .any(|m| m["content"] == "replacement")
-    );
     assert!(
         matches!(&tree.get(&u).unwrap().kind,EntryKind::Message{message} if message["content"]=="original")
     );
-    let (status, body) = gw
-        .post(
-            &format!("/v1/sessions/{session}/navigate"),
-            json!({"targetId":a}),
-        )
-        .await;
-    assert_eq!(status, 200, "{body}");
-    let tree = snapshot(&gw, &session).await;
-    assert!(
-        tree.project()
-            .unwrap()
-            .messages
-            .iter()
-            .any(|m| m["content"] == "original")
-    );
     gw.running.stop().await;
 }
 
 #[tokio::test]
-async fn cloned_messages_and_artifacts_survive_source_purge_without_copying_executable_runs() {
-    let (gw, _, session) = setup().await;
+async fn forked_messages_and_artifacts_survive_source_purge_without_copying_executable_runs() {
+    let (gw, session) = setup().await;
     let _u = seed(&gw, &session, "user", "task").await;
     let _a = seed(&gw, &session, "assistant", "result").await;
     let source_dir = gw.home.path().join("sessions").join(session.as_str());
@@ -218,10 +110,7 @@ async fn cloned_messages_and_artifacts_survive_source_purge_without_copying_exec
         .await
         .unwrap();
     let (status, body) = gw
-        .post(
-            &format!("/v1/sessions/{session}/fork"),
-            json!({"clone":true}),
-        )
+        .post(&format!("/v1/sessions/{session}/fork"), json!({}))
         .await;
     assert_eq!(status, 200, "{body}");
     let response: ForkSessionResponse = serde_json::from_str(&body).unwrap();
@@ -287,68 +176,6 @@ async fn cloned_messages_and_artifacts_survive_source_purge_without_copying_exec
         .filter(|entry| matches!(entry.kind, EntryKind::Message { .. }))
         .count();
     assert_eq!(messages, 2);
-    gw.running.stop().await;
-}
-
-#[tokio::test]
-async fn summaries_and_compaction_are_entries_on_the_new_path() {
-    let (gw, llm, session) = setup().await;
-    let _u = seed(&gw, &session, "user", "task").await;
-    let a = seed(&gw, &session, "assistant", "answer").await;
-    let _left = seed(&gw, &session, "user", "left branch").await;
-    let (status, body) = gw
-        .post(
-            &format!("/v1/sessions/{session}/navigate"),
-            json!({"targetId":a,"summarize":true}),
-        )
-        .await;
-    assert_eq!(status, 200, "{body}");
-    let tree = snapshot(&gw, &session).await;
-    assert!(
-        matches!(&tree.get(tree.leaf_id().unwrap()).unwrap().kind,EntryKind::BranchSummary{from_id,..} if *from_id==_left)
-    );
-    let (status, body) = gw
-        .post(
-            &format!("/v1/sessions/{session}/compact"),
-            json!({"instructions":"keep decisions"}),
-        )
-        .await;
-    assert_eq!(status, 200, "{body}");
-    let tree = snapshot(&gw, &session).await;
-    assert_eq!(
-        tree.project()
-            .unwrap()
-            .messages
-            .iter()
-            .filter(|m| m["role"] == "compactionSummary")
-            .count(),
-        1
-    );
-    assert_eq!(llm.turns(), 2);
-    {
-        // The summary input is pi's serialized conversation, not raw entry JSON.
-        let requests = llm.requests.lock().unwrap();
-        for request in requests.iter() {
-            let input = request.messages[0].text.as_deref().unwrap();
-            assert!(input.starts_with("<conversation>"), "{input}");
-            assert!(input.contains("[User]: "), "{input}");
-            assert!(!input.contains("parentId"), "{input}");
-        }
-        assert!(
-            requests[0].messages[0]
-                .text
-                .as_deref()
-                .unwrap()
-                .contains("left branch")
-        );
-        assert!(
-            !requests[0].messages[0]
-                .text
-                .as_deref()
-                .unwrap()
-                .contains("[User]: task")
-        );
-    }
     gw.running.stop().await;
 }
 
@@ -425,31 +252,6 @@ async fn tree_of(running: &Running, session: &SessionId) -> SessionTreeResponse 
     serde_json::from_str(&body).unwrap()
 }
 
-async fn wait_done(running: &Running, run: &RunId) {
-    let record = crate::service::test_support::harness::wait_run(&running.state, run).await;
-    assert_eq!(
-        record.status(),
-        komo_kernel::durable::SubmissionStatus::Done,
-        "{record:?}"
-    );
-}
-
-async fn say(running: &Running, session: &SessionId, key: &str, text: &str) -> RunId {
-    let (status, body) = call(
-        running,
-        reqwest::Method::POST,
-        &format!("/v1/sessions/{session}/runs"),
-        Some(json!({"request_key": key, "text": text})),
-    )
-    .await;
-    assert_eq!(status, 200, "{body}");
-    let run = serde_json::from_str::<SubmitRunResponse>(&body)
-        .unwrap()
-        .run;
-    wait_done(running, &run).await;
-    run
-}
-
 /// A model that never answers until released: the Run stays unfinished.
 struct Stalled(std::sync::Arc<tokio::sync::Notify>);
 
@@ -483,58 +285,6 @@ impl ModelStream for Stalled {
 }
 
 #[tokio::test]
-async fn a_branch_and_its_current_position_survive_a_gateway_restart() {
-    let home = Home::new();
-    let llm = FakeLlm::finisher("model answer");
-    let running = home.start(llm.clone()).await;
-    let (_, body) = call(
-        &running,
-        reqwest::Method::POST,
-        "/v1/sessions",
-        Some(json!({})),
-    )
-    .await;
-    let session = serde_json::from_str::<SessionSummary>(&body)
-        .unwrap()
-        .session;
-    say(&running, &session, "k1", "first question").await;
-    let tree = tree_of(&running, &session).await;
-    let first_input = tree
-        .entries
-        .iter()
-        .find(|entry| matches!(&entry.kind, EntryKind::Message { message } if message["content"] == "first question"))
-        .unwrap()
-        .id
-        .clone();
-    // Edit the first input: navigation puts the leaf before it, the new input branches.
-    let (status, body) = call(
-        &running,
-        reqwest::Method::POST,
-        &format!("/v1/sessions/{session}/navigate"),
-        Some(json!({"targetId": first_input})),
-    )
-    .await;
-    assert_eq!(status, 200, "{body}");
-    say(&running, &session, "k2", "edited question").await;
-    let before = tree_of(&running, &session).await;
-    running.stop().await;
-
-    let llm = FakeLlm::finisher("after restart");
-    let running = home.start(llm.clone()).await;
-    let after = tree_of(&running, &session).await;
-    assert_eq!(
-        after.leaf_id, before.leaf_id,
-        "最后写入的 entry 就是恢复出的位置"
-    );
-    assert_eq!(after.entries, before.entries, "两个分支都在");
-    say(&running, &session, "k3", "third question").await;
-    let sent = serde_json::to_string(&llm.requests.lock().unwrap()[0].messages).unwrap();
-    assert!(sent.contains("edited question") && sent.contains("third question"));
-    assert!(!sent.contains("first question"), "旧分支不进模型：{sent}");
-    running.stop().await;
-}
-
-#[tokio::test]
 async fn tree_changes_are_refused_while_a_run_is_unfinished() {
     let home = Home::new();
     let release = std::sync::Arc::new(tokio::sync::Notify::new());
@@ -563,20 +313,14 @@ async fn tree_changes_are_refused_while_a_run_is_unfinished() {
         .await
         .leaf_id
         .unwrap_or_default();
-    for (route, body) in [
-        ("navigate", json!({"targetId": target})),
-        ("compact", json!({})),
-        ("fork", json!({"clone": true})),
-    ] {
-        let (status, text) = call(
-            &running,
-            reqwest::Method::POST,
-            &format!("/v1/sessions/{session}/{route}"),
-            Some(body),
-        )
-        .await;
-        assert_eq!(status, 409, "{route}: {text}");
-    }
+    let (status, text) = call(
+        &running,
+        reqwest::Method::POST,
+        &format!("/v1/sessions/{session}/fork"),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(status, 409, "fork: {text}");
     // 改名不等 Run：忙时只改 sessions.title，不动树（`DurableCore::name`）。
     let (status, text) = call(
         &running,

@@ -362,42 +362,6 @@ impl KomoClient {
         }
     }
 
-    pub async fn navigate_session(
-        &self,
-        session: &SessionId,
-        request: &NavigateSessionRequest,
-    ) -> ClientResult<NavigateSessionResponse> {
-        self.post_session_change(&format!("/v1/sessions/{session}/navigate"), request)
-            .await
-    }
-
-    pub async fn fork_session(
-        &self,
-        session: &SessionId,
-        request: &ForkSessionRequest,
-    ) -> ClientResult<ForkSessionResponse> {
-        self.post_session_change(&format!("/v1/sessions/{session}/fork"), request)
-            .await
-    }
-
-    pub async fn edit_session_context(
-        &self,
-        session: &SessionId,
-        request: &EditSessionContextRequest,
-    ) -> ClientResult<NavigateSessionResponse> {
-        self.post_session_change(&format!("/v1/sessions/{session}/context-edit"), request)
-            .await
-    }
-
-    pub async fn label_session(
-        &self,
-        session: &SessionId,
-        request: &LabelSessionRequest,
-    ) -> ClientResult<NavigateSessionResponse> {
-        self.post_session_change(&format!("/v1/sessions/{session}/label"), request)
-            .await
-    }
-
     pub async fn name_session(
         &self,
         session: &SessionId,
@@ -405,18 +369,6 @@ impl KomoClient {
     ) -> ClientResult<NavigateSessionResponse> {
         self.post_session_change(&format!("/v1/sessions/{session}/name"), request)
             .await
-    }
-
-    pub async fn compact_session(
-        &self,
-        session: &SessionId,
-        instructions: Option<String>,
-    ) -> ClientResult<NavigateSessionResponse> {
-        self.post_session_change(
-            &format!("/v1/sessions/{session}/compact"),
-            &serde_json::json!({"instructions": instructions}),
-        )
-        .await
     }
 
     pub async fn session(&self, session: &SessionId) -> ClientResult<SessionDetail> {
@@ -439,27 +391,6 @@ impl KomoClient {
         request: &SubmitRunRequest,
     ) -> ClientResult<SubmitRunResponse> {
         self.post(&format!("/v1/sessions/{session}/runs"), request)
-            .await
-    }
-
-    pub async fn resume(
-        &self,
-        session: &SessionId,
-        request: &ResumeRequest,
-    ) -> ClientResult<ResumeResponse> {
-        self.post(&format!("/v1/sessions/{session}/resume"), request)
-            .await
-    }
-
-    /// `/new`：追加 `conversation.boundary`，**不切 Session**（§13.1）。
-    ///
-    /// TUI 不带 `by`——那个字段是给聊天渠道填发送者的，终端前的人没有平台身份。
-    pub async fn boundary(
-        &self,
-        session: &SessionId,
-        request: &BoundaryRequest,
-    ) -> ClientResult<BoundaryResponse> {
-        self.post(&format!("/v1/sessions/{session}/boundary"), request)
             .await
     }
 
@@ -1328,23 +1259,6 @@ mod wire_tests {
     }
 
     #[tokio::test]
-    async fn a_boundary_from_the_tui_names_nobody() {
-        let server = FakeGateway::spawn(|_, _| {
-            Reply::ok(serde_json::json!({"session": "sess-1", "seq": 10}))
-        })
-        .await;
-        server
-            .client()
-            .boundary(&SessionId::from_raw("sess-1"), &BoundaryRequest::default())
-            .await
-            .unwrap();
-        let sent = &server.requests()[0];
-        assert_eq!(sent.path, "/v1/sessions/sess-1/boundary");
-        // 终端前的人没有平台身份，所以 `by` 根本不上线。
-        assert!(!sent.body.contains("\"by\""), "{}", sent.body);
-    }
-
-    #[tokio::test]
     async fn a_manual_cron_run_carries_its_own_key() {
         let server = FakeGateway::spawn(|_, _| {
             Reply::ok(serde_json::json!({
@@ -1492,10 +1406,7 @@ mod wire_tests {
         let server = FakeGateway::spawn(|request, _| {
             match request.path.rsplit('/').next().unwrap() {
                 "tree" => Reply::ok(serde_json::json!({"entries":[{"id":"u1","parentId":null,"timestamp":"now","type":"message","message":{"role":"user","content":"original"}}],"leafId":null})),
-                "navigate" => Reply::ok(serde_json::json!({"leafId":null,"editorText":"original","cancelled":false})),
-                "fork" => Reply::ok(serde_json::json!({"session":"forked-session"})),
-                "compact" => Reply::ok(serde_json::json!({"leafId":"summary","editorText":null,"cancelled":false})),
-                "context-edit" | "label" | "name" => Reply::ok(serde_json::json!({"leafId":"metadata","editorText":null,"cancelled":false})),
+                "name" => Reply::ok(serde_json::json!({"leafId":"metadata","editorText":null,"cancelled":false})),
                 _ => unreachable!(),
             }
         }).await;
@@ -1504,64 +1415,6 @@ mod wire_tests {
         let tree = client.session_tree(&session).await.unwrap();
         assert!(tree.leaf_id.is_none());
         assert_eq!(tree.entries[0].id, "u1");
-        let navigation = client
-            .navigate_session(
-                &session,
-                &NavigateSessionRequest {
-                    target_id: "u1".into(),
-                    summarize: true,
-                    instructions: Some("keep decisions".into()),
-                    label: Some("branch".into()),
-                },
-            )
-            .await
-            .unwrap();
-        assert_eq!(navigation.editor_text.as_deref(), Some("original"));
-        assert_eq!(
-            client
-                .fork_session(
-                    &session,
-                    &ForkSessionRequest {
-                        target_id: Some("u1".into()),
-                        clone: false
-                    }
-                )
-                .await
-                .unwrap()
-                .session
-                .as_str(),
-            "forked-session"
-        );
-        client
-            .fork_session(
-                &session,
-                &ForkSessionRequest {
-                    target_id: None,
-                    clone: true,
-                },
-            )
-            .await
-            .unwrap();
-        client
-            .edit_session_context(
-                &session,
-                &EditSessionContextRequest {
-                    target_id: "u1".into(),
-                    replacement: None,
-                },
-            )
-            .await
-            .unwrap();
-        client
-            .label_session(
-                &session,
-                &LabelSessionRequest {
-                    target_id: "u1".into(),
-                    label: Some("decision".into()),
-                },
-            )
-            .await
-            .unwrap();
         client
             .name_session(
                 &session,
@@ -1571,54 +1424,23 @@ mod wire_tests {
             )
             .await
             .unwrap();
-        client
-            .compact_session(&session, Some("retain evidence".into()))
-            .await
-            .unwrap();
         let requests = server.requests();
         assert_eq!(requests[0].method, "GET");
         assert_eq!(requests[0].path, "/v1/sessions/sess-1/tree");
         for request in &requests {
             assert_eq!(request.header("authorization"), Some("Bearer test-token"));
         }
-        let bodies: Vec<serde_json::Value> = requests[1..]
-            .iter()
-            .map(|r| serde_json::from_str(&r.body).unwrap())
-            .collect();
-        assert_eq!(
-            bodies[0],
-            serde_json::json!({"targetId":"u1","summarize":true,"instructions":"keep decisions","label":"branch"})
-        );
-        assert_eq!(
-            bodies[1],
-            serde_json::json!({"targetId":"u1","clone":false})
-        );
-        assert_eq!(bodies[2], serde_json::json!({"targetId":null,"clone":true}));
-        assert_eq!(
-            bodies[3],
-            serde_json::json!({"targetId":"u1","replacement":null})
-        );
-        assert_eq!(
-            bodies[4],
-            serde_json::json!({"targetId":"u1","label":"decision"})
-        );
-        assert_eq!(bodies[5], serde_json::json!({"name":"investigation"}));
-        assert_eq!(
-            bodies[6],
-            serde_json::json!({"instructions":"retain evidence"})
-        );
+        let body: serde_json::Value = serde_json::from_str(&requests[1].body).unwrap();
+        assert_eq!(body, serde_json::json!({"name":"investigation"}));
 
         let blocked =
             FakeGateway::spawn(|_, _| Reply::error(409, "conflict", "unfinished run")).await;
         let error = blocked
             .client()
-            .navigate_session(
+            .name_session(
                 &session,
-                &NavigateSessionRequest {
-                    target_id: "u1".into(),
-                    summarize: false,
-                    instructions: None,
-                    label: None,
+                &NameSessionRequest {
+                    name: "investigation".into(),
                 },
             )
             .await

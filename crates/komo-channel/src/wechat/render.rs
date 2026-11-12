@@ -1,7 +1,7 @@
 //! 微信纯文本渲染与入站去重键（§11.3）。
 //!
 //! 微信这一列与另外两个渠道的差别不在内容，在**能力**：iLink 只有纯文本，没有卡片、
-//! 没有按钮、也没有"编辑已发出的那一条"。**超长截断，并提示到 TUI 看全文**（§11.3
+//! 没有按钮、也没有"编辑已发出的那一条"。**超长截断，并提示到网页看全文**（§11.3
 //! 微信列的原话）。审批的纯文本请求与短 ID 命令随审批一起删掉了（§7，2026-10-11）。
 //!
 //! 这里还住着入站去重键的回退哈希（[`fallback_request_key`]）。它和渲染放在一起不是
@@ -16,11 +16,11 @@ use komo_kernel::types::digest::ContentHash;
 // TODO(decide: iLink 没有公开接口文档，服务端的真实上限未知。SDK 自己发长文本时按
 // 4000 **字节**切块（`bot.rs::chunk_text`），所以 4000 字节是目前唯一有依据的数字；
 // 这里取 1800 字符，对全中文正文约 5.4KB、对全 ASCII 约 1.8KB——比 4000 字节保守，
-// 因为 §11.3 微信列要的是"截断并提示到 TUI"，宁可早截也不要发出去被服务端整条拒掉。)
+// 因为 §11.3 微信列要的是"截断并提示到网页"，宁可早截也不要发出去被服务端整条拒掉。)
 pub const MESSAGE_LIMIT: usize = 1800;
 
-/// 截断处留下的那句话。§11.3 微信列：**提示到 TUI 看全文**。
-pub const TRUNCATION_NOTE: &str = "…（已截断，全文到 TUI 看）";
+/// 截断处留下的那句话。§11.3 微信列：**提示到网页看全文**。
+pub const TRUNCATION_NOTE: &str = "…（已截断，全文到网页看）";
 
 /// 回退去重键的时间窗，毫秒（§11.1）。
 pub const FALLBACK_WINDOW_MS: i64 = 60_000;
@@ -100,13 +100,13 @@ mod tests {
     use komo_kernel::types::chat::ChannelPlatform;
     use komo_kernel::types::ids::{RunId, SessionId};
 
-    // ⑤ 超长截断 + 「到 TUI 看全文」提示。
+    // ⑤ 超长截断 + 「到网页看全文」提示。
     #[test]
     fn an_oversized_body_is_truncated_with_a_pointer_to_the_tui() {
         let body = "长".repeat(MESSAGE_LIMIT * 2);
         let text = render(&Outbound::Text { text: body });
         assert!(text.ends_with(TRUNCATION_NOTE), "{text}");
-        assert!(text.contains("TUI"), "提示必须说去哪看全文：{text}");
+        assert!(text.contains("网页"), "提示必须说去哪看全文：{text}");
         assert_eq!(
             text.chars().count(),
             MESSAGE_LIMIT + TRUNCATION_NOTE.chars().count()

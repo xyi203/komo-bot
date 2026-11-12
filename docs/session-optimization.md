@@ -46,8 +46,8 @@ hub，HTTP 先订阅再取，重叠靠 seq 去重。游标在覆盖范围内时�
 `IN (…)` 会退成排序器、读全部匹配行）、各取 `limit + 1` 再归并，一页最多读 3 ×（limit + 1）行，与总会话数无关，**不加索引**。
 概览（live / inbox / tail）只对当页做。内部调用方（`komo session search`、任务清单、监听对账）仍调 `list_sessions` 读全量，
 渠道的 `ensure_session` 走自己的条件扫描，都不受分页影响。客户端：CLI `komo session list` 默认 `--limit 50`，还有更多时末尾印出
-带 `--cursor` 的下一条命令，`--limit 0` 一次列完；web 侧栏按页取（`useInfiniteQuery`），末尾"加载更早的会话"。TUI 没有会话选择
-列表（只有 `komo resume SESSION_ID`），不用改。**取舍**：服务端次序是创建序，web 侧栏默认按"最近更新"排，所以一个很早创建、
+带 `--cursor` 的下一条命令，`--limit 0` 一次列完；web 侧栏按页取（`useInfiniteQuery`），末尾"加载更早的会话"。（TUI 已于 2026-11-12 删除；它当时没有会话选择
+列表，只有 `komo resume SESSION_ID`。）**取舍**：服务端次序是创建序，web 侧栏默认按"最近更新"排，所以一个很早创建、
 最近才动过的会话要等翻到它那一页才出现；按更新时间分页要给 `changed_at` 抽列加索引，这次没做。
 
 **F 的落法与没做的部分**：没有把 `ModelStream::progress` 改成拉取（签名要动三家 provider 和十来个测试替身）。

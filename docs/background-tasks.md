@@ -24,7 +24,7 @@
 ## 2. 现在的形状
 
 ```text
-私聊 / komo home ──▶ home session（就是这个 Agent 本身，能动手，也能派任务）
+私聊 / 网页 ──▶ home session（就是这个 Agent 本身，能动手，也能派任务）
                        │ task(prompt, title, model?) → 回"已派出 #12：标题"，这一轮照常往下
                        ▼
                      任务会话 #12（sessions 行 kind = task，子 conversation 12，同一个 Agent）

@@ -276,7 +276,7 @@ pi 的 #9265（`f715a15c1`）修的就是这个：`StreamingJsonParser` 每个 d
 - **`afterFailedRun`**（`a30c2a81d`）：komo 在 D5 决定 8 已经定了"非正常收尾后排队的输入接着放置"，相当于 pi 的
   `continue` 且覆盖面更大（含取消与 faulted），不改。
 - **只读打开 Harness**（`be14d9732`）：komo 只有 Gateway 一个进程开库，不适用。
-- **工具 handoff 续跑**（`38ff99177`）不是存储优化，作为新功能另写在 [`handoff.md`](handoff.md)。
+- **工具 handoff 续跑**（`38ff99177`）不是存储优化，作为新功能另写在 [`archive/handoff.md`](archive/handoff.md)（草案，未实施，已归档）。
 - **遥测**（`48909d987` / `2ec55d808`）：按任务阶段组织的 span 与存进记录的 trace 上下文，写在 [`observability.md`](observability.md) §3；
   本文 §9 要的提交耗时与事务率由那边 §9 第 6 步的存储指标提供。
 

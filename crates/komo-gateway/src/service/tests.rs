@@ -274,16 +274,12 @@ async fn the_same_request_key_with_other_content_is_a_conflict() {
     );
 }
 
-/// `/new` 在当前会话上追加一条边界，**不切 Session**。
-///
-/// Durable 下的 `/new` 有两个入口：HTTP 的 `POST /boundary`（TUI 用）与聊天渠道的 `/new`
-/// （`dispatcher_v2`，W3a 并进来：原先分开的 `_through_chat_legacy` 只测了回执与同一个 home
-/// session，这里的断言更强——边界真的落进同一个会话的历史）。
+/// 聊天渠道的 `/new` 不切 Session，也不动主线的历史。（HTTP 的 `POST /boundary` 只有 TUI 调，
+/// 2026-11-12 随 TUI 删除；服务层 `DurableCore::boundary` 留给任务会话里的 `/new`。）
 #[tokio::test]
-async fn slash_new_appends_a_boundary_to_the_same_session() {
+async fn slash_new_in_chat_leaves_the_home_session_alone() {
     use crate::service::test_support::harness::FakeLlm;
-    use komo_kernel::protocol::http::{BoundaryResponse, SessionSummary, SubmitRunResponse};
-    use komo_kernel::session::EntryKind;
+    use komo_kernel::protocol::http::{SessionSummary, SubmitRunResponse};
 
     let gateway = TestGateway::with(&telegram_config("111"), FakeLlm::finisher("好")).await;
     let home = |body: String| {
@@ -313,31 +309,8 @@ async fn slash_new_appends_a_boundary_to_the_same_session() {
     let (_, body) = gateway.get(&format!("/v1/sessions/{session}/tree")).await;
     let before = entries_of(body);
 
-    let (status, body) = gateway
-        .post(
-            &format!("/v1/sessions/{session}/boundary"),
-            serde_json::json!({}),
-        )
-        .await;
-    assert_eq!(status, 200, "{body}");
-    let boundary: BoundaryResponse = serde_json::from_str(&body).unwrap();
-    assert_eq!(boundary.session, session);
-
-    // 还是同一个 home session，边界落在它的历史里（"自此重新开始"在 pi 里是一条压缩）。
-    let (_, body) = gateway.get("/v1/home-session").await;
-    assert_eq!(home(body), session);
-    let (_, body) = gateway.get(&format!("/v1/sessions/{session}/tree")).await;
-    let after = entries_of(body);
-    assert!(after.len() > before.len(), "{after:?}");
-    assert!(
-        after[before.len()..]
-            .iter()
-            .any(|entry| matches!(entry.kind, EntryKind::Compaction { .. })),
-        "{after:?}"
-    );
-
-    // 聊天渠道的 `/new`：主线不跑模型、没有上下文可重置（`docs/tasks.md` §4.14），只回一句说明，
-    // 不再追加边界，home session 与历史都不变。
+    // 主线不跑模型、没有上下文可重置（`docs/tasks.md` §4.14），`/new` 只回一句说明，
+    // 不追加边界，home session 与历史都不变。
     let ack = gateway
         .dispatcher()
         .handle(operator_dm("/new", "telegram:2"))
@@ -351,7 +324,7 @@ async fn slash_new_appends_a_boundary_to_the_same_session() {
     assert_eq!(home(body), session, "聊天里的 /new 也不切 Session");
     let (_, body) = gateway.get(&format!("/v1/sessions/{session}/tree")).await;
     let after_chat = entries_of(body);
-    assert_eq!(after_chat.len(), after.len(), "{after_chat:?}");
+    assert_eq!(after_chat.len(), before.len(), "{after_chat:?}");
 }
 
 // ---------------------------------------------------------------- 工具

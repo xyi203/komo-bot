@@ -17,7 +17,7 @@
 //! | **`sessions`** | 会话与树：建会话、列表、`SessionSummary` 映射、主会话与按来源找会话、`SessionError` | W1c |
 //! | `sessions::agent_doc` | `komo.agent` document 的读写与 fork 复制 | W0b |
 //! | `sessions::tree` | 读树（`read_tree`）、导航、label / name、context-edit、分支摘要、compact、忙时守卫 | W1c |
-//! | `sessions::copy` | `/fork`、`/clone`：复制 entry 与 blob | W1c |
+//! | `sessions::copy` | 分叉（网页会话菜单）：复制 entry 与 blob | W1c |
 //! | `sessions::runs` | `RunSummary` / `RunDetail` / `RunState` 映射、按 RunId 取消 | W2a |
 //! | `sessions::tasks` | 任务会话的展示：短号 `#<conversation>`、列表一行、标签 | W2c |
 //! | `sessions::titles` | 首轮跑完后起标题（读写 sessions 行） | W3a |

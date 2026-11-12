@@ -1,7 +1,6 @@
 //! 渲染函数的快照测试：协议类型 → 字符串，全是纯函数。
 
 use super::*;
-use crate::tui::test_support as fixture;
 use komo_kernel::cron::{CronJob, TimeZone, Trigger};
 use komo_kernel::protocol::PROTOCOL_VERSION;
 use komo_kernel::protocol::config::{KeyPath, SourceFile};
@@ -17,6 +16,77 @@ use std::path::PathBuf;
 use time::macros::datetime;
 
 const NOW: OffsetDateTime = datetime!(2026-09-16 08:00:00 UTC);
+
+/// 测试用的固定样本。
+mod fixture {
+    use komo_kernel::protocol::http::{InterventionKind, InterventionSummary};
+    use komo_kernel::types::digest::ContentHash;
+    use komo_kernel::types::ids::{OperationId, RunId, SessionId, ToolCallId};
+    use komo_kernel::types::plan::{
+        ExecutionPlan, Operation, PlanSource, PlanTarget, PlanVersions, RecoveryMode, TargetAccess,
+    };
+    use time::OffsetDateTime;
+    use time::macros::datetime;
+
+    pub const T0: OffsetDateTime = datetime!(2026-09-16 08:00:00 UTC);
+
+    pub fn session() -> SessionId {
+        SessionId::from_raw("sess-1")
+    }
+
+    pub fn run() -> RunId {
+        RunId::from_raw("run-1")
+    }
+
+    pub fn call() -> ToolCallId {
+        ToolCallId::from_raw("call-7")
+    }
+
+    pub fn plan() -> ExecutionPlan {
+        ExecutionPlan {
+            operation_id: OperationId::from_raw("op-1"),
+            source: PlanSource::Interactive { session: session() },
+            tool: "bash".into(),
+            operation: Operation::ShellCommand {
+                command: "rm -rf build".into(),
+            },
+            run: Some(run()),
+            tool_call: Some(call()),
+            args: serde_json::json!({ "command": "rm -rf build" }),
+            cwd: Some("/home/u/project".into()),
+            targets: vec![PlanTarget::local(
+                "/home/u/project/build",
+                TargetAccess::Write,
+            )],
+            versions: PlanVersions {
+                code: Some(ContentHash::of_str("rm -rf build")),
+                env: None,
+            },
+            recovery: RecoveryMode::NoSafeRecovery,
+            then_run: None,
+        }
+    }
+
+    /// 一条待处理 Intervention 的摘要（`GET /v1/interventions` 的一项，§7.5）。
+    ///
+    /// `verdicts` 用 kernel 给这一类定的那几档：清单里"此刻能答什么"就是它，界面不该自己推。
+    pub fn intervention_summary(
+        handle: &str,
+        kind: InterventionKind,
+        question: &str,
+    ) -> InterventionSummary {
+        InterventionSummary {
+            handle: handle.to_string(),
+            kind,
+            session: session(),
+            run: Some(run()),
+            call: Some(call()),
+            question: question.to_string(),
+            verdicts: kind.verdicts(),
+            created_at: T0,
+        }
+    }
+}
 
 // ---- session list ----
 

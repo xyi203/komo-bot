@@ -17,7 +17,7 @@
 | `Seq`（SSE `id:`、`Event.seq`、`EventPage.next`、`SubmitRunResponse.seq`） | `(记录 ID << 12) \| k`，记录 ID 是 entry 或 submission 的全局单调 ID，`k` 是同一记录产出的第几帧 |
 | `SessionSummary.current_wait` | 只会出现 `Retry` |
 | `InterventionSummary` | 只列 faulted 任务，映射成 `Blocked`，可答结论只有 `abandon` |
-| `POST /v1/sessions/{id}/resume`、`POST /v1/reconcile` | 保留路由；resume 只返回未结束的 run，reconcile 只做 blob 引用检查 |
+| `POST /v1/sessions/{id}/resume`、`POST /v1/reconcile` | 保留路由；resume 只返回未结束的 run，reconcile 只做 blob 引用检查。**`resume` 与 `boundary` 路由已于 2026-11-12 删除**（只有 TUI 调；`reconcile` 还在） |
 
 ## 2. 共用契约（各包不得各自发明）
 

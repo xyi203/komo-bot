@@ -1,10 +1,6 @@
-//! `/fork` 与 `/clone`：把一个 Session 的一条路径**复制**成一个新 Session
-//! （`docs/storage-durable-d5.md` §7；决定 10）。
-//!
-//! 两者都复制，区别只在落点：
-//!
-//! - `/clone`：复制到 `target`（默认 leaf）为止的整条路径；
-//! - `/fork`：选中的是用户输入时复制到它的**上一条**（输入的原文留给编辑框），其余同 `/clone`。
+//! fork（网页会话菜单的"分叉"）：把一个 Session 的当前路径**复制**成一个新 Session
+//! （`docs/storage-durable-d5.md` §7；决定 10）。`/fork [id]` 与 `/clone` 两个入口已在 2026-11-12 删除，
+//! 只剩"从当前位置（leaf，没有就是末端）复制"：末条是用户输入时复制到它的**上一条**。
 //!
 //! 复制的是**可见 entry**：路径上的每条 entry 逐条 `append_entry` 进新 Session 的根 conversation，
 //! 新铸 ID，`head`（"自此重新开始" / 压缩的第一条保留）与 `edits` 的目标按旧 ID → 新 ID 的映射重写，
@@ -37,14 +33,6 @@ use super::{NewSession, SessionError, create_in};
 
 /// 整份复制的 blob 子目录。
 const BLOB_DIRS: [&str; 3] = ["tool-output", "artifacts", "payloads"];
-
-#[derive(Debug, Clone, Default)]
-pub struct ForkRequest {
-    /// 复制到哪一条为止；没有就是当前 leaf。
-    pub target: Option<EntryId>,
-    /// `true` = `/clone`（连输入本身一起复制）；`false` = `/fork`。
-    pub clone: bool,
-}
 
 fn io_error(context: &str, error: impl std::fmt::Display) -> SessionError {
     SessionError::Internal(format!("{context}：{error}"))
@@ -246,15 +234,10 @@ pub(in crate::service::durable) type CopyHook =
     Box<dyn FnOnce() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send>;
 
 impl DurableCore {
-    /// `/fork` 与 `/clone`：复制成一个新会话，返回新会话的行。源会话忙时 409。
-    pub async fn fork_session(
-        &self,
-        source: &str,
-        request: ForkRequest,
-    ) -> Result<SessionRecord, SessionError> {
+    /// 复制成一个新会话，返回新会话的行。源会话忙时 409。
+    pub async fn fork_session(&self, source: &str) -> Result<SessionRecord, SessionError> {
         self.fork_session_inner(
             source,
-            request,
             #[cfg(test)]
             None,
         )
@@ -265,35 +248,26 @@ impl DurableCore {
     pub(in crate::service::durable) async fn fork_session_with_hook(
         &self,
         source: &str,
-        request: ForkRequest,
         before_copy: bool,
         hook: CopyHook,
     ) -> Result<SessionRecord, SessionError> {
-        self.fork_session_inner(source, request, Some((before_copy, hook)))
+        self.fork_session_inner(source, Some((before_copy, hook)))
             .await
     }
 
     async fn fork_session_inner(
         &self,
         source: &str,
-        request: ForkRequest,
         #[cfg(test)] mut hook: Option<(bool, CopyHook)>,
     ) -> Result<SessionRecord, SessionError> {
         let tree = self.editable_tree(source).await?;
         let expect = Expect::of(&tree);
-        let target = match request.target {
-            Some(target) => {
-                self.entry_in(&tree, target)?;
-                Some(target)
-            }
-            None => tree.leaf,
-        };
-        let Some(target) = target else {
+        let Some(target) = tree.leaf else {
             return Err(SessionError::Invalid("空会话没有可复制的分支".into()));
         };
-        // `/fork` 选中输入：复制到它的上一条，原文留给编辑框（旧实现同口径）。
+        // 末条是用户输入：复制到它的上一条（还没得到回答的输入不带进副本）。
         let selected = self.entry_in(&tree, target)?;
-        let upto = if !request.clone && input_text(selected).is_some() {
+        let upto = if input_text(selected).is_some() {
             tree.prev_of(target)
         } else {
             Some(target)

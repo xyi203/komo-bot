@@ -5,7 +5,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use komo_kernel::durable::AssistantMessage;
 use komo_kernel::protocol::http::{
-    CancelRunResponse, ResumeResponse, RunDetail, SessionDetail, SessionSummary, SubmitRunResponse,
+    CancelRunResponse, RunDetail, SessionDetail, SessionSummary, SubmitRunResponse,
 };
 use komo_kernel::types::ids::{RunId, SessionId};
 use komo_kernel::types::status::RunState;
@@ -85,22 +85,12 @@ async fn cancelling_stops_the_running_run_and_withdraws_a_queued_one() {
     let second = submit(&gateway, &session, "second").await;
     assert_eq!(second.state, RunState::Queued);
 
-    // 会话详情与 resume 都列得出这两条没结束的 run。
+    // 会话详情列得出这两条没结束的 run。
     let (_, body) = gateway.get(&format!("/v1/sessions/{session}")).await;
     let shown: SessionDetail = serde_json::from_str(&body).unwrap();
     let runs: Vec<_> = shown.unfinished.iter().map(|run| run.run.clone()).collect();
     assert_eq!(runs, [first.run.clone(), second.run.clone()], "{shown:?}");
     assert_eq!(shown.summary.current_run.as_ref(), Some(&first.run));
-    let (status, body) = gateway
-        .post(
-            &format!("/v1/sessions/{session}/resume"),
-            serde_json::json!({}),
-        )
-        .await;
-    assert_eq!(status, 200, "{body}");
-    let resumed: ResumeResponse = serde_json::from_str(&body).unwrap();
-    assert_eq!(resumed.resumed.len(), 2);
-
     // 排队中的单条：撤回，不碰正在跑的。
     assert_eq!(
         cancel(&gateway, &second.run).await.state,

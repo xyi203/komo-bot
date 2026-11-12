@@ -23,7 +23,7 @@ pub mod web;
 pub use komo_agent::skills;
 pub use komo_config as config;
 /// `komo auth codex login|status`（§3、§13.3）：设备码登录与凭证文件，全部实现在
-/// `komo-llm`（不碰 axum / ratatui，只要 reqwest），这里只转一道给 bin。
+/// `komo-llm`（不碰 axum，只要 reqwest），这里只转一道给 bin。
 pub use komo_llm::codex_auth;
 /// `komo auth mcp login|status`（`docs/mcp.md` §2.1）：同上，OAuth 登录与凭证文件在
 /// `komo-tools`。

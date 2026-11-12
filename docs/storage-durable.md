@@ -130,7 +130,7 @@ komo 已经借过它的重放判据（§8.6"已存 / 当前 replay 双 Safe"）�
 - entry / task / submission / conversation / document 用**全局单调数字 ID**（`mintId`，线内计数器，
   开库时取各表最大值）。ID 顺序就是创建顺序——这正是今天 UUIDv7 同毫秒乱序、只好另加 `seq` 来定次序的那个坑
   （§8.4"判谁在前用输入事件的 seq"）。
-- 对外稳定的 ID 保持 UUIDv7 字符串：komo Session（`komo resume SESSION_ID`）、投递、cron。
+- 对外稳定的 ID 保持 UUIDv7 字符串：komo Session（`komo session export SESSION_ID`）、投递、cron。
 - AGENTS.md 的"never AUTOINCREMENT"不受影响：计数器在线内分配，不是数据库自增；只有一条写入者，没有
   MVCC 热点冲突。
 

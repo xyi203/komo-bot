@@ -2,19 +2,15 @@ use super::*;
 use crate::service::test_support::harness::FakeLlm;
 use crate::service::test_support::{TestGateway, config_toml};
 use komo_kernel::durable::{ContentBlock, Message, StopReason};
+use komo_kernel::durable::{ContextEdit, EntryId};
 use komo_kernel::protocol::http::{ForkSessionResponse, SessionSummary, SessionTreeResponse};
 use komo_kernel::session::SessionTree;
 use komo_kernel::types::ids::SessionId;
-use komo_runtime::durable::EntryDraft;
+use komo_runtime::durable::{ConversationOwnership, DraftHead, EntryDraft};
 use serde_json::json;
 
 async fn setup() -> (TestGateway, SessionId) {
-    // 手动压缩只收 `keep_recent_tokens` 之外的旧内容：几十字的测试历史要压得动，调到最小。
-    let gw = TestGateway::with(
-        &config_toml("[compaction]\nkeep_recent_tokens = 1\n"),
-        FakeLlm::finisher("model answer"),
-    )
-    .await;
+    let gw = TestGateway::with(&config_toml(""), FakeLlm::finisher("model answer")).await;
     let session = new_session(&gw).await;
     (gw, session)
 }
@@ -65,6 +61,67 @@ async fn seed(gw: &TestGateway, session: &SessionId, role: &str, content: Conten
 
 async fn say(gw: &TestGateway, session: &SessionId, role: &str, text: &str) -> String {
     seed(gw, session, role, ContentBlock::text(text)).await
+}
+
+fn entry_id(pi_id: &str) -> EntryId {
+    EntryId::new(pi_id.parse().expect("pi ID 是十进制 entry ID"))
+}
+
+/// 在根 conversation 的 `at` 处 fork 出一个分支、写进 `drafts`，并把它设成当前分支。
+/// 用户入口（导航、分支摘要）已删，分支只剩 fork 任务与旧数据会产生，所以这里经提交线直接造。
+async fn branch_at(gw: &TestGateway, session: &SessionId, at: &str, drafts: Vec<EntryDraft>) {
+    let core = gw.state().core().unwrap();
+    let record = core.session(session.as_str()).await.unwrap();
+    let (id, root, at) = (
+        session.as_str().to_owned(),
+        record.root_conversation,
+        entry_id(at),
+    );
+    core.engine
+        .commit(move |tx| {
+            Box::pin(async move {
+                let child = tx
+                    .fork_conversation(root, at, ConversationOwnership::Ownerless)
+                    .await?;
+                for draft in drafts {
+                    tx.append_entry(child.id, draft).await?;
+                }
+                let mut record = tx.session(&id).await?.expect("会话在");
+                record.current_branch = child.id;
+                tx.put_session(record);
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+}
+
+/// 把会话行里的 `leaf` 写成 `at`（旧导航留下的位置）。
+async fn set_leaf(gw: &TestGateway, session: &SessionId, at: &str) {
+    let core = gw.state().core().unwrap();
+    let mut record = core.session(session.as_str()).await.unwrap();
+    record.leaf = Some(entry_id(at));
+    core.engine
+        .commit(move |tx| {
+            Box::pin(async move {
+                tx.put_session(record);
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+}
+
+fn user_draft(text: &str) -> EntryDraft {
+    EntryDraft::new("komo.user").with_model(vec![Message::user(text, 1)])
+}
+
+fn assistant_draft(text: &str) -> EntryDraft {
+    EntryDraft::new("komo.assistant").with_model(vec![Message::assistant(
+        vec![ContentBlock::text(text)],
+        StopReason::Stop,
+        1,
+    )])
 }
 
 async fn post_ok(gw: &TestGateway, session: &SessionId, route: &str, body: Value) -> Value {
@@ -147,41 +204,34 @@ async fn export_round_trips_through_session_tree_with_branches_and_leaf() {
     let (gw, session) = setup().await;
     let u1 = say(&gw, &session, "user", "shared task").await;
     let a1 = say(&gw, &session, "assistant", "shared answer").await;
-    let u2 = say(&gw, &session, "user", "abandoned direction").await;
-    let _a2 = say(&gw, &session, "assistant", "abandoned answer").await;
+    let _u2 = say(&gw, &session, "user", "abandoned direction").await;
+    let a2 = say(&gw, &session, "assistant", "abandoned answer").await;
 
-    // 导航到 u2 前面再提交一条新输入：a1 下面长出第二个分支。
-    post_ok(&gw, &session, "navigate", json!({"targetId": u2})).await;
-    let (status, body) = gw
-        .post(
-            &format!("/v1/sessions/{session}/runs"),
-            json!({"request_key":"export-branch","text":"replacement direction"}),
-        )
-        .await;
-    assert_eq!(status, 200, "{body}");
-    let accepted: komo_kernel::protocol::http::SubmitRunResponse =
-        serde_json::from_str(&body).unwrap();
-    gw.wait_run(&accepted.run).await;
-
-    // 标签、名字、上下文编辑。
-    post_ok(
+    // a1 下面长出第二个分支，分支上带标签与上下文编辑（kind 与旧入口写的一致）。
+    branch_at(
         &gw,
         &session,
-        "label",
-        json!({"targetId": a1, "label": "checkpoint"}),
+        &a1,
+        vec![
+            user_draft("replacement direction"),
+            assistant_draft("model answer"),
+            EntryDraft::new("label").with_data(json!({"targetId": a1, "label": "checkpoint"})),
+            EntryDraft {
+                kind: "context.edit".into(),
+                data: Some(json!({"targetId": u1})),
+                edits: vec![ContextEdit::replace(
+                    entry_id(&u1),
+                    vec![Message::user("edited task", 1)],
+                )],
+                ..EntryDraft::default()
+            },
+        ],
     )
     .await;
     post_ok(&gw, &session, "name", json!({"name": "exported"})).await;
-    post_ok(
-        &gw,
-        &session,
-        "context-edit",
-        json!({"targetId": u1, "replacement": {"content": "edited task"}}),
-    )
-    .await;
 
     // 位置在树中间（a1，它有两个分支）→ 末尾要有一条标记。
-    post_ok(&gw, &session, "navigate", json!({"targetId": a1})).await;
+    set_leaf(&gw, &session, &a1).await;
     let live = snapshot(&gw, &session).await;
     assert_eq!(live.leaf_id(), Some(a1.as_str()));
     assert_eq!(live.label(&a1), Some("checkpoint"));
@@ -214,19 +264,12 @@ async fn export_round_trips_through_session_tree_with_branches_and_leaf() {
     assert!(!texts.contains("replacement direction"));
 
     // 位置在一个叶子上（没有后代）→ 挪到文件末尾，不需要标记。
-    let tip = live
-        .entries()
-        .iter()
-        .find(|entry| matches!(&entry.kind, EntryKind::Message{message} if message["content"][0]["text"] == "abandoned answer"))
-        .unwrap()
-        .id
-        .clone();
-    post_ok(&gw, &session, "navigate", json!({"targetId": tip})).await;
+    set_leaf(&gw, &session, &a2).await;
     let live = snapshot(&gw, &session).await;
-    assert_eq!(live.leaf_id(), Some(tip.as_str()));
+    assert_eq!(live.leaf_id(), Some(a2.as_str()));
     let (_, exported) = read_export(&gw, &session).await;
     assert_same_tree(&exported, &live);
-    assert_eq!(exported.leaf_id(), Some(tip.as_str()));
+    assert_eq!(exported.leaf_id(), Some(a2.as_str()));
     assert!(exported.get(LEAF_MARKER_ID).is_none());
     let texts = serde_json::to_string(&exported.project().unwrap().messages).unwrap();
     assert!(texts.contains("abandoned answer") && !texts.contains("replacement direction"));
@@ -240,11 +283,20 @@ async fn export_carries_branch_summaries_and_compaction() {
     let a = say(&gw, &session, "assistant", "answer").await;
     let left = say(&gw, &session, "user", "left branch").await;
 
-    post_ok(
+    // 分支摘要：在 a 处分叉，第一条是摘要（kind 与数据形状同旧入口）。
+    let summary = komo_kernel::durable::Message::user(
+        "The following is a summary of a branch that this conversation came back from:\n\n<summary>\nSUMMARY OF LEFT\n</summary>",
+        1,
+    );
+    branch_at(
         &gw,
         &session,
-        "navigate",
-        json!({"targetId": a, "summarize": true}),
+        &a,
+        vec![
+            EntryDraft::new("branch.summary")
+                .with_model(vec![summary])
+                .with_data(json!({"fromId": left, "summary": "SUMMARY OF LEFT"})),
+        ],
     )
     .await;
     let live = snapshot(&gw, &session).await;
@@ -254,13 +306,29 @@ async fn export_carries_branch_summaries_and_compaction() {
         |entry| matches!(&entry.kind, EntryKind::BranchSummary { from_id, .. } if *from_id == left)
     ));
 
-    post_ok(
-        &gw,
-        &session,
-        "compact",
-        json!({"instructions": "keep decisions"}),
-    )
-    .await;
+    // 压缩：head 指向第一条保留的 entry。
+    let core = gw.state().core().unwrap();
+    let conversation = core.session(session.as_str()).await.unwrap().current_branch;
+    let kept = entry_id(&a);
+    core.engine
+        .commit(move |tx| {
+            Box::pin(async move {
+                tx.append_entry(
+                    conversation,
+                    EntryDraft::new("komo.compaction")
+                        .with_model(vec![Message::user(
+                            komo_kernel::durable::compaction::wrap_summary("MANUAL SUMMARY"),
+                            1,
+                        )])
+                        .with_head(DraftHead::At(kept))
+                        .with_data(json!({"reason": "manual"})),
+                )
+                .await?;
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
     let live = snapshot(&gw, &session).await;
     let (_, exported) = read_export(&gw, &session).await;
     assert_same_tree(&exported, &live);
@@ -305,7 +373,9 @@ async fn a_forked_session_exports_on_its_own_and_blob_references_stay_references
     )
     .await;
 
-    let fork = post_ok(&gw, &session, "fork", json!({"targetId": image})).await;
+    // 复制到 leaf 为止：leaf 停在图片上，回答不进副本。
+    set_leaf(&gw, &session, &image).await;
+    let fork = post_ok(&gw, &session, "fork", json!({})).await;
     let fork: ForkSessionResponse = serde_json::from_value(fork).unwrap();
     let (header, exported) = read_export(&gw, &fork.session).await;
     assert_eq!(header["id"], fork.session.as_str());
@@ -317,7 +387,12 @@ async fn a_forked_session_exports_on_its_own_and_blob_references_stay_references
 
     // 图片块仍是 `{mime, path, hash}`，没有字节；`artifact://` 文字原样。
     let (_, source) = read_export(&gw, &session).await;
-    let blocks = serde_json::to_string(source.entries()).unwrap();
+    let entries: Vec<_> = source
+        .entries()
+        .iter()
+        .filter(|entry| entry.id != LEAF_MARKER_ID)
+        .collect();
+    let blocks = serde_json::to_string(&entries).unwrap();
     assert!(blocks.contains(r#""path":"images/a.png""#), "{blocks}");
     assert!(!blocks.contains(r#""data""#), "{blocks}");
     assert!(blocks.contains("artifact://run-1/call-7/attempt-1/result"));

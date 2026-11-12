@@ -350,7 +350,7 @@ mod tests {
             .as_str()
             .expect("纯文本");
         assert!(text.ends_with(wechat::TRUNCATION_NOTE), "{text}");
-        assert!(text.contains("TUI"));
+        assert!(text.contains("网页"));
     }
 
     #[tokio::test]

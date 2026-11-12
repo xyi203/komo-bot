@@ -12,7 +12,6 @@
 //! | `POST /v1/web/pair-code` | — | [`PairCodeResponse`] |
 //! | `POST /v1/web/session` | [`PairRequest`] | `{}` + `Set-Cookie` |
 //! | `POST /v1/sessions` | [`CreateSessionRequest`] | [`SessionSummary`] |
-//! | `POST /v1/sessions/{id}/boundary` | [`BoundaryRequest`] | [`BoundaryResponse`] |
 //! | `POST /v1/cron` | [`CreateCronRequest`] | [`CronJob`] |
 //! | `PATCH /v1/cron/{id}` | [`UpdateCronRequest`] | [`CronJob`] |
 //! | `POST /v1/cron/{id}/run` | [`ManualCronRunRequest`] | [`ManualCronRunResponse`] |
@@ -62,7 +61,6 @@ pub use matter::*;
 
 use super::config::{ConfigIssue, KeyPath, McpExposure, SourceFile};
 use crate::cron::{CronFiring, CronJob, JobStatus, NotifyPolicy, OverlapPolicy};
-use crate::types::chat::PeerId;
 use crate::types::ids::{CronJobId, MatterId, MemoryId, RequestKey, RunId, Seq, SessionId};
 use crate::types::memory::{
     ArmScore, MemoryApplication, MemoryItem, MemoryKind, MemoryScope, MemoryState, RetrievalMode,
@@ -628,45 +626,6 @@ pub struct UploadAttachmentResponse {
     /// 认出是图片时才有：取回它的地址（`GET /v1/attachments/{收件箱}/{文件名}`），给界面显示缩略图。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image_url: Option<String>,
-}
-
-// ---- POST /v1/sessions/{id}/resume ----
-
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ResumeRequest {
-    /// 操作者明确切换模型时带上——要记 `config.changed` 并重新验证协议历史可回放性
-    /// （§13.3）。不带 = 沿用原运行的模型 / effort。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub model: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub effort: Option<Effort>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ResumeResponse {
-    pub session: SessionId,
-    /// 已经在跑或刚被接续的 Run。
-    #[serde(default)]
-    pub resumed: Vec<RunSummary>,
-    /// 需要人处理的（§7.5）：结果不明、阻塞。**两类一起列**。
-    #[serde(default)]
-    pub pending: Vec<InterventionSummary>,
-}
-
-// ---- POST /v1/sessions/{id}/boundary ----
-
-/// `POST /v1/sessions/{id}/boundary`：`/new`。
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BoundaryRequest {
-    /// 谁划的这一刀。聊天渠道带上发送者，TUI 不带。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub by: Option<PeerId>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BoundaryResponse {
-    pub session: SessionId,
-    pub seq: Seq,
 }
 
 // ---- /v1/runs ----

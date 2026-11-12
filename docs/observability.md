@@ -81,7 +81,7 @@ komo.submit                    一次受理（一条输入 / write）：受理�
  │   ├─ execute_tool           工具任务 execute 阶段里真正执行的那次尝试
  │   └─ 事件（提交之后）：komo.entry（id、kind）· komo.submission（结算：done / unanswered + reason）
  │        komo.checkpoint（阶段在调用中途前进）· komo.replay（嵌套调用从 komo.nested 回放）
- │        komo.report（type）· komo.handoff（字数，docs/handoff.md）
+ │        komo.report（type）· komo.handoff（字数，docs/archive/handoff.md）
  └─ komo.phase …               下一个 generation、它的工具任务……都挂在同一个 trace 下
 后台（各自一棵树，不变）：
  komo.memory.extract · komo.memory.consolidate · komo.cron.firing · komo.delivery · komo.mcp.connect
@@ -117,7 +117,7 @@ komo.submit                    一次受理（一条输入 / write）：受理�
 | `komo.reports` | counter | `komo.report.type` | **新增**（pi `pi.durable.reports`） |
 | `komo.durable.commit.duration`（秒） | histogram | `komo.commit.kind`（structural / progress）、`komo.commit.outcome`（ok / rejected / failed） | **新增**：存储层 |
 | `komo.durable.gate.wait`（秒） | histogram | `komo.gate.op`（commit / read） | **新增**：等提交线的时间 |
-| `komo.handoffs` | counter | `komo.session.kind` | **新增**（`docs/handoff.md`） |
+| `komo.handoffs` | counter | `komo.session.kind` | **新增**（`docs/archive/handoff.md`） |
 | `komo.memory.injected` · `.used` · `komo.memory.extract.skipped` | counter | 同第一版 | 在 |
 | `komo.delivery.failures` · `komo.cron.failures` · `komo.mcp.connect.failures` | counter | 同第一版 | 在 |
 

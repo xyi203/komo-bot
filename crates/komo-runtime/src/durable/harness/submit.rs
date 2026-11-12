@@ -210,7 +210,7 @@ impl Harness {
         .await
     }
 
-    /// 手动压缩（`/compact`）：起一个 conversation 所有的压缩任务，不是 background，所以
+    /// 手动压缩（用户入口 `/compact` 已在 2026-11-12 删除，在线压缩是自动的）：起一个 conversation 所有的压缩任务，不是 background，所以
     /// `abort_conversation` 会取消它；摘要像别的被动 write 一样放置（空闲时立刻落，忙时在下一个
     /// boundary 落，过期了 `unanswered{stale}`）。返回任务 ID，结局从任务记录读。
     pub async fn compact(

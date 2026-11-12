@@ -11,20 +11,18 @@ use komo_kernel::protocol::config::{ConfigIssue, IssueSeverity, SourceFile};
 use komo_kernel::protocol::http::{
     CompactionSummary, ConfigCheckResponse, ConfigReloadResponse, ConsolidateAction,
     ConsolidateGroupStatus, ConsolidateOutcome, CronListResponse, HealthResponse, IndexState,
-    InterventionDetail, InterventionListResponse, InterventionSummary, McpReconnectResponse,
-    McpServerState, McpServerStatus, MemoryConsolidateResponse, MemoryIndexStatus,
-    MemoryListResponse, MemorySweepResponse, ModelWindow, MonitorListResponse, RunDetail,
-    SessionListResponse, SessionSearchResponse, SessionSummary, SweepRule, TelemetryHealth,
-    ToolCallSummary, WindowSource,
+    InterventionDetail, InterventionKind, InterventionListResponse, InterventionSummary,
+    InterventionVerdict, McpReconnectResponse, McpServerState, McpServerStatus,
+    MemoryConsolidateResponse, MemoryIndexStatus, MemoryListResponse, MemorySweepResponse,
+    ModelWindow, MonitorListResponse, RunDetail, SessionListResponse, SessionSearchResponse,
+    SessionSummary, SweepRule, TelemetryHealth, ToolCallSummary, WindowSource,
 };
 use komo_kernel::types::memory::{
     ArmScore, Confirmation, MemoryItem, MemoryKind, MemoryScope, MemoryState, Provenance,
     RecallDiagnostics, RetrievalMode,
 };
-use komo_kernel::types::status::{RunState, SessionState, ToolCallState, WaitReason};
+use komo_kernel::types::status::{RetryCause, RunState, SessionState, ToolCallState, WaitReason};
 use time::OffsetDateTime;
-
-use crate::tui::app::{intervention_kind_text, status_text, verdicts_text, wait_text};
 
 mod matter;
 pub use matter::{matter_changed, matter_line, matter_list, matter_show};
@@ -1373,6 +1371,101 @@ fn one_line(text: &str) -> String {
         format!("{}…", flat.chars().take(59).collect::<String>())
     } else {
         flat
+    }
+}
+
+/// §7.5 的两类，如实显示。清单、提示行都要它，所以放在这里而不是各写一份。
+pub fn intervention_kind_text(kind: InterventionKind) -> &'static str {
+    match kind {
+        InterventionKind::Verify => "结果不明",
+        InterventionKind::Blocked => "阻塞",
+        InterventionKind::Confirm => "待确认",
+    }
+}
+
+/// 这一条此刻允许答复什么。**空表如实印成「（无）」**——自己推一个菜单会给出一个按下去
+/// 没反应的答案（§11.3）。
+pub fn verdicts_text(verdicts: &[InterventionVerdict]) -> String {
+    if verdicts.is_empty() {
+        return "（无）".into();
+    }
+    verdicts
+        .iter()
+        .map(|verdict| verdict.as_str())
+        .collect::<Vec<_>>()
+        .join(" / ")
+}
+
+/// §6 / §8.4 的状态，如实显示。
+///
+/// `Waiting` 只有一个词，因为**"在等什么"是另一个维度**（[`WaitReason`]）：状态行把它
+/// 接在后面印（见 [`wait_text`]），而不是在这里编出"等待干预 / 等待重试"几种状态。
+pub fn status_text(state: RunState) -> &'static str {
+    match state {
+        RunState::Accepted => "已受理",
+        RunState::Queued => "排队中",
+        RunState::Running => "运行中",
+        RunState::Waiting => "等待中",
+        RunState::Completed => "已完成",
+        RunState::Failed => "已失败",
+        RunState::Cancelled => "已取消",
+        RunState::Abandoned => "已放弃",
+        RunState::Absorbed => "已并入",
+    }
+}
+
+/// 「停着，而且在等什么」。§8.4：**排队二十分钟不知道为什么**正是这一格要答的问题。
+///
+/// `now` 由驱动传进来（状态机不读时钟）；`Retry` 那一句要算"还有多久"才算说得清。
+pub fn wait_text(reason: &WaitReason, now: Option<OffsetDateTime>) -> String {
+    match reason {
+        // 句柄（Run ID）才是操作者要用的东西，而这一格只报"在等谁"：具体那一条在 §7.5 的
+        // 清单里，状态行不复述它、也不替它编一个 id。
+        //
+        // `Approval` 只从 2026-10-11 之前的旧行解码出来（审批已删除）：Gateway 启动时按
+        // "批准"续跑它，它不等人——如实说成马上续跑，不说"等审批"。
+        WaitReason::Approval { .. } => "旧的审批等待，Gateway 会直接续跑".into(),
+        WaitReason::Intervention { .. } => "等一条干预的答复".into(),
+        WaitReason::Dependency { run } => format!("在等 Run {run}"),
+        WaitReason::Retry {
+            attempts,
+            not_before,
+            cause,
+        } => {
+            let remaining = match now {
+                Some(now) if *not_before > now => {
+                    format!("{} 后", wait_span(*not_before - now))
+                }
+                // 到点了却还停着：下一拍就会重试，别报一个负数的"还要等"。
+                _ => "马上".into(),
+            };
+            format!(
+                "{remaining}重试（{}，第 {attempts} 次）",
+                retry_cause_text(*cause)
+            )
+        }
+    }
+}
+
+/// 一次有界退避是**哪一种**失败（§8.5）：分类不是为了好看，是让人一眼知道该不该干预。
+fn retry_cause_text(cause: RetryCause) -> &'static str {
+    match cause {
+        RetryCause::RateLimited => "限流",
+        RetryCause::Transport => "连不上",
+        RetryCause::Server => "服务端错误",
+        RetryCause::Contended => "本地写争用",
+    }
+}
+
+/// 一段时长的人话。
+fn wait_span(duration: time::Duration) -> String {
+    let seconds = duration.whole_seconds().max(0);
+    if seconds < 60 {
+        format!("{seconds}s")
+    } else if seconds < 3600 {
+        format!("{}m{:02}s", seconds / 60, seconds % 60)
+    } else {
+        format!("{}h{:02}m", seconds / 3600, (seconds % 3600) / 60)
     }
 }
 

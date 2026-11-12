@@ -10,9 +10,6 @@ license.workspace = true
 komo-kernel = { workspace = true }
 reqwest = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "io-util"] }
-ratatui = { workspace = true }
-crossterm = { workspace = true }
-pulldown-cmark = { workspace = true }
 
 serde = { workspace = true }
 serde_json = { workspace = true }

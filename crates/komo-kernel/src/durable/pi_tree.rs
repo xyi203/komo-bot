@@ -1,5 +1,5 @@
 //! 把一个 komo Session 的 conversation 与 entry 投影成 pi v3 会话树（D5 W1a，
-//! `docs/storage-durable-d5.md` §4 / §7）：纯函数，供 `/tree`、导航、`/fork` `/clone`、D6 导出共用。
+//! `docs/storage-durable-d5.md` §4 / §7）：纯函数，供 `/tree`、D6 导出共用。
 //!
 //! 输入是 Session 的全部 conversation（各自的 entry 按 ID 升序）、当前分支与可选的导航位置
 //! `leaf`；输出是 [`SessionEntry`] 列表（追加序，父在子前）与 `leaf_id`，交给

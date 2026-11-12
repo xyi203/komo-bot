@@ -12,7 +12,7 @@ web
 
 ## Product Purpose
 
-komo 是一个 Rust 个人 agent 框架：一个二进制提供交互式 LLM 聊天、本地工具、长期记忆、目标与领域、定时 Job（prompt 或直跑命令），以及一个 always-on gateway 承载聊天渠道（飞书 / Telegram / 微信，独立插件进程）和主动后台工作。gateway 是唯一持有状态的进程，TUI、CLI 与 Web 客户端都是它的 HTTP / SSE 客户端（macOS 与手机客户端在计划中，见 `docs/clients.md`）。所有状态本地存于 `~/.komo`。
+komo 是一个 Rust 个人 agent 框架：一个二进制提供 Gateway 与 CLI，对话在网页与聊天渠道里，另有本地工具、长期记忆、目标与领域、定时 Job（prompt 或直跑命令），以及一个 always-on gateway 承载聊天渠道（飞书 / Telegram / 微信，独立插件进程）和主动后台工作。gateway 是唯一持有状态的进程，CLI 与 Web 客户端都是它的 HTTP / SSE 客户端（macOS 与手机客户端在计划中，见 `docs/clients.md`）。所有状态本地存于 `~/.komo`。
 
 成功的定义（用户确认）：**长期记忆越用越懂我** —— 记忆系统随时间积累出真实价值，agent 越来越了解它的主人，这是与其他 agent 框架的根本差异。日常依赖与工程品质服务于这个目标。
 
@@ -22,7 +22,7 @@ komo 是一个 Rust 个人 agent 框架：一个二进制提供交互式 LLM 聊
 
 ## Operating Context
 
-- 主形态是聊天助理：终端 TUI（`komo`）、Web 客户端（`apps/client`，见 `docs/web.md`）、以及飞书 / Telegram / 微信渠道内的对话。
+- 主形态是聊天助理：Web 客户端（`apps/client`，见 `docs/web.md`；终端里敲 `komo` 打开它的配对链接）、以及飞书 / Telegram / 微信渠道内的对话。终端 TUI 已于 2026-11-12 删除。
 - gateway 作为常驻进程运行（macOS launchd / Linux systemd 托管），承担定时 Job、monitor、后台任务会话与记忆提取；主动消息经 home chat 送达。
 - 操作者通过 CLI 或 Web 管理记忆、目标与领域、技能、cron、会话与配置，全部走 gateway 的 `/v1/*` HTTP 接口。没有审批与权限策略（2026-10-11 删除）；唯一的例外是触发器起的 Run 调用声明为对外的工具时，停在 confirm 检查点等操作者 approve / reject（`docs/confirm.md`），在 Web 的待处理页或渠道里答。
 - 单机单用户：数据库、配置、凭证都在本地 `~/.komo` 下。
@@ -46,15 +46,15 @@ komo 是一个 Rust 个人 agent 框架：一个二进制提供交互式 LLM 聊
 
 ## Evidence on Hand
 
-- 真实可运行的产品：CLI、TUI、gateway、三个聊天渠道与 Web 原型均已实现；`README.md` 的功能描述有代码背书。桌面与手机客户端尚未开始。
+- 真实可运行的产品：CLI、gateway、三个聊天渠道与 Web 客户端均已实现；`README.md` 的功能描述有代码背书。桌面与手机客户端尚未开始。
 - 无测评、无用户案例、无第三方评价——未来对外表述不得虚构这些。
 
 ## Product Principles
 
 1. **记忆是产品的心脏**：功能与界面取舍优先服务「越用越懂我」——让记忆的积累、回忆与巩固可见、可信、可管理。
-2. **作者优先，新人不受阻**：以首要用户的真实工作流为准绳做深，同时首次上手路径（init → 配 key → chat）必须对陌生自托管用户顺畅。
+2. **作者优先，新人不受阻**：以首要用户的真实工作流为准绳做深，同时首次上手路径（init → 配 key → `komo` 打开网页聊）必须对陌生自托管用户顺畅。
 3. **本地与安静**：数据留在本地，主动性有节制——温暖而不打扰是人格也是行为准则（只有触发器起的对外动作才停下来问、渠道的安静行为都体现这一点）。
-4. **一个世界，多个入口**：TUI、Web（以后的桌面与手机）、聊天渠道是同一个 agent 的不同入口；术语、行为与人格跨入口一致。
+4. **一个世界，多个入口**：Web（以及桌面端与以后的手机）、聊天渠道是同一个 agent 的不同入口；术语、行为与人格跨入口一致。
 
 ## Accessibility & Inclusion
 

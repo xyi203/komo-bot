@@ -1,6 +1,6 @@
 //! komo 二进制：clap 分发（docs/komo_bot.md §3 命令表、§13.4）。
 //!
-//! 这一层只做分发：`komo` / `komo home` / `komo resume` 与操作子命令走 komo-client，
+//! 这一层只做分发：`komo` / `komo web` 与操作子命令走 komo-client，
 //! `komo gateway` 走 komo-gateway。**没有第二份业务逻辑**——每条命令要么打一个 HTTP
 //! 接口，要么读一次配置文件。
 
@@ -13,13 +13,11 @@ mod update;
 use std::path::Path;
 
 use clap::{Parser, Subcommand};
-use komo_client::{TuiMode, run_tui};
-use komo_kernel::types::ids::SessionId;
 
 #[derive(Parser)]
 #[command(name = "komo", version, about = "komo：个人 Agent 框架", long_about = None)]
 struct Cli {
-    /// 不带子命令时：确保本机 Gateway 就绪，创建新 Session，进入 TUI 聊天（§3）。
+    /// 不带子命令时：确保本机 Gateway 就绪，再做 `komo web` 做的事（§3）。
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -30,13 +28,6 @@ enum Command {
     /// （`docs/codemode.md` §3）。不给人用，不进 `--help`。
     #[command(name = "__codemode-worker", hide = true)]
     CodemodeWorker,
-    /// 操作者那一个常驻会话：早上在微信说的话，回到终端接着说（§11.2）。
-    Home,
-    /// 连接原会话并查看进度或处理待办；恢复调度由 Gateway 自动进行（§3）。
-    Resume {
-        /// 会话 ID。
-        session_id: String,
-    },
     /// 在浏览器里打开网页版：向 Gateway 要一个一次性配对码，打开 `/pair#code=…`，网页换出会话 cookie（`docs/clients.md` D6）。
     ///
     /// 码在 URL 的 fragment 里，不进服务器日志；用一次作废，两分钟失效。Gateway 重启后 cookie 失效，要重新运行。
@@ -592,72 +583,42 @@ async fn main() {
     std::process::exit(code);
 }
 
-/// 跑一条命令。`Ok(None)` = 这条命令自己管输出（TUI、前台 Gateway）。
+/// 裸 `komo` 与 `komo web` 是同一件事：终端里没有对话入口，对话在网页（与渠道）里。
+fn command_of(cli: Cli) -> Command {
+    cli.command.unwrap_or(Command::Web { no_open: false })
+}
+
+/// `komo web`：确保 Gateway 就绪，要一个一次性配对码，打开配对链接。
+async fn web(home: &Path, no_open: bool) -> Result<Option<String>, String> {
+    init_tracing(None, None);
+    let client = connect::connect_or_start(home).await?;
+    let discovery =
+        komo_client::discovery::read_discovery_file(home).map_err(|error| error.to_string())?;
+    let base_url = client.base_url();
+    let pair = komo_gateway::http::request_pair_code(&base_url, discovery.token.as_deref()).await?;
+    let url = format!("{}/pair#code={}", base_url.trim_end_matches('/'), pair.code);
+    if !no_open && !commands::open_in_browser(&url) {
+        eprintln!("没能自动打开浏览器，请手动打开下面的链接。");
+    }
+    Ok(Some(format!(
+        "{url}\n（一次性链接，{} 秒内有效，用过即作废）",
+        pair.expires_in_secs
+    )))
+}
+
+/// 跑一条命令。`Ok(None)` = 这条命令自己管输出（前台 Gateway）。
 async fn dispatch(cli: Cli, home: &Path) -> Result<Option<String>, String> {
-    match cli.command {
-        Some(Command::CodemodeWorker) => std::process::exit(komo_tools::codemode::worker::run()),
-        // `komo`：确保本机 Gateway 就绪，进入 TUI 聊天（§3）。**会话不在这里建**——
-        // TUI 里发出第一条消息时才铸：看一眼、一个字没发就退出，不该在账本和磁盘上
-        // 留下一个空壳会话。
-        None => {
-            init_tracing(None, None);
-            let client = connect::connect_or_start(home).await?;
-            run_tui(client, None, TuiMode::New)
-                .await
-                .map_err(|error| error.to_string())?;
-            Ok(None)
-        }
-        Some(Command::Home) => {
-            init_tracing(None, None);
-            let client = connect::connect_or_start(home).await?;
-            let discovery = komo_client::discovery::read_discovery_file(home)
-                .map_err(|error| error.to_string())?;
-            let base_url = client.base_url();
-            let session =
-                komo_gateway::http::fetch_home_session(&base_url, discovery.token.as_deref())
-                    .await?;
-            run_tui(client, Some(session.session), TuiMode::Home)
-                .await
-                .map_err(|error| error.to_string())?;
-            Ok(None)
-        }
-        Some(Command::Web { no_open }) => {
-            init_tracing(None, None);
-            let client = connect::connect_or_start(home).await?;
-            let discovery = komo_client::discovery::read_discovery_file(home)
-                .map_err(|error| error.to_string())?;
-            let base_url = client.base_url();
-            let pair = komo_gateway::http::request_pair_code(&base_url, discovery.token.as_deref())
-                .await?;
-            let url = format!("{}/pair#code={}", base_url.trim_end_matches('/'), pair.code);
-            if !no_open && !commands::open_in_browser(&url) {
-                eprintln!("没能自动打开浏览器，请手动打开下面的链接。");
-            }
-            Ok(Some(format!(
-                "{url}\n（一次性链接，{} 秒内有效，用过即作废）",
-                pair.expires_in_secs
-            )))
-        }
-        Some(Command::Resume { session_id }) => {
-            init_tracing(None, None);
-            let client = connect::connect_or_start(home).await?;
-            run_tui(
-                client,
-                Some(SessionId::from_raw(session_id)),
-                TuiMode::Resume,
-            )
-            .await
-            .map_err(|error| error.to_string())?;
-            Ok(None)
-        }
-        Some(Command::Gateway { foreground, action }) => gateway(home, foreground, action).await,
+    match command_of(cli) {
+        Command::CodemodeWorker => std::process::exit(komo_tools::codemode::worker::run()),
+        Command::Web { no_open } => web(home, no_open).await,
+        Command::Gateway { foreground, action } => gateway(home, foreground, action).await,
         // 不经 Gateway（§3）：Gateway 起来要先有配置，这条命令就是生成那份配置。
-        Some(Command::Init) => commands::init(home).map(Some),
-        Some(Command::Doctor { reconcile }) => commands::doctor(home, reconcile).await.map(Some),
+        Command::Init => commands::init(home).map(Some),
+        Command::Doctor { reconcile } => commands::doctor(home, reconcile).await.map(Some),
         // 也不经 Gateway（§3）：它换的是磁盘上那份二进制，与在跑的那个进程无关。
-        Some(Command::Update) => update::run(home).await.map(Some),
+        Command::Update => update::run(home).await.map(Some),
         // 三条不经 Gateway 的（§3）。
-        Some(Command::Channel { action }) => match action {
+        Command::Channel { action } => match action {
             ChannelCommand::Login { channel } => {
                 let platform = komo_kernel::types::chat::ChannelPlatform::parse(&channel)
                     .filter(|p| *p != komo_kernel::types::chat::ChannelPlatform::Api)
@@ -680,7 +641,7 @@ async fn dispatch(cli: Cli, home: &Path) -> Result<Option<String>, String> {
             },
         },
         // 不经 Gateway（§3、§13.3）：设备码登录直接落盘，同微信登录的先例。
-        Some(Command::Auth { action }) => match action {
+        Command::Auth { action } => match action {
             AuthCommand::Codex { action } => match action {
                 CodexAuthCommand::Login => {
                     let path = komo_gateway::codex_auth::credentials_path(home);
@@ -705,7 +666,7 @@ async fn dispatch(cli: Cli, home: &Path) -> Result<Option<String>, String> {
                 McpAuthCommand::Status => commands::auth_mcp_status(home).map(Some),
             },
         },
-        Some(Command::Skills { action }) => {
+        Command::Skills { action } => {
             use commands::SkillsAction;
             let action = match &action {
                 SkillsCommand::List => SkillsAction::List,
@@ -723,13 +684,7 @@ async fn dispatch(cli: Cli, home: &Path) -> Result<Option<String>, String> {
     }
 }
 
-async fn operator(
-    command: Option<Command>,
-    client: &komo_client::KomoClient,
-) -> Result<String, String> {
-    let Some(command) = command else {
-        return Err("没有这条命令".into());
-    };
+async fn operator(command: Command, client: &komo_client::KomoClient) -> Result<String, String> {
     match command {
         Command::Session { action } => match action {
             SessionCommand::List { all, limit, cursor } => {
@@ -1144,6 +1099,85 @@ mod tests {
     use super::*;
     use clap::CommandFactory;
 
+    /// 终端里没有对话入口：裸 `komo` 与 `komo web` 是同一件事（要配对链接、开浏览器）。
+    #[test]
+    fn bare_komo_is_komo_web() {
+        assert!(matches!(
+            command_of(Cli::parse_from(["komo"])),
+            Command::Web { no_open: false }
+        ));
+        assert!(matches!(
+            command_of(Cli::parse_from(["komo", "web", "--no-open"])),
+            Command::Web { no_open: true }
+        ));
+        // 已经删掉的子命令不再能解析。
+        for gone in ["home", "resume"] {
+            assert!(Cli::try_parse_from(["komo", gone, "x"]).is_err(), "{gone}");
+        }
+    }
+
+    /// `komo web` 连上发现文件指的 Gateway，要一个配对码，印出 `/pair#code=…` 链接。
+    /// 假 Gateway 在 loopback 上，身份、协议版本与数据目录都对得上；码在 fragment 里。
+    #[tokio::test]
+    async fn web_prints_a_pairing_link_from_the_gateway_in_the_discovery_file() {
+        use axum::routing::{get, post};
+        use axum::{Json, Router};
+        use komo_kernel::protocol::PROTOCOL_VERSION;
+        use komo_kernel::protocol::http::{HealthResponse, PairCodeResponse};
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let dir = tempfile::tempdir().expect("临时数据目录");
+        let data_dir = dir.path().to_string_lossy().to_string();
+        let health = HealthResponse {
+            instance_id: "inst-1".into(),
+            version: "test".into(),
+            protocol_version: PROTOCOL_VERSION,
+            started_at: time::OffsetDateTime::now_utc(),
+            data_dir,
+            telemetry: Default::default(),
+        };
+        let app = Router::new()
+            .route("/healthz", get(move || async move { Json(health) }))
+            .route(
+                "/v1/web/pair-code",
+                post(|| async {
+                    Json(PairCodeResponse {
+                        code: "abc123".into(),
+                        expires_in_secs: 120,
+                    })
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("绑定 loopback");
+        let base_url = format!("http://{}", listener.local_addr().expect("本地地址"));
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        std::fs::create_dir_all(dir.path().join("runtime")).expect("runtime 目录");
+        std::fs::write(
+            dir.path().join("runtime/gateway.json"),
+            serde_json::json!({
+                "instance_id": "inst-1",
+                "base_url": base_url,
+                "protocol_version": PROTOCOL_VERSION,
+            })
+            .to_string(),
+        )
+        .expect("写发现文件");
+
+        let out = web(dir.path(), true)
+            .await
+            .expect("komo web")
+            .expect("有输出");
+        server.abort();
+        assert!(
+            out.starts_with(&format!("{base_url}/pair#code=abc123\n")),
+            "{out}"
+        );
+        assert!(out.contains("120 秒"), "{out}");
+    }
+
     /// 指标事件（`komo::metrics`，DEBUG）不进文本日志：哪怕 `KOMO_LOG=debug`。
     #[test]
     fn metrics_events_stay_out_of_the_text_log() {
@@ -1213,16 +1247,8 @@ mod tests {
     fn the_documented_commands_parse() {
         assert!(Cli::parse_from(["komo"]).command.is_none());
         assert!(matches!(
-            Cli::parse_from(["komo", "home"]).command,
-            Some(Command::Home)
-        ));
-        assert!(matches!(
             Cli::parse_from(["komo", "web", "--no-open"]).command,
             Some(Command::Web { no_open: true })
-        ));
-        assert!(matches!(
-            Cli::parse_from(["komo", "resume", "sess-1"]).command,
-            Some(Command::Resume { .. })
         ));
         assert!(matches!(
             Cli::parse_from(["komo", "gateway", "--foreground"]).command,

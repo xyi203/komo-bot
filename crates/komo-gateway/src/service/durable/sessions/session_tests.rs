@@ -9,11 +9,10 @@ use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use async_trait::async_trait;
-use komo_kernel::durable::compaction::wrap_summary;
 use komo_kernel::durable::storage::{SubmissionQuery, TaskQuery};
 use komo_kernel::durable::{
-    ContentBlock, ConversationId, EditAction, EntryId, EntryRecord, Message, SessionLifecycle,
-    StopReason, Storage, SubmissionStatus, derive_context,
+    ContentBlock, ConversationId, EntryId, Message, SessionLifecycle, StopReason, Storage,
+    SubmissionStatus,
 };
 use komo_kernel::projection::{DEFAULT_MODEL_RESULT_BYTES, ProjectionContext};
 use komo_kernel::test_support::MemOutputStore;
@@ -34,10 +33,9 @@ use tokio::sync::Semaphore;
 use super::super::DurableCore;
 use super::super::submit::{InputRequest, ModelOverride};
 use super::agent_doc;
-use super::copy::ForkRequest;
 use super::tree::{
-    BEFORE_FIRST, CONTEXT_EDIT_ENTRY, LABEL_ENTRY, MODEL_CHANGE_ENTRY, NavigateRequest,
-    SESSION_INFO_ENTRY, Summarizer, TreeData,
+    BEFORE_FIRST, LABEL_ENTRY, LeafPos, MODEL_CHANGE_ENTRY, SESSION_INFO_ENTRY, TreeData,
+    input_text,
 };
 use super::{NewSession, SessionError};
 use crate::service::state::SystemClock;
@@ -315,12 +313,6 @@ fn text_of(message: &Message) -> String {
     }
 }
 
-/// 路径到 `leaf` 的模型上下文里所有文字（拼成一串，断言"在 / 不在"用）。
-fn context_text(tree: &TreeData, leaf: EntryId) -> String {
-    let path: Vec<EntryRecord> = tree.path(leaf).into_iter().cloned().collect();
-    serde_json::to_string(&derive_context(&path, None).messages).unwrap()
-}
-
 fn kinds(tree: &TreeData, conversation: ConversationId) -> Vec<String> {
     tree.branch(conversation)
         .unwrap()
@@ -328,6 +320,38 @@ fn kinds(tree: &TreeData, conversation: ConversationId) -> Vec<String> {
         .iter()
         .map(|entry| entry.kind.clone())
         .collect()
+}
+
+/// 把 `leaf` 直接写成"导航到 `target` 之后"的样子（选中输入时落在它的上一条）。导航的用户入口已删，
+/// 但更早的会话行里还留着这样的 `leaf`，提交与改名对它的落点逻辑还在，所以测试直接写它。
+async fn leave_leaf_at(core: &DurableCore, session: &str, target: EntryId) -> Option<EntryId> {
+    let tree = core.read_tree(session).await.unwrap();
+    let selected = tree.entry(target).expect("目标在树里");
+    let pos = match input_text(selected) {
+        Some(_) => tree
+            .prev_of(selected.id)
+            .map_or(LeafPos::BeforeFirst, LeafPos::At),
+        None => LeafPos::At(selected.id),
+    };
+    let mut record = tree.session.clone();
+    record.leaf = match pos {
+        LeafPos::BeforeFirst => Some(BEFORE_FIRST),
+        LeafPos::At(id) if Some(id) != tree.current_tail() => Some(id),
+        _ => None,
+    };
+    core.engine
+        .commit(move |tx| {
+            Box::pin(async move {
+                tx.put_session(record);
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+    match pos {
+        LeafPos::At(id) => Some(id),
+        _ => None,
+    }
 }
 
 // ------------------------------------------------------------------ 会话
@@ -463,7 +487,7 @@ async fn a_source_finds_its_earliest_active_session_and_never_a_main_one() {
 // ------------------------------------------------------------------ 导航与分支
 
 #[tokio::test]
-async fn editing_an_input_forks_at_its_parent_on_submit() {
+async fn a_leaf_left_in_the_middle_forks_at_its_parent_on_submit() {
     let fx = Fixture::new(FakeLlm::finisher("model answer")).await;
     let (session, ids) = fx
         .session_with(&[
@@ -475,14 +499,8 @@ async fn editing_an_input_forks_at_its_parent_on_submit() {
         .await;
     let (u2, a1) = (ids[2], ids[1]);
 
-    // 选中输入：落在它的上一条，原文给编辑框。
-    let outcome = fx
-        .core
-        .navigate(&session, NavigateRequest::to(u2))
-        .await
-        .unwrap();
-    assert_eq!(outcome.leaf, Some(a1));
-    assert_eq!(outcome.editor_text.as_deref(), Some("abandoned direction"));
+    // 选中输入：落在它的上一条。
+    assert_eq!(leave_leaf_at(&fx.core, &session, u2).await, Some(a1));
 
     // 提交：同一次提交里从 a1 fork，输入落在新分支，current_branch 改过去、leaf 清掉。
     let accepted = fx
@@ -532,7 +550,7 @@ async fn editing_an_input_forks_at_its_parent_on_submit() {
 }
 
 #[tokio::test]
-async fn navigation_alone_appends_nothing_and_persists_the_leaf() {
+async fn a_stored_leaf_survives_reopen_and_lands_the_next_submit() {
     let llm = FakeLlm::finisher("好");
     let dir = tempfile::tempdir().unwrap();
     let (core, _) = open_at(dir.path(), llm.clone()).await;
@@ -549,11 +567,7 @@ async fn navigation_alone_appends_nothing_and_persists_the_leaf() {
     let before = core.read_tree(&record.id).await.unwrap();
     assert_eq!(before.leaf, Some(ids[3]), "没导航过：跟着末端");
 
-    let outcome = core
-        .navigate(&record.id, NavigateRequest::to(ids[1]))
-        .await
-        .unwrap();
-    assert_eq!((outcome.leaf, outcome.editor_text), (Some(ids[1]), None));
+    assert_eq!(leave_leaf_at(&core, &record.id, ids[1]).await, Some(ids[1]));
     let after = core.read_tree(&record.id).await.unwrap();
     assert_eq!(after.session.leaf, Some(ids[1]));
     assert_eq!(after.leaf, Some(ids[1]));
@@ -564,7 +578,7 @@ async fn navigation_alone_appends_nothing_and_persists_the_leaf() {
             .entries
             .len(),
         4,
-        "导航不追加 entry"
+        "写 leaf 不追加 entry"
     );
     assert_eq!(after.branches.len(), 1, "也不新建 conversation");
 
@@ -575,19 +589,12 @@ async fn navigation_alone_appends_nothing_and_persists_the_leaf() {
     assert_eq!(reopened.leaf, Some(ids[1]));
     assert_eq!(reopened.session.leaf, Some(ids[1]));
 
-    // 导航回末端：记成"跟着末端"。
-    core.navigate(&record.id, NavigateRequest::to(ids[3]))
-        .await
-        .unwrap();
+    // 回到末端：记成"跟着末端"。
+    leave_leaf_at(&core, &record.id, ids[3]).await;
     assert_eq!(core.session(&record.id).await.unwrap().leaf, None);
 
     // 选中第一条输入：leaf 落在"第一条之前"，提交时建新根 conversation。
-    let outcome = core
-        .navigate(&record.id, NavigateRequest::to(ids[0]))
-        .await
-        .unwrap();
-    assert_eq!(outcome.leaf, None);
-    assert_eq!(outcome.editor_text.as_deref(), Some("q1"));
+    assert_eq!(leave_leaf_at(&core, &record.id, ids[0]).await, None);
     let tree = core.read_tree(&record.id).await.unwrap();
     assert_eq!(tree.session.leaf, Some(BEFORE_FIRST));
     assert_eq!(tree.leaf, None);
@@ -612,22 +619,16 @@ async fn navigation_alone_appends_nothing_and_persists_the_leaf() {
 }
 
 #[tokio::test]
-async fn navigating_to_the_end_of_another_branch_continues_that_branch_without_forking() {
+async fn a_leaf_at_the_end_of_another_branch_continues_that_branch_without_forking() {
     let fx = Fixture::new(FakeLlm::finisher("好")).await;
     let (session, ids) = fx
         .session_with(&[user("q1"), assistant("a1"), user("q2"), assistant("a2")])
         .await;
     // 在 a1 处分出第二个分支。
-    fx.core
-        .navigate(&session, NavigateRequest::to(ids[2]))
-        .await
-        .unwrap();
+    leave_leaf_at(&fx.core, &session, ids[2]).await;
     let side = fx.say(&session, InputRequest::new("side question")).await;
     // 回到老分支的末端 a2 再提交：接在老分支后面，不再 fork。
-    fx.core
-        .navigate(&session, NavigateRequest::to(ids[3]))
-        .await
-        .unwrap();
+    leave_leaf_at(&fx.core, &session, ids[3]).await;
     let back = fx.say(&session, InputRequest::new("main follow-up")).await;
     let tree = fx.tree(&session).await;
     assert_eq!(tree.branches.len(), 2);
@@ -650,10 +651,7 @@ async fn fork_copies_komo_agent_into_the_branch() {
         .unwrap();
 
     // 编辑成分支，同一提交复制 komo.agent；带 model 覆盖时 sticky 写在新分支上。
-    fx.core
-        .navigate(&session, NavigateRequest::to(ids[2]))
-        .await
-        .unwrap();
+    leave_leaf_at(&fx.core, &session, ids[2]).await;
     let accepted = fx
         .say(
             &session,
@@ -723,7 +721,7 @@ async fn fork_copies_komo_agent_into_the_branch() {
 }
 
 #[tokio::test]
-async fn the_same_request_key_is_one_submission_even_after_the_branch_moved() {
+async fn the_same_request_key_is_one_submission_even_after_the_leaf_moved() {
     let fx = Fixture::new(FakeLlm::finisher("好")).await;
     let (session, ids) = fx
         .session_with(&[user("q1"), assistant("a1"), user("q2"), assistant("a2")])
@@ -754,11 +752,8 @@ async fn the_same_request_key_is_one_submission_even_after_the_branch_moved() {
         "{conflict:?}"
     );
 
-    // 导航之后输入会去另一个 conversation，同一个键重发仍然认回原来那条。
-    fx.core
-        .navigate(&session, NavigateRequest::to(ids[2]))
-        .await
-        .unwrap();
+    // 旧 leaf 让输入去另一个 conversation，同一个键重发仍然认回原来那条。
+    leave_leaf_at(&fx.core, &session, ids[2]).await;
     let replay = fx
         .core
         .submit_input(&session, InputRequest::new("hello").request_id("k1"))
@@ -767,7 +762,7 @@ async fn the_same_request_key_is_one_submission_even_after_the_branch_moved() {
     assert!(replay.deduplicated && replay.submission == first.submission);
     let tree = fx.tree(&session).await;
     assert_eq!(tree.branches.len(), 1, "重发没有造出分支");
-    assert_eq!(tree.session.leaf, Some(ids[1]), "也没有动导航位置");
+    assert_eq!(tree.session.leaf, Some(ids[1]), "也没有动 leaf");
 }
 
 #[tokio::test]
@@ -796,91 +791,14 @@ async fn the_first_message_becomes_a_provisional_title() {
     assert!(record.changed_at >= record.created_at);
 }
 
-// ------------------------------------------------------------------ 分支摘要、label、name、edit
+// ------------------------------------------------------------------ name
 
 #[tokio::test]
-async fn a_branch_summary_forks_at_the_target_and_records_where_it_came_from() {
-    let fx = Fixture::new(FakeLlm::finisher("SUMMARY OF LEFT")).await;
-    let (session, ids) = fx
-        .session_with(&[user("task"), assistant("answer"), user("left branch")])
-        .await;
-    let model = sample_snapshot().model;
-    let outcome = fx
-        .core
-        .navigate(
-            &session,
-            NavigateRequest {
-                target: ids[1],
-                summarize: Some(Summarizer::new(fx.llm.clone(), model)),
-                instructions: Some("keep decisions".into()),
-                label: Some("checkpoint".into()),
-            },
-        )
-        .await
-        .unwrap();
-    let tree = fx.tree(&session).await;
-    assert_eq!(tree.branches.len(), 2);
-    let child = tree.session.current_branch;
-    assert_ne!(child, tree.session.root_conversation);
-    let entries = &tree.branch(child).unwrap().entries;
-    assert_eq!(
-        entries.iter().map(|e| e.kind.as_str()).collect::<Vec<_>>(),
-        [BRANCH_SUMMARY, LABEL_ENTRY]
-    );
-    let summary = &entries[0];
-    assert_eq!(
-        summary.data.as_ref().unwrap()["fromId"],
-        ids[2].get().to_string()
-    );
-    assert_eq!(summary.data.as_ref().unwrap()["summary"], "SUMMARY OF LEFT");
-    assert!(text_of(&summary.model.as_ref().unwrap()[0]).contains("SUMMARY OF LEFT"));
-    let label = &entries[1];
-    assert_eq!(
-        label.data.as_ref().unwrap()["targetId"],
-        summary.id.get().to_string()
-    );
-    assert_eq!(label.data.as_ref().unwrap()["label"], "checkpoint");
-    assert_eq!(outcome.leaf, Some(label.id));
-    assert_eq!(tree.session.leaf, None);
-    assert_eq!(tree.leaf, Some(label.id));
-
-    // 摘要的输入是序列化过的被放弃那一段，不是整条历史。
-    let requests = fx.llm.requests.lock().unwrap();
-    let input = requests[0].messages[0].text.as_deref().unwrap();
-    assert!(input.starts_with("<conversation>"), "{input}");
-    assert!(
-        input.contains("[User]: left branch") && !input.contains("[User]: task"),
-        "{input}"
-    );
-    assert!(requests[0].system_prompt.contains("keep decisions"));
-    drop(requests);
-
-    // 摘要进上下文，被放弃的原话不进。
-    let context = context_text(&tree, label.id);
-    assert!(
-        context.contains("SUMMARY OF LEFT") && !context.contains("left branch"),
-        "{context}"
-    );
-}
-
-const BRANCH_SUMMARY: &str = super::tree::BRANCH_SUMMARY_ENTRY;
-
-#[tokio::test]
-async fn labels_names_and_context_edits_are_entries_that_leave_history_alone() {
+async fn naming_appends_session_info_and_renames_in_one_commit() {
     let fx = Fixture::new(FakeLlm::finisher("好")).await;
     let (session, ids) = fx
         .session_with(&[user("original"), assistant("answer")])
         .await;
-    let (u, a) = (ids[0], ids[1]);
-
-    fx.core
-        .context_edit(&session, u, Some(json!({"content": "replacement"})))
-        .await
-        .unwrap();
-    fx.core
-        .label(&session, a, Some("checkpoint".into()))
-        .await
-        .unwrap();
     let named = fx.core.name(&session, "tree session").await.unwrap();
 
     let tree = fx.tree(&session).await;
@@ -888,13 +806,7 @@ async fn labels_names_and_context_edits_are_entries_that_leave_history_alone() {
     assert_eq!(tree.branches.len(), 1, "leaf 在末端，不分叉");
     assert_eq!(
         kinds(&tree, root),
-        [
-            "komo.user",
-            "komo.assistant",
-            CONTEXT_EDIT_ENTRY,
-            LABEL_ENTRY,
-            SESSION_INFO_ENTRY
-        ]
+        ["komo.user", "komo.assistant", SESSION_INFO_ENTRY]
     );
     assert_eq!(named.leaf, tree.current_tail());
     assert_eq!(
@@ -903,55 +815,23 @@ async fn labels_names_and_context_edits_are_entries_that_leave_history_alone() {
         "name 同提交改标题"
     );
     assert!(!tree.session.title_provisional);
-    let edit = &tree.branch(root).unwrap().entries[2];
-    assert_eq!(edit.edits.len(), 1);
-    assert_eq!(edit.edits[0].target, u);
-    assert!(matches!(edit.edits[0].action, EditAction::Replace { .. }));
-    // 原始历史没动，最新的路径上用的是替换。
-    assert_eq!(
-        text_of(&tree.entry(u).unwrap().model.as_ref().unwrap()[0]),
-        "original"
-    );
-    assert!(context_text(&tree, tree.leaf.unwrap()).contains("replacement"));
 
-    // 导航回编辑之前的位置：上下文里又是原文，编辑只在选中的路径上生效。
-    fx.core
-        .navigate(&session, NavigateRequest::to(a))
-        .await
-        .unwrap();
-    let tree = fx.tree(&session).await;
-    let context = context_text(&tree, tree.leaf.unwrap());
-    assert!(
-        context.contains("original") && !context.contains("replacement"),
-        "{context}"
-    );
-
-    // 在 a 处打标签：leaf 不在末端，先落分支（label 只是展示，不进上下文）。
-    fx.core
-        .label(&session, u, Some("first".into()))
-        .await
-        .unwrap();
+    // 旧 leaf 不在末端：先落分支再追加（session.info 只是展示，不进上下文）。
+    leave_leaf_at(&fx.core, &session, ids[1]).await;
+    fx.core.name(&session, "again").await.unwrap();
     let tree = fx.tree(&session).await;
     assert_eq!(tree.branches.len(), 2);
-    assert_eq!(kinds(&tree, tree.session.current_branch), [LABEL_ENTRY]);
+    assert_eq!(
+        kinds(&tree, tree.session.current_branch),
+        [SESSION_INFO_ENTRY]
+    );
     assert_eq!(tree.session.leaf, None);
-
-    // 不是消息的条目不能编辑；不存在的目标是 NotFound。
-    let label_id = tree.branch(tree.session.current_branch).unwrap().entries[0].id;
-    assert!(matches!(
-        fx.core.context_edit(&session, label_id, None).await,
-        Err(SessionError::Invalid(_))
-    ));
-    assert!(matches!(
-        fx.core.label(&session, EntryId::new(999_999), None).await,
-        Err(SessionError::NotFound(_))
-    ));
 }
 
 // ------------------------------------------------------------------ 复制
 
 #[tokio::test]
-async fn clone_rejects_purged_output_before_copy_without_residue() {
+async fn fork_rejects_purged_output_before_copy_without_residue() {
     let fx = Fixture::new(FakeLlm::finisher("好")).await;
     let (session, _) = fx.session_with(&[user("hello")]).await;
     let tree = fx.tree(&session).await;
@@ -969,10 +849,6 @@ async fn clone_rejects_purged_output_before_copy_without_residue() {
         .core
         .fork_session_with_hook(
             &session,
-            ForkRequest {
-                clone: true,
-                target: None,
-            },
             true,
             Box::new(move || {
                 Box::pin(async move {
@@ -992,7 +868,7 @@ async fn clone_rejects_purged_output_before_copy_without_residue() {
 }
 
 #[tokio::test]
-async fn clone_rejects_tree_change_after_copy_without_residue() {
+async fn fork_rejects_tree_change_after_copy_without_residue() {
     let fx = Fixture::new(FakeLlm::finisher("好")).await;
     let (session, ids) = fx.session_with(&[user("hello"), assistant("answer")]).await;
     let source_dir = fx.dir.path().join("sessions").join(&session);
@@ -1005,16 +881,10 @@ async fn clone_rejects_tree_change_after_copy_without_residue() {
         .core
         .fork_session_with_hook(
             &session,
-            ForkRequest {
-                clone: true,
-                target: None,
-            },
             false,
             Box::new(move || {
                 Box::pin(async move {
-                    core.navigate(&source, NavigateRequest::to(target))
-                        .await
-                        .unwrap();
+                    leave_leaf_at(&core, &source, target).await;
                 })
             }),
         )
@@ -1029,7 +899,7 @@ async fn clone_rejects_tree_change_after_copy_without_residue() {
 }
 
 #[tokio::test]
-async fn clone_copies_entries_and_blobs_and_survives_source_purge() {
+async fn fork_copies_entries_and_blobs_and_survives_source_purge() {
     let fx = Fixture::new(FakeLlm::finisher("好")).await;
     let (session, ids) = fx.session_with(&[user("task"), assistant("result")]).await;
     // 源会话的 blob：工具输出与 artifact。
@@ -1039,17 +909,7 @@ async fn clone_copies_entries_and_blobs_and_survives_source_purge() {
     std::fs::create_dir_all(source_dir.join("tool-output/7/9/1")).unwrap();
     std::fs::write(source_dir.join("tool-output/7/9/1/stdout"), "out").unwrap();
 
-    let clone = fx
-        .core
-        .fork_session(
-            &session,
-            ForkRequest {
-                target: None,
-                clone: true,
-            },
-        )
-        .await
-        .unwrap();
+    let clone = fx.core.fork_session(&session).await.unwrap();
     assert_ne!(clone.id, session);
     assert_eq!(clone.kind, komo_kernel::durable::SessionKind::Normal);
     assert_eq!(clone.parent_session, None);
@@ -1144,53 +1004,34 @@ async fn clone_copies_entries_and_blobs_and_survives_source_purge() {
 }
 
 #[tokio::test]
-async fn fork_stops_before_the_selected_input_and_clone_keeps_it() {
+async fn fork_copies_to_the_leaf_and_stops_before_a_trailing_input() {
     let fx = Fixture::new(FakeLlm::finisher("好")).await;
     let (session, ids) = fx
-        .session_with(&[user("q1"), assistant("a1"), user("q2"), assistant("a2")])
+        .session_with(&[user("q1"), assistant("a1"), user("q2")])
         .await;
-    let forked = fx
-        .core
-        .fork_session(
-            &session,
-            ForkRequest {
-                target: Some(ids[2]),
-                clone: false,
-            },
-        )
-        .await
-        .unwrap();
+    // 末条是还没得到回答的输入：不带进副本。
+    let forked = fx.core.fork_session(&session).await.unwrap();
     let tree = fx.tree(&forked.id).await;
     assert_eq!(
         kinds(&tree, forked.root_conversation),
         ["komo.user", "komo.assistant"]
     );
-    let cloned = fx
-        .core
-        .fork_session(
-            &session,
-            ForkRequest {
-                target: Some(ids[2]),
-                clone: true,
-            },
-        )
-        .await
-        .unwrap();
-    let tree = fx.tree(&cloned.id).await;
+    // 末条不是输入：整条路径都复制。
+    let (whole, _) = fx
+        .session_with(&[user("q1"), assistant("a1"), user("q2"), assistant("a2")])
+        .await;
+    let copied = fx.core.fork_session(&whole).await.unwrap();
+    let tree = fx.tree(&copied.id).await;
     assert_eq!(
-        kinds(&tree, cloned.root_conversation),
-        ["komo.user", "komo.assistant", "komo.user"]
+        kinds(&tree, copied.root_conversation),
+        ["komo.user", "komo.assistant", "komo.user", "komo.assistant"]
     );
-    // 默认目标是当前 leaf（导航过就是导航到的位置）。
-    fx.core
-        .navigate(&session, NavigateRequest::to(ids[1]))
-        .await
-        .unwrap();
-    let at_leaf = fx
-        .core
-        .fork_session(&session, ForkRequest::default())
-        .await
-        .unwrap();
+    // 旧 leaf 不在末端：复制到它为止。
+    let (stale, stale_ids) = fx
+        .session_with(&[user("q1"), assistant("a1"), user("q2"), assistant("a2")])
+        .await;
+    leave_leaf_at(&fx.core, &stale, stale_ids[1]).await;
+    let at_leaf = fx.core.fork_session(&stale).await.unwrap();
     let tree = fx.tree(&at_leaf.id).await;
     assert_eq!(
         tree.branch(at_leaf.root_conversation)
@@ -1199,18 +1040,9 @@ async fn fork_stops_before_the_selected_input_and_clone_keeps_it() {
             .len(),
         2
     );
-    // 第一条输入之前没有东西可复制：fork 出一个空会话，能接着聊。
-    let empty = fx
-        .core
-        .fork_session(
-            &session,
-            ForkRequest {
-                target: Some(ids[0]),
-                clone: false,
-            },
-        )
-        .await
-        .unwrap();
+    // 只有一条输入：之前没有东西可复制，fork 出一个空会话。
+    let (single, _) = fx.session_with(&[user("q1")]).await;
+    let empty = fx.core.fork_session(&single).await.unwrap();
     assert!(
         fx.tree(&empty.id)
             .await
@@ -1219,15 +1051,14 @@ async fn fork_stops_before_the_selected_input_and_clone_keeps_it() {
             .entries
             .is_empty()
     );
+    let _ = ids;
     let blank = fx
         .core
         .create_session(NewSession::new("assistant"))
         .await
         .unwrap();
     assert!(matches!(
-        fx.core
-            .fork_session(&blank.id, ForkRequest::default())
-            .await,
+        fx.core.fork_session(&blank.id).await,
         Err(SessionError::Invalid(_))
     ));
 }
@@ -1262,7 +1093,7 @@ async fn copies_rewrite_heads_edit_targets_and_the_ids_gateway_entries_refer_to(
                 let answer = tx
                     .append_entry(root, EntryDraft::new(kind).with_model(vec![message]))
                     .await?;
-                let mut edit = EntryDraft::new(CONTEXT_EDIT_ENTRY);
+                let mut edit = EntryDraft::new("context.edit");
                 edit.edits = vec![komo_kernel::durable::ContextEdit::omit(input.id)];
                 tx.append_entry(root, edit).await?;
                 tx.append_entry(
@@ -1276,17 +1107,7 @@ async fn copies_rewrite_heads_edit_targets_and_the_ids_gateway_entries_refer_to(
         })
         .await
         .unwrap();
-    let clone = fx
-        .core
-        .fork_session(
-            &record.id,
-            ForkRequest {
-                target: None,
-                clone: true,
-            },
-        )
-        .await
-        .unwrap();
+    let clone = fx.core.fork_session(&record.id).await.unwrap();
     let tree = fx.tree(&clone.id).await;
     let entries = &tree.branch(clone.root_conversation).unwrap().entries;
     assert_eq!(entries.len(), 5);
@@ -1318,7 +1139,7 @@ async fn tree_ops_are_refused_while_any_branch_is_busy() {
         .create_session(NewSession::new("assistant"))
         .await
         .unwrap();
-    let ids = seed(
+    seed(
         &core,
         record.root_conversation,
         &[user("q1"), assistant("a1")],
@@ -1345,16 +1166,6 @@ async fn tree_ops_are_refused_while_any_branch_is_busy() {
         Err(SessionError::Busy(_)) => {}
         other => panic!("忙时应该是 Busy：{other:?}"),
     };
-    busy(
-        core.navigate(&record.id, NavigateRequest::to(ids[0]))
-            .await
-            .map(drop),
-    );
-    busy(
-        core.label(&record.id, ids[0], Some("x".into()))
-            .await
-            .map(drop),
-    );
     // 改名不等 Run：只改标题，树不动
     let entries_before = core
         .read_tree(&record.id)
@@ -1377,19 +1188,7 @@ async fn tree_ops_are_refused_while_any_branch_is_busy() {
         entries_before,
         "忙时改名不追加 entry"
     );
-    busy(core.context_edit(&record.id, ids[0], None).await.map(drop));
-    busy(core.compact(&record.id, None).await.map(drop));
-    busy(
-        core.fork_session(
-            &record.id,
-            ForkRequest {
-                target: None,
-                clone: true,
-            },
-        )
-        .await
-        .map(drop),
-    );
+    busy(core.fork_session(&record.id).await.map(drop));
     // 忙时提交：默认排队；`Reject` 被拒且什么都没写。
     let queued = core
         .submit_input(&record.id, InputRequest::new("later"))
@@ -1451,9 +1250,7 @@ async fn a_busy_branch_that_is_not_current_still_blocks_tree_ops() {
         &[user("q1"), assistant("a1"), user("q2"), assistant("a2")],
     )
     .await;
-    core.navigate(&record.id, NavigateRequest::to(ids[2]))
-        .await
-        .unwrap();
+    leave_leaf_at(&core, &record.id, ids[2]).await;
     let side = core
         .submit_input(&record.id, InputRequest::new("side"))
         .await
@@ -1479,7 +1276,7 @@ async fn a_busy_branch_that_is_not_current_still_blocks_tree_ops() {
         "别的分支忙时也能改名"
     );
     assert!(matches!(
-        core.navigate(&record.id, NavigateRequest::to(ids[0])).await,
+        core.fork_session(&record.id).await,
         Err(SessionError::Busy(_))
     ));
     permits.add_permits(100);
@@ -1488,84 +1285,12 @@ async fn a_busy_branch_that_is_not_current_still_blocks_tree_ops() {
     core.close().await.unwrap();
 }
 
-#[tokio::test]
-async fn compact_runs_on_the_current_branch_and_waits_for_the_summary() {
-    let fx = Fixture::new(FakeLlm::finisher("MANUAL SUMMARY")).await;
-    let (session, _) = fx
-        .session_with(&[
-            user("first question"),
-            assistant("first answer"),
-            user("second question"),
-            assistant("second answer"),
-        ])
-        .await;
-    let outcome = fx
-        .core
-        .compact(&session, Some("keep decisions".into()))
-        .await
-        .unwrap();
-    let summary = outcome.summary.expect("摘要 entry");
-    // 等回来的时候摘要已经落在当前分支上。
-    let tree = fx.tree(&session).await;
-    let root = tree.session.root_conversation;
-    assert_eq!(tree.branches.len(), 1);
-    let entry = tree.entry(summary).unwrap();
-    assert_eq!(entry.kind, "komo.compaction");
-    assert_eq!(entry.data.as_ref().unwrap()["reason"], "manual");
-    assert_eq!(
-        text_of(&entry.model.as_ref().unwrap()[0]),
-        wrap_summary("MANUAL SUMMARY")
-    );
-    assert_eq!(tree.owner_of(summary), Some(root));
-    assert_eq!(tree.leaf, Some(summary), "摘要是新的末端");
-    assert_eq!(fx.llm.turns(), 1);
-    let context = context_text(&tree, summary);
-    assert!(context.contains("MANUAL SUMMARY"), "{context}");
-
-    // 空会话没有可压缩的内容。
-    let blank = fx
-        .core
-        .create_session(NewSession::new("assistant"))
-        .await
-        .unwrap();
-    assert!(matches!(
-        fx.core.compact(&blank.id, None).await,
-        Err(SessionError::Invalid(_))
-    ));
-}
-
-#[tokio::test]
-async fn compact_after_navigation_works_on_a_fresh_branch() {
-    let fx = Fixture::new(FakeLlm::finisher("MANUAL SUMMARY")).await;
-    let (session, ids) = fx
-        .session_with(&[
-            user("first question"),
-            assistant("first answer"),
-            user("second question"),
-            assistant("second answer"),
-        ])
-        .await;
-    fx.core
-        .navigate(&session, NavigateRequest::to(ids[1]))
-        .await
-        .unwrap();
-    let outcome = fx.core.compact(&session, None).await.unwrap();
-    let tree = fx.tree(&session).await;
-    assert_eq!(tree.branches.len(), 2, "leaf 不在末端先 fork");
-    let summary = outcome.summary.unwrap();
-    assert_eq!(tree.owner_of(summary), Some(tree.session.current_branch));
-    assert_ne!(tree.session.current_branch, tree.session.root_conversation);
-    assert_eq!(tree.session.leaf, None);
-    let context = context_text(&tree, summary);
-    assert!(!context.contains("second"), "{context}");
-}
-
 // ------------------------------------------------------------------ 其余
 
 #[tokio::test]
 async fn a_closed_session_refuses_input_and_tree_changes() {
     let fx = Fixture::new(FakeLlm::finisher("好")).await;
-    let (session, ids) = fx.session_with(&[user("q"), assistant("a")]).await;
+    let (session, _) = fx.session_with(&[user("q"), assistant("a")]).await;
     let mut record = fx.core.session(&session).await.unwrap();
     record.lifecycle = SessionLifecycle::Closing;
     fx.core
@@ -1588,9 +1313,7 @@ async fn a_closed_session_refuses_input_and_tree_changes() {
         Err(SessionError::NotOpen(SessionState::Closing))
     ));
     assert!(matches!(
-        fx.core
-            .navigate(&session, NavigateRequest::to(ids[0]))
-            .await,
+        fx.core.fork_session(&session).await,
         Err(SessionError::NotOpen(SessionState::Closing))
     ));
     assert!(matches!(
@@ -1664,14 +1387,10 @@ async fn landing_trace(full_tree: bool, seed_value: u64, steps: usize) -> Vec<St
                     .flat_map(|branch| branch.entries.iter().map(|entry| entry.id))
                     .collect();
                 let target = all[next(all.len())];
-                match fx
-                    .core
-                    .navigate(&session, NavigateRequest::to(target))
-                    .await
-                {
-                    Ok(outcome) => format!("nav {target:?} -> {:?}", outcome.leaf),
-                    Err(error) => format!("nav {target:?} err {error}"),
-                }
+                format!(
+                    "nav {target:?} -> {:?}",
+                    leave_leaf_at(&fx.core, &session, target).await
+                )
             }
             // 用旧键重发：同内容去重，不同内容冲突。
             1 if !keys.is_empty() => {

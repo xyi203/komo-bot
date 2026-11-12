@@ -25,7 +25,7 @@ use axum::Json;
 use axum::routing::{delete, get, post, put};
 use axum::{Router, extract::State};
 use komo_kernel::protocol::PROTOCOL_VERSION;
-use komo_kernel::protocol::http::{HealthResponse, SessionSummary};
+use komo_kernel::protocol::http::HealthResponse;
 
 use crate::service::state::GatewayState;
 use crate::web::{self, WebAuth};
@@ -171,33 +171,9 @@ async fn healthz(State(api): State<Api>) -> Json<HealthResponse> {
     })
 }
 
-/// `GET /v1/home-session`，从进程外面问（`komo home` 用它）。
-///
-/// `komo-client` 的 `KomoClient` 是按 §13.1 的接口表写的，这个端点不在那张表里（`v2::sessions::home`），
-/// 所以这里给一个最小的调用，而不是去改 client。
-pub async fn fetch_home_session(
-    base_url: &str,
-    token: Option<&str>,
-) -> Result<SessionSummary, String> {
-    let mut request = reqwest::Client::new().get(format!(
-        "{}/v1/home-session",
-        base_url.trim_end_matches('/')
-    ));
-    if let Some(token) = token {
-        request = request.bearer_auth(token);
-    }
-    let response = request.send().await.map_err(|error| error.to_string())?;
-    let status = response.status();
-    let body = response.text().await.map_err(|error| error.to_string())?;
-    if !status.is_success() {
-        return Err(format!("{status}：{body}"));
-    }
-    serde_json::from_str(&body).map_err(|error| format!("{error}（{body}）"))
-}
-
 /// `POST /v1/web/pair-code`，从进程外面要一个浏览器配对码（`komo web` 用它）。
 ///
-/// 同 [`fetch_home_session`]：这个端点不在 `komo-client` 按 §13.1 写的接口表里，给一个最小调用。
+/// 这个端点不在 `komo-client` 按 §13.1 写的接口表里，给一个最小调用，而不是去改 client。
 pub async fn request_pair_code(
     base_url: &str,
     token: Option<&str>,

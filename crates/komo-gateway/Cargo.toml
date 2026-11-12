@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
-# §13.4：gateway 看不到 toasty 类型（store 只通过 runtime 的构造函数暴露），也看不到 ratatui。
+# §13.4：gateway 看不到 toasty 类型（store 只通过 runtime 的构造函数暴露）。
 [dependencies]
 komo-kernel = { workspace = true }
 komo-channel = { workspace = true }

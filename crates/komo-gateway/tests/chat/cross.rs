@@ -35,6 +35,13 @@ use crate::harness::{
     eventually, feishu_block, inbound, telegram_block, telegram_config, text_round,
 };
 
+/// 操作者在群里说话：落到群的普通会话（仍有模型轮次）。私聊落到的主会话不起模型轮次、
+/// 消息交给分发任务（`service::durable::dispatch`），下面这些测的是"一个会话里的 Run"的行为，与是不是
+/// 主会话无关，所以改在群会话里跑。
+fn operator_chat(text: &str, key: &str) -> komo_kernel::protocol::InboundMessage {
+    inbound(ChannelPlatform::Telegram, "111", "111", text, key, false)
+}
+
 fn operator_dm(text: &str, key: &str) -> komo_kernel::protocol::InboundMessage {
     inbound(ChannelPlatform::Telegram, "111", "111", text, key, true)
 }
@@ -479,19 +486,21 @@ async fn the_command_table_is_operator_only() {
         ))
         .start()
         .await;
-    let ack = gateway.handle(operator_dm("试一下", "telegram:0")).await;
+    let ack = gateway.handle(operator_chat("试一下", "telegram:0")).await;
     let InboundAck::Queued { run, .. } = ack else {
         panic!("{ack:?}");
     };
     gate.wait_entered(1).await;
 
-    let pending = gateway.handle(operator_dm("/pending", "telegram:1")).await;
+    let pending = gateway
+        .handle(operator_chat("/pending", "telegram:1"))
+        .await;
     assert!(
         matches!(&pending, InboundAck::Replied { text } if text.contains("现在没有待处理的 Intervention")),
         "{pending:?}"
     );
 
-    let status = gateway.handle(operator_dm("/status", "telegram:2")).await;
+    let status = gateway.handle(operator_chat("/status", "telegram:2")).await;
     // §7.5：待处理是两类合起来的一张清单，`/status` 报总数与各类的分布。
     assert!(
         matches!(
@@ -520,7 +529,7 @@ async fn the_command_table_is_operator_only() {
         "命令只接受操作者：{stranger:?}"
     );
 
-    let cancel = gateway.handle(operator_dm("/cancel", "telegram:3")).await;
+    let cancel = gateway.handle(operator_chat("/cancel", "telegram:3")).await;
     assert!(
         matches!(&cancel, InboundAck::Replied { text } if text.contains(run.as_str()) && text.contains("已取消")),
         "/cancel 取消在跑的那条：{cancel:?}"
@@ -579,9 +588,11 @@ async fn a_message_behind_a_waiting_run_waits_instead_of_overtaking() {
         .tool(gate.tool())
         .start()
         .await;
-    let (_, body) = gateway.get("/v1/home-session").await;
+    // 主会话不起模型轮次，Run 跑在一个普通会话里。
+    let (code, body) = gateway.post("/v1/sessions", serde_json::json!({})).await;
+    assert_eq!(code, 200, "{body}");
     let session = serde_json::from_str::<komo_kernel::protocol::http::SessionSummary>(&body)
-        .expect("home session")
+        .expect("会话")
         .session;
     let submit = |key: &'static str, text: &'static str| {
         let session = session.clone();
@@ -715,13 +726,13 @@ async fn cancel_stops_a_run_that_is_still_inside_a_call() {
         ))
         .start()
         .await;
-    let ack = gateway.handle(operator_dm("等着", "telegram:1")).await;
+    let ack = gateway.handle(operator_chat("等着", "telegram:1")).await;
     let InboundAck::Queued { run, .. } = ack else {
         panic!("{ack:?}");
     };
     gate.wait_entered(1).await;
 
-    let cancel = gateway.handle(operator_dm("/cancel", "telegram:2")).await;
+    let cancel = gateway.handle(operator_chat("/cancel", "telegram:2")).await;
     assert!(
         matches!(&cancel, InboundAck::Replied { text } if text.contains(run.as_str())),
         "{cancel:?}"
@@ -840,13 +851,13 @@ home_chat = 999
     .await;
 
     let InboundAck::Queued { session, run } =
-        gateway.handle(operator_dm("在吗", "telegram:1")).await
+        gateway.handle(operator_chat("在吗", "telegram:1")).await
     else {
         panic!("第一句应该受理");
     };
     gateway.wait_run(&run).await;
     poison_agent_doc(&gateway, session.as_str()).await;
-    let ack = gateway.handle(operator_dm("跑一下", "telegram:2")).await;
+    let ack = gateway.handle(operator_chat("跑一下", "telegram:2")).await;
     assert!(matches!(ack, InboundAck::Queued { .. }), "{ack:?}");
 
     let watching = Arc::clone(&sender);
@@ -940,9 +951,11 @@ async fn a_round_with_two_calls_gets_both_results_before_the_next_request() {
         .tool(gate.tool())
         .start()
         .await;
-    let (_, body) = gateway.get("/v1/home-session").await;
+    // 主会话不起模型轮次，Run 跑在一个普通会话里。
+    let (code, body) = gateway.post("/v1/sessions", serde_json::json!({})).await;
+    assert_eq!(code, 200, "{body}");
     let session = serde_json::from_str::<komo_kernel::protocol::http::SessionSummary>(&body)
-        .expect("home session")
+        .expect("会话")
         .session;
     let submit = |key: &'static str, text: &'static str| {
         let session = session.clone();

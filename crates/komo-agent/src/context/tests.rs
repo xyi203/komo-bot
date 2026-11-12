@@ -17,6 +17,7 @@ fn input(instructions: Option<&str>) -> ContextInput {
         skills: None,
         invocation: InvocationContext::Main,
         background_task: false,
+        direct_reply: false,
     }
 }
 
@@ -51,6 +52,7 @@ fn no_instructions_means_no_leading_blank_section() {
 fn a_task_session_ends_its_base_with_the_task_mode() {
     let task = system_sections(&ContextInput {
         background_task: true,
+        direct_reply: false,
         ..input(Some("你是 coder。"))
     });
     let keys: Vec<&str> = task.iter().map(|(key, _)| key.as_str()).collect();
@@ -63,6 +65,24 @@ fn a_task_session_ends_its_base_with_the_task_mode() {
 
     let prompt = prompt_of(&input(None));
     assert!(!prompt.contains(TASK_MODE_BLOCK), "{prompt}");
+}
+
+/// 分发派出的任务会话用「直接对话」那一段，不再说"交回给派你的会话"；两段不会同时出现。
+#[test]
+fn a_dispatched_task_session_talks_to_the_user_directly() {
+    let direct = prompt_of(&ContextInput {
+        background_task: true,
+        direct_reply: true,
+        ..input(None)
+    });
+    assert!(direct.ends_with(TASK_DIRECT_BLOCK), "{direct}");
+    assert!(!direct.contains(TASK_MODE_BLOCK), "{direct}");
+    // 末行状态行照旧要写（程序投递前去掉），写法以 kernel 的常量为准。
+    for status in [TASK_STATUS_DONE, TASK_STATUS_BLOCKED] {
+        assert!(TASK_DIRECT_BLOCK.contains(status), "{status}");
+    }
+    // 提示里不能把派发暴露给用户：要求模型不说的那几个词只出现在"不要出现"的那一句里。
+    assert!(TASK_DIRECT_BLOCK.contains("不要出现「任务」"));
 }
 
 /// 召回的记忆不进系统提示：它按 Run 追加在输入之后（`docs/memory.md` §9.4）。

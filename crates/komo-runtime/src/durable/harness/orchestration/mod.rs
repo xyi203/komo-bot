@@ -48,6 +48,8 @@ pub mod monitor;
 pub mod report;
 mod task;
 
+pub(crate) use task::{ChildSpec, create_child};
+
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -82,6 +84,9 @@ pub const TASK_DOC_KIND: &str = "komo.task";
 pub const TASK_DOC_VERSION: u32 = 1;
 /// 交回到父 conversation 的输入的 entry kind。
 pub const TASK_RESULT_ENTRY: &str = "task.result";
+/// 分发派出的任务的回复落在父（主会话）里的展示 entry 的 kind：只用于展示的 write，没有 `model`，
+/// 所以不进上下文、不起 run（`docs/tasks.md` §4.11 决定 3）。`data` 的形状见 [`report`] 的 `direct_reply`。
+pub const MAIN_REPLY_ENTRY: &str = "main.reply";
 
 /// fork 任务第一条输入的开头（`docs/background-tasks.md` §2b）：紧跟在父的对话与补的结果之后。
 /// 放在输入里而不是系统提示里——系统提示是父那份，改一个字缓存就不中。
@@ -205,6 +210,21 @@ pub struct LastRun {
     pub rounds: Option<u32>,
 }
 
+/// 分发派出的任务把回复投到哪（派出时写定，完成时照它投，不在完成时再推断）。
+///
+/// 有它，任务一轮结束时 runtime 不再往父交回一条 `task.result` 让父起一轮转述，而是在父里落一条
+/// [`MAIN_REPLY_ENTRY`] 展示 entry，渠道投递由 Gateway 照这条 entry 做（`docs/tasks.md` §4.12 U3）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReplyTo {
+    /// 渠道对端（`ChannelPeer` 的字符串形式）；HTTP 来的没有，只落主线的展示 entry。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peer: Option<String>,
+    /// 这条回复是在答主线上的哪一条消息（entry 与受理它的 submission）。
+    pub origin_entry: EntryId,
+    pub origin_submission: SubmissionId,
+}
+
 /// 子 conversation 的 `komo.task`：它是谁派的、叫什么、用哪个模型、哪些输入带结果契约。
 ///
 /// gateway 的 `AgentHooks::setup` 读它：`model` / `effort` 是 alias 名字，按当前配置解析；
@@ -232,6 +252,9 @@ pub struct TaskDoc {
     /// 状态行也照样交回：每条派出 / 追问的输入最多续跑一次。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub continued: Option<SubmissionId>,
+    /// 分发派出的任务：回复直接投到这里（见 [`ReplyTo`]）。`task` 工具派出的没有，照旧交回父会话。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply: Option<ReplyTo>,
 }
 
 /// 提交里读 `komo.task`（document 读，不是表读：排在表写之后也行）。

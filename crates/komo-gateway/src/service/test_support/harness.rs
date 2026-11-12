@@ -1104,6 +1104,40 @@ impl TestGateway {
     pub async fn inputs(&self, session: &str) -> usize {
         inputs_of(self.state(), session).await
     }
+
+    /// 主会话主线上的用户消息数。主会话不起 run，消息是主线上的展示 entry（`main.user`），
+    /// "同一条平台消息只受理一次"在那里数的是它。
+    pub async fn main_messages(&self, session: &str) -> usize {
+        use komo_kernel::durable::storage::{ConversationQuery, EntryQuery};
+        let core = self.state().core().expect("Durable 模式");
+        let conversations = core
+            .storage
+            .scan_conversations(
+                &ConversationQuery {
+                    session: Some(session.to_owned()),
+                    ..ConversationQuery::default()
+                },
+                10_000,
+                None,
+            )
+            .await
+            .expect("读得出")
+            .items;
+        let mut count = 0;
+        for conversation in conversations {
+            let page = core
+                .storage
+                .scan_entries(&EntryQuery::new(conversation.id), 10_000, None)
+                .await
+                .expect("读得出");
+            count += page
+                .items
+                .iter()
+                .filter(|entry| entry.kind == crate::service::durable::dispatch::MAIN_USER_ENTRY)
+                .count();
+        }
+        count
+    }
 }
 
 // ---------------------------------------------------------------- 一个数据目录

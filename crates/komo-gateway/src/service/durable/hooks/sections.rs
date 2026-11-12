@@ -84,6 +84,10 @@ pub(super) fn build(
         skills,
         invocation: InvocationContext::Main,
         background_task: resolved.is_task(),
+        direct_reply: resolved
+            .task
+            .as_ref()
+            .is_some_and(|task| task.reply.is_some()),
     };
     let fresh = system_sections(&input);
     let fresh_text = |key: &str| {

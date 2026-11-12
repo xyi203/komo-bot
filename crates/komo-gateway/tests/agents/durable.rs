@@ -516,7 +516,9 @@ async fn dm(
             "111",
             text,
             key,
-            true,
+            // 群聊：私聊落到的主会话不再起模型轮次，`task` 工具的"交回父会话"这一条只在仍有模型轮次的
+            // 会话里成立（分发派出的任务改为直投渠道，见 `service::durable::dispatch`）。
+            false,
         ))
         .await;
     let InboundAck::Queued { session, run } = ack else {

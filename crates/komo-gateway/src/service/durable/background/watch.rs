@@ -66,7 +66,8 @@ pub enum Source {
 
 /// 一条 entry 的来源。
 pub(in crate::service::durable) fn source_of_entry(entry: &EntryRecord) -> Source {
-    if entry.kind == CHAT_INPUT {
+    // 主线上的用户消息（分发路径落的展示 entry，`data.peer` 同 `chat.input`）：内部输入回溯来源对端时认它。
+    if entry.kind == CHAT_INPUT || entry.kind == super::super::dispatch::MAIN_USER_ENTRY {
         return entry
             .data
             .as_ref()

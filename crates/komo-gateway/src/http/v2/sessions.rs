@@ -267,6 +267,22 @@ async fn submit(
             })),
         };
     }
+    // 主会话不起模型轮次：消息落成主线上的展示消息，由分发任务判断去向（`docs/tasks.md` §4.11）。
+    // 回话只落主线（HTTP 来的没有渠道对端）；`model` / `interject` 对没有轮次的主会话没有意义。
+    if core.session(&id).await?.kind == komo_kernel::durable::SessionKind::Main {
+        let accepted = core
+            .dispatch_message(
+                &id,
+                crate::service::durable::dispatch::MainMessage {
+                    text: request.text,
+                    request_id: request.request_key.as_str().to_owned(),
+                    peer: None,
+                    principal: None,
+                },
+            )
+            .await?;
+        return receipt(core, accepted).await;
+    }
     let model = model_override(
         &api,
         core,

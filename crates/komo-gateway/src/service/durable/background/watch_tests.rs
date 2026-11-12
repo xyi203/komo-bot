@@ -201,6 +201,8 @@ async fn an_internal_input_without_a_peer_falls_back_to_home_chat_for_the_main_s
 }
 
 /// 重启之后：run 在重启前开了头、重启后才收尾，回复照样投回说话的 peer，且只投一次。
+///
+/// 用群聊：私聊落到的主会话不再起 run（回话直投见 `dispatch::deliver`），看客只管仍有模型轮次的会话。
 #[tokio::test]
 async fn a_chat_run_in_flight_across_a_restart_still_gets_its_reply_once() {
     let gate = Gate::new();
@@ -219,7 +221,7 @@ async fn a_chat_run_in_flight_across_a_restart_still_gets_its_reply_once() {
             "111",
             "等着",
             "t:1",
-            true,
+            false,
         ))
         .await;
     let InboundAck::Queued { run, .. } = ack else {

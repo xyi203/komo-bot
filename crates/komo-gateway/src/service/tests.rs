@@ -18,6 +18,11 @@ fn operator_dm(text: &str, key: &str) -> InboundMessage {
     inbound(ChannelPlatform::Telegram, "111", "111", text, key, true)
 }
 
+/// 操作者在群里说话：落到群的普通会话（仍有模型轮次），不是私聊的主会话。
+fn operator_group(text: &str, key: &str) -> InboundMessage {
+    inbound(ChannelPlatform::Telegram, "-100", "111", text, key, false)
+}
+
 /// ③ 改 `allow_from` 保存后重载，下一条消息按新名单判定（不重启）。
 #[tokio::test]
 async fn a_reloaded_allow_list_decides_the_next_message() {
@@ -1275,17 +1280,29 @@ mod chat {
             "重投不该开第二个 Run"
         );
 
-        // 改了断言的读法：Legacy 数 `runs` 表，新存储里一条 run 就是它的首个输入 submission。
-        assert_eq!(
-            inputs_of(gateway.state(), session.as_str()).await,
-            1,
-            "账本上只有一个 Run"
-        );
+        // 改了断言的读法：私聊落到主会话，主会话不起 run——消息是主线上的一条展示 write，
+        // 请求键去重的结果是主线上只有一条这样的消息（也就只有一个分发任务）。
+        let tree = gateway
+            .state()
+            .core()
+            .unwrap()
+            .read_tree(session.as_str())
+            .await
+            .expect("读得出树");
+        let shown = tree
+            .branches
+            .iter()
+            .flat_map(|branch| branch.entries.iter())
+            .filter(|entry| entry.kind == crate::service::durable::dispatch::MAIN_USER_ENTRY)
+            .count();
+        assert_eq!(shown, 1, "主线上只有一条这条消息");
     }
 
     /// 聊天渠道的普通消息以插话受理（§6，2026-10-23）：宿主 Run 忙着跑工具时，同一个 peer 的
     /// 下一句话由它在下一次请求模型之前并进去，不排到整条 Run 后面。
     ///
+    /// 改成群聊：私聊落到的主会话不再起模型轮次（消息交给分发任务，见 `durable::dispatch`），
+    /// "并进宿主 run"只发生在群、话题这些仍有模型轮次的会话里。
     /// 改了断言：Legacy 看 `run.accepted` 上的 `interject` 标记；新存储的 RunAccepted 是合成的，
     /// 没有那一格，插话体现为行为——宿主停在 `gate` 上时第二句话并进它（终态 `absorbed`），
     /// 渠道收到"已并入"，回答只有宿主给的一次。
@@ -1305,12 +1322,14 @@ mod chat {
             ))
             .start()
             .await;
-        let ack = gateway.handle(operator_dm("稍等", "telegram:50")).await;
+        let ack = gateway.handle(operator_group("稍等", "telegram:50")).await;
         let InboundAck::Queued { run: host, .. } = ack else {
             panic!("应该排队：{ack:?}");
         };
         gate.wait_entered(1).await;
-        let ack = gateway.handle(operator_dm("补一句", "telegram:51")).await;
+        let ack = gateway
+            .handle(operator_group("补一句", "telegram:51"))
+            .await;
         let InboundAck::Queued { run: second, .. } = ack else {
             panic!("应该排队：{ack:?}");
         };
@@ -1336,8 +1355,9 @@ mod chat {
     /// 渠道带来的话题上下文：普通文本把它拼进提交的正文（引用块 + "发给你的消息："），
     /// 命令只解析原文、不受影响（§11.3 话题上下文）。
     ///
-    /// 改了断言的读法：正文从输入 entry（`chat.input`）读，不再从 JSONL 的 `run.accepted`；"命令没有
-    /// 起第二个 Run"数的是 submission。
+    /// 改了断言的读法：私聊落到主会话，正文从主线上的展示 entry（`main.user` 的 `data.text`）读，
+    /// 不再从 JSONL 的 `run.accepted`；`gateway.wait_run` 对主线消息立刻返回（它是 write，没有 run 要等）；
+    /// "命令没有起第二个 Run"数的是主线上的消息条数。
     #[tokio::test]
     async fn thread_context_is_prepended_to_plain_text_but_never_to_commands() {
         let (gateway, _) = start(FakeLlm::finisher("好")).await;
@@ -1360,9 +1380,16 @@ mod chat {
             .branches
             .iter()
             .flat_map(|branch| branch.entries.iter())
-            .filter(|entry| entry.kind == "chat.input")
-            .find_map(crate::service::durable::sessions::tree::input_text)
-            .expect("这条输入放置过");
+            .filter(|entry| entry.kind == crate::service::durable::dispatch::MAIN_USER_ENTRY)
+            .find_map(|entry| {
+                entry
+                    .data
+                    .as_ref()?
+                    .get("text")?
+                    .as_str()
+                    .map(str::to_owned)
+            })
+            .expect("这条消息落在主线上");
         assert!(text.starts_with("> 【话题上下文】"), "{text}");
         assert!(
             text.contains("> 张三 10:23：B1 在 Drop，B2 在 escape\n"),
@@ -1378,21 +1405,31 @@ mod chat {
         status.context = Some("张三 10:23：这段不该影响命令".into());
         let ack = gateway.dispatcher().handle(status).await.expect("处理了");
         assert!(matches!(ack, InboundAck::Replied { .. }), "{ack:?}");
-        assert_eq!(
-            inputs_of(gateway.state(), session.as_str()).await,
-            1,
-            "命令没有起第二个 Run"
-        );
+        let shown = gateway
+            .state()
+            .core()
+            .unwrap()
+            .read_tree(session.as_str())
+            .await
+            .expect("读得出树")
+            .branches
+            .iter()
+            .flat_map(|branch| branch.entries.iter())
+            .filter(|entry| entry.kind == crate::service::durable::dispatch::MAIN_USER_ENTRY)
+            .count();
+        assert_eq!(shown, 1, "命令没有再落一条主线消息");
     }
 
     /// 回复要发到聊天渠道的 Run 追加一条篇幅附注（§4「渠道篇幅」）：宿主附上的 user 消息、写明平台，
     /// 同一个 Run 只加一次。
+    ///
+    /// 改成群聊：私聊落到的主会话不再起模型轮次，附注只出现在仍有模型轮次的会话里。
     #[tokio::test]
     async fn a_chat_run_gets_one_channel_note_naming_the_platform() {
         let (gateway, _) = start(FakeLlm::finisher("好")).await;
         let ack = gateway
             .dispatcher()
-            .handle(operator_dm("在吗", "telegram:70"))
+            .handle(operator_group("在吗", "telegram:70"))
             .await
             .expect("处理了");
         let InboundAck::Queued { session, run } = ack else {

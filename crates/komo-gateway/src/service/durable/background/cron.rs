@@ -255,6 +255,7 @@ impl DurableCronTarget {
                     reject_when_busy: false,
                     model: None,
                     interject: false,
+                    dispatch: None,
                 },
             )
             .await

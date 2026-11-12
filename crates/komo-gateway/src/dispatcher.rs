@@ -48,6 +48,7 @@ use komo_runtime::durable::harness::{Harness, InputEntry, WhenBusy};
 use serde_json::json;
 
 use crate::service::durable::background::watch::{self, CHAT_INPUT, Source};
+use crate::service::durable::dispatch::MainMessage;
 use crate::service::durable::{DurableCore, SessionError};
 use crate::service::state::GatewayState;
 
@@ -397,6 +398,36 @@ impl Inbound for Dispatcher {
 
         // ⑥ 普通文本。**先挂看客再提交**：订阅之后才发生的终态帧才收得到。
         watch::ensure(self.state(), &session);
+        // 主会话不起模型轮次：消息落成主线上的展示消息，由分发任务判断去向（`docs/tasks.md` §4.11）。
+        if record.kind == SessionKind::Main {
+            let accepted = core
+                .dispatch_message(
+                    &session,
+                    MainMessage {
+                        text: with_context(&msg),
+                        request_id: msg.request_key.as_str().to_owned(),
+                        peer: Some(msg.peer.clone()),
+                        principal: Some(json!({
+                            "platform": principal.platform().as_str(),
+                            "id": principal.id().as_str(),
+                        })),
+                    },
+                )
+                .await
+                .map_err(gateway_error)?;
+            let ack = if accepted.deduplicated {
+                InboundAck::Duplicate {
+                    run: Some(accepted.run.clone()),
+                }
+            } else {
+                InboundAck::Queued {
+                    session: SessionId::from_raw(session),
+                    run: accepted.run.clone(),
+                }
+            };
+            self.remember(&msg.request_key, &ack);
+            return Ok(ack);
+        }
         let when_busy = if self.host_is_peer(&core, &record, &msg.peer).await {
             WhenBusy::Steer
         } else {

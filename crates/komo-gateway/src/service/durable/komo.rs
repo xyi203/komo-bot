@@ -448,6 +448,7 @@ mode = "keyword"
             contracts: BTreeMap::new(),
             last_run: None,
             continued: None,
+            reply: None,
         };
         let root = task.root_conversation;
         core.engine

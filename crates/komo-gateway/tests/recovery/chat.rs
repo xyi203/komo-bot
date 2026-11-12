@@ -32,7 +32,9 @@ async fn a_chat_run_in_flight_across_a_restart_still_gets_its_reply_delivered_on
             "111",
             "跑一下 echo",
             "restart-1",
-            true,
+            // 群聊：私聊落到的主会话不起 run（回话直投渠道，见 `service::durable::dispatch`），
+            // 看客补挂只管仍有模型轮次的会话。
+            false,
         ))
         .await;
     let InboundAck::Queued { run, .. } = ack else {

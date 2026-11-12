@@ -102,6 +102,7 @@ pub(crate) fn sections(
     mcp_servers: &[ToolNamespace],
     invocation: &InvocationContext,
     background_task: bool,
+    direct_reply: bool,
     project_files: &[ProjectFile],
     skills: Option<&str>,
 ) -> Vec<(String, String)> {
@@ -129,7 +130,7 @@ pub(crate) fn sections(
                     &rules,
                     has(BASH_TOOL),
                     has(KOMO_TOOL),
-                    background_task,
+                    background_task.then_some(direct_reply),
                 ),
             );
             if let Some(block) = project_block(project_files) {
@@ -225,7 +226,7 @@ fn main_base(
     rules: &str,
     has_shell: bool,
     has_komo: bool,
-    background_task: bool,
+    background_task: Option<bool>,
 ) -> String {
     let mut prompt = format!(
         "你是 komo，跑在用户自己机器上的助手。\n\
@@ -241,9 +242,13 @@ fn main_base(
         prompt.push_str("\n\n");
         prompt.push_str(RESTART_NOTE);
     }
-    if background_task {
+    if let Some(direct_reply) = background_task {
         prompt.push_str("\n\n");
-        prompt.push_str(TASK_MODE_BLOCK);
+        prompt.push_str(if direct_reply {
+            TASK_DIRECT_BLOCK
+        } else {
+            TASK_MODE_BLOCK
+        });
     }
     prompt
 }
@@ -265,6 +270,19 @@ pub const TASK_MODE_BLOCK: &str = "你是一个后台任务：派你的会话把
                                    派你的人决定什么。你最后的回复会作为结果交回给派你的会话，\
                                    末行写「状态：完成」；做不下去写「状态：受阻：原因」（带结果\
                                    契约时只给 JSON，不写这一行）。";
+
+/// 分发派出的任务会话的「直接对话」模式（`docs/tasks.md` §4.12 U2/U3/U6）：回复由程序原文投给用户，
+/// 用户看不到派发，所以这里是在直接和用户说话，不是在向谁汇报。
+///
+/// 与 [`TASK_MODE_BLOCK`] 的区别：中途**有**人能回答（用户就在对面，要问就直接问）；回复里不出现
+/// 「任务」「子代理」「Router」这类词；末行状态行照旧要写，程序在投递前去掉它。
+pub const TASK_DIRECT_BLOCK: &str = "你现在是在直接和用户对话：用户发来的话已经交给你处理，你的回复会原文发给用户，\
+                                     所以用你一贯的身份和语气说话。回复里不要出现「任务」「子代理」「Router」\
+                                     「派发」这类词，也不要自称是某个任务——对用户来说，一直是同一个你在聊天。\
+                                     缺信息、需要用户拿主意时，直接问他，不要硬猜；问完这一轮就结束，用户回话后\
+                                     会接着这段对话继续。耗时的事做完之后再回复一次就好，中间不用汇报进度。\
+                                     末行写「状态：完成」；做不下去或在等用户回答时写「状态：受阻：原因」，\
+                                     这一行是写给程序看的，程序会在发给用户之前去掉它。";
 
 /// 能跑命令的那个工具：挂了它，[`RESTART_NOTE`] 才出现——说了也跑不了的提醒不必给。
 const BASH_TOOL: &str = "bash";

@@ -246,6 +246,9 @@ pub async fn start(options: ServiceOptions) -> Result<Running, ServiceError> {
     durable::interventions::confirms::spawn_confirm_attention(&state, &shutdown);
     durable::sessions::lifecycle::boot(&state).await;
     durable::background::watch::reattach(&state).await;
+    // 主线回复的投递：订阅在调度开始之前接上，再补投上一代落下而没投出的。
+    durable::dispatch::deliver::spawn(&state, &shutdown);
+    durable::dispatch::deliver::reattach(&state).await;
     core.resume();
     // 窗口探测放后台，不挡 `Gateway 就绪`。
     state.spawn_window_probes();

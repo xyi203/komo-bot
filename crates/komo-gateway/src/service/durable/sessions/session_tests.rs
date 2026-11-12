@@ -1796,6 +1796,7 @@ mod task_list {
             contracts: BTreeMap::new(),
             last_run: last,
             continued: None,
+            reply: None,
         };
         let root = record.root_conversation;
         core.engine

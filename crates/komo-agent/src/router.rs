@@ -18,6 +18,7 @@
 //! [`context::router`]: crate::context::router
 
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 pub use crate::context::router::RouterPrompt;
@@ -33,7 +34,7 @@ pub const DEFAULT_FINISHED_TASKS: usize = 5;
 pub const TITLE_CHARS: usize = 60;
 
 /// 这条消息从哪来。决定能用哪些去向，也决定候选从哪个范围取（调用方的事）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RouteScope {
     /// 操作者私聊：有 `list`，没有 `ignore`；判断失败按 `new`。
     Private,
@@ -61,7 +62,7 @@ pub struct CandidateTask {
     pub last_said: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Speaker {
     Operator,
     Agent,
@@ -69,7 +70,7 @@ pub enum Speaker {
     Member,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecentMessage {
     pub speaker: Speaker,
     pub text: String,
@@ -198,7 +199,7 @@ impl RouterInput {
 /// 判断的去向。`task` 是候选清单里的任务标识（已校验）。
 ///
 /// 范围决定哪些会出现：`List` 只在私聊，`Ignore` 只在群。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Route {
     /// 一件新的事：`description` 是把要求写完整的任务说明。
     New {
@@ -216,7 +217,7 @@ pub enum Route {
 }
 
 /// 为什么这次判断没成。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RouteFailure {
     /// 模型调用报错。
     Model(String),
@@ -240,7 +241,7 @@ impl std::fmt::Display for RouteFailure {
 }
 
 /// 兜底的记录：原因，以及到放弃时一共调了几次模型。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Fallback {
     pub reason: RouteFailure,
     pub attempts: u32,
@@ -284,8 +285,8 @@ pub async fn route(input: &RouterInput, model: &dyn RouterModel) -> Routed {
     input.fallback(last, MAX_ATTEMPTS)
 }
 
-/// 标题由消息原文截出：第一行非空的内容，最多 [`TITLE_CHARS`] 个字符，截了加 `…`。
-fn title_from(message: &str) -> String {
+/// 标题由消息原文截出（兜底的新任务用它；Gateway 在目标任务已不可用、退成新任务时也用）：第一行非空的内容，最多 [`TITLE_CHARS`] 个字符，截了加 `…`。
+pub fn title_from(message: &str) -> String {
     let Some(first) = message.lines().map(str::trim).find(|line| !line.is_empty()) else {
         return "新任务".into();
     };

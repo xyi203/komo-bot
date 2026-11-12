@@ -24,6 +24,7 @@ fn build(
         mcp_servers,
         invocation,
         false,
+        false,
         project_files,
         skills,
     )

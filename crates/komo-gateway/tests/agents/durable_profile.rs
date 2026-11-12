@@ -78,10 +78,25 @@ async fn two_agents_keep_their_sessions_prompts_and_tools_apart() {
         "默认 Agent 的主会话就是没有归属的入口落的那一个：{body}"
     );
 
+    // 主会话不起模型轮次（消息交给分发任务），所以下面的 Run 跑在各 Agent 名下的普通会话里：
+    // 提示、工具表、工作目录按会话的 Agent 解析，与是不是主会话无关。
+    let assistant_chat = core
+        .create_session(komo_gateway::service::durable::sessions::NewSession::new(
+            "assistant",
+        ))
+        .await
+        .expect("assistant 的会话");
+    let coder_chat = core
+        .create_session(komo_gateway::service::durable::sessions::NewSession::new(
+            "coder",
+        ))
+        .await
+        .expect("coder 的会话");
+
     // ── 2. assistant：提示是它那一版，工具表里没有 write，于是调用被拦住。
     let run = gateway
         .submit(
-            &SessionId::from_raw(&assistant.id),
+            &SessionId::from_raw(&assistant_chat.id),
             "agents-1",
             "写一份笔记",
         )
@@ -117,7 +132,11 @@ async fn two_agents_keep_their_sessions_prompts_and_tools_apart() {
 
     // ── 3. coder：同一个调用，这次真的写了，而且写在**它自己的**工作目录里。
     let run = gateway
-        .submit(&SessionId::from_raw(&coder.id), "agents-2", "写一份笔记")
+        .submit(
+            &SessionId::from_raw(&coder_chat.id),
+            "agents-2",
+            "写一份笔记",
+        )
         .await
         .run;
     let detail = gateway.wait_terminal(&run).await;

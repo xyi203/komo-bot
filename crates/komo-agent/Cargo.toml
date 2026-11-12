@@ -13,6 +13,8 @@ license.workspace = true
 # Router 的模型调用是注入的 trait（`router::RouterModel`），Gateway 给实现。
 async-trait = { workspace = true }
 komo-kernel = { workspace = true }
+# 去向与兜底记录要写进分发任务的检查点（Gateway），所以给 Router 的值类型补 serde。
+serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 

@@ -402,8 +402,19 @@ async fn an_agent_only_recalls_its_own_scope_plus_the_shared_profile() {
 
     // 没有归属的入口 = 默认 Agent（`assistant`）：它没写 `memory_scope`，不按作用域过滤。
     let core = komo_gateway::service::test_support::driver_stream::core(&gateway);
-    let assistant = core.main_session("assistant").await.unwrap().0.id;
-    let coder = core.main_session("coder").await.unwrap().0.id;
+    // 主会话不起模型轮次（消息交给分发任务），召回按会话的 Agent 解析、与是不是主会话无关，
+    // 所以两个 Agent 各开一个普通会话。
+    use komo_gateway::service::durable::sessions::NewSession;
+    let assistant = core
+        .create_session(NewSession::new("assistant"))
+        .await
+        .unwrap()
+        .id;
+    let coder = core
+        .create_session(NewSession::new("coder"))
+        .await
+        .unwrap()
+        .id;
     assert_ne!(assistant, coder);
 
     for (session, key) in [(&assistant, "rk-assistant"), (&coder, "rk-coder")] {

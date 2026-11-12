@@ -2659,6 +2659,7 @@ version = "0.8.0"
 dependencies = [
  "async-trait",
  "komo-kernel",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",

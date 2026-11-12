@@ -738,6 +738,31 @@ pub async fn admit(
         }
         return Ok(Admitted::Id(existing.id));
     }
+    // 已停的任务（`docs/tasks.md` §4.14 F4）：晚到的监听事件 / 结束消息不进收件箱、不起轮次。落一条
+    // `unanswered{stopped}` 的 submission 占住请求键，同一条重投拿回它。
+    if let SubmissionDraft::Input {
+        internal: true,
+        request_id: Some(key),
+        ..
+    } = draft
+        && super::orchestration::monitor::is_monitor_key(key)
+        && super::orchestration::is_stopped(tx, conversation).await?
+    {
+        let submission = tx
+            .create_submission(
+                conversation,
+                request_id,
+                SubmissionKind::Input {
+                    state: InputState::Unanswered {
+                        entry: None,
+                        reason: "stopped".to_owned(),
+                        detail: None,
+                    },
+                },
+            )
+            .await?;
+        return Ok(Admitted::Id(submission.id));
+    }
 
     // 只用于展示的 write：忙闲都立刻落；只有排着 reset 时才排队，免得落在 reset 之前被切出上下文。
     if let SubmissionDraft::Write { entry, .. } = draft
@@ -971,10 +996,27 @@ pub async fn withdraw_queued_inputs(
     tx: &mut Tx,
     conversation: ConversationId,
 ) -> Result<(), DurableError> {
+    withdraw_queued(tx, conversation, false).await
+}
+
+/// 任务被停下时的撤回（`docs/tasks.md` §4.14 F4）：同 [`withdraw_queued_inputs`]，但内部输入（监听事件、
+/// 结束消息）也一并撤——停下的任务不该再被它们叫醒；排队的 write 仍留着。
+pub async fn withdraw_all_inputs(
+    tx: &mut Tx,
+    conversation: ConversationId,
+) -> Result<(), DurableError> {
+    withdraw_queued(tx, conversation, true).await
+}
+
+async fn withdraw_queued(
+    tx: &mut Tx,
+    conversation: ConversationId,
+    internal_too: bool,
+) -> Result<(), DurableError> {
     let mut inbox = load(tx, conversation).await?;
     let mut kept = Vec::new();
     for item in std::mem::take(&mut inbox.items) {
-        if matches!(item, InboxItem::Write { .. }) || item.is_internal() {
+        if matches!(item, InboxItem::Write { .. }) || (item.is_internal() && !internal_too) {
             kept.push(item);
             continue;
         }

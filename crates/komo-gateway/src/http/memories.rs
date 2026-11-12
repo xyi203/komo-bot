@@ -184,9 +184,15 @@ pub async fn add(
     {
         return Ok(Json(previous));
     }
+    // 分发派出的任务会话（带 `reply`）不在此列：这一轮有没有用户原话，由 `memory add` 的证据检查判。
     if let Some(session) = &request.session
         && let Ok(record) = api.state.durable.session(session.as_str()).await
-        && record.kind == komo_kernel::durable::SessionKind::Task
+        && api
+            .state
+            .durable
+            .is_background_task(&record)
+            .await
+            .map_err(|error| ApiFailure::invalid(error.to_string()))?
     {
         return Err(ApiFailure::invalid(format!(
             "会话 {session} 是后台任务：任务正文不是用户原话，不能替用户记；把要记的交回主会话"

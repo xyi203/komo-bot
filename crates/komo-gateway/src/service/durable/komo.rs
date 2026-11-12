@@ -65,6 +65,7 @@ impl KomoService for GatewayKomo {
                 reply(memories::forget(State(api), Path(id.to_string()), Json(request)).await)
             }
             KomoCall::GoalAdd(request) => reply(matters::add(State(api), Json(request)).await),
+            KomoCall::GoalList(query) => reply(matters::list(State(api), Query(query)).await),
             KomoCall::GoalAct { id, verb, request } => reply(
                 matters::act(
                     State(api),
@@ -255,7 +256,7 @@ mode = "keyword"
         (session, run)
     }
 
-    /// 十四个动作各走通一次，经由真的处理函数（真 aux.db / durable.db，不是桩）：返回的是各自
+    /// 十五个动作各走通一次，经由真的处理函数（真 aux.db / durable.db，不是桩）：返回的是各自
     /// 路由的响应体，状态确实落了库。
     #[tokio::test]
     async fn every_komo_action_runs_through_the_real_handlers() {
@@ -337,6 +338,10 @@ mode = "keyword"
         )
         .await;
         assert_eq!(resumed["matter"]["state"], "active", "{resumed}");
+        // goal.list：只列目标；只读动作不要求用户原话。
+        let listed = ok(&tool, &mut ctx, "goal.list", json!({})).await;
+        assert_eq!(listed["matters"][0]["id"], goal.as_str(), "{listed}");
+        assert_eq!(listed["matters"].as_array().map(Vec::len), Some(1));
 
         // ── cron：建一个命令 Job（不经模型），goal.link 挂上，cron.list 看得到，cron.run 触发
         let (status, job) = gateway
@@ -449,6 +454,7 @@ mode = "keyword"
             last_run: None,
             continued: None,
             reply: None,
+            stopped: false,
         };
         let root = task.root_conversation;
         core.engine

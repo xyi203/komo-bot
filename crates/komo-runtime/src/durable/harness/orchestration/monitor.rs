@@ -65,6 +65,11 @@ pub const MONITORS_KIND: &str = "komo.monitors";
 pub const MONITORS_VERSION: u32 = 1;
 /// 交回结束消息的输入的 entry kind。
 pub const MONITOR_END_ENTRY: &str = "monitor.end";
+
+/// 请求键是不是监听交回的（事件 `monitor:`、结束消息 `monitor-end:`）：这两类输入不是用户说的话。
+pub fn is_monitor_key(key: &str) -> bool {
+    key.starts_with("monitor:") || key.starts_with("monitor-end:")
+}
 /// 交回事件的输入的 entry kind。
 pub const MONITOR_EVENT_ENTRY: &str = "monitor.event";
 /// 登记里最多留多少条已结束的。
@@ -295,6 +300,8 @@ pub(crate) async fn finish_in_tx(
                 .is_none_or(|row| row.lifecycle == SessionLifecycle::Active),
         },
     };
+    // 挂它的任务已被停下：只登记，不交回结束消息（`docs/tasks.md` §4.14 F4）。
+    let present = present && !super::is_stopped(tx, conversation).await?;
     record.state = MonitorState::Ended {
         reason: reason.to_owned(),
         detail: detail.map(str::to_owned),

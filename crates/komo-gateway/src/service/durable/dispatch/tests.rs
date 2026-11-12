@@ -90,6 +90,19 @@ struct Rig {
 }
 
 async fn rig(router: Arc<FnRouter>, worker: Arc<FakeLlm>, gate: Option<&Arc<Gate>>) -> Rig {
+    rig_with(
+        router,
+        worker,
+        gate.map(|gate| gate.tool()).into_iter().collect(),
+    )
+    .await
+}
+
+async fn rig_with(
+    router: Arc<FnRouter>,
+    worker: Arc<FakeLlm>,
+    tools: Vec<Arc<dyn komo_kernel::traits::Tool>>,
+) -> Rig {
     let sender = MemSender::new(ChannelPlatform::Telegram);
     let mut builder = GatewayBuilder::new(&telegram_config("111"))
         .llm(router as Arc<dyn LlmClient>)
@@ -97,8 +110,8 @@ async fn rig(router: Arc<FnRouter>, worker: Arc<FakeLlm>, gate: Option<&Arc<Gate
         .factory(FixedFactory::sender_only(
             Arc::clone(&sender) as Arc<dyn ChannelSender>
         ));
-    if let Some(gate) = gate {
-        builder = builder.tool(gate.tool());
+    for tool in tools {
+        builder = builder.tool(tool);
     }
     Rig {
         gateway: builder.start().await,
@@ -408,8 +421,8 @@ async fn stop_cancels_the_target_task() {
         doc.last_run.map(|run| run.state).as_deref(),
         Some("cancelled")
     );
-    // 取消的任务不说话（完整的"停下"是后续步骤）。
-    assert!(rig.sender.texts().is_empty(), "{:?}", rig.sender.texts());
+    // 取消的任务自己不说话；对端收到的是分发落的那一句。
+    assert_eq!(rig.sender.texts(), ["好，先停了。"]);
     gate.release();
 }
 
@@ -784,4 +797,470 @@ async fn a_dispatched_task_without_a_status_line_is_continued_before_anything_is
     assert_eq!(sent, ["全做完了。"]);
     assert_eq!(rig.sender.texts(), ["全做完了。"]);
     assert_eq!(worker.turns(), 2);
+}
+
+// ---------------------------------------------------------------- 停下（§4.14 F4）
+
+use komo_kernel::durable::{InputState, SubmissionKind};
+use komo_runtime::durable::harness::orchestration::monitor::{self, MonitorState};
+
+fn start_monitor(command: &str) -> Result<komo_kernel::types::turn::Round, LlmError> {
+    call_round(
+        1,
+        "m1",
+        "monitor",
+        json!({ "command": command, "title": "盯构建" }),
+    )
+}
+
+/// 判断去向：含 `phrase` 的那条消息按 `route` 指向标题含 `title` 的任务，其余都新建 `title` 的任务。
+fn route_by(phrase: &'static str, route: &'static str, title: &'static str) -> Arc<FnRouter> {
+    FnRouter::new(move |prompt| {
+        if prompt.contains(&format!("## 这条消息\n{phrase}")) {
+            let handle = handle_of(prompt, title);
+            return Ok(json!({ "route": route, "task_id": handle }).to_string());
+        }
+        Ok(new_task(title, "照用户说的做"))
+    })
+}
+
+async fn task_doc_of(rig: &Rig, task: &SessionRecord) -> komo_runtime::durable::harness::TaskDoc {
+    komo_runtime::durable::harness::task_doc(&*rig.core().storage, task.root_conversation)
+        .await
+        .unwrap()
+        .expect("komo.task")
+}
+
+async fn registry(rig: &Rig) -> Vec<monitor::MonitorRecord> {
+    monitor::list(&*rig.core().storage).await.unwrap()
+}
+
+async fn settled(rig: &Rig, id: SubmissionId) -> SubmissionKind {
+    rig.core()
+        .storage
+        .submission(id)
+        .await
+        .unwrap()
+        .expect("submission")
+        .kind
+}
+
+/// 挂着监听的任务被停下：监听登记为已停、不交回结束消息，之后晚到的事件不起轮次，对端收到"好，先停了。"；
+/// 之后一条被判成 `continue` 的用户消息让它重新做起来并正常回复，事件又起得了轮次。
+#[tokio::test]
+async fn a_stopped_task_ends_its_monitors_ignores_late_events_and_resumes_on_continue() {
+    let router = route_by("别盯了", "stop", "盯构建");
+    let worker = FakeLlm::new(vec![vec![
+        start_monitor("sleep 300"),
+        text_round(2, "在盯了。\n状态：完成"),
+    ]]);
+    let mut rig = rig(
+        FnRouter::new({
+            let stop = router.clone();
+            move |prompt| {
+                if prompt.contains("## 这条消息\n接着盯") {
+                    let handle = handle_of(prompt, "盯构建");
+                    return Ok(json!({ "route": "continue", "task_id": handle }).to_string());
+                }
+                (stop.answer)(prompt)
+            }
+        }),
+        worker.clone(),
+        None,
+    )
+    .await;
+
+    rig.say("盯一下构建", "telegram:1").await;
+    rig.wait_texts("挂好监听的回复", 1).await;
+    let task = rig.task_sessions().await.remove(0);
+    let live = registry(&rig).await;
+    assert_eq!(live.len(), 1);
+    assert!(live[0].is_live(), "{live:?}");
+    let monitor_id = live[0].id;
+
+    rig.say("别盯了", "telegram:2").await;
+    let sent = rig.wait_texts("停下的那句话", 2).await;
+    assert_eq!(sent, ["在盯了。", "好，先停了。"]);
+
+    // 监听登记为已停；已停的任务不交回结束消息，也没有起新一轮。
+    let records = registry(&rig).await;
+    assert!(
+        matches!(&records[0].state, MonitorState::Ended { reason, .. } if reason == "stopped"),
+        "{records:?}"
+    );
+    let core = rig.core();
+    assert!(
+        core.storage
+            .submission_by_request(task.current_branch, &format!("monitor-end:{monitor_id}"))
+            .await
+            .unwrap()
+            .is_none(),
+        "已停的任务不该收到结束消息"
+    );
+    assert!(task_doc_of(&rig, &task).await.stopped);
+    // 任务清单里已停的任务不是"进行中"。
+    let listed = core.task_page(false, None, None).await.unwrap().tasks;
+    let row = listed
+        .iter()
+        .find(|row| row.session.as_str() == task.id)
+        .unwrap();
+    assert_eq!(row.state, komo_kernel::protocol::http::TaskState::Returned);
+    assert_eq!(
+        row.outcome,
+        Some(komo_kernel::protocol::http::TaskOutcome::NotCompleted)
+    );
+
+    // 晚到的监听事件：受理处就丢，submission 记 `unanswered{stopped}`，没有新一轮。
+    let late = core
+        .harness
+        .submit(
+            &core.engine,
+            task.current_branch,
+            monitor::event_draft(monitor_id, "盯构建", "9:1", "[监听 #x「盯构建」]\n又有一行"),
+        )
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            settled(&rig, late).await,
+            SubmissionKind::Input {
+                state: InputState::Unanswered { ref reason, .. }
+            } if reason == "stopped"
+        ),
+        "晚到的事件该被丢掉"
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert_eq!(worker.turns(), 1, "没有为晚到的事件起轮次");
+
+    // 用户的消息被判成 continue：标记清掉，任务重新做起来并正常回复。
+    worker.push_script(vec![text_round(1, "接着盯，没有新动静。\n状态：完成")]);
+    rig.say("接着盯", "telegram:3").await;
+    let sent = rig.wait_texts("接着做的回复", 3).await;
+    assert_eq!(sent[2], "接着盯，没有新动静。");
+    assert!(!task_doc_of(&rig, &task).await.stopped);
+    let event = core
+        .harness
+        .submit(
+            &core.engine,
+            task.current_branch,
+            monitor::event_draft(monitor_id, "盯构建", "9:2", "[监听 #x「盯构建」]\n新的一行"),
+        )
+        .await
+        .unwrap();
+    assert!(
+        !matches!(
+            settled(&rig, event).await,
+            SubmissionKind::Input {
+                state: InputState::Unanswered { .. }
+            }
+        ),
+        "清掉标记之后事件照常受理"
+    );
+    rig.gateway.stop().await;
+}
+
+/// 排队的监听事件在停下时被撤回，不会在取消之后把任务叫醒。
+#[tokio::test]
+async fn stop_discards_the_monitor_events_queued_in_the_inbox() {
+    let gate = Gate::new();
+    let router = route_by("停", "stop", "跑脚本");
+    let worker = FakeLlm::new(vec![vec![
+        call_round(1, "g1", "gate", json!({})),
+        text_round(2, "跑完了。\n状态：完成"),
+    ]]);
+    let rig = rig(router, worker.clone(), Some(&gate)).await;
+
+    rig.say("跑个脚本", "telegram:1").await;
+    gate.wait_entered(1).await;
+    let task = rig.task_sessions().await.remove(0);
+    let core = rig.core();
+    // 任务在忙：事件排进收件箱（内部输入，`abort_conversation` 本来会保留它）。
+    let queued = core
+        .harness
+        .submit(
+            &core.engine,
+            task.current_branch,
+            monitor::event_draft(7, "盯", "1:1", "[监听 #x「盯」]\n一行"),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        settled(&rig, queued).await,
+        SubmissionKind::Input {
+            state: InputState::Queued
+        }
+    ));
+
+    rig.say("停", "telegram:2").await;
+    rig.wait_texts("停下的那句话", 1).await;
+    assert!(
+        matches!(
+            settled(&rig, queued).await,
+            SubmissionKind::Input {
+                state: InputState::Unanswered { .. }
+            }
+        ),
+        "排队的事件该被撤回"
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert_eq!(worker.turns(), 1, "撤回之后没有为它起后继轮次");
+    assert_eq!(rig.sender.texts(), ["好，先停了。"]);
+    gate.release();
+}
+
+// ---------------------------------------------------------------- 不许沉默（§4.9 B1）
+
+/// 用户消息起的一轮回 `NO_REPLY`：不当作完成，追问一次；仍然没话，往对端说一句没做成。
+#[tokio::test]
+async fn a_user_round_that_stays_silent_is_asked_once_then_reported_as_not_done() {
+    let router = FnRouter::new(|_| Ok(new_task("整理周报", "整理本周周报")));
+    let worker = FakeLlm::new(vec![
+        vec![text_round(1, "NO_REPLY")],
+        vec![text_round(1, "NO_REPLY")],
+    ]);
+    let rig = rig(router, worker.clone(), None).await;
+
+    rig.say("整理周报", "telegram:1").await;
+    let sent = rig.wait_texts("没做成的那句话", 1).await;
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    assert_eq!(sent, ["这件事我没做成，要不要再试一次？"]);
+    assert_eq!(rig.sender.texts().len(), 1);
+    assert_eq!(worker.turns(), 2, "追问了一次，不多不少");
+    // 追问用的是自动续跑那条输入。
+    let asked = worker.requests.lock().unwrap()[1]
+        .messages
+        .iter()
+        .filter_map(|message| message.text.clone())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(asked.contains("自动发的"), "{asked}");
+    // 主线上也落了这一句，任务清单里它没有"完成"。
+    assert_eq!(
+        texts_of(&rig.main_line().await, MAIN_REPLY_ENTRY),
+        ["这件事我没做成，要不要再试一次？"]
+    );
+    let task = rig.task_sessions().await.remove(0);
+    let last = task_doc_of(&rig, &task).await.last_run.unwrap();
+    assert_eq!(last.state, "failed");
+}
+
+/// 追问之后接上话了，就照常回复，不会再说没做成。
+#[tokio::test]
+async fn a_silent_round_that_answers_when_asked_is_delivered_normally() {
+    let router = FnRouter::new(|_| Ok(new_task("整理周报", "整理本周周报")));
+    let worker = FakeLlm::new(vec![
+        vec![text_round(1, "NO_REPLY")],
+        vec![text_round(1, "整理好了。\n状态：完成")],
+    ]);
+    let rig = rig(router, worker, None).await;
+
+    rig.say("整理周报", "telegram:1").await;
+    rig.wait_texts("回复", 1).await;
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert_eq!(rig.sender.texts(), ["整理好了。"]);
+}
+
+/// 只由监听事件起的一轮回 `NO_REPLY` 保持现状：不交回、不通知、不追问。
+#[tokio::test]
+async fn an_events_only_round_may_still_stay_silent() {
+    let router = FnRouter::new(|_| Ok(new_task("盯构建", "盯一下构建")));
+    let worker = FakeLlm::new(vec![
+        vec![
+            start_monitor("sleep 1; echo hi; sleep 300"),
+            text_round(2, "挂好了。\n状态：完成"),
+        ],
+        vec![text_round(1, "NO_REPLY")],
+    ]);
+    let mut rig = rig(router, worker.clone(), None).await;
+
+    rig.say("盯一下构建", "telegram:1").await;
+    rig.wait_texts("挂好监听的回复", 1).await;
+    let w = Arc::clone(&worker);
+    eventually("事件起了一轮", move || w.turns() >= 2).await;
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+
+    assert_eq!(rig.sender.texts(), ["挂好了。"], "事件那一轮静默");
+    assert_eq!(worker.turns(), 2, "事件那一轮不追问");
+    rig.gateway.stop().await;
+}
+
+// ---------------------------------------------------------------- 放开两条规则（C）
+
+async fn goals(rig: &Rig) -> Vec<komo_kernel::types::matter::Matter> {
+    rig.gateway.state().matters.list(None, true).await.unwrap()
+}
+
+/// 由用户消息派出的任务里 `goal.add` 成功，记下的原话是那条用户消息；同一个任务里由监听事件起的一轮
+/// 同样的操作被拒。
+#[tokio::test]
+async fn a_dispatched_task_may_add_a_goal_on_the_users_words_but_not_on_an_event_round() {
+    let router = FnRouter::new(|_| Ok(new_task("盯构建", "盯一下构建")));
+    let worker = FakeLlm::new(vec![
+        vec![
+            call_round(
+                1,
+                "k1",
+                "komo",
+                json!({ "action": "goal.add", "params": { "title": "盯住构建" } }),
+            ),
+            start_monitor("sleep 1; echo hi; sleep 300"),
+            text_round(2, "记下了，也挂了监听。\n状态：完成"),
+        ],
+        vec![
+            call_round(
+                1,
+                "k2",
+                "komo",
+                json!({ "action": "goal.add", "params": { "title": "事件替我记的" } }),
+            ),
+            text_round(2, "NO_REPLY"),
+        ],
+    ]);
+    let mut rig = rig(router, worker.clone(), None).await;
+
+    rig.say("盯一下构建，顺便记个目标", "telegram:1").await;
+    rig.wait_texts("回复", 1).await;
+    let recorded = goals(&rig).await;
+    assert_eq!(recorded.len(), 1, "{recorded:?}");
+    assert_eq!(recorded[0].title, "盯住构建");
+    // 证据是任务会话里这一轮收到的那条输入（它带着用户的原话）。
+    let task = rig.task_sessions().await.remove(0);
+    let komo_kernel::types::memory::EvidenceRef::Event { session, .. } =
+        &recorded[0].evidence[0].reference
+    else {
+        panic!("{:?}", recorded[0].evidence)
+    };
+    assert_eq!(session.as_str(), task.id);
+    assert_eq!(recorded[0].evidence.len(), 1);
+    assert!(first_input(&worker).contains("盯一下构建，顺便记个目标"));
+
+    // 监听事件起的一轮：同一个任务，被拒。
+    let w = Arc::clone(&worker);
+    eventually("事件那一轮的 goal.add 被拒", move || {
+        format!("{:?}", w.inputs.lock().unwrap()).contains("找不到用户说的话")
+    })
+    .await;
+    assert_eq!(goals(&rig).await.len(), 1, "事件那一轮不能新建目标");
+    rig.gateway.stop().await;
+}
+
+/// 由用户消息派出的任务调对外工具不停在确认上；同一个任务里由监听事件起的一轮仍然要确认。
+#[tokio::test]
+async fn a_dispatched_task_calls_outward_tools_unconfirmed_on_a_user_round_but_not_on_an_event_round()
+ {
+    let probe = komo_gateway_probe();
+    let router = FnRouter::new(|_| Ok(new_task("盯构建", "盯一下构建")));
+    let worker = FakeLlm::new(vec![
+        vec![
+            call_round(1, "o1", "outward_ping", json!({})),
+            start_monitor("sleep 1; echo hi; sleep 300"),
+            text_round(2, "发了，也挂了监听。\n状态：完成"),
+        ],
+        vec![
+            call_round(1, "o2", "outward_ping", json!({})),
+            text_round(2, "NO_REPLY"),
+        ],
+    ]);
+    let mut rig = rig_with(router, worker.clone(), vec![probe.tool()]).await;
+
+    rig.say("通知一下大家，再盯着构建", "telegram:1").await;
+    rig.wait_texts("回复", 1).await;
+    assert_eq!(probe.calls(), 1, "用户消息起的一轮不用确认");
+
+    // 事件那一轮：停在确认卡上，没有执行。
+    let core = rig.core();
+    let waiting = {
+        let core = Arc::clone(&core);
+        move || {
+            let core = Arc::clone(&core);
+            async move {
+                !core
+                    .interventions(&komo_kernel::protocol::http::InterventionListQuery::default())
+                    .await
+                    .unwrap()
+                    .is_empty()
+            }
+        }
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while !waiting().await {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "事件那一轮没有停在确认上"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(probe.calls(), 1, "确认之前不执行");
+    rig.gateway.stop().await;
+}
+
+fn komo_gateway_probe() -> Arc<crate::service::test_support::OutwardProbe> {
+    crate::service::test_support::OutwardProbe::new()
+}
+
+/// 由用户消息派出的任务，如果收到子任务交回的 `task.result` 起了一轮，那一轮仍是触发器：对外工具要停在
+/// 确认上，`goal.add` 被拒（用户原话不含交回的内容）。
+#[tokio::test]
+async fn a_task_result_round_in_a_dispatched_task_is_still_a_trigger() {
+    use komo_runtime::durable::harness::TASK_RESULT_ENTRY;
+    use komo_runtime::durable::harness::inbox::{InputEntry, SubmissionDraft, WhenBusy};
+
+    let probe = komo_gateway_probe();
+    let router = FnRouter::new(|_| Ok(new_task("整理周报", "整理本周周报")));
+    let worker = FakeLlm::new(vec![
+        vec![text_round(1, "整理好了。\n状态：完成")],
+        vec![
+            call_round(
+                1,
+                "k1",
+                "komo",
+                json!({ "action": "goal.add", "params": { "title": "子任务替我记的" } }),
+            ),
+            call_round(2, "o1", "outward_ping", json!({})),
+            text_round(3, "NO_REPLY"),
+        ],
+    ]);
+    let mut rig = rig_with(router, worker.clone(), vec![probe.tool()]).await;
+
+    rig.say("整理周报", "telegram:1").await;
+    rig.wait_texts("回复", 1).await;
+    let task = rig.task_sessions().await.remove(0);
+    let core = rig.core();
+    core.harness
+        .submit(
+            &core.engine,
+            task.current_branch,
+            SubmissionDraft::Input {
+                content: Content::Text("[后台任务 #x「子」已完成]\n结果".into()),
+                entry: Some(InputEntry::new(TASK_RESULT_ENTRY, None)),
+                when_busy: WhenBusy::Steer,
+                request_id: Some("task-result:1:2".into()),
+                internal: true,
+            },
+        )
+        .await
+        .unwrap();
+
+    let w = Arc::clone(&worker);
+    eventually("goal.add 被拒", move || {
+        format!("{:?}", w.inputs.lock().unwrap()).contains("找不到用户说的话")
+    })
+    .await;
+    assert!(goals(&rig).await.is_empty());
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        let waiting = !core
+            .interventions(&komo_kernel::protocol::http::InterventionListQuery::default())
+            .await
+            .unwrap()
+            .is_empty();
+        if waiting {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "没有停在确认上");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(probe.calls(), 0, "确认之前不执行");
+    rig.gateway.stop().await;
 }

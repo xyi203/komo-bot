@@ -144,12 +144,17 @@ async fn events_only(tx: &mut Tx, inputs: &[SubmissionId]) -> Result<bool, Durab
             .and_then(|record| record.request_id);
         let from_monitor = key
             .as_deref()
-            .is_some_and(|key| key.starts_with("monitor:") || key.starts_with("monitor-end:"));
+            .is_some_and(|key| super::monitor::is_monitor_key(key));
         if !from_monitor {
             return Ok(false);
         }
     }
     Ok(true)
+}
+
+/// 回答是空的或只有 [`SILENT_REPLY`](komo_kernel::types::chat::SILENT_REPLY)。
+fn is_blank_or_silent(text: &str) -> bool {
+    text.trim().is_empty() || is_silent_reply(text)
 }
 
 fn detail_text(detail: Option<&Value>) -> String {
@@ -319,7 +324,14 @@ async fn report(
     // 只由监听事件 / 结束消息起的 run（S2，`docs/background-tasks.md` §2e）：不自动续跑（事件那一轮
     // 不是派出的活，没有状态行可写）；回答是 NO_REPLY 时不交回、lastRun 也不动。
     let events_only = events_only(tx, &run.inputs).await?;
-    let may_continue = may_continue && !events_only;
+    // `idle`：这条回答之后没有后继 run（只在回答收尾时为真）。
+    let idle = may_continue;
+    // 已停下的任务（`docs/tasks.md` §4.14 F4）不再自动续跑。
+    let may_continue = may_continue && !events_only && !doc.stopped;
+    // 任务不许沉默（`docs/tasks.md` §4.9 B1）：分发派出 / 续上的任务里，由人的消息起的一轮（有一条输入
+    // 不是监听交回的就算，混着事件的按用户消息算）回 `NO_REPLY` 或空，不当作完成。只由事件起的一轮不在
+    // 此列，保持原样（上面的 `events_only` 静默）。
+    let user_round = doc.reply.is_some() && !events_only && !has_contract;
 
     let (outcome, text, last) = match settlement {
         SubmissionSettlement::Done { answer } => {
@@ -333,20 +345,37 @@ async fn report(
             if may_continue && !continued && !has_contract && status_of(&text) == Status::Unstated {
                 return Ok(Some(doc));
             }
-            let last = LastRun {
-                state: "completed".into(),
-                ended_at: tx.now(),
-                final_message: Some(text.clone()),
-                reason: None,
-                status: Some(
-                    if has_contract {
-                        "done"
-                    } else {
-                        status_of(&text).as_str()
-                    }
-                    .to_owned(),
-                ),
-                rounds: Some(run.rounds),
+            let silent = user_round && is_blank_or_silent(&text);
+            // 追问过一次（或没法追问）仍然是空：后面还有后继 run 就让给它回话，已停下的任务不再说话；
+            // 都不是，就是真没做成，往下走直投那句"没做成"。
+            if silent && (!idle || doc.stopped) {
+                return Ok(None);
+            }
+            let last = if silent {
+                LastRun {
+                    state: "failed".into(),
+                    ended_at: tx.now(),
+                    final_message: None,
+                    reason: Some("没有给出回复".into()),
+                    status: None,
+                    rounds: Some(run.rounds),
+                }
+            } else {
+                LastRun {
+                    state: "completed".into(),
+                    ended_at: tx.now(),
+                    final_message: Some(text.clone()),
+                    reason: None,
+                    status: Some(
+                        if has_contract {
+                            "done"
+                        } else {
+                            status_of(&text).as_str()
+                        }
+                        .to_owned(),
+                    ),
+                    rounds: Some(run.rounds),
+                }
             };
             (Outcome::Completed, text, last)
         }
@@ -497,12 +526,17 @@ fn split_status(text: &str) -> (String, Status, Option<String>) {
 }
 
 /// 直接投给用户的那句话（`docs/tasks.md` §4.12 U3）：去掉状态行，不加前缀、不带任务号。
-/// 受阻时原因是一句普通的话；失败是一句自然的话，不带状态码；被取消的什么都不说（完整的"停下"
-/// 是后续步骤）。
+/// 受阻时原因是一句普通的话；失败是一句自然的话，不带状态码；被取消的什么都不说（"停下"那句话由分发
+/// 在主线上落，`docs/tasks.md` §4.14 F4）。
 fn direct_text(outcome: Outcome, text: &str) -> Option<String> {
     match outcome {
         Outcome::NotCompleted => {
             (text != failure_text("aborted", None)).then(|| format!("这件事我没做成：{text}。"))
+        }
+        // 由人的消息起的一轮没有给出任何话（追问过一次仍空，见 `report`）：一句普通的话说明没做成，
+        // 不带状态码。
+        Outcome::Completed if is_blank_or_silent(text) => {
+            Some("这件事我没做成，要不要再试一次？".to_owned())
         }
         Outcome::Completed => {
             let (body, status, reason) = split_status(text);

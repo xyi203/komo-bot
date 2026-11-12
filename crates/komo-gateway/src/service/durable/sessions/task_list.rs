@@ -137,6 +137,19 @@ impl DurableCore {
         Ok(TaskPage { tasks, next })
     }
 
+    /// 这个会话是不是"后台任务"：不能替用户改承诺类的事项、不能替用户记（`docs/goals.md` §4）。任务会话
+    /// 里只有带 `komo.task.reply` 的例外——它是由用户消息派出或续上的，这一轮是不是用户说的话仍由
+    /// Run 里有没有用户原话来判（只由监听事件起的一轮没有，照样被拒）。`task` 工具派出的子任务没有
+    /// `reply`，仍是后台任务。
+    pub async fn is_background_task(&self, record: &SessionRecord) -> Result<bool, SessionError> {
+        if record.kind != SessionKind::Task {
+            return Ok(false);
+        }
+        Ok(task_doc(&*self.storage, record.root_conversation)
+            .await?
+            .is_none_or(|doc| doc.reply.is_none()))
+    }
+
     async fn task_summary(
         &self,
         record: &SessionRecord,
@@ -151,21 +164,27 @@ impl DurableCore {
                 .items
                 .is_empty();
         // `komo.task` 只有派出的任务有；它在子 conversation（= 根）上。
-        let last = match record.kind {
-            SessionKind::Task => task_doc(&*self.storage, record.root_conversation)
-                .await?
-                .and_then(|doc| doc.last_run),
+        let doc = match record.kind {
+            SessionKind::Task => task_doc(&*self.storage, record.root_conversation).await?,
             _ => None,
         };
-        let outcome = last.as_ref().map(|last| match last.state.as_str() {
-            "completed" => match last.status.as_deref() {
-                Some("done") => TaskOutcome::Done,
-                Some("blocked") => TaskOutcome::Blocked,
-                // 没写状态行；旧 document 没有这一格也是这个。
-                _ => TaskOutcome::Unstated,
-            },
-            _ => TaskOutcome::NotCompleted,
-        });
+        // 被用户停下的任务（`komo.task.stopped`）：不论之前交回过什么，都算"没有完成"，不是进行中，
+        // 也不会因为上一次交回是完成而显示成已交回的好结果。再被 `continue` 做起来时标记清掉。
+        let stopped = doc.as_ref().is_some_and(|doc| doc.stopped);
+        let last = doc.and_then(|doc| doc.last_run);
+        let outcome = if stopped {
+            Some(TaskOutcome::NotCompleted)
+        } else {
+            last.as_ref().map(|last| match last.state.as_str() {
+                "completed" => match last.status.as_deref() {
+                    Some("done") => TaskOutcome::Done,
+                    Some("blocked") => TaskOutcome::Blocked,
+                    // 没写状态行；旧 document 没有这一格也是这个。
+                    _ => TaskOutcome::Unstated,
+                },
+                _ => TaskOutcome::NotCompleted,
+            })
+        };
 
         let archived = record.lifecycle != SessionLifecycle::Active;
         let running = live.run.is_some() || queued;

@@ -423,6 +423,11 @@ impl FakeLlm {
     }
 
     /// 到目前为止开了几个 turn（= 向模型请求了几次）。
+    /// 再排一段脚本（排在已有的后面）：测试跑到一半才知道下一段该是什么。
+    pub fn push_script(&self, script: Vec<Result<Round, LlmError>>) {
+        self.scripts.lock().expect("脚本模型").push_back(script);
+    }
+
     pub fn turns(&self) -> usize {
         self.turns.load(Ordering::SeqCst)
     }

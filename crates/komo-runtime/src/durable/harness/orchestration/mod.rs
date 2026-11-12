@@ -255,6 +255,12 @@ pub struct TaskDoc {
     /// 分发派出的任务：回复直接投到这里（见 [`ReplyTo`]）。`task` 工具派出的没有，照旧交回父会话。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reply: Option<ReplyTo>,
+    /// 用户说"停下"之后记在这里（`docs/tasks.md` §4.14 F4）：[`inbox::admit`](super::inbox::admit) 与监听的
+    /// 结束交回看它，收件箱里排着的、以及在途晚到的监听事件 / 结束消息一律丢弃、不起轮次。只有用户的消息
+    /// 被分发判成 `continue` 指向这个任务时才清掉（`dispatch::continue_task`）。附加字段：旧 document 没有，
+    /// 读成 `false`。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub stopped: bool,
 }
 
 /// 提交里读 `komo.task`（document 读，不是表读：排在表写之后也行）。
@@ -268,6 +274,13 @@ pub async fn load_task_doc(
             .map(Some)
             .map_err(|e| DurableError::rejected(format!("komo.task is malformed: {e}"))),
     }
+}
+
+/// 这个 conversation 是不是已被停下的任务（`komo.task.stopped`）。
+pub async fn is_stopped(tx: &mut Tx, conversation: ConversationId) -> Result<bool, DurableError> {
+    Ok(load_task_doc(tx, conversation)
+        .await?
+        .is_some_and(|doc| doc.stopped))
 }
 
 pub async fn store_task_doc(

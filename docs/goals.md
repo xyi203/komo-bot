@@ -88,7 +88,7 @@ area:  active → retired →（reopen）active
 | add、done、drop、park、retire、reopen、edit | 用户要做 / 要管什么 | 要有这个 Run 里用户说的话，作为证据追加（规则同 `memory add`，§9.3）；一句都没有就拒绝 | 直接改，不带证据 |
 | next、wait、resume、link、unlink | 推进的进度 | 不要求用户原话：推进是 Agent 自己的工作（它提了工单、转等待） | 直接改 |
 
-这和 `memory add` 一样不是安全边界（bash 去掉两个变量就走终端那条路，§7 没有 Policy），分的是常态下谁在说话。后台任务会话（`kind = task`）与 Cron 的 Run 里改承诺类操作被拒：那里没有用户原话。
+这和 `memory add` 一样不是安全边界（bash 去掉两个变量就走终端那条路，§7 没有 Policy），分的是常态下谁在说话。后台任务会话（`kind = task`）与 Cron 的 Run 里改承诺类操作被拒：那里没有用户原话。唯一的例外是由用户消息派出或续上的任务（`komo.task.reply` 有值，`docs/tasks.md` §4.14 F5）：这一轮由用户消息起的话照常放行，用户原话取自这一轮收到的那条用户消息；被别的任务用 `task` 工具派出的子任务、Cron 的会话、只由监听事件起的一轮仍被拒。
 
 **系统提示。** `SELF_BLOCK` 加一句静态文字：用户说开始做某事、开始管某事、在等某人某事、先放一放、办完了、不管了，就当场用 `komo goal` / `komo area` 记下；推进时更新下一步。
 

@@ -204,18 +204,20 @@ impl DurableCore {
         Ok(blockers)
     }
 
-    /// 删会话时停掉它名下还在跑的监听（2026-10-31，S2：任务会话也挂监听之后，删掉的任务不该留着
-    /// 脚本跑到超时）。会话已经 `closing`，登记 `ended{stopped}` 时不再交回结束消息（`finish_in_tx`），
-    /// 所以不会在要删的会话里再起 run。先登记、再停进程，同 `monitor_stop`；停进程失败只记一笔。
-    async fn stop_monitors(
+    /// 停掉这些 conversation 名下还在跑的监听（删会话与任务"停下"共用）：先登记 `ended{stopped}`，再停
+    /// 进程，同 `monitor_stop`；停进程失败只记一笔。`why` 是原因的一句话（进登记与结束消息）。
+    ///
+    /// 结束消息交不交回由挂它的会话定：删会话时会话已经 `closing`，任务"停下"时 `komo.task` 已标成已停
+    /// （[`Harness::mark_stopped`]），两种情况 `finish_in_tx` 都只登记、不交回，所以不会再起 run。
+    pub(in crate::service::durable) async fn stop_monitors(
         &self,
-        conversations: &[ConversationRecord],
+        conversations: &[ConversationId],
+        why: &str,
     ) -> Result<(), SessionError> {
-        let ids: Vec<ConversationId> = conversations.iter().map(|c| c.id).collect();
         let live: Vec<u64> = monitor::list(&*self.storage)
             .await?
             .into_iter()
-            .filter(|record| record.is_live() && ids.contains(&record.conversation))
+            .filter(|record| record.is_live() && conversations.contains(&record.conversation))
             .map(|record| record.id)
             .collect();
         for id in live {
@@ -224,13 +226,51 @@ impl DurableCore {
                     &self.engine,
                     id,
                     "stopped",
-                    Some("已停：挂它的会话被删除"),
-                    format!("[监听 #{} 已停：挂它的会话被删除]", short_handle(id)),
+                    Some(&format!("已停：{why}")),
+                    format!("[监听 #{} 已停：{why}]", short_handle(id)),
                 )
                 .await?;
             if let Err(error) = self.harness.deps().orchestration.stop_monitor(id).await {
-                tracing::warn!(%error, monitor = id, "删会话时停监听进程没停掉");
+                tracing::warn!(%error, monitor = id, "停监听进程没停掉：{why}");
             }
+        }
+        Ok(())
+    }
+
+    /// 任务的"停下"（`docs/tasks.md` §4.14 F4），分发的 `stop` 用：
+    ///
+    /// 1. 标成已停并撤回收件箱里排着的全部输入，包括监听事件与结束消息（[`Harness::mark_stopped`]）；
+    ///    标记先于下面两步，之后晚到的事件在受理处就被丢掉；
+    /// 2. 停掉任务名下还活着的监听，登记为已停、不交回结束消息；
+    /// 3. 撤回排队的用户输入并取消当前执行（[`Harness::abort_conversation`]）。
+    ///
+    /// 每一步幂等，崩在中间重放一遍即可。`task` 是任务会话里的一个 conversation（分发解析出的根）；
+    /// 它不属于任何 Session 就只对它自己做。只有用户的消息被判成 `continue` 才会清掉标记
+    /// （`dispatch::continue_task`）。
+    pub async fn stop_task(&self, task: ConversationId) -> Result<(), SessionError> {
+        let mut conversations = vec![task];
+        if let Some(session) = self
+            .storage
+            .conversation(task)
+            .await?
+            .and_then(|record| record.session)
+        {
+            conversations = session_conversations(&*self.storage, &session)
+                .await?
+                .into_iter()
+                .map(|record| record.id)
+                .collect();
+        }
+        for conversation in &conversations {
+            self.harness
+                .mark_stopped(&self.engine, *conversation)
+                .await?;
+        }
+        self.stop_monitors(&conversations, "任务被停下").await?;
+        for conversation in &conversations {
+            self.harness
+                .abort_conversation(&self.engine, *conversation)
+                .await?;
         }
         Ok(())
     }
@@ -283,7 +323,8 @@ impl DurableCore {
             .advance(id, &[SessionLifecycle::Active], SessionLifecycle::Closing)
             .await?;
         let conversations = session_conversations(&*self.storage, id).await?;
-        self.stop_monitors(&conversations).await?;
+        let ids: Vec<ConversationId> = conversations.iter().map(|c| c.id).collect();
+        self.stop_monitors(&ids, "挂它的会话被删除").await?;
         if now {
             for _ in 0..DRAIN_ROUNDS {
                 self.withdraw_queued(&conversations).await?;

@@ -38,8 +38,8 @@ use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
 use komo_kernel::protocol::http::{
-    ManualCronRunRequest, MatterActionRequest, MatterAddRequest, MemoryAddRequest, MemoryListQuery,
-    MemoryRevisionRequest, SessionListQuery, SessionSearchQuery, TaskListQuery,
+    ManualCronRunRequest, MatterActionRequest, MatterAddRequest, MatterListQuery, MemoryAddRequest,
+    MemoryListQuery, MemoryRevisionRequest, SessionListQuery, SessionSearchQuery, TaskListQuery,
 };
 use komo_kernel::traits::{OutputWriter, Tool};
 use komo_kernel::types::ids::{CronJobId, MatterId, MemoryId, OperationId, RequestKey};
@@ -68,6 +68,7 @@ pub enum Action {
     GoalResume,
     GoalDone,
     GoalLink,
+    GoalList,
     CronList,
     CronRun,
     SessionSearch,
@@ -116,7 +117,7 @@ const PAGING: [Field; 3] = [
     ),
 ];
 
-const SPECS: [Spec; 14] = [
+const SPECS: [Spec; 15] = [
     Spec {
         action: Action::MemoryAdd,
         name: "memory.add",
@@ -187,7 +188,7 @@ const SPECS: [Spec; 14] = [
         action: Action::GoalAdd,
         name: "goal.add",
         read_only: false,
-        summary: "新建一个目标（进行中）。要这个 Run 里有用户说的话作依据；任务会话与定时任务会话不能新建",
+        summary: "新建一个目标（进行中）。要这个 Run 里有用户说的话作依据；`task` 工具派出的子任务、定时任务会话、只由监听事件起的一轮不能新建",
         fields: &[
             field("title", true, "一句能独立看懂的话，≤ 80 字"),
             field("next", false, "下一步"),
@@ -231,7 +232,7 @@ const SPECS: [Spec; 14] = [
         action: Action::GoalDone,
         name: "goal.done",
         read_only: false,
-        summary: "目标完成。要这个 Run 里有用户说的话作依据（用户说办完了）；任务会话与定时任务会话不行",
+        summary: "目标完成。要这个 Run 里有用户说的话作依据（用户说办完了）；`task` 工具派出的子任务、定时任务会话、只由监听事件起的一轮不行",
         fields: &[field("id", true, "目标 id"), REVISION],
     },
     Spec {
@@ -249,6 +250,13 @@ const SPECS: [Spec; 14] = [
             ),
             REVISION,
         ],
+    },
+    Spec {
+        action: Action::GoalList,
+        name: "goal.list",
+        read_only: true,
+        summary: "列出目标（只读），带状态、下一步、截止；默认只列未结案的",
+        fields: &[field("all", false, "true = 带上已结案的")],
     },
     Spec {
         action: Action::CronList,
@@ -351,6 +359,7 @@ pub enum KomoCall {
         request: MemoryRevisionRequest,
     },
     GoalAdd(MatterAddRequest),
+    GoalList(MatterListQuery),
     GoalAct {
         id: MatterId,
         verb: MatterVerb,
@@ -423,9 +432,10 @@ fn doc() -> String {
     let mut text = String::from(
         "`params` 是一个对象，字段按动作不同（下面逐个列出，必填的标明）；给了不认识的字段会被拒绝并列出该动作认的字段。\
          身份（哪个会话、哪个 Run）由宿主填，不要在 params 里给 session / run。\n\
-         写动作按顺序一个个执行；只读动作（memory.search、cron.list、session.*、task.list）可以和别的只读调用放同一轮并行。\n\
-         改承诺的写动作（goal.add、goal.done）要这个 Run 里有用户说的话作依据；后台任务会话与定时任务会话被拒绝——\
-         把要记的在交回的结果里写明，由主会话来做。\n\
+         写动作按顺序一个个执行；只读动作（memory.search、goal.list、cron.list、session.*、task.list）可以和别的只读调用放同一轮并行。\n\
+         改承诺的写动作（goal.add、goal.done）要这个 Run 里有用户说的话作依据；`task` 工具派出的子任务、定时任务会话、\
+         只由监听事件起的一轮被拒绝——把要记的在交回的结果里写明，由主会话来做（由用户消息派出或续上的任务，\
+         这一轮里用户说的话算数）。\n\
          不在这里的：确认记忆（用户自己的动作）、Gateway 的重启与停止。\n",
     );
     for spec in &SPECS {
@@ -565,6 +575,12 @@ fn build(
             identity(&mut map);
             Ok(KomoCall::GoalAdd(decode(spec, map)?))
         }
+        Action::GoalList => {
+            map.insert("kind".into(), json!(MatterKind::Goal));
+            // 带会话：`memory = private / off` 的会话被拒，同路由。
+            map.insert("session".into(), json!(ctx.session));
+            Ok(KomoCall::GoalList(decode(spec, map)?))
+        }
         Action::GoalNext => matter(&mut map, MatterVerb::Next),
         Action::GoalWait => matter(&mut map, MatterVerb::Wait),
         Action::GoalResume => matter(&mut map, MatterVerb::Resume),
@@ -610,7 +626,7 @@ impl Tool for KomoTool {
         ToolDefinition {
             name: KOMO_TOOL.into(),
             description: "操作 komo 自己的状态，不经 shell：记忆（memory.add / search / forget）、\
-                          目标（goal.add / next / wait / resume / done / link）、定时任务（cron.list / run）、\
+                          目标（goal.add / list / next / wait / resume / done / link）、定时任务（cron.list / run）、\
                           找会话（session.search / list）、任务清单（task.list）。\
                           用户要你记住什么、提到别的会话里的事、问有哪些定时任务或任务时用它，\
                           别去翻系统 crontab 或读数据文件。\n\
@@ -761,6 +777,7 @@ mod tests {
             ("goal.resume", json!({ "id": "g-1" })),
             ("goal.done", json!({ "id": "g-1", "revision": 3 })),
             ("goal.link", json!({ "id": "g-1", "cron": "job-1" })),
+            ("goal.list", json!({ "all": true })),
             ("cron.list", json!({})),
             ("cron.run", json!({ "id": "job-1" })),
             ("session.search", json!({ "q": "飞书" })),
@@ -800,6 +817,13 @@ mod tests {
             request.trigger,
             Some(MatterTrigger::cron(CronJobId::from_raw("job-1")))
         );
+        // goal.list：只列目标，带会话（同路由的闸）。
+        let KomoCall::GoalList(list) = &calls[9] else {
+            panic!("{:?}", calls[9])
+        };
+        assert_eq!(list.kind, Some(MatterKind::Goal));
+        assert!(list.all);
+        assert_eq!(list.session.as_ref().unwrap().as_str(), "sess-1");
     }
 
     #[tokio::test]
@@ -956,6 +980,7 @@ mod tests {
             reads,
             [
                 "memory.search",
+                "goal.list",
                 "cron.list",
                 "session.search",
                 "session.list",

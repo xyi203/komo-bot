@@ -14,7 +14,7 @@
 //! execute   第二个检查点。**一次提交**里落效果并把分发任务标成完成：
 //!             new       建任务会话（`Harness::spawn_task_in_tx`，与 `task` 工具同一段）
 //!             continue  把原文提交给目标任务（请求键 `dispatch:{主线消息的 entry}`）；已结束就接着做
-//!             stop      `Harness::abort_conversation`（完整的"停下"在后续步骤）
+//!             stop      `DurableCore::stop_task`（标已停、撤输入、停监听、取消执行），再落一句"好，先停了。"
 //!             list      在主线上落一条清单消息（不经模型）
 //! ```
 //!
@@ -420,12 +420,11 @@ async fn execute(
         return Ok(());
     };
     if let (Route::Stop { .. }, Some(target)) = (&decision.route, decision.target) {
-        // TODO(后续步骤): 完整的"停下"还要停监听、丢晚到的事件、把任务标成已停、交回已有的部分
-        // （`docs/tasks.md` §4.14 F4）。这一步只取消目标会话现在的执行。
-        // 取消先于完成提交：取消幂等，崩在两者之间重放只是再取消一次。
-        core.harness
-            .abort_conversation(&core.engine, target)
-            .await?;
+        // 完整的"停下"（撤排队的输入、停监听、标已停、取消当前执行）见 `DurableCore::stop_task`。
+        // 先于完成提交：每一步幂等，崩在两者之间重放只是再做一遍。任务已有的中间产出留在任务会话里，不外发。
+        core.stop_task(target)
+            .await
+            .map_err(|error| TaskError::new(error.to_string()))?;
     }
     let harness = core.harness.clone();
     let dispatch = dispatch.clone();
@@ -462,25 +461,16 @@ async fn execute(
                         }
                     }
                 }
-                Route::Stop { .. } => json!({ "route": "stop", "task": decision.target }),
+                Route::Stop { .. } => {
+                    // 往来源对端说一句普通的话，同样落成主线上的 `main.reply`。
+                    if decision.target.is_some() {
+                        say(tx, &harness, &dispatch, &reply, key, STOPPED_REPLY).await?;
+                    }
+                    json!({ "route": "stop", "task": decision.target })
+                }
                 Route::List => {
                     let said = decision.list.clone().unwrap_or_default();
-                    let data = json!({
-                        "text": said,
-                        "peer": reply.peer,
-                        "session": dispatch.session,
-                        "origin": {
-                            "entry": reply.origin_entry,
-                            "submission": reply.origin_submission,
-                        },
-                    });
-                    let draft = SubmissionDraft::Write {
-                        entry: WriteDraft::display(MAIN_REPLY_ENTRY, data),
-                        request_id: Some(key),
-                    };
-                    harness
-                        .admit_in_tx(tx, dispatch.conversation, &draft)
-                        .await?;
+                    say(tx, &harness, &dispatch, &reply, key, &said).await?;
                     json!({ "route": "list" })
                 }
                 // 私聊没有 `ignore`；真出现了（检查点被改过）就什么都不做，消息仍在主线上。
@@ -491,6 +481,38 @@ async fn execute(
     })
     .await?;
     core.resume();
+    Ok(())
+}
+
+/// 停下之后往来源对端说的话。
+const STOPPED_REPLY: &str = "好，先停了。";
+
+/// 程序自己往主线说一句话（不经模型）：一条 `main.reply` 展示 entry，渠道投递由 [`deliver`] 照它做。
+/// 请求键 `key` 让同一条消息的分发重放不重复落。
+async fn say(
+    tx: &mut Tx,
+    harness: &komo_runtime::durable::harness::Harness,
+    dispatch: &DispatchInput,
+    reply: &ReplyTo,
+    key: String,
+    text: &str,
+) -> Result<(), DurableError> {
+    let data = json!({
+        "text": text,
+        "peer": reply.peer,
+        "session": dispatch.session,
+        "origin": {
+            "entry": reply.origin_entry,
+            "submission": reply.origin_submission,
+        },
+    });
+    let draft = SubmissionDraft::Write {
+        entry: WriteDraft::display(MAIN_REPLY_ENTRY, data),
+        request_id: Some(key),
+    };
+    harness
+        .admit_in_tx(tx, dispatch.conversation, &draft)
+        .await?;
     Ok(())
 }
 
@@ -570,6 +592,8 @@ async fn continue_task(
         return Err(DurableError::rejected("任务会话在受理时忙了"));
     }
     doc.reply = Some(reply.clone());
+    // 用户的话让停下的任务重新做起来：清掉已停标记（之后的监听事件才又起得了轮次）。
+    doc.stopped = false;
     store_task_doc(tx, session.root_conversation, &doc).await?;
     Ok(true)
 }

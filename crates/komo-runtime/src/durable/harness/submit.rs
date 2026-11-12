@@ -31,7 +31,7 @@ use super::generation::{self, GenerationTask};
 use super::hooks::HarnessDeps;
 use super::inbox::{self, Admitted, QueueModes, SubmissionDraft, WriteDraft};
 use super::live::{self, LiveState, live_address};
-use super::orchestration::{self, monitor};
+use super::orchestration::{self, load_task_doc, monitor, store_task_doc};
 use super::outcome::unanswered;
 use super::tool::ToolTask;
 use super::{COMPACTION_KIND, GENERATION_KIND, TOOL_KIND};
@@ -420,6 +420,32 @@ impl Harness {
             })
             .await?;
         engine.abort_conversation(conversation, false).await
+    }
+
+    /// 任务"停下"的第一步（`docs/tasks.md` §4.14 F4）：一次提交里把 `komo.task` 标成已停，并撤回收件箱里
+    /// 排着的全部输入——用户的和内部的（监听事件、结束消息）都撤，与 [`Harness::abort_conversation`]
+    /// 有意保留内部输入相反。标记之后晚到的监听事件 / 结束消息在 [`inbox::admit`] 就被丢掉。
+    /// `conversation` 不是任务会话（没有 `komo.task`）时只撤回，幂等。
+    pub async fn mark_stopped(
+        &self,
+        engine: &Engine,
+        conversation: ConversationId,
+    ) -> Result<(), DurableError> {
+        engine
+            .commit(move |tx| {
+                Box::pin(async move {
+                    // 先撤回（读收件箱 document 与 submission），再写标记。
+                    inbox::withdraw_all_inputs(tx, conversation).await?;
+                    if let Some(mut doc) = load_task_doc(tx, conversation).await?
+                        && !doc.stopped
+                    {
+                        doc.stopped = true;
+                        store_task_doc(tx, conversation, &doc).await?;
+                    }
+                    Ok(())
+                })
+            })
+            .await
     }
 
     /// 等一个 submission settle（`done` 或 `unanswered`）。线封口（关闭或失败）时报错。

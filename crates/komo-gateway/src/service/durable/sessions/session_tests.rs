@@ -1797,6 +1797,7 @@ mod task_list {
             last_run: last,
             continued: None,
             reply: None,
+            stopped: false,
         };
         let root = record.root_conversation;
         core.engine

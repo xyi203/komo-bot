@@ -343,6 +343,7 @@ pub(crate) async fn create_child(
         last_run: None,
         continued: None,
         reply,
+        stopped: false,
     };
     if let Some(contract) = contract {
         doc.contracts.insert(first.to_string(), contract);

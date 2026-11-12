@@ -245,6 +245,9 @@ implemented, unapproved draft, or superseded.
 - Clients: `docs/clients.md` — plan to rebuild the web client on TanStack
   Start (SPA mode, served by the Gateway) and extend it to macOS (Electron) and
   phones (PWA, then Capacitor); C0–C2 implemented, C3–C4 not; supersedes roadmap-muse §4.4.
+- Tasks: `docs/tasks.md` — make tasks, not sessions, the unit the operator sees
+  (one home conversation plus a task list; trims the session-tree surface);
+  draft, not approved.
 - Direction: `docs/roadmap-muse.md` — gaps and phases toward a Muse-style
   proactive personal agent (PARA-style goals and areas, proactivity,
   outward-action confirmation);

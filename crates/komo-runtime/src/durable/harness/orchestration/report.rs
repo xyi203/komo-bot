@@ -586,6 +586,8 @@ async fn direct_reply(
             "handle": short_handle(at.conversation.get()),
             "title": at.title,
         },
+        // 展示 entry 没有消息自带的时间，事件投影读这一格；不写就只能沿用前一条记录的时间。
+        "at": tx.now(),
     });
     let draft = SubmissionDraft::Write {
         entry: WriteDraft::display(super::MAIN_REPLY_ENTRY, data),

@@ -249,11 +249,14 @@ impl DurableCore {
     ) -> Result<Accepted, SessionError> {
         let hash = komo_kernel::types::digest::ContentHash::of_str(&message.text).to_string();
         let peer = message.peer.as_ref().map(ToString::to_string);
+        // `at`：这条展示 entry 没有 `model`，也就没有消息自带的时间；不写的话事件投影只能沿用前一条记录的时间。
+        let at = (self.clock.now().unix_timestamp_nanos() / 1_000_000) as i64;
         let data = json!({
             "text": message.text,
             "peer": peer,
             "principal": message.principal,
             "inputHash": hash,
+            "at": at,
         });
         let draft = SubmissionDraft::Write {
             entry: WriteDraft::display(MAIN_USER_ENTRY, data),
@@ -643,6 +646,8 @@ async fn say(
             "entry": reply.origin_entry,
             "submission": reply.origin_submission,
         },
+        // 展示 entry 没有消息自带的时间，事件投影读这一格（见 `dispatch_message`）。
+        "at": tx.now(),
     });
     let draft = SubmissionDraft::Write {
         entry: WriteDraft::display(MAIN_REPLY_ENTRY, data),

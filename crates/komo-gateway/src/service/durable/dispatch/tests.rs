@@ -1831,6 +1831,18 @@ mod line_events {
                 ))
                 .all(|event| event.run.is_none())
         );
+        // 线上的展示 entry 没有消息自带的时间：时刻写在 `data.at`，事件的时间取它，不沿用前一条记录的
+        // （新会话里前一条没有，沿用就是 1970 年）。
+        assert!(
+            backfill
+                .iter()
+                .filter(|event| matches!(
+                    event.payload,
+                    EventPayload::MessageUser(_) | EventPayload::LineReply(_)
+                ))
+                .all(|event| event.ts.unix_timestamp() > 1_700_000_000),
+            "线上消息的事件要带它落下的时刻"
+        );
         // 任务的回复带任务会话与回的那条用户消息；清单没有任务。
         let replies: Vec<_> = backfill
             .iter()

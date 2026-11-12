@@ -111,6 +111,15 @@ const USER_ENTRY_KIND: &str = "komo.user";
 /// 主线 / 群的线上的展示 entry（gateway `dispatch` 与 runtime `MAIN_REPLY_ENTRY`，kernel 不依赖它们）。
 const MAIN_USER_ENTRY: &str = "main.user";
 const MAIN_REPLY_ENTRY: &str = "main.reply";
+
+/// 线上展示 entry 的时间：它们没有 `model`，落的时候把时刻写在 `data.at`（毫秒）。2026-11-12 之前落的
+/// 没有这一格，沿用前一条记录的时间。
+fn line_millis(entry: &EntryRecord) -> Option<i64> {
+    if entry.kind != MAIN_USER_ENTRY && entry.kind != MAIN_REPLY_ENTRY {
+        return None;
+    }
+    entry.data.as_ref()?.get("at")?.as_i64()
+}
 /// `!` 命令与命令型 cron 落下的 write entry（gateway `service/durable/shell.rs`）。
 pub const SHELL_ENTRY_KIND: &str = "shell.command";
 const ASSISTANT_ENTRY_KIND: &str = "komo.assistant";
@@ -308,7 +317,9 @@ impl Projection {
     // ------------------------------------------------------------------ entry
 
     fn entry(&mut self, entry: &EntryRecord, out: &mut Vec<Event>) {
-        self.last_ms = entry_millis(entry).unwrap_or(self.last_ms);
+        self.last_ms = entry_millis(entry)
+            .or_else(|| line_millis(entry))
+            .unwrap_or(self.last_ms);
         let frame = Frame::at(self, entry.id.raw(), self.last_ms);
         if entry.kind == SETTLED_ENTRY_KIND {
             return self.settled(entry, &frame, out);

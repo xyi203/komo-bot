@@ -797,20 +797,25 @@ impl Assembled {
                 .unwrap_or_default()
                 .to_string();
             if kind == "tool_use" {
-                // §6：被截断的一轮**不构造任何工具调用**，半个 tool_use 也不回放。
-                if truncated {
-                    continue;
-                }
                 let raw = item
                     .as_object_mut()
                     .and_then(|obj| obj.remove("__raw_input"))
                     .and_then(|value| value.as_str().map(str::to_string))
                     .unwrap_or_default();
-                // 拼不成 JSON 就是没收齐——不能按半轮调用执行（同 Responses 的口径）。
+                // 被截断的一轮：调用块留下（harness 回错误结果让模型重发），参数只做修复不补
+                // 闭合，拼不成就给空对象，且不进 `tool_calls`——不执行半截调用。
+                if truncated {
+                    item["input"] = crate::json_repair::parse_arguments(&raw, false)
+                        .unwrap_or_else(|| json!({}));
+                    content.push(item);
+                    continue;
+                }
+                // 严格 → 修复 → 补闭合都拼不成对象就是没收齐——不能按半轮调用执行（同
+                // Responses 的口径）。
                 let input: Value = if raw.trim().is_empty() {
                     json!({})
                 } else {
-                    serde_json::from_str(&raw).map_err(|_| LlmError::Incomplete)?
+                    crate::json_repair::parse_arguments(&raw, true).ok_or(LlmError::Incomplete)?
                 };
                 item["input"] = input.clone();
                 tool_calls.push(ProviderToolCall {
@@ -1215,7 +1220,7 @@ mod tests {
     // ---- max_tokens 截断 ----
 
     #[tokio::test]
-    async fn a_max_tokens_stop_truncates_and_drops_the_half_built_call() {
+    async fn a_max_tokens_stop_truncates_and_keeps_the_half_call_unexecuted() {
         let transport = ScriptedTransport::new(vec![Reply::raw(
             200,
             &[
@@ -1254,10 +1259,9 @@ mod tests {
         let Some(Value::Array(blocks)) = &round.provider_blocks else {
             panic!()
         };
-        assert!(
-            blocks.iter().all(|b| b["type"] != json!("tool_use")),
-            "没收齐的调用不进回放：{blocks:?}"
-        );
+        // 半截调用留在回放里（harness 回错误结果让模型重发），`input` 必须是合法对象。
+        let call = blocks.iter().find(|b| b["type"] == json!("tool_use"));
+        assert_eq!(call.map(|b| &b["input"]), Some(&json!({})), "{blocks:?}");
     }
 
     // ---- 没有 message_stop = 没收齐 ----

@@ -443,22 +443,36 @@ impl ChatAssembled {
             .is_some_and(|reason| !matches!(reason, "stop" | "tool_calls"));
         let mut tool_calls = Vec::new();
         let mut native_calls = Vec::new();
-        if !truncated {
-            for call in self.calls.into_values() {
+        for call in self.calls.into_values() {
+            {
+                // 被截断的一轮：调用留在回放里（harness 回错误结果让模型重发），但不进
+                // `tool_calls`——不执行半截调用；回放的 `arguments` 原文保持合法 JSON。
                 let arguments = if call.arguments.trim().is_empty() {
                     json!({})
+                } else if truncated {
+                    crate::json_repair::parse_arguments(&call.arguments, false)
+                        .unwrap_or_else(|| json!({}))
                 } else {
-                    serde_json::from_str(&call.arguments).map_err(|_| LlmError::Incomplete)?
+                    crate::json_repair::parse_arguments(&call.arguments, true)
+                        .ok_or(LlmError::Incomplete)?
                 };
-                tool_calls.push(ProviderToolCall {
-                    provider_call_id: call.id.clone(),
-                    name: call.name.clone(),
-                    arguments,
-                });
+                if !truncated {
+                    tool_calls.push(ProviderToolCall {
+                        provider_call_id: call.id.clone(),
+                        name: call.name.clone(),
+                        arguments: arguments.clone(),
+                    });
+                }
+                // 回放给 provider 的 `arguments` 必须是合法 JSON：修复过的、半截的换成解析出的值。
+                let replay = if serde_json::from_str::<Value>(&call.arguments).is_ok() {
+                    call.arguments
+                } else {
+                    arguments.to_string()
+                };
                 native_calls.push(json!({
                     "id": call.id,
                     "type": "function",
-                    "function": { "name": call.name, "arguments": call.arguments },
+                    "function": { "name": call.name, "arguments": replay },
                 }));
             }
         }

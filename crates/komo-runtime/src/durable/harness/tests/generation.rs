@@ -347,6 +347,161 @@ async fn a_truncated_reply_fails_the_run_without_running_its_calls() {
     engine.close().await.unwrap();
 }
 
+fn truncated_calls(calls: &[(&str, &str, serde_json::Value)]) -> Step {
+    let mut message = call_reply(calls);
+    message.stop_reason = StopReason::Length;
+    Step::Reply(message)
+}
+
+/// P1（`docs/tasks.md` §4.10）：带工具调用的截断不让任务失败——保留 assistant entry，给每个
+/// 调用落一条错误结果，下一轮请求让模型重发；截断的调用一个也不执行。
+#[tokio::test(start_paused = true)]
+async fn a_truncated_reply_with_calls_gets_error_results_and_the_model_resends() {
+    let world = World::new();
+    let write = Arc::new(TestTool::writer("write", &world.log));
+    world.tools(vec![write.clone()]);
+    world
+        .script
+        .push(truncated_calls(&[("c1", "write", json!({"path": "a"}))]));
+    world.script.calls(&[("c2", "write", json!({"path": "a"}))]);
+    world.script.reply("done");
+    let engine = world.open().await;
+    let id = world.submit(&engine, "write it").await;
+    let settled = world.harness.wait(&engine, id).await.unwrap();
+
+    assert!(matches!(input_state(&settled), InputState::Done { .. }));
+    assert_eq!(write.runs(), 1, "only the resent call runs");
+    let requests = world.script.requests();
+    assert_eq!(requests.len(), 3);
+    assert_eq!(
+        outline(&requests[1]),
+        [
+            "system",
+            "user: write it",
+            "assistant calls write(c1)",
+            "result(c1)"
+        ]
+    );
+    let Message::ToolResult(result) = &requests[1][3] else {
+        panic!("tool result expected");
+    };
+    assert!(result.is_error);
+    assert!(text_of(&requests[1][3]).contains("输出上限"));
+    let results = world.entries_of("komo.tool-result").await;
+    assert_eq!(results[0].data.as_ref().unwrap()["harness"], "truncated");
+    let assistants = world.entries_of("komo.assistant").await;
+    assert_eq!(assistant_stop(&assistants[0]), StopReason::Length);
+    engine.close().await.unwrap();
+}
+
+/// 连续截断有上限：两次可以重发，第三次按不带调用的截断那样失败。
+#[tokio::test(start_paused = true)]
+async fn consecutive_truncated_replies_fail_the_run_after_two_retries() {
+    let world = World::new();
+    let write = Arc::new(TestTool::writer("write", &world.log));
+    world.tools(vec![write.clone()]);
+    for n in 0..3 {
+        world
+            .script
+            .push(truncated_calls(&[(&format!("c{n}"), "write", json!({}))]));
+    }
+    let engine = world.open().await;
+    let id = world.submit(&engine, "write it").await;
+    let settled = world.harness.wait(&engine, id).await.unwrap();
+
+    let (reason, detail) = unanswered(&settled);
+    assert_eq!(reason, "model_error");
+    assert!(detail.unwrap().contains("模型回复被截断"));
+    assert_eq!(world.script.request_count(), 3);
+    assert_eq!(write.runs(), 0);
+    engine.close().await.unwrap();
+}
+
+/// 中间有一轮正常的工具调用，连续截断的计数就清零。
+#[tokio::test(start_paused = true)]
+async fn a_normal_tool_round_resets_the_truncation_count() {
+    let world = World::new();
+    let write = Arc::new(TestTool::writer("write", &world.log));
+    world.tools(vec![write.clone()]);
+    for n in 0..2 {
+        world
+            .script
+            .push(truncated_calls(&[(&format!("t{n}"), "write", json!({}))]));
+    }
+    world.script.calls(&[("ok", "write", json!({}))]);
+    for n in 2..4 {
+        world
+            .script
+            .push(truncated_calls(&[(&format!("t{n}"), "write", json!({}))]));
+    }
+    world.script.reply("done");
+    let engine = world.open().await;
+    let id = world.submit(&engine, "write it").await;
+    let settled = world.harness.wait(&engine, id).await.unwrap();
+
+    assert!(matches!(input_state(&settled), InputState::Done { .. }));
+    assert_eq!(write.runs(), 1);
+    engine.close().await.unwrap();
+}
+
+/// 重启后回放必须与首次一致：截断那一轮的 assistant 与错误结果在同一次提交里落地，重启后
+/// 重发的请求与重启前那次逐条相同。
+#[tokio::test(start_paused = true)]
+async fn a_restart_after_a_truncated_round_resends_the_same_context() {
+    let world = World::new();
+    let write = Arc::new(TestTool::writer("write", &world.log));
+    world.tools(vec![write.clone()]);
+    world
+        .script
+        .push(truncated_calls(&[("c1", "write", json!({"path": "a"}))]));
+    world.script.push(Step::Hang);
+    let engine = world.open().await;
+    let id = world.submit(&engine, "write it").await;
+    world
+        .until(|| async { world.script.request_count() == 2 })
+        .await;
+
+    world.script.reply("done");
+    let engine = world.restart(engine).await;
+    world.harness.wait(&engine, id).await.unwrap();
+
+    let requests = world.script.requests();
+    assert_eq!(requests.len(), 3);
+    assert_eq!(requests[1], requests[2]);
+    assert_eq!(write.runs(), 0);
+    engine.close().await.unwrap();
+}
+
+/// 截断后重发的那一轮同样计 token 预算：超了就以 `budget` 收场，不再发下一次请求。
+#[tokio::test(start_paused = true)]
+async fn a_truncated_round_counts_against_the_token_budget() {
+    let world = World::new();
+    let write = Arc::new(TestTool::writer("write", &world.log));
+    world.tools(vec![write.clone()]);
+    world.hooks.set_budget(RunBudget {
+        max_tokens: Some(50),
+        ..RunBudget::default()
+    });
+    world
+        .script
+        .push(truncated_calls(&[("c1", "write", json!({}))]));
+    world.script.reply("never asked");
+    let engine = world.open().await;
+    let id = world.submit(&engine, "write it").await;
+    let settled = world.harness.wait(&engine, id).await.unwrap();
+
+    let (reason, detail) = unanswered(&settled);
+    assert_eq!(reason, "budget");
+    assert_eq!(detail.unwrap(), "超过 token 预算（50）");
+    assert_eq!(
+        world.script.request_count(),
+        1,
+        "no resend after the budget stop"
+    );
+    assert_eq!(write.runs(), 0);
+    engine.close().await.unwrap();
+}
+
 /// pi harness-generation "fails with no_model when no model is configured or the model is unknown"。
 #[tokio::test(start_paused = true)]
 async fn no_model_fails_the_input_with_no_model() {

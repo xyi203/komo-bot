@@ -264,16 +264,17 @@ impl OpenAiResponsesLlm {
     }
 }
 
-fn parse_arguments(item: &Value) -> Value {
+fn parse_arguments(item: &Value, complete: bool) -> Value {
     lenient_arguments(
         item.get("arguments")
             .and_then(Value::as_str)
             .unwrap_or_default(),
+        complete,
     )
 }
 
 /// `output` items → provider 无关的块：reasoning 的摘要、assistant 文字、函数调用。
-fn content_from_items(items: &[Value]) -> Vec<ContentBlock> {
+fn content_from_items(items: &[Value], complete: bool) -> Vec<ContentBlock> {
     let mut content = Vec::new();
     for item in items {
         match item.get("type").and_then(Value::as_str) {
@@ -314,7 +315,7 @@ fn content_from_items(items: &[Value]) -> Vec<ContentBlock> {
                     content.push(ContentBlock::tool_call(
                         call_id,
                         name,
-                        parse_arguments(item),
+                        parse_arguments(item, complete),
                     ));
                 }
             }
@@ -325,7 +326,7 @@ fn content_from_items(items: &[Value]) -> Vec<ContentBlock> {
 
 fn message_from_round(model: &ModelConfig, round: Round) -> AssistantMessage {
     let mut content = match &round.provider_blocks {
-        Some(Value::Array(items)) => content_from_items(items),
+        Some(Value::Array(items)) => content_from_items(items, !round.truncated),
         _ => Vec::new(),
     };
     // 服务端的 `output` 里没有 message item、而增量里有文字：文字不能丢。放在调用之前。
@@ -364,7 +365,7 @@ impl Assembled {
             content.push(ContentBlock::tool_call(
                 call.call_id.clone(),
                 call.name.clone(),
-                lenient_arguments(&call.arguments),
+                lenient_arguments(&call.arguments, false),
             ));
         }
         content

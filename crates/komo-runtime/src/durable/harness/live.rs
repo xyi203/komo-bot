@@ -66,6 +66,9 @@ pub struct RunControl {
     /// run 开始的时刻（毫秒）。任务交回时报用时；旧文档没有它，读成 0 就不报。
     #[serde(default)]
     pub started_at: i64,
+    /// 连续被截断（带工具调用）的回复数；一轮正常的工具调用就清零。放在这里是为了重启不重置。
+    #[serde(default)]
+    pub truncations: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

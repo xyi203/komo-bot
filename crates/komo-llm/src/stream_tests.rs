@@ -674,7 +674,11 @@ fn assert_same_parse(label: &str, k: usize, round: &Round, message: &AssistantMe
             )
         })
         .collect();
-    assert_eq!(calls_of(message), calls, "{label} 第 {k} 轮调用");
+    // 被截断的一轮 `Round.tool_calls` 为空（不执行），消息里保留调用块（见
+    // `a_truncated_round_keeps_its_half_calls_but_executes_none`）。
+    if !round.truncated {
+        assert_eq!(calls_of(message), calls, "{label} 第 {k} 轮调用");
+    }
     let expected_stop = if round.truncated {
         StopReason::Length
     } else if calls.is_empty() {
@@ -882,17 +886,20 @@ async fn an_unset_effort_and_an_empty_toolset_are_byte_identical() {
     }
 }
 
-/// 截断的一轮：`stopReason = length`、不含任何调用，与旧 driver 的 `Round.truncated` 一致，
-/// 半截的调用也不在原生块里。
+/// 截断的一轮：`stopReason = length`，`Round.tool_calls` 为空（不执行）；半截的调用留在消息里，
+/// harness 对每个回一条错误结果让模型重发（参数只修复、不补闭合）。
 #[tokio::test]
-async fn a_truncated_round_builds_no_calls_and_replays_identically() {
+async fn a_truncated_round_keeps_its_half_calls_but_executes_none() {
     for p in ALL {
         let case = Case::new(p, vec![step(p.truncated("写到一半"), vec![], vec![])]);
         let outcome = check(case).await;
         let first = &outcome.new_messages[0];
         assert_eq!(first.stop_reason, StopReason::Length, "{p:?}");
-        assert!(calls_of(first).is_empty(), "{p:?}");
+        let calls = calls_of(first);
+        assert_eq!(calls.len(), 1, "{p:?} 半截的调用留在消息里：{calls:?}");
+        assert_eq!(calls[0].0, "call_cut", "{p:?}");
         assert!(outcome.old_rounds[0].truncated, "{p:?}");
+        assert!(outcome.old_rounds[0].tool_calls.is_empty(), "{p:?}");
     }
 }
 

@@ -5,6 +5,7 @@
 
 pub mod agent;
 pub mod chat;
+pub mod coerce;
 pub mod delegate;
 pub mod digest;
 pub mod handle;

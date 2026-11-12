@@ -291,6 +291,23 @@ fn message_from_round(model: &ModelConfig, round: Round) -> AssistantMessage {
             call.arguments.clone(),
         ));
     }
+    // 被截断的一轮 `tool_calls` 为空（不执行），但调用留在原生消息里：投影成调用块，harness
+    // 对每个回一条错误结果让模型重发。
+    if round.truncated
+        && let Some(Value::Object(native)) = &round.provider_blocks
+        && let Some(Value::Array(calls)) = native.get("tool_calls")
+    {
+        for call in calls {
+            let function = &call["function"];
+            if let (Some(id), Some(name)) = (call["id"].as_str(), function["name"].as_str()) {
+                content.push(ContentBlock::tool_call(
+                    id,
+                    name,
+                    lenient_arguments(function["arguments"].as_str().unwrap_or_default(), false),
+                ));
+            }
+        }
+    }
     final_message(
         model,
         API_CHAT,
@@ -315,7 +332,7 @@ impl ChatAssembled {
             content.push(ContentBlock::tool_call(
                 call.id.clone(),
                 call.name.clone(),
-                lenient_arguments(&call.arguments),
+                lenient_arguments(&call.arguments, false),
             ));
         }
         content

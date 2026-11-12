@@ -60,6 +60,7 @@ use komo_kernel::durable::{
 };
 use komo_kernel::projection::{ProjectionContext, ToolResultFacts, project_views, select};
 use komo_kernel::traits::{ChildStarted, OutputWriter, StoreError, Tool};
+use komo_kernel::types::coerce::coerce_arguments;
 use komo_kernel::types::ids::{AttemptId, RunId, ToolCallId};
 use komo_kernel::types::plan::{ExecutionPlan, Operation, Replay};
 use komo_kernel::types::refs::{
@@ -490,6 +491,10 @@ impl ToolTask {
             let message = format!("脚本里不能调 {}", call.name);
             return self.settle_unrun(rt, &set, &call, message).await;
         }
+        // 参数按 schema 宽松转换（"3" → 3、可选字段的 null 去掉）发生在 `prepare` 之前：之后写进
+        // `confirm` / `execute` 检查点与编排调用读到的都是转换后的，回放与首次一致。
+        let mut call = call;
+        call.arguments = coerce_arguments(call.arguments, &tool.definition().parameters);
         let cancel = CancelToken::new();
         let ctx = self
             .context(&set.env, rt, 1, None, cancel, call.nested.is_some())

@@ -646,7 +646,8 @@ impl Assembled {
                 hit_budget,
                 "response.incomplete：这一轮被截断"
             );
-            items.retain(|item| wire::function_call_of(item).is_none());
+            // 调用留在 items 里（参数可能只有半截，不补闭合）：harness 对每个调用回一条
+            // "超出输出上限"的错误结果，让模型重发。不执行，所以 `tool_calls` 照旧为空。
             return Ok(Round {
                 round,
                 text: (!self.text.is_empty()).then_some(self.text),
@@ -688,11 +689,12 @@ impl Assembled {
         };
 
         for (call_id, name, arguments) in sourced {
-            // 参数是逐段到的 JSON 文本；拼不成 JSON 就是没收齐——不能按半轮调用执行。
+            // 参数是逐段到的 JSON 文本；严格 → 修复 → 补闭合都拼不成对象就是没收齐——不能按
+            // 半轮调用执行。
             let parsed: Value = if arguments.trim().is_empty() {
                 json!({})
             } else {
-                serde_json::from_str(&arguments).map_err(|_| LlmError::Incomplete)?
+                crate::json_repair::parse_arguments(&arguments, true).ok_or(LlmError::Incomplete)?
             };
             tool_calls.push(ProviderToolCall {
                 provider_call_id: call_id,
@@ -809,6 +811,36 @@ mod tests {
         assert_eq!(round.text.as_deref(), Some("全文"));
     }
 
+    fn call_with_arguments(arguments: &str) -> Result<Round, LlmError> {
+        let args = serde_json::to_string(arguments).unwrap();
+        assemble(&[
+            (
+                wire::OUTPUT_ITEM_ADDED,
+                r#"{"output_index":0,"item":{"type":"function_call","call_id":"c","name":"write"}}"#,
+            ),
+            (
+                wire::FUNCTION_ARGS_DONE,
+                &format!(r#"{{"output_index":0,"arguments":{args}}}"#),
+            ),
+            (wire::RESPONSE_COMPLETED, r#"{"response":{"output":[]}}"#),
+        ])
+    }
+
+    #[test]
+    fn a_raw_newline_inside_an_argument_string_still_parses() {
+        let round = call_with_arguments("{\"content\":\"a\nb\"}").unwrap();
+        assert_eq!(round.tool_calls[0].arguments, json!({"content": "a\nb"}));
+    }
+
+    #[test]
+    fn an_unclosed_argument_object_is_closed_when_the_stream_ended_normally() {
+        let round = call_with_arguments(r#"{"path":"a","tags":["x","y""#).unwrap();
+        assert_eq!(
+            round.tool_calls[0].arguments,
+            json!({"path": "a", "tags": ["x", "y"]})
+        );
+    }
+
     #[test]
     fn half_an_argument_object_is_incomplete_not_an_empty_call() {
         let error = assemble(&[
@@ -835,7 +867,7 @@ mod tests {
 
     /// `response.incomplete` → 截断，**不构造任何工具调用**。
     #[test]
-    fn an_incomplete_response_truncates_and_builds_no_calls() {
+    fn an_incomplete_response_truncates_and_executes_no_calls() {
         let round = assemble(&[
             (
                 wire::OUTPUT_ITEM_ADDED,
@@ -859,8 +891,8 @@ mod tests {
         assert!(
             items
                 .iter()
-                .all(|item| wire::function_call_of(item).is_none()),
-            "没收齐的调用不进回放：{items:?}"
+                .any(|item| wire::function_call_of(item).is_some()),
+            "半截调用留在回放里，harness 回错误结果让模型重发：{items:?}"
         );
     }
 

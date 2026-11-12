@@ -16,6 +16,7 @@ mod anthropic;
 mod chat;
 pub mod codex_auth;
 mod effort;
+mod json_repair;
 mod model_stream;
 mod models;
 mod reply;

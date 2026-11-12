@@ -227,6 +227,7 @@ async fn write_live(
                         rounds,
                         tokens: 0,
                         started_at: 0,
+                        truncations: 0,
                     }),
                     generation: Some(GenerationLive {
                         attempt: 1,

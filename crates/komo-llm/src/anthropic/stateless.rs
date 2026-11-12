@@ -285,7 +285,7 @@ fn content_block(block: &Value) -> Option<ContentBlock> {
         "tool_use" => {
             // 流进行中的块还带着没解析的原始 JSON 文本。
             let arguments = match block.get("__raw_input").and_then(Value::as_str) {
-                Some(raw) => lenient_arguments(raw),
+                Some(raw) => lenient_arguments(raw, false),
                 None => block.get("input").cloned().unwrap_or_else(|| json!({})),
             };
             Some(ContentBlock::tool_call(
@@ -342,7 +342,7 @@ impl Assembled {
                 } => ContentBlock::tool_call(
                     id.clone(),
                     name.clone(),
-                    lenient_arguments(partial_json),
+                    lenient_arguments(partial_json, false),
                 ),
                 PartialBlock::Verbatim(value) => match content_block(value) {
                     Some(block) => block,

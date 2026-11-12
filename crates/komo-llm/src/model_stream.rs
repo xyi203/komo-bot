@@ -592,9 +592,10 @@ impl ProgressThrottle {
     }
 }
 
-/// 参数 JSON 文本 → 值；还没收齐（流进行中）就给空对象。
-pub(super) fn lenient_arguments(raw: &str) -> Value {
-    serde_json::from_str(raw).unwrap_or_else(|_| json!({}))
+/// 参数 JSON 文本 → 值（严格 → 修复 → `complete` 时补闭合，见 `json_repair`），全失败给空
+/// 对象。`complete` 只在流正常结束时为真：流进行中的部分回复与被截断的回复不补闭合。
+pub(super) fn lenient_arguments(raw: &str, complete: bool) -> Value {
+    crate::json_repair::parse_arguments(raw, complete).unwrap_or_else(|| json!({}))
 }
 
 // ---------------------------------------------------------------- 构造

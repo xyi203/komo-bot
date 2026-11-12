@@ -309,6 +309,7 @@ impl RetrievalSection {
 pub(super) struct AgentSection {
     pub instructions: Option<String>,
     pub model: Option<String>,
+    pub router_model: Option<String>,
     pub tools: Option<Vec<String>>,
     pub skills: Option<Vec<String>>,
     pub workspace: Option<PathBuf>,
@@ -413,6 +414,7 @@ impl AgentSection {
             id: id.to_string(),
             instructions: self.instructions.filter(|text| !text.trim().is_empty()),
             model: self.model,
+            router_model: self.router_model,
             tools: self.tools,
             skills: self.skills,
             workspace: self.workspace.map(|path| resolve(base, path)),

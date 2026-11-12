@@ -624,6 +624,22 @@ fn check_agents(snapshot: &ConfigSnapshot, issues: &mut Vec<ConfigIssue>) {
                 "写了 instructions 就不能是空的；不想要就整行去掉",
             ));
         }
+        // Router 的分发判断每条消息都跑一次：alias 写错不能像 `model` 那样静默退回主模型，
+        // 否则分发会悄悄用了操作者没想要的模型，所以在这里就拒绝。
+        if let Some(alias) = profile.router_model.as_deref()
+            && snapshot.model_catalog.completion(alias).is_none()
+        {
+            let aliases = snapshot
+                .model_catalog
+                .completions()
+                .map(|(alias, _)| alias)
+                .collect::<Vec<_>>()
+                .join("、");
+            issues.push(error(
+                &format!("agents.{id}.router_model"),
+                format!("`{alias}` 不是 [model.<alias>] 里的 completion 模型；可选值：{aliases}"),
+            ));
+        }
         if matches!(profile.memory_scope, Some(MemoryScope::Agent { .. })) {
             issues.push(error(
                 &format!("agents.{id}.memory_scope"),
@@ -1014,6 +1030,44 @@ mod tests {
         profile.memory_scope = Some(MemoryScope::Personal);
         snapshot.agent.agents.insert("scribe".into(), profile);
         assert_eq!(keys(&validate(&snapshot)), vec!["agents.scribe.memory"]);
+    }
+
+    #[test]
+    fn a_router_model_is_optional_and_must_name_a_completion_model() {
+        let mut snapshot = snapshot_fixture();
+        let mut profile = komo_kernel::types::agent::AgentProfile::new("scribe");
+        snapshot
+            .agent
+            .agents
+            .insert("scribe".into(), profile.clone());
+        assert!(
+            validate(&snapshot).is_empty(),
+            "缺省就用 Agent 自己的 model"
+        );
+
+        profile.router_model = Some("chat".into());
+        snapshot
+            .agent
+            .agents
+            .insert("scribe".into(), profile.clone());
+        assert!(validate(&snapshot).is_empty());
+
+        profile.router_model = Some("nope".into());
+        snapshot
+            .agent
+            .agents
+            .insert("scribe".into(), profile.clone());
+        let issues = validate(&snapshot);
+        assert_eq!(keys(&issues), vec!["agents.scribe.router_model"]);
+        assert!(issues[0].message.contains("nope"), "{:?}", issues[0]);
+
+        // 向量模型不能做判断。
+        profile.router_model = Some("embedding".into());
+        snapshot.agent.agents.insert("scribe".into(), profile);
+        assert_eq!(
+            keys(&validate(&snapshot)),
+            vec!["agents.scribe.router_model"]
+        );
     }
 
     #[test]

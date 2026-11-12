@@ -76,7 +76,8 @@ komo-runtime   `durable/`: Task engine + harness (generation / tool / inbox /
                compaction / orchestration / codemode / landing, the agent loop organised
                by pi's hooks) · `durable::memory` · cron scheduler.
 komo-agent     AgentProfile → 能力面选择 · skills 发现与目录 · 编排操作名 ·
-               系统段装配（context：system_sections、task_contract_block、project_update_block，压缩摘要提示）。
+               系统段装配（context：system_sections、task_contract_block、project_update_block，压缩摘要提示）·
+               Router 分发判断（router：输入/去向类型、提示、校验、兜底，模型调用是注入的 trait）。
                只依赖 kernel，不执行；runtime 不依赖它，Gateway 组装两边。
                值类型（AgentProfile/AgentSurface）留在 kernel。
 komo-gateway   axum routes (`http/v2`) · `service/durable` (DurableCore + hooks;

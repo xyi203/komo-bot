@@ -9,11 +9,13 @@
 //!
 //! ```text
 //! surface   Profile 在工具目录里挑出来的能力面（§4 末）+ 编排操作名
+//! router    Router 的分发判断：输入 → 提示 → 去向（校验、兜底、重试上限），模型调用是注入的 trait
 //! skills    SkillRegistry：人写的 SKILL.md 的发现与目录行（§5.6、§14）
 //! context   ContextInput → AgentContext：系统提示、回放消息与记忆段的唯一装配入口（§5、§8、§10、§13）
 //! ```
 
 pub mod context;
+pub mod router;
 pub mod skills;
 pub mod surface;
 

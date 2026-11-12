@@ -58,6 +58,9 @@ pub struct AgentProfile {
     /// 模型 alias（进 `model_catalog` 解析）。`None` = 主模型。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Router 分发判断用的模型 alias（`docs/tasks.md` §4.11）。`None` = 用 `model`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub router_model: Option<String>,
     /// 这次能给模型看的工具。`None` = 目录里装着的那几个（默认面）；`Some(vec![])` =
     /// 一个都不给——**空数组是"不给"，不是"全部"**，两者写在配置文件里的意思完全不同。
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -86,6 +89,7 @@ impl AgentProfile {
             id: id.into(),
             instructions: None,
             model: None,
+            router_model: None,
             tools: None,
             skills: None,
             workspace: None,

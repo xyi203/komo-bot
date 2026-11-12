@@ -26,6 +26,7 @@ pub mod role {
     pub const MEMORY_CONSOLIDATE: &str = "memory.consolidate";
     pub const RERANK: &str = "rerank";
     pub const TITLE: &str = "title";
+    pub const ROUTER: &str = "router";
     pub const EMBEDDING: &str = "embedding";
 }
 

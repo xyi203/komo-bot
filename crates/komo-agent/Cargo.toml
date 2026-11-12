@@ -10,6 +10,8 @@ license.workspace = true
 # Gateway 组装两边。值类型（`AgentProfile` / `AgentSurface` / `RunSnapshot`）留在
 # kernel：事件、协议与 store 模型都按它们落盘，搬出来会把依赖指反。
 [dependencies]
+# Router 的模型调用是注入的 trait（`router::RouterModel`），Gateway 给实现。
+async-trait = { workspace = true }
 komo-kernel = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
@@ -17,3 +19,4 @@ tracing = { workspace = true }
 [dev-dependencies]
 komo-kernel = { workspace = true, features = ["test-support"] }
 tempfile = { workspace = true }
+tokio = { workspace = true, features = ["rt", "macros"] }

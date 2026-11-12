@@ -9,6 +9,7 @@ pub mod channel;
 pub mod compaction;
 pub mod memory;
 mod prompt;
+pub mod router;
 
 use std::path::PathBuf;
 

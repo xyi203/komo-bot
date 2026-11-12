@@ -720,6 +720,23 @@ fn a_warning_rides_along_with_a_config_that_still_loads() {
 }
 
 #[test]
+fn a_router_model_loads_from_the_agent_table_and_is_none_when_omitted() {
+    let fixture = Fixture::valid();
+    let text = Fixture::config_text("chat-a", "medium").replace(
+        "[agents.assistant]",
+        "[agents.assistant]\nrouter_model = \"memory\"\n\n[agents.helper]",
+    );
+    write(&fixture.sources().config, &text);
+
+    let loaded = load_config(&fixture.options()).unwrap();
+    assert!(loaded.issues.is_empty(), "{:?}", loaded.issues);
+    let assistant = loaded.snapshot.agent.get("assistant").unwrap();
+    assert_eq!(assistant.router_model.as_deref(), Some("memory"));
+    let helper = loaded.snapshot.agent.get("helper").unwrap();
+    assert_eq!(helper.router_model, None, "不写就用 Agent 自己的 model");
+}
+
+#[test]
 fn a_private_agent_loads_from_the_file_and_an_empty_tool_list_stays_empty() {
     let fixture = Fixture::valid();
     let text = Fixture::config_text("chat-a", "medium").replace(

@@ -10,6 +10,9 @@ export default defineConfig({
   resolve: {
     alias: { "@": fileURLToPath(new URL("./src", import.meta.url)) },
   },
+  // 构建时 TanStack 预渲染会起 `vite preview`（host 默认 localhost）再用 fetch 连它；
+  // localhost 解析成 ::1 和 127.0.0.1 两个地址时两边可能各挑一个，导致 ECONNREFUSED。钉死 IPv4 回环。
+  preview: { host: "127.0.0.1" },
   plugins: [
     komoGatewayProxy(),
     paraglideVitePlugin({

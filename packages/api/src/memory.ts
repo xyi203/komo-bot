@@ -12,6 +12,7 @@ import { useQuery } from "@tanstack/react-query";
 import { useMemo } from "react";
 import { get, post } from "./http";
 import { keys } from "./keys";
+import { uuid } from "./uuid";
 
 export type { MemoryScope } from "@komo/protocol";
 /** 对话、右栏与 ⌘K 里的一条记忆：就是线上的 `MemoryItem`。 */
@@ -47,7 +48,7 @@ export const classifyMemory = (memory: MemoryItem, body: Pick<MemoryClassifyRequ
     request_key: `web:classify:${memory.id}:${memory.revision}:${body.application}`,
   } satisfies MemoryClassifyRequest);
 export const addMemory = (body: Omit<MemoryAddRequest, "request_key">) =>
-  post<MemoryAddResponse>("/v1/memories", { ...body, request_key: `web:add:${crypto.randomUUID()}` } satisfies MemoryAddRequest);
+  post<MemoryAddResponse>("/v1/memories", { ...body, request_key: `web:add:${uuid()}` } satisfies MemoryAddRequest);
 
 // hooks
 /** 记忆 id → 内容与用法：对话里"带上了哪些记忆"要显示正文。取不到就当没有（对话照常）。 */

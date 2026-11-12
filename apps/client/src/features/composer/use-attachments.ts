@@ -1,4 +1,4 @@
-import { uploadAttachment } from "@komo/api";
+import { uploadAttachment, uuid } from "@komo/api";
 import { useCallback, useSyncExternalStore } from "react";
 import { errorText } from "@/lib/errors";
 import { markFileDraft } from "./draft";
@@ -52,7 +52,7 @@ function release(box: Box, id: string) {
 export function addAttachments(key: string, files: readonly File[]) {
   const box = boxOf(key);
   for (const file of files) {
-    const id = crypto.randomUUID();
+    const id = uuid();
     const controller = new AbortController();
     const preview = file.type.startsWith("image/") ? URL.createObjectURL(file) : undefined;
     box.live.set(id, { controller, preview });

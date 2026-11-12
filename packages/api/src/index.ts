@@ -2,6 +2,7 @@ export * from "./actions";
 export { ApiError, isApiError } from "./errors";
 export { get, post, request } from "./http";
 export { keys } from "./keys";
+export { uuid } from "./uuid";
 export { subscribeSession, type StreamState, type SubscribeOptions } from "./sse";
 export {
   fetchHealth,

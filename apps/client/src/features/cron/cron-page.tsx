@@ -1,4 +1,4 @@
-import { deleteCron, keys, patchCron, runCron, useCronList, useSessions } from "@komo/api";
+import { deleteCron, keys, patchCron, runCron, useCronList, useSessions, uuid } from "@komo/api";
 import type { CronFiring, CronJob, CronJobStatus, FiringStatus, ManualCronRunResponse, SessionSummary } from "@komo/protocol";
 import { useQueryClient } from "@tanstack/react-query";
 import { Link, useNavigate } from "@tanstack/react-router";
@@ -175,9 +175,9 @@ function CronDetail({
     setFail("");
     setRan(null);
     try {
-      if (kind === "run") setRan(await runCron(job.id, `web:cron-run:${crypto.randomUUID()}`));
+      if (kind === "run") setRan(await runCron(job.id, `web:cron-run:${uuid()}`));
       else if (kind === "toggle")
-        await patchCron(job.id, { status: job.status === "paused" ? "active" : "paused", request_key: `web:cron-status:${job.id}:${crypto.randomUUID()}` });
+        await patchCron(job.id, { status: job.status === "paused" ? "active" : "paused", request_key: `web:cron-status:${job.id}:${uuid()}` });
       else {
         await deleteCron(job.id);
         setConfirming(false);

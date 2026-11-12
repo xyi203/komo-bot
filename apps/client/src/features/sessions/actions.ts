@@ -1,4 +1,4 @@
-import { archiveSession, createSession, forkSession, keys, purgeSession, renameSession, type SessionPages } from "@komo/api";
+import { archiveSession, createSession, forkSession, keys, purgeSession, renameSession, uuid, type SessionPages } from "@komo/api";
 import type { SessionSummary } from "@komo/protocol";
 import { useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "@tanstack/react-router";
@@ -20,7 +20,7 @@ export function useSessionActions() {
     /** 新建；`workdir` 给了就在那个目录新建（工作目录分组头的 +）。 */
     async create(workdir?: string) {
       try {
-        const session = await createSession({ request_key: `web:new:${crypto.randomUUID()}`, ...(workdir ? { workdir } : {}) });
+        const session = await createSession({ request_key: `web:new:${uuid()}`, ...(workdir ? { workdir } : {}) });
         // 先放进列表缓存，目标页马上认得它的标题，再让列表重取
         for (const all of [true, false]) {
           queryClient.setQueryData<SessionPages>(keys.sessions.list(all), (previous) =>

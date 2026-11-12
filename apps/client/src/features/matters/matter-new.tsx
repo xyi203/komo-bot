@@ -1,4 +1,4 @@
-import { addMatter, keys } from "@komo/api";
+import { addMatter, keys, uuid } from "@komo/api";
 import type { MatterAddRequest, MatterKind } from "@komo/protocol";
 import { useQueryClient } from "@tanstack/react-query";
 import { useState, type FormEvent } from "react";
@@ -29,7 +29,7 @@ export function NewMatterForm({
     event.preventDefault();
     const data = new FormData(event.currentTarget);
     const v = (key: string) => String(data.get(key) ?? "").trim();
-    const body: MatterAddRequest = { kind, title: v("title"), request_key: `web:matter-add:${crypto.randomUUID()}` };
+    const body: MatterAddRequest = { kind, title: v("title"), request_key: `web:matter-add:${uuid()}` };
     if (kind === "goal") {
       if (v("next")) body.next = v("next");
       if (v("due")) body.due = v("due");

@@ -1,4 +1,4 @@
-import { cancelRun, submitRun } from "@komo/api";
+import { cancelRun, submitRun, uuid } from "@komo/api";
 import type { SubmitRunRequest, WireEvent } from "@komo/protocol";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { errorText } from "@/lib/errors";
@@ -48,7 +48,7 @@ export function useSend(sessionId: string, events: readonly WireEvent[] | undefi
   const send = useCallback(
     (text: string, options: SendOptions = {}) => {
       if (!text.trim()) return;
-      const id = crypto.randomUUID();
+      const id = uuid();
       const body: SubmitRunRequest = {
         request_key: `web:${sessionId}:${id}`,
         text,

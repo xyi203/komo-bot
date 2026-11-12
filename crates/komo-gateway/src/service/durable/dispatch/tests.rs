@@ -1264,3 +1264,706 @@ async fn a_task_result_round_in_a_dispatched_task_is_still_a_trigger() {
     assert_eq!(probe.calls(), 0, "确认之前不执行");
     rig.gateway.stop().await;
 }
+
+/// 对话位置的路由归属、飞书私聊话题与群的线（`docs/tasks.md` §4.7、§4.13、§4.14 F5）。
+mod threads {
+    use komo_kernel::durable::TaskStatus;
+    use komo_kernel::protocol::{InboundAck, InboundMessage};
+    use komo_kernel::types::chat::{ChannelPeer, Outbound};
+
+    use super::*;
+    use crate::dispatcher::chat_origin;
+    use crate::service::durable::sessions::GROUP_LINE_PREFIX;
+
+    const FEISHU_ENV: &str =
+        "KOMO_LLM_API_KEY=test-key\nFEISHU_APP_ID=cli_test\nFEISHU_APP_SECRET=test-app-secret\n";
+
+    async fn feishu_rig(router: Arc<FnRouter>, worker: Arc<FakeLlm>) -> Rig {
+        let sender = MemSender::new(ChannelPlatform::Feishu);
+        let gateway = GatewayBuilder::new(&crate::service::test_support::harness::config_toml(
+            &crate::service::test_support::harness::feishu_block("\"ou_op\""),
+        ))
+        .env(FEISHU_ENV)
+        .llm(router as Arc<dyn LlmClient>)
+        .stream(worker as Arc<dyn komo_llm::ModelStream>)
+        .factory(FixedFactory::sender_only(
+            Arc::clone(&sender) as Arc<dyn ChannelSender>
+        ))
+        .start()
+        .await;
+        Rig { gateway, sender }
+    }
+
+    /// 飞书里的一条消息：`thread` 是话题根（没有就是没话题）。
+    fn feishu(
+        chat: &str,
+        thread: Option<&str>,
+        private: bool,
+        text: &str,
+        key: &str,
+    ) -> InboundMessage {
+        let mut message = inbound(ChannelPlatform::Feishu, chat, "ou_op", text, key, private);
+        if let Some(thread) = thread {
+            message.peer = message.peer.in_thread(thread);
+        }
+        message
+    }
+
+    fn dm(thread: &str, text: &str, key: &str) -> InboundMessage {
+        feishu("oc_dm", Some(thread), true, text, key)
+    }
+
+    fn group(chat: &str, thread: &str, text: &str, key: &str) -> InboundMessage {
+        feishu(chat, Some(thread), false, text, key)
+    }
+
+    impl Rig {
+        async fn send(&self, message: InboundMessage) -> InboundAck {
+            self.gateway.handle(message).await
+        }
+
+        async fn line_of(&self, chat: &str) -> SessionRecord {
+            let agent = self.gateway.state().snapshot().agent.default_agent.clone();
+            self.core()
+                .group_line(&agent, &ChannelPeer::new(ChannelPlatform::Feishu, chat))
+                .await
+                .unwrap()
+                .0
+        }
+
+        async fn sessions_of(&self, kind: SessionKind) -> Vec<SessionRecord> {
+            let query = komo_kernel::durable::storage::SessionQuery {
+                kind: Some(kind),
+                ..Default::default()
+            };
+            self.core()
+                .storage
+                .scan_sessions(&query, 100, None)
+                .await
+                .unwrap()
+                .items
+        }
+
+        /// 这条线上的分发任务都做完了（终态）。
+        async fn settled(&self, line: &SessionRecord) {
+            let core = self.core();
+            let conversation = line.current_branch;
+            for _ in 0..250 {
+                let query = TaskQuery {
+                    conversation: Some(conversation),
+                    kind: Some(DISPATCH_KIND.to_owned()),
+                    ..Default::default()
+                };
+                let tasks = core
+                    .storage
+                    .scan_tasks(&query, 100, None)
+                    .await
+                    .unwrap()
+                    .items;
+                if !tasks.is_empty()
+                    && tasks
+                        .iter()
+                        .all(|task| task.state.status() == TaskStatus::Terminal)
+                {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            panic!("分发任务没有在 5 秒内做完");
+        }
+
+        /// 标题为 `title` 的任务会话。
+        async fn task_titled(&self, title: &str) -> SessionRecord {
+            self.sessions_of(SessionKind::Task)
+                .await
+                .into_iter()
+                .find(|task| task.title.as_deref() == Some(title))
+                .unwrap_or_else(|| panic!("没有任务「{title}」"))
+        }
+
+        async fn reply_peers(&self) -> Vec<ChannelPeer> {
+            self.sender
+                .sent()
+                .into_iter()
+                .map(|message| message.peer)
+                .collect()
+        }
+    }
+
+    fn handle_for(
+        summary_title: &str,
+        rig_core: &Arc<DurableCore>,
+    ) -> impl std::future::Future<Output = String> {
+        let core = Arc::clone(rig_core);
+        let title = summary_title.to_owned();
+        async move {
+            core.task_page(false, None, None)
+                .await
+                .unwrap()
+                .tasks
+                .into_iter()
+                .find(|task| task.title == title)
+                .unwrap_or_else(|| panic!("清单里没有「{title}」"))
+                .handle
+        }
+    }
+
+    /// 飞书私聊里一条开出新话题的主线消息：不再开普通会话，由主会话受理并分发；任务的回话落在这条消息的
+    /// 话题里，话题的归属是这个任务；渠道的"处理中"卡片靠同一个 run 收尾。
+    #[tokio::test]
+    async fn a_new_feishu_dm_topic_is_dispatched_from_main_and_the_task_owns_the_topic() {
+        let router = FnRouter::new(|_| Ok(new_task("订机票", "订下周一的机票")));
+        let worker = FakeLlm::new(vec![vec![text_round(1, "订好了。\n状态：完成")]]);
+        let rig = feishu_rig(router.clone(), worker.clone()).await;
+
+        let ack = rig.send(dm("om_1", "帮我订机票", "feishu:e1")).await;
+        let InboundAck::Queued { session, run } = ack else {
+            panic!("私聊应该排队：{ack:?}");
+        };
+        let sent = rig.wait_texts("回复", 1).await;
+        assert_eq!(sent, ["订好了。"]);
+
+        // 没有开出普通会话：受理落在主会话。
+        assert!(rig.sessions_of(SessionKind::Normal).await.is_empty());
+        let main = rig.main().await;
+        assert_eq!(session.as_str(), main.id);
+        assert_eq!(
+            texts_of(&rig.main_line().await, MAIN_USER_ENTRY),
+            ["帮我订机票"]
+        );
+        assert_eq!(router.calls(), 1);
+
+        // 回话在这条消息的话题里；卡片收尾靠的 run 与回执里的一致。
+        let reply = rig.sender.sent().remove(0);
+        assert_eq!(reply.peer.to_string(), "feishu:oc_dm#om_1");
+        let Outbound::RunFinished { run: finished, .. } = reply.outbound else {
+            panic!("应该是 RunFinished：{:?}", reply.outbound);
+        };
+        assert_eq!(finished, run);
+
+        // 话题的归属是这个任务，回话去处也是这个话题。
+        let task = rig.task_titled("订机票").await;
+        let doc = task_doc_of(&rig, &task).await;
+        assert_eq!(doc.thread.as_deref(), Some("feishu:oc_dm#om_1"));
+        assert_eq!(
+            doc.reply.and_then(|reply| reply.peer).as_deref(),
+            Some("feishu:oc_dm#om_1")
+        );
+    }
+
+    /// 同一话题里的后续消息直通给归属的任务：没有调 Router；任务这一轮已做完（空闲）也照样直通；
+    /// 同一条平台消息重投只处理一次。
+    #[tokio::test]
+    async fn a_followup_in_the_topic_goes_straight_to_the_task_even_when_it_is_idle() {
+        let router = FnRouter::new(|_| Ok(new_task("整理周报", "整理周报")));
+        let worker = FakeLlm::new(vec![
+            vec![text_round(1, "整理好了。\n状态：完成")],
+            vec![text_round(1, "加了风险一节。\n状态：完成")],
+        ]);
+        let rig = feishu_rig(router.clone(), worker.clone()).await;
+
+        rig.send(dm("om_1", "整理周报", "feishu:e1")).await;
+        rig.wait_texts("第一个回复", 1).await;
+        // 任务已经做完、在空闲：不是结束。
+        let ack = rig.send(dm("om_1", "再加一节风险", "feishu:e2")).await;
+        assert!(matches!(ack, InboundAck::Queued { .. }), "{ack:?}");
+        let sent = rig.wait_texts("第二个回复", 2).await;
+
+        assert_eq!(sent[1], "加了风险一节。");
+        assert_eq!(router.calls(), 1, "直通不调 Router");
+        assert_eq!(rig.task_sessions().await.len(), 1, "没有再开任务");
+        // 展示消息落在线上；回话仍在这个话题里。
+        let line = rig.main_line().await;
+        assert_eq!(
+            texts_of(&line, MAIN_USER_ENTRY),
+            ["整理周报", "再加一节风险"]
+        );
+        assert_eq!(rig.reply_peers().await[1].to_string(), "feishu:oc_dm#om_1");
+        let second = {
+            let requests = worker.requests.lock().unwrap();
+            requests[1]
+                .messages
+                .iter()
+                .filter_map(|message| message.text.clone())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        assert!(second.contains("再加一节风险"), "{second}");
+
+        // 平台重投同一条：直通只处理一次。
+        let again = rig.send(dm("om_1", "再加一节风险", "feishu:e2")).await;
+        assert!(matches!(again, InboundAck::Duplicate { .. }), "{again:?}");
+        rig.settled(&rig.main().await).await;
+        assert_eq!(worker.turns(), 2);
+        assert_eq!(texts_of(&rig.main_line().await, MAIN_USER_ENTRY).len(), 2);
+    }
+
+    /// 任务被停后，同一话题再来消息走 Router；判成 `continue` 后重新做起来并再次直通。
+    #[tokio::test]
+    async fn after_a_stop_the_topic_goes_through_the_router_and_continue_resumes_it() {
+        let router = FnRouter::new(|prompt| {
+            if prompt.contains("## 这条消息\n先别订了") {
+                return Ok(
+                    json!({ "route": "stop", "task_id": handle_of(prompt, "订机票") }).to_string(),
+                );
+            }
+            if prompt.contains("## 这条消息\n接着订") {
+                return Ok(
+                    json!({ "route": "continue", "task_id": handle_of(prompt, "订机票") })
+                        .to_string(),
+                );
+            }
+            Ok(new_task("订机票", "订机票"))
+        });
+        let worker = FakeLlm::new(vec![
+            vec![text_round(1, "订好了。\n状态：完成")],
+            vec![text_round(1, "接着订好了。\n状态：完成")],
+            vec![text_round(1, "改到周二了。\n状态：完成")],
+        ]);
+        let rig = feishu_rig(router.clone(), worker.clone()).await;
+
+        rig.send(dm("om_1", "订机票", "feishu:e1")).await;
+        rig.wait_texts("第一个回复", 1).await;
+        // 操作者在没有话题的主线上叫停（话题里的话都会直通给任务，叫停走 Router）。
+        rig.send(feishu("oc_dm", None, true, "先别订了", "feishu:e2"))
+            .await;
+        rig.wait_texts("停下的回复", 2).await;
+        let task = rig.task_titled("订机票").await;
+        assert!(task_doc_of(&rig, &task).await.stopped);
+        let calls = router.calls();
+
+        // 同一话题：归属的任务已被停 → 走 Router，判 continue → 清掉已停、做起来。
+        rig.send(dm("om_1", "接着订", "feishu:e3")).await;
+        let sent = rig.wait_texts("接着做的回复", 3).await;
+        assert_eq!(sent[2], "接着订好了。");
+        assert_eq!(router.calls(), calls + 1, "已停的任务不直通");
+        assert!(!task_doc_of(&rig, &task).await.stopped);
+
+        // 又直通了。
+        rig.send(dm("om_1", "改到周二", "feishu:e4")).await;
+        let sent = rig.wait_texts("直通的回复", 4).await;
+        assert_eq!(sent[3], "改到周二了。");
+        assert_eq!(router.calls(), calls + 1);
+    }
+
+    /// Router 在一个归属任务已被停的话题里判 `new`：新任务拿到归属，旧任务不再收这个话题的消息。
+    #[tokio::test]
+    async fn a_new_task_takes_over_the_topic_from_the_stopped_owner() {
+        let router = FnRouter::new(|prompt| {
+            if prompt.contains("## 这条消息\n先别查了") {
+                return Ok(
+                    json!({ "route": "stop", "task_id": handle_of(prompt, "查日志") }).to_string(),
+                );
+            }
+            if prompt.contains("## 这条消息\n换个事") {
+                return Ok(new_task("写周报", "写周报"));
+            }
+            Ok(new_task("查日志", "查日志"))
+        });
+        let worker = FakeLlm::new(vec![
+            vec![text_round(1, "日志查完了。\n状态：完成")],
+            vec![text_round(1, "周报写好了。\n状态：完成")],
+            vec![text_round(1, "周报加了一节。\n状态：完成")],
+        ]);
+        let rig = feishu_rig(router.clone(), worker.clone()).await;
+
+        rig.send(dm("om_1", "查日志", "feishu:e1")).await;
+        rig.wait_texts("第一个回复", 1).await;
+        rig.send(feishu("oc_dm", None, true, "先别查了", "feishu:e2"))
+            .await;
+        rig.wait_texts("停下的回复", 2).await;
+
+        rig.send(dm("om_1", "换个事", "feishu:e3")).await;
+        rig.wait_texts("新任务的回复", 3).await;
+        let old = rig.task_titled("查日志").await;
+        let new = rig.task_titled("写周报").await;
+        assert_eq!(
+            task_doc_of(&rig, &new).await.thread.as_deref(),
+            Some("feishu:oc_dm#om_1")
+        );
+        assert_eq!(task_doc_of(&rig, &old).await.thread, None, "原归属作废");
+
+        // 之后话题里的消息进新任务，旧任务的输入不再增加。
+        let before = worker.turns();
+        let count_old = || async {
+            rig.core()
+                .storage
+                .scan_entries(&EntryQuery::new(old.current_branch), 500, None)
+                .await
+                .unwrap()
+                .items
+                .len()
+        };
+        let old_before = count_old().await;
+        rig.send(dm("om_1", "加一节", "feishu:e4")).await;
+        let sent = rig.wait_texts("直通新任务", 4).await;
+        assert_eq!(sent[3], "周报加了一节。");
+        assert_eq!(worker.turns(), before + 1);
+        assert_eq!(
+            count_old().await,
+            old_before,
+            "旧任务不该再收到这个话题的消息"
+        );
+        assert!(texts_of(&rig.main_line().await, MAIN_USER_ENTRY).contains(&"加一节".to_owned()));
+    }
+
+    /// 旧办法开出来的话题会话保持可用：话题里再来消息仍由它自己答，不进主会话、不调 Router。
+    #[tokio::test]
+    async fn a_topic_session_opened_the_old_way_still_answers_itself() {
+        let router = FnRouter::new(|_| Ok(new_task("不该被调", "不该被调")));
+        let worker = FakeLlm::new(vec![vec![text_round(1, "旧会话自己答的。")]]);
+        let rig = feishu_rig(router.clone(), worker.clone()).await;
+        let agent = rig.gateway.state().snapshot().agent.default_agent.clone();
+        let peer = ChannelPeer::new(ChannelPlatform::Feishu, "oc_dm").in_thread("om_9");
+        let (legacy, _) = rig
+            .core()
+            .session_for_source(&chat_origin(&peer), &agent)
+            .await
+            .unwrap();
+
+        let ack = rig.send(dm("om_9", "还在吗", "feishu:e1")).await;
+        let InboundAck::Queued { session, .. } = ack else {
+            panic!("应该排队：{ack:?}");
+        };
+        assert_eq!(session.as_str(), legacy.id);
+        let sent = rig.wait_texts("旧会话的回复", 1).await;
+        assert_eq!(sent, ["旧会话自己答的。"]);
+        assert_eq!(router.calls(), 0);
+        assert!(texts_of(&rig.main_line().await, MAIN_USER_ENTRY).is_empty());
+        assert!(rig.sessions_of(SessionKind::Task).await.is_empty());
+    }
+
+    /// 没有话题的私聊不设归属：每条消息都走 Router；任务不带 `thread`。
+    #[tokio::test]
+    async fn a_private_chat_without_topics_sets_no_owner_and_every_message_is_routed() {
+        let router = FnRouter::new(|_| Ok(new_task("查天气", "查天气")));
+        let worker = FakeLlm::new(vec![
+            vec![text_round(1, "晴。\n状态：完成")],
+            vec![text_round(1, "还是晴。\n状态：完成")],
+        ]);
+        let rig = rig(router.clone(), worker, None).await;
+
+        rig.say("查天气", "telegram:1").await;
+        rig.wait_texts("第一个回复", 1).await;
+        rig.say("再查一次", "telegram:2").await;
+        rig.wait_texts("第二个回复", 2).await;
+
+        assert_eq!(router.calls(), 2);
+        for task in rig.task_sessions().await {
+            assert_eq!(task_doc_of(&rig, &task).await.thread, None);
+        }
+    }
+
+    /// 群里 @机器人：受理落在这个群自己的线上，不落在操作者的主会话；Router 输入里没有操作者私聊的
+    /// 任务与消息；`new` 之后以话题回复，回执不让渠道发"处理中"卡片；话题里的后续消息直通。
+    #[tokio::test]
+    async fn a_group_mention_is_dispatched_on_the_groups_own_line_and_the_router_sees_only_that_group()
+     {
+        let router = FnRouter::new(|prompt| {
+            if prompt.contains("## 这条消息\n私聊里的事") {
+                return Ok(new_task("私聊任务", "私聊里的事"));
+            }
+            Ok(new_task("查日志", "查一下日志"))
+        });
+        let worker = FakeLlm::new(vec![
+            vec![text_round(1, "私聊任务做好了。\n状态：完成")],
+            vec![text_round(1, "日志里没有异常。\n状态：完成")],
+            vec![text_round(1, "再看了一遍，还是没有。\n状态：完成")],
+        ]);
+        let rig = feishu_rig(router.clone(), worker.clone()).await;
+
+        // 操作者私聊里先有一个任务与几条消息。
+        rig.send(dm("om_p", "私聊里的事", "feishu:p1")).await;
+        rig.wait_texts("私聊任务的回复", 1).await;
+
+        let ack = rig
+            .send(group("oc_g", "om_g1", "看一下日志", "feishu:g1"))
+            .await;
+        assert_eq!(ack, InboundAck::Ignored, "群里不发卡片 / 表情");
+        let sent = rig.wait_texts("群里的回复", 2).await;
+        assert_eq!(sent[1], "日志里没有异常。");
+
+        // 受理在群的线上；操作者的主线里看不到群里的内容。
+        let line = rig.line_of("oc_g").await;
+        assert_eq!(line.kind, SessionKind::Main);
+        assert!(
+            line.source
+                .as_deref()
+                .unwrap()
+                .starts_with(GROUP_LINE_PREFIX)
+        );
+        assert_ne!(line.id, rig.main().await.id);
+        let line_entries = entries_of(&rig.core(), line.current_branch).await;
+        assert_eq!(texts_of(&line_entries, MAIN_USER_ENTRY), ["看一下日志"]);
+        assert_eq!(
+            texts_of(&line_entries, MAIN_REPLY_ENTRY),
+            ["日志里没有异常。"]
+        );
+        let home = rig.main_line().await;
+        assert_eq!(texts_of(&home, MAIN_USER_ENTRY), ["私聊里的事"]);
+        assert_eq!(texts_of(&home, MAIN_REPLY_ENTRY), ["私聊任务做好了。"]);
+
+        // Router 的输入：这个群的线上没有任何私聊的东西。
+        let prompt = router.prompt(1);
+        for leaked in ["私聊任务", "私聊里的事", "私聊任务做好了。"] {
+            assert!(
+                !prompt.contains(leaked),
+                "{leaked} 漏进了群的输入：{prompt}"
+            );
+        }
+        assert!(prompt.contains("## 这条消息\n看一下日志"), "{prompt}");
+
+        // 回话在话题里；任务绑定这个话题。
+        let reply = rig.sender.sent().remove(1);
+        assert_eq!(reply.peer.to_string(), "feishu:oc_g#om_g1");
+        let task = rig.task_titled("查日志").await;
+        assert_eq!(task.parent_session.as_deref(), Some(line.id.as_str()));
+        assert_eq!(
+            task_doc_of(&rig, &task).await.thread.as_deref(),
+            Some("feishu:oc_g#om_g1")
+        );
+        // 群里开出的任务用"直接对话"的那一段提示。
+        let system = worker.requests.lock().unwrap()[1].system_prompt.clone();
+        assert!(system.contains("直接和用户对话"), "{system}");
+
+        // 话题里的后续消息直通，不调 Router。
+        let calls = router.calls();
+        rig.send(group("oc_g", "om_g1", "再看一遍", "feishu:g2"))
+            .await;
+        let sent = rig.wait_texts("直通的回复", 3).await;
+        assert_eq!(sent[2], "再看了一遍，还是没有。");
+        assert_eq!(router.calls(), calls);
+    }
+
+    /// 直接断言拼出来的输入：群的线上取到的候选与最近消息只有这个群的，范围是群。
+    #[tokio::test]
+    async fn the_router_input_for_a_group_holds_only_that_groups_tasks_and_messages() {
+        let router = FnRouter::new(|prompt| {
+            if prompt.contains("## 这条消息\n私聊里的事") {
+                return Ok(new_task("私聊任务", "私聊里的事"));
+            }
+            if prompt.contains("## 这条消息\n乙群的事") {
+                return Ok(new_task("乙群任务", "乙群的事"));
+            }
+            Ok(new_task("甲群任务", "甲群的事"))
+        });
+        let worker = FakeLlm::new(vec![
+            vec![text_round(1, "私聊做好了。\n状态：完成")],
+            vec![text_round(1, "乙群做好了。\n状态：完成")],
+        ]);
+        let rig = feishu_rig(router.clone(), worker).await;
+        rig.send(dm("om_p", "私聊里的事", "feishu:p1")).await;
+        rig.wait_texts("私聊的回复", 1).await;
+        rig.send(group("oc_b", "om_b1", "乙群的事", "feishu:b1"))
+            .await;
+        rig.wait_texts("乙群的回复", 2).await;
+
+        // 甲群来一条新消息：先受理（不等分发），再自己拼输入。
+        let core = rig.core();
+        let line = rig.line_of("oc_a").await;
+        let position = ChannelPeer::new(ChannelPlatform::Feishu, "oc_a").in_thread("om_a1");
+        core.dispatch_message(
+            &line.id,
+            MainMessage {
+                text: "甲群的事".into(),
+                request_id: "feishu:a1".into(),
+                peer: Some(position.clone()),
+                principal: None,
+            },
+        )
+        .await
+        .unwrap();
+        rig.settled(&line).await;
+        let entry = entries_of(&core, line.current_branch)
+            .await
+            .into_iter()
+            .find(|entry| entry.kind == MAIN_USER_ENTRY)
+            .unwrap();
+        let built = input::build(&core, &line, entry.id, "甲群的事", Some(&position))
+            .await
+            .unwrap();
+        assert_eq!(built.input.scope, komo_agent::router::RouteScope::Group);
+        // 这条线上此刻只有甲群自己的任务（刚派出的那个），没有私聊与乙群的。
+        let titles: Vec<&str> = built
+            .input
+            .tasks
+            .iter()
+            .map(|task| task.title.as_str())
+            .collect();
+        assert_eq!(titles, ["甲群任务"], "{titles:?}");
+        assert!(built.input.recent.is_empty(), "{:?}", built.input.recent);
+    }
+
+    /// 群里判断后 `ignore`：什么都不发、不开任务、没有卡片（回执是 `Ignored`）；消息只留在线上。
+    #[tokio::test]
+    async fn an_ignored_group_message_sends_nothing_and_leaves_no_card() {
+        let router = FnRouter::new(|_| Ok(json!({ "route": "ignore" }).to_string()));
+        let worker = FakeLlm::new(vec![]);
+        let rig = feishu_rig(router.clone(), worker.clone()).await;
+
+        let ack = rig
+            .send(group("oc_g", "om_g1", "老张，你看下这个", "feishu:g1"))
+            .await;
+        assert_eq!(ack, InboundAck::Ignored);
+        let line = rig.line_of("oc_g").await;
+        rig.settled(&line).await;
+
+        assert!(rig.sender.sent().is_empty(), "{:?}", rig.sender.sent());
+        assert_eq!(worker.turns(), 0);
+        assert!(rig.sessions_of(SessionKind::Task).await.is_empty());
+        let entries = entries_of(&rig.core(), line.current_branch).await;
+        assert_eq!(texts_of(&entries, MAIN_USER_ENTRY), ["老张，你看下这个"]);
+        assert!(texts_of(&entries, MAIN_REPLY_ENTRY).is_empty());
+    }
+
+    /// 群里判断模型报错：按 `ignore`，不是 `new`。
+    #[tokio::test]
+    async fn a_failing_judgement_in_a_group_means_ignore() {
+        let router = FnRouter::new(|_| {
+            Err(LlmError::Rejected {
+                status: 503,
+                message: "down".into(),
+            })
+        });
+        let worker = FakeLlm::new(vec![]);
+        let rig = feishu_rig(router.clone(), worker.clone()).await;
+
+        rig.send(group("oc_g", "om_g1", "查一下", "feishu:g1"))
+            .await;
+        let line = rig.line_of("oc_g").await;
+        rig.settled(&line).await;
+
+        assert!(rig.sender.sent().is_empty());
+        assert_eq!(worker.turns(), 0);
+        assert!(rig.sessions_of(SessionKind::Task).await.is_empty());
+    }
+
+    /// 群里的 `stop` 指向不属于这个群的任务：不执行。模型点了别处的任务号（候选里没有它）→ 判断失败按
+    /// `ignore`；执行时的第二道校验（`belongs`）也认得出不属于这个群的任务。
+    #[tokio::test]
+    async fn a_group_stop_aimed_at_another_groups_task_does_nothing() {
+        let foreign = Arc::new(Mutex::new(String::new()));
+        let router = FnRouter::new({
+            let foreign = Arc::clone(&foreign);
+            move |prompt| {
+                if prompt.contains("## 这条消息\n先别做了") {
+                    let handle = foreign.lock().unwrap().clone();
+                    return Ok(json!({ "route": "stop", "task_id": handle }).to_string());
+                }
+                Ok(new_task("私聊任务", "私聊里的事"))
+            }
+        });
+        let worker = FakeLlm::new(vec![vec![text_round(1, "私聊做好了。\n状态：完成")]]);
+        let rig = feishu_rig(router.clone(), worker).await;
+        rig.send(dm("om_p", "私聊里的事", "feishu:p1")).await;
+        rig.wait_texts("私聊的回复", 1).await;
+        let private_task = rig.task_titled("私聊任务").await;
+        *foreign.lock().unwrap() = handle_for("私聊任务", &rig.core()).await;
+
+        rig.send(group("oc_g", "om_g1", "先别做了", "feishu:g1"))
+            .await;
+        let line = rig.line_of("oc_g").await;
+        rig.settled(&line).await;
+
+        assert!(
+            !task_doc_of(&rig, &private_task).await.stopped,
+            "私聊的任务被群里的话停了"
+        );
+        assert_eq!(rig.sender.sent().len(), 1, "群里没有任何回话");
+
+        // 第二道校验。
+        let core = rig.core();
+        let group_peer = ChannelPeer::new(ChannelPlatform::Feishu, "oc_g");
+        assert!(
+            !owner::belongs(
+                &core,
+                &line.id,
+                Some(&group_peer),
+                private_task.root_conversation
+            )
+            .await
+            .unwrap()
+        );
+        let main = rig.main().await;
+        assert!(
+            owner::belongs(&core, &main.id, None, private_task.root_conversation)
+                .await
+                .unwrap()
+        );
+    }
+
+    /// Telegram 的群没有话题：落在群的线上，每条消息都走 Router，不设归属。
+    #[tokio::test]
+    async fn a_telegram_group_uses_the_groups_line_and_sets_no_owner() {
+        let router = FnRouter::new(|_| Ok(new_task("查库存", "查库存")));
+        let worker = FakeLlm::new(vec![
+            vec![text_round(1, "有货。\n状态：完成")],
+            vec![text_round(1, "仍有货。\n状态：完成")],
+        ]);
+        let rig = rig(router.clone(), worker, None).await;
+        for (text, key) in [("查库存", "telegram:g1"), ("再查", "telegram:g2")] {
+            let ack = rig
+                .gateway
+                .handle(inbound(
+                    ChannelPlatform::Telegram,
+                    "-100",
+                    "111",
+                    text,
+                    key,
+                    false,
+                ))
+                .await;
+            assert_eq!(ack, InboundAck::Ignored);
+        }
+        rig.wait_texts("两个回复", 2).await;
+        assert_eq!(router.calls(), 2);
+        let tasks = rig.task_sessions().await;
+        assert_eq!(tasks.len(), 2);
+        for task in tasks {
+            assert_eq!(task_doc_of(&rig, &task).await.thread, None);
+        }
+        assert!(texts_of(&rig.main_line().await, MAIN_USER_ENTRY).is_empty());
+    }
+
+    /// 平台重投群里的第一条消息：分发只处理一次。
+    #[tokio::test]
+    async fn a_redelivered_group_message_is_dispatched_once() {
+        let router = FnRouter::new(|_| Ok(new_task("查日志", "查日志")));
+        let worker = FakeLlm::new(vec![vec![text_round(1, "没异常。\n状态：完成")]]);
+        let rig = feishu_rig(router.clone(), worker.clone()).await;
+
+        let first = rig
+            .send(group("oc_g", "om_g1", "看日志", "feishu:g1"))
+            .await;
+        let second = rig
+            .send(group("oc_g", "om_g1", "看日志", "feishu:g1"))
+            .await;
+        assert_eq!(first, InboundAck::Ignored);
+        // 进程内的去重表先挡住（回原来的回执）；持久的那层在请求键上，由私聊的同名测试覆盖。
+        assert!(
+            matches!(second, InboundAck::Duplicate { .. } | InboundAck::Ignored),
+            "{second:?}"
+        );
+        rig.wait_texts("回复", 1).await;
+        let line = rig.line_of("oc_g").await;
+        rig.settled(&line).await;
+
+        assert_eq!(router.calls(), 1);
+        assert_eq!(rig.task_sessions().await.len(), 1);
+        assert_eq!(worker.turns(), 1);
+    }
+
+    /// 操作者的主会话只认 `source = home` 的那一条：群的线（也是 `kind = main`）不会被当成它。
+    #[tokio::test]
+    async fn a_group_line_is_never_taken_for_the_operators_main_session() {
+        let rig = feishu_rig(
+            FnRouter::new(|_| Ok(json!({ "route": "ignore" }).to_string())),
+            FakeLlm::new(vec![]),
+        )
+        .await;
+        let line = rig.line_of("oc_g").await;
+        let main = rig.main().await;
+        assert_ne!(line.id, main.id);
+        assert_eq!(rig.main().await.id, main.id);
+    }
+}

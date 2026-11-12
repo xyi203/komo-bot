@@ -27,7 +27,7 @@
 //!
 //! 外加 §11.2 / §11.3 的会话与命令表：home session 的归一
 //! （`cross::every_private_chat_lands_in_one_home_session`）、群会话按
-//! `{platform}:{chat_id}`（`cross::every_group_gets_its_own_session`）、`/new`
+//! `{platform}:{chat_id}`（`cross::every_group_gets_its_own_line`）、`/new`
 //! 不切 Session、`/status` `/pending` `/cancel` 的回执、`allow_from` 为空的渠道
 //! "只出不进"、没有 `home_chat` 时 `deliver_home` 报错而不是静默丢弃，以及 §3 的
 //! "校验不过的配置永远不会被装上"。

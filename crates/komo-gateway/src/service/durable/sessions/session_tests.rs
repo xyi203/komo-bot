@@ -1798,6 +1798,7 @@ mod task_list {
             continued: None,
             reply: None,
             stopped: false,
+            thread: None,
         };
         let root = record.root_conversation;
         core.engine

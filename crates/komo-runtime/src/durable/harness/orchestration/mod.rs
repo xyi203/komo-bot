@@ -261,6 +261,12 @@ pub struct TaskDoc {
     /// 读成 `false`。
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub stopped: bool,
+    /// 这个任务拥有的对话位置（带话题的 `ChannelPeer` 的字符串形式）：进来的消息落在这个位置、而它还没被停、
+    /// 会话还活着时，程序不经 Router 直接交给它（`docs/tasks.md` §4.14 F5 "路由归属"）。派出时写定，给的是
+    /// 这次派出的任务；位置上换了新任务，原任务的这一格由分发在同一次提交里清掉，所以每个位置至多一个。
+    /// 任务一轮做完只是空闲，归属不动。附加字段：旧 document 没有，读成 `None`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread: Option<String>,
 }
 
 /// 提交里读 `komo.task`（document 读，不是表读：排在表写之后也行）。

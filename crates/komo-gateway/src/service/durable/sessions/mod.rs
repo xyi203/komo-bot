@@ -30,6 +30,7 @@ use komo_kernel::durable::{
     SessionRecord, Storage, StorageError, SubmissionId, legacy_ids,
 };
 use komo_kernel::protocol::http::SessionSummary;
+use komo_kernel::types::chat::ChannelPeer;
 use komo_kernel::types::ids::{RunId, SessionId};
 use komo_kernel::types::status::{RunState, SessionState};
 use komo_runtime::durable::harness::{InboxItem, SubmitError};
@@ -41,6 +42,18 @@ use agent_doc::AgentDoc;
 
 /// 来源 `home`：主会话的 `source`（旧 komo 的 `HOME_ORIGIN`）。
 pub const HOME_SOURCE: &str = "home";
+
+/// 群的"线"（`docs/tasks.md` §4.13）：一个群一条、不跑模型的 `kind = main` 会话，承载该群的展示消息与分发任务。
+/// `source` 是这个前缀加群的 `ChannelPeer`（不带话题）。
+pub const GROUP_LINE_PREFIX: &str = "line:";
+
+/// 群 `peer` 的线的 `source`。
+pub fn group_line_source(peer: &ChannelPeer) -> String {
+    format!(
+        "{GROUP_LINE_PREFIX}{}",
+        ChannelPeer::new(peer.platform.clone(), peer.chat_id.as_str())
+    )
+}
 
 const SCAN_PAGE: usize = 256;
 
@@ -420,12 +433,51 @@ impl DurableCore {
         let spec = NewSession::new(agent)
             .kind(SessionKind::Main)
             .source(HOME_SOURCE);
+        // 带上 `source`：群的线也是 `kind = main`，不能被当成操作者的主会话。
         let query = SessionQuery {
             kind: Some(SessionKind::Main),
             agent: Some(agent.to_owned()),
+            source: Some(HOME_SOURCE.to_owned()),
             ..SessionQuery::default()
         };
         self.ensure_session(query, |_| true, spec).await
+    }
+
+    /// 群 `peer` 的线：不存在就建（`kind = main`，`source = line:…`，见 [`GROUP_LINE_PREFIX`]）。
+    /// 只认还收输入的会话；同一个群有多条时取最早的。
+    pub async fn group_line(
+        &self,
+        agent: &str,
+        peer: &ChannelPeer,
+    ) -> Result<(SessionRecord, bool), SessionError> {
+        let source = group_line_source(peer);
+        let spec = NewSession::new(agent)
+            .kind(SessionKind::Main)
+            .source(&source);
+        let query = SessionQuery {
+            kind: Some(SessionKind::Main),
+            source: Some(source),
+            ..SessionQuery::default()
+        };
+        self.ensure_session(query, |_| true, spec).await
+    }
+
+    /// 按旧办法开出来的话题会话（`kind = normal`，`source = chat:{peer}`）：有就返回、没有不建。
+    /// 它们保持可用——话题里再来消息仍进它自己答，不迁移。
+    pub async fn legacy_chat_session(
+        &self,
+        peer: &ChannelPeer,
+    ) -> Result<Option<SessionRecord>, SessionError> {
+        let query = SessionQuery {
+            source: Some(crate::dispatcher::chat_origin(peer)),
+            lifecycle: Some(SessionLifecycle::Active),
+            order: Some(ScanOrder::Ascending),
+            ..SessionQuery::default()
+        };
+        Ok(first_session(&*self.storage, &query, |record| {
+            record.kind != SessionKind::Main
+        })
+        .await?)
     }
 
     /// 一个来源（`chat:telegram:123` 这类群 / 话题 / 带话题的私聊）对应的会话：不存在就建一个

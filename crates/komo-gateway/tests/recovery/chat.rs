@@ -25,18 +25,25 @@ async fn a_chat_run_in_flight_across_a_restart_still_gets_its_reply_delivered_on
 
     // **走真的聊天入口**（Dispatcher）：只有它会把 `peer` 写进输入 entry（`chat.input`），
     // HTTP / TUI 提交的 run 测不出看客补挂。
-    let ack = gateway
-        .handle(inbound(
-            ChannelPlatform::Telegram,
-            "111",
-            "111",
-            "跑一下 echo",
-            "restart-1",
-            // 群聊：私聊落到的主会话不起 run（回话直投渠道，见 `service::durable::dispatch`），
-            // 看客补挂只管仍有模型轮次的会话。
-            false,
-        ))
-        .await;
+    // 旧式话题会话：私聊与群的线不起 run（回话直投渠道，见 `service::durable::dispatch`），
+    // 看客补挂只管仍有模型轮次的会话。
+    let mut message = inbound(
+        ChannelPlatform::Telegram,
+        "111",
+        "111",
+        "跑一下 echo",
+        "restart-1",
+        false,
+    );
+    message.peer = message.peer.in_thread("t1");
+    gateway
+        .state()
+        .core()
+        .unwrap()
+        .session_for_source(&format!("chat:{}", message.peer), "assistant")
+        .await
+        .expect("旧式话题会话");
+    let ack = gateway.handle(message).await;
     let InboundAck::Queued { run, .. } = ack else {
         panic!("这条消息该排进一个 run：{ack:?}");
     };
@@ -80,8 +87,8 @@ async fn a_chat_run_in_flight_across_a_restart_still_gets_its_reply_delivered_on
     assert_eq!(delivered.len(), 1, "最终回复只投一次：{delivered:?}");
     assert_eq!(
         delivered[0].peer,
-        ChannelPeer::new(ChannelPlatform::Telegram, "111"),
-        "投到发消息的那个来源渠道"
+        ChannelPeer::new(ChannelPlatform::Telegram, "111").in_thread("t1"),
+        "投到发消息的那个来源渠道（话题里）"
     );
     assert!(
         !first_sender.texts().contains(&"跑完了。".to_string()),

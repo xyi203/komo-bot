@@ -1,5 +1,10 @@
 //! 拼 Router 的输入（`docs/tasks.md` §4.11 "输入"）：候选任务来自任务清单投影，最近消息来自主线。
 //!
+//! **群的线只看这个群**（§4.13）：候选 = 这条线（群自己的 `kind = main` 会话）派出的任务，最近消息 = 这条线
+//! 上的展示 entry，范围 `RouteScope::Group`。操作者私聊的任务清单与主线消息一条都不进来——komo 可以配成
+//! 同一企业的人都算操作者，带进来的话同事在群里一句"先别做了"就能停掉私聊里的任务。隔离靠"按派出它的会话
+//! 取"，不靠事后过滤。
+//!
 //! 只读已提交状态。判断重做时（重启后从检查点续）拼出来的可能与第一次不同——没关系，判断没有副作用，
 //! 而被采用的那一份会写进检查点（`Decision`），执行不再重读。
 
@@ -9,10 +14,11 @@ use komo_agent::router::{
 use komo_kernel::durable::storage::EntryQuery;
 use komo_kernel::durable::{ContentBlock, EntryId, Message, ScanOrder, SessionRecord, StopReason};
 use komo_kernel::protocol::http::{TaskSource, TaskState};
+use komo_kernel::types::chat::ChannelPeer;
 use komo_kernel::types::task::{TASK_STATUS_BLOCKED, TASK_STATUS_DONE};
 
 use super::super::DurableCore;
-use super::super::sessions::SessionError;
+use super::super::sessions::{GROUP_LINE_PREFIX, SessionError};
 use super::{Handles, MAIN_REPLY_ENTRY, MAIN_USER_ENTRY};
 
 /// 候选只看最近这么多个任务会话（任务清单按创建序降序）：已结束的任务会一直累积，每条消息都扫全部
@@ -29,12 +35,27 @@ pub(super) struct Built {
     pub handles: Handles,
 }
 
+/// 这条线是某个群的线就返回那个群（不带话题的 `ChannelPeer`）。
+pub(super) fn group_of(line: &SessionRecord) -> Option<ChannelPeer> {
+    line.source
+        .as_deref()?
+        .strip_prefix(GROUP_LINE_PREFIX)
+        .and_then(ChannelPeer::parse)
+}
+
+/// `position`：这条消息的位置（群里取最近消息时优先看同一个话题）。
 pub(super) async fn build(
     core: &DurableCore,
     main: &SessionRecord,
     message: EntryId,
     text: &str,
+    position: Option<&ChannelPeer>,
 ) -> Result<Built, SessionError> {
+    let scope = if group_of(main).is_some() {
+        RouteScope::Group
+    } else {
+        RouteScope::Private
+    };
     let limits = RouterLimits::default();
     let page = core.task_page(false, Some(SCAN_TASKS), None).await?;
     // 只要这个主会话派出的任务：分发派出的、父是它。`task` 工具在任务会话里派出的子任务、定时任务、
@@ -70,9 +91,9 @@ pub(super) async fn build(
             last_said: last_said(core, &record).await?,
         });
     }
-    let recent = recent_messages(core, main, message).await?;
+    let recent = recent_messages(core, main, message, scope, position).await?;
     Ok(Built {
-        input: RouterInput::new(RouteScope::Private, text, tasks, recent, limits),
+        input: RouterInput::new(scope, text, tasks, recent, limits),
         handles,
     })
 }
@@ -129,10 +150,13 @@ fn strip_status(text: &str) -> String {
 }
 
 /// 主线上最近的消息（旧的在前）：操作者发的与投回主线的回复，不含正在分发的这一条。
+/// 群里发消息的人都记成"群友"；这条消息在话题里、话题里已有消息时只取那个话题的，否则取整个群的。
 async fn recent_messages(
     core: &DurableCore,
     main: &SessionRecord,
     current: EntryId,
+    scope: RouteScope,
+    position: Option<&ChannelPeer>,
 ) -> Result<Vec<RecentMessage>, SessionError> {
     let query = EntryQuery {
         max: Some(EntryId::new(current.get().saturating_sub(1))),
@@ -144,9 +168,17 @@ async fn recent_messages(
         .scan_entries(&query, SCAN_ENTRIES, None)
         .await?;
     let want = RouterLimits::default().recent_messages;
+    let thread = (scope == RouteScope::Group)
+        .then_some(position)
+        .flatten()
+        .filter(|position| position.thread.is_some())
+        .map(ToString::to_string);
     let mut out = Vec::new();
+    // 同一话题里的（只在 `thread` 有值时收集，够了就用它，不够再退回整个群的）。
+    let mut in_thread = Vec::new();
     for entry in page.items {
         let speaker = match entry.kind.as_str() {
+            MAIN_USER_ENTRY if scope == RouteScope::Group => Speaker::Member,
             MAIN_USER_ENTRY => Speaker::Operator,
             MAIN_REPLY_ENTRY => Speaker::Agent,
             _ => continue,
@@ -161,16 +193,31 @@ async fn recent_messages(
         if text.is_empty() {
             continue;
         }
-        out.push(RecentMessage {
+        let one = RecentMessage {
             speaker,
             text: text.to_owned(),
-        });
-        if out.len() >= want {
+        };
+        if let Some(thread) = &thread
+            && entry
+                .data
+                .as_ref()
+                .and_then(|data| data.get("peer"))
+                .and_then(|peer| peer.as_str())
+                == Some(thread.as_str())
+            && in_thread.len() < want
+        {
+            in_thread.push(one.clone());
+        }
+        if out.len() < want {
+            out.push(one);
+        }
+        if out.len() >= want && (thread.is_none() || in_thread.len() >= want) {
             break;
         }
     }
-    out.reverse();
-    Ok(out)
+    let mut chosen = if in_thread.is_empty() { out } else { in_thread };
+    chosen.reverse();
+    Ok(chosen)
 }
 
 pub(super) fn speaker(speaker: Speaker) -> &'static str {

@@ -57,7 +57,23 @@ fn decode(payload: &[u8], _is_private: bool) -> InboundMessage {
     feishu_inbound::from_message(&event, BOT_OPEN_ID, key).expect("这条要进 Dispatcher")
 }
 
-/// 验证列①：同一 `event_id` 重推只产生一个 Run。
+/// 主会话（私聊的线）上展示出来的消息条数：私聊的消息落在这里由分发任务判断去向，不起 Run。
+async fn shown(gateway: &TestGateway, session: &str) -> usize {
+    gateway
+        .state()
+        .core()
+        .unwrap()
+        .read_tree(session)
+        .await
+        .expect("读得出树")
+        .branches
+        .iter()
+        .flat_map(|branch| branch.entries.iter())
+        .filter(|entry| entry.kind == "main.user")
+        .count()
+}
+
+/// 验证列①：同一 `event_id` 重推只产生一条主线消息、一次分发。
 #[tokio::test]
 async fn a_replayed_event_produces_one_run() {
     let wired = wire().await;
@@ -78,11 +94,14 @@ async fn a_replayed_event_produces_one_run() {
         "重推不该开第二个 Run"
     );
 
-    let inputs = wired.gateway.inputs(session.as_str()).await;
-    assert_eq!(inputs, 1, "账本上只有一个 Run");
+    assert_eq!(
+        shown(&wired.gateway, session.as_str()).await,
+        1,
+        "主线上只有一条"
+    );
 }
 
-/// 验证列②：ws 断线重连不丢事件，也不重跑 Run。
+/// 验证列②：ws 断线重连不丢事件，也不重复分发。
 ///
 /// 断线重连在飞书那边等价于"这一批事件原样再推一次"（官方：即使成功接收仍会收到重复
 /// 消息，ws 重连与 3 秒超时都会重推）。这里模拟的是**重连后整批补推**：断线前送到的
@@ -123,13 +142,17 @@ async fn a_reconnect_loses_nothing_and_reruns_nothing() {
         "断线时没送到的那条不能丢：{recovered:?}"
     );
 
-    let inputs = wired.gateway.inputs(session.as_str()).await;
-    assert_eq!(inputs, 2, "一共两条输入、两个 Run");
+    assert_eq!(
+        shown(&wired.gateway, session.as_str()).await,
+        2,
+        "一共两条消息"
+    );
 }
 
-/// 飞书私聊也是一个话题一个会话：主线里每一条都开新话题、新会话，都不是 home。
+/// 飞书私聊里每条开出新话题的主线消息都进主会话的分发（`docs/tasks.md` §4.7）：不开普通会话，两条都落在
+/// home 的线上；回话在各自的话题里。
 #[tokio::test]
-async fn a_feishu_dm_opens_a_thread_session_instead_of_home() {
+async fn a_feishu_dm_main_message_is_dispatched_from_home_not_opened_as_a_session() {
     let wired = wire().await;
     let first = text_event("evt-d1", "oc_dm", "p2p", "ou_op", "第一件事", &[]);
     let second = text_event("evt-d2", "oc_dm", "p2p", "ou_op", "另一件事", &[]);
@@ -142,7 +165,6 @@ async fn a_feishu_dm_opens_a_thread_session_instead_of_home() {
     else {
         panic!("第二条应该排队");
     };
-    assert_ne!(a, b, "主线里的两条是两个话题");
     let (home, _) = wired
         .gateway
         .state()
@@ -151,13 +173,14 @@ async fn a_feishu_dm_opens_a_thread_session_instead_of_home() {
         .main_session("assistant")
         .await
         .unwrap();
-    assert_ne!(a.as_str(), home.id);
-    assert_ne!(b.as_str(), home.id);
+    assert_eq!(a.as_str(), home.id);
+    assert_eq!(b.as_str(), home.id);
+    assert_eq!(shown(&wired.gateway, &home.id).await, 2);
 
     let origins: Vec<String> = wired.gateway.origins().await;
     assert!(
-        origins.contains(&"chat:feishu:oc_dm#om_evt-d1".to_string()),
-        "{origins:?}"
+        !origins.iter().any(|origin| origin.starts_with("chat:")),
+        "不再按话题开普通会话：{origins:?}"
     );
 }
 
@@ -190,7 +213,7 @@ async fn a_feishu_group_needs_only_the_mention() {
         &[("@_user_1", BOT_OPEN_ID)],
     );
     let ack = wired.gateway.handle(decode(&mentioned, false)).await;
-    assert!(matches!(ack, InboundAck::Queued { .. }), "{ack:?}");
+    assert_eq!(ack, InboundAck::Ignored, "群里的消息进分发，回执不触发卡片");
 
     // 另一个从没登记过的群，@ 了照样进 Run。
     let outside = text_event(
@@ -202,15 +225,16 @@ async fn a_feishu_group_needs_only_the_mention() {
         &[("@_user_1", BOT_OPEN_ID)],
     );
     let ack = wired.gateway.handle(decode(&outside, false)).await;
-    assert!(matches!(ack, InboundAck::Queued { .. }), "{ack:?}");
+    assert_eq!(ack, InboundAck::Ignored);
 
+    // 每个群各有一条线。
     let origins: Vec<String> = wired.gateway.origins().await;
     assert!(
-        origins.contains(&"chat:feishu:oc_group#om_evt-g2".to_string()),
+        origins.contains(&"line:feishu:oc_group".to_string()),
         "{origins:?}"
     );
     assert!(
-        origins.contains(&"chat:feishu:oc_other#om_evt-g3".to_string()),
+        origins.contains(&"line:feishu:oc_other".to_string()),
         "{origins:?}"
     );
 }
@@ -268,39 +292,57 @@ async fn queued(gateway: &TestGateway, message: InboundMessage) -> (SessionId, R
     }
 }
 
-/// 话题的 Session 被操作者删掉之后，同一个话题里再 @ 开的是新的 Session，不是被拒的旧墓碑。
+/// 旧办法开出来的话题会话被操作者删掉之后，同一个话题里再 @ 走群的线（由分发判断），不是被拒的旧墓碑。
 #[tokio::test]
-async fn a_deleted_thread_session_is_replaced_by_a_fresh_one() {
+async fn a_deleted_legacy_thread_session_is_replaced_by_the_groups_line() {
     let wired = wire().await;
     let (_, first) = group_mention("D1", "@_user_1 先说一句", "", "");
-    let (old, _) = queued(&wired.gateway, first.clone()).await;
+    let core = wired.gateway.state().core().unwrap().clone();
+    let (old, _) = core
+        .session_for_source(&format!("chat:{}", first.peer), "assistant")
+        .await
+        .unwrap();
+    // 话题里还有旧会话：消息仍进它自己。
+    let (session, _) = queued(&wired.gateway, first.clone()).await;
+    assert_eq!(session.as_str(), old.id);
 
     // 生命周期（W4a）还没有 Durable 版的 delete：直接把 sessions 行标成已删除。
-    wired.gateway.soft_delete(old.as_str()).await;
+    wired.gateway.soft_delete(&old.id).await;
 
     let (_, again) = group_mention("D2", "@_user_1 还在吗", "om_D1", "omt_d");
     assert_eq!(again.peer, first.peer, "还是同一个话题");
-    let (fresh, _) = queued(&wired.gateway, again).await;
-    assert_ne!(fresh, old, "删掉的会话不再接收消息");
+    assert_eq!(wired.gateway.handle(again).await, InboundAck::Ignored);
+    let origins: Vec<String> = wired.gateway.origins().await;
+    assert!(
+        origins.contains(&"line:feishu:oc_group".to_string()),
+        "删掉的会话不再接收消息：{origins:?}"
+    );
 }
 
-/// 群里 @ 一次开一个话题、一个话题一个 Session；话题里的所有出站都回到话题里。
+/// 群里 @ 一次由分发判断：派出的任务绑定这个话题；回执 `Ignored`，渠道不发"处理中"卡片；回复以话题回复发到
+/// 话题根；话题里再 @ 直通给同一个任务（不再调 Router）；主流里另起一条 @ 是另一个话题、另一个任务。
 #[tokio::test]
-async fn a_group_mention_opens_a_thread_that_is_its_own_session() {
+async fn a_group_mention_is_answered_in_its_thread_without_a_card() {
     crate::harness::install_crypto();
     let fake = Arc::new(FakeOpenApi::start(Behavior::default()).await);
     let sender = Arc::new(FeishuSender::with_api(fake.api()));
     let gate = Gate::new();
+    let router = FakeLlm::finisher(
+        &serde_json::json!({ "route": "new", "title": "看日志", "description": "看一下日志" })
+            .to_string(),
+    );
+    let worker = FakeLlm::new(vec![
+        vec![
+            call_round(1, "pc-1", "gate", serde_json::json!({})),
+            text_round(2, "甲好了。\n状态：完成"),
+        ],
+        vec![text_round(1, "乙好了。\n状态：完成")],
+        vec![text_round(1, "丙好了。\n状态：完成")],
+    ]);
     let gateway = GatewayBuilder::new(&config_toml(&feishu_block("\"ou_op\"")))
         .env("KOMO_LLM_API_KEY=test-key\nFEISHU_APP_ID=cli_test\nFEISHU_APP_SECRET=test-app-secret\n")
-        .fake_llm(FakeLlm::new(vec![
-            vec![
-                call_round(1, "pc-1", "gate", serde_json::json!({})),
-                text_round(2, "甲好了。"),
-            ],
-            vec![text_round(1, "乙好了。")],
-            vec![text_round(1, "丙好了。")],
-        ]))
+        .llm(router.clone())
+        .stream(worker.clone())
         .tool(gate.tool())
         .factory(FixedFactory::sender_only(
             Arc::clone(&sender) as Arc<dyn ChannelSender>
@@ -308,36 +350,34 @@ async fn a_group_mention_opens_a_thread_that_is_its_own_session() {
         .start()
         .await;
 
-    // (a) 主流里 @：话题根就是这条消息，处理中卡片以话题回复发出，结果换在这张卡上。
+    // (a) 主流里 @：话题根就是这条消息；回执是 `Ignored`，渠道不加表情、不发卡片。
     let (_, first) = group_mention("A", "@_user_1 看一下日志", "", "");
     assert_eq!(first.peer.to_string(), "feishu:oc_group#om_A");
-    let (session_a, run_a) = queued(&gateway, first.clone()).await;
+    assert_eq!(gateway.handle(first.clone()).await, InboundAck::Ignored);
     gate.wait_entered(1).await;
-    let ticket = sender.expect_run_card(&run_a, &first.peer);
-    let card_id = sender
-        .reply_run_card(ticket, "om_A", true)
-        .await
-        .expect("处理中卡片");
+    assert!(
+        fake.calls_to("reply").is_empty(),
+        "任务还在做，没有处理中卡片"
+    );
     gate.release();
     {
         let fake = Arc::clone(&fake);
-        let card_id = card_id.clone();
-        eventually("结果换在卡片上", move || {
-            fake.patched_message_ids() == vec![card_id.clone()]
+        eventually("结果以话题回复发出", move || {
+            fake.calls_to("reply").len() == 1
         })
         .await;
     }
     let replies = fake.calls_to("reply");
-    assert_eq!(replies.len(), 1, "只有那张处理中卡片：{replies:?}");
     assert_eq!(replies[0]["target"], "om_A");
     assert_eq!(replies[0]["reply_in_thread"], serde_json::json!(true));
+    assert!(replies[0]["content"].as_str().unwrap().contains("甲好了。"));
     assert!(fake.calls_to("messages").is_empty(), "不能发到群主流");
+    assert!(fake.patched_message_ids().is_empty(), "没有卡片可换");
 
-    // (b) 话题里再 @：同一个 Session；没登记卡片，结果以话题回复发到话题根。
+    // (b) 话题里再 @：直通同一个任务，不调 Router。
     let (_, second) = group_mention("B", "@_user_1 再看一眼", "om_A", "omt_x");
     assert_eq!(second.peer, first.peer);
-    let (session_b, _) = queued(&gateway, second).await;
-    assert_eq!(session_b, session_a, "话题里的 @ 落在同一个 Session");
+    assert_eq!(gateway.handle(second).await, InboundAck::Ignored);
     {
         let fake = Arc::clone(&fake);
         eventually("话题里收到结果", move || {
@@ -349,21 +389,25 @@ async fn a_group_mention_opens_a_thread_that_is_its_own_session() {
     assert_eq!(replies[1]["target"], "om_A");
     assert_eq!(replies[1]["reply_in_thread"], serde_json::json!(true));
     assert!(replies[1]["content"].as_str().unwrap().contains("乙好了。"));
-    assert!(fake.calls_to("messages").is_empty(), "不能发到群主流");
+    assert_eq!(router.turns(), 1, "话题里的后续消息直通，没有再判断");
 
-    // (c) 主流里另起一条 @：另一个话题、另一个 Session。
+    // (c) 主流里另起一条 @：另一个话题、另一个任务。
     let (_, third) = group_mention("C", "@_user_1 另一件事", "", "");
-    let (session_c, _) = queued(&gateway, third).await;
-    assert_ne!(session_c, session_a, "另一个话题是另一个 Session");
+    assert_eq!(gateway.handle(third).await, InboundAck::Ignored);
+    {
+        let fake = Arc::clone(&fake);
+        eventually("另一个话题收到结果", move || {
+            fake.calls_to("reply").len() == 3
+        })
+        .await;
+    }
+    assert_eq!(fake.calls_to("reply")[2]["target"], "om_C");
+    assert_eq!(router.turns(), 2);
 
-    let mut origins: Vec<String> = gateway.origins().await;
-    origins.sort();
+    // 群只有一条线；不再按话题开普通会话。
     assert_eq!(
-        origins,
-        vec![
-            "chat:feishu:oc_group#om_A".to_string(),
-            "chat:feishu:oc_group#om_C".to_string()
-        ]
+        gateway.origins().await,
+        vec!["line:feishu:oc_group".to_string()]
     );
 }
 
@@ -478,20 +522,22 @@ async fn a_colleague_in_an_internal_group_is_an_operator_with_allow_tenant() {
     let ack = wired
         .say("T1", "oc_group", "ou_colleague", APP_TENANT, "看一下日志")
         .await;
-    let InboundAck::Queued { session, .. } = ack else {
-        panic!("同事应该排队：{ack:?}");
-    };
-    let record = wired
+    assert_eq!(ack, InboundAck::Ignored, "同事的群消息进分发：{ack:?}");
+    let (record, created) = wired
         .gateway
         .state()
         .core()
         .unwrap()
-        .session(session.as_str())
+        .group_line(
+            "assistant",
+            &ChannelPeer::new(ChannelPlatform::Feishu, "oc_group"),
+        )
         .await
-        .expect("会话在");
-    assert_eq!(record.kind, komo_kernel::durable::SessionKind::Normal);
+        .expect("群的线在");
+    assert!(!created, "消息已经建出了这条线");
+    assert_eq!(record.kind, komo_kernel::durable::SessionKind::Main);
     assert_eq!(record.agent.as_deref(), Some("assistant"));
-    assert_eq!(record.source.as_deref(), Some("chat:feishu:oc_group#om_T1"));
+    assert_eq!(record.source.as_deref(), Some("line:feishu:oc_group"));
 
     let status = wired
         .say("T2", "oc_group", "ou_colleague", APP_TENANT, "/status")

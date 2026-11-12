@@ -18,9 +18,22 @@ fn operator_dm(text: &str, key: &str) -> InboundMessage {
     inbound(ChannelPlatform::Telegram, "111", "111", text, key, true)
 }
 
-/// 操作者在群里说话：落到群的普通会话（仍有模型轮次），不是私聊的主会话。
+/// 操作者在群里一个话题里说话：话题里有旧办法开出来的普通会话时仍进它自己（仍有模型轮次）；群里别的
+/// 消息已经走群的线由分发判断（`durable::dispatch`），不再起模型轮次。
 fn operator_group(text: &str, key: &str) -> InboundMessage {
-    inbound(ChannelPlatform::Telegram, "-100", "111", text, key, false)
+    let mut message = inbound(ChannelPlatform::Telegram, "-100", "111", text, key, false);
+    message.peer = message.peer.in_thread("t1");
+    message
+}
+
+/// 先开出 [`operator_group`] 那个话题的旧式会话（`kind = normal`、`source = chat:{peer}`）。
+async fn open_legacy_topic(state: &Arc<crate::service::state::GatewayState>) {
+    let core = state.core().unwrap();
+    let agent = state.snapshot().agent.default_agent.clone();
+    let peer = operator_group("", "k").peer;
+    core.session_for_source(&crate::dispatcher::chat_origin(&peer), &agent)
+        .await
+        .expect("旧式话题会话");
 }
 
 /// ③ 改 `allow_from` 保存后重载，下一条消息按新名单判定（不重启）。
@@ -1301,8 +1314,8 @@ mod chat {
     /// 聊天渠道的普通消息以插话受理（§6，2026-10-23）：宿主 Run 忙着跑工具时，同一个 peer 的
     /// 下一句话由它在下一次请求模型之前并进去，不排到整条 Run 后面。
     ///
-    /// 改成群聊：私聊落到的主会话不再起模型轮次（消息交给分发任务，见 `durable::dispatch`），
-    /// "并进宿主 run"只发生在群、话题这些仍有模型轮次的会话里。
+    /// 改成旧式话题会话：私聊与群里的新消息落到的线不再起模型轮次（消息交给分发任务，见 `durable::dispatch`），
+    /// "并进宿主 run"只发生在旧办法开出来、仍有模型轮次的话题会话里。
     /// 改了断言：Legacy 看 `run.accepted` 上的 `interject` 标记；新存储的 RunAccepted 是合成的，
     /// 没有那一格，插话体现为行为——宿主停在 `gate` 上时第二句话并进它（终态 `absorbed`），
     /// 渠道收到"已并入"，回答只有宿主给的一次。
@@ -1322,6 +1335,7 @@ mod chat {
             ))
             .start()
             .await;
+        open_legacy_topic(gateway.state()).await;
         let ack = gateway.handle(operator_group("稍等", "telegram:50")).await;
         let InboundAck::Queued { run: host, .. } = ack else {
             panic!("应该排队：{ack:?}");
@@ -1423,10 +1437,11 @@ mod chat {
     /// 回复要发到聊天渠道的 Run 追加一条篇幅附注（§4「渠道篇幅」）：宿主附上的 user 消息、写明平台，
     /// 同一个 Run 只加一次。
     ///
-    /// 改成群聊：私聊落到的主会话不再起模型轮次，附注只出现在仍有模型轮次的会话里。
+    /// 改成旧式话题会话：私聊与群的线不再起模型轮次，附注只出现在仍有模型轮次的会话里。
     #[tokio::test]
     async fn a_chat_run_gets_one_channel_note_naming_the_platform() {
         let (gateway, _) = start(FakeLlm::finisher("好")).await;
+        open_legacy_topic(gateway.state()).await;
         let ack = gateway
             .dispatcher()
             .handle(operator_group("在吗", "telegram:70"))

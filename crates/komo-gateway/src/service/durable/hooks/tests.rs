@@ -152,6 +152,7 @@ impl World {
                         continued: None,
                         reply: None,
                         stopped: false,
+                        thread: None,
                     });
                     store_task_doc(tx, record.id, &doc).await?;
                     Ok(record.id)

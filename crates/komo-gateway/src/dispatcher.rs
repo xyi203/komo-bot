@@ -15,8 +15,13 @@
 //!
 //! 落存储的几步（`docs/storage-durable-d5.md` §4 W3a / §8）：
 //!
-//! - **会话**：操作者的私聊（没有话题）落到默认 Agent 的主会话（`kind = main`）；群、话题、带话题的
-//!   私聊按 `source = chat:{peer}` 各一个普通会话（被删或正在关闭的不再接消息，下一条另开新的）。
+//! - **会话**（`docs/tasks.md` §4.7、§4.13、§4.14 F5）：
+//!   - 操作者的私聊（没有话题）与**带话题的私聊**落到默认 Agent 的主会话（`kind = main`），由分发任务判断去向；
+//!   - 群各有一条"线"（`kind = main`、`source = line:{群}`，不跑模型），群里 @机器人 的消息落在那条线上，
+//!     由分发任务判断去向，Router 只看这个群；
+//!   - 按旧办法开出来的话题会话（`kind = normal`、`source = chat:{peer}`，带话题的 peer）保持可用：那个话题里再来
+//!     消息仍进它自己答，不迁移；被删或正在关闭的不再接，下一条走上面两条。
+//!   话题里的后续消息由分发任务按"位置的路由归属"直通给归属的任务，不调 Router。
 //! - **普通文本**：`request_id` = 平台消息键（持久去重：重投返回原 run），输入 entry 是 `chat.input`，
 //!   `data {peer, principal}`；宿主 run 是**同一个 peer** 起的、还在忙时 `WhenBusy::Steer`（并进去），
 //!   别的 peer 的话排在后面（§6：对端与宿主不同就不并）。
@@ -188,12 +193,19 @@ impl Dispatcher {
         msg: &InboundMessage,
     ) -> Result<SessionRecord, GatewayError> {
         let agent = self.state().snapshot().agent.default_agent.clone();
-        let private_main = msg.is_private && msg.peer.thread.is_none();
-        let (record, _) = if private_main {
+        // 旧办法开出来的话题会话还活着：这个话题里的消息仍由它自己答。
+        if msg.peer.thread.is_some()
+            && let Some(legacy) = core
+                .legacy_chat_session(&msg.peer)
+                .await
+                .map_err(gateway_error)?
+        {
+            return Ok(legacy);
+        }
+        let (record, _) = if msg.is_private {
             core.main_session(&agent).await
         } else {
-            core.session_for_source(&chat_origin(&msg.peer), &agent)
-                .await
+            core.group_line(&agent, &msg.peer).await
         }
         .map_err(gateway_error)?;
         Ok(record)
@@ -415,10 +427,15 @@ impl Inbound for Dispatcher {
                 )
                 .await
                 .map_err(gateway_error)?;
+            // 群里的消息回 `Ignored`：渠道据此不加表情、不回"处理中"卡片。群里 Router 可能判 `ignore`
+            // （什么都不发），而卡片是渠道在收到这个回执时就发的、事后撤不回，不如不发；回复到了就直接作为
+            // 话题里的一条文字消息。
             let ack = if accepted.deduplicated {
                 InboundAck::Duplicate {
                     run: Some(accepted.run.clone()),
                 }
+            } else if !msg.is_private {
+                InboundAck::Ignored
             } else {
                 InboundAck::Queued {
                     session: SessionId::from_raw(session),

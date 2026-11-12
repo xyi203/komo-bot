@@ -121,7 +121,7 @@ async fn a_group_message_only_counts_when_it_names_the_bot() {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
         let origins = gateway_sessions().await;
-        if origins.iter().any(|origin| origin == "chat:telegram:222") {
+        if origins.iter().any(|origin| origin == "line:telegram:222") {
             break;
         }
         assert!(
@@ -158,7 +158,7 @@ async fn an_unregistered_group_is_answered_when_it_names_the_bot() {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
         let origins: Vec<String> = gateway.origins().await;
-        if origins.iter().any(|origin| origin == "chat:telegram:333") {
+        if origins.iter().any(|origin| origin == "line:telegram:333") {
             break;
         }
         assert!(

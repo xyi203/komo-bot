@@ -1049,7 +1049,7 @@ impl TestGateway {
         wait_run(self.state(), run).await
     }
 
-    /// 全部会话（含已删除的）的"来源"：主会话是 `home`，其余是 `source`（`chat:{peer}`）。
+    /// 全部会话（含已删除的）的"来源"：主会话是 `home`，群的线是 `line:{群}`，其余是 `source`（`chat:{peer}`）。
     /// 任务会话与 cron 会话不算（聊天测试里没有它们）。
     pub async fn origins(&self) -> Vec<String> {
         use komo_kernel::durable::SessionKind;
@@ -1059,14 +1059,14 @@ impl TestGateway {
             .expect("读得出")
             .into_iter()
             .filter_map(|record| match record.kind {
-                SessionKind::Main => Some("home".to_owned()),
+                SessionKind::Main => Some(record.source.unwrap_or_else(|| "home".to_owned())),
                 SessionKind::Normal => Some(record.source.unwrap_or_default()),
                 SessionKind::Task | SessionKind::Cron => None,
             })
             .collect()
     }
 
-    /// 来源为 `origin`（`home` 或 `chat:…`）的会话 ID。
+    /// 来源为 `origin`（`home`、`line:…` 或 `chat:…`）的会话 ID。
     pub async fn session_of(&self, origin: &str) -> Option<String> {
         use komo_kernel::durable::SessionKind;
         let core = self.state().core().expect("durable");
@@ -1075,7 +1075,7 @@ impl TestGateway {
             .expect("读得出")
             .into_iter()
             .find(|record| match record.kind {
-                SessionKind::Main => origin == "home",
+                SessionKind::Main => record.source.as_deref().unwrap_or("home") == origin,
                 _ => record.source.as_deref() == Some(origin),
             })
             .map(|record| record.id)

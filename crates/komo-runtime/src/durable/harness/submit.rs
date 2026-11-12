@@ -61,6 +61,8 @@ pub struct NewTask {
     pub request_key: String,
     /// 回话的去处（分发派出的任务才有）。
     pub reply: Option<orchestration::ReplyTo>,
+    /// 任务拥有的对话位置（`TaskDoc::thread`）。
+    pub thread: Option<String>,
 }
 
 /// 撤回一个 submission 的结果（spec §6 `abort`）。
@@ -186,6 +188,7 @@ impl Harness {
             effort: None,
             contract: None,
             reply: task.reply,
+            thread: task.thread,
         };
         let (child, _) = orchestration::create_child(tx, &self.generation, parent, spec).await?;
         Ok(child)

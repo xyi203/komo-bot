@@ -206,6 +206,7 @@ async fn spawn(cx: &Cx<'_>, request: Request) -> Result<(), TaskError> {
                 effort,
                 contract,
                 reply: None,
+                thread: None,
             };
             let (child, _) = create_child(tx, &generation, parent, spec).await?;
             let reply = Reply::ok(
@@ -236,6 +237,8 @@ pub(crate) struct ChildSpec<'a> {
     pub effort: Option<Effort>,
     pub contract: Option<DelegateContract>,
     pub reply: Option<ReplyTo>,
+    /// 任务拥有的对话位置（[`TaskDoc::thread`]）。
+    pub thread: Option<String>,
 }
 
 /// 一次提交里建出任务会话，返回子 conversation 与第一条输入。调用方在同一次提交里落自己的结论
@@ -256,6 +259,7 @@ pub(crate) async fn create_child(
         effort,
         contract,
         reply,
+        thread,
     } = spec;
     let now = tx.now();
     // 表读先于第一次表写：父 conversation 属于哪个 komo Session（任务会话的 `parent_session`）。
@@ -344,6 +348,7 @@ pub(crate) async fn create_child(
         continued: None,
         reply,
         stopped: false,
+        thread,
     };
     if let Some(contract) = contract {
         doc.contracts.insert(first.to_string(), contract);

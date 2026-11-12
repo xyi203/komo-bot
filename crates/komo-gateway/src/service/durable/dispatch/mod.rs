@@ -18,11 +18,20 @@
 //!             list      在主线上落一条清单消息（不经模型）
 //! ```
 //!
+//! 位置的路由归属（[`owner`]，`docs/tasks.md` §4.14 F5）：消息的位置（带话题的 `ChannelPeer`）有归属任务、
+//! 任务没被停、会话还活着时，`judge` 不调 Router，直接把去向定成 `continue` 给那个任务（[`Decision::direct`]），
+//! 之后与 Router 判出的 `continue` 走同一段执行——展示消息、请求键幂等、回话去处都不用另做一套。
+//! `new` 派出的任务带上这个位置的归属（`komo.task.thread`），位置原来的归属在同一次提交里清掉。
+//!
+//! 群的"线"（`kind = main`、`source = line:…`，[`GROUP_LINE_PREFIX`]）走同一套：展示消息与分发任务落在那个群
+//! 自己的会话里，Router 输入只看这条线（[`input`]），范围是 `RouteScope::Group`。
+//!
 //! 结果不在这里：任务一轮结束时 runtime 的 `report` 在主会话里落一条 `main.reply` 展示 entry
 //! （`komo.task.reply` 写定了去处），[`deliver`] 订阅提交把它原文投到渠道。
 
 pub mod deliver;
 mod input;
+mod owner;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Weak};
@@ -113,7 +122,13 @@ pub struct Decision {
     /// `list` 的清单正文（判断时渲染好）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub list: Option<String>,
+    /// 直通：位置的归属任务收下这条消息，没有调 Router（`route` 是占位的 `continue`）。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub direct: bool,
 }
+
+/// 直通时 `Route::Continue` 里占位的任务标识（没有 Router 给的短号）。
+const DIRECT_TASK: &str = "direct";
 
 /// 引擎里的分发任务。`state` 是弱引用：任务定义装在注册表里，不让它替 `GatewayState` 续命。
 pub struct DispatchTask {
@@ -322,7 +337,33 @@ async fn judge(
         .session(&dispatch.session)
         .await
         .map_err(|error| TaskError::new(error.to_string()))?;
-    let built = input::build(core, &record, entry, &text)
+    let position = dispatch.peer.as_deref().and_then(ChannelPeer::parse);
+    // 直通（F5）：位置有归属、归属的任务没被停、会话还活着 → 不调 Router。判断在这里、在"更早的消息都分发完"
+    // 之后做，所以同一话题里紧挨着的两条消息，后一条看得到前一条刚开出来的归属。
+    if let Some(position) = &position
+        && let Some(holder) = owner::holder_of(core, &dispatch.session, position)
+            .await
+            .map_err(|error| TaskError::new(error.to_string()))?
+        && !holder.stopped
+    {
+        let decision = Decision {
+            route: Route::Continue {
+                task: DIRECT_TASK.to_owned(),
+            },
+            target: Some(holder.conversation),
+            fallback: None,
+            recent: Vec::new(),
+            list: None,
+            direct: true,
+        };
+        let next = serde_json::to_value(Checkpoint::Execute {
+            decision: Box::new(decision),
+        })
+        .expect("检查点可序列化");
+        rt.commit_next(outcome::running(next)).await?;
+        return Ok(());
+    }
+    let built = input::build(core, &record, entry, &text, position.as_ref())
         .await
         .map_err(|error| TaskError::new(error.to_string()))?;
     let agent = record
@@ -357,6 +398,7 @@ async fn judge(
         fallback: routed.fallback,
         recent: built.input.recent.clone(),
         list,
+        direct: false,
     };
     let next = serde_json::to_value(Checkpoint::Execute {
         decision: Box::new(decision),
@@ -419,6 +461,30 @@ async fn execute(
             .await?;
         return Ok(());
     };
+    let record = core
+        .session(&dispatch.session)
+        .await
+        .map_err(|error| TaskError::new(error.to_string()))?;
+    let group = input::group_of(&record);
+    let position = dispatch.peer.as_deref().and_then(ChannelPeer::parse);
+    // `continue` / `stop` 的目标必须是这条线派出的任务（群里还要回话去处在这个群）：候选里本来只有这些，
+    // 这里是第二道。不属于就什么都不做——不停、不转交，也不退成新任务。
+    let refused = match (&decision.route, decision.target) {
+        (Route::Continue { .. } | Route::Stop { .. }, Some(target)) => {
+            !owner::belongs(core, &dispatch.session, group.as_ref(), target)
+                .await
+                .map_err(|error| TaskError::new(error.to_string()))?
+        }
+        _ => false,
+    };
+    if refused {
+        tracing::warn!(route = ?decision.route, target = ?decision.target, "分发的目标不属于这条线，没有执行");
+        rt.commit_next(outcome::completed(
+            json!({ "route": "refused", "task": decision.target }),
+        ))
+        .await?;
+        return Ok(());
+    }
     if let (Route::Stop { .. }, Some(target)) = (&decision.route, decision.target) {
         // 完整的"停下"（撤排队的输入、停监听、标已停、取消当前执行）见 `DurableCore::stop_task`。
         // 先于完成提交：每一步幂等，崩在两者之间重放只是再做一遍。任务已有的中间产出留在任务会话里，不外发。
@@ -426,6 +492,21 @@ async fn execute(
             .await
             .map_err(|error| TaskError::new(error.to_string()))?;
     }
+    // 新任务拿位置的归属，位置原来的归属任务在同一次提交里清掉（每个位置至多一个）。同一条线上的分发
+    // 一条一条做（`judge` 先等更早的），这里读到的归属不会在提交前被别的分发改掉。
+    let thread = position
+        .as_ref()
+        .filter(|position| position.thread.is_some())
+        .map(ToString::to_string);
+    let old_holder = match (&position, &decision.route) {
+        (Some(position), Route::New { .. } | Route::Continue { .. }) if thread.is_some() => {
+            owner::holder_of(core, &dispatch.session, position)
+                .await
+                .map_err(|error| TaskError::new(error.to_string()))?
+                .map(|holder| holder.conversation)
+        }
+        _ => None,
+    };
     let harness = core.harness.clone();
     let dispatch = dispatch.clone();
     rt.commit(move |tx, _task| {
@@ -438,10 +519,19 @@ async fn execute(
             let key = format!("dispatch:{entry}");
             let done = match &decision.route {
                 Route::New { description, title } => {
-                    let task = new_task(description, title, &text, &decision.recent, key, reply);
+                    let task = new_task(
+                        description,
+                        title,
+                        &text,
+                        &decision.recent,
+                        key,
+                        reply,
+                        thread.clone(),
+                    );
                     let child = harness
                         .spawn_task_in_tx(tx, dispatch.conversation, task)
                         .await?;
+                    release(tx, old_holder, &thread).await?;
                     json!({ "route": "new", "task": child })
                 }
                 Route::Continue { .. } => {
@@ -453,10 +543,19 @@ async fn execute(
                         false => {
                             // 目标会话已经不收输入了（判断之后被删）：宁可多开一个任务，不丢消息。
                             let title = title_from(&text);
-                            let task = new_task(&text, &title, &text, &decision.recent, key, reply);
+                            let task = new_task(
+                                &text,
+                                &title,
+                                &text,
+                                &decision.recent,
+                                key,
+                                reply,
+                                thread.clone(),
+                            );
                             let child = harness
                                 .spawn_task_in_tx(tx, dispatch.conversation, task)
                                 .await?;
+                            release(tx, old_holder, &thread).await?;
                             json!({ "route": "new", "task": child, "from": "continue" })
                         }
                     }
@@ -473,7 +572,7 @@ async fn execute(
                     say(tx, &harness, &dispatch, &reply, key, &said).await?;
                     json!({ "route": "list" })
                 }
-                // 私聊没有 `ignore`；真出现了（检查点被改过）就什么都不做，消息仍在主线上。
+                // 群里"不该由 Agent 接的"：什么都不发，消息只留在线上。
                 Route::Ignore => json!({ "route": "ignore" }),
             };
             Ok(Some(outcome::completed(done)))
@@ -481,6 +580,24 @@ async fn execute(
     })
     .await?;
     core.resume();
+    Ok(())
+}
+
+/// 位置换了新任务：原归属任务的 `thread` 清掉（它还是 `thread` 这个位置的才清；任务本身不动）。
+async fn release(
+    tx: &mut Tx,
+    old: Option<ConversationId>,
+    thread: &Option<String>,
+) -> Result<(), DurableError> {
+    let (Some(old), Some(thread)) = (old, thread) else {
+        return Ok(());
+    };
+    if let Some(mut doc) = load_task_doc(tx, old).await?
+        && doc.thread.as_ref() == Some(thread)
+    {
+        doc.thread = None;
+        store_task_doc(tx, old, &doc).await?;
+    }
     Ok(())
 }
 
@@ -525,13 +642,14 @@ fn new_task(
     recent: &[RecentMessage],
     key: String,
     reply: ReplyTo,
+    thread: Option<String>,
 ) -> NewTask {
     let mut text = description.trim().to_owned();
     if message.trim() != text {
         text.push_str(&format!("\n\n用户的原话：\n{}", message.trim()));
     }
     if !recent.is_empty() {
-        text.push_str("\n\n这之前主线上最近的几条消息（旧的在前，只用来接上前面的话）：");
+        text.push_str("\n\n这之前最近的几条消息（旧的在前，只用来接上前面的话）：");
         for one in recent {
             text.push_str(&format!(
                 "\n- {}：{}",
@@ -545,6 +663,7 @@ fn new_task(
         text,
         request_key: key,
         reply: Some(reply),
+        thread,
     }
 }
 

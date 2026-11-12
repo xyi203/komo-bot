@@ -455,6 +455,7 @@ mode = "keyword"
             continued: None,
             reply: None,
             stopped: false,
+            thread: None,
         };
         let root = task.root_conversation;
         core.engine

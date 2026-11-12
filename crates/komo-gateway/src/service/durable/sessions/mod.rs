@@ -19,6 +19,7 @@ pub mod runs;
 pub mod search;
 #[cfg(test)]
 mod session_tests;
+pub mod task_list;
 pub mod tasks;
 pub mod titles;
 pub mod tree;

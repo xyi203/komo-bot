@@ -264,6 +264,108 @@ pub struct SessionListResponse {
     pub next_cursor: Option<String>,
 }
 
+// ---- /v1/tasks ----
+
+/// `GET /v1/tasks` 的 query（`docs/tasks.md` §3）。分页同 [`SessionListQuery`]：不带 `limit` 就是全部。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskListQuery {
+    /// 把已归档的（会话 `closing` / `deleted`）也列出来。
+    #[serde(default)]
+    pub all: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+    /// 上一页的 `next_cursor`，不透明。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+}
+
+/// 任务现在的状态（读出来的，不落库；`docs/tasks.md` §3.2）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum TaskState {
+    /// 有一条 Run 在跑或排着队。
+    Running,
+    /// 等你：有未答的介入 / `confirm`，或最近一次交回是受阻。
+    Waiting,
+    /// 已交回：`outcome` 说明是完成、没说做完还是没有完成。
+    Returned,
+    /// 没有在跑的 Run，也没有交回过。
+    Idle,
+    /// 会话在关闭 / 已删除。
+    Archived,
+}
+
+/// 最近一次交回的结局（`state` 为 `returned` 或因受阻而 `waiting` 时有）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum TaskOutcome {
+    Done,
+    Blocked,
+    /// 交回了但没写状态行；旧数据没有记状态也是这个。
+    Unstated,
+    /// 失败、取消、预算。
+    NotCompleted,
+}
+
+/// 任务从哪来：区分三种会话（`docs/tasks.md` §3.1，cron 以任务说明为准算任务）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum TaskSource {
+    /// 别的会话用 `task` 派出的（`dispatched_by` 是派出方）。
+    Dispatched,
+    /// 自己开的会话、群与话题的会话。
+    Conversation,
+    /// 定时任务触发的。
+    Cron,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(optional_fields))]
+pub struct TaskSummary {
+    /// 背后的会话。
+    pub session: SessionId,
+    /// 短号（不带 `#`），与派出回执、`task_id` 同一个。
+    pub handle: String,
+    pub title: String,
+    pub state: TaskState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<TaskOutcome>,
+    pub source: TaskSource,
+    /// 派出方会话（`source == dispatched`）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatched_by: Option<SessionId>,
+    /// 会话的创建时刻。
+    #[cfg_attr(feature = "ts", ts(type = "string"))]
+    #[serde(with = "time::serde::rfc3339")]
+    pub started_at: OffsetDateTime,
+    /// 最近一次交回的时刻；没交回过（含没有派出方的会话）缺省。
+    #[cfg_attr(feature = "ts", ts(type = "string"))]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "time::serde::rfc3339::option"
+    )]
+    pub ended_at: Option<OffsetDateTime>,
+    /// 工具轮数：在跑时是当前 Run 的，否则是最近一次交回的（旧数据缺省）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rounds: Option<u32>,
+    /// 还活着的监听数。
+    pub monitors: u32,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(optional_fields))]
+pub struct TaskListResponse {
+    pub tasks: Vec<TaskSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
 /// `GET /v1/session-search` 的 query（`komo session search`，roadmap-muse S3）。
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionSearchQuery {

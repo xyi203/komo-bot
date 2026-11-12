@@ -14,6 +14,7 @@
 //! | `interventions` | 待处理清单、详情、答复、reconcile | W4a |
 //! | `export` | `GET /v1/sessions/{id}/export` | W4c |
 //! | `monitors` | `GET /v1/monitors`（只读清单） | S4 |
+//! | `tasks` | `GET /v1/tasks`（任务清单，只读投影） | T1 |
 //! | `changes` | 每轮改了哪些文件与逐文件对比（只活在进程里） | — |
 
 pub mod changes;
@@ -24,6 +25,7 @@ pub mod interventions;
 pub mod monitors;
 pub mod runs;
 pub mod sessions;
+pub mod tasks;
 pub mod tree;
 
 #[cfg(test)]
@@ -45,4 +47,5 @@ pub fn routes() -> Router<Api> {
         .merge(interventions::routes())
         .merge(export::routes())
         .merge(monitors::routes())
+        .merge(tasks::routes())
 }

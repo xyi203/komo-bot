@@ -60,6 +60,16 @@ enum Status {
     Unstated,
 }
 
+impl Status {
+    fn as_str(self) -> &'static str {
+        match self {
+            Status::Done => "done",
+            Status::Blocked => "blocked",
+            Status::Unstated => "unstated",
+        }
+    }
+}
+
 /// 末行是不是 [`TASK_STATUS_DONE`] / [`TASK_STATUS_BLOCKED`]。模型常给它加粗、套引用或列表
 /// 符号，冒号也会写成半角，这些都认；"状态：未完成"之类不认，按没写算。
 fn status_of(text: &str) -> Status {
@@ -326,6 +336,15 @@ async fn report(
                 ended_at: tx.now(),
                 final_message: Some(text.clone()),
                 reason: None,
+                status: Some(
+                    if has_contract {
+                        "done"
+                    } else {
+                        status_of(&text).as_str()
+                    }
+                    .to_owned(),
+                ),
+                rounds: Some(run.rounds),
             };
             (Outcome::Completed, text, last)
         }
@@ -340,6 +359,8 @@ async fn report(
                 ended_at: tx.now(),
                 final_message: None,
                 reason: Some(text.clone()),
+                status: None,
+                rounds: Some(run.rounds),
             };
             (Outcome::NotCompleted, text, last)
         }
@@ -397,11 +418,7 @@ async fn report(
                         Outcome::Completed => "completed",
                         Outcome::NotCompleted => "notCompleted",
                     },
-                    "status": status.map(|status| match status {
-                        Status::Done => "done",
-                        Status::Blocked => "blocked",
-                        Status::Unstated => "unstated",
-                    }),
+                    "status": status.map(Status::as_str),
                     "rounds": run.rounds,
                 }
             })),

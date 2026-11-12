@@ -195,6 +195,14 @@ pub struct LastRun {
     pub final_message: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// 回答末行的状态：`done` / `blocked` / `unstated`（与 `task.result` 的 `data.status` 同一套词；
+    /// 带结果契约的回答不看状态行，记成 `done`，与交回的标题"已完成"一致）。失败 / 取消没有。
+    /// 任务清单读它认"受阻"。附加字段：旧 document 没有，读成 `None`，清单按"没说做完"显示。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    /// 这条 run 的工具调用轮数（与交回标题里的数字同源）。旧 document 没有。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rounds: Option<u32>,
 }
 
 /// 子 conversation 的 `komo.task`：它是谁派的、叫什么、用哪个模型、哪些输入带结果契约。

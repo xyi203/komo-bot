@@ -1749,3 +1749,343 @@ async fn landing_without_the_tree_matches_landing_with_it_over_random_sequences(
         );
     }
 }
+
+// ------------------------------------------------------------------ 任务清单
+
+mod task_list {
+    use std::collections::BTreeMap;
+
+    use komo_kernel::durable::{SessionKind, SessionRecord, TaskId};
+    use komo_kernel::protocol::http::{TaskOutcome, TaskSource, TaskState, TaskSummary};
+    use komo_runtime::durable::harness::orchestration::{LastRun, TaskDoc, store_task_doc};
+
+    use super::*;
+    use crate::service::durable::sessions::SessionPageCursor;
+
+    fn last_run(state: &str, status: Option<&str>) -> LastRun {
+        LastRun {
+            state: state.into(),
+            ended_at: 1_700_000_000_000,
+            final_message: Some("交回".into()),
+            reason: None,
+            status: status.map(str::to_owned),
+            rounds: Some(4),
+        }
+    }
+
+    /// 派出的任务会话：`komo.task` 里带这条 `lastRun`；`legacy` 时把新增的两格去掉，当作旧 document。
+    async fn dispatched(
+        core: &DurableCore,
+        parent: &SessionRecord,
+        title: &str,
+        last: Option<LastRun>,
+        legacy: bool,
+    ) -> SessionRecord {
+        let mut spec = NewSession::new("assistant")
+            .kind(SessionKind::Task)
+            .title(title);
+        spec.parent_session = Some(parent.id.clone());
+        let record = core.create_session(spec).await.unwrap();
+        let doc = TaskDoc {
+            parent: parent.root_conversation,
+            anchor: TaskId::new(1),
+            title: title.into(),
+            fork: false,
+            model: None,
+            effort: None,
+            contracts: BTreeMap::new(),
+            last_run: last,
+            continued: None,
+        };
+        let root = record.root_conversation;
+        core.engine
+            .commit(move |tx| {
+                Box::pin(async move {
+                    if legacy {
+                        let mut value = serde_json::to_value(&doc).unwrap();
+                        let last = value["lastRun"].as_object_mut().unwrap();
+                        last.remove("status");
+                        last.remove("rounds");
+                        tx.put_document(
+                            komo_runtime::durable::harness::orchestration::task_doc_address(root),
+                            komo_runtime::durable::harness::orchestration::TASK_DOC_VERSION,
+                            value,
+                        )
+                        .await
+                    } else {
+                        store_task_doc(tx, root, &doc).await
+                    }
+                })
+            })
+            .await
+            .unwrap();
+        record
+    }
+
+    async fn plain(core: &DurableCore, spec: NewSession) -> SessionRecord {
+        core.create_session(spec).await.unwrap()
+    }
+
+    async fn all(core: &DurableCore, all: bool) -> Vec<TaskSummary> {
+        core.task_page(all, None, None).await.unwrap().tasks
+    }
+
+    fn row<'a>(tasks: &'a [TaskSummary], record: &SessionRecord) -> &'a TaskSummary {
+        tasks
+            .iter()
+            .find(|task| task.session.as_str() == record.id)
+            .unwrap_or_else(|| panic!("清单里没有 {}", record.id))
+    }
+
+    #[tokio::test]
+    async fn each_kind_of_task_session_shows_its_own_state_and_source() {
+        let permits = Arc::new(Semaphore::new(0));
+        let dir = tempfile::tempdir().unwrap();
+        let (core, _) = open_at(
+            dir.path(),
+            Arc::new(Gate {
+                inner: FakeLlm::finisher("好"),
+                permits,
+            }),
+        )
+        .await;
+        let (home, _) = core.main_session("assistant").await.unwrap();
+
+        let done = dispatched(
+            &core,
+            &home,
+            "查空调",
+            Some(last_run("completed", Some("done"))),
+            false,
+        )
+        .await;
+        let blocked = dispatched(
+            &core,
+            &home,
+            "改配置",
+            Some(last_run("completed", Some("blocked"))),
+            false,
+        )
+        .await;
+        let failed = dispatched(
+            &core,
+            &home,
+            "跑脚本",
+            Some(last_run("failed", None)),
+            false,
+        )
+        .await;
+        let legacy = dispatched(
+            &core,
+            &home,
+            "老任务",
+            Some(last_run("completed", Some("done"))),
+            true,
+        )
+        .await;
+        let fresh = dispatched(&core, &home, "刚派出", None, false).await;
+        let group = plain(
+            &core,
+            NewSession::new("assistant")
+                .source("chat:feishu:oc_1:om_2")
+                .title("群里的话题"),
+        )
+        .await;
+        let cron = plain(
+            &core,
+            NewSession::new("assistant")
+                .kind(SessionKind::Cron)
+                .title("每日简报"),
+        )
+        .await;
+        let running = plain(&core, NewSession::new("assistant").title("在跑")).await;
+        core.submit_input(&running.id, InputRequest::new("work"))
+            .await
+            .unwrap();
+
+        let tasks = all(&core, false).await;
+        assert!(
+            tasks.iter().all(|task| task.session.as_str() != home.id),
+            "主会话不算任务"
+        );
+        assert_eq!(tasks.len(), 8);
+
+        let line = row(&tasks, &done);
+        assert_eq!(
+            (line.state, line.outcome, line.source),
+            (
+                TaskState::Returned,
+                Some(TaskOutcome::Done),
+                TaskSource::Dispatched
+            )
+        );
+        assert_eq!(
+            line.dispatched_by.as_ref().map(|id| id.as_str()),
+            Some(home.id.as_str())
+        );
+        assert_eq!(line.rounds, Some(4));
+        assert!(line.ended_at.is_some());
+        assert_eq!(line.title, "查空调");
+        assert_eq!(
+            line.handle,
+            komo_kernel::types::handle::short_handle(done.root_conversation.get())
+        );
+
+        // 受阻：算"等你"，结局保留"受阻"。
+        let line = row(&tasks, &blocked);
+        assert_eq!(
+            (line.state, line.outcome),
+            (TaskState::Waiting, Some(TaskOutcome::Blocked))
+        );
+
+        let line = row(&tasks, &failed);
+        assert_eq!(
+            (line.state, line.outcome),
+            (TaskState::Returned, Some(TaskOutcome::NotCompleted))
+        );
+
+        // 旧 document（`lastRun` 没有 status / rounds）读得出来，按"没说做完"。
+        let line = row(&tasks, &legacy);
+        assert_eq!(
+            (line.state, line.outcome, line.rounds),
+            (TaskState::Returned, Some(TaskOutcome::Unstated), None)
+        );
+
+        let line = row(&tasks, &fresh);
+        assert_eq!((line.state, line.outcome), (TaskState::Idle, None));
+
+        let line = row(&tasks, &group);
+        assert_eq!(
+            (line.state, line.source, line.dispatched_by.clone()),
+            (TaskState::Idle, TaskSource::Conversation, None)
+        );
+        assert_eq!(line.title, "群里的话题");
+
+        let line = row(&tasks, &cron);
+        assert_eq!(
+            (line.state, line.source),
+            (TaskState::Idle, TaskSource::Cron)
+        );
+
+        let line = row(&tasks, &running);
+        assert_eq!(
+            (line.state, line.outcome, line.rounds),
+            (TaskState::Running, None, Some(0))
+        );
+        assert!(line.ended_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_new_run_outranks_the_previous_blocked_hand_back() {
+        let permits = Arc::new(Semaphore::new(0));
+        let dir = tempfile::tempdir().unwrap();
+        let (core, _) = open_at(
+            dir.path(),
+            Arc::new(Gate {
+                inner: FakeLlm::finisher("好"),
+                permits,
+            }),
+        )
+        .await;
+        let (home, _) = core.main_session("assistant").await.unwrap();
+        let task = dispatched(
+            &core,
+            &home,
+            "追问过的",
+            Some(last_run("completed", Some("blocked"))),
+            false,
+        )
+        .await;
+        assert_eq!(
+            row(&all(&core, false).await, &task).state,
+            TaskState::Waiting
+        );
+
+        core.submit_input(&task.id, InputRequest::new("接着做"))
+            .await
+            .unwrap();
+        let tasks = all(&core, false).await;
+        let line = row(&tasks, &task);
+        assert_eq!((line.state, line.outcome), (TaskState::Running, None));
+    }
+
+    #[tokio::test]
+    async fn archived_tasks_are_listed_only_with_all() {
+        let fixture = Fixture::new(FakeLlm::finisher("好")).await;
+        let kept = plain(&fixture.core, NewSession::new("assistant").title("留着")).await;
+        let gone = plain(&fixture.core, NewSession::new("assistant").title("删了")).await;
+        fixture.core.delete_session(&gone.id, true).await.unwrap();
+
+        let default = all(&fixture.core, false).await;
+        assert_eq!(default.len(), 1);
+        assert_eq!(default[0].session.as_str(), kept.id);
+
+        let everything = all(&fixture.core, true).await;
+        assert_eq!(everything.len(), 2);
+        assert_eq!(row(&everything, &gone).state, TaskState::Archived);
+        assert_eq!(row(&everything, &kept).state, TaskState::Idle);
+    }
+
+    #[tokio::test]
+    async fn task_pages_walk_the_whole_list_without_repeats_or_gaps() {
+        let fixture = Fixture::new(FakeLlm::finisher("好")).await;
+        let core = &fixture.core;
+        // 主会话夹在中间被滤掉，不能让页变短或断页。
+        let mut made = Vec::new();
+        for n in 0..5 {
+            made.push(
+                plain(core, NewSession::new("assistant").title(format!("t{n}")))
+                    .await
+                    .id,
+            );
+            if n == 1 || n == 3 {
+                plain(
+                    core,
+                    NewSession::new(format!("agent{n}")).kind(SessionKind::Main),
+                )
+                .await;
+            }
+        }
+        let full: Vec<String> = all(core, false)
+            .await
+            .into_iter()
+            .map(|task| task.session.as_str().to_owned())
+            .collect();
+        assert_eq!(full.len(), 5);
+
+        let mut seen = Vec::new();
+        let mut cursor = None;
+        let mut pages = 0;
+        loop {
+            let page = core
+                .task_page(false, Some(2), cursor.as_ref())
+                .await
+                .unwrap();
+            assert!(page.tasks.len() <= 2);
+            seen.extend(
+                page.tasks
+                    .iter()
+                    .map(|task| task.session.as_str().to_owned()),
+            );
+            pages += 1;
+            // 经 encode / decode 走一遍，和 HTTP 层一样。
+            cursor = page
+                .next
+                .map(|next| SessionPageCursor::decode(&next.encode()).unwrap());
+            if cursor.is_none() {
+                break;
+            }
+        }
+        assert_eq!(pages, 3);
+        assert_eq!(seen, full);
+        let mut sorted = made.clone();
+        sorted.sort();
+        sorted.reverse();
+        assert_eq!(seen, sorted, "最新的在前");
+
+        // 刚好一页装得下：没有下一页。
+        let page = core.task_page(false, Some(5), None).await.unwrap();
+        assert_eq!(page.tasks.len(), 5);
+        assert!(page.next.is_none());
+    }
+}

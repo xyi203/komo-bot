@@ -199,6 +199,34 @@ async fn the_monitor_list_shows_live_ones_with_their_session() {
     gateway.stop().await;
 }
 
+/// `GET /v1/tasks`（T1）：任务行上"还活着的监听数"跟着登记走——挂上是 1，停掉之后归零。
+#[tokio::test]
+async fn the_task_list_counts_live_monitors_and_drops_to_zero_after_stop() {
+    let llm = MonitorLlm::new(Duration::ZERO);
+    let mut gateway = start(&llm, None).await;
+    let (session, id) = arm(&gateway, "while true; do sleep 0.2; done").await;
+
+    async fn monitors_of(gateway: &TestGateway, session: &str) -> u64 {
+        let (status, body) = gateway.get_json("/v1/tasks").await;
+        assert_eq!(status, 200, "{body}");
+        let row = body["tasks"]
+            .as_array()
+            .expect("数组")
+            .iter()
+            .find(|task| task["session"] == session)
+            .unwrap_or_else(|| panic!("清单里没有 {session}：{body}"));
+        row["monitors"].as_u64().expect("监听数")
+    }
+
+    assert_eq!(monitors_of(&gateway, &session).await, 1);
+
+    let reply = say(&gateway, &session, "stop", &format!("停：{id}")).await;
+    assert!(reply.contains(&format!("已停止监听 #{id}")), "{reply}");
+    assert_eq!(monitors_of(&gateway, &session).await, 0);
+
+    gateway.stop().await;
+}
+
 /// 删会话时停掉它名下的监听（S2，`docs/background-tasks.md` §2e）：进程组没了，登记 `ended{stopped}`，
 /// 不在要删的会话里交回结束消息。
 #[tokio::test]

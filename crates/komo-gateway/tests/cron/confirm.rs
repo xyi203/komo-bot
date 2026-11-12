@@ -132,6 +132,39 @@ async fn a_cron_run_asks_before_an_outward_mcp_call_and_runs_it_once_approved() 
     gw.stop().await;
 }
 
+/// 任务清单（T1，`GET /v1/tasks`）：定时任务的 Run 停在确认卡上时，Run 虽然还在跑，行仍是"等你"
+/// （未答的介入压过"进行中"）；答复之后 Run 收尾，不再是"等你"。
+#[tokio::test]
+async fn a_cron_session_waiting_on_a_confirm_card_is_listed_as_waiting_for_you() {
+    let (home, _counter) = home_with_outward();
+    let gw = home.start(bump_then("加好了")).await;
+    let job = gw.add_job(daily()).await;
+    gw.make_due(&job.id).await;
+    let run = gw.tick().await.fired[0].run.clone();
+    let pending = gw.wait_intervention(&run).await;
+
+    let row_of = |body: &serde_json::Value| {
+        body["tasks"]
+            .as_array()
+            .expect("数组")
+            .iter()
+            .find(|task| task["session"] == pending.session.as_str())
+            .cloned()
+            .unwrap_or_else(|| panic!("清单里没有这个定时会话：{body}"))
+    };
+    let (code, body) = gw.get_json("/v1/tasks").await;
+    assert_eq!(code, 200, "{body}");
+    let row = row_of(&body);
+    assert_eq!(row["state"], "waiting", "{row}");
+    assert_eq!(row["source"], "cron", "{row}");
+
+    gw.answer(&pending.handle, "approve").await;
+    gw.wait_state(&run, |s| s.is_terminal(), "终态").await;
+    let (_, body) = gw.get_json("/v1/tasks").await;
+    assert_eq!(row_of(&body)["state"], "idle", "{body}");
+    gw.stop().await;
+}
+
 #[tokio::test]
 async fn a_rejected_card_never_runs_the_call_and_the_model_hears_why() {
     let (home, counter) = home_with_outward();

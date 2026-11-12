@@ -121,10 +121,16 @@ pub(crate) fn sections(
     }
     match invocation {
         InvocationContext::Main => {
-            let has_shell = tools.iter().any(|tool| tool == BASH_TOOL);
+            let has = |name: &str| tools.iter().any(|tool| tool == name);
             push(
                 SECTION_BASE,
-                main_base(workspace, &rules, has_shell, background_task),
+                main_base(
+                    workspace,
+                    &rules,
+                    has(BASH_TOOL),
+                    has(KOMO_TOOL),
+                    background_task,
+                ),
             );
             if let Some(block) = project_block(project_files) {
                 push(SECTION_PROJECT, block);
@@ -211,18 +217,29 @@ fn truncate(text: &str, max: usize) -> String {
     format!("{}…", head.trim_end())
 }
 
-/// 主 Agent 提示里不随项目规范与 skills 变的那一段：身份 / 工作目录 / 行为约束，能跑命令时
-/// 再加「komo 自查」，任务会话最后再加 [`TASK_MODE_BLOCK`]。[`sections`] 用它。
-fn main_base(workspace: &Path, rules: &str, has_shell: bool, background_task: bool) -> String {
+/// 主 Agent 提示里不随项目规范与 skills 变的那一段：身份 / 工作目录 / 行为约束，挂了 `komo`
+/// 工具时再加「komo 自查」，能跑命令时再加一句重启 Gateway 的提醒，任务会话最后再加
+/// [`TASK_MODE_BLOCK`]。[`sections`] 用它。
+fn main_base(
+    workspace: &Path,
+    rules: &str,
+    has_shell: bool,
+    has_komo: bool,
+    background_task: bool,
+) -> String {
     let mut prompt = format!(
         "你是 komo，跑在用户自己机器上的助手。\n\
          工作目录：{}\n\
          {rules}",
         workspace.display(),
     );
-    if has_shell {
+    if has_komo {
         prompt.push_str("\n\n");
         prompt.push_str(SELF_BLOCK);
+    }
+    if has_shell {
+        prompt.push_str("\n\n");
+        prompt.push_str(RESTART_NOTE);
     }
     if background_task {
         prompt.push_str("\n\n");
@@ -249,55 +266,59 @@ pub const TASK_MODE_BLOCK: &str = "你是一个后台任务：派你的会话把
                                    末行写「状态：完成」；做不下去写「状态：受阻：原因」（带结果\
                                    契约时只给 JSON，不写这一行）。";
 
-/// 能跑 komo CLI 的那个工具；没挂它时 [`SELF_BLOCK`] 不出现——说了也跑不了。
+/// 能跑命令的那个工具：挂了它，[`RESTART_NOTE`] 才出现——说了也跑不了的提醒不必给。
 const BASH_TOOL: &str = "bash";
 
-/// 「你就跑在 komo 里」：komo 自己的状态用 komo CLI 查（2026-09-24 的实际会话：问
+/// komo 自己的状态的那个工具；没挂它时 [`SELF_BLOCK`] 不出现——说了也调不了。
+const KOMO_TOOL: &str = "komo";
+
+/// 「你就跑在 komo 里」：komo 自己的状态用 `komo` 工具查和改（2026-09-24 的实际会话：问
 /// "有哪些 cron job"，模型先读了同名的共享 skill、再翻系统 crontab / launchctl，第 8 轮才
-/// 想到 `komo cron list`）。`komo` 靠 PATH 找到：服务单元写入了安装时的 PATH（§3）。
+/// 想到 `komo cron list`）。2026-11-11 起这些动作是一个在 Gateway 里执行的工具，不再教模型在 `bash`
+/// 里跑 `komo <子命令>`：命令执行的地方不一定有 `komo`，也不一定连得到 Gateway
+/// （`docs/tasks.md` §4.4）。
 ///
-/// 学 pi 的 docs 段：只给入口（`komo --help`）和一个例子，子命令清单不抄进提示。
+/// 动作清单一句话带过，字段在 `tool://komo/doc`，不抄进提示。
 ///
 /// 「记住」那句（2026-10-20）：记忆原本只能等后台提取，用户说"记住这个习惯"时只能回一句
 /// "等它出现在列表里再确认"。
 ///
 /// 「记住」那句的约定分支（2026-10-28，附录 F）：用户说了"以后""默认""每次都"这类话才带
-/// `--application convention` 与条件，当次要求不 add；不带 `--application` 记成线索。
+/// `application: convention` 与条件，当次要求不 add；不带 `application` 记成线索。
 ///
 /// 「查记忆」那句（2026-10-28，§9.4「Agent 主动查」）：注入的记忆不够用、或报错之后想看以前
-/// 的排查经验，由 Agent 自己 `komo memory search`，替代宿主在 Run 中途插召回。静态文字，不
+/// 的排查经验，由 Agent 自己 `memory.search`，替代宿主在 Run 中途插召回。静态文字，不
 /// 影响前缀；查到的按注入块同一套规则用（约定照做、线索先核实）。
 ///
 /// 「找别的会话」那句（2026-10-31，roadmap-muse S3）：用户说"刚才在飞书里那篇文章"时，模型曾
 /// `komo session list` + `session export` 再 grep 才找到另一个会话里的链接。静态文字，不影响前缀。
 ///
-/// 「目标与领域」那句（2026-10-29，`docs/goals.md` §4）：事项由 Agent 在 Run 里当场记，用户在场、
+/// 「目标」那句（2026-10-29，`docs/goals.md` §4）：事项由 Agent 在 Run 里当场记，用户在场、
 /// 上下文齐全；后台提取不建事项。静态文字，不影响前缀。末尾补一句挂触发器（P1e，§8）：等待时 monitor
 /// 盯着、交回来再 resume。
-///
-/// 末句（2026-10-15）：会话里 6 次在 Run 里重启 Gateway，8 个调用因此记成 uncertain，
-/// 最长的一条两个多小时后才收尾。
-const SELF_BLOCK: &str = "komo 自己的状态（cron、会话 / Run、记忆、介入、配置、skills、\
-                          Gateway）用 bash 跑 `komo <子命令>` 查，例如 `komo cron list`，\
-                          其余看 `komo --help`；别去翻系统 crontab、launchctl 或同名 skill。\
-                          用户要你记住什么，当场用 `komo memory add \"一句陈述\"` 记下，它记成用户\
-                          原话、未确认，告诉用户可以用 `komo memory confirm` 确认；别替用户 \
-                          confirm。用户表达了长期意图（\"以后\"\"默认\"\"每次都\"）的偏好，带 \
-                          `--application convention --applies-when \"适用的条件\"` 记成长期约定；\
+const SELF_BLOCK: &str = "komo 自己的状态（记忆、目标、定时任务、别的会话、任务清单）用 komo 工具查和改，\
+                          不要去翻系统 crontab、launchctl 或同名 skill，也不要在 bash 里找。\
+                          动作：memory.add / search / forget，goal.add / next / wait / resume / done / link，\
+                          cron.list / run，session.search / list，task.list；各动作的 params 字段先 read \
+                          tool://komo/doc。\
+                          用户要你记住什么，当场用 memory.add 记下，它记成用户原话、未确认，由用户自己\
+                          确认；别替用户确认。用户表达了长期意图（\"以后\"\"默认\"\"每次都\"）的偏好，带 \
+                          application = convention 与 applies_when（适用的条件）记成长期约定；\
                           只管眼前这件事的要求（\"这个工单选 saas\"）不要 add；拿不准就不带 \
-                          `--application`，记成线索。\
-                          注入的记忆不够用、或者报错之后想看以前的排查经验，用 \
-                          `komo memory search \"关键词\"` 查；查到的按同样的规则用——约定照做，\
-                          线索先核实。\
-                          用户提到别的会话、别的渠道里的事（\"刚才在飞书里那篇\"），用 \
-                          `komo session search \"关键词\"` 找到会话与片段，别 export 整个会话去 grep。\
-                          用户说开始做某事、开始管某事、在等某人某事、先放一放、办完了、不管了，\
-                          就当场用 `komo goal` / `komo area` 记下（`komo goal --help`）；推进时用 \
-                          `komo goal next` 更新下一步；目标转等待时通常顺手挂个 monitor 盯着，用 \
-                          `komo goal link` 挂上，monitor 交回来就 `komo goal resume`。\
-                          你自己就跑在 Gateway 里：`komo gateway restart|stop` 和会重启 \
-                          Gateway 的安装脚本会打断你正在做的这件事，要跑就放在最后一步，\
-                          或者交给用户自己跑。";
+                          application，记成线索。\
+                          注入的记忆不够用、或者报错之后想看以前的排查经验，用 memory.search 查；\
+                          查到的按同样的规则用——约定照做，线索先核实。\
+                          用户提到别的会话、别的渠道里的事（\"刚才在飞书里那篇\"），用 session.search \
+                          找到会话与片段，别 export 整个会话去 grep。\
+                          用户说开始做某事、在等某人某事、办完了，就当场用 goal.add / goal.wait / \
+                          goal.done 记下；推进时用 goal.next 更新下一步；目标转等待时通常顺手挂个 \
+                          monitor 盯着，用 goal.link 挂上，monitor 交回来就 goal.resume。";
+
+/// 能跑命令时的一句提醒（2026-10-15）：会话里 6 次在 Run 里重启 Gateway，8 个调用因此记成
+/// uncertain，最长的一条两个多小时后才收尾。`komo gateway` 是给人用的命令，不在 komo 工具里。
+const RESTART_NOTE: &str = "你自己就跑在 Gateway 里：`komo gateway restart|stop` 和会重启 \
+                            Gateway 的安装脚本会打断你正在做的这件事，要跑就放在最后一步，\
+                            或者交给用户自己跑。";
 
 /// 项目规范（`AGENTS.md` / `CLAUDE.md`）那一块：开头一句说清顺序与冲突怎么办，每份文件
 /// 原样包在 `<project_instructions path="…">` 里（标签照 pi，`system-prompt.ts`）。

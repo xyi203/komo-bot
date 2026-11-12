@@ -93,35 +93,89 @@ fn system_sections_are_keyed_in_prompt_order_and_skip_the_empty_ones() {
     assert_eq!(keys, ["base"]);
 }
 
-/// 能跑 bash 时系统提示教 Agent 自己查记忆（`docs/memory.md` §9.4「Agent 主动查」）；这句是静态文字，
-/// 跨轮、跨输入逐字不变，不影响前缀缓存。没有 bash 就没有这一段。
+/// 挂了 `komo` 工具时系统提示教 Agent 用它自己查记忆（`docs/memory.md` §9.4「Agent 主动查」）；这句是
+/// 静态文字，跨轮、跨输入逐字不变，不影响前缀缓存。没挂 `komo` 就没有这一段。
 #[test]
-fn the_self_block_teaches_searching_memory_and_stays_byte_stable() {
-    let with_bash = ContextInput {
-        tools: vec!["bash".into()],
+fn the_self_block_points_at_the_komo_tool_for_memory_and_stays_byte_stable() {
+    let with_komo = ContextInput {
+        tools: vec!["komo".into()],
         ..input(None)
     };
-    let first = prompt_of(&with_bash);
-    assert!(first.contains("komo memory search"), "{first}");
+    let first = prompt_of(&with_komo);
+    assert!(first.contains("memory.search"), "{first}");
+    assert!(first.contains("tool://komo/doc"), "{first}");
     assert!(first.contains("约定照做，线索先核实"), "{first}");
     // 同一份输入再装配一次逐字相同；换了工作目录之外的输入（比如召回）不会进系统段。
-    assert_eq!(first, prompt_of(&with_bash));
-    assert!(!prompt_of(&input(None)).contains("komo memory search"));
+    assert_eq!(first, prompt_of(&with_komo));
+    assert!(!prompt_of(&input(None)).contains("memory.search"));
 }
 
-/// 能跑 bash 时系统提示教 Agent 当场记目标与领域（`docs/goals.md` §4）；静态文字，逐字不变。
+/// 系统提示教 Agent 当场记目标（`docs/goals.md` §4）：动作写成 `komo` 工具的动作；静态文字，逐字不变。
 #[test]
-fn the_self_block_teaches_recording_goals_and_areas_and_stays_byte_stable() {
-    let with_bash = ContextInput {
-        tools: vec!["bash".into()],
+fn the_self_block_teaches_recording_goals_with_the_komo_actions() {
+    let with_komo = ContextInput {
+        tools: vec!["komo".into()],
         ..input(None)
     };
-    let first = prompt_of(&with_bash);
-    assert!(first.contains("`komo goal` / `komo area` 记下"), "{first}");
-    assert!(first.contains("先放一放、办完了、不管了"), "{first}");
-    assert!(first.contains("`komo goal next` 更新下一步"), "{first}");
-    assert!(first.contains("`komo goal link` 挂上"), "{first}");
-    assert!(first.contains("`komo goal resume`"), "{first}");
-    assert_eq!(first, prompt_of(&with_bash));
-    assert!(!prompt_of(&input(None)).contains("komo goal"));
+    let first = prompt_of(&with_komo);
+    for action in [
+        "goal.add",
+        "goal.wait",
+        "goal.done",
+        "goal.next",
+        "goal.link",
+        "goal.resume",
+        "cron.list",
+        "session.search",
+        "task.list",
+        "memory.add",
+    ] {
+        assert!(first.contains(action), "{action}：{first}");
+    }
+    assert_eq!(first, prompt_of(&with_komo));
+    assert!(!prompt_of(&input(None)).contains("goal.add"));
+}
+
+/// 不再教模型去 shell 里跑 `komo memory/goal/area/session/cron …`：挂着 `bash` 也一样；这一段只跟着
+/// `komo` 工具走，`bash` 只带来重启 Gateway 的那句提醒（`komo gateway` 是给人用的命令，不在工具里）。
+#[test]
+fn the_self_block_follows_the_komo_tool_not_the_shell() {
+    let only_bash = prompt_of(&ContextInput {
+        tools: vec!["bash".into()],
+        ..input(None)
+    });
+    assert!(!only_bash.contains("tool://komo/doc"), "{only_bash}");
+    assert!(!only_bash.contains("memory.search"), "{only_bash}");
+    assert!(
+        only_bash.contains("komo gateway restart|stop"),
+        "{only_bash}"
+    );
+
+    let both = prompt_of(&ContextInput {
+        tools: vec!["bash".into(), "komo".into()],
+        ..input(None)
+    });
+    assert!(both.contains("tool://komo/doc"), "{both}");
+    assert!(both.contains("komo gateway restart|stop"), "{both}");
+    for old in [
+        "komo memory",
+        "komo goal",
+        "komo area",
+        "komo session",
+        "komo cron",
+        "用 bash 跑 `komo",
+        "--help",
+    ] {
+        assert!(!both.contains(old), "{old}：{both}");
+    }
+
+    let only_komo = prompt_of(&ContextInput {
+        tools: vec!["komo".into()],
+        ..input(None)
+    });
+    assert!(only_komo.contains("tool://komo/doc"));
+    assert!(
+        !only_komo.contains("komo gateway"),
+        "没有 bash 就没有重启的提醒：{only_komo}"
+    );
 }

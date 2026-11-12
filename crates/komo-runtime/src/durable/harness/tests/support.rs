@@ -524,10 +524,17 @@ pub struct TestTool {
     pub runs: AtomicUsize,
     pub prepares: AtomicUsize,
     pub input_runs: Mutex<Vec<Option<komo_kernel::types::ids::RunId>>>,
+    /// 每次 `prepare` 收到的参数、每次 `execute` 拿到的计划里的参数。
+    pub prepared_args: Mutex<Vec<Value>>,
+    pub executed_args: Mutex<Vec<Value>>,
+    /// 工具声明的 JSON Schema。
+    pub parameters: Value,
     /// `Tool::outward`（`docs/confirm.md`）。
     pub outward: bool,
     /// `Tool::exposure` 是 `Codemode`（只在脚本里调，不声明给模型）。
     pub codemode_only: bool,
+    /// 一个工具里读写混着（`komo`）：`Tool::parallel_for` 看参数里的 `read`，不看工具名。
+    pub mixed: bool,
     pub log: Log,
 }
 
@@ -552,10 +559,21 @@ impl TestTool {
             runs: AtomicUsize::new(0),
             prepares: AtomicUsize::new(0),
             input_runs: Mutex::new(Vec::new()),
+            prepared_args: Mutex::new(Vec::new()),
+            executed_args: Mutex::new(Vec::new()),
+            parameters: json!({ "type": "object", "properties": {} }),
             outward: false,
             codemode_only: false,
+            mixed: false,
             log: log.clone(),
         }
+    }
+
+    /// 同一个工具里读写混着：声明 `Replay::Safe`（计划的 `recovery` 才是逐次的），能不能并发看这次
+    /// 调用的参数 `read` 是不是 `true`。
+    pub fn mixed(mut self) -> Self {
+        self.mixed = true;
+        self
     }
 
     /// 有副作用、重放不安全（`bash` / `write` 那一类）。
@@ -568,6 +586,11 @@ impl TestTool {
             replay: Mutex::new(Replay::Unsafe),
             ..Self::reader(name, log)
         }
+    }
+
+    pub fn with_parameters(mut self, parameters: Value) -> Self {
+        self.parameters = parameters;
+        self
     }
 
     pub fn with_text(mut self, text: &str) -> Self {
@@ -635,13 +658,14 @@ impl Tool for TestTool {
         komo_kernel::types::tool::ToolDefinition {
             name: self.name.to_owned(),
             description: format!("the {} tool", self.name),
-            parameters: json!({ "type": "object", "properties": {} }),
+            parameters: self.parameters.clone(),
             doc: None,
         }
     }
 
     async fn prepare(&self, args: Value, ctx: &ToolContext) -> Result<ExecutionPlan, ToolError> {
         self.prepares.fetch_add(1, Ordering::SeqCst);
+        self.prepared_args.lock().unwrap().push(args.clone());
         self.log.push(format!("prepare {}", self.name));
         let remaining = self.hang_prepares.load(Ordering::SeqCst);
         if remaining > 0 {
@@ -671,10 +695,11 @@ impl Tool for TestTool {
 
     async fn execute(
         &self,
-        _plan: ExecutionPlan,
+        plan: ExecutionPlan,
         ctx: &ToolContext,
         sink: &mut dyn OutputWriter,
     ) -> Result<ToolOutput, ToolError> {
+        self.executed_args.lock().unwrap().push(plan.args.clone());
         self.input_runs.lock().unwrap().push(ctx.input_run.clone());
         let run = self.runs.fetch_add(1, Ordering::SeqCst) + 1;
         self.log.push(format!("start {} #{run}", self.name));
@@ -716,6 +741,13 @@ impl Tool for TestTool {
 
     fn replay(&self) -> Replay {
         *self.replay.lock().unwrap()
+    }
+
+    fn parallel_for(&self, args: &Value) -> bool {
+        match self.mixed {
+            true => args["read"] == json!(true),
+            false => self.replay() == Replay::Safe,
+        }
     }
 
     fn outward(&self) -> bool {

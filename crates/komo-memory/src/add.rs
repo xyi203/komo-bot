@@ -159,7 +159,7 @@ impl MemoryManager {
                 // 遗忘是操作者做的决定：同一句话再来一次不悄悄复活它（§9.6）。
                 MemoryState::Forgotten => {
                     return Err(MemoryError::Invalid(format!(
-                        "这一条之前遗忘过（{}@{}）：要用它，`komo memory restore {} --revision {}`",
+                        "这一条之前遗忘过（{}@{}）：这是用户做的决定，要用它请用户自己恢复（`komo memory restore {} --revision {}`）",
                         existing.id, existing.revision, existing.id, existing.revision
                     )));
                 }
@@ -169,8 +169,8 @@ impl MemoryManager {
                 // 该先把事项重开——不悄悄让它回到无归属的推送里。
                 MemoryState::Archived if request.belongs_to.is_none() => {
                     return Err(MemoryError::Invalid(format!(
-                        "这一条随事项结案归档了（{}@{}）：要用它，reopen 那件事，或 \
-                         `komo memory classify {} --for <事项>`",
+                        "这一条随事项结案归档了（{}@{}）：要用它，先重开那件事，或请用户 \
+                         `komo memory classify {} --for <事项>` 改挂到进行中的事",
                         existing.id, existing.revision, existing.id
                     )));
                 }

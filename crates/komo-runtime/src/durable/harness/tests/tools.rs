@@ -68,6 +68,44 @@ async fn consecutive_reads_overlap_and_a_write_is_a_barrier() {
     engine.close().await.unwrap();
 }
 
+/// 一个工具里读写混着（`komo`）：并发分组按这次调用的参数判断，不按工具名——同名的写调用照样是屏障，
+/// 连着的同名读调用照样同时在飞。
+#[tokio::test(start_paused = true)]
+async fn calls_of_one_mixed_tool_are_grouped_by_their_arguments() {
+    let world = World::new();
+    let komo = Arc::new(
+        TestTool::reader("komo", &world.log)
+            .mixed()
+            .with_delay(Duration::from_millis(100)),
+    );
+    world.tools(vec![komo]);
+    world.script.calls(&[
+        ("c1", "komo", json!({ "read": true })),
+        ("c2", "komo", json!({ "read": true })),
+        ("c3", "komo", json!({ "read": false })),
+        ("c4", "komo", json!({ "read": true })),
+    ]);
+    world.script.reply("done");
+    let engine = world.open().await;
+    let id = world.submit(&engine, "go").await;
+    world.harness.wait(&engine, id).await.unwrap();
+
+    let lines = world.log.lines();
+    assert!(
+        position(&lines, "start komo #2") < position(&lines, "finish komo #1"),
+        "the first two reads overlap: {lines:?}"
+    );
+    assert!(
+        position(&lines, "start komo #3") > position(&lines, "finish komo #2"),
+        "the write waits for the reads in flight: {lines:?}"
+    );
+    assert!(
+        position(&lines, "start komo #4") > position(&lines, "finish komo #3"),
+        "the read after the write waits for it: {lines:?}"
+    );
+    engine.close().await.unwrap();
+}
+
 /// 设计 §12.5 第一步 + pi harness-tools "answers calls to tools the request did not offer"：能力面之外的
 /// 名字等于不认识，得到的是一条列出可用工具的失败结果，Run 接着往下走。
 #[tokio::test(start_paused = true)]
@@ -231,5 +269,99 @@ async fn the_result_entry_holds_the_projected_view_and_a_reference_to_the_full_o
         format!("tool-output/1/{}/1/output.json", task.id)
     );
     assert_eq!(entry.by_task, Some(task.id));
+    engine.close().await.unwrap();
+}
+
+fn limit_schema() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "path": {"type": "string"},
+            "limit": {"type": "integer"},
+            "all": {"type": "boolean"},
+        },
+        "required": ["path"],
+    })
+}
+
+/// P3（`docs/tasks.md` §4.10）：数字写成字符串、可选字段给 null，工具照常执行——`prepare` 收到
+/// 的已经是按 schema 转换后的参数。
+#[tokio::test(start_paused = true)]
+async fn string_numbers_and_optional_nulls_are_coerced_before_prepare() {
+    let world = World::new();
+    let read = Arc::new(TestTool::reader("read", &world.log).with_parameters(limit_schema()));
+    world.tools(vec![read.clone()]);
+    world.script.calls(&[(
+        "c1",
+        "read",
+        json!({"path": "a", "limit": "20", "all": "true"}),
+    )]);
+    world
+        .script
+        .calls(&[("c2", "read", json!({"path": "b", "limit": null}))]);
+    world.script.reply("ok");
+    let engine = world.open().await;
+    let id = world.submit(&engine, "go").await;
+    world.harness.wait(&engine, id).await.unwrap();
+
+    assert_eq!(read.runs(), 2);
+    assert_eq!(
+        *read.prepared_args.lock().unwrap(),
+        vec![
+            json!({"path": "a", "limit": 20, "all": true}),
+            json!({"path": "b"})
+        ]
+    );
+    assert_eq!(
+        *read.executed_args.lock().unwrap(),
+        *read.prepared_args.lock().unwrap()
+    );
+    engine.close().await.unwrap();
+}
+
+/// 转换发生在计划写进 `execute` 检查点之前：重启后重跑用的是检查点里的计划，参数与首次一致。
+#[tokio::test(start_paused = true)]
+async fn a_restart_replays_the_coerced_arguments_from_the_execute_checkpoint() {
+    let world = World::new();
+    let read = Arc::new(
+        TestTool::reader("read", &world.log)
+            .with_parameters(limit_schema())
+            .hanging_first(1),
+    );
+    world.tools(vec![read.clone()]);
+    world
+        .script
+        .calls(&[("c1", "read", json!({"path": "a", "limit": "20"}))]);
+    world.script.reply("ok");
+    let engine = world.open().await;
+    let id = world.submit(&engine, "go").await;
+    world.until_log("start read #1").await;
+
+    let engine = world.restart(engine).await;
+    world.harness.wait(&engine, id).await.unwrap();
+
+    assert_eq!(read.runs(), 2, "the second run is a new attempt");
+    let expected = json!({"path": "a", "limit": 20});
+    assert_eq!(
+        *read.executed_args.lock().unwrap(),
+        vec![expected.clone(), expected]
+    );
+    engine.close().await.unwrap();
+}
+
+/// 不能无歧义转换的原样交给 `prepare`（这里不报错，只看收到的没被动过）。
+#[tokio::test(start_paused = true)]
+async fn ambiguous_arguments_reach_prepare_unchanged() {
+    let world = World::new();
+    let read = Arc::new(TestTool::reader("read", &world.log).with_parameters(limit_schema()));
+    world.tools(vec![read.clone()]);
+    let args = json!({"path": "a", "limit": "2.5", "all": "yes"});
+    world.script.calls(&[("c1", "read", args.clone())]);
+    world.script.reply("ok");
+    let engine = world.open().await;
+    let id = world.submit(&engine, "go").await;
+    world.harness.wait(&engine, id).await.unwrap();
+
+    assert_eq!(*read.prepared_args.lock().unwrap(), vec![args]);
     engine.close().await.unwrap();
 }

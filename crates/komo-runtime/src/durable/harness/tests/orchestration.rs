@@ -316,6 +316,24 @@ async fn a_continued_answer_is_reported_even_without_a_status_line() {
         .clone()
         .unwrap();
     assert_eq!(data["task"]["status"], json!("unstated"));
+    assert_eq!(
+        last_run_of(&world, child).await.1.as_deref(),
+        Some("unstated")
+    );
+}
+
+/// 收尾那次提交写进 `komo.task.lastRun` 的 `(state, status, rounds)`（任务清单读它）。
+async fn last_run_of(
+    world: &World,
+    child: ConversationId,
+) -> (String, Option<String>, Option<u32>) {
+    let last = task_doc(&*world.storage_handle(), child)
+        .await
+        .unwrap()
+        .unwrap()
+        .last_run
+        .expect("收尾了");
+    (last.state, last.status, last.rounds)
 }
 
 /// 写了"受阻"的回答直接交回，不续跑。
@@ -343,6 +361,11 @@ async fn a_blocked_answer_is_reported_without_continuing() {
         .clone()
         .unwrap();
     assert_eq!(data["task"]["status"], json!("blocked"));
+    // 同一次提交里 `lastRun` 也记了状态与轮数，清单不用翻交回的 entry 就认得出"受阻"。
+    assert_eq!(
+        last_run_of(&world, child).await,
+        ("completed".to_owned(), Some("blocked".to_owned()), Some(0))
+    );
 }
 
 /// 带结果契约的回答只放 JSON：不看状态行、不续跑，结局看契约复验。
@@ -371,6 +394,11 @@ async fn an_answer_under_a_contract_is_reported_without_a_status_line() {
     );
     assert!(text.contains("（结果契约复验：符合"), "{text}");
     assert_eq!(continues(&world, child).await, 0);
+    // 契约任务不看状态行，`lastRun` 记成 done（与标题"已完成"一致）。
+    assert_eq!(
+        last_run_of(&world, child).await,
+        ("completed".to_owned(), Some("done".to_owned()), Some(0))
+    );
 }
 
 /// 父所在的 Session 已经在删（`closing`）时，子任务跑完不再往父交回：交回是内部输入，会在父里起
@@ -1162,6 +1190,11 @@ async fn aborting_the_child_reports_that_it_did_not_finish() {
     );
     assert!(text.contains("]\n\n已取消"), "{text}");
     assert!(world.live_of(child).await.run.is_none());
+    // 没完成的收尾没有状态，轮数照记。
+    assert_eq!(
+        last_run_of(&world, child).await,
+        ("cancelled".to_owned(), None, Some(0))
+    );
     engine.close().await.unwrap();
 }
 

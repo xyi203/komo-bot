@@ -253,6 +253,14 @@ task(prompt, title, task_id?, model?, effort?, contract?, context?)
 
 **MCP 工具也不是第七个工具，是操作者接进来的外部能力。** `[mcp.servers.<name>]` 里配的服务器在 Gateway 启动时连上（要登录的，登录后下一条 Run 受理时连上，不用重启；`docs/mcp.md` §2.2），每个工具注册成 `mcp__<server>__<tool>`，与内置工具走同一条 `prepare` / 落账的路；只读与否由操作者声明，不信服务器自报——它决定恢复时能不能直接重读（§8.6）。codemode 脚本里 MCP 工具都能调，只读声明只决定中断后能不能重做（2026-10-13 之前它还决定 codemode 能不能调）。**默认不声明给模型**（2026-10-14，照 pi 的 `exposure`）：`exposure = "codemode"` 的 MCP 工具不进 schema、只在 codemode 脚本里调，脚本用 `search_tools` / `describe_tool` / `describe_namespace` 找；系统提示只给每台服务器一行摘要（配置的 `description`，没写就是服务器 instructions 的第一行），instructions 全文只在脚本里读。`direct` 照常声明，`hidden` 不挂。见 `docs/mcp.md` §3。
 
+**`komo` 工具也不是第七个基础工具，是"自己的状态"这一层（2026-11-11 定，理由见 `docs/tasks.md` §4.4）。** 它不做事——读写文件、搜索、跑命令仍是上面那六个——只让模型操作 komo 自己的状态：记忆、目标、定时任务、找会话、任务清单。此前这些由系统提示教模型在 `bash` 里跑 `komo <子命令>`，而命令执行的地方不一定有 `komo` 二进制、也不一定连得到 Gateway。参数只有 `action`（"领域.动作"，enum：`memory.add` / `memory.search` / `memory.forget`、`goal.add` / `goal.next` / `goal.wait` / `goal.resume` / `goal.done` / `goal.link`、`cron.list` / `cron.run`、`session.search` / `session.list`、`task.list`）与 `params`（对象）；各动作的字段不进 schema，写在 `tool://komo/doc`，`params` 填错时 `prepare` 的报错列出该动作认的字段。
+
+- **在 Gateway 进程里执行，不经 shell，不走 HTTP 回环。** 工具本体在 `komo-tools`（它不能依赖 gateway）：`prepare` 把 `params` 反序列化成 kernel 里现成的请求类型（`MemoryAddRequest`、`MatterAddRequest`、`MatterActionRequest`、`ManualCronRunRequest` …），`execute` 经 `KomoService` 这个接缝交给 Gateway——接缝是个空槽（同 `bash` 的 `DetachSlot`：服务要等整份 `GatewayState` 才造得出来，装配完再接上），Gateway 的实现调 HTTP 路由背后的**同一个处理函数**，不另写业务逻辑，规则只有一份：`docs/goals.md` §4 的"改承诺类操作要有这个 Run 里的用户原话、任务会话与 Cron 被拒"、`memory = off` / `private` 的会话被拒、版本冲突，工具与路由自然一致。
+- **身份取自 `ToolContext`**，不读 `KOMO_SESSION` / `KOMO_RUN`：会话是这个会话，Run 是输入 Run（与 `bash` 子进程的 `KOMO_RUN` 同一个口径）；`params` 里给 `session` / `run` 会被当成未知字段拒绝。请求键取这次工具调用的 id。
+- **只读动作**（`*.search`、`*.list`）：计划是 `Operation::Komo` + `SafeReread`，可与相邻的只读调用并发、中断后可直接重跑；写动作是 `NoSafeRecovery`，顺序执行、中断后不重跑，交给模型判断。同一个工具里读写混着，所以 `Tool::replay` 声明 `Safe`（只否决不放行：两边都 `Safe` 才重跑），并发分组按动作判断（`Tool::parallel_for`，分组在 `prepare` 之前，只看工具名与原始参数）。`memory.search` 的输出首行带 `MEMORY_QUERY_MARKER`，记忆提取据此不把查到的已有记忆当新证据（§9.4）。
+- **不含** `memory.confirm`（那是用户的动作）、`area.*`（领域并进约定）、Gateway 的重启与停止。所有会话都挂（主会话、任务会话、定时任务会话）；codemode 脚本里能否调用跟随现有规则（只放行读写文件、bash、MCP），不单独处理。现有的 `komo memory|goal|area|session|cron …` 子命令并存一个版本，之后 Agent 用的那几组再删。
+- 系统提示的「komo 自查」段（下文）随之只在挂了 `komo` 工具时出现，指向这个工具。
+
 工具执行的公共能力放在 ToolExecutor：参数校验、执行计划生成、执行状态保存、取消和输出限制。
 
 **每次运行有它自己的能力面（`AgentSurface`）。** 这次允许调用哪些工具是一个显式的集合：**交给模型的工具 schema 与执行时查找的表出自同一份能力面**，所以两边不可能分家。schema 是能力面的投影：`exposure = "codemode"` 的 MCP 工具在能力面里、不进 schema（只在 codemode 脚本里调，`docs/mcp.md` §3）——隐藏 schema 不等于撤权。能力面里没有的名字，执行器不认——模型自己拼出这个名字，拿到的是"这次运行的工具集里没有它"，而不是"进去试试看"。执行器手里那份全局工具目录只用于**发现与构造**（`komo skills` 的 `requires_tools` 门控也问它），**执行时一次都不回退到它**：能回退就等于能力边界只是一句建议。任务会话是这条边界的使用者之一（它的 schema 里没有 `task`，于是它也调不动 `task`；2026-10-16 之前是子代理的能力面里没有 `delegate`）。**唯一的例外是 fork 任务会话**（2026-10-23，`docs/background-tasks.md` §2b）：为了与父的请求逐字节同前缀、复用提示缓存，它的能力面照抄父的、含 `task`，派任务在派出那一步被拒（调用方 conversation 自己有 `komo.task`），调用照常落一条失败结果——schema 与执行仍出自同一份能力面，执行器照旧不回退到全局目录。
@@ -428,7 +436,7 @@ Gateway 设置活动执行时限、输出长度和子进程并发预算。总轮
 
 普通追问可以作为 assistant 回复结束本轮；用户下一条输入开启同一 Session 的新 Run。没有工具审批（§7）；需要人回答的只有 faulted 的任务（§7.5），回答通常来自聊天渠道（§11）。
 
-**系统提示告诉模型它就跑在 komo 里（2026-09-24）。** 主 Agent 的提示在工作目录 / 工具 / 行为约束之后、skills 目录之前多一小段：cron、会话与 Run、记忆、待处理的介入、配置、skills、Gateway 都是 komo 自己的状态，问到就用 bash 跑 `komo <子命令>`（给出几个常用子命令，其余看 `komo --help`）。这一段是**常量**，提示前缀因此稳定；`komo` 靠 PATH 找到——服务单元写入了安装时的 PATH（§3）。只在主 Agent 且挂了 `bash` 时出现：子代理只拿任务里写的东西；没给 `bash` 的 Profile 说了也跑不了。回归测试：`context::prompt::tests::the_main_prompt_tells_the_model_to_query_komo_with_its_cli`、`the_komo_section_needs_shell_and_the_main_agent`，golden `full_main_agent`、`plain_main_agent`。
+**系统提示告诉模型它就跑在 komo 里（2026-09-24）。** 主 Agent 的提示在工作目录 / 工具 / 行为约束之后、skills 目录之前多一小段：cron、会话与 Run、记忆、待处理的介入、配置、skills、Gateway 都是 komo 自己的状态，问到就用 `komo` 工具（动作清单一句话带过，字段指向 `tool://komo/doc`；2026-11-11 起不再教模型在 `bash` 里跑 `komo <子命令>`，见上文）。这一段是**常量**，提示前缀因此稳定。只在主 Agent 且挂了 `komo` 工具时出现：子代理只拿任务里写的东西；没给 `komo` 的 Profile 说了也调不了。挂了 `bash` 时另有一句重启 Gateway 的提醒（`komo gateway restart|stop` 是给人用的命令，不在工具里）。回归测试：`context::prompt::tests::the_main_prompt_tells_the_model_to_query_komo_with_its_tool`、`the_komo_section_needs_the_komo_tool_and_the_main_agent`，`context::tests::the_self_block_follows_the_komo_tool_not_the_shell`。
 
 Run 完成仅表示本轮结束。测试是否通过、性能是否改善、设备是否到达目标状态，都要依据具体执行证据报告。
 
@@ -845,7 +853,7 @@ komo cron resume JOB_ID
 komo cron remove JOB_ID
 ```
 
-模型需要管理 Cron 时通过 bash 调用这些命令；CLI 连接 Gateway，不直接访问数据库，也不增加专用 cron tool。修改调度属于持久副作用，执行计划展示完整调度与指令。
+模型查看与手动触发 Cron 用 `komo` 工具的 `cron.list` / `cron.run`（§4，在 Gateway 里调同一个处理函数）；新建、暂停、恢复、删除这几条仍由 CLI 做，CLI 连接 Gateway，不直接访问数据库。修改调度属于持久副作用，执行计划展示完整调度与指令。
 
 默认行为：
 

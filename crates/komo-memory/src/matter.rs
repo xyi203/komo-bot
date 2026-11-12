@@ -191,7 +191,7 @@ impl MatterManager {
             && cron.get(job).await?.is_none()
         {
             return Err(MatterFailure::Invalid(format!(
-                "没有这个 Cron Job：{job}（`komo cron list` 看现有的）"
+                "没有这个 Cron Job：{job}（komo 工具的 cron.list，或 `komo cron list`，看现有的）"
             )));
         }
         let evidence = if verb.is_commitment() {

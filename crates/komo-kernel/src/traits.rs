@@ -448,6 +448,14 @@ pub trait Tool: Send + Sync {
         Replay::Unsafe
     }
 
+    /// 同一轮里这一次调用能不能与相邻的只读调用同时在飞（§6）。分组在建任务之前、`prepare` 之前
+    /// 就要定，所以只能看工具名与模型给的原始参数。默认跟随 [`Tool::replay`]：整个工具要么只读要么
+    /// 不是。只有一个工具里同时有读动作与写动作（`komo`）才覆盖它——那时 `replay` 声明 `Safe`
+    /// 只为让读动作的计划（`SafeReread`）能被重跑，写动作要靠这里留在顺序组里。
+    fn parallel_for(&self, _args: &serde_json::Value) -> bool {
+        self.replay() == Replay::Safe
+    }
+
     /// 模型怎么够到它（`docs/mcp.md` §3）：直接声明，还是只在 codemode 脚本里调。默认直接
     /// 声明；只改 schema 给不给模型，不改能力面——codemode 里的那些照样要在能力面里。
     fn exposure(&self) -> ToolExposure {

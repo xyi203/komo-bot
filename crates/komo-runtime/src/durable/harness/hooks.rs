@@ -20,7 +20,7 @@ use komo_kernel::projection::ProjectionContext;
 use komo_kernel::traits::{Tool, ToolOutputStore};
 use komo_kernel::types::ids::SessionId;
 use komo_kernel::types::model::ModelConfig;
-use komo_kernel::types::plan::{PlanSource, Replay};
+use komo_kernel::types::plan::PlanSource;
 use komo_kernel::types::resource::ResourceMounts;
 use komo_kernel::types::surface::AgentSurface;
 use komo_kernel::types::tool::{InterjectSignal, ToolDefinition, ToolExposure, WorkspaceRoot};
@@ -212,13 +212,14 @@ impl ToolSet {
 
     /// 同一轮里能不能和后面的调用同时在飞（§6："只读的并行，有副作用的与 codemode 顺序"）。
     /// 工具要等 `prepare` 才知道自己的计划是不是只读，但一轮要在**建任务之前**就分好组，
-    /// 所以按工具现在声明的重放策略近似：`replay = safe`（读、搜索）且不是 codemode 的算只读。
+    /// 所以按工具现在声明的重放策略近似（[`Tool::parallel_for`]，一个工具里读写混着的看参数）：
+    /// `replay = safe`（读、搜索）且不是 codemode 的算只读。
     /// 工具表里没有的名字不挡别人（它会立刻被拒）。
-    pub fn parallel_safe(&self, name: &str) -> bool {
+    pub fn parallel_safe(&self, name: &str, args: &serde_json::Value) -> bool {
         match self.get(name) {
             None => true,
             Some(tool) => {
-                name != komo_tools::tools::codemode::CODEMODE_TOOL && tool.replay() == Replay::Safe
+                name != komo_tools::tools::codemode::CODEMODE_TOOL && tool.parallel_for(args)
             }
         }
     }

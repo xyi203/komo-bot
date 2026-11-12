@@ -10,6 +10,7 @@ use std::sync::{Arc, OnceLock, Weak};
 
 use komo_runtime::durable::harness::{AgentHooks, OrchestrationHooks};
 use komo_tools::tools::detach::DetachSlot;
+use komo_tools::tools::komo::KomoSlot;
 
 use super::background::monitor_runner;
 use super::{hooks, orchestration};
@@ -24,8 +25,9 @@ pub fn new_slot() -> StateSlot {
 
 /// 把 `GatewayState` 填进槽（只能填一次，重复填忽略），并把监听的接手方装进 `bash` 的
 /// `DetachSlot`——接手方（`MonitorRunner`）要等整份状态才造得出来，所以 `bash` 先拿着空槽，
-/// 这里再接上（问编排钩子要，没装监听就没有）。
-pub fn wire(slot: &StateSlot, state: &Arc<GatewayState>, detach: &DetachSlot) {
+/// 这里再接上（问编排钩子要，没装监听就没有）。`komo` 工具的服务同理：它要调 HTTP 处理函数，
+/// 处理函数要整份状态。
+pub fn wire(slot: &StateSlot, state: &Arc<GatewayState>, detach: &DetachSlot, komo: &KomoSlot) {
     if slot.set(Arc::downgrade(state)).is_err() {
         tracing::warn!("Durable 钩子已经接过一次，忽略这次重复设置");
     }
@@ -34,6 +36,7 @@ pub fn wire(slot: &StateSlot, state: &Arc<GatewayState>, detach: &DetachSlot) {
     if let Some(detacher) = core.harness.deps().orchestration.detacher() {
         detach.set(detacher);
     }
+    komo.set(super::komo::GatewayKomo::new(state));
 }
 
 /// `AgentHooks` 的装配点：[`hooks::GatewayHooks`]（`docs/storage-durable-d5.md` §6）。

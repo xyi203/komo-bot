@@ -129,11 +129,11 @@ fn both_prompts_tell_the_model_to_search_with_rg() {
     assert!(sub.contains("别用 bash 拼 rg / grep"), "{sub}");
 }
 
-/// 主 Agent 挂了 `bash` 时，提示里说它跑在 komo 里、komo 的状态用 komo CLI 查；排在
-/// skills 目录前面。
+/// 主 Agent 挂了 `komo` 工具时，提示里说 komo 的状态用这个工具查和改，不再教它在 shell 里跑
+/// `komo <子命令>`；排在 skills 目录前面。
 #[test]
-fn the_main_prompt_tells_the_model_to_query_komo_with_its_cli() {
-    let tools = vec!["read".to_string(), "bash".to_string()];
+fn the_main_prompt_tells_the_model_to_query_komo_with_its_tool() {
+    let tools = vec!["read".to_string(), "bash".to_string(), "komo".to_string()];
     let dir = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(dir.path().join("cron-scheduler")).unwrap();
     std::fs::write(
@@ -153,8 +153,9 @@ fn the_main_prompt_tells_the_model_to_query_komo_with_its_cli() {
         catalog.prompt_block().as_deref(),
     );
     assert!(prompt.contains("komo 自己的状态"), "{prompt}");
-    assert!(prompt.contains("`komo <子命令>`"), "{prompt}");
-    assert!(prompt.contains("cron list"), "{prompt}");
+    assert!(prompt.contains("komo 工具"), "{prompt}");
+    assert!(prompt.contains("cron.list"), "{prompt}");
+    assert!(!prompt.contains("`komo <子命令>`"), "{prompt}");
     let own = prompt.find("komo 自己的状态").unwrap();
     let skills = prompt.find("cron-scheduler").unwrap();
     assert!(own < skills, "{prompt}");
@@ -172,10 +173,10 @@ fn the_main_prompt_tells_the_model_to_query_komo_with_its_cli() {
     );
 }
 
-/// 没有 `bash`（例如只给了 `task` 的 Profile）或是子代理时，这一段不出现：前者说了
-/// 也跑不了，后者只拿任务里写的东西（§4）。
+/// 没有 `komo` 工具（例如只给了 `task` 的 Profile）或是子代理时，这一段不出现：前者说了
+/// 也调不了，后者只拿任务里写的东西（§4）。
 #[test]
-fn the_komo_section_needs_shell_and_the_main_agent() {
+fn the_komo_section_needs_the_komo_tool_and_the_main_agent() {
     let dispatcher = build(
         Path::new("/tmp/w"),
         &["task".to_string()],
@@ -193,7 +194,7 @@ fn the_komo_section_needs_shell_and_the_main_agent() {
     );
     let sub = build(
         Path::new("/tmp/w"),
-        &["bash".to_string()],
+        &["bash".to_string(), "komo".to_string()],
         &[],
         &InvocationContext::Delegated(spec),
         &[],
@@ -345,7 +346,7 @@ fn project_file(path: &str, content: &str) -> ProjectFile {
 /// `<project_instructions>`；文件末尾的换行不多留一个空行。
 #[test]
 fn the_main_prompt_puts_project_files_between_the_komo_section_and_skills() {
-    let tools = vec!["read".to_string(), "bash".to_string()];
+    let tools = vec!["read".to_string(), "bash".to_string(), "komo".to_string()];
     let dir = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(dir.path().join("pr-review")).unwrap();
     std::fs::write(

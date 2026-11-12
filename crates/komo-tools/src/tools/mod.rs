@@ -6,12 +6,16 @@
 //! `task` / `monitor` 是这条规则的例外，而且它们**不是第七个基础工具**：
 //! 模型看不见任何新能力——任务会话用的还是这几个工具。它们是编排操作，不由工具执行
 //! （见 [`task`]）。
+//!
+//! `komo` 也不是第七个：它不做事，是"komo 自己的状态"这一层（记忆、目标、定时任务、找会话、
+//! 任务清单），在 Gateway 里执行、不经 shell（见 [`komo`]）。
 
 pub mod bash;
 pub mod codemode;
 pub mod detach;
 pub mod edit;
 pub mod fusion;
+pub mod komo;
 pub mod mcp;
 pub mod monitor;
 pub mod paths;
@@ -33,6 +37,7 @@ use serde::{Deserialize, Serialize};
 pub use bash::BashTool;
 pub use codemode::CodemodeTool;
 pub use edit::EditTool;
+pub use komo::KomoTool;
 pub use mcp::McpTool;
 pub use monitor::{MonitorStopTool, MonitorTool};
 pub use read::ReadTool;

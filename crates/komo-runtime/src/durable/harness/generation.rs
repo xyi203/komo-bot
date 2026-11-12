@@ -45,7 +45,9 @@
 //!   压过之后又超长，都照旧以 `model_error` 失败——不会无限循环。
 //!
 //! 预算（轮数、token）落在 `komo.live.run`，重启不重置。被截断的回复（`length`）不按半轮调用
-//! 执行：它记成一条失败的 assistant entry，run 以 `model_error` 收场（沿用今天的规则）。
+//! 执行：带工具调用的，保留 assistant entry、给每个调用落一条错误结果（同一次提交），交给
+//! 下一个 generation 让模型重发；连续 `MAX_TRUNCATIONS` 次之后、以及不带调用的，记成一条失败的
+//! assistant entry，run 以 `model_error` 收场。
 
 use std::sync::{Arc, Mutex};
 
@@ -81,6 +83,12 @@ use komo_llm::{ModelRequest, RequestOptions, is_context_overflow, retry_cause, u
 
 /// 被截断的回复失败时的文字（沿用 `AgentLoop` 的）。
 const TRUNCATED: &str = "模型回复被截断，调用参数未收齐——不按半轮调用执行";
+
+/// 带工具调用的回复连续被截断几次之后放弃（再截断就按 [`TRUNCATED`] 失败）。
+const MAX_TRUNCATIONS: u32 = 2;
+
+/// 截断的回复里每个调用的错误结果：模型看到的文字。
+const TRUNCATED_CALL: &str = "这次回复超出了输出上限被截断，调用参数未收齐，没有执行。请重新发出这个调用；内容很长时拆成几次。";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -651,7 +659,13 @@ impl GenerationTask {
                 }
             }
             StopReason::Length => {
-                // 截断的一轮：不按半轮调用执行，连这一条也不进之后的上下文。
+                let calls = entries_tool_calls(&message);
+                if !calls.is_empty() {
+                    return self
+                        .retry_truncated_calls(rt, request, message, calls)
+                        .await;
+                }
+                // 不带调用的截断：这一条不进之后的上下文，任务失败。
                 let mut message = message;
                 message.stop_reason = StopReason::Error;
                 message
@@ -677,6 +691,106 @@ impl GenerationTask {
                 self.fail_with_message(rt, message, text).await
             }
         }
+    }
+
+    /// 带工具调用的回复被输出上限截断：保留这条 assistant entry，给每个调用落一条错误结果
+    /// （不执行任何一个），同一次提交里交给下一个 generation，让模型自己重发。assistant 与
+    /// 结果 entry 同在一次提交里，所以重启前后上下文一致。连续 [`MAX_TRUNCATIONS`] 次之后
+    /// 再截断，按不带调用的截断那样失败。
+    async fn retry_truncated_calls(
+        &self,
+        rt: &TaskRuntime,
+        request: &RequestCheckpoint,
+        message: AssistantMessage,
+        calls: Vec<(String, String)>,
+    ) -> Result<(), TaskError> {
+        let conversation = rt.conversation();
+        let spent = spent(&usage_of(&message));
+        let max_tokens = request.limits.max_tokens;
+        let this = self.clone();
+        let modes = self.modes();
+        rt.commit(move |tx, task| {
+            Box::pin(async move {
+                // 表读先于第一次表写。
+                let mut boundary = inbox::prepare_boundary(tx, conversation, modes).await?;
+                let mut live = live::load(tx, conversation).await?;
+                let given_up = live
+                    .run
+                    .as_ref()
+                    .is_some_and(|run| run.task == task.id() && run.truncations >= MAX_TRUNCATIONS);
+                if given_up {
+                    let mut message = message;
+                    message.stop_reason = StopReason::Error;
+                    message
+                        .extra
+                        .insert("errorMessage".into(), json!(TRUNCATED));
+                    append_assistant(tx, conversation, message).await?;
+                    report::end_run_abnormal(
+                        tx,
+                        &this,
+                        conversation,
+                        &mut live,
+                        task.id(),
+                        &unanswered("model_error", Some(TRUNCATED)),
+                        boundary,
+                    )
+                    .await?;
+                    live::store(tx, conversation, &live).await?;
+                    return Ok(Some(failed(TRUNCATED.to_owned(), "model_error", None)));
+                }
+                let entry = append_assistant(tx, conversation, message).await?;
+                for (call_id, name) in &calls {
+                    entries::append_harness_error(
+                        tx,
+                        conversation,
+                        call_id,
+                        name,
+                        "truncated",
+                        TRUNCATED_CALL,
+                    )
+                    .await?;
+                }
+                if let Some(run) = live.run.as_mut()
+                    && run.task == task.id()
+                {
+                    run.rounds += 1;
+                    run.tokens += spent;
+                    run.truncations += 1;
+                    // 同正常工具轮：回复已落账、调用不执行，token 超了就以 `budget` 收场。
+                    if let Some(limit) = max_tokens
+                        && run.tokens > limit
+                    {
+                        let text = format!("超过 token 预算（{limit}）");
+                        report::end_run_abnormal(
+                            tx,
+                            &this,
+                            conversation,
+                            &mut live,
+                            task.id(),
+                            &unanswered("budget", Some(&text)),
+                            boundary,
+                        )
+                        .await?;
+                        live::store(tx, conversation, &live).await?;
+                        return Ok(Some(failed(text, "budget", None)));
+                    }
+                }
+                live.generation = None;
+                hand_to_next_generation(
+                    tx,
+                    &this,
+                    conversation,
+                    &mut live,
+                    task.id(),
+                    &mut boundary,
+                )
+                .await?;
+                live::store(tx, conversation, &live).await?;
+                Ok(Some(completed(json!({ "entryId": entry.id }))))
+            })
+        })
+        .await?;
+        Ok(())
     }
 
     /// `ModelStream` 报错：能退避的写下到点时刻回到 `prepare`，不能的（或预算用完）失败。
@@ -868,7 +982,7 @@ impl GenerationTask {
         tools: &ToolSet,
     ) -> Result<(), TaskError> {
         let conversation = rt.conversation();
-        let size = group_len(tools, &calls);
+        let size = group_len(tools, &calls, Some(&message));
         let spent = spent(&usage_of(&message));
         let max_tokens = request.limits.max_tokens;
         let this = self.clone();
@@ -889,6 +1003,7 @@ impl GenerationTask {
                 {
                     run.rounds += 1;
                     run.tokens += spent;
+                    run.truncations = 0;
                     if let Some(limit) = max_tokens
                         && run.tokens > limit
                     {
@@ -944,14 +1059,15 @@ impl GenerationTask {
         }
         // 顺序组：建下一组调用的工具任务，再等它们。
         let conversation = rt.conversation();
-        let calls = self.pending_calls(rt, assistant, &pending).await?;
+        let message = self.assistant_message(rt, assistant).await?;
+        let calls = pending_of(message.as_ref(), &pending);
         let set = match self.deps.hooks.tools(conversation).await {
             Ok(set) => set,
             Err(HookError::NoModel(message)) | Err(HookError::Failed(message)) => {
                 return Err(TaskError::new(message));
             }
         };
-        let size = group_len(&set, &calls);
+        let size = group_len(&set, &calls, message.as_ref());
         let this = self.clone();
         rt.commit(move |tx, task| {
             Box::pin(async move {
@@ -990,23 +1106,28 @@ impl GenerationTask {
         assistant: EntryId,
         pending: &[String],
     ) -> Result<Vec<(String, String)>, TaskError> {
+        let message = self.assistant_message(rt, assistant).await?;
+        Ok(pending_of(message.as_ref(), pending))
+    }
+
+    /// 发起调用的那条 assistant 消息（entry 里没有就是 `None`）。
+    async fn assistant_message(
+        &self,
+        rt: &TaskRuntime,
+        assistant: EntryId,
+    ) -> Result<Option<AssistantMessage>, TaskError> {
         let entry = rt
             .entry(assistant)
             .await?
             .ok_or_else(|| TaskError::new(format!("entry {assistant} does not exist")))?;
-        let calls = entry
+        Ok(entry
             .model
             .iter()
             .flatten()
             .find_map(|message| match message {
-                Message::Assistant(message) => Some(entries_tool_calls(message)),
+                Message::Assistant(message) => Some(message.clone()),
                 _ => None,
-            })
-            .unwrap_or_default();
-        Ok(pending
-            .iter()
-            .filter_map(|id| calls.iter().find(|(call, _)| call == id).cloned())
-            .collect())
+            }))
     }
 
     /// 这一轮的工具都终结了：在 postTools boundary 把 run 交给下一个 generation；选中的 reset
@@ -1019,35 +1140,15 @@ impl GenerationTask {
             Box::pin(async move {
                 let mut boundary = inbox::prepare_boundary(tx, conversation, modes).await?;
                 let mut live = live::load(tx, conversation).await?;
-                let now = tx.now();
-                let result = inbox::apply_boundary(tx, &mut boundary, At::PostTools, now).await?;
-                if result.reset {
-                    report::end_run(
-                        tx,
-                        &this,
-                        conversation,
-                        &mut live,
-                        task.id(),
-                        &unanswered("reset", None),
-                    )
-                    .await?;
-                    if !result.users.is_empty() {
-                        inbox::start_run(tx, &this, conversation, &mut live, result.users).await?;
-                    }
-                } else {
-                    live.tools = None;
-                    let run_of = live
-                        .run
-                        .as_ref()
-                        .and_then(|run| run.inputs.first().copied());
-                    let next = inbox::create_generation(tx, &this, conversation, run_of).await?;
-                    if let Some(run) = live.run.as_mut()
-                        && run.task == task.id()
-                    {
-                        run.inputs.extend(result.users);
-                        run.task = next;
-                    }
-                }
+                hand_to_next_generation(
+                    tx,
+                    &this,
+                    conversation,
+                    &mut live,
+                    task.id(),
+                    &mut boundary,
+                )
+                .await?;
                 live::store(tx, conversation, &live).await?;
                 Ok(Some(completed(json!({ "entryId": assistant }))))
             })
@@ -1055,6 +1156,48 @@ impl GenerationTask {
         .await?;
         Ok(())
     }
+}
+
+/// 一轮收尾在 postTools boundary：把 run 交给下一个 generation；选中的 reset 把它变成 final，
+/// 当前 run 以 `reset` 收场（它的上下文在回答之前被切掉了）。
+async fn hand_to_next_generation(
+    tx: &mut crate::durable::tx::Tx,
+    this: &GenerationTask,
+    conversation: ConversationId,
+    live: &mut live::LiveState,
+    task: TaskId,
+    boundary: &mut inbox::Boundary,
+) -> Result<(), DurableError> {
+    let now = tx.now();
+    let result = inbox::apply_boundary(tx, boundary, At::PostTools, now).await?;
+    if result.reset {
+        report::end_run(
+            tx,
+            this,
+            conversation,
+            live,
+            task,
+            &unanswered("reset", None),
+        )
+        .await?;
+        if !result.users.is_empty() {
+            inbox::start_run(tx, this, conversation, live, result.users).await?;
+        }
+    } else {
+        live.tools = None;
+        let run_of = live
+            .run
+            .as_ref()
+            .and_then(|run| run.inputs.first().copied());
+        let next = inbox::create_generation(tx, this, conversation, run_of).await?;
+        if let Some(run) = live.run.as_mut()
+            && run.task == task
+        {
+            run.inputs.extend(result.users);
+            run.task = next;
+        }
+    }
+    Ok(())
 }
 
 /// `prepare` 是从什么恢复的：等过的阻塞压缩与它的起因。
@@ -1098,19 +1241,44 @@ fn entries_tool_calls(message: &AssistantMessage) -> Vec<(String, String)> {
         .collect()
 }
 
+/// `pending` 里的调用（id 与名字），按调用顺序。
+fn pending_of(message: Option<&AssistantMessage>, pending: &[String]) -> Vec<(String, String)> {
+    let calls = message.map(entries_tool_calls).unwrap_or_default();
+    pending
+        .iter()
+        .filter_map(|id| calls.iter().find(|(call, _)| call == id).cloned())
+        .collect()
+}
+
 /// 下一组有几个调用：第一个是只读的，就连同后面连续的只读调用一起（同时在飞）；否则它自成
-/// 一组。
-fn group_len(tools: &ToolSet, calls: &[(String, String)]) -> usize {
-    let Some((_, first)) = calls.first() else {
+/// 一组。只读与否看工具名与这个调用的参数（`komo` 一个工具里既有读也有写）。
+fn group_len(
+    tools: &ToolSet,
+    calls: &[(String, String)],
+    message: Option<&AssistantMessage>,
+) -> usize {
+    let parallel = |(id, name): &(String, String)| {
+        let args = message
+            .and_then(|message| {
+                message.content.iter().find_map(|block| match block {
+                    ContentBlock::ToolCall {
+                        id: call,
+                        arguments,
+                        ..
+                    } if call == id => Some(arguments),
+                    _ => None,
+                })
+            })
+            .unwrap_or(&serde_json::Value::Null);
+        tools.parallel_safe(name, args)
+    };
+    let Some(first) = calls.first() else {
         return 0;
     };
-    if !tools.parallel_safe(first) {
+    if !parallel(first) {
         return 1;
     }
-    calls
-        .iter()
-        .take_while(|(_, name)| tools.parallel_safe(name))
-        .count()
+    calls.iter().take_while(|call| parallel(call)).count()
 }
 
 /// 建一组工具任务，由生成任务拥有；返回任务 ID，按调用顺序。

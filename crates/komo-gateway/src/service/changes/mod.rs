@@ -575,6 +575,10 @@ impl Tool for Recording {
         self.inner.replay()
     }
 
+    fn parallel_for(&self, args: &serde_json::Value) -> bool {
+        self.inner.parallel_for(args)
+    }
+
     fn exposure(&self) -> ToolExposure {
         self.inner.exposure()
     }

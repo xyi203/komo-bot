@@ -176,7 +176,9 @@ pub async fn start(options: ServiceOptions) -> Result<Running, ServiceError> {
     // 4. 装配。
     // 转后台的接手方要等整份状态才造得出来：`bash` 先拿着空槽，`wire` 再接上。
     let detach_slot = Arc::new(komo_tools::tools::detach::DetachSlot::default());
-    let (tools, codemode, mcp) = build_tools(&config, &instance_id, &detach_slot).await;
+    // `komo` 工具的服务同理（调 HTTP 处理函数，要整份状态）。
+    let komo_slot = Arc::new(komo_tools::tools::komo::KomoSlot::default());
+    let (tools, codemode, mcp) = build_tools(&config, &instance_id, &detach_slot, &komo_slot).await;
 
     // 钩子要等 `GatewayState` 造好才找得到它，环用槽断开（`durable::assemble`）。
     let state_slot = durable::assemble::new_slot();
@@ -231,7 +233,7 @@ pub async fn start(options: ServiceOptions) -> Result<Running, ServiceError> {
         .set(Arc::clone(&dispatcher) as Arc<dyn Inbound>);
     let shutdown = Shutdown::new();
     // 把 `GatewayState` 交给钩子，然后才开始调度（编排走 harness，监听由 `MonitorRunner` 接）。
-    durable::assemble::wire(&state_slot, &state, &detach_slot);
+    durable::assemble::wire(&state_slot, &state, &detach_slot, &komo_slot);
     // 重启时的订阅顺序（W4a）：**订阅与看客都在引擎恢复之前就位**，恢复里结算的 run（崩溃时在飞的）
     // 产生的终态帧才不会落在没人听的空档里。顺序有讲究：
     //   1. feed——提交 → SSE 帧（看客读的就是它推进 hub 的帧）；
@@ -364,13 +366,15 @@ async fn build_tools(
     config: &Arc<ConfigHolder>,
     instance_id: &str,
     detach_slot: &Arc<komo_tools::tools::detach::DetachSlot>,
+    komo_slot: &Arc<komo_tools::tools::komo::KomoSlot>,
 ) -> (
     Vec<Arc<dyn Tool>>,
     Option<komo_tools::codemode::Worker>,
     Arc<komo_tools::mcp::McpHub>,
 ) {
     use komo_tools::tools::{
-        BashTool, EditTool, MonitorStopTool, MonitorTool, ReadTool, RgTool, TaskTool, WriteTool,
+        BashTool, EditTool, KomoTool, MonitorStopTool, MonitorTool, ReadTool, RgTool, TaskTool,
+        WriteTool,
     };
 
     let snapshot = config.current();
@@ -408,6 +412,9 @@ async fn build_tools(
     // （`service/durable/monitor_runner.rs`，`docs/monitor.md`）。
     tools.push(Arc::new(MonitorTool::new()));
     tools.push(Arc::new(MonitorStopTool::new()));
+    // komo：操作 komo 自己的状态（记忆、目标、定时、找会话、任务清单），在本进程里调 HTTP 处理函数，
+    // 不经 shell；也不是第七个基础工具（`docs/tasks.md` §4.4）。
+    tools.push(Arc::new(KomoTool::new(Arc::clone(komo_slot))));
     // MCP（`docs/mcp.md` §2.2）：启动时每台服务器后台连，**不等握手**，这里一个 MCP 工具也不挂。
     // 连上的工具在受理 Run 时挂进同一份目录（`GatewayState::refresh_mcp`），之后与内置工具走
     // 同一条落账的路；被接续的 Run 调到时执行器自己等（`ToolExecutor::await_mcp`）。

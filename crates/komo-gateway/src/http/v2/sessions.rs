@@ -47,7 +47,7 @@ pub fn routes() -> Router<Api> {
 
 /// query 里那个开关开着吗。`?all`、`?all=1`、`?all=true`、`?all=yes` 都算开（
 /// §13.1 写的是 `?all=1`，而 `serde_urlencoded` 的 bool 只认 `true` / `false`）。
-fn flag(query: &str, name: &str) -> bool {
+pub(super) fn flag(query: &str, name: &str) -> bool {
     query.split('&').any(|pair| {
         let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
         key == name
@@ -62,20 +62,20 @@ fn flag(query: &str, name: &str) -> bool {
 const SUMMARY_READS: usize = 2;
 
 /// 会话列表一页的上限：再大就按它给。
-const MAX_PAGE: u32 = 500;
+pub(super) const MAX_PAGE: u32 = 500;
 
 /// `GET /v1/sessions` 的分页参数（`all` 走 [`flag`]，这里只认这两个，其余 serde 忽略）。
 #[derive(serde::Deserialize)]
-struct ListPaging {
-    limit: Option<u32>,
-    cursor: Option<String>,
+pub(crate) struct ListPaging {
+    pub(crate) limit: Option<u32>,
+    pub(crate) cursor: Option<String>,
 }
 
 /// `GET /v1/sessions`：默认只列 `active` 与 `closing`；`?all=1` 带上 `deleted`；`purged` 不列。
 ///
 /// 分页只做加法：**不带 `limit` 就是全部**（与分页之前逐字节相同，老客户端不被截断，`cursor` 被忽略）；
 /// 带 `limit` 按页给，还有下一页时回 `next_cursor`。概览（live / inbox / 末条 entry）只读当页的。
-async fn list(
+pub(crate) async fn list(
     State(api): State<Api>,
     uri: axum::http::Uri,
     Query(paging): Query<ListPaging>,
@@ -115,7 +115,7 @@ async fn list(
 
 /// `GET /v1/session-search?q=…&limit=…`：跨会话找回（`komo session search`，roadmap-muse S3）。
 /// 只读；可见性与次序见 `service::durable::search`。空关键词 400。
-async fn search(
+pub(crate) async fn search(
     State(api): State<Api>,
     Query(query): Query<SessionSearchQuery>,
 ) -> ApiResult<Json<SessionSearchResponse>> {

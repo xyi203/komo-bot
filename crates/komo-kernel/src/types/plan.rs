@@ -147,6 +147,12 @@ pub enum Operation {
         #[serde(default)]
         read_only: bool,
     },
+    /// `komo` 工具（`docs/tasks.md` §4.4）：操作 komo 自己的状态（记忆、目标、定时、找会话、
+    /// 任务清单）。`action` 是"领域.动作"，各动作的参数随 `ExecutionPlan::args` 进计划。
+    ///
+    /// 只读动作的计划是 [`RecoveryMode::SafeReread`]，写动作是 `NoSafeRecovery`：同一个工具两种
+    /// 恢复方式，重启后只有前者会被重跑。
+    Komo { action: String },
     /// 一段在 Monty 里跑的 Python 脚本（`docs/codemode.md`）。
     ///
     /// 脚本自己碰不到文件、网络与进程；工具调用经 executor 的 durable journal。

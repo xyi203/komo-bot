@@ -83,7 +83,12 @@ impl World {
         let gateway = TestGateway::with(config, llm).await;
         let slot = assemble_slot::new_slot();
         // 这个世界只测钩子，不装转后台：给一个用不上的空槽。
-        assemble_slot::wire(&slot, gateway.state(), &Default::default());
+        assemble_slot::wire(
+            &slot,
+            gateway.state(),
+            &Default::default(),
+            &Default::default(),
+        );
         World { gateway, slot }
     }
 
@@ -397,7 +402,7 @@ async fn a_fresh_task_session_gets_the_task_mode_in_its_base() {
     );
 }
 
-/// fresh 任务会话交给模型的工具表里没有 `task`，有 `monitor` / `monitor_stop`（S2）；对话会话都有。
+/// fresh 任务会话交给模型的工具表里没有 `task`，有 `monitor` / `monitor_stop`（S2）与 `komo`；对话会话都有。
 #[tokio::test]
 async fn task_sessions_lack_task_but_keep_monitor_in_schema() {
     let world = World::new(&config_with("", NO_MEMORY), finisher()).await;
@@ -407,7 +412,7 @@ async fn task_sessions_lack_task_but_keep_monitor_in_schema() {
 
     let main = hooks.tools(parent).await.unwrap();
     let declared = names(main.definitions());
-    for name in ["task", "monitor", "monitor_stop", "read", "bash"] {
+    for name in ["task", "monitor", "monitor_stop", "komo", "read", "bash"] {
         assert!(
             declared.iter().any(|have| have == name),
             "{name} in {declared:?}"
@@ -423,7 +428,7 @@ async fn task_sessions_lack_task_but_keep_monitor_in_schema() {
         "task 不该在任务会话里：{declared:?}"
     );
     assert!(child.get("task").is_none(), "task 也不在能力面里");
-    for name in ["monitor", "monitor_stop"] {
+    for name in ["monitor", "monitor_stop", "komo"] {
         assert!(
             declared.iter().any(|have| have == name),
             "{name} in {declared:?}"

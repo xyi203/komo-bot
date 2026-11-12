@@ -11,6 +11,7 @@
 //! | `assemble` | 钩子与编排的装配、与 `GatewayState` 的断环 | W0b（W1b 填） |
 //! | `hooks` | `AgentHooks`：setup / 工具表 / 系统段 / 压缩（按当前配置现解析） | W1b |
 //! | `orchestration` | `OrchestrationHooks`：`check_effort`、契约段、监听委托 `MonitorRunner` | W1b |
+//! | `komo` | `komo` 工具的服务：调 HTTP 路由背后的同一个处理函数 | — |
 //! | **`sessions`** | 会话与树：建会话、列表、`SessionSummary` 映射、主会话与按来源找会话、`SessionError` | W1c |
 //! | `sessions::agent_doc` | `komo.agent` document 的读写与 fork 复制 | W0b |
 //! | `sessions::tree` | 读树（`read_tree`）、导航、label / name、context-edit、分支摘要、compact、忙时守卫 | W1c |
@@ -39,6 +40,7 @@ pub mod core;
 pub mod feed;
 pub mod hooks;
 pub mod interventions;
+pub mod komo;
 pub mod orchestration;
 pub mod sessions;
 pub mod submit;

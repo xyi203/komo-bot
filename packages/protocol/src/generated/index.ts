@@ -3,6 +3,8 @@ export type { ApiError } from "./ApiError";
 export type { ArmScore } from "./ArmScore";
 export type { CancelRunResponse } from "./CancelRunResponse";
 export type { ChangedFile } from "./ChangedFile";
+export type { ChatListResponse } from "./ChatListResponse";
+export type { ChatRow } from "./ChatRow";
 export type { ClosureConvention } from "./ClosureConvention";
 export type { ConfigCheckResponse } from "./ConfigCheckResponse";
 export type { ConfigEditResponse } from "./ConfigEditResponse";

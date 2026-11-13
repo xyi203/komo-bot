@@ -25,6 +25,7 @@
 //! | `submit::shell` | `!` 命令直跑（不建 run），落 `shell.command` write | W2a |
 //! | **`interventions`** | faulted 任务清单、`abandon` 确认 | W4a |
 //! | `interventions::confirms` | 待确认的对外调用（`docs/confirm.md` §6） | — |
+//! | **`chats`** | 对话列表（`/v1/chats`）、往对话里投一句话、停住的运行在对话里开口与 `intervention.answer`（`docs/redesign.md` §2.1） | — |
 //! | **`feed`** | 提交订阅 → SSE 帧（投影、`AssistantDelta`）与事件补读 | W2b |
 //! | `feed::nested_view` | codemode 子调用给界面的视图 | — |
 //! | **`background`** | Durable 模式的后台循环 | W0b（W2b/W3 往里加） |
@@ -36,6 +37,7 @@
 
 pub mod assemble;
 pub mod background;
+pub mod chats;
 pub mod core;
 pub mod feed;
 pub mod hooks;

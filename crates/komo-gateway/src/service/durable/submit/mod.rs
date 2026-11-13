@@ -500,6 +500,7 @@ impl DurableCore {
                     record.current_branch = conversation;
                     record.leaf = None;
                     record.changed_at = tx.now();
+                    record.last_message_at = record.changed_at;
                     if record
                         .title
                         .as_deref()

@@ -49,6 +49,29 @@ async fn a_command_job_never_asks_the_model_and_settles_ok() {
     gw.stop().await;
 }
 
+/// 命令型 Job 的结果投进主对话：stdout trim 过，前面带上定时任务的名字；非 0 退出带上退出码与 stderr。
+#[tokio::test]
+async fn a_command_jobs_output_is_posted_to_the_main_chat() {
+    let home = Home::new();
+    let gw = home.start(FakeLlm::new(vec![])).await;
+    let ok = gw.add_job(command_job("say-hi", "echo '  hi  '")).await;
+    gw.make_due(&ok.id).await;
+    let run = gw.tick().await.fired[0].run.clone();
+    gw.wait_state(&run, |s| s.is_terminal(), "终态").await;
+    let line = crate::notify::wait_line(&gw, "命令的输出", |line| line.contains("say-hi")).await;
+    assert_eq!(line, "定时任务「say-hi」：hi");
+
+    let bad = gw
+        .add_job(command_job("breaks", "echo oops >&2; exit 3"))
+        .await;
+    gw.make_due(&bad.id).await;
+    let run = gw.tick().await.fired[0].run.clone();
+    gw.wait_state(&run, |s| s.is_terminal(), "终态").await;
+    let line = crate::notify::wait_line(&gw, "出错的命令", |line| line.contains("breaks")).await;
+    assert!(line.contains("exit=3") && line.contains("oops"), "{line}");
+    gw.stop().await;
+}
+
 /// 退出 0、stdout 为空：照样 `ok`——它确实跑成了，只是没有输出（§10）。
 #[tokio::test]
 async fn a_command_job_with_empty_stdout_settles_ok() {
@@ -79,6 +102,9 @@ async fn a_command_job_with_empty_stdout_settles_ok() {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
     assert!(settled, "这一次触发应当已经记成 ok");
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let lines = crate::notify::main_lines(&gw).await;
+    assert!(lines.is_empty(), "没有输出就不投：{lines:?}");
     gw.stop().await;
 }
 

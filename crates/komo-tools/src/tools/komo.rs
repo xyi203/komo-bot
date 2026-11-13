@@ -38,11 +38,14 @@ use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
 use komo_kernel::protocol::http::{
-    ManualCronRunRequest, MatterActionRequest, MatterAddRequest, MatterListQuery, MemoryAddRequest,
-    MemoryListQuery, MemoryRevisionRequest, SessionListQuery, SessionSearchQuery, TaskListQuery,
+    InterventionVerdict, ManualCronRunRequest, MatterActionRequest, MatterAddRequest,
+    MatterListQuery, MemoryAddRequest, MemoryListQuery, MemoryRevisionRequest, SessionListQuery,
+    SessionSearchQuery, TaskListQuery,
 };
 use komo_kernel::traits::{OutputWriter, Tool};
-use komo_kernel::types::ids::{CronJobId, MatterId, MemoryId, OperationId, RequestKey, SessionId};
+use komo_kernel::types::ids::{
+    CronJobId, MatterId, MemoryId, OperationId, RequestKey, RunId, SessionId,
+};
 use komo_kernel::types::matter::{MatterKind, MatterTrigger, MatterVerb};
 use komo_kernel::types::memory::{MEMORY_QUERY_MARKER, MemoryScope};
 use komo_kernel::types::plan::{ExecutionPlan, Operation, PlanVersions, RecoveryMode, Replay};
@@ -76,6 +79,8 @@ pub enum Action {
     SessionSearch,
     SessionList,
     TaskList,
+    InterventionList,
+    InterventionAnswer,
 }
 
 /// 一个字段：名字、是否必填、一句话说明。
@@ -131,7 +136,7 @@ const TASK_LIST_FIELDS: [Field; 4] = [
     ),
 ];
 
-const SPECS: [Spec; 17] = [
+const SPECS: [Spec; 19] = [
     Spec {
         action: Action::MemoryAdd,
         name: "memory.add",
@@ -326,6 +331,37 @@ const SPECS: [Spec; 17] = [
         summary: "任务清单（只读）：把会话读成面向人的任务行，带状态（进行中 / 等你 / 已交回 / 空闲 / 已归档）和带着的目标",
         fields: &TASK_LIST_FIELDS,
     },
+    Spec {
+        action: Action::InterventionList,
+        name: "intervention.list",
+        read_only: true,
+        summary: "列出指向**当前对话**、还没答复的待处理事项（只读）：停住的运行在对话里问过操作者的那些，\
+                  每项带 handle、类型（blocked / confirm）、问的是什么、可答的结论（verdicts）",
+        fields: &[],
+    },
+    Spec {
+        action: Action::InterventionAnswer,
+        name: "intervention.answer",
+        read_only: false,
+        summary: "替操作者提交对一个待处理事项的答复。**只有操作者在这一轮里明确回答了那个问题才能调用**：\
+                  比如你在对话里问过要不要执行某个对外动作、操作者回了「发吧」，你读到上下文里那句提问和这句回复，\
+                  才能 approve；操作者没说清楚就先问清楚，**不要替操作者做决定**。\
+                  只有操作者亲自发消息开始的那一轮能用——定时、监听、任务交回触发的 Run 里一律被拒绝。\
+                  只能答指向当前对话的事项；confirm 只认 approve / reject，blocked 的出错任务只认 abandon\
+                  （崩溃停住的还认 resolve）；答过的再答返回原结论",
+        fields: &[
+            field(
+                "handle",
+                true,
+                "待处理事项的 handle（对话里那句话的附注或 intervention.list 给的）",
+            ),
+            field(
+                "verdict",
+                true,
+                "操作者的结论：approve（执行）/ reject（不执行）/ abandon（放弃）/ resolve（重试，仅崩溃停住的）",
+            ),
+        ],
+    },
 ];
 
 impl Action {
@@ -410,6 +446,16 @@ pub enum KomoCall {
     SessionSearch(SessionSearchQuery),
     SessionList(SessionListQuery),
     TaskList(TaskListQuery),
+    /// 指向调用它的那段对话、还没答复的介入。
+    InterventionList,
+    /// 替操作者答复一个介入。`session` / `run` 是调用它的会话与 Run（Gateway 据此核对这个 Run 是不是
+    /// 操作者亲自发消息开始的，以及这条介入是不是指向这段对话）。
+    InterventionAnswer {
+        session: SessionId,
+        run: RunId,
+        handle: String,
+        verdict: InterventionVerdict,
+    },
 }
 
 /// Gateway 一侧：调 HTTP 路由背后的同一个处理函数，返回响应体的 JSON。
@@ -470,10 +516,12 @@ fn doc() -> String {
     let mut text = String::from(
         "`params` 是一个对象，字段按动作不同（下面逐个列出，必填的标明）；给了不认识的字段会被拒绝并列出该动作认的字段。\
          身份（哪个会话、哪个 Run）由宿主填，不要在 params 里给 session / run。\n\
-         写动作按顺序一个个执行；只读动作（memory.search、goal.list、cron.list、session.*、task.list）可以和别的只读调用放同一轮并行。\n\
+         写动作按顺序一个个执行；只读动作（memory.search、goal.list、cron.list、session.*、task.list、intervention.list）可以和别的只读调用放同一轮并行。\n\
          改承诺的写动作（goal.add、goal.done）要这个 Run 里有用户说的话作依据；后台任务会话与定时任务会话被拒绝——\
          把要记的在交回的结果里写明，由主会话来做。\n\
          goal.attach / goal.detach 改的是任务自己的关联、不是目标的承诺，不要用户原话；但只有任务会话里能用。\
+         intervention.answer 替操作者答复一个待处理事项（停住的运行在对话里问过他的问题）：只有他在这一轮里明确回答了\
+         才能调用，不要替他做决定；触发器起的 Run（定时、监听、任务交回）里被拒绝。\n\
          不在这里的：确认记忆（用户自己的动作）、Gateway 的重启与停止。\n",
     );
     for spec in &SPECS {
@@ -661,6 +709,24 @@ fn build(
         Action::SessionSearch => Ok(KomoCall::SessionSearch(decode(spec, map)?)),
         Action::SessionList => Ok(KomoCall::SessionList(decode(spec, map)?)),
         Action::TaskList => Ok(KomoCall::TaskList(decode(spec, map)?)),
+        Action::InterventionList => Ok(KomoCall::InterventionList),
+        Action::InterventionAnswer => {
+            let handle = text_of(spec, &mut map, "handle")?;
+            let verdict = text_of(spec, &mut map, "verdict")?;
+            let verdict =
+                serde_json::from_value::<InterventionVerdict>(json!(verdict)).map_err(|_| {
+                    wrong(
+                        spec,
+                        "`verdict` 要是 approve / reject / abandon / resolve 之一",
+                    )
+                })?;
+            Ok(KomoCall::InterventionAnswer {
+                session: ctx.session.clone(),
+                run: ctx.input_run.clone().unwrap_or_else(|| ctx.run.clone()),
+                handle,
+                verdict,
+            })
+        }
     }
 }
 
@@ -671,7 +737,8 @@ impl Tool for KomoTool {
             name: KOMO_TOOL.into(),
             description: "操作 komo 自己的状态，不经 shell：记忆（memory.add / search / forget）、\
                           目标（goal.add / list / next / wait / resume / done / link / attach / detach）、定时任务（cron.list / run）、\
-                          找会话（session.search / list）、任务清单（task.list）。\
+                          找会话（session.search / list）、任务清单（task.list）、\
+                          待处理事项（intervention.list / answer：操作者在对话里答复了你问过的问题，才替他提交）。\
                           用户要你记住什么、提到别的会话里的事、问有哪些定时任务或任务时用它，\
                           别去翻系统 crontab 或读数据文件。\n\
                           用前先 read tool://komo/doc（各动作的 params 字段）。"
@@ -829,6 +896,11 @@ mod tests {
             ("session.search", json!({ "q": "飞书" })),
             ("session.list", json!({ "all": true, "limit": 5 })),
             ("task.list", json!({})),
+            ("intervention.list", json!({})),
+            (
+                "intervention.answer",
+                json!({ "handle": "42", "verdict": "approve" }),
+            ),
         ];
         assert_eq!(cases.len(), SPECS.len(), "每个动作都有一条用例");
         for (action, params) in cases {
@@ -1027,6 +1099,7 @@ mod tests {
             "goal.link" => json!({ "id": "g", "cron": "j" }),
             "cron.run" => json!({ "id": "j" }),
             "session.search" => json!({ "q": "x" }),
+            "intervention.answer" => json!({ "handle": "7", "verdict": "approve" }),
             _ => json!({}),
         };
         for spec in &SPECS {
@@ -1059,7 +1132,8 @@ mod tests {
                 "cron.list",
                 "session.search",
                 "session.list",
-                "task.list"
+                "task.list",
+                "intervention.list"
             ]
         );
         // 认不出来的动作不算只读。

@@ -260,6 +260,40 @@ pub struct SessionListResponse {
     pub next_cursor: Option<String>,
 }
 
+// ---- /v1/chats ----
+
+/// 对话列的一行（`docs/redesign.md` §2.1）：主对话或一段支线对话。字段是 camelCase（新主页的约定）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
+pub struct ChatRow {
+    /// 背后的会话。
+    pub id: SessionId,
+    /// 是主对话（默认 Agent 的 `kind = main` 会话）。
+    pub main: bool,
+    pub title: String,
+    /// 对话里最后一句话（用户或 Komo 说的，投进来的也算），截断过；还没有话是空串。
+    pub last_message: String,
+    /// 最后一句话的时刻；旧会话回落到最近一次改动、再回落到创建时刻。
+    #[cfg_attr(feature = "ts", ts(type = "string"))]
+    #[serde(with = "time::serde::rfc3339")]
+    pub last_message_at: OffsetDateTime,
+    /// 有指向这段对话、还没答复的介入（停住的运行在等你）。
+    pub waiting: bool,
+    /// 这段对话此刻有一条 Run 在跑。
+    pub running: bool,
+}
+
+/// `GET /v1/chats`：主对话固定第一，其余在等你的在前、再按 `lastMessageAt` 倒序。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
+pub struct ChatListResponse {
+    pub chats: Vec<ChatRow>,
+    /// 等你的事的总数（对话图标上的数字）：指向列表里各段对话、还没答复的介入条数。
+    pub waiting_count: u32,
+}
+
 // ---- /v1/tasks ----
 
 /// `GET /v1/tasks` 的 query（`docs/tasks.md` §3）。分页同 [`SessionListQuery`]：不带 `limit` 就是全部。

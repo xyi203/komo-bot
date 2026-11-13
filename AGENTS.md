@@ -76,7 +76,7 @@ komo-agent     AgentProfile → 能力面选择 · skills 发现与目录 · 编
                系统段装配（context：system_sections、task_contract_block、project_update_block，压缩摘要提示）。
                只依赖 kernel，不执行；runtime 不依赖它，Gateway 组装两边。
                值类型（AgentProfile/AgentSurface）留在 kernel。
-komo-gateway   axum routes (`http/v2`) · `service/durable` (DurableCore + hooks;
+komo-gateway   axum routes (`http/v2`) · `service/durable` (DurableCore + hooks; chats/ ·
                sessions/ · submit/ · interventions/ · feed/ · background/) · SSE · auth · lock/discovery ·
                web (Host guard · pairing → cookie · static shell) · launchd/systemd · web attachment inbox ·
                intervention rendering · config reload.

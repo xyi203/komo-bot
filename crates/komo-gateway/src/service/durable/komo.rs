@@ -98,6 +98,13 @@ impl KomoService for GatewayKomo {
                 )
                 .await,
             ),
+            KomoCall::InterventionList => intervention_list(&api, caller).await,
+            KomoCall::InterventionAnswer {
+                session,
+                run,
+                handle,
+                verdict,
+            } => intervention_answer(&api, &session, &run, &handle, verdict).await,
             KomoCall::TaskList(query) => reply(
                 tasks::list(
                     State(api),
@@ -112,6 +119,41 @@ impl KomoService for GatewayKomo {
             ),
         }
     }
+}
+
+/// `intervention.list`：指向调用它的那段对话、还没答复的介入（只读）。任务会话与定时会话不是对话，
+/// 没有指向它们的介入，清单是空的。
+async fn intervention_list(api: &Api, caller: &SessionId) -> Result<Value, ToolError> {
+    let core = api.state.core().map_err(|error| refusal(error.into()))?;
+    let interventions = core
+        .interventions_for_chat(caller.as_str())
+        .await
+        .map_err(session_failure)?;
+    Ok(json!({ "interventions": interventions }))
+}
+
+/// `intervention.answer`：替操作者答复一个介入。只有操作者亲自发消息开始的 Run 能答，规则与理由见
+/// [`crate::service::durable::chats::attention`]。
+async fn intervention_answer(
+    api: &Api,
+    session: &SessionId,
+    run: &komo_kernel::types::ids::RunId,
+    handle: &str,
+    verdict: komo_kernel::protocol::http::InterventionVerdict,
+) -> Result<Value, ToolError> {
+    use crate::service::durable::chats::attention::ChatAnswerError;
+    let core = api.state.core().map_err(|error| refusal(error.into()))?;
+    let response = core
+        .answer_from_chat(session.as_str(), run, handle.trim(), verdict)
+        .await
+        .map_err(|error| match error {
+            ChatAnswerError::Denied(reason) => ToolError::Denied { reason },
+            ChatAnswerError::Invalid(message) => ToolError::InvalidArguments { message },
+            ChatAnswerError::Failed(message) => ToolError::Failed { message },
+        })?;
+    serde_json::to_value(response).map_err(|error| ToolError::Failed {
+        message: format!("响应无法序列化：{error}"),
+    })
 }
 
 /// `goal.list`：路由的清单，每个目标再带上 `tasks`——有几个（活着的）任务带着它的键。计数不是目标自己的
@@ -371,7 +413,7 @@ mode = "keyword"
         (session, run)
     }
 
-    /// 十七个动作各走通一次，经由真的处理函数（真 aux.db / durable.db，不是桩）：返回的是各自
+    /// 十七个动作（`intervention.*` 两个另有专门的测试）各走通一次，经由真的处理函数（真 aux.db / durable.db，不是桩）：返回的是各自
     /// 路由的响应体，状态确实落了库。
     #[tokio::test]
     async fn every_komo_action_runs_through_the_real_handlers() {
@@ -1011,6 +1053,238 @@ mode = "keyword"
                 && results[1].content.contains("content（必填）"),
             "{}",
             results[1].content
+        );
+        gateway.running.stop().await;
+    }
+
+    // ------------------------------------------------------------ intervention.*
+
+    /// 一台带 `demo` MCP 服务器的 Gateway，`bump` 声明为对外（无人值守的 Run 调它要先确认；每执行一次往计数
+    /// 文件写一行）。
+    fn home_with_outward() -> (Home, std::path::PathBuf) {
+        let home = Home::new();
+        let server = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/mcp/server.py");
+        let counter = home.path().join("bump.count");
+        let config = format!(
+            "{}\n[mcp.servers.demo]\ncommand = \"python3\"\nargs = [\"{}\", \"{}\"]\nexposure = \"direct\"\noutward = [\"bump\"]\n",
+            crate::service::test_support::harness::home_config(),
+            server.display(),
+            counter.display(),
+        );
+        std::fs::write(home.path().join("config.toml"), config).unwrap();
+        (home, counter)
+    }
+
+    /// 触发器（定时）起的一条 Run：往 `session` 的当前分支放一条 `cron.input` 输入。
+    async fn trigger_run(gateway: &Gw, session: &SessionId) -> RunId {
+        use komo_runtime::durable::harness::{InputEntry, SubmissionDraft};
+        let core = gateway.state().core().unwrap();
+        let record = core.session(session.as_str()).await.unwrap();
+        let id = core
+            .harness
+            .submit(
+                &core.engine,
+                record.current_branch,
+                SubmissionDraft::input("每日巡检").with_entry(InputEntry::new("cron.input", None)),
+            )
+            .await
+            .unwrap();
+        komo_kernel::durable::legacy_ids::run_id(id)
+    }
+
+    /// 计数文件里有几行 = 副作用发生了几次。
+    fn lines(path: &std::path::Path) -> usize {
+        std::fs::read_to_string(path)
+            .map(|text| text.lines().filter(|line| !line.trim().is_empty()).count())
+            .unwrap_or(0)
+    }
+
+    fn denied(result: Result<ToolOutput, ToolError>) -> String {
+        match result {
+            Err(ToolError::Denied { reason }) => reason,
+            other => panic!("应当被拒绝：{other:?}"),
+        }
+    }
+
+    /// 操作者亲自发消息开始的 Run 里能答复；触发器起的 Run 里一律拒绝；别的对话里的、任务会话里的也不行；
+    /// confirm 不认的答复报错；答过的返回原结论。
+    #[tokio::test]
+    async fn intervention_answer_works_in_an_operator_run_and_is_refused_in_a_trigger_run() {
+        use komo_kernel::protocol::http::InterventionKind;
+        let (home, counter) = home_with_outward();
+        let llm = FakeLlm::new(vec![
+            vec![crate::service::test_support::harness::text_round(1, "好")],
+            vec![
+                crate::service::test_support::harness::call_round(
+                    1,
+                    "pc-1",
+                    "mcp__demo__bump",
+                    json!({}),
+                ),
+                crate::service::test_support::harness::text_round(2, "加好了"),
+            ],
+        ]);
+        let gateway = home.start(llm).await;
+        let tool = komo_tool(&gateway);
+        let core = gateway.state().core().unwrap().clone();
+
+        // 支线对话：操作者说了一句话（Run 1），之后一条触发器起的 Run 调对外工具、停在确认上。
+        let (chat, operator_run) = user_run(&gateway, "每天早上帮我巡检一下").await;
+        let trigger = trigger_run(&gateway, &chat).await;
+        let pending = gateway.wait_intervention(&trigger).await;
+        assert_eq!(pending.kind, InterventionKind::Confirm);
+        let handle = pending.handle.clone();
+        let (other, other_run) = user_run(&gateway, "另一段对话").await;
+        let source = |session: &SessionId| PlanSource::Interactive {
+            session: session.clone(),
+        };
+
+        // 清单：只列指向当前对话的。
+        let mut ctx = context(&chat, &operator_run, source(&chat));
+        let listed = ok(&tool, &mut ctx, "intervention.list", json!({})).await;
+        assert_eq!(
+            listed["interventions"][0]["handle"],
+            handle.as_str(),
+            "{listed}"
+        );
+        let mut elsewhere = context(&other, &other_run, source(&other));
+        let listed = ok(&tool, &mut elsewhere, "intervention.list", json!({})).await;
+        assert!(
+            listed["interventions"].as_array().unwrap().is_empty(),
+            "{listed}"
+        );
+
+        // 触发器起的 Run 里答复：拒绝。
+        let mut in_trigger = context(&chat, &trigger, source(&chat));
+        let reason = denied(
+            call(
+                &tool,
+                &mut in_trigger,
+                "intervention.answer",
+                json!({ "handle": handle, "verdict": "approve" }),
+            )
+            .await,
+        );
+        assert!(reason.contains("不是操作者发消息开始的"), "{reason}");
+        assert_eq!(lines(&counter), 0);
+        // 任务会话里答复：拒绝。
+        let mut spec = NewSession::new("assistant").kind(komo_kernel::durable::SessionKind::Task);
+        spec.parent_session = Some(chat.as_str().to_owned());
+        let task = SessionId::from_raw(core.create_session(spec).await.unwrap().id);
+        let mut in_task = context(&task, &operator_run, source(&task));
+        denied(
+            call(
+                &tool,
+                &mut in_task,
+                "intervention.answer",
+                json!({ "handle": handle, "verdict": "approve" }),
+            )
+            .await,
+        );
+        // 别的对话里的操作者 Run 不能答这段对话的事。
+        let mut wrong_chat = context(&other, &other_run, source(&other));
+        let error = call(
+            &tool,
+            &mut wrong_chat,
+            "intervention.answer",
+            json!({ "handle": handle, "verdict": "approve" }),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("不是在这段对话里等你答复的"),
+            "{error}"
+        );
+
+        // 操作者的 Run 里：confirm 不认的答复报错并列出能答的。
+        let error = call(
+            &tool,
+            &mut ctx,
+            "intervention.answer",
+            json!({ "handle": handle, "verdict": "abandon" }),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("approve"), "{error}");
+        assert_eq!(lines(&counter), 0, "答之前不执行");
+        // 认的答复：提交，之后那条触发器 Run 照常执行。
+        let answered = ok(
+            &tool,
+            &mut ctx,
+            "intervention.answer",
+            json!({ "handle": handle, "verdict": "approve" }),
+        )
+        .await;
+        assert_eq!(answered["verdict"], "approve");
+        assert_eq!(answered["already_answered"], false);
+        gateway.wait_terminal(&trigger).await;
+        assert_eq!(lines(&counter), 1, "批准后只执行一次");
+        gateway.running.stop().await;
+    }
+
+    /// 出错的任务（blocked，只认 abandon）在对话里答复；答过的再答返回原结论，认不得的结论报错。
+    #[tokio::test]
+    async fn a_faulted_run_is_answered_from_its_chat_and_a_second_answer_returns_the_first() {
+        let (_home, gateway) = start().await;
+        let tool = komo_tool(&gateway);
+        let core = gateway.state().core().unwrap().clone();
+        let (chat, run) = user_run(&gateway, "在吗").await;
+        let branch = core.session(chat.as_str()).await.unwrap().current_branch;
+        core.engine
+            .commit(move |tx| {
+                Box::pin(async move {
+                    use crate::service::durable::sessions::agent_doc::{
+                        AGENT_DOC_VERSION, address,
+                    };
+                    tx.put_document(
+                        address(branch),
+                        AGENT_DOC_VERSION,
+                        json!("坏掉的 komo.agent"),
+                    )
+                    .await
+                })
+            })
+            .await
+            .unwrap();
+        let stalled = gateway.submit(&chat, "komo-2", "跑一下").await.run;
+        let handle = gateway.wait_intervention(&stalled).await.handle;
+        let mut ctx = context(
+            &chat,
+            &run,
+            PlanSource::Interactive {
+                session: chat.clone(),
+            },
+        );
+
+        let error = call(
+            &tool,
+            &mut ctx,
+            "intervention.answer",
+            json!({ "handle": handle, "verdict": "approve" }),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("abandon"), "{error}");
+        let first = ok(
+            &tool,
+            &mut ctx,
+            "intervention.answer",
+            json!({ "handle": handle, "verdict": "abandon" }),
+        )
+        .await;
+        assert_eq!(first["already_answered"], false, "{first}");
+        let second = ok(
+            &tool,
+            &mut ctx,
+            "intervention.answer",
+            json!({ "handle": handle, "verdict": "abandon" }),
+        )
+        .await;
+        assert_eq!(second["already_answered"], true, "{second}");
+        let listed = ok(&tool, &mut ctx, "intervention.list", json!({})).await;
+        assert!(
+            listed["interventions"].as_array().unwrap().is_empty(),
+            "{listed}"
         );
         gateway.running.stop().await;
     }

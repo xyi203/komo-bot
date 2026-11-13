@@ -105,12 +105,34 @@
 
 ### 2.1 对话
 
-- [ ] 支线对话：用户直接开的会话（`kind = normal`），消息直通、不经 Router（P13，已定）。`POST /v1/sessions` 的入口保留；`docs/tasks.md` §0、§3.1 里「入口去掉」的说法要改
-- [ ] 对话列表接口：主对话 + 支线，每行带最后一句话、时间、是否在等你
-- [ ] 会话记录补「最后一句话的时间」（现在 `updated_at` 不随消息更新）
+- [x] 支线对话：用户直接开的会话（`kind = normal`），消息直通、不经 Router（P13，已定）。`POST /v1/sessions` 的入口保留（建出来的带 `source = web`）；`docs/tasks.md` §0、§3.1 里「入口去掉」的说法已改（2026-11-14）
+- [x] 对话列表接口 `GET /v1/chats`：主对话 + 支线，每行带最后一句话、时间、是否在等你、是否在跑，另给等你的总数（2026-11-14，做法记录见下）
+- [x] 会话记录补「最后一句话的时间」`last_message_at`（现在 `updated_at` 不随消息更新；`/v1/sessions` 的 `updated_at` 没改，对话列表读新的一格）
 - [x] ~~任务带上来源~~ 不需要了（P18）：「正在输入」就是这段对话当前的 Run，过程面板看的也是它
 - [x] ~~网页往主对话发消息走 Router 分发~~ 反过来（P18）：主对话的消息直接进主会话，不再分发
-- [ ] 停住的运行（介入清单 `/v1/interventions`）接到对话里（P14）：停住时往它所在的对话投一句话——支线里的投那段支线，主对话派出的与目标定时触发的投主对话；把你的回复对应到它认的几种答复上。原来的接口留给排查用
+- [x] 停住的运行（介入清单 `/v1/interventions`）接到对话里（P14）：停住时往它所在的对话投一句话——支线里的投那段支线，主对话派出的与目标定时触发的投主对话；把你的回复对应到它认的几种答复上（由那段对话里的模型调 `komo` 工具的 `intervention.answer`）。原来的接口留给排查用。**目标定时触发的改投绑定的支线是 3a 的事**，接缝是 `chats::cron_route`（现在一律主对话）
+
+- [x] 做法记录（2026-11-14，对话的服务端；代码在 `komo-gateway/src/service/durable/chats/`）：
+  - **投一句话**（`say::say_in`，不起 Run）：复用 Router 时代的展示 entry `main.reply`（事件流里仍是 `LineReply`，不挂 Run），区别是这次带 `model`——
+    一条 user 消息，前面一行说明"这是你（Komo）刚才对操作者说的，不是操作者说的"，后面可接只给模型看的附注（介入的 handle、可答的结论）；`data` 带
+    `text`（界面上那句，不含附注）、`at`、`source`（`intervention` / `cron`）、`key` 与关联字段（介入的 `handle` / `interventionKind` / `session`，
+    定时的 `job` / `firing` / `run`）。它是 write submission：对话空闲时立刻落，对话正忙时排进收件箱、下一个 boundary 落（write 的通常规则，不打断 Run）。
+    选 user 角色而不是 assistant：boundary 落在工具往返中间时 assistant 消息会打乱调用与结果的配对；没有用宿主附加（`komoOrigin`）标记，因为压缩会跳过它，
+    定时结果的正文就丢了。
+  - **判重**：关联键就是这条 write submission 的请求键（`submissions.request_id`，落库）；写之前在同一次提交里按**目标 Session** 查已有的 submission，
+    有就什么都不写（`Said::Duplicate`），所以重启后的补投、cron 看客重挂都不会重复。键：介入 `intervention:{kind}:{handle}`（崩溃停住的再加起跑时刻，放行后
+    再停算新的一句）；定时 `cron:{job}@{计划时刻毫秒}`（手动 run 用 `@run-{run}`）。换了目标会话（例如 3a 绑定的支线变了）算新的一句。
+  - **`last_message_at`** 在三处更新，都在已有的写会话行的那次提交里：用户输入受理（`submit::land`）、Run 以最终回复结束（`generation::answer`，回复有文字才算）、
+    投一句话（`say_in`）。旧记录读成 0，`SessionRecord::last_message_ms()` 回落到 `changed_at`、再回落到 `created_at`。
+  - **介入落在哪段对话**（`DurableCore::route_of`）：主对话与支线对话（`kind = main / normal`，排除 `chat:` 来源与已不收输入的）是自己；任务会话沿 `parent_session` 往上找；
+    `kind = cron` 走 `cron_route`（现在主对话）；其余回落主对话。启动时在引擎调度之前订阅提交（faulted / 待确认的任务），并回放全部未答复的介入；老库第一次升级后，
+    积压的未答复介入会各投一句（判重键挡住之后的重复）。
+  - **`intervention.answer` 的约束**：`komo` 工具的 `intervention.list` / `intervention.answer`（`handle` + `verdict`）。调用它的 Run 必须是操作者亲自发消息开始的——
+    取 Run 第一条输入放置成的 entry，kind 在 `confirm::is_trigger_input`（与 `docs/confirm.md` §3 同一张表：`cron.input`、监听、任务交回）里的一律拒绝；任务会话与定时会话也拒；
+    只能答指向调用它的那段对话的介入（已答过的走原路径，返回原结论）；结论走现有的 `answer_intervention`，confirm 只认 `approve` / `reject`，blocked 只认 `abandon`（崩溃停住的还认 `resolve`），
+    不认的报错并列出能答的。工具说明里写明：只有操作者在这一轮里明确回答了那个问题才能调用，不要替操作者做决定。
+  - **已知的缺口（按代码推断，未实测）**：触发器起的 Run 在**同一段对话**里停在 confirm（例如支线里的监听事件起的 Run 调对外工具）时，操作者的回复是往忙着的对话里插话，要等这个 Run 过了 confirm 才会被模型读到，而这个 Run 在等答复——
+    只能靠超时（默认 24 小时，不执行）或网页的 `/v1/interventions` 答。主对话派出的任务、定时触发的 Run 停住时对话是空闲的，不受影响。
 
 ### 2.2 目标与定时
 
@@ -171,7 +193,7 @@
 - [x] 主会话恢复成会跑模型的普通会话：有 Run、有压缩与提示缓存（`kind = main` 与普通会话走同一条受理与 Run 路径，能力面是完整的做事能力面）
 - [x] 留下：模型调用的容错（T2a）、`komo` 工具（含 `goal.list` / `goal.attach` / `goal.detach`）、`task` 工具（长活可以派到后台）、任务清单接口 `GET /v1/tasks`（去留见 §2.5）、任务带目标的键、"停下"（`DurableCore::stop_task`：标已停、撤回排队输入、停监听、丢弃晚到的监听事件，任务清单里算"没有完成"）。注意 `stop_task` 现在没有生产调用方（原来只有分发的 `stop` 与渠道 `/cancel` 用它），只有测试在用
 - [x] 「不许沉默」的补救、卡死检测、"用户消息派出的任务视同用户发起 / 可改承诺"这类规则：已核实，全部只对 `komo.task.reply`（分发派出的任务）生效，与任务会话共用的部分没有，整套删除（含 `[execution] stall_model_secs` / `stall_tool_secs`、`komo.live.activityAt`、`task.stall` 输入）。`task` 工具派出的任务本来就走"交回父会话"的老路，那条路的末行状态行与自动续跑一直是独立的，未动
-- [ ] 目标的定时结果与提问投到主对话：作为主会话里的一条消息落下，下一轮进上下文
+- [x] 目标的定时结果与提问投到主对话：作为主会话里的一条消息落下，下一轮进上下文（2026-11-14：定时结果按 `notify` 投、提问由介入投；**绑定了支线时改投那段支线留给 3a**，接缝 `chats::cron_route`）
 - [x] 主对话的上下文：同一个会话加自动压缩，见 §2.8
 
 ### 2.8 主对话的上下文（照 Muse 的做法，建议）
@@ -223,7 +245,7 @@
 - [ ] `matters`：加说明列、定时配置（一个 JSON 字段）、下一次运行时间（单独一列，建索引）、上次错误
 - [ ] `cron_jobs`：并进 `matters`，表不再用
 - [ ] `cron_firings`：保留，键从定时任务 id 换成目标 id
-- [ ] `sessions`：补最后一句话的时间
+- [x] `sessions`：补最后一句话的时间（`SessionRecord.last_message_at`，会话行 JSON 里加一格，没有迁移）
 - [ ] 配置文件：MCP 工具启停、服务器启用、技能与渠道启用；删群聊相关键
 - [ ] 回填：存量定时任务 → 目标
 - [ ] 记下不做的：把 `aux.db` 并进 `durable.db`（与这次无关，单独一笔）

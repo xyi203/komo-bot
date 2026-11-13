@@ -13,9 +13,10 @@ use axum::{Json, Router};
 use futures_util::{StreamExt, TryStreamExt};
 use komo_kernel::durable::legacy_ids;
 use komo_kernel::protocol::http::{
-    CreateSessionRequest, DeleteSessionRequest, PurgeBlocked, PurgeSessionRequest,
-    PurgeSessionResponse, SessionDetail, SessionLifecycleResponse, SessionListResponse,
-    SessionSearchQuery, SessionSearchResponse, SessionSummary, SubmitRunRequest, SubmitRunResponse,
+    ChatListResponse, CreateSessionRequest, DeleteSessionRequest, PurgeBlocked,
+    PurgeSessionRequest, PurgeSessionResponse, SessionDetail, SessionLifecycleResponse,
+    SessionListResponse, SessionSearchQuery, SessionSearchResponse, SessionSummary,
+    SubmitRunRequest, SubmitRunResponse,
 };
 use komo_kernel::types::ids::{RunId, Seq, SessionId};
 use komo_kernel::types::model::Effort;
@@ -35,6 +36,7 @@ use crate::service::durable::submit::{Accepted, InputRequest, ModelOverride};
 pub fn routes() -> Router<Api> {
     Router::new()
         .route("/v1/home-session", get(home))
+        .route("/v1/chats", get(chats))
         .route("/v1/sessions", get(list).post(create))
         .route("/v1/session-search", get(search))
         .route("/v1/sessions/{id}", get(detail))
@@ -137,7 +139,9 @@ async fn create(
 ) -> ApiResult<Json<SessionSummary>> {
     let hash = body_hash(&request);
     let core = api.state.core()?;
-    let mut spec = NewSession::new(api.state.snapshot().agent.default_agent.clone());
+    // 支线对话：用户自己开的普通会话（`kind = normal`），来源 `web`；消息直通，不经任何分发。
+    let mut spec = NewSession::new(api.state.snapshot().agent.default_agent.clone())
+        .source(crate::service::durable::chats::WEB_SOURCE);
     if let Some(title) = &request.title {
         spec = spec.title(title);
     }
@@ -152,6 +156,11 @@ async fn create(
         .create_session_idempotent(spec, key, hash.to_string())
         .await?;
     Ok(Json(core.session_summary(&record).await?))
+}
+
+/// `GET /v1/chats`：新主页的对话列（`docs/redesign.md` §2.1）。主对话没有就建，同 `/v1/home-session`。
+async fn chats(State(api): State<Api>) -> ApiResult<Json<ChatListResponse>> {
+    Ok(Json(api.state.core()?.chats().await?))
 }
 
 /// `GET /v1/home-session`：默认 Agent 的主会话（没有就建）。

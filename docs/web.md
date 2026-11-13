@@ -121,14 +121,20 @@ TUI 与聊天渠道之外的第三个入口，给电脑上的长会话用，之�
 做原型时发现、正式版之前要补的：
 
 1. （已解决，C0）没有托管静态文件的路由：Gateway 现在同源托管网页，浏览器用配对换来的 cookie 鉴权（`docs/clients.md` D5、D6）。
-2. 会话列表不带运行状态：要知道哪个任务在跑，得逐个 `GET /v1/sessions/{id}` 看 `unfinished`。
-3. 会话的 `updated_at` 不随最后一条消息更新，侧栏的时间与"最近更新"排序因此不准。
+2. 会话列表不带运行状态：要知道哪个任务在跑，得逐个 `GET /v1/sessions/{id}` 看 `unfinished`。（新主页的对话列用 `GET /v1/chats`，每行带 `running`，见下方第 10 条。）
+3. 会话的 `updated_at` 不随最后一条消息更新，侧栏的时间与"最近更新"排序因此不准。（会话记录已补 `last_message_at`，`GET /v1/chats` 按它排序；`/v1/sessions` 的 `updated_at` 没改。）
 4. 上下文构成要前端拉整棵会话树来估；应由 Gateway 在 `prepare` 组请求时记下各段 token 数直接返回，口径与窗口保护一致。
 5. 右栏"连接"卡片只写 Gateway 本身：渠道与 MCP 的连接状态现在有接口（`GET /v1/channels`、`GET /v1/mcp`，2026-10-30），在设置里看（§15），卡片还没接。
 6. 没有"归档"状态：归档后可恢复、删除才进 purge，需要新状态与接口。
 7. 事件里没有请求耗时，算不出 tok/s。
 8. 分叉要会话树的条目 ID，事件流里没有，所以只能分叉整段会话，做不了"从这条回答分叉"。
 9. 没有读工作区文件的接口：改动卡片与对比有了（§16），但文件本身点不开预览，也没有"产出"（DeepSeek 由模型调 `present` 显式交付）。
+10. **对话列表 `GET /v1/chats`**（新主页的对话列，2026-11-14 服务端已做，网页还没接；`docs/redesign.md` §2.1）：返回 `{ chats, waitingCount }`，
+    字段 camelCase。`chats` 里主对话（默认 Agent 的 `kind = main` 会话，没有就建）固定第一，其余是活着的支线对话（`kind = normal`，
+    排除 `source` 以 `chat:` 开头的存量渠道 / 群会话；`POST /v1/sessions` 建的带 `source = web`），在等你的在前、再按 `lastMessageAt` 倒序。
+    每行：`id`、`main`、`title`、`lastMessage`（最后一句用户或 Komo 的话，80 字截断，Komo 投进来的也算）、`lastMessageAt`（RFC 3339）、
+    `waiting`（有指向这段对话、没答复的介入）、`running`（对话里有 Run 在跑）。`waitingCount` 是等你的事的条数（对话图标上的数字）。
+    停住的运行与定时结果作为 Komo 的一句话落进对话，事件流里是 `line.reply`（不挂 Run）；用户在对话里回复后由模型调 `intervention.answer` 答复。
 
 ## 10. 未做与未验证
 

@@ -25,6 +25,12 @@ const UNATTENDED_INPUTS: [&str; 4] = [
     TASK_RESULT_ENTRY,
 ];
 
+/// 这种输入 entry 起的 Run 是不是触发器起的（不是人打的字）。`intervention.answer` 用它挡掉触发器 Run：
+/// 与 [`attended`] 同一张表。
+pub fn is_trigger_input(kind: &str) -> bool {
+    UNATTENDED_INPUTS.contains(&kind)
+}
+
 pub fn confirm_address(conversation: ConversationId, task: TaskId) -> DocumentAddress {
     DocumentAddress {
         kind: CONFIRM_KIND.to_owned(),
@@ -75,7 +81,7 @@ pub(super) async fn attended(env: &ToolEnv, rt: &TaskRuntime) -> Result<bool, Ta
     let Some(entry) = rt.entry(entry).await? else {
         return Ok(false);
     };
-    Ok(!UNATTENDED_INPUTS.contains(&entry.kind.as_str()))
+    Ok(!is_trigger_input(&entry.kind))
 }
 
 /// 已有的答复（没答是 `None`）。

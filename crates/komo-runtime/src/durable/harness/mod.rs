@@ -50,7 +50,7 @@ pub mod tool;
 mod tests;
 
 pub use compaction::{CompactionSettings, CompactionSetup, CompactionTask, SummaryPrompt};
-pub use confirm::{CONFIRM_KIND, ConfirmAnswer, ConfirmVerdict, confirm_address};
+pub use confirm::{CONFIRM_KIND, ConfirmAnswer, ConfirmVerdict, confirm_address, is_trigger_input};
 pub use generation::GenerationTask;
 pub use hooks::{
     AgentHooks, AgentSetup, ContextRequest, HarnessDeps, HarnessSettings, HookError, PromptSection,

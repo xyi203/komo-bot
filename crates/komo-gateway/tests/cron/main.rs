@@ -17,7 +17,7 @@
 //! | 改定义版本 +1、暂停不动版本 | `definition::changing_the_definition_bumps_the_version_but_pausing_does_not` |
 //! | 时区明确保存 | `definition::an_unknown_timezone_is_refused_with_what_to_write`（到期时刻的断言在 `komo-runtime` 的真 tzdb 测试里） |
 //! | 模型 / effort 覆盖按完整配置解析 | `definition::a_model_override_is_a_whole_config_and_leaves_memory_alone` |
-//! | `notify`（结果不再往外投，只验触发状态与写错的值） | `notify::*` |
+//! | `notify`（结果按 always / on_error / never 投进主对话；静默回复不投；写错的值当场拒绝） | `notify::*` |
 //! | 结果去原 Session 查看 | `firing::the_list_shows_the_last_firing_and_the_next_slot` |
 //! | 命令直跑：零模型请求、ok / error / 空输出语义 | `command::*` |
 //!

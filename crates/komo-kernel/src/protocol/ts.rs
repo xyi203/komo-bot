@@ -21,15 +21,15 @@ use serde::{Deserialize, Serialize};
 use ts_rs::{Config, TS};
 
 use super::{
-    CancelRunResponse, ConfigCheckResponse, ConfigEditResponse, ConfigEnvResponse,
-    ConfigModelsResponse, ConfigReloadResponse, ConfigSettingsResponse, ConfigVersionRequest,
-    CreateSessionRequest, CronDeleteResponse, CronListResponse, DefaultModelRequest,
-    DeleteSessionRequest, EmbeddingUpsertRequest, EnvSetRequest, ErrorBody, EventPage, EventQuery,
-    FileDiff, ForkSessionResponse, HealthResponse, InterventionAnswerRequest,
-    InterventionAnswerResponse, InterventionListResponse, ManualCronRunResponse,
-    MatterActionRequest, MatterAddRequest, MatterDetail, MatterListResponse, McpReconnectRequest,
-    McpReconnectResponse, McpServersResponse, MemoryAddRequest, MemoryAddResponse,
-    MemoryClassifyRequest, MemoryDetail, MemoryIndexStatus, MemoryListResponse,
+    CancelRunResponse, ChatListResponse, ConfigCheckResponse, ConfigEditResponse,
+    ConfigEnvResponse, ConfigModelsResponse, ConfigReloadResponse, ConfigSettingsResponse,
+    ConfigVersionRequest, CreateSessionRequest, CronDeleteResponse, CronListResponse,
+    DefaultModelRequest, DeleteSessionRequest, EmbeddingUpsertRequest, EnvSetRequest, ErrorBody,
+    EventPage, EventQuery, FileDiff, ForkSessionResponse, HealthResponse,
+    InterventionAnswerRequest, InterventionAnswerResponse, InterventionListResponse,
+    ManualCronRunResponse, MatterActionRequest, MatterAddRequest, MatterDetail, MatterListResponse,
+    McpReconnectRequest, McpReconnectResponse, McpServersResponse, MemoryAddRequest,
+    MemoryAddResponse, MemoryClassifyRequest, MemoryDetail, MemoryIndexStatus, MemoryListResponse,
     MemoryRevisionRequest, ModelUpsertRequest, ModelsResponse, MonitorListResponse,
     NameSessionRequest, PairCodeResponse, PairRequest, ProviderModelsRequest,
     ProviderModelsResponse, ProviderUpsertRequest, PurgeBlocked, PurgeSessionResponse,
@@ -67,6 +67,7 @@ pub fn export_all(dir: &Path) -> Result<(), String> {
     each(HealthResponse::export_all(&cfg))?;
     each(SessionListResponse::export_all(&cfg))?;
     each(TaskListResponse::export_all(&cfg))?;
+    each(ChatListResponse::export_all(&cfg))?;
     each(EventQuery::export_all(&cfg))?;
     each(EventPage::export_all(&cfg))?;
     each(SseFrame::export_all(&cfg))?;

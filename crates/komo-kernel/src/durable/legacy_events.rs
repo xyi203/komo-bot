@@ -111,7 +111,10 @@ const USER_ENTRY_KIND: &str = "komo.user";
 /// Router 时期落在主线 / 群的线上的展示 entry。Router 已删除、不再写这两种 entry，但 entry 不可变，
 /// 已落盘的仍要投影成消息，所以这里保留读取。
 const MAIN_USER_ENTRY: &str = "main.user";
-const MAIN_REPLY_ENTRY: &str = "main.reply";
+/// 「Komo 往对话里说的一句话」的 entry kind：Router 时期写任务回复，现在 gateway 用它把停住的运行与定时
+/// 结果投进对话（`docs/redesign.md` §2.1）。事件流里是一条 `LineReply`；现在这种 entry 带 `model`（下一轮
+/// 进上下文），Router 时期的没有。
+pub const MAIN_REPLY_ENTRY: &str = "main.reply";
 
 /// 线上展示 entry 的时间：它们没有 `model`，落的时候把时刻写在 `data.at`（毫秒）。2026-11-12 之前落的
 /// 没有这一格，沿用前一条记录的时间。

@@ -583,6 +583,10 @@ pub struct SessionRecord {
     pub created_at: i64,
     #[serde(default)]
     pub changed_at: i64,
+    /// 对话里最后一句话（用户输入受理、Run 以最终回复结束、往对话里投一句话）的时刻（毫秒）。旧记录没有，
+    /// 读成 0；读的一方用 [`SessionRecord::last_message_ms`] 回落。
+    #[serde(default)]
+    pub last_message_at: i64,
     /// 创建请求的幂等键（同一键同一内容是同一个会话）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_key: Option<String>,
@@ -609,9 +613,20 @@ impl SessionRecord {
             title_provisional: false,
             created_at: 0,
             changed_at: 0,
+            last_message_at: 0,
             request_key: None,
             request_hash: None,
         }
+    }
+}
+
+impl SessionRecord {
+    /// 最后一句话的时刻（毫秒）：旧记录没有 `last_message_at`（0），回落到最近一次改动，再回落到创建时刻。
+    pub fn last_message_ms(&self) -> i64 {
+        [self.last_message_at, self.changed_at, self.created_at]
+            .into_iter()
+            .find(|at| *at > 0)
+            .unwrap_or(0)
     }
 }
 
@@ -739,6 +754,25 @@ mod tests {
             serde_json::from_value::<SessionRecord>(value).unwrap(),
             full
         );
+    }
+
+    /// 旧记录没有 `lastMessageAt`：读成 0，读的一方回落到最近一次改动，再回落到创建时刻。
+    #[test]
+    fn an_old_session_record_reads_last_message_as_zero_and_falls_back() {
+        let old = json!({
+            "id": "s1", "lifecycle": "active", "currentBranch": 7, "rootConversation": 2,
+            "createdAt": 10, "changedAt": 20,
+        });
+        let mut record: SessionRecord = serde_json::from_value(old).unwrap();
+        assert_eq!(record.last_message_at, 0);
+        assert_eq!(record.last_message_ms(), 20, "回落到 changedAt");
+        record.changed_at = 0;
+        assert_eq!(record.last_message_ms(), 10, "再回落到 createdAt");
+        record.last_message_at = 30;
+        record.changed_at = 20;
+        assert_eq!(record.last_message_ms(), 30, "有就用它");
+        let value = serde_json::to_value(&record).unwrap();
+        assert_eq!(value["lastMessageAt"], 30);
     }
 
     #[test]

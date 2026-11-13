@@ -948,7 +948,18 @@ impl GenerationTask {
                 let mut boundary = inbox::prepare_boundary(tx, conversation, modes).await?;
                 let mut live = live::load(tx, conversation).await?;
                 let now = tx.now();
+                // 会话行在这一次提交里记下"最后一句话"的时刻（对话列表按它排序）；Session 行不算表写，
+                // 读它不受"表读先于表写"的限制，但 conversation 行要在第一次表写之前读。
+                let said = answer_said(&message);
+                let session = match said {
+                    true => session_of(tx, conversation).await?,
+                    false => None,
+                };
                 let entry = append_assistant(tx, conversation, message).await?;
+                if let Some(mut record) = session {
+                    record.last_message_at = now;
+                    tx.put_session(record);
+                }
                 let result = inbox::apply_boundary(tx, &mut boundary, At::Final, now).await?;
                 let idle = result.users.is_empty() && boundary.inbox.items.is_empty();
                 report::end_answered_run(
@@ -1234,6 +1245,29 @@ fn first_revised(
 }
 
 /// 这条消息里的工具调用 `(id, name)`，按调用顺序。
+/// 这条最终回答有字（只有思考或空回复不算"说了话"）。
+fn answer_said(message: &AssistantMessage) -> bool {
+    message
+        .content
+        .iter()
+        .any(|block| matches!(block, ContentBlock::Text { text, .. } if !text.trim().is_empty()))
+}
+
+/// conversation 所在的 Session 行（还没有行的测试 conversation 是 `None`）。
+async fn session_of(
+    tx: &mut crate::durable::tx::Tx,
+    conversation: ConversationId,
+) -> Result<Option<komo_kernel::durable::SessionRecord>, DurableError> {
+    let Some(session) = tx
+        .conversation(conversation)
+        .await?
+        .and_then(|record| record.session)
+    else {
+        return Ok(None);
+    };
+    tx.session(&session).await
+}
+
 fn entries_tool_calls(message: &AssistantMessage) -> Vec<(String, String)> {
     message
         .tool_calls()

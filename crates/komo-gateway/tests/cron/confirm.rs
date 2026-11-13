@@ -82,6 +82,19 @@ async fn a_cron_run_asks_before_an_outward_mcp_call_and_runs_it_once_approved() 
     );
     assert_eq!(lines(&counter), 0, "答之前不执行");
 
+    // 定时触发的运行停在确认上：往主对话里说一句（说清调什么、能怎么答），主对话在等你。
+    let line =
+        crate::notify::wait_line(&gw, "确认的话", |line| line.contains("mcp__demo__bump")).await;
+    assert!(line.contains("你可以回复：「执行」、「不执行」"), "{line}");
+    assert!(
+        line.starts_with("定时任务「bump-daily」里有一个对外动作等你确认"),
+        "{line}"
+    );
+    let (_, chats) = gw.get_json("/v1/chats").await;
+    assert_eq!(chats["chats"][0]["main"], true);
+    assert_eq!(chats["chats"][0]["waiting"], true, "{chats}");
+    assert_eq!(chats["waitingCount"], 1);
+
     let (code, body) = gw
         .post_json(
             &format!("/v1/interventions/{}/answer", pending.handle),
@@ -93,6 +106,8 @@ async fn a_cron_run_asks_before_an_outward_mcp_call_and_runs_it_once_approved() 
     gw.wait_state(&run, |s| s.is_terminal(), "终态").await;
     assert_eq!(lines(&counter), 1, "批准后只执行一次");
     assert!(gw.interventions().await.is_empty());
+    let (_, chats) = gw.get_json("/v1/chats").await;
+    assert_eq!(chats["waitingCount"], 0, "答复之后不再等你：{chats}");
 
     // 谁、什么时候答的留在 `komo.confirm` 里。
     let core = gw.state().core().unwrap().clone();

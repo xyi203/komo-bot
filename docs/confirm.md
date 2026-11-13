@@ -100,6 +100,10 @@ Call ──prepare──▶ Confirm{arguments, plan, replay, asked_at, deadline}
   回复 /answer <handle> approve 执行，/answer <handle> reject 不执行。
   ```
 
+- **在对话里答复**（2026-11-14，`docs/redesign.md` P14）：聊天渠道删除后，确认卡不再发到飞书，而是作为一句话投进它所在的对话
+  （支线里的投那段支线，主对话派出的与定时触发的投主对话）；操作者在对话里回一句话，由那段对话里的模型调 `komo` 工具的
+  `intervention.answer`（`handle` + `verdict`）提交。**触发器启动的 Run（定时、监听、任务交回、任务会话）里不能答**，只有操作者亲自发消息开始的 Run 能答；
+  confirm 仍只认 `approve` / `reject`。下一条里的 `/answer` 是渠道删除前的写法。
 - 回答入口：聊天 `/answer`（只认操作者）、`komo intervention answer <handle> approve|reject`、
   `POST /v1/interventions/{handle}/answer`。都写 `komo.confirm`，并追加一条 `komo.confirm` entry 记下
   裁决、谁答的（渠道 peer 或 `cli`）、什么时候——事后能查。重复回答返回 `already_answered`。

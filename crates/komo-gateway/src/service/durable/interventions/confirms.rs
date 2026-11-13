@@ -33,7 +33,7 @@ use super::{RunLookup, task_entry};
 const SCAN_PAGE: usize = 512;
 
 /// 工具任务此刻停在 `confirm` 吗。
-fn confirming(record: &TaskRecord) -> bool {
+pub(in crate::service::durable) fn confirming(record: &TaskRecord) -> bool {
     record.kind == TOOL_KIND
         && match &record.state {
             TaskState::Pending { checkpoint } | TaskState::Running { checkpoint } => {

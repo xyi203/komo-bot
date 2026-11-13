@@ -406,7 +406,7 @@ async fn creating_a_session_writes_its_row_root_and_agent_in_one_commit() {
 }
 
 #[tokio::test]
-async fn the_main_session_and_source_sessions_are_found_before_they_are_created() {
+async fn the_main_session_is_found_before_it_is_created() {
     let fx = Fixture::new(FakeLlm::finisher("好")).await;
     let (main, created) = fx.core.main_session("assistant").await.unwrap();
     assert!(created);
@@ -416,75 +416,15 @@ async fn the_main_session_and_source_sessions_are_found_before_they_are_created(
     let (other, created) = fx.core.main_session("coder").await.unwrap();
     assert!(created && other.id != main.id, "每个 Agent 一份主会话");
 
-    let (group, created) = fx
-        .core
-        .session_for_source("chat:telegram:123", "assistant")
-        .await
-        .unwrap();
-    assert!(created);
-    assert_eq!(group.source.as_deref(), Some("chat:telegram:123"));
-    let (same, created) = fx
-        .core
-        .session_for_source("chat:telegram:123", "assistant")
-        .await
-        .unwrap();
-    assert!(!created && same.id == group.id);
-
     let listed = fx.core.list_sessions(false).await.unwrap();
-    assert_eq!(listed.len(), 3);
-    assert_eq!(listed[0].id, other.id.max(group.id.clone()), "最新的在前");
+    assert_eq!(listed.len(), 2);
+    assert_eq!(listed[0].id, other.id, "最新的在前");
     assert!(fx.core.input_refusal(&main.id).await.unwrap().is_none());
     assert!(matches!(
         fx.core.input_refusal("nope").await,
         Err(SessionError::NotFound(_))
     ));
 }
-
-#[tokio::test]
-async fn a_source_finds_its_earliest_active_session_and_never_a_main_one() {
-    let fx = Fixture::new(FakeLlm::finisher("好")).await;
-    let (main, _) = fx.core.main_session("assistant").await.unwrap();
-    let mut made = Vec::new();
-    for _ in 0..3 {
-        made.push(
-            fx.core
-                .create_session(NewSession::new("assistant").source("chat:a"))
-                .await
-                .unwrap(),
-        );
-    }
-    // 最早的那条被删了：不再接消息，找第二早的。
-    let mut gone = made[0].clone();
-    gone.lifecycle = SessionLifecycle::Deleted;
-    fx.core
-        .engine
-        .commit(move |tx| {
-            Box::pin(async move {
-                tx.put_session(gone);
-                Ok(())
-            })
-        })
-        .await
-        .unwrap();
-    let (found, created) = fx
-        .core
-        .session_for_source("chat:a", "assistant")
-        .await
-        .unwrap();
-    assert!(!created);
-    assert_eq!(found.id, made[1].id);
-    // 主会话的来源也是 home，但按来源找不会认它。
-    let (home, created) = fx
-        .core
-        .session_for_source(main.source.as_deref().unwrap(), "assistant")
-        .await
-        .unwrap();
-    assert!(created && home.id != main.id);
-    let (again, created) = fx.core.main_session("assistant").await.unwrap();
-    assert!(!created && again.id == main.id);
-}
-
-// ------------------------------------------------------------------ 导航与分支
 
 #[tokio::test]
 async fn a_leaf_left_in_the_middle_forks_at_its_parent_on_submit() {

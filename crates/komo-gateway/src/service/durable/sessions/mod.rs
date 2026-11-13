@@ -428,23 +428,6 @@ impl DurableCore {
         self.ensure_session(query, |_| true, spec).await
     }
 
-    /// 一个来源（`chat:telegram:123` 这类群 / 话题 / 带话题的私聊）对应的会话：不存在就建一个
-    /// 普通会话。只认还收输入的会话（被删或正在关闭的不再接消息，下一条另开新的）；多条取最早的。
-    /// 返回 `(行, 是否刚建)`。
-    pub async fn session_for_source(
-        &self,
-        source: &str,
-        agent: &str,
-    ) -> Result<(SessionRecord, bool), SessionError> {
-        let spec = NewSession::new(agent).source(source);
-        let query = SessionQuery {
-            source: Some(source.to_owned()),
-            ..SessionQuery::default()
-        };
-        self.ensure_session(query, |record| record.kind != SessionKind::Main, spec)
-            .await
-    }
-
     /// 找到第一个（创建序最早的）还收输入、过 `query` 且 `matches` 的会话；没有就按 `spec` 建。
     /// 同一次提交，所以找与建之间不会有第二个入口插进来。`query` 下推成带索引的条件，提交线里
     /// 只读命中的那几行，不扫全表。

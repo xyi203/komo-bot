@@ -1,7 +1,7 @@
 //! [`DurableCore`]：Durable 模式下 Gateway 手里的新存储与新 harness。
 //!
 //! 一个 `Engine`（提交线 + 任务调度）、一个 `Harness`（受理 submission、生成与工具任务的
-//! 定义）、一个 `Storage`（读不经过线）。HTTP、渠道、cron 这些入口拿它：
+//! 定义）、一个 `Storage`（读不经过线）。HTTP、cron 这些入口拿它：
 //! `state.core()?`（或 `state.durable.as_ref()`）。
 
 use std::collections::HashMap;

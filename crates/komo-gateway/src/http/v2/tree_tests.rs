@@ -181,7 +181,7 @@ async fn forked_messages_and_artifacts_survive_source_purge_without_copying_exec
 
 // ---------------------------------------------------------------- 重启与并发
 
-use crate::service::test_support::{install_crypto, telegram_config};
+use crate::service::test_support::install_crypto;
 use crate::service::{Running, ServiceOptions, start};
 use komo_kernel::traits::LlmClient;
 use komo_llm::{ModelRequest, ModelStream};
@@ -194,12 +194,8 @@ impl Home {
     fn new() -> Home {
         install_crypto();
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("config.toml"), telegram_config("111")).unwrap();
-        std::fs::write(
-            dir.path().join(".env"),
-            "KOMO_LLM_API_KEY=test-key\nTELEGRAM_BOT_TOKEN=test-bot-token\n",
-        )
-        .unwrap();
+        std::fs::write(dir.path().join("config.toml"), config_toml("")).unwrap();
+        std::fs::write(dir.path().join(".env"), "KOMO_LLM_API_KEY=test-key\n").unwrap();
         Home { dir }
     }
 
@@ -208,7 +204,6 @@ impl Home {
         start(ServiceOptions {
             home: Some(self.dir.path().to_path_buf()),
             listen: Some("127.0.0.1:0".into()),
-            channels: Vec::new(),
             llm: Some(llm.clone() as std::sync::Arc<dyn LlmClient>),
             stream: Some(llm as std::sync::Arc<dyn ModelStream>),
             embeddings: None,

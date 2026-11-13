@@ -1,8 +1,7 @@
 //! Durable 的 cron 看客（`docs/storage-durable-d5.md` §4 W3b）：一次触发投出去之后，等它的输入
 //! submission 结算，按 **run 终态帧**（`komo.settled` 经 `legacy_events` 投影出的
-//! `RunCompleted` / `RunFailed` / `RunCancelled`）决定回写什么触发状态、投不投。规则同
-//! [`crate::service::cron_watch`]：`notify` 的 `always` / `on_error` / `never` 过滤**结果**；
-//! 手动 run 没有触发记录，不回写。
+//! `RunCompleted` / `RunFailed` / `RunCancelled`）决定回写什么触发状态。规则同
+//! [`crate::service::cron_watch`]：手动 run 没有触发记录，不回写。结果不再往外投（聊天渠道已删除）。
 //!
 //! 要点：
 //!
@@ -19,14 +18,13 @@ use komo_kernel::cron::FiringStatus;
 use komo_kernel::durable::{WriteState, legacy_ids};
 use komo_kernel::events::EventPayload;
 use komo_kernel::traits::ToolOutputStore;
-use komo_kernel::types::chat::is_silent_reply;
 use komo_kernel::types::ids::{RunId, SessionId};
 use komo_kernel::types::refs::OutputRef;
 use komo_store::{FileToolOutputStore, SessionPaths};
 use tracing::Instrument;
 
 use super::super::feed;
-use crate::service::cron_watch::{Watched, notify, settle};
+use crate::service::cron_watch::{Watched, settle};
 use crate::service::state::GatewayState;
 
 /// 盯一次触发，直到它有结论。同一个 Run 只盯一次。
@@ -52,12 +50,10 @@ pub fn watch(state: Arc<GatewayState>, watched: Watched) {
     );
 }
 
-/// 一次触发的结论：`(状态, 错误, 投递正文, 要不要投)`。
+/// 一次触发的结论：`(状态, 错误)`。
 struct Outcome {
     status: FiringStatus,
     error: Option<String>,
-    text: String,
-    deliver: bool,
 }
 
 async fn follow(state: &Arc<GatewayState>, watched: &Watched) {
@@ -98,34 +94,22 @@ async fn run_outcome(state: &Arc<GatewayState>, session: &SessionId, run: &RunId
             continue;
         }
         match &event.payload {
-            EventPayload::RunCompleted(body) => {
-                let text = body
-                    .final_message
-                    .clone()
-                    .unwrap_or_else(|| "（这一轮没有文字回复）".to_string());
-                // 回的是不说话的记号（S1）：触发照记 `Ok`，不投（同命令型 Job 的空 stdout）。
-                let deliver = !is_silent_reply(&text);
+            EventPayload::RunCompleted(_) => {
                 return Outcome {
                     status: FiringStatus::Ok,
                     error: None,
-                    text,
-                    deliver,
                 };
             }
             EventPayload::RunFailed(body) => {
                 return Outcome {
                     status: FiringStatus::Error,
                     error: Some(body.reason.clone()),
-                    text: format!("任务失败：{}", body.reason),
-                    deliver: true,
                 };
             }
             EventPayload::RunCancelled(_) => {
                 return Outcome {
                     status: FiringStatus::Error,
                     error: Some("已取消".to_string()),
-                    text: "任务已取消。".to_string(),
-                    deliver: true,
                 };
             }
             _ => {}
@@ -138,50 +122,23 @@ fn unreadable(why: &str) -> Outcome {
     Outcome {
         status: FiringStatus::Error,
         error: Some(why.to_string()),
-        text: format!("读不出这次触发的结果（{why}），去原 Session 看细节（§10）"),
-        deliver: true,
     }
 }
 
-/// 命令型 Job：
-///
-/// - 退出 0、stdout 非空：`Ok`，正文是 trim 过的 stdout，要投；
-/// - 退出 0、stdout 为空：`Ok`，不投（看门狗"没事不说话"）；
-/// - 非 0 退出：`Error`，正文是退出码 + stderr 末尾若干行，受 `notify` 过滤；
-/// - 结果读不出来：留一句说得清出处的话，仍然投。
+/// 命令型 Job：退出 0 是 `Ok`；非 0 退出是 `Error`；结果读不出来也是 `Error`。
 async fn command_outcome(
     state: &Arc<GatewayState>,
     session: &SessionId,
     submission: komo_kernel::durable::SubmissionId,
 ) -> Outcome {
     match shell_result(state, session, submission).await {
-        Some(result) if result.exit_code == Some(0) => {
-            let stdout = result.stdout_excerpt.trim();
-            Outcome {
-                status: FiringStatus::Ok,
-                error: None,
-                text: stdout.to_string(),
-                deliver: !stdout.is_empty(),
-            }
-        }
-        Some(result) => {
-            let code = result
-                .exit_code
-                .map_or_else(|| "?".to_string(), |code| code.to_string());
-            let stderr = tail_lines(&result.stderr_excerpt, 20);
-            Outcome {
-                status: FiringStatus::Error,
-                error: None,
-                text: format!("exit={code}\n{stderr}"),
-                deliver: true,
-            }
-        }
-        None => Outcome {
+        Some(result) if result.exit_code == Some(0) => Outcome {
+            status: FiringStatus::Ok,
+            error: None,
+        },
+        Some(_) | None => Outcome {
             status: FiringStatus::Error,
             error: None,
-            text: "命令的执行结果读不出来（超时或结果不明时没有结构化结果），去原 Session 看细节（§10）"
-                .to_string(),
-            deliver: true,
         },
     }
 }
@@ -212,20 +169,9 @@ async fn shell_result(
     serde_json::from_value(verified.body.result).ok()
 }
 
-fn tail_lines(text: &str, n: usize) -> String {
-    let lines: Vec<&str> = text.lines().collect();
-    let start = lines.len().saturating_sub(n);
-    lines[start..].join("\n")
-}
-
-/// 收场：回写触发状态，按 `notify` 投 home chat。
+/// 收场：回写触发状态。
 async fn finish(state: &Arc<GatewayState>, watched: &Watched, outcome: Outcome) {
-    let Outcome {
-        status,
-        error,
-        text,
-        deliver,
-    } = outcome;
+    let Outcome { status, error } = outcome;
     tracing::Span::current().record("komo.cron.outcome", status.as_str());
     if status == FiringStatus::Error && watched.scheduled {
         tracing::event!(
@@ -238,15 +184,4 @@ async fn finish(state: &Arc<GatewayState>, watched: &Watched, outcome: Outcome) 
         );
     }
     settle(state, watched, status, error).await;
-    if deliver {
-        notify(
-            state,
-            watched,
-            status,
-            &watched.session,
-            &watched.run,
-            &text,
-        )
-        .await;
-    }
 }

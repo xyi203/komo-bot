@@ -20,7 +20,7 @@ scripts/install-local.sh       # release build → ~/.local/bin/komo (atomic) �
                                # worktrees share the main checkout's target/
 
 cargo fmt --check
-cargo tree -d                  # duplicate versions must be attributed per channel
+cargo tree -d                  # duplicate versions must be attributed to the dependency that brings them
 cargo build --timings          # rerun at the end of every phase, record in docs
 
 pnpm install                   # root pnpm workspace (docs/clients.md): apps/client + packages/{protocol,api}
@@ -34,7 +34,6 @@ komo init                      # write a minimal commented config.toml + 0600 .e
 komo web [--no-open]           # start Gateway if needed → one-time pairing link → browser cookie session (Gateway serves [web] dir); bare `komo` does the same
 komo gateway [--foreground] | gateway status|stop|restart
 komo config check | config reload
-komo channel list|probe | channel login CHANNEL  # wechat login remains an alias
 komo session list|delete|purge|export SESSION_ID [-o FILE]   # export = pi v3 树形 JSONL
 komo session search 关键词     # 跨会话找回（标题与正文）
 komo monitor list [--all]      # 监听清单（只读）
@@ -56,7 +55,7 @@ komo-kernel    value types, `durable/` (entry · conversation · task · submiss
 komo-store     `durable/`: `Line` (the single commit line), Turso `Storage`, DDL,
                blob writes, id high-water mark — raw `turso`, no toasty.
                Plus `aux.db`: toasty models + *_TABLE_DDL · repositories (cron,
-               deliveries, memory) · tool_output · session_dir / purge (Session directory
+               memory; the retired `deliveries` table keeps its DDL, nothing reads or writes it) · tool_output · session_dir / purge (Session directory
                paths, pre-purge reference check). The only crate that sees
                toasty/turso.
 komo-llm       Model layer: protocol adapters (stateless `ModelStream`, `RoutingStream`,
@@ -79,12 +78,8 @@ komo-agent     AgentProfile → 能力面选择 · skills 发现与目录 · 编
                值类型（AgentProfile/AgentSurface）留在 kernel。
 komo-gateway   axum routes (`http/v2`) · `service/durable` (DurableCore + hooks;
                sessions/ · submit/ · interventions/ · feed/ · background/) · SSE · auth · lock/discovery ·
-               web (Host guard · pairing → cookie · static shell) · launchd/systemd · Dispatcher · generic channel process host ·
-               Notifier · deliveries · intervention rendering · config reload.
-komo-channel  Shared protocol, runner and image inbox, plus feature-gated
-               feishu/telegram/wechat modules and their standalone plugin binaries.
-               Depends on kernel; no runtime, store or Gateway dependency.
-               Gateway selects no platform features; build the core and plugins separately.
+               web (Host guard · pairing → cookie · static shell) · launchd/systemd · web attachment inbox ·
+               intervention rendering · config reload.
 komo-client    HTTP + SSE client · discovery · command output (CLI subcommands).
                Depends on kernel only.
 komo (bin)     clap dispatch only (incl. the hidden `__codemode-worker`, whose
@@ -95,9 +90,7 @@ Dependencies point downward only: `kernel ← llm ← config ← tools ← runti
 `kernel ← store ← memory ← runtime` (memory also uses llm), `runtime ← gateway`,
 `kernel ← agent ← gateway`, and `kernel ← client`, meeting in the bin (which also
 takes `komo-tools` for `__codemode-worker`). Gateway uses llm / config / tools / memory
-types directly. Channel plugins are a separate branch:
-`kernel ← channel`; Gateway uses its common protocol with platform features disabled.
-Build plugins separately with `-p komo-channel --features feishu,telegram,wechat`.
+types directly.
 `gateway` never sees toasty; `runtime` and the four crates under it never
 see axum and never depend on `agent`; only `memory` and `runtime` (besides gateway)
 depend on `store`; `client` knows only protocol types.
@@ -161,14 +154,10 @@ depend on `store`; `client` knows only protocol types.
   只影响之后落的结果；当前 Session 的 `tool-output/` 与 `artifacts/` 是只读根。衰减写成一条
   `komo.decay` entry，只带 `edits`（`replace` 成 `data.decayed` 的短视图），回放按 edits 选视图；
   decay 只改模型视图，不改完整 blob，换不换由缓存账决定（`compaction::decide`），前缀默认只追加。
-- **Channel identity lives in config, not the db** (§11.2): `allow_from` /
-  `home_chat` / `groups` in `config.toml`, credentials in `.env`. No pairing
-  table, no `/sethome`.
 - **The release convention is one string in three places** (§13.6; the macOS desktop packages `Komo-*` + `latest-mac.yml` ride the same tag but never match `komo-*.tar.gz`): the repo
   name, `komo-<os>-<arch>.tar.gz`, and `SHA256SUMS` appear in
   `.github/workflows/release.yml`, `scripts/install.sh`, and
-  `crates/komo/src/update.rs` — change one, change all three. The archive contains `komo`, all three `komo-channel-*` executables and the web shell directory `web/`; install
-  and update prepare a versioned plugin set before swapping the main binary. The tag must
+  `crates/komo/src/update.rs` — change one, change all three. The archive contains only `komo` and the web shell directory `web/`. The tag must
   equal `[workspace.package].version`, or `komo update` refuses the package.
 - **Config hot-reloads** (§3): one `Arc<ConfigSnapshot>` swapped atomically;
   readers read the current snapshot per use (every phase resolves Agent/model by
@@ -181,7 +170,7 @@ depend on `store`; `client` knows only protocol types.
   persisted high-water mark (never reused; not AUTOINCREMENT), closures never `await`
   models/subprocesses/files/users, a storage error fails the whole line. Schema is a
   `*_TABLE_DDL` constant per table with a byte-parity test; additive after the first
-  version. `aux.db` (cron, deliveries, memory) is still toasty + Turso MVCC: DDL
+  version. `aux.db` (cron, memory; `deliveries` is a retired table) is still toasty + Turso MVCC: DDL
   before the pool on a plain connection (MVCC DDL persists nothing), writes in a
   transaction inside `with_write_retry`, string UUIDv7 keys, retired columns keep
   being written empty.
@@ -233,8 +222,8 @@ implemented, unapproved draft, or superseded.
 - Goals and areas: `docs/goals.md` — PARA/GTD-style goals (next action,
   waiting, parked) and areas, memory belongs-to and archive on close; spec
   approved 2026-10-29, implemented in slices P1a–P1e.
-- Channels: `docs/channel-plugins.md` — standalone official plugins, the private-pipe
-  protocol, dynamic channel registration and bundle installation.
+- Channels: **deleted 2026-11-13** (`docs/redesign.md` P17). `docs/archive/channel-plugins.md` is the
+  historical record of the removed plugin design; no chat channel, group or proactive delivery exists.
 - Web client: `docs/web.md` — behavior spec of the web client in `apps/client/`
   (TanStack Start SPA served by the Gateway; dev: `pnpm --filter @komo/client dev`),
   what it reads from the Gateway, and the Gateway gaps found. The W0 prototype
@@ -244,7 +233,7 @@ implemented, unapproved draft, or superseded.
   phones (PWA, then Capacitor); C0–C2 implemented, C3–C4 not; supersedes roadmap-muse §4.4.
 - Redesign: `docs/redesign.md` — approved 2026-11-13, in progress: the operator sees only conversations
   (one main chat plus optional side chats), goals (schedules are a goal's config) and memory; no Router,
-  no chat channels, no groups; komo runs as a remote single-user service with OIDC login and a separately
+  no chat channels (deleted), no groups; komo runs as a remote single-user service with OIDC login and a separately
   deployed web client. **Where it conflicts with the docs below, it wins** until they are rewritten.
 - Tasks: `docs/tasks.md` — make tasks, not sessions, the unit the operator sees
   (one home conversation plus a task list; trims the session-tree surface);

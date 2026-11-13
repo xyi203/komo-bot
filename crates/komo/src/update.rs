@@ -19,13 +19,8 @@ use tokio::io::AsyncWriteExt;
 
 /// 发布仓库；`scripts/install.sh` 的默认值必须与它一致。
 const REPO: &str = "xyi203/komo-bot";
-/// 主程序成员名；同一包另含下面列出的三个渠道插件。
+/// 主程序成员名；同一包另含网页壳目录 `web/`，没有别的可执行文件。
 const BINARY: &str = "komo";
-const PLUGINS: [&str; 3] = [
-    "komo-channel-feishu",
-    "komo-channel-telegram",
-    "komo-channel-wechat",
-];
 /// 包里网页壳的目录名（`docs/clients.md` D5）；装到二进制旁，Gateway 默认从那里读。
 const WEB: &str = "web";
 /// 所有资产共用一份校验和，格式就是 `sha256sum` 的输出。
@@ -47,7 +42,7 @@ pub async fn run(home: &Path) -> Result<String, String> {
 }
 
 /// 换的这一步。`api` 与 `dest` 是参数、不是常量，测试里指向假服务端与临时文件
-/// （渠道那边同一种形状：假服务端靠参数进来，不靠全局开关）。
+/// （假服务端靠参数进来，不靠全局开关）。
 async fn update_against(
     home: &Path,
     client: &reqwest::Client,
@@ -114,7 +109,6 @@ async fn install(
     let _ = std::fs::remove_file(&archive);
     match outcome {
         Ok(()) => {
-            install_plugins(&staged, directory, tag)?;
             install_web(&staged, directory, tag)?;
             std::fs::rename(&staged, dest).map_err(|error| {
                 format!(
@@ -126,7 +120,6 @@ async fn install(
             })
         }
         Err(error) => {
-            let _ = std::fs::remove_dir_all(staged.with_extension("plugins"));
             let _ = std::fs::remove_dir_all(staged.with_extension("web"));
             let _ = std::fs::remove_file(&staged);
             Err(error)
@@ -157,38 +150,11 @@ async fn stage(
     extract(archive, staged)?;
     set_executable(staged)?;
     probe(staged, tag)?;
-    for name in PLUGINS {
-        let path = staged.with_extension("plugins").join(name);
-        set_executable(&path)?;
-        probe(&path, tag)?;
-    }
     Ok(())
 }
 
-fn install_plugins(staged: &Path, directory: &Path, tag: &str) -> Result<(), String> {
-    let version = tag.strip_prefix('v').unwrap_or(tag);
-    let root = directory.join("komo-plugins");
-    std::fs::create_dir_all(&root).map_err(|e| e.to_string())?;
-    let generation = format!(
-        "{version}-update-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|e| e.to_string())?
-            .as_nanos()
-    );
-    std::fs::rename(staged.with_extension("plugins"), root.join(&generation))
-        .map_err(|e| e.to_string())?;
-    let link = root.join(format!("{version}.new-{}", std::process::id()));
-    #[cfg(unix)]
-    std::os::unix::fs::symlink(&generation, &link).map_err(|e| e.to_string())?;
-    #[cfg(not(unix))]
-    return Err("渠道发布包仅支持 macOS / Linux".into());
-    std::fs::rename(link, root.join(version)).map_err(|e| e.to_string())
-}
-
 /// 网页壳：解到 `komo-web/<代次>/`，再把 `<目录>/web` 这个符号链接用一次 `rename` 指过去
-/// （同插件集的做法：Gateway 读到的永远是完整的一份）。旧版本的包没有 `web/`，那就不动现有的。
+/// （Gateway 读到的永远是完整的一份）。旧版本的包没有 `web/`，那就不动现有的。
 fn install_web(staged: &Path, directory: &Path, tag: &str) -> Result<(), String> {
     let source = staged.with_extension(WEB);
     if !source.is_dir() {
@@ -416,13 +382,11 @@ fn sum_for(sums: &str, asset: &str) -> Option<String> {
     })
 }
 
-/// 只解出四个明确命名的普通文件；拒绝重复成员和符号链接。
+/// 只解出主程序与 `web/` 下的成员；拒绝重复成员和符号链接。
 /// 不按包内路径直接 unpack，避免把更新器变成任意路径写入口。
 fn extract(archive: &Path, into: &Path) -> Result<(), String> {
     let file = std::fs::File::open(archive).map_err(|e| e.to_string())?;
     let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(file));
-    let plugins = into.with_extension("plugins");
-    std::fs::create_dir(&plugins).map_err(|e| e.to_string())?;
     let mut found = std::collections::BTreeSet::new();
     for entry in archive.entries().map_err(|e| e.to_string())? {
         let mut entry = entry.map_err(|e| e.to_string())?;
@@ -432,25 +396,18 @@ fn extract(archive: &Path, into: &Path) -> Result<(), String> {
             extract_web_entry(&mut entry, &path, &into.with_extension(WEB))?;
             continue;
         }
-        if name != BINARY && !PLUGINS.contains(&name) {
+        if name != BINARY {
             continue;
         }
         if !entry.header().entry_type().is_file() || !found.insert(name.to_owned()) {
             return Err(format!("发布包成员 {name} 不是唯一的普通文件"));
         }
-        let target = if name == BINARY {
-            into.to_path_buf()
-        } else {
-            plugins.join(name)
-        };
-        let mut out = std::fs::File::create(&target).map_err(|e| e.to_string())?;
+        let mut out = std::fs::File::create(into).map_err(|e| e.to_string())?;
         std::io::copy(&mut entry, &mut out).map_err(|e| e.to_string())?;
         out.sync_all().map_err(|e| e.to_string())?;
     }
-    for name in std::iter::once(BINARY).chain(PLUGINS) {
-        if !found.contains(name) {
-            return Err(format!("发布包里没有 {name}"));
-        }
+    if !found.contains(BINARY) {
+        return Err(format!("发布包里没有 {BINARY}"));
     }
     Ok(())
 }
@@ -621,7 +578,7 @@ mod tests {
         }
     }
 
-    /// 发布包夹具包含主程序与三个插件，均使用可控版本的测试程序。
+    /// 发布包夹具只含主程序，使用可控版本的测试程序。
     fn release_archive(binary: &str) -> Vec<u8> {
         let encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
         let mut builder = tar::Builder::new(encoder);
@@ -629,11 +586,9 @@ mod tests {
         header.set_size(binary.len() as u64);
         header.set_mode(0o755);
         header.set_cksum();
-        for name in std::iter::once(BINARY).chain(PLUGINS) {
-            builder
-                .append_data(&mut header, name, binary.as_bytes())
-                .expect("打包");
-        }
+        builder
+            .append_data(&mut header, BINARY, binary.as_bytes())
+            .expect("打包");
         builder.into_inner().expect("收尾").finish().expect("压缩")
     }
 
@@ -645,11 +600,9 @@ mod tests {
         header.set_size(binary.len() as u64);
         header.set_mode(0o755);
         header.set_cksum();
-        for name in std::iter::once(BINARY).chain(PLUGINS) {
-            builder
-                .append_data(&mut header, name, binary.as_bytes())
-                .expect("打包");
-        }
+        builder
+            .append_data(&mut header, BINARY, binary.as_bytes())
+            .expect("打包");
         let mut dir = tar::Header::new_gnu();
         dir.set_entry_type(tar::EntryType::Directory);
         dir.set_size(0);

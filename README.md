@@ -1,7 +1,7 @@
 # komo
 
-Rust 写的个人 Agent 框架：一个持有数据目录的 Gateway 进程，加上网页（`komo web`）与飞书 /
-Telegram / 微信三个聊天入口。
+Rust 写的个人 Agent 框架：一个持有数据目录的 Gateway 进程，加上网页（`komo web`）作为对话入口（飞书 / Telegram /
+微信聊天渠道已于 2026-11-13 删除）。
 
 设计文档是唯一真相：[`docs/komo_bot.md`](docs/komo_bot.md)。
 
@@ -16,7 +16,7 @@ curl -fsSL https://raw.githubusercontent.com/xyi203/komo-bot/main/scripts/instal
 默认装到 `~/.local/bin/komo`（不用 sudo；`--prefix` 可改）。安装脚本在
 [`scripts/install.sh`](scripts/install.sh)；2026-10-15 之前的地址 `…/main/install.sh` 已经失效。
 
-或者自己编（不需要 openssl-devel：微信渠道走 vendored rustls，见 [`docs/komo_bot.md`](docs/komo_bot.md) §13.4）：
+或者自己编（不需要 openssl-devel，见 [`docs/komo_bot.md`](docs/komo_bot.md) §13.4）：
 
 ```bash
 cargo build --release

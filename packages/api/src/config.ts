@@ -1,10 +1,8 @@
-// 设置（docs/web.md §15）用到的读写：配置检查、配置 / 环境变量 / 模型三份视图、记忆索引、MCP、渠道。
+// 设置（docs/web.md §15）用到的读写：配置检查、配置 / 环境变量 / 模型三份视图、记忆索引、MCP。
 //
 // 三份视图（`models` / `settings` / `env`）共用一个 `version`：任何一次写都带读到的 version，文件在别处被改过 Gateway 回 409。
 // 写的回应（`ConfigEditResponse`）带回新的三份视图，`applyConfigEdit` 把它们写回各自的缓存。
 import type {
-  ChannelProbeResponse,
-  ChannelsResponse,
   ConfigCheckResponse,
   ConfigEditResponse,
   ConfigEnvResponse,
@@ -31,7 +29,6 @@ export const configKeys = {
   env: ["config", "env"] as const,
   memoryIndex: ["config", "memory-index"] as const,
   mcp: ["config", "mcp"] as const,
-  channels: ["config", "channels"] as const,
 };
 
 // 读
@@ -41,7 +38,6 @@ export const fetchConfigSettings = () => get<ConfigSettingsResponse>("/v1/config
 export const fetchConfigEnv = () => get<ConfigEnvResponse>("/v1/config/env");
 export const fetchMemoryIndexStatus = () => get<MemoryIndexStatus>("/v1/memory-index");
 export const fetchMcp = () => get<McpServersResponse>("/v1/mcp");
-export const fetchChannels = () => get<ChannelsResponse>("/v1/channels");
 
 // 写
 export const reloadConfig = () => post<ConfigReloadResponse>("/v1/config/reload");
@@ -55,7 +51,6 @@ export const deleteEnv = (version: string, name: string) =>
 export const rebuildMemoryIndex = () => post<RebuildIndexResponse>("/v1/memory-index/rebuild");
 export const reconnectMcp = (servers: string[] = []) => post<McpReconnectResponse>("/v1/mcp/reconnect", { servers });
 export const disconnectMcp = (servers: string[]) => post<McpReconnectResponse>("/v1/mcp/disconnect", { servers });
-export const probeChannel = (channel: string) => post<ChannelProbeResponse>(`/v1/channels/${enc(channel)}/probe`);
 
 /** 写完把回应里新的三份视图写回缓存，并让配置检查与 `/v1/models`（输入框下的模型菜单）重读。 */
 export function applyConfigEdit(queryClient: QueryClient, response: ConfigEditResponse) {
@@ -96,9 +91,6 @@ export function useMemoryIndexStatus() {
 }
 export function useMcp() {
   return useQuery({ queryKey: configKeys.mcp, queryFn: fetchMcp, ...fresh });
-}
-export function useChannels() {
-  return useQuery({ queryKey: configKeys.channels, queryFn: fetchChannels, ...fresh });
 }
 
 /** Gateway 的 `/healthz`，附上这一圈请求的往返时间（浏览器 → Gateway）。 */

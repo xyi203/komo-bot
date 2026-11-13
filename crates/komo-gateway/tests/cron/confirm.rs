@@ -6,7 +6,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use komo_kernel::protocol::http::{InterventionKind, InterventionVerdict};
-use komo_kernel::types::chat::Outbound;
 use komo_kernel::types::turn::RoundInput;
 use komo_runtime::durable::harness::{ConfirmAnswer, ConfirmVerdict, confirm_address};
 
@@ -21,7 +20,7 @@ fn daily() -> serde_json::Value {
     })
 }
 
-/// 默认的 home（Telegram 配了 home chat）加一台 `demo` 服务器，`bump` 声明为对外。
+/// 默认的 home 加一台 `demo` 服务器，`bump` 声明为对外。
 fn home_with_outward() -> (Home, PathBuf) {
     let home = Home::new();
     let server = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/mcp/server.py");
@@ -82,18 +81,6 @@ async fn a_cron_run_asks_before_an_outward_mcp_call_and_runs_it_once_approved() 
         vec![InterventionVerdict::Approve, InterventionVerdict::Reject]
     );
     assert_eq!(lines(&counter), 0, "答之前不执行");
-
-    let sender = Arc::clone(&gw.home);
-    let handle = pending.handle.clone();
-    eventually("确认卡投到 home chat", move || {
-        sender.sent().iter().any(|message| {
-            matches!(&message.outbound, Outbound::NeedsAttention { reason, .. }
-                if reason.contains("mcp__demo__bump")
-                    && reason.contains("定时任务「bump-daily」")
-                    && reason.contains(&format!("/answer {handle} approve")))
-        })
-    })
-    .await;
 
     let (code, body) = gw
         .post_json(

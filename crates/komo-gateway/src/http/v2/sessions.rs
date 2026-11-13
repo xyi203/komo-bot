@@ -1,6 +1,6 @@
 //! Durable 模式的 `/v1/sessions`（`docs/storage-durable-d5.md` §4 W2a）：create / list / detail /
 //! submit，加 `/v1/home-session`。`resume` 与 `boundary` 两条路由只有 TUI 调，2026-11-12 随 TUI 删除
-//! （渠道的 `/new` 走服务层 `DurableCore::boundary`，不经 HTTP）。
+//! （`DurableCore::boundary` 现在没有生产调用方）。
 //!
 //! delete / purge（W4a，`service::durable::lifecycle`）；`/v1/reconcile` 在 `interventions`；事件流是 W2b 的。
 //!

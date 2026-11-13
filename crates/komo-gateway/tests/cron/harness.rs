@@ -1,10 +1,7 @@
 //! 这一组测试要的那一台 Gateway：共用件在
-//! `komo_gateway::service::test_support::harness`（真数据目录、真 `service::start`、内存
-//! 发送口、脚本化模型），这里只留 Cron 特有的那几个——扫一轮、把槽位拨到过去、读触发
+//! `komo_gateway::service::test_support::harness`（真数据目录、真 `service::start`、
+//! 脚本化模型），这里只留 Cron 特有的那几个——扫一轮、把槽位拨到过去、读触发
 //! 记录、停住一次触发。
-//!
-//! 数据目录的默认配置（[`Home`]）里 Telegram 是**配了 home chat 的**：无人值守的介入
-//! 只有这一个出口（§11.4）。
 
 #![allow(dead_code, unused_imports)]
 
@@ -13,8 +10,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use async_trait::async_trait;
 use komo_kernel::cron::CronJob;
-use komo_kernel::traits::Inbound;
-use komo_kernel::types::chat::ChannelPlatform;
 use komo_kernel::types::ids::{CronJobId, RunId};
 use komo_kernel::types::turn::{LlmError, Round};
 

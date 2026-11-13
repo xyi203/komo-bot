@@ -21,15 +21,15 @@ use serde::{Deserialize, Serialize};
 use ts_rs::{Config, TS};
 
 use super::{
-    CancelRunResponse, ChannelProbeResponse, ChannelsResponse, ConfigCheckResponse,
-    ConfigEditResponse, ConfigEnvResponse, ConfigModelsResponse, ConfigReloadResponse,
-    ConfigSettingsResponse, ConfigVersionRequest, CreateSessionRequest, CronDeleteResponse,
-    CronListResponse, DefaultModelRequest, DeleteSessionRequest, EmbeddingUpsertRequest,
-    EnvSetRequest, ErrorBody, EventPage, EventQuery, FileDiff, ForkSessionResponse, HealthResponse,
-    InterventionAnswerRequest, InterventionAnswerResponse, InterventionListResponse,
-    ManualCronRunResponse, MatterActionRequest, MatterAddRequest, MatterDetail, MatterListResponse,
-    McpReconnectRequest, McpReconnectResponse, McpServersResponse, MemoryAddRequest,
-    MemoryAddResponse, MemoryClassifyRequest, MemoryDetail, MemoryIndexStatus, MemoryListResponse,
+    CancelRunResponse, ConfigCheckResponse, ConfigEditResponse, ConfigEnvResponse,
+    ConfigModelsResponse, ConfigReloadResponse, ConfigSettingsResponse, ConfigVersionRequest,
+    CreateSessionRequest, CronDeleteResponse, CronListResponse, DefaultModelRequest,
+    DeleteSessionRequest, EmbeddingUpsertRequest, EnvSetRequest, ErrorBody, EventPage, EventQuery,
+    FileDiff, ForkSessionResponse, HealthResponse, InterventionAnswerRequest,
+    InterventionAnswerResponse, InterventionListResponse, ManualCronRunResponse,
+    MatterActionRequest, MatterAddRequest, MatterDetail, MatterListResponse, McpReconnectRequest,
+    McpReconnectResponse, McpServersResponse, MemoryAddRequest, MemoryAddResponse,
+    MemoryClassifyRequest, MemoryDetail, MemoryIndexStatus, MemoryListResponse,
     MemoryRevisionRequest, ModelUpsertRequest, ModelsResponse, MonitorListResponse,
     NameSessionRequest, PairCodeResponse, PairRequest, ProviderModelsRequest,
     ProviderModelsResponse, ProviderUpsertRequest, PurgeBlocked, PurgeSessionResponse,
@@ -128,8 +128,6 @@ pub fn export_all(dir: &Path) -> Result<(), String> {
     each(McpServersResponse::export_all(&cfg))?;
     each(McpReconnectRequest::export_all(&cfg))?;
     each(McpReconnectResponse::export_all(&cfg))?;
-    each(ChannelsResponse::export_all(&cfg))?;
-    each(ChannelProbeResponse::export_all(&cfg))?;
 
     let names: BTreeSet<String> = std::fs::read_dir(dir)
         .map_err(|error| error.to_string())?

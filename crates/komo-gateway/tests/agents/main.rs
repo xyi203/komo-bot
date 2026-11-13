@@ -146,8 +146,7 @@ fn write_call(round: u32, path: &str) -> Result<Round, LlmError> {
 // ---------------------------------------------------------------- 后台任务（`docs/background-tasks.md`）
 
 /// home 用的就是它自己的 Agent：能派后台任务（`task`），也能自己动手。两个模型：
-/// `main` 是默认，`cheap` 给任务用。渠道是 Telegram（操作者 111，home chat 也是 111），
-/// DM 走真 Dispatcher，不绕过它。
+/// `main` 是默认，`cheap` 给任务用。
 fn tasks_config() -> String {
     r#"
 default_agent = "assistant"
@@ -155,11 +154,6 @@ default_agent = "assistant"
 [agents.assistant]
 instructions = "你是助手（assistant 那一版身份）。"
 tools = ["task", "read", "bash", "unsure", "gate"]
-
-[channels.telegram]
-enabled = true
-allow_from = [111]
-home_chat = 111
 
 [model.main]
 type = "completion"
@@ -214,21 +208,11 @@ impl TasksLlm {
     }
 }
 
-/// 宿主附上的渠道篇幅附注（`docs/komo_bot.md` §11.2）：不是用户说的话，脚本按用户的话挑回答时跳过。
-fn is_host_note(message: &komo_kernel::types::turn::ReplayMessage) -> bool {
-    message
-        .text
-        .as_deref()
-        .is_some_and(|text| text.starts_with(komo_agent::context::channel::CHANNEL_NOTE_HEAD))
-}
-
 fn last_user_text(req: &TurnRequest) -> String {
     req.messages
         .iter()
         .rev()
-        .find(|message| {
-            message.role == komo_kernel::types::turn::Role::User && !is_host_note(message)
-        })
+        .find(|message| message.role == komo_kernel::types::turn::Role::User)
         .and_then(|message| message.text.clone())
         .unwrap_or_default()
 }
@@ -248,7 +232,7 @@ fn answered_since_last_user(req: &TurnRequest) -> bool {
     req.messages
         .iter()
         .rev()
-        .take_while(|message| message.role != Role::User || is_host_note(message))
+        .take_while(|message| message.role != Role::User)
         .any(|message| message.role == Role::Tool)
 }
 

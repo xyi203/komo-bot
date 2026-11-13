@@ -47,8 +47,6 @@ default = "main"
 [memory]
 enabled = false
 
-[channels.telegram]
-enabled = false
 "#,
     )
     .expect("写 config.toml");

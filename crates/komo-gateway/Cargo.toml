@@ -8,7 +8,6 @@ license.workspace = true
 # §13.4：gateway 看不到 toasty 类型（store 只通过 runtime 的构造函数暴露）。
 [dependencies]
 komo-kernel = { workspace = true }
-komo-channel = { workspace = true }
 komo-runtime = { workspace = true }
 komo-llm = { workspace = true }
 komo-config = { workspace = true }
@@ -40,7 +39,6 @@ tempfile = { workspace = true, optional = true }
 rustls = { workspace = true, optional = true }
 
 [features]
-# Platform features belong to komo-channel. Gateway production selects none.
 default = []
 # W5：集成测试（`tests/recovery`）要的故障注入口。只开这个 feature 时编进来的是
 # `service::test_support` 里的注入表，生产构建里那张表根本不存在。
@@ -55,7 +53,6 @@ test-support = [
 
 
 [dev-dependencies]
-komo-channel = { workspace = true, features = ["test-support", "feishu", "telegram", "wechat"] }
 # 自依赖：只给 test / bench 目标打开 `test-support`，`cargo test -p komo-gateway` 因此
 # 不必带 `--features`，而 `cargo build` 仍然看不到注入口。
 komo-gateway = { path = ".", features = ["test-support"] }

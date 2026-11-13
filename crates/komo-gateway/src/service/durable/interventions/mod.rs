@@ -39,40 +39,32 @@ pub mod confirms;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::Duration;
 
 use komo_kernel::durable::storage::TaskQuery;
 use komo_kernel::durable::task::BlockedReason;
 use komo_kernel::durable::{
-    ConversationId, Cursor, DocumentAddress, DocumentScope, EntryId, ScanOrder, SessionKind,
-    SessionLifecycle, SessionRecord, Storage, StorageWrite, TaskId, TaskOutcome, TaskRecord,
-    TaskState, TaskStatus, legacy_ids,
+    ConversationId, Cursor, DocumentAddress, DocumentScope, EntryId, ScanOrder, SessionLifecycle,
+    SessionRecord, Storage, StorageWrite, TaskId, TaskOutcome, TaskRecord, TaskState, TaskStatus,
+    legacy_ids,
 };
 use komo_kernel::protocol::http::{
     InterventionAnswerResponse, InterventionDetail, InterventionKind, InterventionListQuery,
     InterventionSummary, InterventionVerdict,
 };
-use komo_kernel::traits::{GatewayError, Shutdown};
-use komo_kernel::types::chat::{ChannelPeer, DeliveryTarget, Outbound};
+use komo_kernel::traits::GatewayError;
 use komo_kernel::types::ids::{RunId, SessionId, ToolCallId};
 use komo_runtime::durable::TaskInspectionState;
 use komo_runtime::durable::harness::{COMPACTION_KIND, GENERATION_KIND, TOOL_KIND};
 use serde_json::{Value, json};
-use tokio::sync::mpsc;
 
 use super::DurableCore;
-use super::background::watch::{Source, source_of_entry};
-use super::sessions::tree::load_tree;
 use super::sessions::{SessionError, time_of};
-use crate::service::state::GatewayState;
 
 /// Session 级 document 的种类：key 是 komo Session ID，值 `{ abandoned: [任务 ID] }`。
 pub const ACK_KIND: &str = "komo.interventions.ack";
 const ACK_VERSION: u32 = 1;
 
 const SCAN_PAGE: usize = 512;
-/// 轮询停机旗子的间隔（`Shutdown` 只是个标志，不能 await）。
-pub(super) const SHUTDOWN_POLL: Duration = Duration::from_millis(250);
 
 pub fn ack_address(session: &str) -> DocumentAddress {
     DocumentAddress {
@@ -100,8 +92,6 @@ pub struct FaultIndex {
     state: Mutex<IndexState>,
     /// 全扫只做一次；并发的第一次调用排队等它。
     loading: tokio::sync::Mutex<()>,
-    /// 投递任务的接收口（有人订阅才有）。
-    announce: Mutex<Option<mpsc::UnboundedSender<TaskRecord>>>,
 }
 
 #[derive(Default)]
@@ -120,30 +110,12 @@ impl FaultIndex {
             if fault_message(record).is_none() {
                 continue;
             }
-            let fresh = self
-                .state
+            self.state
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .tasks
-                .insert(record.id.get(), record.clone())
-                .is_none();
-            if fresh
-                && let Some(sender) = self
-                    .announce
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .as_ref()
-            {
-                let _ = sender.send(record.clone());
-            }
+                .insert(record.id.get(), record.clone());
         }
-    }
-
-    /// 订阅"新出现的 faulted 任务"（给 [`spawn_attention`]；只有最后一个订阅者收得到）。
-    fn subscribe(&self) -> mpsc::UnboundedReceiver<TaskRecord> {
-        let (sender, receiver) = mpsc::unbounded_channel();
-        *self.announce.lock().unwrap_or_else(PoisonError::into_inner) = Some(sender);
-        receiver
     }
 
     async fn ensure_loaded(&self, storage: &dyn Storage) -> Result<(), SessionError> {
@@ -738,175 +710,6 @@ impl RunLookup {
             .find(|event| event.seq == wanted)
             .and_then(|event| event.run.clone())
     }
-}
-
-// ------------------------------------------------------------------- NeedsAttention 投递
-
-/// 起 NeedsAttention 的投递（`service::start` 调，**在 `core.resume()` 之前**）：订阅是同步建好的，
-/// 之后出现的 faulted 任务一个不漏；任务里先回放已有的（上一代崩在投递前），再等新的。
-pub fn spawn_attention(state: &Arc<GatewayState>, shutdown: &Shutdown) {
-    let Ok(core) = state.core() else { return };
-    let mut receiver = core.faults.subscribe();
-    let weak = Arc::downgrade(state);
-    let shutdown = shutdown.clone();
-    tokio::spawn(async move {
-        // 回放：全部未确认的 faulted 任务（`deliver_once` 幂等，投过的原样返回）。
-        if let Some(state) = weak.upgrade()
-            && let Ok(core) = state.core()
-        {
-            match core.faulted(None).await {
-                Ok(all) => {
-                    for faulted in all {
-                        announce(&state, &faulted).await;
-                    }
-                }
-                Err(error) => tracing::warn!(%error, "读不出 faulted 任务，启动时的提醒补投没做成"),
-            }
-            // 崩溃循环保护只在开库时停住任务，所以启动时投一次就是"报告一次"（键按任务与起跑时刻，幂等）。
-            match core.stopped(None).await {
-                Ok(all) => {
-                    for stopped in all {
-                        announce(&state, &stopped).await;
-                    }
-                }
-                Err(error) => tracing::warn!(%error, "读不出停住的任务，启动时的提醒没投"),
-            }
-        }
-        loop {
-            let received = tokio::time::timeout(SHUTDOWN_POLL, receiver.recv()).await;
-            if shutdown.is_cancelled() {
-                return;
-            }
-            let record = match received {
-                Err(_) => continue,
-                Ok(Some(record)) => record,
-                Ok(None) => return,
-            };
-            let Some(state) = weak.upgrade() else { return };
-            let Ok(core) = state.core() else { return };
-            match core.find_faulted(&record.id.to_string()).await {
-                Ok(Some(faulted)) => {
-                    let acks = acked(&*core.storage, &faulted.session.id)
-                        .await
-                        .unwrap_or_default();
-                    // 先确认再投的竞争不会发生（刚出现的任务还没人答），但 purge 后的会话要跳过。
-                    if matches!(
-                        faulted.session.lifecycle,
-                        SessionLifecycle::Active | SessionLifecycle::Closing
-                    ) && !acks.contains(&faulted.task.id.get())
-                    {
-                        announce(&state, &faulted).await;
-                    }
-                }
-                Ok(None) => {}
-                Err(error) => tracing::warn!(%error, "faulted 任务的提醒没投出去"),
-            }
-        }
-    });
-}
-
-/// 一个 faulted 任务该提醒给谁：来源对端（有的话）+ home chat。
-async fn announce(state: &Arc<GatewayState>, faulted: &Faulted) {
-    let Ok(core) = state.core() else { return };
-    let summary = core.summary_of(faulted, &mut RunLookup::default()).await;
-    let key = crate::notifier::intervention_key(&summary);
-    let label = match faulted.session.kind {
-        SessionKind::Cron => faulted
-            .session
-            .title
-            .as_deref()
-            .map(|name| format!("定时任务「{name}」：")),
-        SessionKind::Task => core
-            .task_label(&faulted.session.id)
-            .await
-            .map(|label| format!("{label}：")),
-        _ => None,
-    }
-    .unwrap_or_default();
-    let reason = if faulted.stopped {
-        format!("{label}{}停住了：{}", faulted.what(), faulted.message)
-    } else {
-        format!("{label}{}出错：{}", faulted.what(), faulted.message)
-    };
-    let message = Outbound::NeedsAttention {
-        session: SessionId::from_raw(faulted.session.id.clone()),
-        run: summary
-            .run
-            .clone()
-            .unwrap_or_else(|| RunId::from_raw(faulted.handle())),
-        reason,
-    };
-    deliver_attention(state, &faulted.session, message, &key, &faulted.handle()).await;
-}
-
-/// 一条提醒投给谁：来源对端（有的话，不是 home 才单投）+ home chat，按 `key` 幂等。
-pub(super) async fn deliver_attention(
-    state: &Arc<GatewayState>,
-    session: &SessionRecord,
-    message: Outbound,
-    key: &str,
-    handle: &str,
-) {
-    let Ok(core) = state.core() else { return };
-    let peer = attention_peer(core, session).await;
-    let mut delivered_to_source = false;
-    if let Some(peer) = peer {
-        let is_home = state
-            .notifier
-            .home_targets()
-            .iter()
-            .any(|target| target.peer == peer);
-        if !is_home
-            && let Err(error) = state
-                .notifier
-                .log()
-                .deliver_once(&DeliveryTarget::to_peer(peer), message.clone(), key)
-                .await
-        {
-            tracing::warn!(%error, "提醒投不到来源会话");
-        }
-        delivered_to_source = !is_home;
-    }
-    if let Err(error) = state.notifier.deliver_home_once(message, key).await {
-        if delivered_to_source {
-            tracing::debug!(%error, "没有 home chat，只提醒了来源会话");
-        } else {
-            tracing::warn!(%error, %handle, "没有 home chat 也没有来源会话，这条没人看得见");
-        }
-    }
-}
-
-/// 这个 Session 的"来源对端"：渠道会话（`source = chat:{peer}`）就是那个 peer；主会话取当前分支路径上
-/// 最近一条带 peer 的用户输入；任务会话沿父会话找一层。TUI / HTTP / cron 的会话没有。
-async fn attention_peer(core: &DurableCore, session: &SessionRecord) -> Option<ChannelPeer> {
-    if let Some(peer) = session
-        .source
-        .as_deref()
-        .and_then(|source| source.strip_prefix("chat:"))
-        .and_then(ChannelPeer::parse)
-    {
-        return Some(peer);
-    }
-    if session.kind == SessionKind::Task {
-        let parent = session.parent_session.as_deref()?;
-        let parent = core.storage.session(parent).await.ok()??;
-        if parent.kind == SessionKind::Task {
-            return None;
-        }
-        return Box::pin(attention_peer(core, &parent)).await;
-    }
-    if session.kind != SessionKind::Main {
-        return None;
-    }
-    let tail = core.tail_entry(session.current_branch).await.ok()??;
-    let tree = load_tree(&*core.storage, &session.id).await.ok()?;
-    tree.path(tail)
-        .into_iter()
-        .rev()
-        .find_map(|record| match source_of_entry(record) {
-            Source::Peer(peer) => Some(peer),
-            _ => None,
-        })
 }
 
 #[cfg(test)]

@@ -92,8 +92,7 @@ impl EventHub {
 
     /// 这个 Session 现在有几个客户端在看（TUI / HTTP 的 SSE 连接）。
     ///
-    /// 介入的周期兜底要问它：屏幕前有人看着时，介入只弹在他面前——home chat 那条消息
-    /// 是一次网络往返（实测几秒到几十秒），人在看着的时候它只会**晚到**，还多一份噪音。
+    /// 介入的周期兜底要问它：屏幕前有人看着时，介入只弹在他面前。
     pub fn viewers(&self, session: &SessionId) -> usize {
         self.viewers
             .lock()

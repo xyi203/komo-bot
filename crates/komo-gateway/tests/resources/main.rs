@@ -35,11 +35,6 @@ default_agent = "assistant"
 
 {agents}
 
-[channels.telegram]
-enabled = true
-allow_from = [111]
-home_chat = 111
-
 [model.main]
 type = "completion"
 api_backend = "responses"

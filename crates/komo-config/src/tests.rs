@@ -4,54 +4,6 @@ use super::testing::{Fixture, SECRET_VALUE, write};
 use super::*;
 
 #[test]
-fn an_external_channel_loads_without_core_registration_and_tracks_its_credential() {
-    let fixture = Fixture::valid();
-    let text = format!(
-        "{}\n[channels.discord]\nenabled = true\nallow_from = [\"operator\"]\nhome_chat = \"home\"\n[channels.discord.plugin]\ncommand = \"/opt/komo-channel-discord\"\nenv = [\"DISCORD_BOT_TOKEN\"]\n",
-        Fixture::config_text("chat-a", "medium")
-    );
-    write(&fixture.sources().config, &text);
-    write(
-        &fixture.sources().env,
-        &format!("{}DISCORD_BOT_TOKEN=first\n", Fixture::env_text()),
-    );
-    let loaded = load_config(&fixture.options()).unwrap();
-    assert!(loaded.issues.is_empty(), "{:?}", loaded.issues);
-    let platform = komo_kernel::types::chat::ChannelPlatform::parse("discord").unwrap();
-    assert!(loaded.snapshot.channels.get(platform).unwrap().enabled);
-    let before = loaded.snapshot.credentials["DISCORD_BOT_TOKEN"].clone();
-    write(
-        &fixture.sources().env,
-        &format!("{}DISCORD_BOT_TOKEN=second\n", Fixture::env_text()),
-    );
-    let after = load_config(&fixture.options()).unwrap();
-    assert_ne!(before, after.snapshot.credentials["DISCORD_BOT_TOKEN"]);
-    assert!(
-        loaded
-            .snapshot
-            .diff(&after.snapshot)
-            .iter()
-            .any(|key| key.as_str() == "credentials.DISCORD_BOT_TOKEN")
-    );
-}
-
-#[test]
-fn channel_login_can_bootstrap_before_model_configuration_is_valid() {
-    let fixture = Fixture::valid();
-    write(
-        &fixture.sources().config,
-        "[channels.wechat]\nenabled = true\n",
-    );
-    let (plugin, _) = channel_login_config(
-        fixture.sources().config.parent().unwrap(),
-        &komo_kernel::types::chat::ChannelPlatform::Wechat,
-    )
-    .unwrap();
-    assert!(plugin.is_none());
-    assert!(load_config(&fixture.options()).is_err());
-}
-
-#[test]
 fn a_valid_directory_loads_into_a_snapshot() {
     let fixture = Fixture::valid();
     let loaded = load_config(&fixture.options()).unwrap();
@@ -67,10 +19,6 @@ fn a_valid_directory_loads_into_a_snapshot() {
             .unwrap()
             .dimensions,
         Some(1024)
-    );
-    assert_eq!(
-        loaded.snapshot.channels.feishu.allow_from,
-        vec![komo_kernel::types::chat::PeerId::new("ou_operator")]
     );
     assert!(loaded.issues.is_empty(), "{:?}", loaded.issues);
     let chat = loaded.snapshot.model_catalog.get("chat").unwrap();
@@ -383,16 +331,6 @@ fn a_missing_credential_variable_refuses_the_load() {
     );
 }
 
-#[test]
-fn a_malformed_channel_id_refuses_the_load() {
-    let fixture = Fixture::valid();
-    let text = Fixture::config_text("chat-a", "medium").replace("ou_operator", "operator");
-    write(&fixture.sources().config, &text);
-    let error = load_config(&fixture.options()).unwrap_err();
-    let keys: Vec<&str> = error.issues().iter().map(|i| i.key.as_str()).collect();
-    assert_eq!(keys, vec!["channels.feishu.allow_from"]);
-}
-
 /// 不认识的键**不让加载失败**，但每一个都作为警告列出来（§3）：升级前后多一个、少一个键
 /// 是常态，为此整份配置装不上代价太大；可拼错的键也不能悄悄消失。
 #[test]
@@ -462,23 +400,66 @@ fn keys_retired_with_the_router_still_load_with_a_warning() {
     }
 }
 
-/// 退役的 `groups` 名单：旧配置里留着它照常加载，只是一条警告（群里 @ 就响应，没有名单了）。
+/// 聊天渠道删除后（P17）`[channels.*]` 整段退役：旧配置里留着它们照常加载，里面每个键各一条
+/// "不认识这个键，已忽略"的警告（`komo config check` 会列出来），值一个都不读，`.env` 里的渠道凭证
+/// 也不再被引用。
 #[test]
-fn a_retired_groups_list_still_loads_with_a_warning() {
+fn keys_retired_with_the_chat_channels_still_load_with_a_warning() {
     let fixture = Fixture::valid();
     let mut text = Fixture::config_text("chat-a", "medium");
-    text.push_str("groups = [\"oc_x\"]\n");
+    text.push_str(
+        "\n[channels.feishu]\nenabled = true\nallow_from = [\"ou_operator\"]\nallow_tenant = true\n\
+         home_chat = \"oc_home\"\ngroups = [\"oc_x\"]\n\
+         [channels.telegram]\nenabled = true\nallow_from = [123456789]\nhome_chat = 123456789\n\
+         [channels.discord]\nenabled = true\n[channels.discord.plugin]\ncommand = \"/opt/komo-channel-discord\"\n",
+    );
     write(&fixture.sources().config, &text);
+    write(
+        &fixture.sources().env,
+        &format!(
+            "{}FEISHU_APP_ID=cli_x\nFEISHU_APP_SECRET=s\nTELEGRAM_BOT_TOKEN=t\n",
+            Fixture::env_text()
+        ),
+    );
 
     let loaded = load_config(&fixture.options()).expect("退役的键不挡加载");
+    for key in [
+        "channels.feishu.enabled",
+        "channels.feishu.allow_from",
+        "channels.feishu.allow_tenant",
+        "channels.feishu.home_chat",
+        "channels.feishu.groups",
+        "channels.telegram.enabled",
+        "channels.telegram.allow_from",
+        "channels.telegram.home_chat",
+        "channels.discord.enabled",
+        "channels.discord.plugin",
+    ] {
+        assert!(
+            loaded
+                .issues
+                .iter()
+                .any(|issue| issue.key.as_str() == key && issue.severity == IssueSeverity::Warning),
+            "{key}：{:?}",
+            loaded.issues
+        );
+    }
     assert!(
         loaded
             .issues
             .iter()
-            .any(|issue| issue.key.as_str() == "channels.feishu.groups"
-                && issue.severity == IssueSeverity::Warning),
+            .all(|issue| issue.severity == IssueSeverity::Warning),
         "{:?}",
         loaded.issues
+    );
+    assert!(
+        loaded
+            .snapshot
+            .credentials
+            .keys()
+            .all(|name| !name.contains("FEISHU") && !name.contains("TELEGRAM")),
+        "渠道凭证不再被引用：{:?}",
+        loaded.snapshot.credentials.keys().collect::<Vec<_>>()
     );
 }
 
@@ -714,34 +695,18 @@ fn the_snapshot_records_the_source_files_it_was_built_from() {
 }
 
 #[test]
-fn allow_tenant_loads_from_the_file_and_defaults_off() {
-    let fixture = Fixture::valid();
-    let loaded = load_config(&fixture.options()).unwrap();
-    assert!(!loaded.snapshot.channels.feishu.allow_tenant);
-
-    let text = Fixture::config_text("chat-a", "medium").replace(
-        "allow_from = [\"ou_operator\"]",
-        "allow_from = []\nallow_tenant = true",
-    );
-    write(&fixture.sources().config, &text);
-    let loaded = load_config(&fixture.options()).unwrap();
-    assert!(loaded.snapshot.channels.feishu.allow_tenant);
-    assert!(
-        loaded.issues.is_empty(),
-        "靠租户进来的渠道不是只出不进：{:?}",
-        loaded.issues
-    );
-}
-
-#[test]
 fn a_warning_rides_along_with_a_config_that_still_loads() {
     let fixture = Fixture::valid();
-    let text = Fixture::config_text("chat-a", "medium")
-        .replace("allow_from = [\"ou_operator\"]", "allow_from = []");
+    // `read_only` 写了白名单之外的工具是笔误：警告，配置照常装上。
+    let mut text = Fixture::config_text("chat-a", "medium");
+    text.push_str(
+        "\n[mcp.servers.gh]\ncommand = \"gh-mcp\"\ntools = [\"search\"]\nread_only = [\"delete\"]\n",
+    );
     write(&fixture.sources().config, &text);
 
     let loaded = load_config(&fixture.options()).unwrap();
     assert_eq!(loaded.issues.len(), 1, "{:?}", loaded.issues);
+    assert_eq!(loaded.issues[0].key.as_str(), "mcp.servers.gh.read_only");
     assert_eq!(
         loaded.issues[0].severity,
         komo_kernel::protocol::config::IssueSeverity::Warning

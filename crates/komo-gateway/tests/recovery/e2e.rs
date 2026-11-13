@@ -8,7 +8,7 @@ use komo_gateway::service::test_support::harness::{
 use komo_kernel::types::ids::{RunId, SessionId};
 use komo_kernel::types::status::RunState;
 
-use crate::{entries_json, sender, start, until};
+use crate::{entries_json, start, until};
 
 /// 启动 komo 自动拉起 Gateway，模型调用 `write` 生成工作文件，在任务的后续步骤前重启 Gateway；
 /// **不打开 CLI 也自动接续原 run**，随后 resume 原会话查看结果，再读出原文件。
@@ -43,7 +43,7 @@ async fn the_first_end_to_end_acceptance() {
         text_round(2, "报告写好了。"),
     ]]);
     std::fs::create_dir_all(home.join("workspaces")).unwrap();
-    let mut gateway = start(Some(&home), llm, vec![gate.tool()], &sender()).await;
+    let mut gateway = start(Some(&home), llm, vec![gate.tool()]).await;
     let session = open_session(&gateway).await;
     let run = submit(&gateway, &session, "e2e-1", "写一份报告").await.run;
     gate.wait_entered(1).await;
@@ -70,7 +70,7 @@ async fn the_first_end_to_end_acceptance() {
             text_round(2, "读到了。"),
         ],
     ]);
-    let gateway = start(Some(&home), llm, vec![], &sender()).await;
+    let gateway = start(Some(&home), llm, vec![]).await;
     // 只看存储，不发任何 HTTP：这就是"不打开 CLI"。
     let record = gateway.wait_run(&run).await;
     assert_eq!(

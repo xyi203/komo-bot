@@ -7,11 +7,9 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use crate::protocol::config::{
-    ChannelConfig, ChannelsConfig, ConfigSnapshot, MemoryConfig, PathsConfig, RetrievalConfig,
-    StartOnly, TypesafeConfig,
+    ConfigSnapshot, MemoryConfig, PathsConfig, RetrievalConfig, StartOnly, TypesafeConfig,
 };
 use crate::types::agent::{AgentConfig, AgentProfile};
-use crate::types::chat::PeerId;
 use crate::types::digest::ContentHash;
 use crate::types::model::{CatalogModel, Effort, EmbeddingConfig, ModelCatalog, ModelConfig};
 
@@ -102,18 +100,6 @@ pub fn snapshot_fixture() -> ConfigSnapshot {
             )]),
         },
         typesafe: TypesafeConfig::default(),
-        channels: ChannelsConfig {
-            extra: Default::default(),
-            feishu: ChannelConfig {
-                plugin: None,
-                enabled: true,
-                allow_from: vec![PeerId::new("ou_operator")],
-                allow_tenant: false,
-                home_chat: Some(PeerId::new("oc_home")),
-            },
-            telegram: ChannelConfig::default(),
-            wechat: ChannelConfig::default(),
-        },
         mcp: Default::default(),
         paths: PathsConfig {
             sessions_dir: home.join("sessions"),
@@ -126,8 +112,6 @@ pub fn snapshot_fixture() -> ConfigSnapshot {
             ("KOMO_LLM_API_KEY".into(), ContentHash::of_str("a")),
             ("KOMO_MEMORY_API_KEY".into(), ContentHash::of_str("b")),
             ("KOMO_EMBEDDING_API_KEY".into(), ContentHash::of_str("c")),
-            ("FEISHU_APP_ID".into(), ContentHash::of_str("d")),
-            ("FEISHU_APP_SECRET".into(), ContentHash::of_str("e")),
         ]),
         loaded_at: time::macros::datetime!(2026-09-15 08:00:00 UTC),
         sources: vec![],

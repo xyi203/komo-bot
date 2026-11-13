@@ -16,8 +16,6 @@ use async_trait::async_trait;
 use time::OffsetDateTime;
 
 use crate::cron::{CronFiring, CronJob, JobStatus, ZoneError, ZoneResolution};
-use crate::protocol::{InboundAck, InboundMessage};
-use crate::types::chat::{Delivery, DeliveryTarget, Outbound};
 use crate::types::ids::{CronJobId, MatterId, MemoryId};
 use crate::types::matter::{Matter, MatterKind};
 use crate::types::memory::{MemoryItem, RecallQuery, RecallResult};
@@ -104,21 +102,7 @@ pub enum EmbedError {
     Other(String),
 }
 
-/// 主动投递失败。**注意 `Deferred` 不是错误**——它是 [`Delivery`] 的一个状态。
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-pub enum DeliverError {
-    /// 一个 home chat 都没配。**返回错误给调用方，不静默丢弃**（§11.4）。
-    #[error("没有可用的投递目标：{0}")]
-    NoTarget(String),
-    #[error("平台拒绝：{0}")]
-    Rejected(String),
-    #[error("投递记录写入失败：{0}")]
-    Persist(String),
-    #[error("{0}")]
-    Other(String),
-}
-
-/// Dispatcher 的失败。
+/// Gateway 动作的失败。
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum GatewayError {
     #[error("未认证")]
@@ -135,16 +119,7 @@ pub enum GatewayError {
     Internal(String),
 }
 
-/// 渠道 `serve` 的失败。
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("渠道 {channel}：{message}")]
-pub struct ChannelError {
-    pub channel: String,
-    pub message: String,
-}
-
-/// 停机信号。kernel 不依赖 tokio，所以它就是一个可查询的标志；渠道把它和自己的
-/// select 包在一起。
+/// 停机信号。kernel 不依赖 tokio，所以它就是一个可查询的标志。
 pub type Shutdown = CancelToken;
 
 // ---------------------------------------------------------------- 输出存储
@@ -494,44 +469,6 @@ pub enum MonitorError {
     Ambiguous(String),
 }
 
-// ---------------------------------------------------------------- 渠道
-
-/// 首版就有三个真实现（飞书、Telegram、WeChat），加上 HTTP API 与 SSE。
-#[async_trait]
-pub trait Channel: Send + Sync {
-    fn name(&self) -> &'static str;
-
-    async fn serve(
-        &self,
-        inbound: std::sync::Arc<dyn Inbound>,
-        shutdown: Shutdown,
-    ) -> Result<(), ChannelError>;
-}
-
-/// Gateway 交给渠道的**唯一入口**。渠道不知道 Session 是什么。
-#[async_trait]
-pub trait Inbound: Send + Sync {
-    /// Platform health notifications use the host's configured home destinations.
-    async fn alert(&self, _text: String) -> Result<(), GatewayError> {
-        Err(GatewayError::InvalidRequest(
-            "这个宿主不接收渠道告警".into(),
-        ))
-    }
-    async fn handle(&self, msg: InboundMessage) -> Result<InboundAck, GatewayError>;
-}
-
-/// 主动投递。各类消息的渲染是各渠道实现的事（§11.3）。
-#[async_trait]
-pub trait Notifier: Send + Sync {
-    /// **先持久化投递记录再发送。**`Sent` = 已送达；`Deferred` = 渠道此刻无法推送
-    /// （微信无回复令牌），行留在 pending，由下一条入站消息触发冲刷。
-    async fn deliver(
-        &self,
-        target: &DeliveryTarget,
-        msg: Outbound,
-    ) -> Result<Delivery, DeliverError>;
-}
-
 // ---------------------------------------------------------------- 时钟与时区
 
 /// Cron 到期、`valid_until`、重试退避全部依赖时间，所以它必须可拨。
@@ -583,9 +520,6 @@ mod tests {
         assert_object_safe::<dyn TurnDriver>();
         assert_object_safe::<dyn EmbeddingClient>();
         assert_object_safe::<dyn Tool>();
-        assert_object_safe::<dyn Channel>();
-        assert_object_safe::<dyn Inbound>();
-        assert_object_safe::<dyn Notifier>();
         assert_object_safe::<dyn Clock>();
         assert_object_safe::<dyn ZoneResolver>();
     }

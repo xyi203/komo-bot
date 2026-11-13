@@ -4,13 +4,13 @@
 //! 只留自己特有的那几个助手——cron 的触发记录断言、memory 的假向量后端。
 //!
 //! **真的东西一个没少**：真 config.toml、真 durable.db / aux.db、真 TcpListener、真 harness
-//! 引擎、真 Dispatcher、真 `HomeNotifier`。替身只有两个——模型与渠道，因为这两样一个要钱、一个
-//! 要网。
+//! 引擎。替身只有一个——模型，因为它要钱。聊天渠道删除后（`docs/redesign.md` P17）消息一律走
+//! HTTP（[`TestGateway::say`]）或 `DurableCore::submit_input`。
 //!
 //! 两套门面，因为两种测试问的是两个问题：
 //!
-//! - [`GatewayBuilder`] / [`TestGateway`]：**一台起着的 Gateway**，围着它发 HTTP、喂
-//!   入站消息（chat / memory）。
+//! - [`GatewayBuilder`] / [`TestGateway`]：**一台起着的 Gateway**，围着它发 HTTP、提交消息
+//!   （chat / memory）。
 //! - [`Home`] / [`Gw`]：**一个数据目录**，可以反复起落（cron / recovery 的"重启之后"）。
 //!
 //! 它们共用同一个 `start`，分别只在"谁持有临时目录"。
@@ -25,13 +25,8 @@ use async_trait::async_trait;
 use komo_kernel::durable::{
     AssistantMessage, Content, ContentBlock, Message, StopReason, ToolResultMessage,
 };
-use komo_kernel::protocol::config::ConfigSnapshot;
 use komo_kernel::protocol::http::{InterventionSummary, RunDetail, SubmitRunResponse};
-use komo_kernel::protocol::{InboundAck, InboundMessage};
-use komo_kernel::traits::{
-    Channel, ChannelError, DeliverError, EmbeddingClient, Inbound, LlmClient, Tool, TurnDriver,
-};
-use komo_kernel::types::chat::{ChannelPeer, ChannelPlatform, Outbound};
+use komo_kernel::traits::{EmbeddingClient, LlmClient, Tool, TurnDriver};
 use komo_kernel::types::ids::{RunId, Seq, SessionId, ToolCallId};
 use komo_kernel::types::model::TokenUsage;
 use komo_kernel::types::status::RunState;
@@ -39,10 +34,8 @@ use komo_kernel::types::turn::{
     LlmError, ProviderToolCall, ReplayMessage, Role, Round, RoundInput, ToolCallRequest,
     ToolResultForModel, TurnRequest,
 };
-use komo_llm::Secrets;
 use komo_llm::{ModelRequest, ModelStream, replay_system};
 
-use crate::channels::{BuiltChannel, ChannelFactory, ChannelRegistry, ChannelSender, SendOutcome};
 use crate::service::state::GatewayState;
 use crate::service::{Running, ServiceOptions, start};
 
@@ -79,63 +72,12 @@ enabled = false
     )
 }
 
-/// `[channels.telegram]`：操作者 111，home chat 111。
-pub fn telegram_block(allow_from: &str) -> String {
-    format!(
-        r#"
-[channels.telegram]
-enabled = true
-allow_from = [{allow_from}]
-home_chat = 111
-"#
-    )
-}
-
-/// `[channels.feishu]`：操作者 `ou_op`，home chat `oc_home`。
-pub fn feishu_block(allow_from: &str) -> String {
-    format!(
-        r#"
-[channels.feishu]
-enabled = true
-allow_from = [{allow_from}]
-home_chat = "oc_home"
-"#
-    )
-}
-
-/// `[channels.wechat]`：操作者 `wxid_op`，home chat 也是他（微信只有 DM）。
-pub fn wechat_block(allow_from: &str) -> String {
-    format!(
-        r#"
-[channels.wechat]
-enabled = true
-allow_from = [{allow_from}]
-home_chat = "wxid_op"
-"#
-    )
-}
-
-/// 默认：只有 Telegram 一个渠道。
-pub fn telegram_config(allow_from: &str) -> String {
-    config_toml(&telegram_block(allow_from))
-}
-
-/// [`Home`] 的默认配置：**配了 home chat 的** Telegram 渠道。
-///
-/// 无人值守的那些测试（cron / recovery）要的正是这一份：要人处理的介入有一个出口，而
-/// "群里说话"不在它们的范围里。
+/// [`Home`] 的默认配置：没有额外的段。
 pub fn home_config() -> String {
-    config_toml(
-        r#"
-[channels.telegram]
-enabled = true
-allow_from = [111]
-home_chat = 111
-"#,
-    )
+    config_toml("")
 }
 
-pub const DEFAULT_ENV: &str = "KOMO_LLM_API_KEY=test-key\nTELEGRAM_BOT_TOKEN=test-bot-token\n";
+pub const DEFAULT_ENV: &str = "KOMO_LLM_API_KEY=test-key\n";
 
 /// 写出一个数据目录。不写 `policy.toml`：它已经不再被读（§7，2026-10-11）。
 pub fn write_home(home: &Path, config: &str, env: &str) {
@@ -145,174 +87,6 @@ pub fn write_home(home: &Path, config: &str, env: &str) {
     // **故意不建 `workspaces/`**：它是数据目录骨架的一部分，该由 Gateway 自己在启动时
     // 建（§12）。这里替它建过，于是生产路径上少了那一步也一直看不出来——每一个 bash
     // 调用都在报"程序起不来"，而真正不在的是会话 cwd。
-}
-
-// ---------------------------------------------------------------- 渠道替身
-
-/// 送出去的一条。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SentMessage {
-    pub peer: ChannelPeer,
-    pub outbound: Outbound,
-}
-
-/// 一个内存发送口：`send` 记在 `sent` 里，可以被调成"此刻推不出去"、也可以被扣住。
-#[derive(Debug)]
-pub struct MemSender {
-    platform: ChannelPlatform,
-    sent: Mutex<Vec<SentMessage>>,
-    deferring: std::sync::atomic::AtomicBool,
-    /// 扣住时每条发送都停在平台往返上，直到放开。**启动补发是网络 I/O**：扣住它，
-    /// "就绪等不等补发"就是一个确定的问题，不必拿墙钟去量（§11.4 的补发不得压在就绪之前）。
-    held: tokio::sync::watch::Sender<bool>,
-}
-
-impl MemSender {
-    pub fn new(platform: ChannelPlatform) -> Arc<Self> {
-        Arc::new(MemSender {
-            platform,
-            sent: Mutex::new(Vec::new()),
-            deferring: std::sync::atomic::AtomicBool::new(false),
-            held: tokio::sync::watch::Sender::new(false),
-        })
-    }
-
-    pub fn sent(&self) -> Vec<SentMessage> {
-        self.sent.lock().expect("发送记录").clone()
-    }
-
-    pub fn texts(&self) -> Vec<String> {
-        self.sent()
-            .into_iter()
-            .filter_map(|message| match message.outbound {
-                Outbound::Text { text } => Some(text),
-                Outbound::RunFinished { summary, .. } => Some(summary),
-                Outbound::NeedsAttention { reason, .. } => Some(reason),
-                // 不是文本：只是告诉渠道"这条并进别的 Run 了"。
-                Outbound::RunAbsorbed { .. } => None,
-            })
-            .collect()
-    }
-
-    /// 送到某个会话的那些。
-    pub fn to_chat(&self, chat: &str) -> Vec<SentMessage> {
-        self.sent()
-            .into_iter()
-            .filter(|message| message.peer.chat_id.as_str() == chat)
-            .collect()
-    }
-
-    /// 微信那条路径：没有回复令牌时 `Deferred`。
-    pub fn defer(&self, deferring: bool) {
-        self.deferring
-            .store(deferring, std::sync::atomic::Ordering::SeqCst);
-    }
-
-    /// 扣住之后的每条发送都停在"跟平台往返"上，直到 [`Self::release`]。
-    pub fn hold(&self) {
-        self.held.send_replace(true);
-    }
-
-    pub fn release(&self) {
-        self.held.send_replace(false);
-    }
-}
-
-#[async_trait]
-impl ChannelSender for MemSender {
-    fn platform(&self) -> ChannelPlatform {
-        self.platform.clone()
-    }
-
-    async fn send(&self, peer: &ChannelPeer, msg: Outbound) -> Result<SendOutcome, DeliverError> {
-        let _ = self.held.subscribe().wait_for(|held| !*held).await;
-        if self.deferring.load(std::sync::atomic::Ordering::SeqCst) {
-            return Ok(SendOutcome::Deferred {
-                reason: "没有回复令牌".into(),
-            });
-        }
-        self.sent.lock().expect("发送记录").push(SentMessage {
-            peer: peer.clone(),
-            outbound: msg,
-        });
-        Ok(SendOutcome::Sent)
-    }
-}
-
-/// 一个什么都不收的 `Channel`：`serve` 只是把形状补全，入站由测试自己驱动。
-pub struct IdleChannel;
-
-#[async_trait]
-impl Channel for IdleChannel {
-    fn name(&self) -> &'static str {
-        "idle"
-    }
-
-    async fn serve(
-        &self,
-        _inbound: Arc<dyn Inbound>,
-        shutdown: komo_kernel::traits::Shutdown,
-    ) -> Result<(), ChannelError> {
-        while !shutdown.is_cancelled() {
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        Ok(())
-    }
-}
-
-/// 把一对**已经造好**的收发两半当成一个工厂交给 `service::start`。
-///
-/// `build` 照 `ChannelFactory` 的契约看当前快照：`enabled = false` → `None`，于是热重载
-/// 时"停掉这一个"这条路也走得通。
-pub struct FixedFactory {
-    platform: ChannelPlatform,
-    channel: Arc<dyn Channel>,
-    sender: Arc<dyn ChannelSender>,
-}
-
-impl FixedFactory {
-    pub fn new(
-        platform: ChannelPlatform,
-        channel: Arc<dyn Channel>,
-        sender: Arc<dyn ChannelSender>,
-    ) -> Arc<Self> {
-        Arc::new(FixedFactory {
-            platform,
-            channel,
-            sender,
-        })
-    }
-
-    /// 只有出站一半（入站由测试直接调 Dispatcher）。
-    pub fn sender_only(sender: Arc<dyn ChannelSender>) -> Arc<Self> {
-        let platform = sender.platform();
-        Self::new(platform, Arc::new(IdleChannel), sender)
-    }
-}
-
-#[async_trait]
-impl ChannelFactory for FixedFactory {
-    fn platform(&self) -> ChannelPlatform {
-        self.platform.clone()
-    }
-
-    fn build(
-        &self,
-        snapshot: &ConfigSnapshot,
-        _secrets: &Secrets,
-    ) -> Result<Option<BuiltChannel>, ChannelError> {
-        if !snapshot
-            .channels
-            .get(self.platform.clone())
-            .is_some_and(|channel| channel.enabled)
-        {
-            return Ok(None);
-        }
-        Ok(Some(BuiltChannel {
-            channel: Arc::clone(&self.channel),
-            sender: Arc::clone(&self.sender),
-        }))
-    }
 }
 
 // ---------------------------------------------------------------- 脚本化模型
@@ -760,7 +534,6 @@ pub struct GatewayBuilder {
     env: String,
     llm: Option<Arc<dyn LlmClient>>,
     embeddings: Option<Arc<dyn EmbeddingClient>>,
-    factories: Vec<Arc<dyn ChannelFactory>>,
     home: Option<PathBuf>,
     tools: Vec<Arc<dyn Tool>>,
     stream: Option<Arc<dyn ModelStream>>,
@@ -773,7 +546,6 @@ impl GatewayBuilder {
             env: DEFAULT_ENV.to_string(),
             llm: None,
             embeddings: None,
-            factories: Vec::new(),
             home: None,
             tools: Vec::new(),
             stream: None,
@@ -815,11 +587,6 @@ impl GatewayBuilder {
         self
     }
 
-    pub fn factory(mut self, factory: Arc<dyn ChannelFactory>) -> Self {
-        self.factories.push(factory);
-        self
-    }
-
     /// 复用一个已有的数据目录（"停机再起来"的测试用）。
     pub fn at(mut self, home: &Path) -> Self {
         self.home = Some(home.to_path_buf());
@@ -843,7 +610,6 @@ impl GatewayBuilder {
             home: Some(home.clone()),
             // 端口 0：内核挑一个空的，发现文件里写的是真实地址。
             listen: Some("127.0.0.1:0".into()),
-            channels: self.factories.clone(),
             llm: self.llm,
             stream: self.stream,
             embeddings: self.embeddings,
@@ -860,7 +626,6 @@ impl GatewayBuilder {
             home,
             env: self.env,
             running: Some(running),
-            factories: self.factories,
         }
     }
 }
@@ -873,21 +638,15 @@ pub struct TestGateway {
     /// 起这一台时用的 `.env`——重启要用**同一份**，否则第二次起来会缺钥匙。
     env: String,
     running: Option<Running>,
-    factories: Vec<Arc<dyn ChannelFactory>>,
 }
 
 impl TestGateway {
-    /// 默认配置：一个 Telegram 渠道（操作者 111）+ 一个内存发送口，`FakeLlm::finisher("好")` 当模型。
-    pub async fn start() -> (TestGateway, Arc<MemSender>) {
-        let sender = MemSender::new(ChannelPlatform::Telegram);
-        let gateway = GatewayBuilder::new(&telegram_config("111"))
+    /// 默认配置：没有额外的段，`FakeLlm::finisher("好")` 当模型。
+    pub async fn start() -> TestGateway {
+        GatewayBuilder::new(&home_config())
             .fake_llm(FakeLlm::finisher("好"))
-            .factory(FixedFactory::sender_only(
-                Arc::clone(&sender) as Arc<dyn ChannelSender>
-            ))
             .start()
-            .await;
-        (gateway, sender)
+            .await
     }
 
     fn running(&self) -> &Running {
@@ -898,17 +657,9 @@ impl TestGateway {
         &self.running().state
     }
 
-    pub fn dispatcher(&self) -> &Arc<crate::Dispatcher> {
-        &self.running().dispatcher
-    }
-
     /// 这个 Session 的全部合成事件（见 [`Gw::events`]）。
     pub async fn events(&self, session: &str) -> Vec<komo_kernel::events::Event> {
         events_of(self.state(), &SessionId::from_raw(session)).await
-    }
-
-    pub fn channels(&self) -> &Arc<ChannelRegistry> {
-        &self.state().channels
     }
 
     pub fn base_url(&self) -> &str {
@@ -919,11 +670,39 @@ impl TestGateway {
         &self.running().state.token
     }
 
-    pub async fn handle(&self, msg: InboundMessage) -> InboundAck {
-        self.dispatcher()
-            .handle(msg)
-            .await
-            .expect("Dispatcher 处理")
+    /// 主会话（`GET /v1/home-session`，没有就建）。
+    pub async fn home_session(&self) -> SessionId {
+        let (code, body) = self.get("/v1/home-session").await;
+        assert_eq!(code, 200, "{body}");
+        serde_json::from_str::<komo_kernel::protocol::http::SessionSummary>(&body)
+            .expect("主会话")
+            .session
+    }
+
+    /// 往主会话提交一条输入（`POST /v1/sessions/{id}/runs`，`request_key` 持久去重），
+    /// 返回 `(会话, run)`。`interject = true` 是网页的"插话"：忙时并进当前 Run。
+    pub async fn say_in(
+        &self,
+        session: &SessionId,
+        text: &str,
+        key: &str,
+        interject: bool,
+    ) -> SubmitRunResponse {
+        let (code, body) = self
+            .post(
+                &format!("/v1/sessions/{session}/runs"),
+                serde_json::json!({ "request_key": key, "text": text, "interject": interject }),
+            )
+            .await;
+        assert_eq!(code, 200, "{body}");
+        serde_json::from_str(&body).expect("回执")
+    }
+
+    /// 往主会话说一句话（不插话）。返回 `(会话, run)`。
+    pub async fn say(&self, text: &str, key: &str) -> (SessionId, RunId) {
+        let session = self.home_session().await;
+        let receipt = self.say_in(&session, text, key, false).await;
+        (session, receipt.run)
     }
 
     /// 改 config.toml（热重载的测试用）。
@@ -951,21 +730,15 @@ impl TestGateway {
         }
     }
 
-    /// 停机再按**同一个数据目录**起一台（"重启后 pending 补发"的测试用）。
-    pub async fn restart_with(&mut self, config: &str, factories: Vec<Arc<dyn ChannelFactory>>) {
+    /// 停机再按**同一个数据目录**起一台（"重启之后"的测试用）。
+    pub async fn restart_with(&mut self, config: &str) {
         self.stop().await;
-        let mut builder = GatewayBuilder::new(config)
+        let builder = GatewayBuilder::new(config)
             .env(&self.env)
             .at(&self.home)
             .fake_llm(FakeLlm::finisher("好"));
-        for factory in &factories {
-            builder = builder.factory(Arc::clone(factory));
-        }
-        let TestGateway {
-            running, factories, ..
-        } = builder.start().await;
+        let TestGateway { running, .. } = builder.start().await;
         self.running = running;
-        self.factories = factories;
     }
 
     pub async fn get(&self, path: &str) -> (u16, String) {
@@ -994,16 +767,6 @@ impl TestGateway {
         body: Option<serde_json::Value>,
     ) -> (u16, String) {
         request(self.base_url(), self.token(), method, path, body).await
-    }
-
-    /// 还没送到的投递。
-    pub async fn pending_deliveries(&self) -> Vec<komo_store::DeliveryRecord> {
-        self.state()
-            .notifier
-            .log()
-            .pending(None)
-            .await
-            .expect("读得出")
     }
 
     /// 待处理清单（两类一起，§7.5）。
@@ -1044,7 +807,7 @@ impl TestGateway {
         wait_run(self.state(), run).await
     }
 
-    /// 全部会话（含已删除的）的"来源"：主会话是 `home`，其余是 `source`（`chat:{peer}`）。
+    /// 全部会话（含已删除的）的"来源"：主会话是 `home`，其余是 `source`（没有就是空串）。
     /// 任务会话与 cron 会话不算（聊天测试里没有它们）。
     pub async fn origins(&self) -> Vec<String> {
         use komo_kernel::durable::SessionKind;
@@ -1061,7 +824,7 @@ impl TestGateway {
             .collect()
     }
 
-    /// 来源为 `origin`（`home` 或 `chat:…`）的会话 ID。
+    /// 来源为 `origin`（`home` 或某个 `source`）的会话 ID。
     pub async fn session_of(&self, origin: &str) -> Option<String> {
         use komo_kernel::durable::SessionKind;
         let core = self.state().core().expect("durable");
@@ -1155,18 +918,9 @@ impl Home {
     /// 起一台 Gateway。**同一个数据目录**，再调一次就是"重启"。`llm` 同时当辅助调用的
     /// `LlmClient` 与 harness 的 `ModelStream`。
     pub async fn start(&self, llm: Arc<FakeLlm>) -> Gw {
-        let sender = MemSender::new(ChannelPlatform::Telegram);
-        self.start_with(llm, sender).await
-    }
-
-    /// 同上，但发送口自己给。
-    pub async fn start_with(&self, llm: Arc<FakeLlm>, sender: Arc<MemSender>) -> Gw {
         let running = start(ServiceOptions {
             home: Some(self.dir.path().to_path_buf()),
             listen: Some("127.0.0.1:0".into()),
-            channels: vec![FixedFactory::sender_only(
-                Arc::clone(&sender) as Arc<dyn ChannelSender>
-            )],
             llm: Some(Arc::clone(&llm) as Arc<dyn LlmClient>),
             stream: Some(llm as Arc<dyn ModelStream>),
             embeddings: None,
@@ -1181,7 +935,6 @@ impl Home {
             running,
             base,
             token,
-            home: sender,
         }
     }
 
@@ -1198,21 +951,11 @@ pub struct Gw {
     pub running: Running,
     base: String,
     token: String,
-    /// home chat 的那一半——无人值守的投递全在这里。
-    pub home: Arc<MemSender>,
 }
 
 impl Gw {
     pub fn state(&self) -> &Arc<GatewayState> {
         &self.running.state
-    }
-
-    pub fn dispatcher(&self) -> &Arc<crate::Dispatcher> {
-        &self.running.dispatcher
-    }
-
-    pub fn channels(&self) -> &Arc<ChannelRegistry> {
-        &self.state().channels
     }
 
     pub fn base_url(&self) -> &str {
@@ -1524,18 +1267,6 @@ pub fn install_crypto() {
     ONCE.call_once(|| {
         let _ = rustls::crypto::ring::default_provider().install_default();
     });
-}
-
-/// 一条来自某个平台的入站消息。
-pub fn inbound(
-    platform: ChannelPlatform,
-    chat: &str,
-    sender: &str,
-    text: &str,
-    request_key: &str,
-    is_private: bool,
-) -> InboundMessage {
-    crate::dispatcher::inbound(platform, chat, sender, text, request_key, is_private)
 }
 
 /// 等一个条件成真（或超时）。

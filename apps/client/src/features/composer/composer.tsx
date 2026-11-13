@@ -71,7 +71,7 @@ export function Composer({
     if (disabled || (!text.trim() && drafts.length === 0)) return;
     if (drafts.some((d) => d.state === "uploading")) return showToast(m.composer_attach_wait());
     if (drafts.some((d) => d.state === "failed")) return showToast(m.composer_attach_blocked());
-    // 说明在前、用户的话在后（与聊天渠道一样：附言是 `/pending` 也不会被当成命令）
+    // 说明在前、用户的话在后
     const body = [...drafts.map((d) => d.note ?? ""), text.trim() ? text : ""].filter(Boolean).join("\n");
     onSend(body, {
       // 选的就是默认模型时不带 model，让 Gateway 用当前快照的主模型

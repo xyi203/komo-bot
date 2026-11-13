@@ -3,15 +3,14 @@
 //! 旧 `tests/recovery` 是 §14「恢复故障注入验收」，逐行钉死旧账本（`state.db` + JSONL）在 §8.5 各步骤之间被
 //! 打断的行为，靠故障账本装饰器注入。新存储的恢复由引擎开库时的 reconciliation 做，逐步的故障注入在
 //! runtime 的测试里覆盖（`harness/tests/{recovery,tools}.rs`、`durable/tests/recovery.rs`）；gateway 这一层只
-//! 保留 5 个**端到端重启**测试，每个起一台真 Gateway（`service::start`）、停机、同一个数据目录再起：
+//! 保留 4 个**端到端重启**测试，每个起一台真 Gateway（`service::start`）、停机、同一个数据目录再起：
 //!
 //! | 测试 | 钉住什么 |
 //! |---|---|
 //! | `the_first_end_to_end_acceptance` | §14「首个端到端验收」：重启后不开任何客户端自动接续原 run，再 resume / 读文件 |
-//! | `a_chat_run_in_flight_across_a_restart_still_gets_its_reply_delivered_once` | 重启后看客补挂：聊天来源的 run 收到回复，只投一次 |
-//! | `a_background_task_in_flight_across_a_restart_still_reports_back` | 后台任务跨重启，结果仍交回 home |
+//! //! | `a_background_task_in_flight_across_a_restart_still_reports_back` | 后台任务跨重启，结果仍交回 home |
 //! | `a_killed_bash_is_handed_to_the_model_as_interrupted` | 在飞的 `bash` 重启后不重跑，`uncertain` 交给模型 |
-//! | `a_missing_blob_faults_the_tool_task_and_lists_it` | blob 引用读不到 → 工具任务 `faulted`，列进 intervention、投 NeedsAttention、可 `abandon` |
+//! | `a_missing_blob_faults_the_tool_task_and_lists_it` | blob 引用读不到 → 工具任务 `faulted`，列进 intervention、可 `abandon` |
 //!
 //! 旧 `tests/recovery/{rows,verdicts,reconcile}.rs` 保持只跑 Legacy（D7 删）。"停在 `waiting + intervention`"
 //! 在新存储里不存在，原来靠 `unsure` 工具停住的步骤换成 `gate` 工具（停在 running 上，重启后按
@@ -19,7 +18,6 @@
 
 mod bash;
 mod blob;
-mod chat;
 mod crash_loop;
 mod e2e;
 mod task;
@@ -28,34 +26,27 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use komo_gateway::channels::ChannelSender;
 use komo_gateway::service::test_support::harness::{
-    FakeLlm, FixedFactory, GatewayBuilder, MemSender, TestGateway, telegram_config,
+    FakeLlm, GatewayBuilder, TestGateway, config_toml,
 };
 use komo_kernel::traits::Tool;
-use komo_kernel::types::chat::ChannelPlatform;
 
 /// 起一台 Durable Gateway。`home = Some(..)` 就是"重启"（同一个数据目录）。
 pub async fn start(
     home: Option<&Path>,
     llm: Arc<FakeLlm>,
     tools: Vec<Arc<dyn Tool>>,
-    sender: &Arc<MemSender>,
 ) -> TestGateway {
-    start_with(&telegram_config("111"), home, llm, tools, sender).await
+    start_with(&config_toml(""), home, llm, tools).await
 }
 
 /// 同上，Agent 多挂 `bash`（默认工具表里没有它）。
-pub async fn start_bash(
-    home: Option<&Path>,
-    llm: Arc<FakeLlm>,
-    sender: &Arc<MemSender>,
-) -> TestGateway {
-    let config = telegram_config("111").replace(
+pub async fn start_bash(home: Option<&Path>, llm: Arc<FakeLlm>) -> TestGateway {
+    let config = config_toml("").replace(
         "[agents.assistant]\n",
         "[agents.assistant]\ntools = [\"bash\"]\n",
     );
-    start_with(&config, home, llm, vec![], sender).await
+    start_with(&config, home, llm, vec![]).await
 }
 
 async fn start_with(
@@ -63,13 +54,8 @@ async fn start_with(
     home: Option<&Path>,
     llm: Arc<FakeLlm>,
     tools: Vec<Arc<dyn Tool>>,
-    sender: &Arc<MemSender>,
 ) -> TestGateway {
-    let mut builder = GatewayBuilder::new(config)
-        .fake_llm(llm)
-        .factory(FixedFactory::sender_only(
-            Arc::clone(sender) as Arc<dyn ChannelSender>
-        ));
+    let mut builder = GatewayBuilder::new(config).fake_llm(llm);
     for tool in tools {
         builder = builder.tool(tool);
     }
@@ -77,10 +63,6 @@ async fn start_with(
         builder = builder.at(home);
     }
     builder.start().await
-}
-
-pub fn sender() -> Arc<MemSender> {
-    MemSender::new(ChannelPlatform::Telegram)
 }
 
 /// 轮询到条件成立（最多 20 秒）。

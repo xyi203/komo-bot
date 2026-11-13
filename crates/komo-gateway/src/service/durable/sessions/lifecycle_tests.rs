@@ -10,7 +10,7 @@ use serde_json::json;
 use crate::service::test_support::Gate;
 use crate::service::test_support::driver_stream::{core, open_session, submit};
 use crate::service::test_support::harness::{
-    FakeLlm, GatewayBuilder, TestGateway, call_round, telegram_config, text_round,
+    FakeLlm, GatewayBuilder, TestGateway, call_round, config_toml, text_round,
 };
 
 /// 一条 run 停在 `gate` 工具上，收件箱里再排一条用户输入与一条内部输入。
@@ -33,7 +33,7 @@ async fn busy() -> Busy {
         ],
         vec![text_round(1, "不该有第二条 run")],
     ]);
-    let gateway = GatewayBuilder::new(&telegram_config("111"))
+    let gateway = GatewayBuilder::new(&config_toml(""))
         .fake_llm(llm.clone())
         .tool(gate.tool())
         .start()
@@ -176,7 +176,7 @@ async fn a_closing_session_lets_the_run_finish_but_never_starts_a_successor() {
 /// purge 只从 `deleted` 起步；之后一次提交抹掉全部 conversation、墓碑 `purged`、再删目录；幂等。
 #[tokio::test]
 async fn purge_requires_deleted_then_removes_rows_and_directory_and_is_idempotent() {
-    let gateway = GatewayBuilder::new(&telegram_config("111"))
+    let gateway = GatewayBuilder::new(&config_toml(""))
         .fake_llm(FakeLlm::finisher("好"))
         .start()
         .await;
@@ -252,7 +252,7 @@ async fn unfinished_work_is_listed_as_blockers() {
 /// 上一代停在 `closing` 的会话，这一代启动时做完（也收掉墓碑已落而目录还在的）。
 #[tokio::test]
 async fn a_closing_session_left_by_the_previous_generation_is_finished_on_start() {
-    let mut first = GatewayBuilder::new(&telegram_config("111"))
+    let mut first = GatewayBuilder::new(&config_toml(""))
         .fake_llm(FakeLlm::finisher("好"))
         .start()
         .await;
@@ -280,7 +280,7 @@ async fn a_closing_session_left_by_the_previous_generation_is_finished_on_start(
     std::fs::write(leftover.join("x"), b"x").unwrap();
     first.stop().await;
 
-    let second = GatewayBuilder::new(&telegram_config("111"))
+    let second = GatewayBuilder::new(&config_toml(""))
         .fake_llm(FakeLlm::finisher("好"))
         .at(&first.home)
         .start()
@@ -296,7 +296,7 @@ async fn a_closing_session_left_by_the_previous_generation_is_finished_on_start(
 /// 重启之后新铸的 ID 不复用 purge 掉的：gateway 层的回归（存储层的在 komo-store）。
 #[tokio::test]
 async fn ids_after_a_purge_and_restart_are_never_reused() {
-    let mut first = GatewayBuilder::new(&telegram_config("111"))
+    let mut first = GatewayBuilder::new(&config_toml(""))
         .fake_llm(FakeLlm::finisher("好"))
         .start()
         .await;
@@ -316,7 +316,7 @@ async fn ids_after_a_purge_and_restart_are_never_reused() {
     assert_eq!(code, 200, "{body}");
     first.stop().await;
 
-    let second = GatewayBuilder::new(&telegram_config("111"))
+    let second = GatewayBuilder::new(&config_toml(""))
         .fake_llm(FakeLlm::finisher("好"))
         .at(&first.home)
         .start()

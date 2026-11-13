@@ -7,7 +7,7 @@ use komo_gateway::service::test_support::driver_stream::{core, submit, wait_keye
 use komo_gateway::service::test_support::harness::{FakeLlm, call_round, text_round};
 use komo_kernel::durable::SubmissionStatus;
 
-use crate::{sender, start};
+use crate::start;
 
 /// home 会话派出一个后台任务；任务停在 `gate` 上时重启。重启后任务接着跑完（没结果的那次 `gate` 调用落成
 /// `uncertain`），结果由 runtime 在子 run 收尾的同一次提交里交回 home（请求键 `task-result:…` 的内部输入），
@@ -32,7 +32,7 @@ async fn a_background_task_in_flight_across_a_restart_still_reports_back() {
             text_round(2, "任务跑完了。"),
         ],
     ]);
-    let mut gateway = start(None, llm, vec![gate.tool()], &sender()).await;
+    let mut gateway = start(None, llm, vec![gate.tool()]).await;
     let agent = gateway.state().snapshot().agent.default_agent.clone();
     let (home_session, _) = core(&gateway)
         .main_session(&agent)
@@ -45,13 +45,7 @@ async fn a_background_task_in_flight_across_a_restart_still_reports_back() {
     gateway.stop().await;
 
     let home = gateway.home.clone();
-    let gateway = start(
-        Some(&home),
-        FakeLlm::finisher("转告：任务跑完了。"),
-        vec![],
-        &sender(),
-    )
-    .await;
+    let gateway = start(Some(&home), FakeLlm::finisher("转告：任务跑完了。"), vec![]).await;
     let report = wait_keyed(&gateway, "task-result:", Duration::from_secs(30)).await;
     assert_eq!(
         report.status(),
@@ -86,7 +80,7 @@ async fn a_stopped_task_drops_queued_and_late_monitor_events() {
             text_round(2, "跑完了。\n状态：完成"),
         ],
     ]);
-    let gateway = start(None, llm, vec![gate.tool()], &sender()).await;
+    let gateway = start(None, llm, vec![gate.tool()]).await;
     let core = core(&gateway);
     let agent = gateway.state().snapshot().agent.default_agent.clone();
     let (home_session, _) = core.main_session(&agent).await.expect("home 会话");

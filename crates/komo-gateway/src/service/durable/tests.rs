@@ -9,9 +9,7 @@ use komo_kernel::types::turn::{Role, RoundInput};
 use komo_llm::{ModelRequest, ModelStream};
 
 use crate::service::state::{codemode_unreadable_paths, protected_paths};
-use crate::service::test_support::harness::{
-    FakeLlm, GatewayBuilder, call_round, telegram_config, text_round,
-};
+use crate::service::test_support::harness::{FakeLlm, GatewayBuilder, call_round, text_round};
 use crate::service::test_support::{TestGateway, config_toml, sample_snapshot};
 
 fn files_starting_with(home: &Path, prefix: &str) -> Vec<String> {
@@ -25,7 +23,7 @@ fn files_starting_with(home: &Path, prefix: &str) -> Vec<String> {
 
 #[tokio::test]
 async fn opens_and_closes_durable_db_beside_aux_db() {
-    let config = telegram_config("111");
+    let config = config_toml("");
     let mut first = GatewayBuilder::new(&config)
         .fake_llm(FakeLlm::finisher("好"))
         .start()
@@ -47,7 +45,7 @@ async fn opens_and_closes_durable_db_beside_aux_db() {
 
 #[tokio::test]
 async fn durable_mode_never_opens_state_db() {
-    let mut gateway = GatewayBuilder::new(&telegram_config("111"))
+    let mut gateway = GatewayBuilder::new(&config_toml(""))
         .fake_llm(FakeLlm::finisher("好"))
         .start()
         .await;

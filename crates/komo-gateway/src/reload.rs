@@ -3,10 +3,10 @@
 //! 「文件 mtime 变化（每秒轮询一次，不引入 inotify 依赖）、`komo config reload`、
 //! `SIGHUP`」——三条路都落到 [`reload`]，流程固定：
 //!
-//! 1. 重新解析成**完整的**新快照并校验；任何错误 → 旧快照原样保留，错误写日志并投递到
-//!    home chat，重载命令返回该错误。**校验不过的配置永远不会被装上。**
+//! 1. 重新解析成**完整的**新快照并校验；任何错误 → 旧快照原样保留，错误写日志，
+//!    重载命令返回该错误。**校验不过的配置永远不会被装上。**
 //! 2. 校验通过 → 原子替换进程内唯一的 `Arc<ConfigSnapshot>`（`ConfigHolder::reload`）。
-//! 3. 逐段比对，只重建变化了的东西：某个 `[channels.*]` 变了就只重启那个渠道；模型 /
+//! 3. 逐段比对，只重建变化了的东西：模型 /
 //!    凭证变了就换掉 `LlmClient` 实例；`[mcp.servers]` 变了就增删那几台服务器（不等握手，
 //!    `docs/mcp.md` §2.2）。
 //! 4. 只在启动时生效的那一组键：照常完成其余部分，然后**明确报告**它们需要
@@ -17,7 +17,6 @@ use std::sync::Arc;
 use komo_config::ConfigError;
 use komo_kernel::protocol::config::KeyPath;
 use komo_kernel::protocol::http::{ConfigReloadResponse, McpServerStatus};
-use komo_kernel::types::chat::Outbound;
 
 use crate::http::error::ApiFailure;
 use crate::service::state::GatewayState;
@@ -35,8 +34,7 @@ pub async fn reload(state: &Arc<GatewayState>) -> Result<ConfigReloadResponse, A
                 "配置已重载"
             );
             let mcp = apply(state, &report.changed).await;
-            announce_recovered(state).await;
-            announce_start_only(state, &report.start_only).await;
+            announce_start_only(&report.start_only);
             Ok(ConfigReloadResponse {
                 changed: report.changed,
                 start_only: report.start_only,
@@ -45,39 +43,9 @@ pub async fn reload(state: &Arc<GatewayState>) -> Result<ConfigReloadResponse, A
             })
         }
         Err(error) => {
-            // 「旧快照原样保留，错误写日志并投递到 home chat」。编辑器每次自动保存都会
-            // 触发一次重载，所以**同一条错误只投一次**。
             tracing::error!(%error, "配置校验不过，继续用旧的那一份");
-            let text = format!("配置没装上，还在用上一份：{error}");
-            let repeated = {
-                let mut last = state.reload_notice.lock().expect("锁没中毒");
-                let repeated = last.as_deref() == Some(text.as_str());
-                *last = Some(text.clone());
-                repeated
-            };
-            if !repeated {
-                let _ = state.notifier.deliver_home(Outbound::Text { text }).await;
-            }
             Err(config_failure(error))
         }
-    }
-}
-
-/// 上一次没装上、这一次装上了：说一声，不然操作者只看到过错误。
-async fn announce_recovered(state: &Arc<GatewayState>) {
-    let had_error = state
-        .reload_notice
-        .lock()
-        .expect("锁没中毒")
-        .take()
-        .is_some();
-    if had_error {
-        let _ = state
-            .notifier
-            .deliver_home(Outbound::Text {
-                text: "配置已装上。".into(),
-            })
-            .await;
     }
 }
 
@@ -124,47 +92,11 @@ async fn apply(state: &Arc<GatewayState>, changed: &[KeyPath]) -> Vec<McpServerS
     }) {
         state.refresh_reranker();
     }
-    let mut platforms = state.snapshot().channels.platforms();
-    platforms.extend(state.supervisor.platforms().await);
-    platforms.sort();
-    platforms.dedup();
-    for platform in platforms {
-        let key = format!("channels.{platform}");
-        let prefix = format!("{key}.");
-        let channel = state.snapshot().channels.get(platform.clone()).cloned();
-        let credentials_changed = channel
-            .as_ref()
-            .and_then(|c| c.plugin.as_ref())
-            .is_some_and(|p| {
-                p.env.iter().any(|name| {
-                    changed
-                        .iter()
-                        .any(|key| key.as_str() == format!("credentials.{name}"))
-                })
-            });
-        let legacy_credentials_changed = komo_config::channel_credentials(platform.clone())
-            .iter()
-            .any(|name| {
-                changed
-                    .iter()
-                    .any(|key| key.as_str() == format!("credentials.{name}"))
-            });
-        if credentials_changed
-            || legacy_credentials_changed
-            || changed.iter().any(|changed| {
-                changed.as_str() == "channels"
-                    || changed.as_str() == key
-                    || changed.as_str().starts_with(&prefix)
-            })
-        {
-            state.restart_channel(platform).await;
-        }
-    }
     mcp
 }
 
 /// 第 4 步：**不静默忽略，也不假装已生效**。
-async fn announce_start_only(state: &Arc<GatewayState>, start_only: &[KeyPath]) {
+fn announce_start_only(start_only: &[KeyPath]) {
     if start_only.is_empty() {
         return;
     }
@@ -177,7 +109,6 @@ async fn announce_start_only(state: &Arc<GatewayState>, start_only: &[KeyPath]) 
             .join("、")
     );
     tracing::warn!(%text, "重载完成，但有键只在启动时生效");
-    let _ = state.notifier.deliver_home(Outbound::Text { text }).await;
 }
 
 /// 校验失败 → 422 `ConfigInvalid`，`keys` 带定位。

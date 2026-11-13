@@ -23,7 +23,7 @@ use std::sync::Arc;
 use komo_kernel::types::ids::SessionId;
 use komo_kernel::types::turn::LlmError;
 
-use crate::harness::{FakeLlm, Gw, Home, config_toml, telegram_block, text_round};
+use crate::harness::{FakeLlm, Gw, Home, config_toml, text_round};
 
 /// 一个 `<root>/<name>/SKILL.md`。
 fn write_skill(root: &Path, name: &str, front: &str, body: &str) {
@@ -38,11 +38,7 @@ fn config_with_skills(skill_dirs: &[&Path]) -> String {
         .iter()
         .map(|dir| format!("\"{}\"", dir.display()))
         .collect();
-    config_toml(&format!(
-        "[paths]\nskill_dirs = [{}]\n{}",
-        dirs.join(", "),
-        telegram_block("111")
-    ))
+    config_toml(&format!("[paths]\nskill_dirs = [{}]\n", dirs.join(", ")))
 }
 
 /// 跑一句到终态，返回这一轮交给模型的系统提示。

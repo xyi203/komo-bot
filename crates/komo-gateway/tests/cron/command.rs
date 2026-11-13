@@ -17,10 +17,10 @@ fn command_job(name: &str, command: &str) -> serde_json::Value {
     })
 }
 
-/// 退出 0、stdout 非空：`ok`，投递的正文是 trim 过的 stdout **原样**——没有
-/// `CommandDriver` 收尾那份投影正文的头（`exit=... stdout=...`），也没经过模型。
+/// 退出 0、stdout 非空：`ok`，也没经过模型（零模型请求）。
+/// （聊天渠道删除前这一条还断言投递的正文是 trim 过的 stdout 原样；投递随渠道删除，结果在原会话里看。）
 #[tokio::test]
-async fn a_command_job_never_asks_the_model_and_delivers_trimmed_stdout() {
+async fn a_command_job_never_asks_the_model_and_settles_ok() {
     let home = Home::new();
     // 空脚本：`begin_turn` 一旦真的被调用，`FakeDriver` 会给一句收尾文本而不是报错
     // （见 `FakeLlm` 的注释），所以断言靠 `llm.turns()`，不是"没崩"。
@@ -34,32 +34,29 @@ async fn a_command_job_never_asks_the_model_and_delivers_trimmed_stdout() {
 
     assert_eq!(llm.turns(), 0, "命令 Run 全程零模型请求（§10）");
 
-    let sender = Arc::clone(&gw.home);
-    eventually("home chat 收到 trim 过的 stdout", move || {
-        sender
-            .texts()
-            .iter()
-            .any(|t| t.contains("hi") && !t.contains("stdout="))
-    })
-    .await;
-
-    let firings = gw.firings(&job.id).await;
-    assert_eq!(
-        firings.first().map(|f| f.status),
-        Some(komo_kernel::cron::FiringStatus::Ok)
-    );
+    // 触发状态回写为 ok（盯梢是异步的，等它落下来）。
+    let mut settled = false;
+    for _ in 0..100 {
+        if gw.firings(&job.id).await.first().map(|f| f.status)
+            == Some(komo_kernel::cron::FiringStatus::Ok)
+        {
+            settled = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(settled, "这一次触发应当已经记成 ok");
     gw.stop().await;
 }
 
-/// 退出 0、stdout 为空：`ok`，但**不投递**——看门狗"没事不说话"（§10）。
+/// 退出 0、stdout 为空：照样 `ok`——它确实跑成了，只是没有输出（§10）。
 #[tokio::test]
-async fn a_command_job_with_empty_stdout_settles_ok_but_delivers_nothing() {
+async fn a_command_job_with_empty_stdout_settles_ok() {
     let home = Home::new();
     let llm = FakeLlm::new(vec![]);
     let gw = home.start(Arc::clone(&llm)).await;
 
     let job = gw.add_job(command_job("silent", "true")).await;
-    let before = gw.home.texts().len();
     gw.make_due(&job.id).await;
     let run = gw.tick().await.fired[0].run.clone();
     gw.wait_state(&run, |s| s.is_terminal(), "终态").await;
@@ -82,20 +79,12 @@ async fn a_command_job_with_empty_stdout_settles_ok_but_delivers_nothing() {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
     assert!(settled, "这一次触发应当已经记成 ok");
-
-    assert_eq!(
-        gw.home.texts().len(),
-        before,
-        "空输出不该多出一条投递：{:?}",
-        gw.home.texts()
-    );
     gw.stop().await;
 }
 
-/// 非 0 退出：`error`，投递退出码 + stderr 末尾若干行，受 `notify` 过滤（默认
-/// `always`，投）。
+/// 非 0 退出：触发状态记成 `error`，同样零模型请求。
 #[tokio::test]
-async fn a_non_zero_exit_delivers_an_error_summary() {
+async fn a_non_zero_exit_settles_the_firing_as_error() {
     let home = Home::new();
     let llm = FakeLlm::new(vec![]);
     let gw = home.start(Arc::clone(&llm)).await;
@@ -109,20 +98,17 @@ async fn a_non_zero_exit_delivers_an_error_summary() {
 
     assert_eq!(llm.turns(), 0);
 
-    let sender = Arc::clone(&gw.home);
-    eventually("错误摘要带着退出码与 stderr", move || {
-        sender
-            .texts()
-            .iter()
-            .any(|t| t.contains("exit=3") && t.contains("went-wrong"))
-    })
-    .await;
-
-    let firings = gw.firings(&job.id).await;
-    assert_eq!(
-        firings.first().map(|f| f.status),
-        Some(komo_kernel::cron::FiringStatus::Error)
-    );
+    let mut settled = false;
+    for _ in 0..100 {
+        if gw.firings(&job.id).await.first().map(|f| f.status)
+            == Some(komo_kernel::cron::FiringStatus::Error)
+        {
+            settled = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(settled, "触发状态应当记成 error");
     gw.stop().await;
 }
 

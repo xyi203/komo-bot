@@ -1,14 +1,13 @@
 //! 每条操作命令的实现：拿一个客户端、调一个接口、用 `render` 印出来。
 //!
-//! 「CLI 通过 HTTP 发命令」（§13.1）——所以这里没有任何业务判断，除了三条**不经
-//! Gateway** 的（`channel list|probe`、`skills *`、`gateway start|stop|status`，§3）。
+//! 「CLI 通过 HTTP 发命令」（§13.1）——所以这里没有任何业务判断，除了两条**不经
+//! Gateway** 的（`skills *`、`gateway start|stop|status`，§3）。
 
 use std::path::Path;
 
 use komo_client::KomoClient;
 use komo_client::api::RequestKeys;
 use komo_client::render;
-use komo_gateway::channels;
 use komo_gateway::config::{LoadOptions, load_config};
 use komo_gateway::skills::{OfferContext, SkillRegistry, one_line};
 use komo_kernel::cron::{JobStatus, NotifyPolicy, OverlapPolicy};
@@ -816,58 +815,6 @@ pub fn init(home: &Path) -> Outcome {
         report.config.display(),
         report.config.display(),
     ))
-}
-
-/// `komo channel list`：渠道清单，只读配置（§3、§11.5）。
-pub fn channel_list(home: &Path) -> Outcome {
-    let loaded = load_config(&LoadOptions::at(home)).map_err(failed)?;
-    let mut lines = Vec::new();
-    for platform in loaded.snapshot.channels.platforms() {
-        let Some(config) = loaded.snapshot.channels.get(platform.clone()) else {
-            continue;
-        };
-        let mut line = format!(
-            "{platform:<9} {}",
-            if config.enabled {
-                "enabled "
-            } else {
-                "disabled"
-            }
-        );
-        line.push_str(&format!("  allow_from {}", config.allow_from.len()));
-        if let Some(home_chat) = &config.home_chat {
-            line.push_str(&format!("  home_chat {home_chat}"));
-        }
-        // 「某渠道 enabled 但 allow_from 为空」是一条警告（§11.2）。
-        if config.is_outbound_only() {
-            line.push_str("  ⚠ 只出不进（allow_from 为空，没人能通过它下指令）");
-        }
-        lines.push(line);
-    }
-    Ok(lines.join("\n"))
-}
-
-/// `komo channel probe`：连通性核对，**不经 Gateway**（§3）。
-pub async fn channel_probe(home: &Path) -> Outcome {
-    let loaded = load_config(&LoadOptions::at(home)).map_err(failed)?;
-    let mut lines = Vec::new();
-    for factory in channels::factories(&loaded.snapshot) {
-        let platform = factory.platform();
-        let enabled = loaded
-            .snapshot
-            .channels
-            .get(platform.clone())
-            .is_some_and(|config| config.enabled);
-        if !enabled {
-            lines.push(format!("{platform:<9} 未启用"));
-            continue;
-        }
-        match factory.probe(&loaded.snapshot, &loaded.secrets).await {
-            Ok(message) => lines.push(format!("{platform:<9} ✓ {message}")),
-            Err(error) => lines.push(format!("{platform:<9} ✗ {error}")),
-        }
-    }
-    Ok(lines.join("\n"))
 }
 
 /// `komo auth codex status`：账号、邮箱、套餐、过期时间——**不打印 token**，

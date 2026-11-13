@@ -1,26 +1,19 @@
 //! 一次触发投出去之后（§10 流程的最后两步：「保存结果和产物」→「更新本次触发状态」）。
 //!
-//! Cron 与聊天的分别全在**谁在看**。一条聊天消息有来源会话，Dispatcher 订阅那个
-//! Session 的事件流、把终态回给那个会话（`Dispatcher::watch_reply`）；一次 Cron 触发
-//! 没有来源会话，所以这里做同一件事、投到 **home chat**（§11.4：「来源是 Cron 或已
-//! 断开的 TUI 时只有 home chat」）。
+//! 一次触发投出去之后（§10 流程的最后两步：「保存结果和产物」→「更新本次触发状态」）。
 //!
-//! 两条语句在这里落地，各只有一处实现：
-//!
-//! - **`notify`**（§10）：`always` / `on_error` / `never` 过滤**结果**的投递。
-//! - **「更新本次触发状态」**：终态 → `ok` / `error`。手动 run 没有触发记录，`settle`
-//!   什么都不写（§10：手动 run 不冒充定时触发）。
+//! 这里只剩「更新本次触发状态」：终态 → `ok` / `error`，写进 `cron_firings`。手动 run 没有触发
+//! 记录，`settle` 什么都不写（§10：手动 run 不冒充定时触发）。结果不再往外投——聊天渠道已删除
+//! （`docs/redesign.md` P17），主动消息改投网页对话是后续一步。
 //!
 //! **订阅那一层在 [`super::durable::background::cron_watch`]**：等 submission 结算再读终态帧。这里是
-//! Cron 自己的那两件事——回写触发状态与按 `notify` 过滤结果。
+//! Cron 自己的那件事——回写触发状态。
 //!
-//! 它**不是**恢复机制：重启后靠 `deliveries` 表里那一行 pending 补发（§11.4）与
-//! `durable::background::cron::recover` 重挂看客，不靠这里再看一遍。
+//! 它**不是**恢复机制：重启后靠 `durable::background::cron::recover` 重挂看客，不靠这里再看一遍。
 
 use std::sync::Arc;
 
-use komo_kernel::cron::{CronJob, FiringStatus, NotifyPolicy};
-use komo_kernel::types::chat::Outbound;
+use komo_kernel::cron::{CronJob, FiringStatus};
 use komo_kernel::types::ids::{CronJobId, RunId, SessionId};
 use komo_runtime::scheduler::Fired;
 
@@ -34,11 +27,9 @@ pub struct Watched {
     pub session: SessionId,
     pub run: RunId,
     pub scheduled_at: time::OffsetDateTime,
-    pub name: String,
-    pub notify: NotifyPolicy,
     /// 手动 run 没有触发记录，不回写状态（§10）。
     pub scheduled: bool,
-    /// 这个 Job 是不是命令直跑模式（§10）：是的话，终态的 ok / error 与投递正文不看模型
+    /// 这个 Job 是不是命令直跑模式（§10）：是的话，终态的 ok / error 不看模型
     /// 回复，改读 `shell.command` 落下的那次 `bash` 结果（`durable::background::cron_watch`）。
     pub is_command: bool,
 }
@@ -50,8 +41,6 @@ impl Watched {
             session: fired.session.clone(),
             run: fired.run.clone(),
             scheduled_at: fired.scheduled_at,
-            name: job.name.clone(),
-            notify: job.notify,
             scheduled,
             is_command: job.command.is_some(),
         }
@@ -75,31 +64,4 @@ pub(crate) async fn settle(
     {
         tracing::warn!(%problem, job = %watched.job, "触发状态没记下来");
     }
-}
-
-/// 按 `notify` 决定投不投（§10）。
-pub(crate) async fn notify(
-    state: &Arc<GatewayState>,
-    watched: &Watched,
-    status: FiringStatus,
-    session: &SessionId,
-    run: &RunId,
-    text: &str,
-) {
-    if !watched.notify.delivers(status) {
-        tracing::debug!(job = %watched.job, notify = watched.notify.as_str(), "这一次不投");
-        return;
-    }
-    let _ = state
-        .notifier
-        .deliver_home(Outbound::RunFinished {
-            session: session.clone(),
-            run: run.clone(),
-            summary: summary(watched, text),
-        })
-        .await;
-}
-
-fn summary(watched: &Watched, body: &str) -> String {
-    format!("定时任务「{}」：{body}", watched.name)
 }

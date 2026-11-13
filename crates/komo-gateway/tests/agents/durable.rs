@@ -1,9 +1,10 @@
-//! 后台任务（`task`）在 Durable 存储上（`docs/storage-durable-d5.md` W2c）：`tests/agents` 里不依赖
-//! 渠道投递的 5 个，换成新 harness——任务会话是 runtime 在派出提交里建的子 conversation（短号 `#<id>`），
+//! 后台任务（`task`）在 Durable 存储上（`docs/storage-durable-d5.md` W2c）：`tests/agents` 里的
+//! 全部测试，换成新 harness——任务会话是 runtime 在派出提交里建的子 conversation（短号 `#<id>`），
 //! 结果由 runtime 在子 run 收尾的同一次提交里交回父 conversation。测试名与 Legacy 版本（`main.rs`）一一
-//! 对应；home 会话是 `main_session`，输入直接走 `DurableCore::submit_input`（不经渠道与 HTTP），
-//! 模型替身是同一个 `TasksLlm` 经 `DriverStream` 演成 `ModelStream`。涉及渠道投递的
-//! （`a_background_task_reports_back_through_home` 等）留给 W3a。
+//! 对应；home 会话是 `main_session`，输入走 `DurableCore::submit_input` 或 HTTP
+//! （`POST /v1/sessions/{id}/runs`），模型替身是同一个 `TasksLlm` 经 `DriverStream` 演成 `ModelStream`。
+//! 聊天渠道删除之前，后四个测试（`a_background_task_reports_back_through_home` 等）走渠道私聊提交、
+//! 从内存发送口读回复；现在改走 HTTP、从 home 会话里 Run 的最终回复读（同一条回复，少了投递那一跳）。
 //!
 //! 与 Legacy 不同的断言各有理由，写在对应测试的注释里。共同的：
 //!
@@ -34,12 +35,8 @@ use tokio::sync::Notify;
 
 use super::{TasksLlm, last_user_text, tasks_config};
 
-/// 与 Legacy 同一份配置，去掉渠道（这里不经渠道）。
 fn config() -> String {
-    let config = tasks_config();
-    let at = config.find("[channels.telegram]").expect("有渠道段");
-    let end = config.find("[model.main]").expect("有模型段");
-    format!("{}{}", &config[..at], &config[end..])
+    tasks_config()
 }
 
 async fn start(llm: &Arc<TasksLlm>, at: Option<&Path>, tool: Option<Arc<dyn Tool>>) -> TestGateway {
@@ -458,71 +455,82 @@ async fn a_status_query_for_an_unknown_task_fails_cleanly() {
     gateway.stop().await;
 }
 
-// ---------------------------------------------------------------- 渠道投递（W3a）
+// ---------------------------------------------------------------- home 里的对话（W3a）
 //
-// 这四个与 Legacy（`main.rs`）同名：DM 走真 Dispatcher，回复、并入通知看内存发送口。与 Legacy 不同的
+// 这四个与 Legacy（`main.rs`）同名：往 home 说话走 HTTP，回复读 home 会话里 Run 的最终回复。与 Legacy 不同的
 // 断言各有理由，写在对应测试的注释里；共同的：
 //
 // - Legacy 里"这条 Run 受理时带不带插话标记"（`run.accepted.interject`）是内部旗子，新存储的
 //   `RunAccepted` 是合成的、没有那一格；插话体现为行为（并进宿主、终态 `absorbed`），断言改看行为；
-// - 任务会话的"origin / agent_id"换成 sessions 行的 `parent_session` / `agent`。
+// - 任务会话的"origin / agent_id"换成 sessions 行的 `parent_session` / `agent`；
+// - 渠道删除后没有"投给渠道的回复"和"已并入通知"，断言落在 home 会话里 Run 的最终回复上。
 
-use komo_gateway::channels::ChannelSender;
 use komo_gateway::service::test_support::Gate;
-use komo_gateway::service::test_support::harness::{FixedFactory, MemSender, eventually, inbound};
-use komo_kernel::protocol::InboundAck;
-use komo_kernel::types::chat::{ChannelPlatform, Outbound};
 use komo_kernel::types::status::RunState;
 
-async fn start_chat(
-    llm: &Arc<TasksLlm>,
-    sender: &Arc<MemSender>,
-    gate: Option<&Arc<Gate>>,
-) -> TestGateway {
+async fn start_chat(llm: &Arc<TasksLlm>, gate: Option<&Arc<Gate>>) -> TestGateway {
     let mut builder = GatewayBuilder::new(&tasks_config())
         .llm(Arc::clone(llm) as Arc<dyn LlmClient>)
-        .stream(DriverStream::new(Arc::clone(llm) as Arc<dyn LlmClient>))
-        .factory(FixedFactory::sender_only(
-            Arc::clone(sender) as Arc<dyn ChannelSender>
-        ));
+        .stream(DriverStream::new(Arc::clone(llm) as Arc<dyn LlmClient>));
     if let Some(gate) = gate {
         builder = builder.tool(gate.tool());
     }
     builder.start().await
 }
 
-/// 送到某个渠道对端的全部文本回复：Run 的最终回复（`Outbound::RunFinished`）与其余文本。
-fn texts_to(sender: &MemSender, chat: &str) -> Vec<String> {
-    sender
-        .to_chat(chat)
+/// home 会话里全部正常完成的 Run 的最终回复（按事件顺序）。
+async fn home_replies(gateway: &TestGateway) -> Vec<String> {
+    let session = gateway.home_session().await;
+    gateway
+        .events(session.as_str())
+        .await
         .into_iter()
-        .filter_map(|message| match message.outbound {
-            Outbound::Text { text } => Some(text),
-            Outbound::RunFinished { summary, .. } => Some(summary),
+        .filter_map(|event| match event.payload {
+            komo_kernel::events::EventPayload::RunCompleted(body) => body.final_message,
             _ => None,
         })
         .collect()
 }
 
+/// 等 home 里出现一条最终回复正好是 `text`（最多 20 秒）。
+async fn wait_home_reply(gateway: &TestGateway, text: &str) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        if home_replies(gateway)
+            .await
+            .iter()
+            .any(|reply| reply == text)
+        {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "等了 20 秒 home 还没有这条回复：{text}；现有：{:?}",
+            home_replies(gateway).await
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// 往 home 说一句话（`POST /v1/sessions/{home}/runs`）。
 async fn dm(
     gateway: &TestGateway,
     text: &str,
     key: &str,
 ) -> (String, komo_kernel::types::ids::RunId) {
-    let ack = gateway
-        .handle(inbound(
-            ChannelPlatform::Telegram,
-            "111",
-            "111",
-            text,
-            key,
-            true,
-        ))
-        .await;
-    let InboundAck::Queued { session, run } = ack else {
-        panic!("{ack:?}")
-    };
+    let (session, run) = gateway.say(text, key).await;
     (session.as_str().to_owned(), run)
+}
+
+/// 同上，但带 `interject`：home 忙时并进当前 Run（网页的"插话"）。
+async fn dm_interject(
+    gateway: &TestGateway,
+    text: &str,
+    key: &str,
+) -> (String, komo_kernel::types::ids::RunId) {
+    let session = gateway.home_session().await;
+    let receipt = gateway.say_in(&session, text, key, true).await;
+    (session.as_str().to_owned(), receipt.run)
 }
 
 /// 一个 conversation 里的输入 submission（按 ID 序）。
@@ -590,8 +598,7 @@ async fn wait_keyed_exists(gateway: &TestGateway, prefix: &str) -> SubmissionRec
 #[tokio::test]
 async fn a_background_task_reports_back_through_home() {
     let llm = TasksLlm::new();
-    let sender = MemSender::new(ChannelPlatform::Telegram);
-    let mut gateway = start_chat(&llm, &sender, None).await;
+    let mut gateway = start_chat(&llm, None).await;
 
     // ── 1. DM 进 home，home 派出任务、回一句已派出。
     let (home_session, home_run) = dm(&gateway, "帮我查一下空调", "dm-1").await;
@@ -619,16 +626,11 @@ async fn a_background_task_reports_back_through_home() {
     // ── 3. 任务跑完，结果交回 home，由 home 转告；任务自己的回复不直接投给渠道。
     let report = wait_keyed(&gateway, "task-result:", Duration::from_secs(20)).await;
     assert_eq!(answer_of(&gateway, &report).await, "转告：空调已经关掉了。");
-    eventually_async(|| {
-        texts_to(&sender, "111")
-            .iter()
-            .any(|t| t == "转告：空调已经关掉了。")
-    })
-    .await;
-    let delivered = texts_to(&sender, "111");
+    wait_home_reply(&gateway, "转告：空调已经关掉了。").await;
+    let replies = home_replies(&gateway).await;
     assert!(
-        !delivered.iter().any(|text| text == "空调已经关掉了。"),
-        "任务的原话不该直接投给渠道：{delivered:?}"
+        !replies.iter().any(|text| text == "空调已经关掉了。"),
+        "任务的原话不该直接成为 home 的回复：{replies:?}"
     );
 
     // ④ 任务那一段用 `task` 给的模型；交回的那条输入按 home 自己的默认。
@@ -669,12 +671,7 @@ async fn a_background_task_reports_back_through_home() {
     llm.set_follow_target(&task.handle());
     let (_, home_run_2) = dm(&gateway, "功耗呢", "dm-2").await;
     gateway.wait_run(&home_run_2).await;
-    eventually_async(|| {
-        texts_to(&sender, "111")
-            .iter()
-            .any(|t| t == "转告：功耗 300W。")
-    })
-    .await;
+    wait_home_reply(&gateway, "转告：功耗 300W。").await;
     // 派出、追问，外加追问的回答没写状态行时 komo 自动放的续跑（`docs/background-tasks.md` §2c）。
     assert_eq!(inputs_of(&gateway, task.conversation).await.len(), 3);
     let follow_request = llm
@@ -698,31 +695,18 @@ async fn a_background_task_reports_back_through_home() {
     gateway.stop().await;
 }
 
-/// 等一个同步条件成真（最多 20 秒）。
-async fn eventually_async(done: impl Fn() -> bool) {
-    let deadline = std::time::Instant::now() + Duration::from_secs(20);
-    while std::time::Instant::now() < deadline {
-        if done() {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    panic!("等了 20 秒还没有想要的投递");
-}
-
-/// 渠道的普通消息插话（§6，2026-10-23）：home 忙着跑工具（停在一道门上）时说的第二句话，
-/// 门开之后并进同一条 Run，不另开一条；被并走的那条是终态 `absorbed`，渠道收到一条
-/// `RunAbsorbed`（飞书据此收尾它的"处理中"卡片），回答只由宿主给一次。
+/// 插话（§6，2026-10-23）：home 忙着跑工具（停在一道门上）时说的第二句话（带 `interject`），
+/// 门开之后并进同一条 Run，不另开一条；被并走的那条是终态 `absorbed`，回答只由宿主给一次。
+/// （Legacy 还断言渠道收到"已并入"通知；渠道删除后没有这一跳。）
 #[tokio::test]
-async fn a_chat_message_is_absorbed_into_a_running_home_and_its_channel_is_told() {
+async fn a_chat_message_is_absorbed_into_a_running_home() {
     let llm = TasksLlm::new();
-    let sender = MemSender::new(ChannelPlatform::Telegram);
     let gate = Gate::new();
-    let mut gateway = start_chat(&llm, &sender, Some(&gate)).await;
+    let mut gateway = start_chat(&llm, Some(&gate)).await;
 
     let (_, host) = dm(&gateway, "等门", "dm-1").await;
     gate.wait_entered(1).await;
-    let (_, second) = dm(&gateway, "补一句", "dm-2").await;
+    let (_, second) = dm_interject(&gateway, "补一句", "dm-2").await;
     assert_eq!(
         run_state(&gateway, &host).await,
         RunState::Running,
@@ -738,26 +722,17 @@ async fn a_chat_message_is_absorbed_into_a_running_home_and_its_channel_is_told(
         "第二句并进了 home，没有另开一条"
     );
 
-    eventually("渠道收到了并入通知", || {
-        sender.to_chat("111").iter().any(|message| {
-            matches!(&message.outbound, Outbound::RunAbsorbed { run, into, .. }
-                    if run == &second && into == &host)
-        })
-    })
-    .await;
     // 回答只有宿主那一次：被并走的那条自己没有回复。
-    eventually("宿主答了并进来的那句", || {
-        texts_to(&sender, "111")
+    wait_home_reply(&gateway, "没见过这句：补一句").await;
+    let replies = home_replies(&gateway).await;
+    assert_eq!(
+        replies
             .iter()
-            .any(|text| text == "没见过这句：补一句")
-    })
-    .await;
-    let finished = sender
-        .to_chat("111")
-        .iter()
-        .filter(|message| matches!(&message.outbound, Outbound::RunFinished { run, .. } if run == &second))
-        .count();
-    assert_eq!(finished, 0, "被并走的那条不另投回复");
+            .filter(|text| text.as_str() == "没见过这句：补一句")
+            .count(),
+        1,
+        "被并走的那条不另给回复：{replies:?}"
+    );
 
     gateway.stop().await;
 }
@@ -774,9 +749,8 @@ async fn a_chat_message_is_absorbed_into_a_running_home_and_its_channel_is_told(
 #[tokio::test]
 async fn a_task_result_is_absorbed_into_a_running_home() {
     let llm = TasksLlm::new();
-    let sender = MemSender::new(ChannelPlatform::Telegram);
     let gate = Gate::new();
-    let mut gateway = start_chat(&llm, &sender, Some(&gate)).await;
+    let mut gateway = start_chat(&llm, Some(&gate)).await;
 
     let (_, home_run) = dm(&gateway, "派了再等", "dm-1").await;
     let _task = the_task(&gateway).await;
@@ -796,12 +770,7 @@ async fn a_task_result_is_absorbed_into_a_running_home() {
         RunState::Absorbed,
         "交回的那条并进了 home，没有另开一条"
     );
-    eventually("home 把并进来的结果转告了", || {
-        texts_to(&sender, "111")
-            .iter()
-            .any(|text| text == "转告：热水器 60 度。")
-    })
-    .await;
+    wait_home_reply(&gateway, "转告：热水器 60 度。").await;
 
     gateway.stop().await;
 }
@@ -814,9 +783,8 @@ async fn a_task_result_is_absorbed_into_a_running_home() {
 #[tokio::test]
 async fn a_follow_up_absorbed_into_a_busy_task_reports_back_once() {
     let llm = TasksLlm::new();
-    let sender = MemSender::new(ChannelPlatform::Telegram);
     let gate = Gate::new();
-    let mut gateway = start_chat(&llm, &sender, Some(&gate)).await;
+    let mut gateway = start_chat(&llm, Some(&gate)).await;
 
     let (_, first) = dm(&gateway, "派等门任务", "dm-1").await;
     gateway.wait_run(&first).await;
@@ -845,12 +813,7 @@ async fn a_follow_up_absorbed_into_a_busy_task_reports_back_once() {
         RunState::Absorbed,
         "追问并进了正在跑的任务，没有另开一条"
     );
-    eventually("宿主那一次把结果交回并转告", || {
-        texts_to(&sender, "111")
-            .iter()
-            .any(|text| text == "转告：没见过这句：任务补一句")
-    })
-    .await;
+    wait_home_reply(&gateway, "转告：没见过这句：任务补一句").await;
 
     tokio::time::sleep(Duration::from_millis(300)).await;
     let reports = komo_gateway::service::test_support::driver_stream::submissions_keyed(
@@ -883,9 +846,8 @@ async fn a_follow_up_absorbed_into_a_busy_task_reports_back_once() {
 #[tokio::test]
 async fn home_answers_while_a_task_is_stuck_in_a_call() {
     let llm = TasksLlm::new();
-    let sender = MemSender::new(ChannelPlatform::Telegram);
     let gate = Gate::new();
-    let mut gateway = start_chat(&llm, &sender, Some(&gate)).await;
+    let mut gateway = start_chat(&llm, Some(&gate)).await;
 
     let (_, home_run) = dm(&gateway, "派等门任务", "dm-1").await;
     gateway.wait_run(&home_run).await;
@@ -905,10 +867,7 @@ async fn home_answers_while_a_task_is_stuck_in_a_call() {
         RunState::Completed,
         "home 答完了"
     );
-    eventually("渠道收到了答案", || {
-        texts_to(&sender, "111").iter().any(|text| text == "2")
-    })
-    .await;
+    wait_home_reply(&gateway, "2").await;
     assert_eq!(
         run_state(&gateway, &komo_kernel::durable::legacy_ids::run_id(host.id)).await,
         RunState::Running,

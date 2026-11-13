@@ -1,12 +1,12 @@
 //! 后台循环（`service::start` 在 `core.resume()` 之后调 [`spawn`]）：配置轮询与 SIGHUP、
-//! 启动时对账监听、已结算输入的补投、`closing` 删除的补做、cron、记忆领取。
+//! 启动时对账监听、已结算输入的标题补起、`closing` 删除的补做、cron、记忆领取。
 //! 没有调度器、审计补写与周期对账（旧存储的东西）。各包往这里加过：
 //!
 //! - W2c：启动时对账监听（上一代遗留的进程核对 + `Harness::reconcile_monitors`），已在这里；
 //! - W2b：`feed::spawn`（提交订阅 → SSE），由主控合并时补一行；
 //! - W3b：cron tick；W3c：`MEMORY_TICK`；W4a：做完停在 `closing` 的删除（`lifecycle::spawn`）。
 //!
-//! **次序**（W4a）：`feed::spawn`、`interventions::spawn_attention`、`lifecycle::boot`、`watch::reattach`
+//! **次序**（W4a）：`feed::spawn`、`lifecycle::boot`、`watch::reattach`
 //! 都在 `service::start` 里排在 `core.resume()` **之前**；本文件的 `spawn` 在 resume 之后。
 
 pub mod cron;
@@ -14,8 +14,6 @@ pub mod cron_watch;
 pub mod memory;
 pub mod monitor_runner;
 pub mod watch;
-#[cfg(test)]
-mod watch_tests;
 
 use std::sync::Arc;
 
@@ -39,7 +37,7 @@ pub fn spawn(state: &Arc<GatewayState>, shutdown: &Shutdown) {
         tokio::spawn(async move { reconcile_monitors(&state).await });
     }
     // W3a / W4a：看客与未结算输入的小任务已在 `core.resume()` 之前挂好（`watch::reattach`）；
-    // 这里只补"已结算、投递前崩溃"的那一窗（`watch::replay_recent`，判据的评估见它的文档）。
+    // 这里只补"已结算、标题还没起"的那一窗（`watch::replay_recent`）。
     {
         let state = Arc::clone(state);
         tokio::spawn(async move { watch::replay_recent(&state).await });

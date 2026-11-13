@@ -3,16 +3,15 @@
 //! ```text
 //! 读配置 → 取得实例锁 → 打开 aux.db 与 durable.db → 绑监听 → 写发现文件
 //!        → 引擎恢复（订阅与看客先就位，再 `core.resume()`）
-//!        → 起配置轮询 / Cron / 记忆领取 → 起渠道与 HTTP → 等停机信号
-//!        → 渠道停 → 引擎收尾 → 删发现文件 → 放锁
+//!        → 起配置轮询 / Cron / 记忆领取 → 起 HTTP → 等停机信号
+//!        → 引擎收尾 → 删发现文件 → 放锁
 //! ```
 //!
 //! 存储只有一套（`docs/storage-durable.md`）：`durable.db`（harness 的 entry / task / submission）与
-//! `aux.db`（cron / 投递 / memory / 幂等键等辅助表）。恢复由引擎开库时的 reconciliation 与
+//! `aux.db`（cron / memory / 幂等键等辅助表；`deliveries` 表还在库里，不再读写）。恢复由引擎开库时的 reconciliation 与
 //! [`durable::sessions::lifecycle::boot`] 负责，后台循环在 [`durable::background`]。
 
 pub mod changes;
-pub mod channels;
 pub mod cron_watch;
 pub mod durable;
 pub mod interventions;
@@ -32,12 +31,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use komo_config::{ConfigHolder, LoadOptions};
-use komo_kernel::traits::{Clock, Inbound, LlmClient, Shutdown, Tool};
+use komo_kernel::traits::{Clock, LlmClient, Shutdown, Tool};
 use komo_llm::EffortCapabilities;
 use komo_store::Db;
 
-use crate::channels::ChannelFactory;
-use crate::dispatcher::Dispatcher;
 use crate::http::Api;
 use crate::lock::{DiscoveryFile, GatewayDiscovery, InstanceLock, LockError, random_token};
 
@@ -67,8 +64,6 @@ pub struct ServiceOptions {
     pub home: Option<PathBuf>,
     /// 监听地址；`None` = 配置里的（默认 `127.0.0.1:7777`）。
     pub listen: Option<String>,
-    /// 渠道工厂。三个渠道各自一个 feature，接线由调用方给（`komo` 的 `main`）。
-    pub channels: Vec<Arc<dyn ChannelFactory>>,
     /// 测试注入的模型后端。
     pub llm: Option<Arc<dyn LlmClient>>,
     /// 测试注入的无状态模型后端（harness 的主模型）；`None` = 按配置造
@@ -99,7 +94,6 @@ impl std::fmt::Debug for ServiceOptions {
 /// 一台起着的 Gateway。
 pub struct Running {
     pub state: Arc<GatewayState>,
-    pub dispatcher: Arc<Dispatcher>,
     pub addr: SocketAddr,
     pub base_url: String,
     pub shutdown: Shutdown,
@@ -118,7 +112,6 @@ impl std::fmt::Debug for Running {
 impl Running {
     /// 正常停机（§8.7）：**先停止接收新执行**，给手上的收尾时间，再删发现文件、放锁。
     pub async fn stop(self) {
-        self.state.supervisor.stop_all(&self.state).await;
         self.shutdown.cancel();
         // 引擎收尾：先终止监听的进程组（登记留给下一代启动时收）、封住受理、等 invocation 走完、
         // 关库（放掉 Turso 的文件锁）。
@@ -157,7 +150,7 @@ pub async fn start(options: ServiceOptions) -> Result<Running, ServiceError> {
     // 2b. 数据目录的骨架。**`workspaces/` 必须真的存在**：它是会话默认的 cwd（§12），
     //     少了它每一次 shell 的 spawn 都以 ENOENT 失败，而报错只会说是程序
     //     起不来——一个把人引偏的结论。建不出来不让整台 Gateway 起来：别的工具照常，
-    //     这一条报在日志里（与渠道、向量端点的处理同一个取舍）。
+    //     这一条报在日志里（与向量端点的处理同一个取舍）。
     if let Err(error) = std::fs::create_dir_all(&snapshot.paths.workspaces_dir) {
         tracing::warn!(
             dir = %snapshot.paths.workspaces_dir.display(),
@@ -212,7 +205,6 @@ pub async fn start(options: ServiceOptions) -> Result<Running, ServiceError> {
         tools,
         codemode,
         mcp,
-        channels: options.channels,
     })
     .await
     {
@@ -227,10 +219,6 @@ pub async fn start(options: ServiceOptions) -> Result<Running, ServiceError> {
         let _ = state.telemetry.set(telemetry);
     }
 
-    let dispatcher = Arc::new(Dispatcher::new(Arc::clone(&state)));
-    let _ = state
-        .inbound
-        .set(Arc::clone(&dispatcher) as Arc<dyn Inbound>);
     let shutdown = Shutdown::new();
     // 把 `GatewayState` 交给钩子，然后才开始调度（编排走 harness，监听由 `MonitorRunner` 接）。
     durable::assemble::wire(&state_slot, &state, &detach_slot, &komo_slot);
@@ -242,8 +230,6 @@ pub async fn start(options: ServiceOptions) -> Result<Running, ServiceError> {
     //      所以要先让这些任务 `faulted`；
     //   4. 看客与未结算输入的小任务（`wait_submission` 内部会 `resume`，所以排在 3 之后）。
     durable::feed::spawn(&core, &state.hub, &shutdown).await;
-    durable::interventions::spawn_attention(&state, &shutdown);
-    durable::interventions::confirms::spawn_confirm_attention(&state, &shutdown);
     durable::sessions::lifecycle::boot(&state).await;
     durable::background::watch::reattach(&state).await;
     core.resume();
@@ -293,13 +279,7 @@ pub async fn start(options: ServiceOptions) -> Result<Running, ServiceError> {
     // 8. 后台循环：feed 与看客已在 `core.resume()` 之前起好（上面），这里只起 resume 之后的。
     durable::background::spawn(&state, &shutdown);
 
-    // 9. 渠道与 HTTP。
-    //
-    // **补发不在就绪之前**：它是网络 I/O，一条 pending 一个平台往返，积压多少就等多久。
-    // 它曾经同步跑在 "Gateway 就绪" 之前，于是卡住的投递直接把重启拖长——10 条卡住的
-    // 投递是 3 秒，几百条能拖过客户端 60 秒的就绪超时（§11.4 的补发等得起：投递记录先
-    // 写后发，按 `DeliveryId` 幂等，晚几十毫秒没有代价）。
-    state.supervisor.start_all(&state).await;
+    // 9. HTTP。
     let app = crate::http::router(Api::new(Arc::clone(&state), addr));
     let serving = shutdown.clone();
     tokio::spawn(async move {
@@ -315,20 +295,8 @@ pub async fn start(options: ServiceOptions) -> Result<Running, ServiceError> {
 
     tracing::info!(%base_url, instance = %instance_id, "Gateway 就绪");
 
-    // 10. 补发积压的投递。**渠道全部登记之后**才有意义：`DeliveryLog::send_recorded`
-    //     找不到发送口就把行原样留在 pending，所以在 `start_all` 之前冲刷等于什么都没干
-    //     （W5 验收 BUG(3)）。这一步补的是"渠道都起完了"之后的那一遍，包括没有工厂、
-    //     由别处登记发送口的情形。
-    {
-        let state = Arc::clone(&state);
-        tokio::spawn(async move {
-            state.notifier.flush(None).await;
-        });
-    }
-
     Ok(Running {
         state,
-        dispatcher,
         addr,
         base_url,
         shutdown,

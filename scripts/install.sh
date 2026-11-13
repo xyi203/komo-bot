@@ -198,38 +198,23 @@ if [[ -z "$EXPECTED" || "$EXPECTED" != "$ACTUAL" ]]; then
 fi
 success "校验和过了"
 
-# Extract only the four known files; never trust arbitrary archive paths.
-for binary in komo komo-channel-feishu komo-channel-telegram komo-channel-wechat; do
-    tar -xzf "${TMP_DIR}/${ASSET}" -C "$TMP_DIR" "$binary"
-    if [[ ! -x "${TMP_DIR}/${binary}" ]]; then
-        error "发布包里没有可执行的 ${binary}"
-        exit 1
-    fi
-    printed="$("${TMP_DIR}/${binary}" --version)"
-    if [[ "${printed##* }" != "${TAG#v}" ]]; then
-        error "${binary} 版本与发布标签不匹配"
-        exit 1
-    fi
-done
+# Extract only the known binary; never trust arbitrary archive paths.
+tar -xzf "${TMP_DIR}/${ASSET}" -C "$TMP_DIR" komo
+if [[ ! -x "${TMP_DIR}/komo" ]]; then
+    error "发布包里没有可执行的 komo"
+    exit 1
+fi
+printed="$("${TMP_DIR}/komo" --version)"
+if [[ "${printed##* }" != "${TAG#v}" ]]; then
+    error "komo 版本与发布标签不匹配"
+    exit 1
+fi
 
 if [[ ! -d "$INSTALL_DIR" ]]; then
     run_install_cmd mkdir -p "$INSTALL_DIR"
 fi
 
 plugin_version="${TAG#v}"
-plugin_generation="${plugin_version}-install-$$"
-plugin_root="${INSTALL_DIR}/komo-plugins"
-run_install_cmd mkdir -p "${plugin_root}/${plugin_generation}"
-for channel in feishu telegram wechat; do
-    run_install_cmd cp "${TMP_DIR}/komo-channel-${channel}" "${plugin_root}/${plugin_generation}/komo-channel-${channel}"
-    run_install_cmd chmod +x "${plugin_root}/${plugin_generation}/komo-channel-${channel}"
-done
-run_install_cmd ln -s "$plugin_generation" "${plugin_root}/${plugin_version}.new-$$"
-if [ "$(uname -s)" = Darwin ]; then
-  run_install_cmd mv -fh "${plugin_root}/${plugin_version}.new-$$" "${plugin_root}/${plugin_version}"
-else
-  run_install_cmd mv -fT "${plugin_root}/${plugin_version}.new-$$" "${plugin_root}/${plugin_version}"
-fi
 # 网页壳（docs/clients.md D5）：`web/` 是个符号链接，指向 komo-web/<代次>/；整个换掉靠
 # 一次 rename，Gateway 读到的永远是完整的一份。旧版本的发布包没有 web/，那就不动现有的。
 if tar -tzf "${TMP_DIR}/${ASSET}" | grep -q '^web/'; then
@@ -254,7 +239,7 @@ if tar -tzf "${TMP_DIR}/${ASSET}" | grep -q '^web/'; then
         komo-web/*) run_install_cmd rm -rf "${INSTALL_DIR}/${previous_web}" ;;
     esac
 fi
-# Plugins are ready before the atomic main-binary replacement; old versions keep their set.
+# The web shell is ready before the atomic main-binary replacement.
 run_install_cmd cp "${TMP_DIR}/komo" "${INSTALL_DIR}/komo.new"
 run_install_cmd chmod +x "${INSTALL_DIR}/komo.new"
 run_install_cmd mv -f "${INSTALL_DIR}/komo.new" "${INSTALL_DIR}/komo"

@@ -23,15 +23,15 @@
 //! | `sessions::lifecycle` | delete / purge / 启动补做 `closing` / reconcile（只查 blob 引用） | W4a |
 //! | **`submit`** | 提交受理：路由到当前分支、惰性 fork、model / effort 覆盖、`/new`、`/cancel` | W1c |
 //! | `submit::shell` | `!` 命令直跑（不建 run），落 `shell.command` write | W2a |
-//! | **`interventions`** | faulted 任务清单、`abandon` 确认、NeedsAttention 投递 | W4a |
+//! | **`interventions`** | faulted 任务清单、`abandon` 确认 | W4a |
 //! | `interventions::confirms` | 待确认的对外调用（`docs/confirm.md` §6） | — |
 //! | **`feed`** | 提交订阅 → SSE 帧（投影、`AssistantDelta`）与事件补读 | W2b |
 //! | `feed::nested_view` | codemode 子调用给界面的视图 | — |
 //! | **`background`** | Durable 模式的后台循环 | W0b（W2b/W3 往里加） |
 //! | `background::monitor_runner` | `MonitorRunner`：监听与转后台命令的进程、泵、合批、时限、遗留进程核对 | W2c |
-//! | `background::watch` | 看客：终态回给输入的来源对端、并入通知、重启补挂 | W3a |
+//! | `background::watch` | 看客：run 正常完成后起会话标题、重启补挂 | W3a |
 //! | `background::cron` | cron 的 `CronTarget`（一次提交建会话 + 受理）、重启补做、tick 的 spawn | W3b |
-//! | `background::cron_watch` | 按 run 终态帧（`komo.settled`）回写触发状态、按 `notify` 投递 | W3b |
+//! | `background::cron_watch` | 按 run 终态帧（`komo.settled`）回写触发状态 | W3b |
 //! | `background::memory` | 记忆的装配（`DurableSessionEvents` / `DurableMemoryWork`）与 `MEMORY_TICK` | W3c |
 
 pub mod assemble;

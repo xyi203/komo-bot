@@ -13,9 +13,8 @@ use komo_kernel::traits::LlmClient as _;
 use komo_kernel::types::ids::{RunId, SessionId};
 use komo_kernel::types::turn::{ReplayMessage, Role, RoundInput, TurnRequest};
 
-use komo_channel::inbox::attachment_label;
-
 use super::tree::input_text;
+use crate::inbox::attachment_label;
 use crate::service::state::GatewayState;
 
 /// 生成的标题最多这么多个字符。
@@ -57,7 +56,7 @@ async fn retitle(
         return Ok(());
     }
     let first = legacy_ids::submission_of(run).ok_or("不是 Durable 的 RunId")?;
-    let (_, entry) = super::super::background::watch::source_of(core, first).await;
+    let entry = super::super::background::watch::input_entry(core, first).await;
     let entry = entry.ok_or("输入没有放置过")?;
     let stored = core
         .storage
@@ -155,7 +154,7 @@ pub(crate) fn title_for(text: &str) -> Option<String> {
         .map(str::trim)
         .filter(|line| !line.is_empty())
         .collect();
-    // 开头的附件说明（聊天渠道收的图、网页输入框的附件）不当标题：取用户自己的第一行；只有附件就用它们的短名字
+    // 开头的附件说明（网页输入框的附件，以及渠道删除前收进旧会话的图）不当标题：取用户自己的第一行；只有附件就用它们的短名字
     let labels: String;
     let first = match lines.iter().find(|line| attachment_label(line).is_none()) {
         Some(line) => *line,

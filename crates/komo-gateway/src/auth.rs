@@ -2,7 +2,7 @@
 //!
 //! 两种凭据：
 //!
-//! - `Authorization: Bearer <token>`：令牌在发现文件里（与数据目录同权限），CLI / TUI / 渠道插件用；
+//! - `Authorization: Bearer <token>`：令牌在发现文件里（与数据目录同权限），CLI 用；
 //! - 会话 cookie：浏览器经配对码换来（[`crate::web`]）。用 cookie 的请求，**会改东西的**（非
 //!   GET / HEAD）还要核对 `Origin` 与 `Host` 同源，否则 403——`SameSite=Strict` 之外再加一道。
 //!

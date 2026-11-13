@@ -27,7 +27,7 @@ pub struct AgentDoc {
     pub workdir: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_rounds: Option<u32>,
-    /// 来源（origin，如 `chat:telegram:123`）。
+    /// 来源（origin；渠道删除前的会话是 `chat:{peer}`）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
 }

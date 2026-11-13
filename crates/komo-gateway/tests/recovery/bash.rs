@@ -4,7 +4,7 @@ use komo_gateway::service::test_support::driver_stream::{open_session, submit};
 use komo_gateway::service::test_support::harness::{FakeLlm, call_round, text_round};
 use komo_kernel::durable::SubmissionStatus;
 
-use crate::{entries_json, sender, start_bash, until};
+use crate::{entries_json, start_bash, until};
 
 /// 一条 `bash` 命令跑到一半 Gateway 重启：**执行器不把命令再跑一遍**（计数文件只有一行），那次调用落成
 /// `uncertain`——正文说明"被 Gateway 重启打断、副作用是否已经发生未知"，并带上中断前已落盘的部分输出——
@@ -28,7 +28,7 @@ async fn a_killed_bash_is_handed_to_the_model_as_interrupted() {
         ),
         text_round(2, "不该走到这里"),
     ]]);
-    let mut gateway = start_bash(Some(&home), llm, &sender()).await;
+    let mut gateway = start_bash(Some(&home), llm).await;
     let session = open_session(&gateway).await;
     let run = submit(&gateway, &session, "kill-1", "跑一条慢命令")
         .await
@@ -44,7 +44,7 @@ async fn a_killed_bash_is_handed_to_the_model_as_interrupted() {
     gateway.stop().await;
 
     let llm = FakeLlm::finisher("核对过了，不重做。");
-    let gateway = start_bash(Some(&home), llm, &sender()).await;
+    let gateway = start_bash(Some(&home), llm).await;
     let record = gateway.wait_run(&run).await;
     assert_eq!(
         record.status(),

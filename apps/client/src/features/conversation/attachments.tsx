@@ -3,8 +3,9 @@ import { ImageZoom } from "@/components/image-zoom";
 import { m } from "@/paraglide/messages.js";
 
 /**
- * 附件在消息里只是正文开头的几行说明（Gateway 不认识附件，docs/web.md §5）：网页输入框的附件与聊天渠道收的图片
- * 都写成这个样子。形状与 `crates/komo-channel/src/inbox.rs` 的 `image_note` / `file_note` 逐字对应，改了要一起改。
+ * 附件在消息里只是正文开头的几行说明（Gateway 不认识附件，docs/web.md §5）：网页输入框的附件写成这个样子
+ * （聊天渠道删除之前收进来的图片在旧会话里也是这个写法，仍要认得出来）。形状与
+ * `crates/komo-gateway/src/inbox.rs` 的 `image_note` / `file_note` 逐字对应，改了要一起改。
  */
 const IMAGE_NOTE = /^\[用户发来一张图片，已存到 (.+)，用 read 查看\]$/;
 const FILE_NOTE = /^\[用户发来一个文件 (.+?)，已存到 (.+)，用 read 查看\]$/;

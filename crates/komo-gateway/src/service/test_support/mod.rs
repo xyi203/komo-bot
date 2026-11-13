@@ -1,12 +1,11 @@
-//! 集成测试用的一整台 Gateway：真数据目录、真 durable.db / aux.db、真 HTTP 监听、真 Dispatcher；
-//! 模型与渠道是替身。
+//! 集成测试用的一整台 Gateway：真数据目录、真 durable.db / aux.db、真 HTTP 监听；模型是替身。
 //!
 //! 用 [`super::start`] 而不是另起一套装配——验收要证的是**这条启动路径**本身对，
 //! 而不是一条只在测试里存在的近似路径。
 //!
 //! 这个模块里的 `TestGateway` 是**单元测试**（`service::tests`）用的那一份；四个集成
 //! 测试目标（chat / cron / memory / recovery）共用的那一套在 [`harness`] 里——它们原先
-//! 各自抄了一份"真 Gateway + MemSender + FakeLlm + 数据目录"，四份的差别只在各自特有的
+//! 各自抄了一份"真 Gateway + FakeLlm + 数据目录"，四份的差别只在各自特有的
 //! 那几个助手上。
 
 pub mod driver_stream;
@@ -19,20 +18,14 @@ use std::sync::Arc;
 
 #[cfg(test)]
 use komo_kernel::protocol::config::{
-    ChannelsConfig, ConfigSnapshot, MemoryConfig, PathsConfig, RetrievalConfig, StartOnly,
-    TypesafeConfig,
+    ConfigSnapshot, MemoryConfig, PathsConfig, RetrievalConfig, StartOnly, TypesafeConfig,
 };
 #[cfg(test)]
 use komo_kernel::traits::LlmClient;
 #[cfg(test)]
 use komo_kernel::types::agent::{AgentConfig, AgentProfile};
 #[cfg(test)]
-use komo_kernel::types::chat::ChannelPlatform;
-#[cfg(test)]
 use komo_kernel::types::model::{CatalogModel, ModelCatalog, ModelConfig};
-
-#[cfg(test)]
-use crate::channels::{ChannelSender, test_channel::MemChannel};
 
 #[cfg(test)]
 use komo_llm::ModelStream;
@@ -63,19 +56,6 @@ enabled = false
 {extra}
 "#
     )
-}
-
-/// 配置里有一个 Telegram 渠道：操作者 111，home chat 111。
-#[cfg(test)]
-pub fn telegram_config(allow_from: &str) -> String {
-    config_toml(&format!(
-        r#"
-[channels.telegram]
-enabled = true
-allow_from = [{allow_from}]
-home_chat = 111
-"#
-    ))
 }
 
 /// 一份手搭的快照（纯函数的测试用它，不落文件）。
@@ -132,7 +112,6 @@ pub fn sample_snapshot() -> ConfigSnapshot {
             )]),
         },
         typesafe: TypesafeConfig::default(),
-        channels: ChannelsConfig::default(),
         mcp: Default::default(),
         paths: PathsConfig {
             sessions_dir: "/tmp/komo/sessions".into(),
@@ -147,19 +126,18 @@ pub fn sample_snapshot() -> ConfigSnapshot {
     }
 }
 
-/// 一台起着的 Gateway，外加一个内存渠道。
+/// 一台起着的 Gateway。
 #[cfg(test)]
 pub struct TestGateway {
     pub home: tempfile::TempDir,
     pub running: Running,
-    pub channel: Arc<MemChannel>,
 }
 
 #[cfg(test)]
 impl TestGateway {
-    /// 默认配置：一个 Telegram 渠道，操作者 111；不注入模型（按配置造，用不到就不会被调用）。
+    /// 默认配置；不注入模型（按配置造，用不到就不会被调用）。
     pub async fn start() -> TestGateway {
-        TestGateway::boot(&telegram_config("111"), None, None).await
+        TestGateway::boot(&config_toml(""), None, None).await
     }
 
     /// 配置自己给，不注入模型。
@@ -191,7 +169,6 @@ impl TestGateway {
             home: Some(home.path().to_path_buf()),
             // 端口 0：内核挑一个空的，发现文件里写的是真实地址。
             listen: Some("127.0.0.1:0".into()),
-            channels: Vec::new(),
             llm,
             stream,
             embeddings: None,
@@ -202,17 +179,7 @@ impl TestGateway {
         .await
         .expect("Gateway 起得来");
 
-        let channel = MemChannel::new(ChannelPlatform::Telegram);
-        running
-            .state
-            .channels
-            .register(Arc::clone(&channel) as Arc<dyn ChannelSender>);
-
-        TestGateway {
-            home,
-            running,
-            channel,
-        }
+        TestGateway { home, running }
     }
 
     /// 等这条 run 的输入 submission 结算（`done` 或 `unanswered`，最多 20 秒）。
@@ -225,10 +192,6 @@ impl TestGateway {
 
     pub fn state(&self) -> &Arc<super::state::GatewayState> {
         &self.running.state
-    }
-
-    pub fn dispatcher(&self) -> &Arc<crate::dispatcher::Dispatcher> {
-        &self.running.dispatcher
     }
 
     pub fn base_url(&self) -> &str {

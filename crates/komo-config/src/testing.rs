@@ -91,10 +91,6 @@ candidate_limit = 40
 top_k = 8
 max_tokens = 1500
 
-[channels.feishu]
-enabled = true
-allow_from = ["ou_operator"]
-home_chat = "oc_home"
 "#
         )
     }
@@ -103,9 +99,7 @@ home_chat = "oc_home"
         format!(
             "KOMO_LLM_API_KEY={SECRET_VALUE}\n\
              KOMO_MEMORY_API_KEY={SECRET_VALUE}-memory\n\
-             KOMO_EMBEDDING_API_KEY={SECRET_VALUE}-embed\n\
-             FEISHU_APP_ID=cli_fixture\n\
-             FEISHU_APP_SECRET={SECRET_VALUE}-feishu\n"
+             KOMO_EMBEDDING_API_KEY={SECRET_VALUE}-embed\n"
         )
     }
 }

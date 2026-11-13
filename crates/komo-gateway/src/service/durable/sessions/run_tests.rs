@@ -13,8 +13,8 @@ use komo_kernel::types::turn::LlmError;
 use komo_llm::{ModelRequest, ModelStream};
 use tokio::sync::Semaphore;
 
+use crate::service::test_support::config_toml;
 use crate::service::test_support::harness::{FakeLlm, GatewayBuilder, TestGateway};
-use crate::service::test_support::{config_toml, harness::telegram_config};
 
 /// 放行之前一个请求都不回的模型：在跑的 run 停在"请求模型"上。
 struct Gated {
@@ -139,7 +139,7 @@ async fn an_unknown_or_legacy_run_id_is_not_found() {
 #[tokio::test]
 async fn a_replayed_bang_command_runs_once_and_other_content_conflicts() {
     let llm = FakeLlm::finisher("好");
-    let gateway = GatewayBuilder::new(&telegram_config("111"))
+    let gateway = GatewayBuilder::new(&config_toml(""))
         .fake_llm(llm.clone())
         .start()
         .await;
@@ -352,7 +352,7 @@ async fn stopping_the_gateway_ends_a_detached_bang_command_and_notes_it_in_histo
     assert!(receipt.detached, "{receipt:?}");
 
     let stopping = std::time::Instant::now();
-    gateway.restart_with(&detaching_config(), Vec::new()).await;
+    gateway.restart_with(&detaching_config()).await;
     assert!(
         stopping.elapsed() < std::time::Duration::from_secs(15),
         "没等那条 sleep：{:?}",

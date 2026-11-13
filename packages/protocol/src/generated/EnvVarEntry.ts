@@ -10,6 +10,6 @@ in_file: boolean,
  */
 set: boolean, 
 /**
- * 引用它的配置项，如 `provider magpie`、`渠道 feishu`。
+ * 引用它的配置项，如 `provider magpie`、`MCP linear`。
  */
 used_by?: Array<string>, };

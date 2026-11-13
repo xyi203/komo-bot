@@ -14,28 +14,23 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use komo_kernel::durable::storage::TaskQuery;
 use komo_kernel::durable::{
-    ConversationId, Cursor, ScanOrder, SessionKind, SessionLifecycle, SessionRecord, StorageWrite,
-    TaskId, TaskRecord, TaskState, TaskStatus,
+    ConversationId, Cursor, ScanOrder, SessionLifecycle, SessionRecord, StorageWrite, TaskId,
+    TaskRecord, TaskState, TaskStatus,
 };
 use komo_kernel::protocol::http::{
     InterventionAnswerResponse, InterventionDetail, InterventionKind, InterventionSummary,
     InterventionVerdict,
 };
-use komo_kernel::traits::{GatewayError, Shutdown};
-use komo_kernel::types::chat::Outbound;
-use komo_kernel::types::ids::{RunId, SessionId, ToolCallId};
+use komo_kernel::traits::GatewayError;
+use komo_kernel::types::ids::{SessionId, ToolCallId};
 use komo_runtime::durable::harness::{ConfirmAnswer, ConfirmVerdict, TOOL_KIND, confirm_address};
 use serde_json::Value;
-use tokio::sync::mpsc;
 
 use super::super::DurableCore;
 use super::super::sessions::{SessionError, time_of};
-use super::{RunLookup, deliver_attention, task_entry};
-use crate::service::state::GatewayState;
+use super::{RunLookup, task_entry};
 
 const SCAN_PAGE: usize = 512;
-/// 卡里的参数最多印这么多字节。
-const ARGUMENTS_BYTES: usize = 1024;
 
 /// 工具任务此刻停在 `confirm` 吗。
 fn confirming(record: &TaskRecord) -> bool {
@@ -61,7 +56,6 @@ fn checkpoint(record: &TaskRecord) -> Option<&Value> {
 pub struct ConfirmIndex {
     state: Mutex<IndexState>,
     loading: tokio::sync::Mutex<()>,
-    announce: Mutex<Option<mpsc::UnboundedSender<TaskRecord>>>,
 }
 
 #[derive(Default)]
@@ -85,27 +79,8 @@ impl ConfirmIndex {
                 state.tasks.remove(&record.id.get());
                 continue;
             }
-            let fresh = state
-                .tasks
-                .insert(record.id.get(), record.clone())
-                .is_none();
-            drop(state);
-            if fresh
-                && let Some(sender) = self
-                    .announce
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .as_ref()
-            {
-                let _ = sender.send(record.clone());
-            }
+            state.tasks.insert(record.id.get(), record.clone());
         }
-    }
-
-    fn subscribe(&self) -> mpsc::UnboundedReceiver<TaskRecord> {
-        let (sender, receiver) = mpsc::unbounded_channel();
-        *self.announce.lock().unwrap_or_else(PoisonError::into_inner) = Some(sender);
-        receiver
     }
 
     async fn ensure_loaded(
@@ -220,19 +195,6 @@ impl Confirming {
     pub fn handle(&self) -> String {
         self.task.id.to_string()
     }
-}
-
-/// 卡里的参数：紧凑 JSON，截到 [`ARGUMENTS_BYTES`]。
-fn arguments_text(arguments: &Value) -> String {
-    let text = arguments.to_string();
-    if text.len() <= ARGUMENTS_BYTES {
-        return text;
-    }
-    let mut end = ARGUMENTS_BYTES;
-    while !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}…（共 {} 字节）", &text[..end], text.len())
 }
 
 impl DurableCore {
@@ -401,120 +363,5 @@ impl DurableCore {
             note,
             already_answered: already,
         })
-    }
-
-    /// 卡从哪来（定时任务、后台任务、会话里的后台事件）。
-    async fn confirm_origin(&self, session: &SessionRecord) -> String {
-        match session.kind {
-            SessionKind::Cron => match session.title.as_deref() {
-                Some(name) => format!("定时任务「{name}」"),
-                None => "定时任务".into(),
-            },
-            SessionKind::Task => self
-                .task_label(&session.id)
-                .await
-                .unwrap_or_else(|| "后台任务".into()),
-            _ => match session.title.as_deref() {
-                Some(title) => format!("会话「{title}」里的后台事件"),
-                None => "会话里的后台事件".into(),
-            },
-        }
-    }
-
-    /// 卡的正文（渲染时前面加"需要你判断"）。
-    async fn confirm_card(&self, found: &Confirming) -> String {
-        let hours = (found.deadline - found.asked_at) as f64 / 3_600_000.0;
-        let wait = if hours >= 1.0 && hours.fract() == 0.0 {
-            format!("{} 小时", hours as i64)
-        } else {
-            format!("{} 分钟", (found.deadline - found.asked_at) / 60_000)
-        };
-        let handle = found.handle();
-        format!(
-            "对外动作等你确认\n来源：{}\n调用：{}\n参数：{}\n{wait}内没回复就不执行。\n\
-             回复 /answer {handle} approve 执行，/answer {handle} reject 不执行。",
-            self.confirm_origin(&found.session).await,
-            found.tool,
-            arguments_text(&found.arguments),
-        )
-    }
-}
-
-// ------------------------------------------------------------------- 投递
-
-/// 起确认卡的投递（与 [`super::interventions::spawn_attention`] 同时起，在 `core.resume()` 之前）。
-pub fn spawn_confirm_attention(state: &Arc<GatewayState>, shutdown: &Shutdown) {
-    let Ok(core) = state.core() else { return };
-    let mut receiver = core.confirms.subscribe();
-    let weak = Arc::downgrade(state);
-    let shutdown = shutdown.clone();
-    tokio::spawn(async move {
-        if let Some(state) = weak.upgrade()
-            && let Ok(core) = state.core()
-        {
-            match core.confirming(None).await {
-                Ok(all) => {
-                    for found in all {
-                        announce(&state, &found).await;
-                    }
-                }
-                Err(error) => tracing::warn!(%error, "读不出待确认的调用，启动时的补投没做成"),
-            }
-        }
-        loop {
-            let received = tokio::time::timeout(super::SHUTDOWN_POLL, receiver.recv()).await;
-            if shutdown.is_cancelled() {
-                return;
-            }
-            let record = match received {
-                Err(_) => continue,
-                Ok(Some(record)) => record,
-                Ok(None) => return,
-            };
-            let Some(state) = weak.upgrade() else { return };
-            let Ok(core) = state.core() else { return };
-            match core.find_confirming(&record.id.to_string()).await {
-                Ok(Some(found))
-                    if matches!(
-                        found.session.lifecycle,
-                        SessionLifecycle::Active | SessionLifecycle::Closing
-                    ) =>
-                {
-                    announce(&state, &found).await;
-                }
-                Ok(_) => {}
-                Err(error) => tracing::warn!(%error, "确认卡没投出去"),
-            }
-        }
-    });
-}
-
-async fn announce(state: &Arc<GatewayState>, found: &Confirming) {
-    let Ok(core) = state.core() else { return };
-    let summary = core.confirm_summary(found, &mut RunLookup::default()).await;
-    let key = crate::notifier::intervention_key(&summary);
-    let message = Outbound::NeedsAttention {
-        session: SessionId::from_raw(found.session.id.clone()),
-        run: summary
-            .run
-            .clone()
-            .unwrap_or_else(|| RunId::from_raw(found.handle())),
-        reason: core.confirm_card(found).await,
-    };
-    deliver_attention(state, &found.session, message, &key, &found.handle()).await;
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn long_arguments_are_cut_on_a_char_boundary() {
-        let short = serde_json::json!({ "to": "x" });
-        assert_eq!(arguments_text(&short), r#"{"to":"x"}"#);
-        let long = serde_json::json!({ "text": "中".repeat(1000) });
-        let text = arguments_text(&long);
-        assert!(text.contains("…（共 "), "{text}");
-        assert!(text.len() < ARGUMENTS_BYTES + 40);
     }
 }

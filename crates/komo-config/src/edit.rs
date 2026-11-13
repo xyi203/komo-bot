@@ -12,7 +12,6 @@ use komo_kernel::protocol::http::{
     ConfigEnvResponse, ConfigModelEntry, ConfigModelsResponse, EmbeddingModelEntry, EnvVarEntry,
     ProviderEntry,
 };
-use komo_kernel::types::chat::ChannelPlatform;
 use komo_kernel::types::digest::ContentHash;
 use toml_edit::{Array, DocumentMut, Item, Table, value};
 
@@ -931,7 +930,7 @@ pub fn env_view(
 }
 
 /// 配置里按名字指向 `.env` 的地方：provider / 模型的凭证变量、MCP 的 `bearer_token_env`
-/// 与 `env`、启用渠道的凭证。名字 → 引用方（"provider magpie" 这样的短语）。
+/// 与 `env`。名字 → 引用方（"provider magpie" 这样的短语）。
 fn env_references(doc: &DocumentMut) -> BTreeMap<String, Vec<String>> {
     let mut refs: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut add = |name: &str, who: String| {
@@ -975,20 +974,6 @@ fn env_references(doc: &DocumentMut) -> BTreeMap<String, Vec<String>> {
                 if let Some(name) = name.as_str() {
                     add(name, format!("MCP {server}"));
                 }
-            }
-        }
-    }
-    for (platform, key) in [
-        (ChannelPlatform::Feishu, "feishu"),
-        (ChannelPlatform::Telegram, "telegram"),
-    ] {
-        let enabled = sub_table(doc, "channels", key)
-            .and_then(|t| t.get("enabled"))
-            .and_then(Item::as_bool)
-            .unwrap_or(false);
-        if enabled {
-            for name in super::channel_credentials(platform) {
-                add(name, format!("渠道 {key}"));
             }
         }
     }
@@ -1499,9 +1484,8 @@ default = "magpie-sol"
 
     #[test]
     fn the_env_view_lists_names_and_missing_references_but_never_values() {
-        let config = format!(
-            "{CONFIG}\n[mcp.servers.gh]\ncommand = \"gh-mcp\"\nenv = [\"GH_TOKEN\"]\n\n[channels.telegram]\nenabled = true\n"
-        );
+        let config =
+            format!("{CONFIG}\n[mcp.servers.gh]\ncommand = \"gh-mcp\"\nenv = [\"GH_TOKEN\"]\n");
         let env = "MAGPIE_API_KEY='sk-secret'\nOTHER=1\nMAGPIE_API_KEY=dup\n";
         let view = env_view(
             &config,
@@ -1521,12 +1505,10 @@ default = "magpie-sol"
                 ("MAGPIE_API_KEY", true, true),
                 ("OTHER", true, true),
                 ("GH_TOKEN", false, false),
-                ("TELEGRAM_BOT_TOKEN", false, false),
             ]
         );
         assert_eq!(view.vars[0].used_by, ["provider magpie"]);
         assert_eq!(view.vars[2].used_by, ["MCP gh"]);
-        assert_eq!(view.vars[3].used_by, ["渠道 telegram"]);
         assert!(view.vars[1].used_by.is_empty());
         let json = serde_json::to_string(&view).unwrap();
         assert!(!json.contains("sk-secret") && !json.contains("dup"));

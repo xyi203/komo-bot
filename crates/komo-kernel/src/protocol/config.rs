@@ -25,12 +25,11 @@ use time::OffsetDateTime;
 use crate::compaction::CompactionEconomics;
 use crate::projection::{DecayPolicy, ProjectionContext};
 use crate::types::agent::AgentConfig;
-use crate::types::chat::{ChannelPlatform, PeerId};
 use crate::types::digest::ContentHash;
 use crate::types::memory::RetrievalMode;
 use crate::types::model::{EmbeddingConfig, ModelCatalog, ModelConfig};
 
-/// 一个配置键的路径，例如 `channels.feishu.allow_from`。**只有键名，没有值。**
+/// 一个配置键的路径，例如 `model.model`。**只有键名，没有值。**
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(type = "string"))]
 #[serde(transparent)]
@@ -198,107 +197,6 @@ pub enum McpTransport {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         oauth: bool,
     },
-}
-
-/// Explicit external plugin command; omitted official channels use sibling binaries.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ChannelPlugin {
-    pub command: PathBuf,
-    #[serde(default)]
-    pub args: Vec<String>,
-    #[serde(default)]
-    pub env: Vec<String>,
-}
-
-/// 一个聊天渠道的行为键（§11.2）。凭证在 .env，不在这里。
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ChannelConfig {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub plugin: Option<ChannelPlugin>,
-    #[serde(default)]
-    pub enabled: bool,
-    /// 操作者的平台 id。**为空 = 只出不进**：还能作 home chat 收投递，但没人能通过它
-    /// 下指令。
-    #[serde(default)]
-    pub allow_from: Vec<PeerId>,
-    /// 与机器人同一租户（企业）的人都算操作者，等同写进 `allow_from`。只有飞书能核实，
-    /// 且外部联系人、外部群（含组织外成员的群）里的消息不算。
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub allow_tenant: bool,
-    /// 主动投递（Run 结束、需要人判断等）的目标会话。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub home_chat: Option<PeerId>,
-}
-
-impl ChannelConfig {
-    /// 这个发送者是不是操作者。
-    pub fn is_operator(&self, sender: &PeerId) -> bool {
-        self.allow_from.contains(sender)
-    }
-
-    /// 这条消息的发送者算不算操作者：在 `allow_from` 里，或开了 `allow_tenant` 且渠道
-    /// 核实了同一组织（[`InboundMessage::same_org`](crate::protocol::InboundMessage)）。
-    pub fn admits(&self, sender: &PeerId, same_org: bool) -> bool {
-        self.is_operator(sender) || (self.allow_tenant && same_org)
-    }
-
-    /// enabled 但没人能说话——`komo doctor` 把它列为警告（§11.2）。
-    pub fn is_outbound_only(&self) -> bool {
-        self.enabled && self.allow_from.is_empty() && !self.allow_tenant
-    }
-}
-
-/// 三个渠道。
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ChannelsConfig {
-    #[serde(default)]
-    pub feishu: ChannelConfig,
-    #[serde(default)]
-    pub telegram: ChannelConfig,
-    #[serde(default)]
-    pub wechat: ChannelConfig,
-    #[serde(flatten)]
-    pub extra: BTreeMap<String, ChannelConfig>,
-}
-
-impl ChannelsConfig {
-    pub fn get(&self, platform: ChannelPlatform) -> Option<&ChannelConfig> {
-        match platform {
-            ChannelPlatform::Feishu => Some(&self.feishu),
-            ChannelPlatform::Telegram => Some(&self.telegram),
-            ChannelPlatform::Wechat => Some(&self.wechat),
-            ChannelPlatform::Api => None,
-            ChannelPlatform::Custom(ref id) => self.extra.get(id),
-        }
-    }
-
-    pub fn platforms(&self) -> Vec<ChannelPlatform> {
-        let mut platforms = vec![
-            ChannelPlatform::Feishu,
-            ChannelPlatform::Telegram,
-            ChannelPlatform::Wechat,
-        ];
-        platforms.extend(
-            self.extra
-                .keys()
-                .filter_map(|id| ChannelPlatform::parse(id)),
-        );
-        platforms
-    }
-
-    /// home chat 的候选，按 §11.4 的默认顺序：**飞书 > Telegram > WeChat**。前两者能
-    /// 对任意已加入的会话主动推送，微信不能。
-    pub fn home_chats(&self) -> Vec<(ChannelPlatform, PeerId)> {
-        self.platforms()
-            .into_iter()
-            .filter_map(|platform| {
-                self.get(platform.clone())
-                    .filter(|c| c.enabled)
-                    .and_then(|c| c.home_chat.clone())
-                    .map(|chat| (platform, chat))
-            })
-            .collect()
-    }
 }
 
 /// `[memory.retrieval]`（§9.4）。这些是可调整的初始预算，不强行填满。
@@ -779,7 +677,6 @@ pub struct ConfigSnapshot {
     pub execution: ExecutionConfig,
     #[serde(default)]
     pub compaction: CompactionConfig,
-    pub channels: ChannelsConfig,
     pub paths: PathsConfig,
     /// MCP 服务器（`[mcp.servers.<name>]`，`docs/mcp.md`）。重载时按名字比对：新增的后台连上，
     /// 删掉的撤工具、断开，改了的先删后加（照 pi 的 `mcp_servers_change`）。
@@ -914,18 +811,6 @@ mod tests {
                 agents: BTreeMap::from([("assistant".into(), AgentProfile::new("assistant"))]),
             },
             typesafe: TypesafeConfig::default(),
-            channels: ChannelsConfig {
-                extra: Default::default(),
-                feishu: ChannelConfig {
-                    plugin: None,
-                    enabled: true,
-                    allow_from: vec![PeerId::new("ou_xxx")],
-                    allow_tenant: false,
-                    home_chat: Some(PeerId::new("oc_xxx")),
-                },
-                telegram: ChannelConfig::default(),
-                wechat: ChannelConfig::default(),
-            },
             paths: PathsConfig {
                 sessions_dir: PathBuf::from("/home/u/.komo/sessions"),
                 skill_dirs: vec![PathBuf::from("/home/u/.komo/skills")],
@@ -955,19 +840,15 @@ mod tests {
         let before = snapshot();
         let mut after = snapshot();
         after.model.model = "chat-b".into();
-        after.channels.feishu.allow_from.push(PeerId::new("ou_yyy"));
+        after.memory.enabled = false;
 
         let keys = before.diff(&after);
         assert_eq!(
             keys,
-            vec![
-                KeyPath::new("channels.feishu.allow_from"),
-                KeyPath::new("model.model"),
-            ]
+            vec![KeyPath::new("memory.enabled"), KeyPath::new("model.model"),]
         );
         for key in &keys {
             assert!(!key.as_str().contains("chat-b"), "{key}");
-            assert!(!key.as_str().contains("ou_yyy"), "{key}");
         }
     }
 
@@ -1041,76 +922,6 @@ mod tests {
         two.mcp.insert("jira".into(), server("y"));
         assert_eq!(one.diff(&two), vec![KeyPath::new("mcp.jira")]);
         assert_eq!(one.start_only_changes(&two), vec![]);
-    }
-
-    #[test]
-    fn home_chat_candidates_follow_feishu_then_telegram_then_wechat() {
-        let mut snapshot = snapshot();
-        snapshot.channels.telegram = ChannelConfig {
-            plugin: None,
-            enabled: true,
-            allow_from: vec![PeerId::new("123")],
-            allow_tenant: false,
-            home_chat: Some(PeerId::new("123")),
-        };
-        snapshot.channels.wechat = ChannelConfig {
-            plugin: None,
-            enabled: true,
-            allow_from: vec![PeerId::new("wxid_x")],
-            allow_tenant: false,
-            home_chat: Some(PeerId::new("wxid_x")),
-        };
-        let order: Vec<ChannelPlatform> = snapshot
-            .channels
-            .home_chats()
-            .into_iter()
-            .map(|(p, _)| p)
-            .collect();
-        assert_eq!(
-            order,
-            vec![
-                ChannelPlatform::Feishu,
-                ChannelPlatform::Telegram,
-                ChannelPlatform::Wechat
-            ]
-        );
-    }
-
-    #[test]
-    fn an_enabled_channel_with_an_empty_allow_list_is_outbound_only() {
-        let channel = ChannelConfig {
-            plugin: None,
-            enabled: true,
-            allow_from: vec![],
-            allow_tenant: false,
-            home_chat: Some(PeerId::new("oc_x")),
-        };
-        assert!(channel.is_outbound_only());
-        assert!(!channel.is_operator(&PeerId::new("ou_x")));
-    }
-
-    #[test]
-    fn allow_tenant_admits_a_verified_same_org_sender_only() {
-        let channel = ChannelConfig {
-            plugin: None,
-            enabled: true,
-            allow_tenant: true,
-            ..ChannelConfig::default()
-        };
-        let sender = PeerId::new("ou_colleague");
-        assert!(channel.admits(&sender, true));
-        assert!(!channel.admits(&sender, false), "渠道没核实就不算");
-        assert!(!channel.is_outbound_only(), "靠租户进来的人也能下指令");
-
-        let closed = ChannelConfig {
-            plugin: None,
-            enabled: true,
-            ..ChannelConfig::default()
-        };
-        assert!(
-            !closed.admits(&sender, true),
-            "没开 allow_tenant 就不看 same_org"
-        );
     }
 
     /// `tool_exposure`：原名最优先；模式里字面部分最长的赢；都不中就是服务器的 `exposure`。

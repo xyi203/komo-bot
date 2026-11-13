@@ -42,8 +42,6 @@
 //! | `GET /v1/mcp` | — | [`McpServersResponse`] |
 //! | `POST /v1/config/provider-models` | [`ProviderModelsRequest`] | [`ProviderModelsResponse`] |
 //! | `POST /v1/mcp/disconnect` | [`McpReconnectRequest`] | [`McpReconnectResponse`] |
-//! | `GET /v1/channels` | — | [`ChannelsResponse`] |
-//! | `POST /v1/channels/{id}/probe` | — | [`ChannelProbeResponse`] |
 //!
 //! `confirm` 与 `forget` 都返回**整条**记忆而不是一个 `{ok:true}`：它们带着预期
 //! revision 来，回去的那条才说得清现在是第几版（§9.6 的幂等就是靠这个比出来的）。
@@ -1969,7 +1967,7 @@ pub struct EnvVarEntry {
     pub in_file: bool,
     /// `.env` 或进程环境里有非空值。
     pub set: bool,
-    /// 引用它的配置项，如 `provider magpie`、`渠道 feishu`。
+    /// 引用它的配置项，如 `provider magpie`、`MCP linear`。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[cfg_attr(feature = "ts", ts(as = "Option<Vec<String>>"))]
     pub used_by: Vec<String>,
@@ -2101,70 +2099,6 @@ pub enum McpServerState {
     Failed,
     /// 操作者手动断开（`POST /v1/mcp/disconnect`）：重连之前不自动再连，调它的工具报错。
     Disconnected,
-}
-
-/// `GET /v1/channels`：每个配置里的渠道，配置摘要加上 Gateway 看得见的运行状态。凭证与
-/// 插件命令不给。
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
-#[cfg_attr(feature = "ts", ts(optional_fields))]
-pub struct ChannelsResponse {
-    #[serde(default)]
-    pub channels: Vec<ChannelView>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
-#[cfg_attr(feature = "ts", ts(optional_fields))]
-pub struct ChannelView {
-    pub channel: String,
-    pub enabled: bool,
-    /// 配了 `plugin.command`（自定义渠道，或换了命令的官方渠道）。
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    #[cfg_attr(feature = "ts", ts(as = "Option<bool>"))]
-    pub custom_plugin: bool,
-    pub allow_from: usize,
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    #[cfg_attr(feature = "ts", ts(as = "Option<bool>"))]
-    pub allow_tenant: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub home_chat: Option<String>,
-    /// 启用了却没人能通过它下指令（§11.2 的那条警告）。
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    #[cfg_attr(feature = "ts", ts(as = "Option<bool>"))]
-    pub outbound_only: bool,
-    pub state: ChannelRunState,
-    /// 进入当前状态的时间；未启用时没有。
-    #[serde(default, with = "time::serde::rfc3339::option")]
-    #[cfg_attr(feature = "ts", ts(type = "string | null"))]
-    pub since: Option<OffsetDateTime>,
-    /// 退出或起不来的原因。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub detail: Option<String>,
-    /// 这次启动以来插件退出后重建了几次（配置重载重启的不算）。
-    #[serde(default)]
-    pub restarts: u32,
-}
-
-/// Gateway 只看得见插件进程这一层：在跑（握手、平台连接在插件里）、退出后退避重试、
-/// 起不来（缺凭证、缺插件这类重建前就失败的）、没启用。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
-#[serde(rename_all = "snake_case")]
-pub enum ChannelRunState {
-    Off,
-    Running,
-    Retrying,
-    Failed,
-}
-
-/// `POST /v1/channels/{id}/probe`：和 `komo channel probe` 同一条连通性核对，不起消费循环。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
-#[cfg_attr(feature = "ts", ts(optional_fields))]
-pub struct ChannelProbeResponse {
-    pub ok: bool,
-    pub message: String,
 }
 
 // ---------------------------------------------------------------- 一轮改了哪些文件

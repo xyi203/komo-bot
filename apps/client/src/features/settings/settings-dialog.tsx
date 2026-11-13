@@ -6,7 +6,6 @@ import { Dialog, DialogContent, DialogDescription, DialogTitle } from "@/compone
 import { IconButton } from "@/components/ui/icon-button";
 import { cn } from "@/lib/utils";
 import { m } from "@/paraglide/messages.js";
-import { ChannelsSection } from "./sections/channels-section";
 import { ConfigSection } from "./sections/config-section";
 import { EnvSection } from "./sections/env-section";
 import { GatewaySection } from "./sections/gateway-section";
@@ -22,7 +21,6 @@ const ICONS: Record<SettingsSection, IconName> = {
   index: "search",
   mcp: "plug",
   gateway: "term",
-  channels: "chat",
 };
 
 // 左栏只有 216px（窄窗 180px）：分节名必须一行放得下，长的给短名（节标题仍用全称）
@@ -33,7 +31,6 @@ const LABELS: Record<SettingsSection, () => string> = {
   index: () => m.settings_sec_index(),
   mcp: () => m.settings_sec_mcp(),
   gateway: () => m.settings_sec_gateway(),
-  channels: () => m.settings_sec_channels(),
 };
 
 const BODIES: Record<SettingsSection, () => ReactNode> = {
@@ -43,7 +40,6 @@ const BODIES: Record<SettingsSection, () => ReactNode> = {
   index: () => <IndexSection />,
   mcp: () => <McpSection />,
   gateway: () => <GatewaySection />,
-  channels: () => <ChannelsSection />,
 };
 
 /**

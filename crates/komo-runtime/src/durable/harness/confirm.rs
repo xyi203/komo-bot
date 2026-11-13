@@ -45,7 +45,7 @@ pub enum ConfirmVerdict {
 #[serde(rename_all = "camelCase")]
 pub struct ConfirmAnswer {
     pub verdict: ConfirmVerdict,
-    /// 谁答的：渠道 peer（`feishu:ou_…`）或 `cli`。
+    /// 谁答的：渠道删除前是渠道 peer（`feishu:ou_…`），现在是 `cli`。
     pub by: String,
     /// 答复时刻（Unix 毫秒）。
     pub at: i64,

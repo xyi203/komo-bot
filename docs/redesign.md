@@ -141,22 +141,27 @@
 
 ### 2.4 去掉群聊（已被 §2.6 包含，不单做）
 
-- [ ] 飞书：群里 @机器人 的入站、群话题（`komo-channel/src/feishu/inbound.rs`）
-- [ ] Telegram：群消息
+- [x] 飞书：群里 @机器人 的入站、群话题（`komo-channel/src/feishu/inbound.rs`）（随 `komo-channel` 整个删除，2026-11-13）
+- [x] Telegram：群消息（同上）
 - [x] Router：群分支（`ignore` 去向、只看本群的清单）（随 Router 删除，2026-11-13）
 - [x] 分发：群的线（`source = line:{platform}:{chat_id}`）（随 Router 删除，2026-11-13；存量的群的线会话留在库里，不迁移，群消息改按 `chat:{peer}` 另开普通会话）
-- [ ] 配置：`groups`；`allow_tenant` 是否只为群聊服务未核实，删前看调用方
+- [x] 配置：`groups`（上一步已不认，现在整个 `[channels.*]` 都按退役键处理）；`allow_tenant` 已核实：**不只为群聊**——它让「与机器人同一租户的人」都算操作者，飞书私聊与群的准入都看它，唯一调用方是渠道入站的准入判断（`Dispatcher::principal`），所以随渠道整体删除，没有别的用处（2026-11-13）
 - [x] 群任务不带个人记忆与目标的那条规则（随 Router 删除，2026-11-13：`is_group_task`、召回里的 `from_group`、`komo` 工具对群任务的整体拒绝）
-- [ ] 对应测试
+- [x] 对应测试（渠道与群聊专属的测试已删，通用行为的测试改走 HTTP 提交，见 §2.6 的做法记录）
 - [ ] 计划中的 T5「代操作者回复」取消
-- [ ] 存量群会话留在库里，不迁移
+- [x] 存量群会话留在库里，不迁移（没有任何迁移或清理代码；`source = chat:{peer}` 的会话照常能读）
 
 ### 2.6 去掉聊天渠道（P17，已定：三个渠道全删，直接删代码）
 
-- [ ] 涉及：`komo-channel`（三个平台模块与各自的插件二进制）、Gateway 的渠道进程宿主与 Dispatcher、主动消息的投递（Notifier、`deliveries`、`home_chat`）、渠道命令（`/pending` `/new` 等）、`/v1/channels` 接口、配置里的渠道段、发布包里的三个 `komo-channel-*`（`release.yml`、`install.sh`、`update.rs` 三处的约定）
+- [x] 涉及：`komo-channel`（三个平台模块与各自的插件二进制）、Gateway 的渠道进程宿主与 Dispatcher、主动消息的投递（Notifier、`deliveries`、`home_chat`）、渠道命令（`/pending` `/new` 等）、`/v1/channels` 接口、配置里的渠道段、发布包里的三个 `komo-channel-*`（`release.yml`、`install.sh`、`update.rs` 三处的约定）（2026-11-13 全部直接删代码，没有留停用的版本）
 - [x] 包含了 §2.4（去掉群聊）的全部内容，§2.4 不再单做
 - [x] Router 里只为渠道存在的部分一并收掉：话题的路由归属、主线最近几条消息里按平台区分的逻辑（已核实：这些都只在 Router 与分发里，网页的主对话与支线不用，随 Router 一起删，2026-11-13）
-- [ ] `docs/channel-plugins.md` 归档；`docs/komo_bot.md` §11 整节、`PRODUCT.md`「一个世界，多个入口」改口
+- [x] `docs/channel-plugins.md` 归档（`docs/archive/`）；`docs/komo_bot.md` §11 整节、`PRODUCT.md`「一个世界，多个入口」改口
+- [x] 做法记录（2026-11-13）：
+  - 删：`komo-channel` crate 与 `vendor/wechatbot` 补丁、工作区里的 `openlark` / `wechatbot` / `qrcode` 依赖；Gateway 的 `channels/`、`dispatcher.rs`、`notifier.rs`、`deliveries.rs`、`/v1/channels`、渠道看客的投递（`background/watch.rs` 只剩「首轮完成后起会话标题」与它的重启补挂，见下）、`hooks/channel.rs`（渠道篇幅附注）与 `komo-agent` 的 `context/channel.rs`、介入 / 确认卡往 home chat 的投递（`spawn_attention` 等）、`reload.rs` 里的 home chat 通知、`cron_watch` 的 `notify` 投递；`komo channel` 子命令；`komo-store` 的 `repos/deliveries.rs`；kernel 的 `Channel` / `Inbound` / `Notifier`、`ChannelPlatform` / `ChannelPeer` / `Principal` / `Outbound` / `Delivery*`、`InboundMessage` / `InboundAck` / `ChatCommand`、`ChannelsConfig` 与 `/v1/channels` 的协议类型；网页设置里的「渠道」一节。
+  - 留：`PeerId`（事件里的 `by` 字段，存量事件里是渠道 peer 的 id）、`SILENT_REPLY`、`NotifyPolicy` 与 cron 的 `notify` 字段（配置与接口还在，只是不再往外投，随目标的定时一起重做）、`deliveries` 表的 DDL 与模型（老库里有这张表，只建表不读写）、网页附件收件箱（从 `komo-channel` 搬到 `komo-gateway/src/inbox.rs`）。
+  - `background/watch.rs` 不是只为渠道存在：它同时负责「run 正常完成后给会话起标题」，所以留下这一部分（看客订阅会话帧、重启补挂、补起最近结算输入的标题）。
+  - 配置：整个 `[channels.*]` 按退役键处理，旧配置照常加载，每个键一条警告（测试 `keys_retired_with_the_chat_channels_still_load_with_a_warning`）；`mcp.servers.*.outward` 那条「没有渠道配 home_chat」的警告随之删除。
 - [ ] 后果：Komo 主动找你的话（定时的结果、问你一句）只有在网页或桌面端开着时才看得到；手机上没有入口，直到 PWA 做出来（`docs/clients.md` C3–C4）
 
 ### 2.7 去掉 Router（P18）

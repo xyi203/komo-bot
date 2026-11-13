@@ -1,4 +1,4 @@
-//! 提交输入（`docs/storage-durable-d5.md` §4 W1c / §7）：HTTP、渠道、cron 共用的那一段。
+//! 提交输入（`docs/storage-durable-d5.md` §4 W1c / §7）：HTTP、cron 共用的那一段。
 //!
 //! 输入路由到 `current_branch`。`leaf` 不在末端（导航过）时，**同一次提交**里：
 //!
@@ -73,8 +73,8 @@ pub struct InputRequest {
     pub when_busy: WhenBusy,
     pub model: Option<ModelOverride>,
     /// 用户在 TUI 里插话（`interject: true`）：输入排在忙着的会话后面时，前台正跑着的长 `bash`
-    /// 提前转后台，别让这句话等它跑完（`docs/monitor.md` §8）。只有 HTTP 的插话带它——渠道里的
-    /// steer、监听事件与任务交回不带。
+    /// 提前转后台，别让这句话等它跑完（`docs/monitor.md` §8）。只有 HTTP 的插话带它——监听事件与
+    /// 任务交回不带。
     pub interject: bool,
 }
 

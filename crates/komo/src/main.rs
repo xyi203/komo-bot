@@ -100,11 +100,6 @@ enum Command {
         #[command(subcommand)]
         action: McpCommand,
     },
-    /// 渠道清单、连通性核对与插件登录；不经 Gateway（§3）。
-    Channel {
-        #[command(subcommand)]
-        action: ChannelCommand,
-    },
     /// 账号 OAuth 登录；不经 Gateway，凭证写入数据目录（§3、§13.3）。
     Auth {
         #[command(subcommand)]
@@ -481,27 +476,6 @@ enum McpCommand {
 }
 
 #[derive(Subcommand)]
-enum ChannelCommand {
-    /// 登录指定的渠道插件。
-    Login { channel: String },
-    /// 渠道清单。
-    List,
-    /// 连通性核对（飞书 tenant token、Telegram getMe、微信凭证文件）。
-    Probe,
-    /// 微信。
-    Wechat {
-        #[command(subcommand)]
-        action: WechatCommand,
-    },
-}
-
-#[derive(Subcommand)]
-enum WechatCommand {
-    /// 终端显示二维码完成微信登录，凭证写入数据目录。
-    Login,
-}
-
-#[derive(Subcommand)]
 enum AuthCommand {
     /// Codex 模型走的 ChatGPT 账号 OAuth（§13.3）。
     Codex {
@@ -617,30 +591,7 @@ async fn dispatch(cli: Cli, home: &Path) -> Result<Option<String>, String> {
         Command::Doctor { reconcile } => commands::doctor(home, reconcile).await.map(Some),
         // 也不经 Gateway（§3）：它换的是磁盘上那份二进制，与在跑的那个进程无关。
         Command::Update => update::run(home).await.map(Some),
-        // 三条不经 Gateway 的（§3）。
-        Command::Channel { action } => match action {
-            ChannelCommand::Login { channel } => {
-                let platform = komo_kernel::types::chat::ChannelPlatform::parse(&channel)
-                    .filter(|p| *p != komo_kernel::types::chat::ChannelPlatform::Api)
-                    .ok_or_else(|| "无效的渠道名称".to_string())?;
-                komo_gateway::channels::login(home, platform)
-                    .await
-                    .map(Some)
-            }
-            ChannelCommand::List => commands::channel_list(home).map(Some),
-            ChannelCommand::Probe => commands::channel_probe(home).await.map(Some),
-            ChannelCommand::Wechat { action } => match action {
-                // 不经 Gateway（§3）：二维码打到 stderr，凭证写入数据目录 `wechat/credentials.json`
-                // （0600）。返回值里不带 token / userId。
-                WechatCommand::Login => komo_gateway::channels::login(
-                    home,
-                    komo_kernel::types::chat::ChannelPlatform::Wechat,
-                )
-                .await
-                .map(Some),
-            },
-        },
-        // 不经 Gateway（§3、§13.3）：设备码登录直接落盘，同微信登录的先例。
+        // 不经 Gateway（§3、§13.3）：设备码登录直接落盘，落盘。
         Command::Auth { action } => match action {
             AuthCommand::Codex { action } => match action {
                 CodexAuthCommand::Login => {
@@ -923,13 +874,6 @@ async fn gateway(
             let outcome = komo_gateway::run(komo_gateway::ServiceOptions {
                 home: Some(home.to_path_buf()),
                 listen: None,
-                channels: komo_gateway::channels::factories(
-                    &komo_gateway::config::load_config(&komo_gateway::config::LoadOptions::at(
-                        home,
-                    ))
-                    .map_err(|e| e.to_string())?
-                    .snapshot,
-                ),
                 llm: None,
                 stream: None,
                 embeddings: None,

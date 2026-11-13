@@ -1,8 +1,8 @@
-//! `notify`（§10）：过滤**结果**的投递，**从不**过滤一次等待。
+//! 触发状态（§10）：不论 `notify` 怎么写，结果都照常回写进 `cron_firings`。聊天渠道删除后（`docs/redesign.md`
+//! P17）结果不再往外投，`notify` 只剩配置里的一个值（后续随目标的定时重做），所以这里只验：
+//! 触发状态不受它影响，以及写错的值当场被拒。
 
 use std::sync::Arc;
-
-use komo_kernel::types::chat::Outbound;
 
 use crate::harness::*;
 
@@ -16,36 +16,14 @@ fn daily(notify: &str) -> serde_json::Value {
     })
 }
 
-/// `always`：跑成了也投。
+/// 不说话（S1）：prompt Job 的回答整段是 `NO_REPLY` 时触发照记 `ok`——同命令型 Job 的空 stdout。
 #[tokio::test]
-async fn always_delivers_a_good_run() {
-    let home = Home::new();
-    let gw = home
-        .start(FakeLlm::always(vec![text_round(1, "整理好了")]))
-        .await;
-    let job = gw.add_job(daily("always")).await;
-    gw.make_due(&job.id).await;
-    let run = gw.tick().await.fired[0].run.clone();
-    gw.wait_state(&run, |s| s.is_terminal(), "终态").await;
-
-    let sender = Arc::clone(&gw.home);
-    eventually("home chat 收到结果", move || {
-        sender.texts().iter().any(|t| t.contains("整理好了"))
-    })
-    .await;
-    gw.stop().await;
-}
-
-/// 不说话（S1）：prompt Job 的回答整段是 `NO_REPLY` 时触发照记 `ok`，`always` 下也不投——
-/// 同命令型 Job 的空 stdout。
-#[tokio::test]
-async fn a_silent_reply_settles_ok_but_delivers_nothing() {
+async fn a_silent_reply_settles_ok() {
     let home = Home::new();
     let gw = home
         .start(FakeLlm::always(vec![text_round(1, "NO_REPLY")]))
         .await;
     let job = gw.add_job(daily("always")).await;
-    let before = gw.home.texts().len();
     gw.make_due(&job.id).await;
     let run = gw.tick().await.fired[0].run.clone();
     gw.wait_state(&run, |s| s.is_terminal(), "终态").await;
@@ -65,88 +43,12 @@ async fn a_silent_reply_settles_ok_but_delivers_nothing() {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
     assert!(settled, "这一次触发应当已经记成 ok");
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-    assert_eq!(
-        gw.home.texts().len(),
-        before,
-        "记号不该多出一条投递：{:?}",
-        gw.home.texts()
-    );
     gw.stop().await;
 }
 
-/// `on_error`：跑成了**不投**，但一次等待照样投——那是任务在**问**，不是在报告。
+/// 失败的触发在任何 `notify` 下都照记 `error`——结果去原 Session 看（§10 最后一条）。
 #[tokio::test]
-async fn on_error_keeps_quiet_about_a_good_run_but_never_about_a_wait() {
-    let home = Home::new();
-    // ── 前半：一个顺利跑完的 Job，`on_error` 下不投。
-    let gw = home
-        .start(FakeLlm::always(vec![text_round(1, "整理好了")]))
-        .await;
-    let quiet = gw.add_job(daily("on_error")).await;
-    gw.make_due(&quiet.id).await;
-    let run = gw.tick().await.fired[0].run.clone();
-    gw.wait_state(&run, |s| s.is_terminal(), "终态").await;
-
-    // 等触发状态记成 ok，说明盯梢已经处理完这个 Run——这时还没投才说明问题。
-    let mut settled = false;
-    for _ in 0..100 {
-        if gw
-            .firings(&quiet.id)
-            .await
-            .first()
-            .map(|f| f.status)
-            .is_some_and(|s| s == komo_kernel::cron::FiringStatus::Ok)
-        {
-            settled = true;
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
-    assert!(settled, "这一次触发应当已经记成 ok");
-    assert!(
-        !gw.home.texts().iter().any(|t| t.contains("整理好了")),
-        "on_error 不该报告一次顺利的运行：{:?}",
-        gw.home.texts()
-    );
-    gw.stop().await;
-
-    // ── 后半：同一份配置，一个**失败**的 Job。**照投**。
-    //
-    // Legacy 版这里是"停在等人核对上的等待照样投"；新语义没有 `waiting + intervention`（结果不明
-    // 直接交给模型），`on_error` 要保住的那条底线换成它的另一半：出错一定报告。
-    let llm = FakeLlm::always(vec![Err(komo_kernel::types::turn::LlmError::Rejected {
-        status: 400,
-        message: "模型后端坏了".into(),
-    })]);
-    let gw = home.start(Arc::clone(&llm)).await;
-    let failing = gw.add_job(daily("on_error")).await;
-    gw.make_due(&failing.id).await;
-    let run = gw.tick().await.fired[0].run.clone();
-    gw.wait_state(&run, |s| s.is_terminal(), "终态").await;
-
-    let sender = Arc::clone(&gw.home);
-    eventually("失败照样投到 home chat", move || {
-        sender
-            .sent()
-            .iter()
-            .any(|message| matches!(message.outbound, Outbound::RunFinished { .. }))
-    })
-    .await;
-    assert_eq!(
-        gw.firings(&failing.id).await.first().map(|f| f.status),
-        Some(komo_kernel::cron::FiringStatus::Error)
-    );
-    gw.stop().await;
-}
-
-/// `never`：结果一概不投。
-///
-/// Legacy 版叫"等待照样投"：`never` 下一次停在等人核对上的等待仍然投，否则 Job 会从此停在那里。
-/// Durable 里没有那种等待（faulted 任务的提醒是 W4a 的 intervention），这一条只能验 `never` 的前半：
-/// 失败也**不**投，但触发状态照样记成 `error`——结果去原 Session 看（§10 最后一条）。
-#[tokio::test]
-async fn never_keeps_quiet_even_about_a_failure() {
+async fn a_failed_run_settles_the_firing_as_error_whatever_notify_says() {
     let home = Home::new();
     let llm = FakeLlm::always(vec![Err(komo_kernel::types::turn::LlmError::Rejected {
         status: 400,
@@ -170,11 +72,6 @@ async fn never_keeps_quiet_even_about_a_failure() {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
     assert!(settled, "触发状态应当记成 error");
-    assert!(
-        gw.home.sent().is_empty(),
-        "never 一概不投：{:?}",
-        gw.home.sent()
-    );
     gw.stop().await;
 }
 

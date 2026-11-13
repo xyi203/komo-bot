@@ -25,18 +25,15 @@ pub mod tool;
 pub mod turn;
 
 pub use agent::{AgentConfig, AgentProfile, MemoryMode, RunSnapshot};
-pub use chat::{
-    ChannelPeer, ChannelPlatform, Delivery, DeliveryState, DeliveryTarget, Outbound, PeerId,
-    Principal,
-};
+pub use chat::PeerId;
 pub use delegate::{
     DELEGATE_REPAIR_ROUNDS, DelegateContract, DelegateSpec, SchemaMode, Validation, Violation,
     validate,
 };
 pub use digest::{ContentHash, sha256};
 pub use ids::{
-    AttemptId, CronJobId, DeliveryId, EventId, ExecutorId, IdParseError, MatterId, MemoryId,
-    OperationId, RequestKey, RunId, Seq, SessionId, ToolCallId, uuid_v7_at,
+    AttemptId, CronJobId, EventId, ExecutorId, IdParseError, MatterId, MemoryId, OperationId,
+    RequestKey, RunId, Seq, SessionId, ToolCallId, uuid_v7_at,
 };
 pub use memory::{
     Confirmation, Evidence, EvidenceRef, ExtractionMetadata, Injection, MemoryItem, MemoryKind,

@@ -8,9 +8,8 @@ use komo_kernel::durable::{TaskState, TaskStatus};
 use komo_kernel::protocol::http::{
     InterventionAnswerResponse, InterventionKind, InterventionSummary,
 };
-use komo_kernel::types::chat::Outbound;
 
-use crate::{sender, start_bash, until};
+use crate::{start_bash, until};
 
 /// 一个在 `execute` 阶段的工具任务（重启时被打断的 `bash`），它尝试目录里的 `output.json` 被写坏了——
 /// 这份"已发布的输出"不可信，而恢复会把它当成"没有结果"重判（重跑或记成 uncertain），悄悄换掉一次
@@ -18,7 +17,6 @@ use crate::{sender, start_bash, until};
 /// 工具任务 `faulted`：
 ///
 /// - 出现在 `/v1/interventions`（`blocked`、问题 = fault 原因、可答只有 `abandon`），也在会话详情的 `pending` 里；
-/// - 投一条 NeedsAttention 到 home chat，重启之后不重复投；
 /// - `resolve` 等别的结论是 422；`abandon` 记在 `komo.interventions.ack`，之后不再列出，重复答复回原结论；
 /// - run 本身不被挡住，照常收尾。
 #[tokio::test]
@@ -35,7 +33,7 @@ async fn a_missing_blob_faults_the_tool_task_and_lists_it() {
         ),
         text_round(2, "不该走到这里"),
     ]]);
-    let mut gateway = start_bash(Some(&home), llm, &sender()).await;
+    let mut gateway = start_bash(Some(&home), llm).await;
     let session = open_session(&gateway).await;
     let run = submit(&gateway, &session, "blob-1", "跑一条命令").await.run;
 
@@ -99,13 +97,7 @@ async fn a_missing_blob_faults_the_tool_task_and_lists_it() {
     std::fs::write(attempt_dir.join("output.json"), b"{ this is not json").unwrap();
 
     // 重启：启动时的 reconcile 在恢复之前让它 faulted；run 照常收尾。
-    let second_sender = sender();
-    let gateway = start_bash(
-        Some(&home),
-        FakeLlm::finisher("命令没跑成，我知道了。"),
-        &second_sender,
-    )
-    .await;
+    let gateway = start_bash(Some(&home), FakeLlm::finisher("命令没跑成，我知道了。")).await;
     let record = gateway.wait_run(&run).await;
     assert_eq!(record.status(), SubmissionStatus::Done, "{record:?}");
 
@@ -131,19 +123,6 @@ async fn a_missing_blob_faults_the_tool_task_and_lists_it() {
         Some(1),
         "{detail}"
     );
-
-    // NeedsAttention 投到 home chat。
-    let watching = std::sync::Arc::clone(&second_sender);
-    until("NeedsAttention 投到了 home", || {
-        let watching = std::sync::Arc::clone(&watching);
-        async move {
-            watching
-                .sent()
-                .iter()
-                .any(|m| matches!(&m.outbound, Outbound::NeedsAttention { reason, .. } if reason.contains("blob")))
-        }
-    })
-    .await;
 
     // 答复：别的结论是 422；abandon 之后不再列出，重复答复回原结论。
     let (code, body) = gateway.answer_raw(&task.to_string(), "resolve").await;
@@ -172,21 +151,11 @@ async fn a_missing_blob_faults_the_tool_task_and_lists_it() {
     // 再重启一次：已确认的不再列出，也不再重复提醒。
     let mut gateway = gateway;
     gateway.stop().await;
-    let third_sender = sender();
-    let gateway = start_bash(Some(&home), FakeLlm::finisher("好"), &third_sender).await;
+    let gateway = start_bash(Some(&home), FakeLlm::finisher("好")).await;
     let (_, body) = gateway.get_json("/v1/interventions").await;
     assert_eq!(
         body["interventions"].as_array().map(Vec::len),
         Some(0),
         "{body}"
-    );
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-    assert!(
-        third_sender
-            .sent()
-            .iter()
-            .all(|m| !matches!(&m.outbound, Outbound::NeedsAttention { .. })),
-        "{:?}",
-        third_sender.sent()
     );
 }

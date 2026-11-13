@@ -1,21 +1,16 @@
-//! Gateway：HTTP/SSE 接口、进程锁与发现文件、Dispatcher 与三个聊天渠道
-//! （docs/komo_bot.md §13.1、§13.4）。
+//! Gateway：HTTP/SSE 接口、进程锁与发现文件（docs/komo_bot.md §13.1、§13.4）。
 
 pub mod auth;
-pub mod channels;
-pub mod deliveries;
-pub mod dispatcher;
 pub mod http;
+pub mod inbox;
 pub mod lock;
-pub mod notifier;
 pub mod reload;
 pub mod service;
 pub mod sse;
 pub mod telemetry;
 pub mod web;
 
-/// bin 要的几样**不经 Gateway** 的东西（§3 的命令表：`komo channel list|probe` 与
-/// `komo skills *` 只读文件系统与配置）。
+/// bin 要的几样**不经 Gateway** 的东西（§3 的命令表：`komo skills *` 只读文件系统与配置）。
 ///
 /// 从这里再导一次，而不是让 bin 直接依赖 `komo-config` / `komo-llm` / `komo-agent`：§13.4 给 bin
 /// 的依赖是 client / gateway / clap（外加 `__codemode-worker` 要的 komo-tools），加更多会把
@@ -29,8 +24,6 @@ pub use komo_llm::codex_auth;
 /// `komo-tools`。
 pub use komo_tools::mcp_auth;
 
-pub use dispatcher::Dispatcher;
 pub use lock::{DiscoveryFile, GatewayDiscovery, InstanceLock};
-pub use notifier::HomeNotifier;
 pub use service::{Running, ServiceError, ServiceOptions, run, start};
 pub use telemetry::TelemetryStatus;

@@ -8,14 +8,12 @@
 //! （装填时空值不入表），所以校验函数拿不到、也不需要凭证的值。
 
 use komo_kernel::protocol::config::{
-    ChannelConfig, ConfigIssue, ConfigSnapshot, IssueSeverity, KeyPath, glob_matches,
+    ConfigIssue, ConfigSnapshot, IssueSeverity, KeyPath, glob_matches,
 };
 use komo_kernel::types::agent::MemoryMode;
-use komo_kernel::types::chat::{ChannelPlatform, PeerId};
 use komo_kernel::types::memory::{MemoryScope, RetrievalMode};
 use komo_kernel::types::model::{CatalogModel, EmbeddingConfig, ModelConfig};
 
-use super::file::channel_credentials;
 use komo_llm::EffortCapabilities;
 
 /// 向量维度的可信范围。小于 1 是结构错误，大得离谱的是打字错误——两者都会在第一次
@@ -79,7 +77,6 @@ pub fn validate_with(snapshot: &ConfigSnapshot, caps: &EffortCapabilities) -> Ve
         }
     }
 
-    check_channels(snapshot, &mut issues);
     check_execution(snapshot, &mut issues);
     check_compaction(snapshot, &mut issues);
     check_typesafe(snapshot, &mut issues);
@@ -540,23 +537,8 @@ fn check_compaction(snapshot: &ConfigSnapshot, issues: &mut Vec<ConfigIssue>) {
 /// `[mcp.servers.<name>]`（`docs/mcp.md`）：名字要进工具名（`mcp__<name>__<tool>`），只能是
 /// 字母、数字、`_`、`-`；`read_only` / `outward` 写了白名单之外的工具是笔误，不会生效。
 fn check_mcp(snapshot: &ConfigSnapshot, issues: &mut Vec<ConfigIssue>) {
-    // 确认卡（`docs/confirm.md` §6）：Cron 起的 Run 没有来源对端，卡只能投 home chat。
-    let has_home = [
-        &snapshot.channels.feishu,
-        &snapshot.channels.telegram,
-        &snapshot.channels.wechat,
-    ]
-    .iter()
-    .any(|channel| channel.enabled && channel.home_chat.is_some());
     for (name, server) in &snapshot.mcp {
         let key = format!("mcp.servers.{name}");
-        if !server.outward.is_empty() && !has_home {
-            issues.push(warning(
-                &format!("{key}.outward"),
-                "声明了对外工具，但没有渠道配 home_chat：Cron 起的 Run 要确认时卡投不到人，\
-                 只能在 `komo intervention list` 里看到，到点不答就不执行",
-            ));
-        }
         if name.is_empty()
             || !name
                 .chars()
@@ -654,146 +636,6 @@ fn check_agents(snapshot: &ConfigSnapshot, issues: &mut Vec<ConfigIssue>) {
     }
 }
 
-fn check_channels(snapshot: &ConfigSnapshot, issues: &mut Vec<ConfigIssue>) {
-    for (id, channel) in &snapshot.channels.extra {
-        if !matches!(ChannelPlatform::parse(id), Some(ChannelPlatform::Custom(_))) {
-            issues.push(error(
-                &format!("channels.{id}"),
-                "渠道名称无效或为宿主保留名称",
-            ));
-        }
-        if channel.enabled && channel.plugin.is_none() {
-            issues.push(error(
-                &format!("channels.{id}.plugin"),
-                "外部渠道必须配置 plugin.command",
-            ));
-        }
-    }
-    for platform in snapshot.channels.platforms() {
-        let Some(channel) = snapshot.channels.get(platform.clone()) else {
-            continue;
-        };
-        let key = format!("channels.{platform}");
-        check_channel(channel, platform, &key, snapshot, issues);
-    }
-}
-
-fn check_channel(
-    channel: &ChannelConfig,
-    platform: ChannelPlatform,
-    key: &str,
-    snapshot: &ConfigSnapshot,
-    issues: &mut Vec<ConfigIssue>,
-) {
-    if let Some(plugin) = &channel.plugin {
-        if !plugin.command.is_absolute() {
-            issues.push(error(
-                &format!("{key}.plugin.command"),
-                "插件命令必须是绝对路径",
-            ));
-        }
-    }
-    for (index, peer) in channel.allow_from.iter().enumerate() {
-        if let Err(message) = check_peer_id(platform.clone(), peer) {
-            issues.push(error(
-                &format!("{key}.allow_from"),
-                format!("[{index}] {message}"),
-            ));
-        }
-    }
-
-    if channel.allow_tenant
-        && !matches!(
-            platform,
-            ChannelPlatform::Feishu | ChannelPlatform::Custom(_)
-        )
-    {
-        issues.push(error(
-            &format!("{key}.allow_tenant"),
-            "只有飞书能判断是不是同一家企业",
-        ));
-    }
-
-    if let Some(home) = &channel.home_chat {
-        if let Err(message) = check_peer_id(platform.clone(), home) {
-            issues.push(error(&format!("{key}.home_chat"), message));
-        }
-        // §11.2：home_chat 所属渠道必须 enabled 且有凭证。
-        if !channel.enabled {
-            issues.push(error(
-                &format!("{key}.home_chat"),
-                "这个渠道没有 enabled，它收不到主动投递",
-            ));
-        }
-    }
-
-    if channel.enabled {
-        if let Some(plugin) = &channel.plugin {
-            for var in &plugin.env {
-                if var.is_empty() || !var.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
-                    issues.push(error(
-                        &format!("{key}.plugin.env"),
-                        "凭证变量名只能包含字母、数字和下划线",
-                    ));
-                } else if !snapshot.credentials.contains_key(var) {
-                    issues.push(error(
-                        &format!("{key}.plugin.env"),
-                        format!(".env 里没有 `{var}`"),
-                    ));
-                }
-            }
-        }
-        for var in channel_credentials(platform.clone()) {
-            if !snapshot.credentials.contains_key(*var) {
-                issues.push(error(
-                    &format!("{key}.enabled"),
-                    format!("渠道已启用，但 .env 里没有 `{var}`"),
-                ));
-            }
-        }
-        // §11.2：「enabled 但 allow_from 为空」= 只出不进，`komo doctor` 当作警告列出。
-        if channel.is_outbound_only() {
-            issues.push(warning(
-                &format!("{key}.allow_from"),
-                "名单为空：这个渠道只出不进（还能收主动投递，但没人能通过它下指令）",
-            ));
-        }
-    }
-}
-
-/// 平台 id 的形态（§11.2 的三种写法）。
-fn check_peer_id(platform: ChannelPlatform, peer: &PeerId) -> Result<(), String> {
-    let raw = peer.as_str();
-    if raw.trim().is_empty() {
-        return Err("id 不能为空".into());
-    }
-    if raw.trim() != raw || raw.contains(char::is_whitespace) {
-        return Err(format!("`{raw}` 里有空白字符"));
-    }
-    match platform {
-        // 飞书的 open_id / chat_id：ou_ 用户、oc_ 群、on_ 外部用户、om_ 消息。
-        ChannelPlatform::Feishu => {
-            if ["ou_", "oc_", "on_", "om_"]
-                .iter()
-                .any(|prefix| raw.starts_with(prefix))
-            {
-                Ok(())
-            } else {
-                Err(format!(
-                    "`{raw}` 不像飞书 id（open_id 以 ou_ 开头，群以 oc_ 开头）"
-                ))
-            }
-        }
-        // Telegram 的 user / chat id 是整数（群是负数）。
-        ChannelPlatform::Telegram => raw
-            .parse::<i64>()
-            .map(|_| ())
-            .map_err(|_| format!("`{raw}` 不是 Telegram 的整数 id")),
-        // iLink 的 from：只要求是一个没有空白的字符串。
-        ChannelPlatform::Wechat | ChannelPlatform::Api | ChannelPlatform::Custom(_) => Ok(()),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -843,25 +685,6 @@ mod tests {
             "{}",
             issues[0].message
         );
-    }
-
-    #[test]
-    fn outward_tools_without_any_home_chat_are_a_warning() {
-        let mut snapshot = snapshot_fixture();
-        let mut server = mcp_server(None, vec![]);
-        server.outward = vec!["push".into()];
-        snapshot.mcp.insert("gh".into(), server);
-        assert!(
-            keys(&validate(&snapshot)).is_empty(),
-            "the fixture has a home chat"
-        );
-
-        snapshot.channels.feishu.home_chat = None;
-        snapshot.channels.telegram.home_chat = None;
-        snapshot.channels.wechat.home_chat = None;
-        let issues = validate(&snapshot);
-        assert_eq!(keys(&issues), vec!["mcp.servers.gh.outward"]);
-        assert_eq!(issues[0].severity, IssueSeverity::Warning);
     }
 
     #[test]
@@ -975,38 +798,6 @@ mod tests {
     }
 
     #[test]
-    fn a_home_chat_on_a_disabled_channel_is_refused() {
-        let mut snapshot = snapshot_fixture();
-        snapshot.channels.feishu.enabled = false;
-        let issues = validate(&snapshot);
-        assert_eq!(keys(&issues), vec!["channels.feishu.home_chat"]);
-    }
-
-    #[test]
-    fn an_enabled_channel_without_its_credentials_is_refused() {
-        let mut snapshot = snapshot_fixture();
-        snapshot.channels.telegram.enabled = true;
-        snapshot.channels.telegram.allow_from = vec![PeerId::new("123456789")];
-        let issues = validate(&snapshot);
-        assert!(
-            issues
-                .iter()
-                .any(|i| i.key.as_str() == "channels.telegram.enabled"
-                    && i.message.contains("TELEGRAM_BOT_TOKEN")),
-            "{issues:?}"
-        );
-    }
-
-    #[test]
-    fn a_malformed_platform_id_is_refused_with_its_index() {
-        let mut snapshot = snapshot_fixture();
-        snapshot.channels.feishu.allow_from = vec![PeerId::new("ou_ok"), PeerId::new("12345")];
-        let issues = validate(&snapshot);
-        assert_eq!(keys(&issues), vec!["channels.feishu.allow_from"]);
-        assert!(issues[0].message.starts_with("[1]"), "{:?}", issues[0]);
-    }
-
-    #[test]
     fn a_private_memory_agent_cannot_also_name_a_memory_scope() {
         let mut snapshot = snapshot_fixture();
         let mut profile = komo_kernel::types::agent::AgentProfile::new("scribe");
@@ -1028,32 +819,6 @@ mod tests {
             keys(&validate(&snapshot)),
             vec!["agents.scribe.memory_scope"]
         );
-    }
-
-    #[test]
-    fn allow_tenant_is_refused_outside_feishu() {
-        let mut snapshot = snapshot_fixture();
-        snapshot.channels.feishu.allow_tenant = true;
-        assert!(keys(&validate(&snapshot)).is_empty(), "飞书可以开");
-        snapshot.channels.telegram.allow_tenant = true;
-        snapshot.channels.wechat.allow_tenant = true;
-        assert_eq!(
-            keys(&validate(&snapshot)),
-            vec![
-                "channels.telegram.allow_tenant",
-                "channels.wechat.allow_tenant"
-            ]
-        );
-    }
-
-    #[test]
-    fn an_outbound_only_channel_is_a_warning_not_an_error() {
-        let mut snapshot = snapshot_fixture();
-        snapshot.channels.feishu.allow_from.clear();
-        let issues = validate(&snapshot);
-        assert_eq!(keys(&issues), vec!["channels.feishu.allow_from"]);
-        assert_eq!(issues[0].severity, IssueSeverity::Warning);
-        assert!(!has_errors(&issues));
     }
 
     #[test]

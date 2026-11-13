@@ -1,8 +1,8 @@
 //! `POST /v1/attachments` 与 `GET /v1/attachments/{收件箱}/{文件名}`：网页输入框的附件。
 //!
-//! 走聊天渠道收图片的同一条路（`komo_channel::inbox`，§11.2）：存进 `{workspaces_dir}/inbox/web/`，
-//! 回执里给拼进正文的那行说明，消息结构、受理与回放都不认识附件。取回只给收件箱里按内容哈希
-//! 命名的图片（网页缩略图用，聊天渠道收的图也能看），别的路径一概 404——这不是一个读文件的口子。
+//! 存进 `{workspaces_dir}/inbox/web/`，回执里给拼进正文的那行说明，消息结构、受理与回放都不认识
+//! 附件。取回只给收件箱里按内容哈希命名的图片（网页缩略图用；聊天渠道删除之前收进
+//! `inbox/{平台}/` 的旧图也还能看），别的路径一概 404——这不是一个读文件的口子。
 
 use std::path::PathBuf;
 
@@ -11,19 +11,19 @@ use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
 use axum::http::header;
 use axum::response::{IntoResponse, Response};
-use komo_channel::inbox::{ImageInbox, file_note, image_note};
 use komo_kernel::protocol::http::UploadAttachmentResponse;
 use komo_kernel::types::tool::image_mime;
 use serde::Deserialize;
 
 use super::Api;
 use super::error::{ApiFailure, ApiResult};
+use crate::inbox::{DOWNLOAD_LIMIT_BYTES, ImageInbox, file_note, image_note};
 
-/// 网页的附件落在哪个收件箱（与 `inbox/feishu` 等并列）。
+/// 网页的附件落在哪个收件箱。
 const WEB_INBOX: &str = "web";
 
-/// 请求体上限：与聊天渠道下载图片的上限相同。axum 默认只收 2 MB，路由上要单独放宽到这个数。
-pub const BODY_LIMIT_BYTES: usize = komo_channel::inbox::DOWNLOAD_LIMIT_BYTES;
+/// 请求体上限。axum 默认只收 2 MB，路由上要单独放宽到这个数。
+pub const BODY_LIMIT_BYTES: usize = DOWNLOAD_LIMIT_BYTES;
 
 #[derive(Debug, Default, Deserialize)]
 pub struct UploadQuery {

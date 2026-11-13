@@ -9,7 +9,7 @@
 //!   看到的 `已派出 #k3x9qa`、`task_id: "k3x9qa"`、监听的 `#短号` 同一种写法。老的纯数字（`#12`）解析
 //!   时还收，不再往外给。任务会话的根 conversation 就是那个子 conversation（`SessionRecord::root_conversation`）。
 //! - [`TaskLine`]：一个任务会话现在的样子（标题、父会话、跑着 / 排队 / 上一次怎么收的尾），
-//!   [`TaskLine::render`] 是一行给操作者看的话；`/status`、`/pending` 一类渠道命令（W3a）直接用。
+//!   [`TaskLine::render`] 是一行给操作者看的话。
 //! - [`DurableCore::task_label`]：任务会话里那些"需要你判断"的消息前面挂的标签
 //!   `后台任务 #12「查空调」`，操作者在聊天里同时看着几个任务时靠它分清是哪一个在问。
 //!

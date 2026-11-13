@@ -9,6 +9,5 @@
 //! 命中 0 行与 1 行不可区分，§8.2 那张表）。
 
 pub mod cron;
-pub mod deliveries;
 pub mod matter;
 pub mod memory;

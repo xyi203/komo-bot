@@ -5,7 +5,7 @@ import type { EditNotice } from "./use-config-edit";
 import { m } from "@/paraglide/messages.js";
 
 /** 译文里的命令与配置键按代码样式写：译文是一整句字符串，这里把已知的机器名切出来包 `<code>`。 */
-const CODE = /(`[^`]+`|komo gateway restart|komo auth mcp login [\w.-]+|komo channel (?:list|probe)|allow_from|home_chat|\.env)/;
+const CODE = /(`[^`]+`|komo gateway restart|komo auth mcp login [\w.-]+|\.env)/;
 
 export function withCode(text: string): ReactNode {
   return text.split(CODE).map((part, i) =>

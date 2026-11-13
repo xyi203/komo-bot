@@ -2,13 +2,12 @@
 //!
 //! 「CLI 通过 HTTP 发命令，通过 SSE 观察运行。Gateway 内部采用函数调用，无需在本机
 //! 模块之间再发 HTTP。」——所以这一层很薄：请求体 / 响应体就是 kernel 的协议类型，
-//! 真正的动作在 [`GatewayState`] 上，聊天渠道调的是同一批函数（§13.1 最后一段）。
+//! 真正的动作在 [`GatewayState`] 上。
 //!
 //! **除 `GET /healthz`、配对换 cookie 与静态文件外统一认证**，由 [`crate::auth`] 的 layer 一次性挡住；
 //! 所有路由之外还有一层 Host 校验（[`crate::web::host_guard`]）。
 
 pub mod attachments;
-pub mod channels;
 pub mod config;
 pub mod cron;
 pub mod error;
@@ -145,8 +144,6 @@ fn shared_routes() -> Router<Api> {
             )),
         )
         .route("/v1/attachments/{inbox}/{name}", get(attachments::image))
-        .route("/v1/channels", get(channels::list))
-        .route("/v1/channels/{id}/probe", post(channels::probe))
         .route("/v1/mcp", get(mcp::list))
         .route("/v1/mcp/reconnect", post(mcp::reconnect))
         .route("/v1/mcp/disconnect", post(mcp::disconnect))

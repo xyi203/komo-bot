@@ -8,13 +8,11 @@
 //! | `env` | 工具执行环境：根与挂载、投影、时限、Session 目录上的输出存储 |
 //! | `sections` | 系统段（key 与"已展示的段钉住"的规则见该文件） |
 //! | `recall` | 每个 Run 的记忆召回块与遗忘改写（`docs/memory.md` §9.4） |
-//! | `channel` | 回复要发到聊天渠道的 Run 追加一次篇幅附注（`docs/komo_bot.md` §4「渠道篇幅」） |
 //! | `compaction` | `[compaction]` 的旋钮、摘要提示与摘要用的模型 |
 //!
 //! 钩子拿 `GatewayState` 的路径是 `StateSlot`（`assemble` 的断环）：槽没填之前被问到就干净地
 //! 失败（调度此刻也还是暂停的，不会被问到）。
 
-mod channel;
 mod compaction;
 /// `!` 命令直跑（`shell.rs`）也要同一份执行环境与能力面。
 pub(crate) mod env;
@@ -131,10 +129,7 @@ impl AgentHooks for GatewayHooks {
         let config = state.snapshot();
         let core = state.core().map_err(|e| HookError::Failed(e.to_string()))?;
         let resolved = resolve(&state, &*core.storage, request.conversation, &config).await?;
-        let (run, entries, now) = (request.run, request.entries, request.now);
-        let mut out = recall::entries(&state, &resolved, request).await;
-        out.extend(channel::entry(&state, &resolved, run, entries, now).await);
-        Ok(out)
+        Ok(recall::entries(&state, &resolved, request).await)
     }
 
     /// 只要工具表：不召回记忆、不渲染系统段（默认实现会走完整的 `setup`）。

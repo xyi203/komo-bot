@@ -208,10 +208,7 @@ mod tests {
 
     #[test]
     fn an_invalid_config_is_a_422_that_names_keys_and_never_values() {
-        let failure = ApiFailure::config_invalid(
-            "校验不过",
-            vec![KeyPath::new("channels.telegram.allow_from")],
-        );
+        let failure = ApiFailure::config_invalid("校验不过", vec![KeyPath::new("model.default")]);
         assert_eq!(failure.status, StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(failure.error.keys.len(), 1);
     }

@@ -974,9 +974,9 @@ fn issues() -> Vec<ConfigIssue> {
             message: "缺少 base_url".into(),
         },
         ConfigIssue {
-            key: KeyPath::new("channels.telegram.allow_from"),
+            key: KeyPath::new("mcp.servers.linear.tools"),
             severity: IssueSeverity::Warning,
-            message: "已启用但名单为空".into(),
+            message: "只读名单里有白名单外的工具".into(),
         },
     ]
 }
@@ -1015,7 +1015,7 @@ fn config_check_locates_every_problem_at_a_key() {
         &printed,
         &[
             "错误  memory.embedding.base_url: 缺少 base_url",
-            "警告  channels.telegram.allow_from: 已启用但名单为空",
+            "警告  mcp.servers.linear.tools: 只读名单里有白名单外的工具",
             "1 个错误——这份配置不会被装上",
             &format!("当前配置装载于 {}", stamp(NOW)),
         ],
@@ -1064,7 +1064,7 @@ fn a_reload_names_the_keys_that_changed_without_their_values() {
             // §3 第 4 步：不静默忽略，也不假装已生效。
             "只在启动时生效",
             "komo gateway restart",
-            "警告  channels.telegram.allow_from",
+            "警告  mcp.servers.linear.tools",
         ],
     );
     // 只出键名，不出值。

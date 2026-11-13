@@ -57,7 +57,7 @@ mod tests {
                     message: "不支持".into(),
                 },
                 ConfigIssue {
-                    key: KeyPath::new("channels.feishu.allow_from"),
+                    key: KeyPath::new("model.default"),
                     severity: IssueSeverity::Warning,
                     message: "为空".into(),
                 },
@@ -65,7 +65,7 @@ mod tests {
         };
         let text = error.to_string();
         assert!(text.contains("model.effort"), "{text}");
-        assert!(!text.contains("allow_from"), "警告不算失败原因：{text}");
+        assert!(!text.contains("model.default"), "警告不算失败原因：{text}");
         assert_eq!(error.issues().len(), 2);
     }
 }

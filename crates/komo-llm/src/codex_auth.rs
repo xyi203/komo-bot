@@ -468,8 +468,7 @@ pub(crate) async fn login_with(
     }
 }
 
-/// `komo auth codex login`：不经 Gateway，凭证直接落盘（同 `komo channel wechat
-/// login` 的先例）。
+/// `komo auth codex login`：不经 Gateway，凭证直接落盘（与其他登录命令一样）。
 pub async fn login(path: &Path, out: &mut dyn std::io::Write) -> Result<CodexAuth, CodexAuthError> {
     login_with(super::default_transport().as_ref(), path, out).await
 }

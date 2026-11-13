@@ -100,10 +100,6 @@ id_type!(
     AttemptId
 );
 id_type!(
-    /// 一条主动投递记录（§11.4），补发按它幂等。
-    DeliveryId
-);
-id_type!(
     /// 一个定时任务定义（§10）。
     CronJobId
 );
@@ -221,8 +217,7 @@ impl fmt::Display for EventId {
     }
 }
 
-/// 幂等请求键（§8.5、§11.1）：`feishu:{event_id}` / `telegram:{update_id}` /
-/// `wechat:{from}:{msg_id}` / HTTP 调用方自带的键。
+/// 幂等请求键（§8.5）：HTTP 调用方自带的键。
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(type = "string"))]
 #[serde(transparent)]

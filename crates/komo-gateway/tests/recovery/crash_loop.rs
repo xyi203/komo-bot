@@ -1,5 +1,5 @@
 //! 崩溃循环保护（`docs/storage-durable-perf.md` §6）：连续被崩溃打断到上限的任务停住，列进
-//! intervention（`blocked`，`resolve` 放行 / `abandon` 放弃），投一次 NeedsAttention。
+//! intervention（`blocked`，`resolve` 放行 / `abandon` 放弃）。
 //!
 //! 测试进程里杀不掉 Gateway 又在同一个目录重开（Turso 的文件锁还在旧实例手里），所以"前几次崩溃"是
 //! 停机之后直接改库造出来的：在飞工具任务的 `restarts` 记成上限减一、引擎标记改成"没有干净关闭"——
@@ -9,9 +9,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use komo_gateway::service::test_support::driver_stream::{core, open_session, submit};
-use komo_gateway::service::test_support::harness::{
-    FakeLlm, MemSender, TestGateway, call_round, text_round,
-};
+use komo_gateway::service::test_support::harness::{FakeLlm, TestGateway, call_round, text_round};
 use komo_kernel::durable::storage::TaskQuery;
 use komo_kernel::durable::task::RESTART_LIMIT;
 use komo_kernel::durable::{
@@ -20,17 +18,14 @@ use komo_kernel::durable::{
 use komo_kernel::protocol::http::{
     InterventionAnswerResponse, InterventionKind, InterventionSummary, InterventionVerdict,
 };
-use komo_kernel::types::chat::Outbound;
 use komo_kernel::types::ids::RunId;
 use komo_runtime::durable::engine::{engine_address, engine_state};
 
-use crate::{sender, start_bash, until};
+use crate::{start_bash, until};
 
 /// 起一台、让一条 `bash` 停在 `execute`、停机，再把库改成"它已经被崩溃打断了上限减一次、上一代又崩了"，
-/// 然后重启。返回重启后的 Gateway、那条 run、那个工具任务、会话与第二台的发件箱。
-async fn restart_after_crashes(
-    home: &Path,
-) -> (TestGateway, RunId, TaskId, String, Arc<MemSender>) {
+/// 然后重启。返回重启后的 Gateway、那条 run、那个工具任务与会话。
+async fn restart_after_crashes(home: &Path) -> (TestGateway, RunId, TaskId, String) {
     let llm = FakeLlm::new(vec![vec![
         call_round(
             1,
@@ -40,7 +35,7 @@ async fn restart_after_crashes(
         ),
         text_round(2, "不该走到这里"),
     ]]);
-    let mut gateway = start_bash(Some(home), llm, &sender()).await;
+    let mut gateway = start_bash(Some(home), llm).await;
     let session = open_session(&gateway).await;
     let run = submit(&gateway, &session, "loop-1", "跑一条命令").await.run;
     let core1 = core(&gateway);
@@ -105,14 +100,8 @@ async fn restart_after_crashes(
         .unwrap();
     storage.close().await.unwrap();
 
-    let second = sender();
-    let gateway = start_bash(
-        Some(home),
-        FakeLlm::finisher("命令被打断了，我知道了。"),
-        &second,
-    )
-    .await;
-    (gateway, run, task, session, second)
+    let gateway = start_bash(Some(home), FakeLlm::finisher("命令被打断了，我知道了。")).await;
+    (gateway, run, task, session)
 }
 
 async fn listed(gateway: &TestGateway) -> Vec<InterventionSummary> {
@@ -126,7 +115,7 @@ async fn a_task_stopped_by_the_crash_loop_guard_is_listed_and_can_be_resolved() 
     let dir = tempfile::tempdir().unwrap();
     let home = dir.path().to_path_buf();
     std::fs::create_dir_all(home.join("workspaces")).unwrap();
-    let (gateway, run, task, session, second) = restart_after_crashes(&home).await;
+    let (gateway, run, task, session) = restart_after_crashes(&home).await;
 
     // 停住：列进清单（blocked、两种结论），会话详情的 pending 里也有；run 没有收尾。
     let all = listed(&gateway).await;
@@ -150,16 +139,6 @@ async fn a_task_stopped_by_the_crash_loop_guard_is_listed_and_can_be_resolved() 
     );
     let (code, shown) = gateway.get_json(&format!("/v1/interventions/{task}")).await;
     assert_eq!(code, 200, "{shown}");
-    let watching = Arc::clone(&second);
-    until("NeedsAttention 投到了 home", || {
-        let watching = Arc::clone(&watching);
-        async move {
-            watching.sent().iter().any(|m| {
-                matches!(&m.outbound, Outbound::NeedsAttention { reason, .. } if reason.contains("停住"))
-            })
-        }
-    })
-    .await;
     let stored = core(&gateway).storage.task(task).await.unwrap().unwrap();
     assert_eq!(stored.state.status(), TaskStatus::Pending, "没被再起");
 
@@ -181,7 +160,7 @@ async fn abandoning_a_stopped_task_faults_it_without_listing_it_again() {
     let dir = tempfile::tempdir().unwrap();
     let home = dir.path().to_path_buf();
     std::fs::create_dir_all(home.join("workspaces")).unwrap();
-    let (mut gateway, run, task, _session, _second) = restart_after_crashes(&home).await;
+    let (mut gateway, run, task, _session) = restart_after_crashes(&home).await;
     assert_eq!(listed(&gateway).await.len(), 1);
 
     let answered: InterventionAnswerResponse =
@@ -203,6 +182,6 @@ async fn abandoning_a_stopped_task_faults_it_without_listing_it_again() {
 
     // 干净重启：什么都不再列。
     gateway.stop().await;
-    let gateway = start_bash(Some(&home), FakeLlm::finisher("好"), &sender()).await;
+    let gateway = start_bash(Some(&home), FakeLlm::finisher("好")).await;
     assert!(listed(&gateway).await.is_empty());
 }

@@ -2,7 +2,7 @@ import { useSyncExternalStore } from "react";
 
 // 设置弹窗的开关与当前节（照 ⌘K 的 store）。侧栏的齿轮与 `/settings[/节]` 路由只管 `openSettings()`；
 // 弹窗本身（`settings-dialog.tsx`）渲染在 `app-shell.tsx` 里。弹窗关着时节内容不挂载，所以每次打开都重新取数、丢掉没提交的表单。
-export const SETTINGS_SECTIONS = ["models", "config", "env", "index", "mcp", "gateway", "channels"] as const;
+export const SETTINGS_SECTIONS = ["models", "config", "env", "index", "mcp", "gateway"] as const;
 export type SettingsSection = (typeof SETTINGS_SECTIONS)[number];
 
 export const isSettingsSection = (value: string | undefined): value is SettingsSection =>

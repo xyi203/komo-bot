@@ -1,8 +1,7 @@
 //! Gateway 的进程状态：一次装配，所有入口共用。
 //!
-//! HTTP 与聊天渠道走的是**同一段代码**（§13.1 最后一段），所以"提交一条输入"、"答一条
-//! 介入"、"把等着的 Run 放回队列"这些动作都只在这里实现一次；`http` 与
-//! `dispatcher` 各自只做自己的那层翻译。
+//! "提交一条输入"、"答一条介入"、"把等着的 Run 放回队列"这些动作都只在这里实现一次；`http`
+//! 只做自己的那层翻译。
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -17,14 +16,10 @@ use komo_llm::EffortCapabilities;
 use komo_memory::matter::MatterManager;
 use komo_memory::{MemoryManager, MemoryParts};
 use komo_runtime::durable::harness::RetryPolicy;
-use komo_store::{Db, TursoCronRepo, TursoDeliveryRepo, TursoMatterRepo, TursoMemoryRepo};
+use komo_store::{Db, TursoCronRepo, TursoMatterRepo, TursoMemoryRepo};
 use komo_tools::executor::ToolExecutor;
 use time::OffsetDateTime;
 
-use crate::channels::ChannelFactory;
-use crate::channels::ChannelRegistry;
-use crate::deliveries::DeliveryLog;
-use crate::notifier::HomeNotifier;
 use crate::sse::{EventHub, SharedHub};
 
 /// 系统时钟。**进程里唯一读墙上时间的地方**（其余一切经 `Clock`）。
@@ -80,7 +75,7 @@ impl LlmClient for SwappableLlm {
 
 /// 没有配置模型 / 配置不可用时的后端：每次调用都报同一个明确的错误。
 ///
-/// 它存在只是为了让 Gateway **起得来**——渠道、介入、恢复扫描与操作命令都不依赖模型，
+/// 它存在只是为了让 Gateway **起得来**——介入、恢复扫描与操作命令都不依赖模型，
 /// 而一个连 `komo doctor` 都跑不起来的进程什么都诊断不了。
 #[derive(Debug)]
 pub struct UnconfiguredLlm {
@@ -120,7 +115,7 @@ pub struct GatewayState {
     pub clock: Arc<dyn Clock>,
     pub config: Arc<ConfigHolder>,
     pub caps: EffortCapabilities,
-    /// `aux.db`（toasty 模型，只装 cron / 投递 / memory / 幂等键这类辅助表，
+    /// `aux.db`（toasty 模型，只装 cron / memory / 幂等键这类辅助表，
     /// `docs/storage-durable-d5.md` §1）。
     pub db: Db,
     /// 新存储与 harness（`durable.db`）。
@@ -132,9 +127,6 @@ pub struct GatewayState {
     pub memories: Arc<MemoryManager>,
     /// 目标与领域（`docs/goals.md` §4）：`/v1/matters`。
     pub matters: Arc<MatterManager>,
-    pub deliveries: Arc<TursoDeliveryRepo>,
-    pub notifier: Arc<HomeNotifier>,
-    pub channels: Arc<ChannelRegistry>,
     pub llm: Arc<SwappableLlm>,
     /// provider 报的上下文窗口（配置没写 `context_window` 的模型）。
     pub windows: super::windows::WindowCache,
@@ -142,8 +134,6 @@ pub struct GatewayState {
     probe_windows: bool,
     /// 首轮跑完后用记忆模型起会话标题（[`super::titles`]）。注入模型后端的测试里关着。
     pub auto_title: bool,
-    /// 上一条投到 home chat 的重载错误。同一条错误不重复投；装上之后清掉并说一声。
-    pub reload_notice: Mutex<Option<String>>,
     /// MCP 服务器的连接（`docs/mcp.md` §2.2）：受理 Run 前问它一次，登录后才连上的服务器的
     /// 工具从这里挂进执行器。
     pub mcp: Arc<komo_tools::mcp::McpHub>,
@@ -155,9 +145,6 @@ pub struct GatewayState {
     /// 的挂载点一处），**事实只有这一份**——存一份字符串就是第二份事实，它会和这一份
     /// 各走各的。注册表每次查询重扫目录（§5.6），所以"人改了 SKILL.md"不必重启。
     pub skills: Arc<std::sync::RwLock<komo_agent::skills::SkillRegistry>>,
-    pub supervisor: Arc<super::channels::ChannelSupervisor>,
-    /// Dispatcher。**构造之后才填**：它握着这份状态，反过来也要被渠道拿到。
-    pub inbound: std::sync::OnceLock<Arc<dyn komo_kernel::traits::Inbound>>,
     /// OTLP 导出的状态，`run` 接上；`/healthz` 读。
     pub telemetry: std::sync::OnceLock<Arc<crate::telemetry::TelemetryStatus>>,
     /// 正在被人看着的 Run，以及已经投出去的 Intervention 句柄。
@@ -210,12 +197,10 @@ pub struct Assembly {
     pub codemode: Option<komo_tools::codemode::Worker>,
     /// MCP 连接，后台连着；`tools` 里没有 MCP 工具，受理 Run 时才挂进来。
     pub mcp: Arc<komo_tools::mcp::McpHub>,
-    /// 渠道工厂：热重载时按平台重造（§3 第 3 步）。
-    pub channels: Vec<Arc<dyn ChannelFactory>>,
 }
 
 impl GatewayState {
-    /// 把 store、runtime 与渠道接成一个进程。
+    /// 把 store 与 runtime 接成一个进程。
     pub async fn assemble(parts: Assembly) -> Result<Arc<GatewayState>, GatewayError> {
         let Assembly {
             home,
@@ -232,7 +217,6 @@ impl GatewayState {
             tools,
             codemode,
             mcp,
-            channels: factories,
         } = parts;
 
         let snapshot = config.current();
@@ -241,14 +225,6 @@ impl GatewayState {
 
         let cron: Arc<dyn CronRepo> = Arc::new(TursoCronRepo::new(db.clone()));
         let memory: Arc<dyn MemoryRepo> = Arc::new(TursoMemoryRepo::new(db.clone()));
-        let deliveries = Arc::new(TursoDeliveryRepo::new(db.clone()));
-        let channels = Arc::new(ChannelRegistry::new());
-        let delivery_log = Arc::new(DeliveryLog::new(
-            Arc::clone(&deliveries),
-            Arc::clone(&channels),
-            Arc::clone(&clock),
-        ));
-        let notifier = Arc::new(HomeNotifier::new(delivery_log, Arc::clone(&config)));
 
         // 记忆这一层要**先于**模型后端装好：注入是系统提示的一部分（Gateway 装配时拼进
         // `TurnRequest.system_prompt`，§13.2），模型后端只管发送，不再自己接一段。
@@ -332,16 +308,10 @@ impl GatewayState {
             memory,
             memories,
             matters,
-            deliveries,
-            reload_notice: Mutex::new(None),
-            notifier,
-            channels,
             llm,
             windows: super::windows::WindowCache::default(),
             probe_windows,
             auto_title,
-            supervisor: Arc::new(super::channels::ChannelSupervisor::new(factories)),
-            inbound: std::sync::OnceLock::new(),
             telemetry: std::sync::OnceLock::new(),
             watching: Mutex::new(std::collections::BTreeSet::new()),
             mcp,
@@ -502,8 +472,7 @@ impl GatewayState {
 
     /// 这一轮扫描投出去的每一次触发都找个人盯着（§10 的最后两步）。
     ///
-    /// Cron 没有来源会话，所以"需要人处理"这条路只能从这里投到 home chat——不盯着，
-    /// 一个 Cron Run 会停在等待上而没有人知道它在等（§7.4 / §11.4）。
+    /// 盯着是为了回写触发状态（`cron_firings`）；结果不再往外投（聊天渠道已删除）。
     pub async fn watch_fired(self: &Arc<Self>, fired: &[komo_runtime::scheduler::Fired]) {
         for one in fired {
             // Job 可能在触发与这一刻之间被改了；读不出来就按默认的 `always` 盯着，
@@ -526,7 +495,7 @@ impl GatewayState {
     }
 
     /// 盯一次触发。`scheduled = false` 是手动 run：它**没有触发记录**（§10：不冒充
-    /// 定时触发），所以只投递，不回写状态。
+    /// 定时触发），所以不回写状态。
     pub fn watch_cron_run(
         self: &Arc<Self>,
         fired: &komo_runtime::scheduler::Fired,
@@ -582,15 +551,6 @@ impl GatewayState {
                 state.windows.finish(key, outcome);
             });
         }
-    }
-
-    /// 某个 `[channels.*]` 变了：只停掉并重启那一个渠道（§3 第 3 步）。
-    pub async fn restart_channel(
-        self: &Arc<Self>,
-        platform: komo_kernel::types::chat::ChannelPlatform,
-    ) {
-        let supervisor = Arc::clone(&self.supervisor);
-        supervisor.restart(self, platform).await;
     }
 
     /// 对 `aux.db` 做一次启动期的写（见 [`komo_store::Db::first_write`]）。

@@ -8,12 +8,11 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use komo_kernel::protocol::config::{
-    ChannelConfig, ChannelsConfig, CompactionConfig, ConfigSnapshot, ConsolidateConfig,
-    ExecutionConfig, KeyPath, McpExposure, McpServerConfig, McpTransport, MemoryConfig,
-    PathsConfig, RetrievalConfig, SourceFile, StartOnly, TypesafeConfig,
+    CompactionConfig, ConfigSnapshot, ConsolidateConfig, ExecutionConfig, KeyPath, McpExposure,
+    McpServerConfig, McpTransport, MemoryConfig, PathsConfig, RetrievalConfig, SourceFile,
+    StartOnly, TypesafeConfig,
 };
 use komo_kernel::types::agent::{AgentConfig, AgentProfile, MemoryMode};
-use komo_kernel::types::chat::{ChannelPlatform, PeerId};
 use komo_kernel::types::memory::{MemoryScopeParseError, RetrievalMode};
 use komo_kernel::types::model::{
     CatalogModel, Effort, EmbeddingConfig, ModelCatalog, ModelConfig, ModelType,
@@ -28,16 +27,6 @@ use komo_llm::Secrets;
 pub const DEFAULT_LISTEN: &str = "127.0.0.1:7777";
 /// 默认模型超时，和 kernel 的 `ModelConfig` 默认一致。
 const DEFAULT_TIMEOUT_SECS: u64 = 120;
-
-/// 一个渠道的凭证变量名（§11.2 的 `.env` 示例）。微信的凭证是
-/// `~/.komo/wechat/credentials.json`，不在 `.env` 里，所以它没有变量。
-pub fn channel_credentials(platform: ChannelPlatform) -> &'static [&'static str] {
-    match platform {
-        ChannelPlatform::Feishu => &["FEISHU_APP_ID", "FEISHU_APP_SECRET"],
-        ChannelPlatform::Telegram => &["TELEGRAM_BOT_TOKEN"],
-        ChannelPlatform::Wechat | ChannelPlatform::Api | ChannelPlatform::Custom(_) => &[],
-    }
-}
 
 // ---------------------------------------------------------------- 文件形状
 
@@ -67,8 +56,12 @@ pub(super) struct FileConfig {
     pub default_agent: Option<String>,
     #[serde(default)]
     pub agents: std::collections::BTreeMap<String, AgentSection>,
+    /// 已退役的 `[channels.*]`（聊天渠道在 2026-11-13 删除，`docs/redesign.md` P17）。只为让旧配置里
+    /// 留着的键（`enabled`、`allow_from`、`home_chat`、`plugin` ……）逐个落进 `serde_ignored`，
+    /// 变成各一条"不认识这个键，已忽略"的警告；里面的值一个都不读。
     #[serde(default)]
-    pub channels: ChannelsSection,
+    #[allow(dead_code)] // 故意不读：存在只是为了让退役的键被 serde_ignored 点名
+    pub channels: std::collections::BTreeMap<String, RetiredChannelSection>,
     #[serde(default)]
     pub mcp: McpSection,
     #[serde(default)]
@@ -446,42 +439,9 @@ impl TypesafeSection {
     }
 }
 
+/// 一个退役渠道的表：故意没有字段（见 [`FileConfig::channels`]）。
 #[derive(Debug, Default, Deserialize)]
-pub(super) struct ChannelsSection {
-    #[serde(flatten)]
-    pub extra: std::collections::BTreeMap<String, ChannelSection>,
-    #[serde(default)]
-    pub feishu: ChannelSection,
-    #[serde(default)]
-    pub telegram: ChannelSection,
-    #[serde(default)]
-    pub wechat: ChannelSection,
-}
-
-#[derive(Debug, Default, Deserialize)]
-pub(super) struct ChannelSection {
-    #[serde(default)]
-    pub plugin: Option<komo_kernel::protocol::config::ChannelPlugin>,
-    #[serde(default)]
-    pub enabled: bool,
-    #[serde(default)]
-    pub allow_from: Vec<PeerId>,
-    #[serde(default)]
-    pub allow_tenant: bool,
-    pub home_chat: Option<PeerId>,
-}
-
-impl ChannelSection {
-    fn into_channel(self) -> ChannelConfig {
-        ChannelConfig {
-            plugin: self.plugin,
-            enabled: self.enabled,
-            allow_from: self.allow_from,
-            allow_tenant: self.allow_tenant,
-            home_chat: self.home_chat,
-        }
-    }
-}
+pub(super) struct RetiredChannelSection {}
 
 // ---------------------------------------------------------------- 装配
 
@@ -733,19 +693,7 @@ pub(super) fn assemble(
         max_observations: file.memory.max_observations.unwrap_or(defaults.1),
     };
 
-    let channels = ChannelsConfig {
-        extra: file
-            .channels
-            .extra
-            .into_iter()
-            .map(|(id, c)| (id, c.into_channel()))
-            .collect(),
-        feishu: file.channels.feishu.into_channel(),
-        telegram: file.channels.telegram.into_channel(),
-        wechat: file.channels.wechat.into_channel(),
-    };
-
-    let credentials = credential_fingerprints(&model_catalog, &channels, secrets, &data_dir);
+    let credentials = credential_fingerprints(&model_catalog, secrets, &data_dir);
 
     Ok(ConfigSnapshot {
         start_only,
@@ -756,7 +704,6 @@ pub(super) fn assemble(
         typesafe: file.typesafe.into_typesafe(),
         execution: file.execution.into_execution(),
         compaction: file.compaction.into_compaction(),
-        channels,
         paths,
         mcp,
         credentials,
@@ -899,11 +846,10 @@ fn inherited_optional(own: Option<&str>, inherited: Option<&str>) -> Option<Stri
         .map(str::to_string)
 }
 
-/// 快照里的凭证**指纹**：这份配置引用到的变量名，加上已启用渠道的固定变量名，
+/// 快照里的凭证**指纹**：这份配置引用到的变量名，
 /// 再加上（用到了 `auth = "chatgpt"` 时）ChatGPT 凭证文件本身的指纹（§13.3）。
 fn credential_fingerprints(
     catalog: &ModelCatalog,
-    channels: &ChannelsConfig,
     secrets: &Secrets,
     data_dir: &Path,
 ) -> BTreeMap<String, komo_kernel::types::digest::ContentHash> {
@@ -913,21 +859,6 @@ fn credential_fingerprints(
         .filter(|model| model.common().auth.is_none())
         .map(|model| model.common().api_key_env.clone())
         .collect();
-    for platform in channels.platforms() {
-        if channels.get(platform.clone()).is_some_and(|c| c.enabled) {
-            names.extend(
-                channel_credentials(platform.clone())
-                    .iter()
-                    .map(|s| s.to_string()),
-            );
-            if let Some(plugin) = channels
-                .get(platform.clone())
-                .and_then(|c| c.plugin.as_ref())
-            {
-                names.extend(plugin.env.iter().cloned());
-            }
-        }
-    }
     names.sort();
     names.dedup();
     let mut fingerprints = secrets.fingerprints(names.iter().map(String::as_str));

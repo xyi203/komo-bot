@@ -1,6 +1,6 @@
 //! 回收 Session 内容（§8.10 第 3 条）：`purge` 之前**先算引用**，再删目录。
 //!
-//! - [`purge_blockers`]：`aux.db` 里还有哪些东西引用这个会话（记忆证据、未送出的投递、cron 触发
+//! - [`purge_blockers`]：`aux.db` 里还有哪些东西引用这个会话（记忆证据、cron 触发
 //!   记录），一条一类、说人话；空数组 = 可以删内容。非空 = 网关回 409 并列出这些，不假装成功
 //!   （§8.8）。会话自己的未完成工作在 `durable.db` 里，由 gateway 另算。
 //! - [`remove_session_content`]：删 Session 目录，**目录不在 = `Ok(0)`**——墓碑先落、内容后删，
@@ -10,13 +10,11 @@ use std::path::Path;
 
 use komo_kernel::protocol::http::PurgeBlocker;
 use komo_kernel::traits::StoreError;
-use komo_kernel::types::chat::Outbound;
 use komo_kernel::types::ids::SessionId;
 use komo_kernel::types::memory::EvidenceRef;
 
 use crate::db::{BoxFuture, Db, map_toasty};
-use crate::models::{CronFiringRow, DeliveryRow, MemoryEvidenceRow};
-use crate::repos::deliveries;
+use crate::models::{CronFiringRow, MemoryEvidenceRow};
 use crate::session_dir::SessionPaths;
 
 /// `purge` 之前的引用检查：**还有多少条要处置**。
@@ -43,30 +41,6 @@ pub async fn purge_blockers(db: &Db, session: &SessionId) -> Result<Vec<PurgeBlo
                     detail: format!(
                         "还有 {evidence} 条记忆证据指向这个会话的事件；先停用或删除这些记忆条目（§8.10）"
                     ),
-                });
-            }
-
-            // `deliveries` 没有 `session_id` 列，归属只能从 `outbound` 里读：带会话的几种直接比。
-            // 认不出的一条不算这个会话的——它是别人的投递，删内容不该把它算进来。
-            let rows = DeliveryRow::all().exec(ex).await.map_err(map_toasty)?;
-            let deliveries = rows
-                .iter()
-                .filter(|row| !deliveries::is_settled_state(&row.state))
-                .filter(|row| {
-                    matches!(
-                        Outbound::from_stored(&row.outbound),
-                        Ok(Some(
-                            Outbound::RunFinished { session: ref s, .. }
-                                | Outbound::NeedsAttention { session: ref s, .. }
-                                | Outbound::RunAbsorbed { session: ref s, .. }
-                        )) if s.as_str() == id
-                    )
-                })
-                .count();
-            if deliveries > 0 {
-                blockers.push(PurgeBlocker {
-                    what: "delivery".into(),
-                    detail: format!("还有 {deliveries} 条未送出的投递挂在这个会话上；先送出或明确终止"),
                 });
             }
 
@@ -141,8 +115,8 @@ async fn dir_bytes(root: &Path) -> Result<u64, StoreError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::{CronFiringRow, DeliveryRow, MemoryEvidenceRow};
-    use komo_kernel::types::ids::{RunId, Seq};
+    use crate::models::{CronFiringRow, MemoryEvidenceRow};
+    use komo_kernel::types::ids::Seq;
 
     struct Fixture {
         /// 目录守卫：把它放走，`aux.db` 一起没了。
@@ -192,42 +166,6 @@ mod tests {
                 .unwrap();
         }
 
-        /// 一条**还没送出**的投递：正文说得出它属于哪个会话（§11.4）。
-        async fn pending_delivery(&self, id: &str, session: &SessionId) {
-            let outbound = serde_json::to_string(&Outbound::RunFinished {
-                session: session.clone(),
-                run: RunId::from_raw("run-1"),
-                summary: "跑完了".into(),
-            })
-            .unwrap();
-            let id = id.to_string();
-            self.db
-                .with_write_retry(move |ex| {
-                    let (id, outbound) = (id.clone(), outbound.clone());
-                    Box::pin(async move {
-                        toasty::create!(DeliveryRow {
-                            id,
-                            platform: "feishu",
-                            chat_id: "oc_1",
-                            is_home: false,
-                            outbound,
-                            approval_id: None as Option<String>,
-                            state: "pending",
-                            attempts: 0_i64,
-                            last_error: None as Option<String>,
-                            created_at: 0_i64,
-                            updated_at: 0_i64,
-                        })
-                        .exec(ex)
-                        .await
-                        .map_err(map_toasty)?;
-                        Ok(())
-                    }) as BoxFuture<'_, Result<(), StoreError>>
-                })
-                .await
-                .unwrap();
-        }
-
         async fn cron_firing(&self, id: &str, session: &SessionId) {
             let (id, session) = (id.to_string(), session.to_string());
             self.db
@@ -263,7 +201,6 @@ mod tests {
         let f = fixture().await;
         let session = SessionId::from_raw("sess-1");
         f.evidence("ev-1", &session).await;
-        f.pending_delivery("dl-1", &session).await;
         f.cron_firing("cf-1", &session).await;
         // 别的会话的东西不该被算进来。
         let other = SessionId::from_raw("sess-2");
@@ -274,8 +211,8 @@ mod tests {
         let kinds: Vec<&str> = blockers.iter().map(|b| b.what.as_str()).collect();
         assert_eq!(
             kinds,
-            vec!["memory_evidence", "delivery", "cron_firing"],
-            "三类各一条：{blockers:#?}"
+            vec!["memory_evidence", "cron_firing"],
+            "两类各一条：{blockers:#?}"
         );
         for blocker in &blockers {
             assert!(
@@ -299,10 +236,6 @@ mod tests {
         f.db.with_write_retry(|ex| {
             Box::pin(async move {
                 toasty::sql::statement("DELETE FROM memory_evidence WHERE id = 'ev-1'")
-                    .exec(ex)
-                    .await
-                    .map_err(map_toasty)?;
-                toasty::sql::statement("UPDATE deliveries SET state = 'sent' WHERE id = 'dl-1'")
                     .exec(ex)
                     .await
                     .map_err(map_toasty)?;

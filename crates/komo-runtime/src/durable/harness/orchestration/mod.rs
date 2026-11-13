@@ -48,8 +48,6 @@ pub mod monitor;
 pub mod report;
 mod task;
 
-pub(crate) use task::{ChildSpec, create_child};
-
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -84,9 +82,6 @@ pub const TASK_DOC_KIND: &str = "komo.task";
 pub const TASK_DOC_VERSION: u32 = 1;
 /// 交回到父 conversation 的输入的 entry kind。
 pub const TASK_RESULT_ENTRY: &str = "task.result";
-/// 分发派出的任务的回复落在父（主会话）里的展示 entry 的 kind：只用于展示的 write，没有 `model`，
-/// 所以不进上下文、不起 run（`docs/tasks.md` §4.11 决定 3）。`data` 的形状见 [`report`] 的 `direct_reply`。
-pub const MAIN_REPLY_ENTRY: &str = "main.reply";
 
 /// fork 任务第一条输入的开头（`docs/background-tasks.md` §2b）：紧跟在父的对话与补的结果之后。
 /// 放在输入里而不是系统提示里——系统提示是父那份，改一个字缓存就不中。
@@ -100,11 +95,6 @@ pub const FORK_NOTICE: &str = "（以上是派你的那个会话到此刻为止�
 /// 任务的回答没写状态行时，在任务会话里自动续跑的那条输入的 entry kind（`docs/background-tasks.md`
 /// §2c）。不带 `komo.` 前缀、`model` 是 user 消息，gateway 认它是输入。
 pub const TASK_CONTINUE_ENTRY: &str = "task.continue";
-
-/// 卡死检测给在跑的任务插的提醒输入的 entry kind（`docs/tasks.md` §4.9 B4，Gateway 的 `dispatch::stall`）。
-/// 与 [`TASK_CONTINUE_ENTRY`] 同样不带 `komo.` 前缀；它不是用户的话，**不能**把一轮变成"用户发起"
-/// （`confirm` 的 `UNATTENDED_INPUTS` 里有它），否则只由事件起的一轮会因为这条提醒免掉对外动作的确认。
-pub const TASK_STALL_ENTRY: &str = "task.stall";
 
 /// 自动续跑那条输入的正文。派它的会话只收到续跑之后的那条回复，所以要的是一份完整的最后回复。
 pub(crate) const TASK_CONTINUE_PROMPT: &str = "（这条是 komo 自动发的，不是派你的会话。）你上一条回复的末行\
@@ -215,21 +205,6 @@ pub struct LastRun {
     pub rounds: Option<u32>,
 }
 
-/// 分发派出的任务把回复投到哪（派出时写定，完成时照它投，不在完成时再推断）。
-///
-/// 有它，任务一轮结束时 runtime 不再往父交回一条 `task.result` 让父起一轮转述，而是在父里落一条
-/// [`MAIN_REPLY_ENTRY`] 展示 entry，渠道投递由 Gateway 照这条 entry 做（`docs/tasks.md` §4.12 U3）。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ReplyTo {
-    /// 渠道对端（`ChannelPeer` 的字符串形式）；HTTP 来的没有，只落主线的展示 entry。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub peer: Option<String>,
-    /// 这条回复是在答主线上的哪一条消息（entry 与受理它的 submission）。
-    pub origin_entry: EntryId,
-    pub origin_submission: SubmissionId,
-}
-
 /// 子 conversation 的 `komo.task`：它是谁派的、叫什么、用哪个模型、哪些输入带结果契约。
 ///
 /// gateway 的 `AgentHooks::setup` 读它：`model` / `effort` 是 alias 名字，按当前配置解析；
@@ -257,29 +232,13 @@ pub struct TaskDoc {
     /// 状态行也照样交回：每条派出 / 追问的输入最多续跑一次。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub continued: Option<SubmissionId>,
-    /// 分发派出的任务：回复直接投到这里（见 [`ReplyTo`]）。`task` 工具派出的没有，照旧交回父会话。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reply: Option<ReplyTo>,
-    /// 用户说"停下"之后记在这里（`docs/tasks.md` §4.14 F4）：[`inbox::admit`](super::inbox::admit) 与监听的
-    /// 结束交回看它，收件箱里排着的、以及在途晚到的监听事件 / 结束消息一律丢弃、不起轮次。只有用户的消息
-    /// 被分发判成 `continue` 指向这个任务时才清掉（`dispatch::continue_task`）。附加字段：旧 document 没有，
-    /// 读成 `false`。
+    /// 任务被停下之后记在这里（`DurableCore::stop_task`）：[`inbox::admit`](super::inbox::admit) 与监听的
+    /// 结束交回看它，收件箱里排着的、以及在途晚到的监听事件 / 结束消息一律丢弃、不起轮次，也不再自动续跑。
+    /// 附加字段：旧 document 没有，读成 `false`。
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub stopped: bool,
-    /// 这个任务拥有的对话位置（带话题的 `ChannelPeer` 的字符串形式）：进来的消息落在这个位置、而它还没被停、
-    /// 会话还活着时，程序不经 Router 直接交给它（`docs/tasks.md` §4.14 F5 "路由归属"）。派出时写定，给的是
-    /// 这次派出的任务；位置上换了新任务，原任务的这一格由分发在同一次提交里清掉，所以每个位置至多一个。
-    /// 任务一轮做完只是空闲，归属不动。附加字段：旧 document 没有，读成 `None`。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub thread: Option<String>,
-    /// 这个任务自己的 komo Session ID（建任务时写下）：线上的 `line.reply` 事件带它，客户端据此点进任务会话。
-    /// 存在 document 里是因为收尾提交里已经写过 conversation 表，不能再按表读它的 `session`。附加字段：旧
-    /// document 没有，读成 `None`。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub session: Option<String>,
     /// 这个任务带着的目标 id（`docs/tasks.md` §4.7、`docs/goals.md` 的"任务与目标的关联"）：表示"这件事是为这些目标做的"，
-    /// 只用来找回与显示（任务清单、`task.list` 的过滤、`goal.list` 的计数）。**不参与消息路由**——路由归属只属于
-    /// 对话位置（[`thread`](Self::thread)）。由任务自己用 `komo` 的 `goal.attach` / `goal.detach` 增减，按挂上的先后、
+    /// 只用来找回与显示（任务清单、`task.list` 的过滤、`goal.list` 的计数）。由任务自己用 `komo` 的 `goal.attach` / `goal.detach` 增减，按挂上的先后、
     /// 不重复。目标完成或放弃时这里的键**原样留着**：历史关联仍有意义，所以不做级联清理，目标被删了也不回头改。
     /// 附加字段：旧 document 没有，读成空。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

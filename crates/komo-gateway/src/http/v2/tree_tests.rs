@@ -214,7 +214,6 @@ impl Home {
             embeddings: None,
             shared_home: Some(self.dir.path().to_path_buf()),
             telemetry: None,
-            clock: None,
         })
         .await
         .expect("Gateway 起得来")

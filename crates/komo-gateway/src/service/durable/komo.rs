@@ -25,7 +25,7 @@ use crate::http::error::{ApiFailure, ApiResult};
 use crate::http::idempotency::Idempotency;
 use crate::http::v2::{sessions, tasks};
 use crate::http::{Api, cron, matters, memories};
-use crate::service::durable::sessions::{SessionError, is_group_task};
+use crate::service::durable::sessions::SessionError;
 use crate::service::state::GatewayState;
 use crate::web::WebAuth;
 
@@ -62,10 +62,6 @@ impl GatewayKomo {
 impl KomoService for GatewayKomo {
     async fn call(&self, caller: &SessionId, call: KomoCall) -> Result<Value, ToolError> {
         let api = self.api()?;
-        // 群的线派出的任务一个动作都不能用（逐个动作的理由见 [`group_task_refusal`]）。
-        if is_group_task(&*api.state.durable.storage, caller.as_str()).await {
-            return Err(group_task_refusal(&call));
-        }
         match call {
             KomoCall::MemoryAdd(request) => reply(memories::add(State(api), Json(request)).await),
             KomoCall::MemorySearch(query) => reply(memories::list(State(api), Query(query)).await),
@@ -118,36 +114,6 @@ impl KomoService for GatewayKomo {
     }
 }
 
-/// 群的线派出的任务（[`is_group_task`]）调 `komo` 的任何动作都拒绝，按动作分两句话：
-///
-/// - `memory.*` / `goal.*`：操作者的个人记忆与目标，读和写都不行；
-/// - `cron.list` / `cron.run`：定时任务的清单与触发——任务说明里是操作者自己写的东西，触发它是以操作者的身份
-///   起一次 Run；`session.search` / `session.list`：搜索与列出会话——正好是操作者私聊里的内容；
-///   `task.list`：任务清单是全部任务（含私聊派出的）的标题与状态。这些都会把操作者私聊里的东西带到群里，
-///   所以也拒绝。（`task.list` 没有"只列这个群"的参数，不能放行一半。）
-fn group_task_refusal(call: &KomoCall) -> ToolError {
-    let reason = match call {
-        KomoCall::MemoryAdd(_)
-        | KomoCall::MemorySearch(_)
-        | KomoCall::MemoryForget { .. }
-        | KomoCall::GoalAdd(_)
-        | KomoCall::GoalList(_)
-        | KomoCall::GoalAttach { .. }
-        | KomoCall::GoalDetach { .. }
-        | KomoCall::GoalAct { .. } => "群里派出的任务不能读写个人记忆与目标",
-        KomoCall::CronList
-        | KomoCall::CronRun { .. }
-        | KomoCall::SessionSearch(_)
-        | KomoCall::SessionList(_)
-        | KomoCall::TaskList(_) => {
-            "群里派出的任务不能查看或触发定时任务、会话与任务清单（里面有操作者私聊里的内容）"
-        }
-    };
-    ToolError::Denied {
-        reason: reason.to_owned(),
-    }
-}
-
 /// `goal.list`：路由的清单，每个目标再带上 `tasks`——有几个（活着的）任务带着它的键。计数不是目标自己的
 /// 字段（目标落在 aux.db、任务的键落在 durable.db），所以在这里补到响应里，路由与线上的 `Matter` 类型不变。
 async fn goal_list(
@@ -175,7 +141,7 @@ async fn goal_list(
 ///
 /// 这是任务自己的关联、不是目标的承诺，所以不走 `matters::act`、不要 Run 里的用户原话（只由监听事件起的一轮也能用）。
 /// 要求：不是 `memory = private / off` 的 Agent（同目标的所有读写，[`matters::gate`]）；当前会话是任务会话（有
-/// `komo.task`）。群里派出的任务在 [`GatewayKomo::call`] 入口就被拒了。目标完成或放弃不会清掉任务上的键——
+/// `komo.task`）。目标完成或放弃不会清掉任务上的键——
 /// 那是有意的：历史关联仍有意义（`TaskDoc::goals`）。
 async fn set_task_goal(
     api: &Api,
@@ -602,10 +568,7 @@ mode = "keyword"
             contracts: BTreeMap::new(),
             last_run: None,
             continued: None,
-            reply: None,
             stopped: false,
-            thread: None,
-            session: None,
             goals: Vec::new(),
         };
         let root = task.root_conversation;
@@ -660,15 +623,12 @@ mode = "keyword"
         gateway.running.stop().await;
     }
 
-    /// 造一个任务会话（带 `komo.task`），返回会话记录；`reply` 给了就是"由用户消息派出的任务"。
+    /// 造一个任务会话（带 `komo.task`），返回会话记录。
     async fn task_session(
         core: &crate::service::durable::DurableCore,
         parent: &komo_kernel::durable::SessionRecord,
         title: &str,
-        reply: bool,
     ) -> komo_kernel::durable::SessionRecord {
-        use komo_kernel::durable::{EntryId, SubmissionId};
-        use komo_runtime::durable::harness::ReplyTo;
         let mut spec = NewSession::new("assistant")
             .kind(SessionKind::Task)
             .title(title);
@@ -684,14 +644,7 @@ mode = "keyword"
             contracts: BTreeMap::new(),
             last_run: None,
             continued: None,
-            reply: reply.then(|| ReplyTo {
-                peer: None,
-                origin_entry: EntryId::new(1),
-                origin_submission: SubmissionId::new(1),
-            }),
             stopped: false,
-            thread: None,
-            session: None,
             goals: Vec::new(),
         };
         let root = task.root_conversation;
@@ -738,7 +691,7 @@ mode = "keyword"
         let (home_session, run) = user_run(&gateway, "开始做空调巡检").await;
         let core = gateway.state().core().unwrap().clone();
         let parent = core.session(home_session.as_str()).await.unwrap();
-        let task = task_session(&core, &parent, "查空调", true).await;
+        let task = task_session(&core, &parent, "查空调").await;
         let goal = new_matter(&gateway, "goal", "空调巡检").await;
         let area = new_matter(&gateway, "area", "家里的设备").await;
 
@@ -811,9 +764,9 @@ mode = "keyword"
         gateway.running.stop().await;
     }
 
-    /// 非任务会话（主会话）里调用被拒，说明只有任务里能用；群里派出的任务照旧被拒（沿用 `is_group_task`）。
+    /// 非任务会话（主会话）里调用被拒，说明只有任务里能用。
     #[tokio::test]
-    async fn goal_attach_is_refused_outside_a_task_and_in_a_group_task() {
+    async fn goal_attach_is_refused_outside_a_task() {
         let (_home, gateway) = start().await;
         let tool = komo_tool(&gateway);
         let (home_session, run) = user_run(&gateway, "开始做空调巡检").await;
@@ -832,27 +785,6 @@ mode = "keyword"
             assert!(message.contains("只有任务里能用"), "{action}：{message}");
         }
 
-        // 群的线（`source = line:…`）派出的任务。
-        let group_line = core
-            .create_session(
-                NewSession::new("assistant")
-                    .kind(SessionKind::Main)
-                    .source("line:feishu:oc_g")
-                    .title("群"),
-            )
-            .await
-            .unwrap();
-        let task = task_session(&core, &group_line, "群任务", true).await;
-        let mut ctx = ctx_of(&task, &run);
-        for action in ["goal.attach", "goal.detach"] {
-            let error = call(&tool, &mut ctx, action, json!({ "id": goal }))
-                .await
-                .unwrap_err();
-            let ToolError::Denied { reason } = &error else {
-                panic!("{action}：{error:?}")
-            };
-            assert!(reason.contains("群里派出的任务"), "{action}：{reason}");
-        }
         gateway.running.stop().await;
     }
 
@@ -870,7 +802,7 @@ mode = "keyword"
 
         let mut mine = Vec::new();
         for title in ["一", "二", "三"] {
-            let task = task_session(&core, &parent, title, true).await;
+            let task = task_session(&core, &parent, title).await;
             ok(
                 &tool,
                 &mut ctx_of(&task, &run),
@@ -880,8 +812,8 @@ mode = "keyword"
             .await;
             mine.push(task.id.clone());
         }
-        let stray = task_session(&core, &parent, "无关", true).await;
-        let filter = task_session(&core, &parent, "别的目标", true).await;
+        let stray = task_session(&core, &parent, "无关").await;
+        let filter = task_session(&core, &parent, "别的目标").await;
         ok(
             &tool,
             &mut ctx_of(&filter, &run),

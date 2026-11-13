@@ -152,7 +152,7 @@ Gateway 对数据目录持有进程锁。多个 CLI 同时启动时，只允许�
 
 **从 Web 改常用设置与环境变量（2026-10-29，认可）。** 同一套写法（带 `version`、先校验后落盘、原子写、重载、失败写回原文、同一把锁）再开放两组：
 
-- **常用设置**：一张写死的白名单，一项一个键，其余键仍只在文件里改。`default_agent`（选一个已有的 `[agents.*]`）、`[memory] enabled`、`[memory] model`（选一个 completion 模型；不写 = 跟默认模型）、`[memory.retrieval] mode`（`hybrid` / `keyword` / `vector`）、`[compaction] enabled`、`[execution] model_result_bytes`（1–30720，上限见 §8.6 的投影）、`[execution] call_timeout_secs`、`[execution] confirm_timeout_mins`、`[execution] stall_model_secs`、`[execution] stall_tool_secs`（0–，0 = 不检测）。`GET /v1/config/settings` 每项给：种类（开关 / 整数 / 选项）、文件里写的值（没写为空）、当前生效的值（从快照读；`memory.model` 没写时是默认模型的 alias）、选项或范围。`PUT /v1/config/settings/{key}` 带 `value`，`null` = 删掉这一行回到默认；键不在白名单 404，类型、范围、选项不对 400。只改这一行，节不存在就建上。
+- **常用设置**：一张写死的白名单，一项一个键，其余键仍只在文件里改。`default_agent`（选一个已有的 `[agents.*]`）、`[memory] enabled`、`[memory] model`（选一个 completion 模型；不写 = 跟默认模型）、`[memory.retrieval] mode`（`hybrid` / `keyword` / `vector`）、`[compaction] enabled`、`[execution] model_result_bytes`（1–30720，上限见 §8.6 的投影）、`[execution] call_timeout_secs`、`[execution] confirm_timeout_mins`。`GET /v1/config/settings` 每项给：种类（开关 / 整数 / 选项）、文件里写的值（没写为空）、当前生效的值（从快照读；`memory.model` 没写时是默认模型的 alias）、选项或范围。`PUT /v1/config/settings/{key}` 带 `value`，`null` = 删掉这一行回到默认；键不在白名单 404，类型、范围、选项不对 400。只改这一行，节不存在就建上。
 - **环境变量**：`GET /v1/config/env` 按 `.env` 里的顺序列出变量名，再补上配置引用了、文件里却没有的名字（provider / 模型的 `env_key`、MCP 的 `bearer_token_env` 与 `env`、启用渠道的凭证名）。每个名字带：在不在文件里、当前有没有非空值（`.env` 或进程环境）、谁在用它。**任何值都不返回**——`.env` 是凭证文件，值只进不出。`PUT /v1/config/env` 一次设一批 `{name, value}`：名字只用大写字母、数字与 `_` 且不以数字开头（与 provider 的 `env_key` 同一条规则），值非空、不含单引号与换行，已有的行就地换掉、没有的追加；`DELETE /v1/config/env/{name}` 删掉那一行，还被配置引用的 409 并说出引用方，文件里没有的 404。
 - 所有写接口（含模型那一组）都回同一个 `ConfigEditResponse`：模型、常用设置、环境变量三份视图（共用一个新 `version`）加重载报告，客户端不用再分别重读。
 - Web 不显示两份文件的路径：设置页说"配置""环境变量"，不说它们在磁盘上的哪儿。
@@ -455,7 +455,6 @@ default_agent = "assistant"
 [agents.assistant]
 instructions = "你是家里那个助手，回答用中文。"
 model = "chat"                     # [model.<alias>] 的 alias；省略 = [models].default
-router_model = "chat"              # 可选：Router 分发判断用的 [model.<alias>]；省略 = 上面的 model
 tools = ["read", "rg", "codemode"]   # 省略 = 目录里全部；[] = 一个都不给
 workspace = "home"                 # 相对数据目录；省略 = [paths] workspaces_dir
 memory_scope = "personal"
@@ -471,8 +470,6 @@ project_files = false              # 省略 = true
 ```
 
 **记忆模式与项目文件。** `memory`：`shared`（省略）= 召回 `memory_scope` + Personal，没写 `memory_scope` 就是全部作用域——**但不含任何 `agent:*`**；`private` = 这个 Agent 自己的 `agent:<id>` 作用域，召回只看它、不并 Personal，提取前的候选召回也只看它，提取结果不管模型选了什么都由 Rust 改写成 `agent:<id>`，别的 Agent 的召回与提取候选都看不见它（双向隔离，判断只有 `memory::scope_allowed` 一处）；`off` = 不召回，提取当场结案、不调模型。`private` 与 `memory_scope` 不能同写，任何 Profile 的 `memory_scope` 都不能写 `agent:...`——那一格只属于 `private`。**召回按当前 Profile（每段第一次钉住时）；提取按提取那一刻的配置**——新存储没有受理快照，也不把模式冻进 `komo.agent`：提取要等会话空闲之后，这段空窗里把记忆关掉应立即生效，而不是让已说过的话在关掉之后又入库（`docs/memory.md` §9.10）；沿用的注入每次请求前按现在放行的作用域重新过一遍。`project_files = false` 不做项目文件的发现（发现会从工作目录一路往上到 `/`）。操作者看某个 Agent 的私有记忆要显式 `komo memory list --scope agent:<id>`。
-
-**`router_model`（可选，`docs/tasks.md` §4.11）。** Router 对每条没有直通去处的消息做一次不带工具、不带历史的模型调用，只填去向。`router_model` 是 `[model.<alias>]` 里一个 `completion` 模型的 alias；省略就用该 Agent 的 `model`（再省略就是 `[models].default`）。**与 `model` 不同，写错不会静默退回**：alias 不存在或不是 completion 模型，`komo config check` 与热加载都按 `agents.<id>.router_model` 报错，非法配置不安装。每次判断按当前快照解析，热加载后下一条消息就生效。带几条最近消息（6）、带几个最近结束的任务（5）、判断重试上限（2 次）、候选里"最后说的话"的截断长度（80 字符）目前是 `komo-agent::router` 里的常量，不是配置键。判断单元本身（`komo-agent::router`）已实现，Gateway 里的调用胶水在 `service::durable::router`；还没接到渠道入口。
 
 两个字段各带一次"省略 ≠ 空"的区分，写在类型里（§4 的能力面）：`tools` 省略 = 目录里全部，`[]` = 一个都不给；写了目录里没有的工具名**不算数**，装配时 warn 出来，模型看到的 schema 里也不会出现它（`AgentProfile::surface` 把不认识的名字单独返回，就是为了不静默采纳一份写错的配置）。
 
@@ -1242,15 +1239,6 @@ model_result_bytes = 30720
 # 到这里才终止进程组）。命令型 Cron Job 仍是 bash 默认的 120 秒。
 # 热生效，对下一轮调用立即生效。省略 = 1800。
 call_timeout_secs = 1800
-# 卡死检测（docs/tasks.md §4.9 B4）：分发派出的任务一轮在跑，这么久没有任何进展（没有模型调用完成、
-# 没有工具开始或结束、没有进度提交）就判卡死——到约 80% 先给它插一条提醒，到点还没动静就停掉，并往
-# 来源对端说一句"这件事卡住了，我先停下……"。不设总时长：一直有进展，跑多久都不管。
-# stall_model_secs 管两次模型调用之间，stall_tool_secs 管有工具在执行的时候（后者宽，工具本来就慢；
-# 注意默认 1200 比 call_timeout_secs 短：一条要跑满 1800 秒的命令会在 1200 秒处被判卡死，
-# 需要的话把它调到 call_timeout_secs 以上）。等操作者确认 / 介入答复的任务不算。热生效。0 = 不检测。
-# 省略 = 450 / 1200。
-stall_model_secs = 450
-stall_tool_secs = 1200
 # 对话会话里的 bash 跑过这么久还没完，就自动转到后台：这次调用先返回「已转后台 #id」，跑完时
 # 退出码与输出尾部作为一条消息交回会话（docs/monitor.md §8）。任务会话与 Cron 的 Run 不转。
 # `shell` 提交（原 TUI 的 `!` 命令）用同一个阈值转后台，跑完以一条 shell.command 进历史（不交回、不起模型 Run）。
@@ -1415,8 +1403,7 @@ komo-agent     Agent 的身份、能力与上下文装配（`docs/bot.md` 批次
                只描述"要做什么"，
                不执行；值类型（`AgentProfile` / `AgentSurface`）留在
                kernel（协议与记录类型按它们定形，搬出来会把依赖指反）。
-               Router 的分发判断（`router`：输入输出类型、提示、解析校验、兜底；模型调用是注入的 trait，Gateway 给实现）。
-               deps: kernel, serde_json, tracing, async-trait；dev: tokio（rt、macros）。
+               deps: kernel, serde_json, tracing。
 
 komo-gateway   axum 路由（§13.1）、SSE、认证、进程锁与发现文件、launchd/systemd 集成、
                Dispatcher、`service/durable/`（`DurableCore`：引擎 + harness + 钩子装配、会话与树服务、feed / watch / lifecycle / interventions / cron / memory 接线）、`http/v2/`、通用渠道进程宿主、Notifier 实现、deliveries；平台渲染归各插件。

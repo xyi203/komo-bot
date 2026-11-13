@@ -18,24 +18,6 @@ fn operator_dm(text: &str, key: &str) -> InboundMessage {
     inbound(ChannelPlatform::Telegram, "111", "111", text, key, true)
 }
 
-/// 操作者在群里一个话题里说话：话题里有旧办法开出来的普通会话时仍进它自己（仍有模型轮次）；群里别的
-/// 消息已经走群的线由分发判断（`durable::dispatch`），不再起模型轮次。
-fn operator_group(text: &str, key: &str) -> InboundMessage {
-    let mut message = inbound(ChannelPlatform::Telegram, "-100", "111", text, key, false);
-    message.peer = message.peer.in_thread("t1");
-    message
-}
-
-/// 先开出 [`operator_group`] 那个话题的旧式会话（`kind = normal`、`source = chat:{peer}`）。
-async fn open_legacy_topic(state: &Arc<crate::service::state::GatewayState>) {
-    let core = state.core().unwrap();
-    let agent = state.snapshot().agent.default_agent.clone();
-    let peer = operator_group("", "k").peer;
-    core.session_for_source(&crate::dispatcher::chat_origin(&peer), &agent)
-        .await
-        .expect("旧式话题会话");
-}
-
 /// ③ 改 `allow_from` 保存后重载，下一条消息按新名单判定（不重启）。
 #[tokio::test]
 async fn a_reloaded_allow_list_decides_the_next_message() {
@@ -193,7 +175,6 @@ async fn only_one_gateway_holds_a_data_directory() {
         embeddings: None,
         shared_home: None,
         telemetry: None,
-        clock: None,
     })
     .await;
     let error = second.expect_err("第二台起不来");
@@ -274,12 +255,13 @@ async fn the_same_request_key_with_other_content_is_a_conflict() {
     );
 }
 
-/// 聊天渠道的 `/new` 不切 Session，也不动主线的历史。（HTTP 的 `POST /boundary` 只有 TUI 调，
-/// 2026-11-12 随 TUI 删除；服务层 `DurableCore::boundary` 留给任务会话里的 `/new`。）
+/// 聊天渠道的 `/new` 在当前会话上追加一条边界，**不切 Session**。（HTTP 的 `POST /boundary` 只有 TUI 调，
+/// 2026-11-12 随 TUI 删除；聊天渠道的 `/new` 走 `DurableCore::boundary`。）
 #[tokio::test]
-async fn slash_new_in_chat_leaves_the_home_session_alone() {
+async fn slash_new_in_chat_appends_a_boundary_to_the_same_session() {
     use crate::service::test_support::harness::FakeLlm;
     use komo_kernel::protocol::http::{SessionSummary, SubmitRunResponse};
+    use komo_kernel::session::EntryKind;
 
     let gateway = TestGateway::with(&telegram_config("111"), FakeLlm::finisher("好")).await;
     let home = |body: String| {
@@ -309,22 +291,28 @@ async fn slash_new_in_chat_leaves_the_home_session_alone() {
     let (_, body) = gateway.get(&format!("/v1/sessions/{session}/tree")).await;
     let before = entries_of(body);
 
-    // 主线不跑模型、没有上下文可重置（`docs/tasks.md` §4.14），`/new` 只回一句说明，
-    // 不追加边界，home session 与历史都不变。
+    // 聊天渠道的 `/new`：回执，落在**同一个** home session（操作者私聊就是它），多一条边界
+    // （"自此重新开始"在 pi 里是一条压缩）。
     let ack = gateway
         .dispatcher()
         .handle(operator_dm("/new", "telegram:2"))
         .await
         .unwrap();
     assert!(
-        matches!(&ack, InboundAck::Replied { text } if text.contains("不需要重新开始")),
+        matches!(&ack, InboundAck::Replied { text } if text.contains("新的一段")),
         "{ack:?}"
     );
     let (_, body) = gateway.get("/v1/home-session").await;
     assert_eq!(home(body), session, "聊天里的 /new 也不切 Session");
     let (_, body) = gateway.get(&format!("/v1/sessions/{session}/tree")).await;
     let after_chat = entries_of(body);
-    assert_eq!(after_chat.len(), before.len(), "{after_chat:?}");
+    assert!(
+        after_chat.len() > before.len()
+            && after_chat[before.len()..]
+                .iter()
+                .any(|entry| matches!(entry.kind, EntryKind::Compaction { .. })),
+        "{after_chat:?}"
+    );
 }
 
 // ---------------------------------------------------------------- 工具
@@ -1262,29 +1250,17 @@ mod chat {
             "重投不该开第二个 Run"
         );
 
-        // 改了断言的读法：私聊落到主会话，主会话不起 run——消息是主线上的一条展示 write，
-        // 请求键去重的结果是主线上只有一条这样的消息（也就只有一个分发任务）。
-        let tree = gateway
-            .state()
-            .core()
-            .unwrap()
-            .read_tree(session.as_str())
-            .await
-            .expect("读得出树");
-        let shown = tree
-            .branches
-            .iter()
-            .flat_map(|branch| branch.entries.iter())
-            .filter(|entry| entry.kind == crate::service::durable::dispatch::MAIN_USER_ENTRY)
-            .count();
-        assert_eq!(shown, 1, "主线上只有一条这条消息");
+        // 改了断言的读法：Legacy 数 `runs` 表，新存储里一条 run 就是它的首个输入 submission。
+        assert_eq!(
+            inputs_of(gateway.state(), session.as_str()).await,
+            1,
+            "账本上只有一个 Run"
+        );
     }
 
     /// 聊天渠道的普通消息以插话受理（§6，2026-10-23）：宿主 Run 忙着跑工具时，同一个 peer 的
     /// 下一句话由它在下一次请求模型之前并进去，不排到整条 Run 后面。
     ///
-    /// 改成旧式话题会话：私聊与群里的新消息落到的线不再起模型轮次（消息交给分发任务，见 `durable::dispatch`），
-    /// "并进宿主 run"只发生在旧办法开出来、仍有模型轮次的话题会话里。
     /// 改了断言：Legacy 看 `run.accepted` 上的 `interject` 标记；新存储的 RunAccepted 是合成的，
     /// 没有那一格，插话体现为行为——宿主停在 `gate` 上时第二句话并进它（终态 `absorbed`），
     /// 渠道收到"已并入"，回答只有宿主给的一次。
@@ -1304,15 +1280,12 @@ mod chat {
             ))
             .start()
             .await;
-        open_legacy_topic(gateway.state()).await;
-        let ack = gateway.handle(operator_group("稍等", "telegram:50")).await;
+        let ack = gateway.handle(operator_dm("稍等", "telegram:50")).await;
         let InboundAck::Queued { run: host, .. } = ack else {
             panic!("应该排队：{ack:?}");
         };
         gate.wait_entered(1).await;
-        let ack = gateway
-            .handle(operator_group("补一句", "telegram:51"))
-            .await;
+        let ack = gateway.handle(operator_dm("补一句", "telegram:51")).await;
         let InboundAck::Queued { run: second, .. } = ack else {
             panic!("应该排队：{ack:?}");
         };
@@ -1338,9 +1311,8 @@ mod chat {
     /// 渠道带来的话题上下文：普通文本把它拼进提交的正文（引用块 + "发给你的消息："），
     /// 命令只解析原文、不受影响（§11.3 话题上下文）。
     ///
-    /// 改了断言的读法：私聊落到主会话，正文从主线上的展示 entry（`main.user` 的 `data.text`）读，
-    /// 不再从 JSONL 的 `run.accepted`；`gateway.wait_run` 对主线消息立刻返回（它是 write，没有 run 要等）；
-    /// "命令没有起第二个 Run"数的是主线上的消息条数。
+    /// 改了断言的读法：正文从输入 entry（`chat.input`）读，不再从 JSONL 的 `run.accepted`；"命令没有
+    /// 起第二个 Run"数的是 submission。
     #[tokio::test]
     async fn thread_context_is_prepended_to_plain_text_but_never_to_commands() {
         let (gateway, _) = start(FakeLlm::finisher("好")).await;
@@ -1363,16 +1335,9 @@ mod chat {
             .branches
             .iter()
             .flat_map(|branch| branch.entries.iter())
-            .filter(|entry| entry.kind == crate::service::durable::dispatch::MAIN_USER_ENTRY)
-            .find_map(|entry| {
-                entry
-                    .data
-                    .as_ref()?
-                    .get("text")?
-                    .as_str()
-                    .map(str::to_owned)
-            })
-            .expect("这条消息落在主线上");
+            .filter(|entry| entry.kind == "chat.input")
+            .find_map(crate::service::durable::sessions::tree::input_text)
+            .expect("这条输入放置过");
         assert!(text.starts_with("> 【话题上下文】"), "{text}");
         assert!(
             text.contains("> 张三 10:23：B1 在 Drop，B2 在 escape\n"),
@@ -1388,32 +1353,21 @@ mod chat {
         status.context = Some("张三 10:23：这段不该影响命令".into());
         let ack = gateway.dispatcher().handle(status).await.expect("处理了");
         assert!(matches!(ack, InboundAck::Replied { .. }), "{ack:?}");
-        let shown = gateway
-            .state()
-            .core()
-            .unwrap()
-            .read_tree(session.as_str())
-            .await
-            .expect("读得出树")
-            .branches
-            .iter()
-            .flat_map(|branch| branch.entries.iter())
-            .filter(|entry| entry.kind == crate::service::durable::dispatch::MAIN_USER_ENTRY)
-            .count();
-        assert_eq!(shown, 1, "命令没有再落一条主线消息");
+        assert_eq!(
+            inputs_of(gateway.state(), session.as_str()).await,
+            1,
+            "命令没有起第二个 Run"
+        );
     }
 
     /// 回复要发到聊天渠道的 Run 追加一条篇幅附注（§4「渠道篇幅」）：宿主附上的 user 消息、写明平台，
     /// 同一个 Run 只加一次。
-    ///
-    /// 改成旧式话题会话：私聊与群的线不再起模型轮次，附注只出现在仍有模型轮次的会话里。
     #[tokio::test]
     async fn a_chat_run_gets_one_channel_note_naming_the_platform() {
         let (gateway, _) = start(FakeLlm::finisher("好")).await;
-        open_legacy_topic(gateway.state()).await;
         let ack = gateway
             .dispatcher()
-            .handle(operator_group("在吗", "telegram:70"))
+            .handle(operator_dm("在吗", "telegram:70"))
             .await
             .expect("处理了");
         let InboundAck::Queued { session, run } = ack else {

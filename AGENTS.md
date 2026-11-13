@@ -74,8 +74,7 @@ komo-runtime   `durable/`: Task engine + harness (generation / tool / inbox /
                compaction / orchestration / codemode / landing, the agent loop organised
                by pi's hooks) · `durable::memory` · cron scheduler.
 komo-agent     AgentProfile → 能力面选择 · skills 发现与目录 · 编排操作名 ·
-               系统段装配（context：system_sections、task_contract_block、project_update_block，压缩摘要提示）·
-               Router 分发判断（router：输入/去向类型、提示、校验、兜底，模型调用是注入的 trait）。
+               系统段装配（context：system_sections、task_contract_block、project_update_block，压缩摘要提示）。
                只依赖 kernel，不执行；runtime 不依赖它，Gateway 组装两边。
                值类型（AgentProfile/AgentSurface）留在 kernel。
 komo-gateway   axum routes (`http/v2`) · `service/durable` (DurableCore + hooks;
@@ -243,9 +242,14 @@ implemented, unapproved draft, or superseded.
 - Clients: `docs/clients.md` — plan to rebuild the web client on TanStack
   Start (SPA mode, served by the Gateway) and extend it to macOS (Electron) and
   phones (PWA, then Capacitor); C0–C2 implemented, C3–C4 not; supersedes roadmap-muse §4.4.
+- Redesign: `docs/redesign.md` — approved 2026-11-13, in progress: the operator sees only conversations
+  (one main chat plus optional side chats), goals (schedules are a goal's config) and memory; no Router,
+  no chat channels, no groups; komo runs as a remote single-user service with OIDC login and a separately
+  deployed web client. **Where it conflicts with the docs below, it wins** until they are rewritten.
 - Tasks: `docs/tasks.md` — make tasks, not sessions, the unit the operator sees
   (one home conversation plus a task list; trims the session-tree surface);
-  draft, not approved.
+  draft, not approved. Its §4 (Router - Worker) is superseded by `docs/redesign.md`; the Router
+  was deleted 2026-11-13 — the main session is an ordinary session that runs the model.
 - Direction: `docs/roadmap-muse.md` — gaps and phases toward a Muse-style
   proactive personal agent (PARA-style goals and areas, proactivity,
   outward-action confirmation);

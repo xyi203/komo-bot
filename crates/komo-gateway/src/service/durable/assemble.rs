@@ -33,10 +33,6 @@ pub fn wire(slot: &StateSlot, state: &Arc<GatewayState>, detach: &DetachSlot, ko
     }
     let core = &state.durable;
     core.attach_state(slot);
-    // 分发任务要读配置、调模型：等 `GatewayState` 就绪才装。调度此刻还是暂停的，上一代留下的分发任务
-    // 在注册之前只是等着（注册表装入时会通知调度器重新考虑）。
-    core.registry
-        .install(Arc::new(super::dispatch::DispatchTask::new(state)));
     if let Some(detacher) = core.harness.deps().orchestration.detacher() {
         detach.set(detacher);
     }

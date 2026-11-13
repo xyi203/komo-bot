@@ -35,33 +35,6 @@ use crate::harness::{
     eventually, feishu_block, inbound, telegram_block, telegram_config, text_round,
 };
 
-/// 操作者在一个话题里说话：话题里有旧办法开出来的普通会话（仍有模型轮次，先 [`open_topic`]）。私聊与群的线
-/// 不起模型轮次、消息交给分发任务（`service::durable::dispatch`），下面这些测的是"一个会话里的 Run"的行为，
-/// 与是不是主会话无关，所以改在旧式话题会话里跑。
-fn operator_chat(text: &str, key: &str) -> komo_kernel::protocol::InboundMessage {
-    topic_message("111", text, key)
-}
-
-fn topic_message(chat: &str, text: &str, key: &str) -> komo_kernel::protocol::InboundMessage {
-    let mut message = inbound(ChannelPlatform::Telegram, chat, "111", text, key, false);
-    message.peer = message.peer.in_thread("t1");
-    message
-}
-
-/// 先开出 `chat` 里那个话题的旧式会话（`kind = normal`、`source = chat:{peer}`）。
-async fn open_topic(gateway: &TestGateway, chat: &str) -> String {
-    let peer = ChannelPeer::new(ChannelPlatform::Telegram, chat).in_thread("t1");
-    gateway
-        .state()
-        .core()
-        .unwrap()
-        .session_for_source(&format!("chat:{peer}"), "assistant")
-        .await
-        .expect("旧式话题会话")
-        .0
-        .id
-}
-
 fn operator_dm(text: &str, key: &str) -> komo_kernel::protocol::InboundMessage {
     inbound(ChannelPlatform::Telegram, "111", "111", text, key, true)
 }
@@ -391,10 +364,9 @@ async fn every_private_chat_lands_in_one_home_session() {
     );
 }
 
-/// §11.2、`docs/tasks.md` §4.13：每个群各有一条自己的线（`kind = main`、不跑模型），都不是 home；
-/// 群里的消息交给分发任务，回执是 `Ignored`（渠道不发"处理中"卡片）。
+/// §11.2：群聊按 `{platform}:{chat_id}` 各自一个 Session，且都不是 home。
 #[tokio::test]
-async fn every_group_gets_its_own_line() {
+async fn every_group_gets_its_own_session() {
     let (gateway, _telegram, _feishu) = both_channels().await;
 
     let telegram_group = gateway
@@ -417,20 +389,24 @@ async fn every_group_gets_its_own_line() {
             false,
         ))
         .await;
-    assert_eq!(telegram_group, InboundAck::Ignored);
-    assert_eq!(feishu_group, InboundAck::Ignored);
+    let (InboundAck::Queued { session: a, .. }, InboundAck::Queued { session: b, .. }) =
+        (telegram_group, feishu_group)
+    else {
+        panic!("两个群都该进 Run");
+    };
+    assert_ne!(a, b, "两个群是两个 Session");
 
     let mut origins: Vec<String> = gateway.origins().await;
     origins.sort();
     assert_eq!(
         origins,
         vec![
-            "line:feishu:oc_group".to_string(),
-            "line:telegram:222".to_string()
+            "chat:feishu:oc_group".to_string(),
+            "chat:telegram:222".to_string()
         ]
     );
 
-    // 同一个群的第二条消息落回同一条线。
+    // 同一个群的第二条消息落回同一个 Session。
     let again = gateway
         .handle(inbound(
             ChannelPlatform::Telegram,
@@ -441,14 +417,15 @@ async fn every_group_gets_its_own_line() {
             false,
         ))
         .await;
-    assert_eq!(again, InboundAck::Ignored);
-    assert_eq!(gateway.origins().await.len(), 2);
+    assert!(
+        matches!(&again, InboundAck::Queued { session, .. } if session == &a),
+        "{again:?}"
+    );
 }
 
-/// §11.3（`docs/tasks.md` §4.14）：主线不跑模型，没有上下文可重置——`/new` 在主线上只回一句说明，
-/// 不追加边界、不切 Session、不改任何状态。（旧办法开出的话题会话里 `/new` 仍追加边界。）
+/// §11.3：`/new` 在当前会话上追加一条边界，**不切 Session**。
 #[tokio::test]
-async fn slash_new_on_the_main_line_only_explains() {
+async fn slash_new_appends_a_boundary_without_switching_sessions() {
     let (gateway, _sender) = TestGateway::start().await;
     let first = gateway.handle(operator_dm("在", "telegram:1")).await;
     let InboundAck::Queued { session, .. } = first else {
@@ -459,7 +436,7 @@ async fn slash_new_on_the_main_line_only_explains() {
     let InboundAck::Replied { text } = ack else {
         panic!("{ack:?}");
     };
-    assert_eq!(text, "现在每件事都是单独处理的，不需要重新开始。");
+    assert!(text.contains("新的一段"), "{text}");
 
     let (home, _) = gateway
         .state()
@@ -471,27 +448,7 @@ async fn slash_new_on_the_main_line_only_explains() {
     assert_eq!(home.id, session.as_str(), "还是同一个 home session");
     assert_eq!(gateway.origins().await.len(), 1);
 
-    // 事件流上没有边界。
-    let events = gateway.events(session.as_str()).await;
-    assert!(
-        events
-            .iter()
-            .all(|event| event.payload.type_name() != "conversation.boundary"),
-        "{events:?}"
-    );
-}
-
-/// 旧办法开出的话题会话（`kind = normal`）里 `/new` 照旧追加一条边界、不切 Session。
-#[tokio::test]
-async fn slash_new_in_a_legacy_topic_session_still_appends_a_boundary() {
-    let (gateway, _sender) = TestGateway::start().await;
-    let session = open_topic(&gateway, "111").await;
-
-    let ack = gateway.handle(operator_chat("/new", "telegram:2")).await;
-    let InboundAck::Replied { text } = ack else {
-        panic!("{ack:?}");
-    };
-    assert!(text.contains("新的一段"), "{text}");
+    // 事件流上有那条边界。
     let (status, body) = gateway
         .get(&format!("/v1/sessions/{session}/events?from=0"))
         .await;
@@ -522,22 +479,19 @@ async fn the_command_table_is_operator_only() {
         ))
         .start()
         .await;
-    open_topic(&gateway, "111").await;
-    let ack = gateway.handle(operator_chat("试一下", "telegram:0")).await;
+    let ack = gateway.handle(operator_dm("试一下", "telegram:0")).await;
     let InboundAck::Queued { run, .. } = ack else {
         panic!("{ack:?}");
     };
     gate.wait_entered(1).await;
 
-    let pending = gateway
-        .handle(operator_chat("/pending", "telegram:1"))
-        .await;
+    let pending = gateway.handle(operator_dm("/pending", "telegram:1")).await;
     assert!(
         matches!(&pending, InboundAck::Replied { text } if text.contains("现在没有待处理的 Intervention")),
         "{pending:?}"
     );
 
-    let status = gateway.handle(operator_chat("/status", "telegram:2")).await;
+    let status = gateway.handle(operator_dm("/status", "telegram:2")).await;
     // §7.5：待处理是两类合起来的一张清单，`/status` 报总数与各类的分布。
     assert!(
         matches!(
@@ -566,7 +520,7 @@ async fn the_command_table_is_operator_only() {
         "命令只接受操作者：{stranger:?}"
     );
 
-    let cancel = gateway.handle(operator_chat("/cancel", "telegram:3")).await;
+    let cancel = gateway.handle(operator_dm("/cancel", "telegram:3")).await;
     assert!(
         matches!(&cancel, InboundAck::Replied { text } if text.contains(run.as_str()) && text.contains("已取消")),
         "/cancel 取消在跑的那条：{cancel:?}"
@@ -625,11 +579,9 @@ async fn a_message_behind_a_waiting_run_waits_instead_of_overtaking() {
         .tool(gate.tool())
         .start()
         .await;
-    // 主会话不起模型轮次，Run 跑在一个普通会话里。
-    let (code, body) = gateway.post("/v1/sessions", serde_json::json!({})).await;
-    assert_eq!(code, 200, "{body}");
+    let (_, body) = gateway.get("/v1/home-session").await;
     let session = serde_json::from_str::<komo_kernel::protocol::http::SessionSummary>(&body)
-        .expect("会话")
+        .expect("home session")
         .session;
     let submit = |key: &'static str, text: &'static str| {
         let session = session.clone();
@@ -763,14 +715,13 @@ async fn cancel_stops_a_run_that_is_still_inside_a_call() {
         ))
         .start()
         .await;
-    open_topic(&gateway, "111").await;
-    let ack = gateway.handle(operator_chat("等着", "telegram:1")).await;
+    let ack = gateway.handle(operator_dm("等着", "telegram:1")).await;
     let InboundAck::Queued { run, .. } = ack else {
         panic!("{ack:?}");
     };
     gate.wait_entered(1).await;
 
-    let cancel = gateway.handle(operator_chat("/cancel", "telegram:2")).await;
+    let cancel = gateway.handle(operator_dm("/cancel", "telegram:2")).await;
     assert!(
         matches!(&cancel, InboundAck::Replied { text } if text.contains(run.as_str())),
         "{cancel:?}"
@@ -832,8 +783,8 @@ async fn an_intervention_reaches_both_the_source_and_home() {
         .await;
 
     // 来源会话是群 222，home chat 是 111。先说一句建出会话，再让它 fault。
-    open_topic(&gateway, "222").await;
-    let group = |text: &str, key: &str| topic_message("222", text, key);
+    let group =
+        |text: &str, key: &str| inbound(ChannelPlatform::Telegram, "222", "111", text, key, false);
     let InboundAck::Queued { session, run } = gateway.handle(group("在吗", "telegram:1")).await
     else {
         panic!("第一句应该受理");
@@ -888,15 +839,14 @@ home_chat = 999
     .start()
     .await;
 
-    open_topic(&gateway, "111").await;
     let InboundAck::Queued { session, run } =
-        gateway.handle(operator_chat("在吗", "telegram:1")).await
+        gateway.handle(operator_dm("在吗", "telegram:1")).await
     else {
         panic!("第一句应该受理");
     };
     gateway.wait_run(&run).await;
     poison_agent_doc(&gateway, session.as_str()).await;
-    let ack = gateway.handle(operator_chat("跑一下", "telegram:2")).await;
+    let ack = gateway.handle(operator_dm("跑一下", "telegram:2")).await;
     assert!(matches!(ack, InboundAck::Queued { .. }), "{ack:?}");
 
     let watching = Arc::clone(&sender);
@@ -990,11 +940,9 @@ async fn a_round_with_two_calls_gets_both_results_before_the_next_request() {
         .tool(gate.tool())
         .start()
         .await;
-    // 主会话不起模型轮次，Run 跑在一个普通会话里。
-    let (code, body) = gateway.post("/v1/sessions", serde_json::json!({})).await;
-    assert_eq!(code, 200, "{body}");
+    let (_, body) = gateway.get("/v1/home-session").await;
     let session = serde_json::from_str::<komo_kernel::protocol::http::SessionSummary>(&body)
-        .expect("会话")
+        .expect("home session")
         .session;
     let submit = |key: &'static str, text: &'static str| {
         let session = session.clone();

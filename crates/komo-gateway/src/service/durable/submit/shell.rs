@@ -541,7 +541,6 @@ async fn run_and_land(
             reject_when_busy: false,
             model: None,
             interject: false,
-            dispatch: None,
         },
     )
     .await

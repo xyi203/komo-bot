@@ -16,15 +16,15 @@ use serde_json::json;
 use time::OffsetDateTime;
 
 use super::{
-    BackgroundTask, Cx, FORK_CALL_RESULT, FORK_LATER_CALL_RESULT, FORK_NOTICE, Reply, ReplyTo,
-    TaskDoc, load_task_doc, store_task_doc, task_doc_address,
+    BackgroundTask, Cx, FORK_CALL_RESULT, FORK_LATER_CALL_RESULT, FORK_NOTICE, Reply, TaskDoc,
+    load_task_doc, store_task_doc, task_doc_address,
 };
 use crate::durable::error::{DurableError, TaskError};
 use crate::durable::harness::entries::TOOL_RESULT;
 use crate::durable::harness::generation::GenerationTask;
 use crate::durable::harness::inbox::{self, Admitted, QueueModes, SubmissionDraft, WhenBusy};
 use crate::durable::harness::live::{self, LiveState, SlotStatus, live_address};
-use crate::durable::tx::{ConversationOwnership, EntryDraft, Ownership, TaskOptions, Tx};
+use crate::durable::tx::{ConversationOwnership, EntryDraft, Ownership, TaskOptions};
 
 /// 模型给的、`prepare` 验过的参数。
 pub(super) struct Request {
@@ -69,10 +69,10 @@ fn input_text(cx: &Cx<'_>, prompt: &str, contract: Option<&DelegateContract>) ->
 // ---------------------------------------------------------------- 派出
 
 /// fork 的切口：子 conversation 从父的这条 entry 起，加上要补结果的调用。
-pub(crate) struct ForkSeed {
-    pub(crate) at: EntryId,
+struct ForkSeed {
+    at: EntryId,
     /// `(call_id, tool, 结果正文)`：发起这次调用的那条 assistant 消息里还没有结果的调用。
-    pub(crate) synth: Vec<(String, String, &'static str)>,
+    synth: Vec<(String, String, &'static str)>,
 }
 
 /// fork 切在父**此刻**的最新 entry 上（含这一轮里排在前面、已经收尾的调用结果——编排调用
@@ -196,19 +196,98 @@ async fn spawn(cx: &Cx<'_>, request: Request) -> Result<(), TaskError> {
     } = request;
     cx.commit_effect(move |tx, task| {
         Box::pin(async move {
-            let spec = ChildSpec {
-                title: &title,
-                text,
-                request_key: format!("task:{}", task.id()),
-                seed: seed.as_ref(),
+            let now = tx.now();
+            // 表读先于第一次表写：父 conversation 属于哪个 komo Session（任务会话的 `parent_session`）。
+            let parent_session = tx
+                .conversation(parent)
+                .await?
+                .and_then(|record| record.session);
+            let anchor = tx
+                .create_task(
+                    &BackgroundTask,
+                    json!({ "parent": parent, "title": title }),
+                    Ownership::Conversation,
+                    TaskOptions {
+                        conversation: Some(parent),
+                        background: true,
+                        abandon_on_restart: false,
+                    },
+                )
+                .await?;
+            let ownership = ConversationOwnership::Task(anchor);
+            // 任务有自己的 komo Session 行（`kind=task`）：子 conversation（fork 的也是）属于它，
+            // 不继承父的。同一次提交写下，所以不会有"有任务会话、没有 Session 行"的状态。
+            let session = SessionId::new_at(
+                OffsetDateTime::from_unix_timestamp_nanos(i128::from(now) * 1_000_000)
+                    .unwrap_or(OffsetDateTime::UNIX_EPOCH),
+            )
+            .to_string();
+            let child = match &seed {
+                Some(seed) => {
+                    tx.fork_conversation_in(parent, seed.at, &session, ownership)
+                        .await?
+                }
+                None => tx.create_conversation_in(&session, ownership).await?,
+            }
+            .id;
+            let mut record = SessionRecord::new(session, child);
+            record.kind = SessionKind::Task;
+            record.parent_session = parent_session;
+            record.title = Some(title.clone()).filter(|title| !title.is_empty());
+            record.created_at = now;
+            record.changed_at = now;
+            record.request_key = Some(format!("task:{}", task.id()));
+            tx.put_session(record);
+            if let Some(seed) = &seed {
+                for (call_id, tool, text) in &seed.synth {
+                    let message = ToolResultMessage {
+                        tool_call_id: call_id.clone(),
+                        tool_name: tool.clone(),
+                        content: vec![ContentBlock::text(*text)],
+                        is_error: false,
+                        details: Some(json!({ "reason": "fork" })),
+                        timestamp: now,
+                        extra: Default::default(),
+                    };
+                    tx.append_entry(
+                        child,
+                        EntryDraft::new(TOOL_RESULT)
+                            .with_model(vec![Message::ToolResult(message)])
+                            .with_data(json!({ "harness": "fork" })),
+                    )
+                    .await?;
+                }
+            }
+            let mut live = LiveState::default();
+            let first = inbox::place_idle_input(
+                tx,
+                &generation,
+                child,
+                &mut live,
+                &Content::Text(text),
+                None,
+                Some(&format!("task:{}", task.id())),
+                now,
+            )
+            .await?;
+            live::store(tx, child, &live).await?;
+            let mut doc = TaskDoc {
+                parent,
+                anchor,
+                title: title.clone(),
                 fork,
                 model,
                 effort,
-                contract,
-                reply: None,
-                thread: None,
+                contracts: BTreeMap::new(),
+                last_run: None,
+                continued: None,
+                stopped: false,
+                goals: Vec::new(),
             };
-            let (child, _) = create_child(tx, &generation, parent, spec).await?;
+            if let Some(contract) = contract {
+                doc.contracts.insert(first.to_string(), contract);
+            }
+            store_task_doc(tx, child, &doc).await?;
             let reply = Reply::ok(
                 format!("已派出 #{}：{title}", short_handle(child.get())),
                 json!({
@@ -221,142 +300,6 @@ async fn spawn(cx: &Cx<'_>, request: Request) -> Result<(), TaskError> {
         })
     })
     .await
-}
-
-/// 建一个任务会话需要的东西。`task` 工具与分发（Gateway 的 `komo.dispatch`）共用 [`create_child`]，
-/// 所以两条路径派出的任务形状一致：锚任务、子 conversation、`sessions` 行、`komo.task`、第一条输入。
-pub(crate) struct ChildSpec<'a> {
-    pub title: &'a str,
-    /// 第一条输入的正文（带契约时已补好契约段）。
-    pub text: String,
-    /// 会话 `request_key` 与第一条输入的请求键：同一个键重放不会再派一遍。
-    pub request_key: String,
-    pub seed: Option<&'a ForkSeed>,
-    pub fork: bool,
-    pub model: Option<String>,
-    pub effort: Option<Effort>,
-    pub contract: Option<DelegateContract>,
-    pub reply: Option<ReplyTo>,
-    /// 任务拥有的对话位置（[`TaskDoc::thread`]）。
-    pub thread: Option<String>,
-}
-
-/// 一次提交里建出任务会话，返回子 conversation 与第一条输入。调用方在同一次提交里落自己的结论
-/// （`task` 工具的 `Reply`、分发任务的完成）。
-pub(crate) async fn create_child(
-    tx: &mut Tx,
-    generation: &GenerationTask,
-    parent: ConversationId,
-    spec: ChildSpec<'_>,
-) -> Result<(ConversationId, komo_kernel::durable::SubmissionId), DurableError> {
-    let ChildSpec {
-        title,
-        text,
-        request_key,
-        seed,
-        fork,
-        model,
-        effort,
-        contract,
-        reply,
-        thread,
-    } = spec;
-    let now = tx.now();
-    // 表读先于第一次表写：父 conversation 属于哪个 komo Session（任务会话的 `parent_session`）。
-    let parent_session = tx
-        .conversation(parent)
-        .await?
-        .and_then(|record| record.session);
-    let anchor = tx
-        .create_task(
-            &BackgroundTask,
-            json!({ "parent": parent, "title": title }),
-            Ownership::Conversation,
-            TaskOptions {
-                conversation: Some(parent),
-                background: true,
-                abandon_on_restart: false,
-            },
-        )
-        .await?;
-    let ownership = ConversationOwnership::Task(anchor);
-    // 任务有自己的 komo Session 行（`kind=task`）：子 conversation（fork 的也是）属于它，
-    // 不继承父的。同一次提交写下，所以不会有"有任务会话、没有 Session 行"的状态。
-    let session = SessionId::new_at(
-        OffsetDateTime::from_unix_timestamp_nanos(i128::from(now) * 1_000_000)
-            .unwrap_or(OffsetDateTime::UNIX_EPOCH),
-    )
-    .to_string();
-    let child = match seed {
-        Some(seed) => {
-            tx.fork_conversation_in(parent, seed.at, &session, ownership)
-                .await?
-        }
-        None => tx.create_conversation_in(&session, ownership).await?,
-    }
-    .id;
-    let mut record = SessionRecord::new(session.clone(), child);
-    record.kind = SessionKind::Task;
-    record.parent_session = parent_session;
-    record.title = Some(title.to_owned()).filter(|title| !title.is_empty());
-    record.created_at = now;
-    record.changed_at = now;
-    record.request_key = Some(request_key.clone());
-    tx.put_session(record);
-    if let Some(seed) = seed {
-        for (call_id, tool, text) in &seed.synth {
-            let message = ToolResultMessage {
-                tool_call_id: call_id.clone(),
-                tool_name: tool.clone(),
-                content: vec![ContentBlock::text(*text)],
-                is_error: false,
-                details: Some(json!({ "reason": "fork" })),
-                timestamp: now,
-                extra: Default::default(),
-            };
-            tx.append_entry(
-                child,
-                EntryDraft::new(TOOL_RESULT)
-                    .with_model(vec![Message::ToolResult(message)])
-                    .with_data(json!({ "harness": "fork" })),
-            )
-            .await?;
-        }
-    }
-    let mut live = LiveState::default();
-    let first = inbox::place_idle_input(
-        tx,
-        generation,
-        child,
-        &mut live,
-        &Content::Text(text),
-        None,
-        Some(&request_key),
-        now,
-    )
-    .await?;
-    live::store(tx, child, &live).await?;
-    let mut doc = TaskDoc {
-        parent,
-        anchor,
-        title: title.to_owned(),
-        fork,
-        model,
-        effort,
-        contracts: BTreeMap::new(),
-        last_run: None,
-        continued: None,
-        reply,
-        stopped: false,
-        thread,
-        session: Some(session.clone()),
-        goals: Vec::new(),
-    };
-    if let Some(contract) = contract {
-        doc.contracts.insert(first.to_string(), contract);
-    }
-    store_task_doc(tx, child, &doc).await?;
-    Ok((child, first))
 }
 
 // ---------------------------------------------------------------- 找到任务

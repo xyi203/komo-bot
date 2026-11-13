@@ -61,11 +61,10 @@ pub use live::{
     GenerationLive, LiveState, RetryLive, RunControl, SlotStatus, ToolSlot, live_address,
 };
 pub use orchestration::{
-    ANCHOR_KIND, FORK_NOTICE, LaunchMode, MAIN_REPLY_ENTRY, MonitorError, MonitorLaunch,
-    MonitorRecord, MonitorState, NoOrchestration, OrchestrationHooks, ReplyTo, TASK_RESULT_ENTRY,
-    TaskDoc, load_task_doc, store_task_doc, task_doc,
+    ANCHOR_KIND, FORK_NOTICE, LaunchMode, MonitorError, MonitorLaunch, MonitorRecord, MonitorState,
+    NoOrchestration, OrchestrationHooks, TASK_RESULT_ENTRY, TaskDoc, task_doc,
 };
-pub use submit::{Harness, HarnessHooks, NewTask, SubmitError, WithdrawResult};
+pub use submit::{Harness, HarnessHooks, SubmitError, WithdrawResult};
 pub use tool::ToolTask;
 
 /// 任务种类名（`TaskRecord::kind`）。

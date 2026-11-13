@@ -142,8 +142,6 @@ pub(super) struct Landing {
     pub model: Option<ModelOverride>,
     /// 插话（`InputRequest::interject`）：排在忙着的会话后面时举旗。
     pub interject: bool,
-    /// 主会话的消息：受理的同一次提交里建分发任务（`dispatch`）。
-    pub dispatch: Option<super::dispatch::Seed>,
 }
 
 struct Landed {
@@ -281,7 +279,6 @@ impl DurableCore {
                 reject_when_busy: request.when_busy == WhenBusy::Reject,
                 model: request.model,
                 interject: request.interject,
-                dispatch: None,
             },
         )
         .await
@@ -376,7 +373,6 @@ impl DurableCore {
             reject_when_busy,
             model,
             interject,
-            dispatch,
         } = landing;
         let request_id = match &draft {
             SubmissionDraft::Input { request_id, .. }
@@ -492,10 +488,6 @@ impl DurableCore {
                             ));
                         }
                     };
-                    if let Some(seed) = dispatch {
-                        super::dispatch::create_task(tx, &id, conversation, submission, seed.peer)
-                            .await?;
-                    }
                     if let Some(data) = change {
                         tx.append_entry(
                             conversation,

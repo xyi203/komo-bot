@@ -208,8 +208,6 @@ pub(super) struct ExecutionSection {
     pub decay_head_bytes: Option<usize>,
     pub decay_tail_bytes: Option<usize>,
     pub confirm_timeout_mins: Option<u64>,
-    pub stall_model_secs: Option<u64>,
-    pub stall_tool_secs: Option<u64>,
 }
 
 impl ExecutionSection {
@@ -228,8 +226,6 @@ impl ExecutionSection {
             confirm_timeout_mins: self
                 .confirm_timeout_mins
                 .unwrap_or(base.confirm_timeout_mins),
-            stall_model_secs: self.stall_model_secs.unwrap_or(base.stall_model_secs),
-            stall_tool_secs: self.stall_tool_secs.unwrap_or(base.stall_tool_secs),
         }
     }
 }
@@ -313,7 +309,6 @@ impl RetrievalSection {
 pub(super) struct AgentSection {
     pub instructions: Option<String>,
     pub model: Option<String>,
-    pub router_model: Option<String>,
     pub tools: Option<Vec<String>>,
     pub skills: Option<Vec<String>>,
     pub workspace: Option<PathBuf>,
@@ -418,7 +413,6 @@ impl AgentSection {
             id: id.to_string(),
             instructions: self.instructions.filter(|text| !text.trim().is_empty()),
             model: self.model,
-            router_model: self.router_model,
             tools: self.tools,
             skills: self.skills,
             workspace: self.workspace.map(|path| resolve(base, path)),

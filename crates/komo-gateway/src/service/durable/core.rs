@@ -23,8 +23,6 @@ pub struct DurableCore {
     pub harness: Harness,
     /// 已提交状态的读口（读不经过提交线）。
     pub storage: Arc<dyn Storage>,
-    /// 任务种类注册表（引擎持有同一份）：`GatewayState` 就绪之后装 Gateway 自己的种类（分发任务）。
-    pub registry: Registry,
     pub clock: Arc<dyn Clock>,
     /// 数据目录：`durable.db` 在这里，blob 在 `sessions/{uuid}/`。
     pub home: PathBuf,
@@ -45,9 +43,6 @@ pub struct DurableCore {
     /// 测试用：受理一律走读整棵树的落点路径，好与快速路径比对（`submit::land`）。
     #[cfg(test)]
     pub(super) full_tree_landing: AtomicBool,
-    /// 测试用：分发任务停在"判断之前"/"执行之前"（模拟那两处的重启，`dispatch` 的测试）。
-    #[cfg(test)]
-    pub(super) dispatch_hold: [AtomicBool; 2],
 }
 
 impl std::fmt::Debug for DurableCore {
@@ -78,7 +73,7 @@ impl DurableCore {
         harness.install(&registry);
         let engine = Engine::open(
             Arc::clone(&storage),
-            registry.clone(),
+            registry,
             Arc::clone(&clock),
             EngineOptions {
                 hooks: harness.hooks(),
@@ -105,7 +100,6 @@ impl DurableCore {
             engine: Arc::new(engine),
             harness,
             storage,
-            registry,
             clock,
             home: home.to_path_buf(),
             closed: AtomicBool::new(false),
@@ -117,8 +111,6 @@ impl DurableCore {
             recent: Arc::default(),
             #[cfg(test)]
             full_tree_landing: AtomicBool::new(false),
-            #[cfg(test)]
-            dispatch_hold: [AtomicBool::new(false), AtomicBool::new(false)],
         }))
     }
 

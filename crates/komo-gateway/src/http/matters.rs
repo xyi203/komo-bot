@@ -10,6 +10,7 @@
 
 use axum::Json;
 use axum::extract::{Path, Query, State};
+use komo_kernel::durable::SessionKind;
 use komo_kernel::protocol::http::{
     ClosureConvention, ErrorCode, MatterActionRequest, MatterAddRequest, MatterClosure,
     MatterDetail, MatterListQuery, MatterListResponse, MatterShowQuery,
@@ -215,7 +216,7 @@ pub(crate) async fn gate(api: &Api, session: &SessionId) -> ApiResult<bool> {
         .await
         .map_err(|error| ApiFailure::invalid(error.to_string()))?;
     let mode = match resolved.profile.memory {
-        MemoryMode::Shared => return Ok(core.is_background_task(&record).await?),
+        MemoryMode::Shared => return Ok(record.kind == SessionKind::Task),
         MemoryMode::Private => "private",
         MemoryMode::Off => "off",
     };

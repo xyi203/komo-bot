@@ -31,7 +31,7 @@ use super::generation::{self, GenerationTask};
 use super::hooks::HarnessDeps;
 use super::inbox::{self, Admitted, QueueModes, SubmissionDraft, WriteDraft};
 use super::live::{self, LiveState, live_address};
-use super::orchestration::{self, load_task_doc, monitor, store_task_doc};
+use super::orchestration::{load_task_doc, monitor, store_task_doc};
 use super::outcome::unanswered;
 use super::tool::ToolTask;
 use super::{COMPACTION_KIND, GENERATION_KIND, TOOL_KIND};
@@ -49,20 +49,6 @@ pub enum SubmitError {
     Invalid(String),
     #[error(transparent)]
     Durable(#[from] DurableError),
-}
-
-/// [`Harness::spawn_task_in_tx`] 的参数。
-#[derive(Debug, Clone)]
-pub struct NewTask {
-    pub title: String,
-    /// 第一条输入的正文。
-    pub text: String,
-    /// 会话 `request_key` 与第一条输入的请求键。
-    pub request_key: String,
-    /// 回话的去处（分发派出的任务才有）。
-    pub reply: Option<orchestration::ReplyTo>,
-    /// 任务拥有的对话位置（`TaskDoc::thread`）。
-    pub thread: Option<String>,
 }
 
 /// 撤回一个 submission 的结果（spec §6 `abort`）。
@@ -166,32 +152,6 @@ impl Harness {
     ) -> Result<Admitted, DurableError> {
         draft.check().map_err(DurableError::rejected)?;
         inbox::admit(tx, &self.generation, conversation, draft, self.modes()).await
-    }
-
-    /// 在**调用方自己的提交**里派出一个 fresh 任务会话（`task` 工具用的同一段，所以形状一致：锚任务、
-    /// 子 conversation、`kind=task` 的 Session 行、`komo.task`、第一条输入与它的 run）。分发任务（Gateway）
-    /// 用它建"new"去向的任务：`parent` 是主会话的 conversation，`task.reply` 写定回话的去处。
-    /// 返回子 conversation。调用方提交之后要 `engine.resume()`。
-    pub async fn spawn_task_in_tx(
-        &self,
-        tx: &mut Tx,
-        parent: ConversationId,
-        task: NewTask,
-    ) -> Result<ConversationId, DurableError> {
-        let spec = orchestration::ChildSpec {
-            title: &task.title,
-            text: task.text,
-            request_key: task.request_key,
-            seed: None,
-            fork: false,
-            model: None,
-            effort: None,
-            contract: None,
-            reply: task.reply,
-            thread: task.thread,
-        };
-        let (child, _) = orchestration::create_child(tx, &self.generation, parent, spec).await?;
-        Ok(child)
     }
 
     /// `/new`：`komo.reset` write（`head: "self"`），可带交接文字。空闲时立刻落，忙时排在
@@ -425,10 +385,10 @@ impl Harness {
         engine.abort_conversation(conversation, false).await
     }
 
-    /// 任务"停下"的第一步（`docs/tasks.md` §4.14 F4）：一次提交里把 `komo.task` 标成已停，并撤回收件箱里
-    /// 排着的全部输入——用户的和内部的（监听事件、结束消息）都撤，与 [`Harness::abort_conversation`]
-    /// 有意保留内部输入相反。标记之后晚到的监听事件 / 结束消息在 [`inbox::admit`] 就被丢掉。
-    /// `conversation` 不是任务会话（没有 `komo.task`）时只撤回，幂等。
+    /// 任务"停下"的第一步：一次提交里把 `komo.task` 标成已停，并撤回收件箱里排着的全部输入——用户的和
+    /// 内部的（监听事件、结束消息）都撤，与 [`Harness::abort_conversation`] 有意保留内部输入相反。
+    /// 标记之后晚到的监听事件 / 结束消息在 [`inbox::admit`] 就被丢掉。`conversation` 不是任务会话
+    /// （没有 `komo.task`）时只撤回，幂等。
     pub async fn mark_stopped(
         &self,
         engine: &Engine,

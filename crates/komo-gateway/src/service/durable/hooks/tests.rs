@@ -150,10 +150,7 @@ impl World {
                         contracts: BTreeMap::new(),
                         last_run: None,
                         continued: None,
-                        reply: None,
                         stopped: false,
-                        thread: None,
-                        session: None,
                         goals: Vec::new(),
                     });
                     store_task_doc(tx, record.id, &doc).await?;

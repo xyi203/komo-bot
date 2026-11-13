@@ -9,7 +9,6 @@ pub mod channel;
 pub mod compaction;
 pub mod memory;
 mod prompt;
-pub mod router;
 
 use std::path::PathBuf;
 
@@ -19,7 +18,7 @@ use komo_kernel::types::tool::ToolNamespace;
 
 pub use prompt::{
     PROJECT_UPDATE_HEAD, SECTION_BASE, SECTION_INSTRUCTIONS, SECTION_PROJECT, SECTION_SKILLS,
-    TASK_DIRECT_BLOCK, TASK_MODE_BLOCK,
+    TASK_MODE_BLOCK,
 };
 
 /// 一次装配所需的**全部事实**（`docs/agent.md` §5）。
@@ -50,9 +49,6 @@ pub struct ContextInput {
     /// 这是 `task` 派出的 fresh 任务会话：`base` 段末尾补 [`TASK_MODE_BLOCK`]（中途没人能回答）。
     /// fork 任务不走这里，它沿用父的段。
     pub background_task: bool,
-    /// 配合 `background_task`：这个任务会话是分发派出的，回复由程序原文投给用户，`base` 段末尾补
-    /// [`TASK_DIRECT_BLOCK`] 而不是 [`TASK_MODE_BLOCK`]。
-    pub direct_reply: bool,
 }
 
 /// 这一段是主 Agent 的对话，还是一次委派（`docs/agent.md` §11）。
@@ -78,7 +74,6 @@ pub fn system_sections(input: &ContextInput) -> Vec<(String, String)> {
         &input.mcp_servers,
         &input.invocation,
         input.background_task,
-        input.direct_reply,
         &input.project_files,
         input.skills.as_deref(),
     )

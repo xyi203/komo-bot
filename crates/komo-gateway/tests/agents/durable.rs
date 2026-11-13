@@ -509,15 +509,16 @@ async fn dm(
     text: &str,
     key: &str,
 ) -> (String, komo_kernel::types::ids::RunId) {
-    // 旧办法开出来的话题会话：`task` 工具的"交回父会话"这一条只在仍有模型轮次的会话里成立——私聊与群的线
-    // 现在都由分发任务判断、不起模型轮次，分发派出的任务改为直投渠道（见 `service::durable::dispatch`）。
-    let mut message = inbound(ChannelPlatform::Telegram, "111", "111", text, key, false);
-    message.peer = message.peer.in_thread("t1");
-    core(gateway)
-        .session_for_source(&format!("chat:{}", message.peer), "assistant")
-        .await
-        .expect("旧式话题会话");
-    let ack = gateway.handle(message).await;
+    let ack = gateway
+        .handle(inbound(
+            ChannelPlatform::Telegram,
+            "111",
+            "111",
+            text,
+            key,
+            true,
+        ))
+        .await;
     let InboundAck::Queued { session, run } = ack else {
         panic!("{ack:?}")
     };

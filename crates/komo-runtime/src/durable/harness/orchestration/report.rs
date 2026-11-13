@@ -41,9 +41,7 @@ use super::{
 };
 use crate::durable::error::DurableError;
 use crate::durable::harness::generation::GenerationTask;
-use crate::durable::harness::inbox::{
-    self, At, Boundary, InputEntry, SubmissionDraft, WhenBusy, WriteDraft,
-};
+use crate::durable::harness::inbox::{self, At, Boundary, InputEntry, SubmissionDraft, WhenBusy};
 use crate::durable::harness::live::{self, LiveState};
 use crate::durable::tx::Tx;
 
@@ -150,11 +148,6 @@ async fn events_only(tx: &mut Tx, inputs: &[SubmissionId]) -> Result<bool, Durab
         }
     }
     Ok(true)
-}
-
-/// 回答是空的或只有 [`SILENT_REPLY`](komo_kernel::types::chat::SILENT_REPLY)。
-fn is_blank_or_silent(text: &str) -> bool {
-    text.trim().is_empty() || is_silent_reply(text)
 }
 
 fn detail_text(detail: Option<&Value>) -> String {
@@ -324,14 +317,8 @@ async fn report(
     // 只由监听事件 / 结束消息起的 run（S2，`docs/background-tasks.md` §2e）：不自动续跑（事件那一轮
     // 不是派出的活，没有状态行可写）；回答是 NO_REPLY 时不交回、lastRun 也不动。
     let events_only = events_only(tx, &run.inputs).await?;
-    // `idle`：这条回答之后没有后继 run（只在回答收尾时为真）。
-    let idle = may_continue;
-    // 已停下的任务（`docs/tasks.md` §4.14 F4）不再自动续跑。
+    // 已停下的任务（`DurableCore::stop_task`）不再自动续跑。
     let may_continue = may_continue && !events_only && !doc.stopped;
-    // 任务不许沉默（`docs/tasks.md` §4.9 B1）：分发派出 / 续上的任务里，由人的消息起的一轮（有一条输入
-    // 不是监听交回的就算，混着事件的按用户消息算）回 `NO_REPLY` 或空，不当作完成。只由事件起的一轮不在
-    // 此列，保持原样（上面的 `events_only` 静默）。
-    let user_round = doc.reply.is_some() && !events_only && !has_contract;
 
     let (outcome, text, last) = match settlement {
         SubmissionSettlement::Done { answer } => {
@@ -345,37 +332,20 @@ async fn report(
             if may_continue && !continued && !has_contract && status_of(&text) == Status::Unstated {
                 return Ok(Some(doc));
             }
-            let silent = user_round && is_blank_or_silent(&text);
-            // 追问过一次（或没法追问）仍然是空：后面还有后继 run 就让给它回话，已停下的任务不再说话；
-            // 都不是，就是真没做成，往下走直投那句"没做成"。
-            if silent && (!idle || doc.stopped) {
-                return Ok(None);
-            }
-            let last = if silent {
-                LastRun {
-                    state: "failed".into(),
-                    ended_at: tx.now(),
-                    final_message: None,
-                    reason: Some("没有给出回复".into()),
-                    status: None,
-                    rounds: Some(run.rounds),
-                }
-            } else {
-                LastRun {
-                    state: "completed".into(),
-                    ended_at: tx.now(),
-                    final_message: Some(text.clone()),
-                    reason: None,
-                    status: Some(
-                        if has_contract {
-                            "done"
-                        } else {
-                            status_of(&text).as_str()
-                        }
-                        .to_owned(),
-                    ),
-                    rounds: Some(run.rounds),
-                }
+            let last = LastRun {
+                state: "completed".into(),
+                ended_at: tx.now(),
+                final_message: Some(text.clone()),
+                reason: None,
+                status: Some(
+                    if has_contract {
+                        "done"
+                    } else {
+                        status_of(&text).as_str()
+                    }
+                    .to_owned(),
+                ),
+                rounds: Some(run.rounds),
             };
             (Outcome::Completed, text, last)
         }
@@ -417,29 +387,6 @@ async fn report(
     }
     // 带契约的回答只放 JSON，结局看契约复验，不看状态行。
     let status = (outcome == Outcome::Completed && !has_contract).then(|| status_of(&text));
-    // 分发派出的任务：回复直接落成主线上的一条展示 entry，不交回给父起一轮转述（带契约的不走这条，
-    // JSON 不外发；分发从不带契约，这只是兜住"追问时被别处塞了契约"的情形）。
-    if contract.is_none()
-        && let Some(reply) = doc.reply.clone()
-    {
-        direct_reply(
-            tx,
-            generation,
-            Direct {
-                parent,
-                session: parent_record.session.clone(),
-                conversation,
-                task_session: doc.session.as_deref(),
-                first,
-                title: &doc.title,
-                reply: &reply,
-            },
-            outcome,
-            &text,
-        )
-        .await?;
-        return Ok(None);
-    }
     let headline = match (outcome, status) {
         (Outcome::Completed, Some(Status::Blocked)) => "受阻",
         (Outcome::Completed, Some(Status::Unstated)) => "交回了，没说做完没有",
@@ -486,117 +433,6 @@ async fn report(
     Ok(None)
 }
 
-/// [`direct_reply`] 的位置信息。
-struct Direct<'a> {
-    parent: ConversationId,
-    /// 父 conversation 属于的 komo Session（Gateway 投递时要它）。
-    session: Option<String>,
-    conversation: ConversationId,
-    /// 任务自己的 Session ID（`TaskDoc::session`）。
-    task_session: Option<&'a str>,
-    first: SubmissionId,
-    title: &'a str,
-    reply: &'a super::ReplyTo,
-}
-
-/// 把回复里给程序看的末行状态行拆出来：`(正文, 状态, 受阻的原因)`。状态行不是末行（或没有）时正文原样。
-fn split_status(text: &str) -> (String, Status, Option<String>) {
-    let status = status_of(text);
-    if status == Status::Unstated {
-        return (text.trim().to_owned(), status, None);
-    }
-    let lines: Vec<&str> = text.lines().collect();
-    let last = lines
-        .iter()
-        .rposition(|line| !line.trim().is_empty())
-        .unwrap_or(0);
-    let body = lines[..last].join("\n").trim().to_owned();
-    // 与 `status_of` 同一套归一：去加粗 / 引用符号，冒号统一成全角。
-    let line: String = lines[last]
-        .chars()
-        .filter(|c| !matches!(c, '*' | '`' | '_'))
-        .collect();
-    let line = line
-        .trim()
-        .trim_start_matches(['>', '-', '#', ' '])
-        .replace(':', "：")
-        .replace("： ", "：");
-    let reason = line
-        .strip_prefix(TASK_STATUS_BLOCKED)
-        .map(|rest| rest.trim_start_matches('：').trim().to_owned())
-        .filter(|reason| !reason.is_empty());
-    (body, status, reason)
-}
-
-/// 直接投给用户的那句话（`docs/tasks.md` §4.12 U3）：去掉状态行，不加前缀、不带任务号。
-/// 受阻时原因是一句普通的话；失败是一句自然的话，不带状态码；被取消的什么都不说（"停下"那句话由分发
-/// 在主线上落，`docs/tasks.md` §4.14 F4）。
-fn direct_text(outcome: Outcome, text: &str) -> Option<String> {
-    match outcome {
-        Outcome::NotCompleted => {
-            (text != failure_text("aborted", None)).then(|| format!("这件事我没做成：{text}。"))
-        }
-        // 由人的消息起的一轮没有给出任何话（追问过一次仍空，见 `report`）：一句普通的话说明没做成，
-        // 不带状态码。
-        Outcome::Completed if is_blank_or_silent(text) => {
-            Some("这件事我没做成，要不要再试一次？".to_owned())
-        }
-        Outcome::Completed => {
-            let (body, status, reason) = split_status(text);
-            Some(match (status, reason) {
-                (Status::Blocked, Some(reason)) if body.is_empty() => reason,
-                // 正文里多半已经写了原因，重复一遍只会啰嗦。
-                (Status::Blocked, Some(reason)) if !body.contains(&reason) => {
-                    format!("{body}\n\n{reason}")
-                }
-                _ if body.is_empty() => match status {
-                    Status::Blocked => "这件事我没能做下去。".to_owned(),
-                    _ => "做完了。".to_owned(),
-                },
-                _ => body,
-            })
-        }
-    }
-}
-
-/// 分发派出的任务的回复：同一次提交里往父（主会话）受理一条展示 write（请求键
-/// `task-reply:{子}:{首个输入}`，与交回同样原子、幂等）。**不是内部输入**：没有 `model`，父不起 run。
-/// 渠道投递是 Gateway 的事，它读这条 entry 的 `data.peer`（先写 `deliveries` 后发，按 entry 去重）。
-async fn direct_reply(
-    tx: &mut Tx,
-    generation: &GenerationTask,
-    at: Direct<'_>,
-    outcome: Outcome,
-    text: &str,
-) -> Result<(), DurableError> {
-    let Some(said) = direct_text(outcome, text) else {
-        return Ok(());
-    };
-    let data = json!({
-        "text": said,
-        "peer": at.reply.peer,
-        "session": at.session,
-        "origin": {
-            "entry": at.reply.origin_entry,
-            "submission": at.reply.origin_submission,
-        },
-        "task": {
-            "conversation": at.conversation,
-            "session": at.task_session,
-            "handle": short_handle(at.conversation.get()),
-            "title": at.title,
-        },
-        // 展示 entry 没有消息自带的时间，事件投影读这一格；不写就只能沿用前一条记录的时间。
-        "at": tx.now(),
-    });
-    let draft = SubmissionDraft::Write {
-        entry: WriteDraft::display(super::MAIN_REPLY_ENTRY, data),
-        request_id: Some(format!("task-reply:{}:{}", at.conversation, at.first)),
-    };
-    inbox::admit(tx, generation, at.parent, &draft, generation.modes()).await?;
-    Ok(())
-}
-
 /// 从最后一条回复里取 JSON 并按契约验一遍：`task` 交回之前的复验（`orchestration::report`）用它。
 ///
 /// 校验器来自 kernel，**两头共用同一份代码**（§8.6）：两份实现会漂移，漂移的症状是
@@ -636,48 +472,6 @@ mod tests {
         // 加粗、引用、半角冒号都认。
         assert_eq!(status_of("结论……\n**状态**: 完成"), Status::Done);
         assert_eq!(status_of("> 状态：受阻：缺权限"), Status::Blocked);
-    }
-
-    /// 直投的回复去掉状态行、不加前缀；受阻的原因是一句普通的话；被取消的不说话。
-    #[test]
-    fn a_direct_reply_drops_the_status_line_and_speaks_plainly() {
-        let said = |outcome, text: &str| direct_text(outcome, text);
-        assert_eq!(
-            said(
-                Outcome::Completed,
-                &format!("周报整理好了。\n\n{TASK_STATUS_DONE}")
-            ),
-            Some("周报整理好了。".into())
-        );
-        // 受阻：正文在前，原因补一句；原因正文里已有就不重复；没有正文就只有原因。
-        assert_eq!(
-            said(
-                Outcome::Completed,
-                &format!("试了两种办法。\n{TASK_STATUS_BLOCKED}：缺少仓库权限")
-            ),
-            Some("试了两种办法。\n\n缺少仓库权限".into())
-        );
-        assert_eq!(
-            said(
-                Outcome::Completed,
-                &format!("我没有仓库权限，做不下去。\n{TASK_STATUS_BLOCKED}：没有仓库权限")
-            ),
-            Some("我没有仓库权限，做不下去。".into())
-        );
-        assert_eq!(
-            said(
-                Outcome::Completed,
-                &format!("{TASK_STATUS_BLOCKED}：要你确认日期")
-            ),
-            Some("要你确认日期".into())
-        );
-        // 没写状态行：原样。
-        assert_eq!(said(Outcome::Completed, "好的"), Some("好的".into()));
-        assert_eq!(said(Outcome::NotCompleted, "已取消"), None);
-        assert_eq!(
-            said(Outcome::NotCompleted, "模型调用失败：503"),
-            Some("这件事我没做成：模型调用失败：503。".into())
-        );
     }
 
     /// fork 任务的说明教的写法就是这里认的写法（fresh 任务的在 komo-agent 的测试里核对）。

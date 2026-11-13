@@ -937,7 +937,6 @@ async fn gateway(
                 // 那一份（§5.6）。
                 shared_home: None,
                 telemetry: telemetry.as_ref().map(|_| status),
-                clock: None,
             })
             .await
             .map_err(|error| error.to_string());

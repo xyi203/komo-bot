@@ -82,9 +82,6 @@ const SETTINGS: &[Spec] = &[
     int("execution.model_result_bytes", 1, Some(30 * 1024)),
     int("execution.call_timeout_secs", 1, None),
     int("execution.confirm_timeout_mins", 1, None),
-    // 0 = 不检测。
-    int("execution.stall_model_secs", 0, None),
-    int("execution.stall_tool_secs", 0, None),
 ];
 
 fn find(key: &str) -> Result<&'static Spec, EditError> {
@@ -166,8 +163,6 @@ fn effective(key: &str, snapshot: &ConfigSnapshot, doc: &DocumentMut) -> Option<
         "execution.model_result_bytes" => Value::from(snapshot.execution.model_result_bytes),
         "execution.call_timeout_secs" => Value::from(snapshot.execution.call_timeout_secs),
         "execution.confirm_timeout_mins" => Value::from(snapshot.execution.confirm_timeout_mins),
-        "execution.stall_model_secs" => Value::from(snapshot.execution.stall_model_secs),
-        "execution.stall_tool_secs" => Value::from(snapshot.execution.stall_tool_secs),
         _ => return None,
     })
 }
@@ -361,11 +356,6 @@ enabled = true # 开着
         assert!(bad("memory.enabled", Value::from("yes")));
         assert!(bad("execution.model_result_bytes", Value::from(40_000)));
         assert!(bad("execution.call_timeout_secs", Value::from(0)));
-        assert!(
-            !bad("execution.stall_model_secs", Value::from(0)),
-            "0 = 不检测"
-        );
-        assert!(bad("execution.stall_tool_secs", Value::from(-1)));
         assert!(bad("memory.model", Value::from("embedding")));
         assert!(bad("default_agent", Value::from("nobody")));
         assert!(matches!(

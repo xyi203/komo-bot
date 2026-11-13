@@ -202,7 +202,7 @@ const SPECS: [Spec; 17] = [
         action: Action::GoalAdd,
         name: "goal.add",
         read_only: false,
-        summary: "新建一个目标（进行中）。要这个 Run 里有用户说的话作依据；`task` 工具派出的子任务、定时任务会话、只由监听事件起的一轮不能新建",
+        summary: "新建一个目标（进行中）。要这个 Run 里有用户说的话作依据；任务会话与定时任务会话不能新建",
         fields: &[
             field("title", true, "一句能独立看懂的话，≤ 80 字"),
             field("next", false, "下一步"),
@@ -246,7 +246,7 @@ const SPECS: [Spec; 17] = [
         action: Action::GoalDone,
         name: "goal.done",
         read_only: false,
-        summary: "目标完成。要这个 Run 里有用户说的话作依据（用户说办完了）；`task` 工具派出的子任务、定时任务会话、只由监听事件起的一轮不行",
+        summary: "目标完成。要这个 Run 里有用户说的话作依据（用户说办完了）；任务会话与定时任务会话不行",
         fields: &[field("id", true, "目标 id"), REVISION],
     },
     Spec {
@@ -276,7 +276,7 @@ const SPECS: [Spec; 17] = [
         action: Action::GoalAttach,
         name: "goal.attach",
         read_only: false,
-        summary: "把**当前任务**挂到一个目标上，表示这件事是为这个目标做的（只用于找回与显示，不影响消息怎么分发）。\
+        summary: "把**当前任务**挂到一个目标上，表示这件事是为这个目标做的（只用于找回与显示）。\
                   只有任务会话里能用；不改目标本身，不需要用户原话。重复挂无变化。\
                   只有这件事明显是在推进某个已有目标时才挂：不要为了挂而挂，也不要为此新建目标",
         fields: &[field("id", true, "目标 id（必须存在，且是目标而不是领域）")],
@@ -418,7 +418,7 @@ pub enum KomoCall {
 /// [`ToolError`]，模型照着改。
 #[async_trait]
 pub trait KomoService: Send + Sync {
-    /// `caller`：这次工具调用所在的会话（宿主填的身份）。Gateway 据它拒绝群里派出的任务碰操作者的东西。
+    /// `caller`：这次工具调用所在的会话（宿主填的身份）；`goal.attach` / `goal.detach` 改的是它自己的 `komo.task`。
     async fn call(&self, caller: &SessionId, call: KomoCall) -> Result<Value, ToolError>;
 }
 
@@ -471,9 +471,8 @@ fn doc() -> String {
         "`params` 是一个对象，字段按动作不同（下面逐个列出，必填的标明）；给了不认识的字段会被拒绝并列出该动作认的字段。\
          身份（哪个会话、哪个 Run）由宿主填，不要在 params 里给 session / run。\n\
          写动作按顺序一个个执行；只读动作（memory.search、goal.list、cron.list、session.*、task.list）可以和别的只读调用放同一轮并行。\n\
-         改承诺的写动作（goal.add、goal.done）要这个 Run 里有用户说的话作依据；`task` 工具派出的子任务、定时任务会话、\
-         只由监听事件起的一轮被拒绝——把要记的在交回的结果里写明，由主会话来做（由用户消息派出或续上的任务，\
-         这一轮里用户说的话算数）。\n\
+         改承诺的写动作（goal.add、goal.done）要这个 Run 里有用户说的话作依据；后台任务会话与定时任务会话被拒绝——\
+         把要记的在交回的结果里写明，由主会话来做。\n\
          goal.attach / goal.detach 改的是任务自己的关联、不是目标的承诺，不要用户原话；但只有任务会话里能用。\
          不在这里的：确认记忆（用户自己的动作）、Gateway 的重启与停止。\n",
     );

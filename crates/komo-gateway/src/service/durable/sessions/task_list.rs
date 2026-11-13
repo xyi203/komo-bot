@@ -201,19 +201,6 @@ impl DurableCore {
         }
     }
 
-    /// 这个会话是不是"后台任务"：不能替用户改承诺类的事项、不能替用户记（`docs/goals.md` §4）。任务会话
-    /// 里只有带 `komo.task.reply` 的例外——它是由用户消息派出或续上的，这一轮是不是用户说的话仍由
-    /// Run 里有没有用户原话来判（只由监听事件起的一轮没有，照样被拒）。`task` 工具派出的子任务没有
-    /// `reply`，仍是后台任务。
-    pub async fn is_background_task(&self, record: &SessionRecord) -> Result<bool, SessionError> {
-        if record.kind != SessionKind::Task {
-            return Ok(false);
-        }
-        Ok(task_doc(&*self.storage, record.root_conversation)
-            .await?
-            .is_none_or(|doc| doc.reply.is_none()))
-    }
-
     async fn task_summary(
         &self,
         record: &SessionRecord,

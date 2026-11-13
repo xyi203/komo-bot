@@ -433,6 +433,35 @@ fn an_unknown_key_inside_a_table_is_reported_with_its_full_path() {
     );
 }
 
+/// Router 删除后 `router_model` 与 `[execution] stall_*` 不再认识：旧配置里留着它们照常加载，
+/// 只是各一条"不认识这个键，已忽略"的警告（`komo config check` 会列出来）。
+#[test]
+fn keys_retired_with_the_router_still_load_with_a_warning() {
+    let fixture = Fixture::valid();
+    let mut text = Fixture::config_text("chat-a", "medium").replace(
+        "[agents.assistant]\n",
+        "[agents.assistant]\nrouter_model = \"chat\"\n",
+    );
+    text.push_str("\n[execution]\nstall_model_secs = 450\nstall_tool_secs = 1200\n");
+    write(&fixture.sources().config, &text);
+
+    let loaded = load_config(&fixture.options()).expect("退役的键不挡加载");
+    for key in [
+        "agents.assistant.router_model",
+        "execution.stall_model_secs",
+        "execution.stall_tool_secs",
+    ] {
+        assert!(
+            loaded
+                .issues
+                .iter()
+                .any(|issue| issue.key.as_str() == key && issue.severity == IssueSeverity::Warning),
+            "{key}：{:?}",
+            loaded.issues
+        );
+    }
+}
+
 /// 退役的 `groups` 名单：旧配置里留着它照常加载，只是一条警告（群里 @ 就响应，没有名单了）。
 #[test]
 fn a_retired_groups_list_still_loads_with_a_warning() {
@@ -463,32 +492,6 @@ fn a_known_key_with_the_wrong_type_still_refuses_the_load() {
 
     let error = load_config(&fixture.options()).unwrap_err();
     assert!(matches!(error, ConfigError::Parse { .. }), "{error:?}");
-}
-
-/// 卡死阈值默认 450 / 1200 秒，可以写成别的，0 = 不检测（不是错误）。
-#[test]
-fn the_stall_thresholds_default_are_overridable_and_zero_turns_them_off() {
-    let fixture = Fixture::valid();
-    let text = Fixture::config_text("chat-a", "medium");
-    write(&fixture.sources().config, &text);
-    let loaded = load_config(&fixture.options()).unwrap();
-    assert_eq!(loaded.snapshot.execution.stall_model_secs, 450);
-    assert_eq!(loaded.snapshot.execution.stall_tool_secs, 1200);
-
-    let mut text = Fixture::config_text("chat-a", "medium");
-    text.push_str("\n[execution]\nstall_model_secs = 0\nstall_tool_secs = 90\n");
-    write(&fixture.sources().config, &text);
-    let loaded = load_config(&fixture.options()).unwrap();
-    assert_eq!(loaded.snapshot.execution.stall_model_secs, 0);
-    assert_eq!(loaded.snapshot.execution.stall_tool_secs, 90);
-    assert!(
-        loaded
-            .issues
-            .iter()
-            .all(|issue| !issue.key.as_str().starts_with("execution")),
-        "{:?}",
-        loaded.issues
-    );
 }
 
 #[test]
@@ -743,23 +746,6 @@ fn a_warning_rides_along_with_a_config_that_still_loads() {
         loaded.issues[0].severity,
         komo_kernel::protocol::config::IssueSeverity::Warning
     );
-}
-
-#[test]
-fn a_router_model_loads_from_the_agent_table_and_is_none_when_omitted() {
-    let fixture = Fixture::valid();
-    let text = Fixture::config_text("chat-a", "medium").replace(
-        "[agents.assistant]",
-        "[agents.assistant]\nrouter_model = \"memory\"\n\n[agents.helper]",
-    );
-    write(&fixture.sources().config, &text);
-
-    let loaded = load_config(&fixture.options()).unwrap();
-    assert!(loaded.issues.is_empty(), "{:?}", loaded.issues);
-    let assistant = loaded.snapshot.agent.get("assistant").unwrap();
-    assert_eq!(assistant.router_model.as_deref(), Some("memory"));
-    let helper = loaded.snapshot.agent.get("helper").unwrap();
-    assert_eq!(helper.router_model, None, "不写就用 Agent 自己的 model");
 }
 
 #[test]

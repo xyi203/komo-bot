@@ -52,9 +52,6 @@ pub(crate) struct Resolved {
     pub budget: RunBudget,
     /// 提示缓存的路由键：Session ID；fork 任务用父的。
     pub cache_key: String,
-    /// 群的线派出的任务（[`is_group_task`](crate::service::durable::sessions::is_group_task)）：不带操作者的
-    /// 记忆与目标。
-    pub from_group: bool,
 }
 
 impl Resolved {
@@ -201,8 +198,6 @@ fn resolve_at<'a>(
             },
         };
 
-        let from_group = kind == Some(SessionKind::Task)
-            && crate::service::durable::sessions::is_group_task(storage, session.as_str()).await;
         Ok(Resolved {
             conversation,
             session,
@@ -215,7 +210,6 @@ fn resolve_at<'a>(
             workspace,
             budget,
             cache_key,
-            from_group,
         })
     })
 }

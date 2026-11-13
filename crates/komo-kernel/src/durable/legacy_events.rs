@@ -37,8 +37,8 @@
 //! | `komo.decay` | `ContextCompacted::Decayed`（D,0） |
 //! | `model.change` | `ConfigChanged`（M,0） |
 //! | `komo.memory.recall` | `MemoryInjected`（K,0，`run` 是 `data.submission` 所在的 run，只带 `uses` 与诊断）；正文不出 `MessageUser`，提取引不到它（`docs/memory.md` §9.4） |
-//! | `main.user`（主线 / 群的线上用户说的，没有 `model`，正文在 `data.text`） | `MessageUser`（E,0），`run` 为空 |
-//! | `main.reply`（任务的回复、清单、"好，先停了。"） | `LineReply`（E,0），`run` 为空；`origin` = 被回答那条 `main.user` 的 `MessageUser` 事件 ID，`task` 是说话的任务会话（有的话） |
+//! | `main.user`（Router 时期落在主线 / 群的线上的用户消息，没有 `model`，正文在 `data.text`；已不再写，旧库里还有） | `MessageUser`（E,0），`run` 为空 |
+//! | `main.reply`（Router 时期任务的回复、清单、"好，先停了。"；已不再写，旧库里还有） | `LineReply`（E,0），`run` 为空；`origin` = 被回答那条 `main.user` 的 `MessageUser` 事件 ID，`task` 是说话的任务会话（有的话） |
 //! | 别的 entry：有 `model` 里的 user 消息、kind 不是 `komo.*`（`komo.user` 除外）与 `branch.summary` | `MessageUser`（E,0），`run` 为空——`!` 命令这类"不开启 run 的用户消息" |
 //! | 其余（`komo.system`、`label`、`session.info`、`branch.summary`、`context.edit`、不认识的 kind） | **不出帧**。不认识的 kind 在 pi 树里是 `Custom`（见 [`pi_tree`](super::pi_tree)），事件流里没有对应词汇，宁可不出也不出一个误导的帧 |
 //!
@@ -108,7 +108,8 @@ use crate::types::{ContentRef, PREVIEW_LIMIT_BYTES, ToolCallRequest};
 /// `komo.settled` 的 kind（与 runtime `harness::entries::SETTLED` 一致，kernel 不依赖 runtime）。
 pub const SETTLED_ENTRY_KIND: &str = "komo.settled";
 const USER_ENTRY_KIND: &str = "komo.user";
-/// 主线 / 群的线上的展示 entry（gateway `dispatch` 与 runtime `MAIN_REPLY_ENTRY`，kernel 不依赖它们）。
+/// Router 时期落在主线 / 群的线上的展示 entry。Router 已删除、不再写这两种 entry，但 entry 不可变，
+/// 已落盘的仍要投影成消息，所以这里保留读取。
 const MAIN_USER_ENTRY: &str = "main.user";
 const MAIN_REPLY_ENTRY: &str = "main.reply";
 

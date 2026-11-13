@@ -423,11 +423,6 @@ impl FakeLlm {
     }
 
     /// 到目前为止开了几个 turn（= 向模型请求了几次）。
-    /// 再排一段脚本（排在已有的后面）：测试跑到一半才知道下一段该是什么。
-    pub fn push_script(&self, script: Vec<Result<Round, LlmError>>) {
-        self.scripts.lock().expect("脚本模型").push_back(script);
-    }
-
     pub fn turns(&self) -> usize {
         self.turns.load(Ordering::SeqCst)
     }
@@ -769,7 +764,6 @@ pub struct GatewayBuilder {
     home: Option<PathBuf>,
     tools: Vec<Arc<dyn Tool>>,
     stream: Option<Arc<dyn ModelStream>>,
-    clock: Option<Arc<dyn komo_kernel::traits::Clock>>,
 }
 
 impl GatewayBuilder {
@@ -783,14 +777,7 @@ impl GatewayBuilder {
             home: None,
             tools: Vec::new(),
             stream: None,
-            clock: None,
         }
-    }
-
-    /// 注入时钟（卡死检测用，测试里拨它，不真的睡）。
-    pub fn clock(mut self, clock: Arc<dyn komo_kernel::traits::Clock>) -> Self {
-        self.clock = Some(clock);
-        self
     }
 
     /// 注入无状态的模型后端（harness 的主模型）。
@@ -864,7 +851,6 @@ impl GatewayBuilder {
             // `~/.agents/skills` 里有什么，别的测试的断言就跟着变。
             shared_home: Some(home.clone()),
             telemetry: None,
-            clock: self.clock,
         })
         .await
         .expect("Gateway 起得来");
@@ -1058,7 +1044,7 @@ impl TestGateway {
         wait_run(self.state(), run).await
     }
 
-    /// 全部会话（含已删除的）的"来源"：主会话是 `home`，群的线是 `line:{群}`，其余是 `source`（`chat:{peer}`）。
+    /// 全部会话（含已删除的）的"来源"：主会话是 `home`，其余是 `source`（`chat:{peer}`）。
     /// 任务会话与 cron 会话不算（聊天测试里没有它们）。
     pub async fn origins(&self) -> Vec<String> {
         use komo_kernel::durable::SessionKind;
@@ -1068,14 +1054,14 @@ impl TestGateway {
             .expect("读得出")
             .into_iter()
             .filter_map(|record| match record.kind {
-                SessionKind::Main => Some(record.source.unwrap_or_else(|| "home".to_owned())),
+                SessionKind::Main => Some("home".to_owned()),
                 SessionKind::Normal => Some(record.source.unwrap_or_default()),
                 SessionKind::Task | SessionKind::Cron => None,
             })
             .collect()
     }
 
-    /// 来源为 `origin`（`home`、`line:…` 或 `chat:…`）的会话 ID。
+    /// 来源为 `origin`（`home` 或 `chat:…`）的会话 ID。
     pub async fn session_of(&self, origin: &str) -> Option<String> {
         use komo_kernel::durable::SessionKind;
         let core = self.state().core().expect("durable");
@@ -1084,7 +1070,7 @@ impl TestGateway {
             .expect("读得出")
             .into_iter()
             .find(|record| match record.kind {
-                SessionKind::Main => record.source.as_deref().unwrap_or("home") == origin,
+                SessionKind::Main => origin == "home",
                 _ => record.source.as_deref() == Some(origin),
             })
             .map(|record| record.id)
@@ -1117,40 +1103,6 @@ impl TestGateway {
     /// 一个会话里受理过的输入 submission 数（排队的、并进别人 run 的都算一条）。
     pub async fn inputs(&self, session: &str) -> usize {
         inputs_of(self.state(), session).await
-    }
-
-    /// 主会话主线上的用户消息数。主会话不起 run，消息是主线上的展示 entry（`main.user`），
-    /// "同一条平台消息只受理一次"在那里数的是它。
-    pub async fn main_messages(&self, session: &str) -> usize {
-        use komo_kernel::durable::storage::{ConversationQuery, EntryQuery};
-        let core = self.state().core().expect("Durable 模式");
-        let conversations = core
-            .storage
-            .scan_conversations(
-                &ConversationQuery {
-                    session: Some(session.to_owned()),
-                    ..ConversationQuery::default()
-                },
-                10_000,
-                None,
-            )
-            .await
-            .expect("读得出")
-            .items;
-        let mut count = 0;
-        for conversation in conversations {
-            let page = core
-                .storage
-                .scan_entries(&EntryQuery::new(conversation.id), 10_000, None)
-                .await
-                .expect("读得出");
-            count += page
-                .items
-                .iter()
-                .filter(|entry| entry.kind == crate::service::durable::dispatch::MAIN_USER_ENTRY)
-                .count();
-        }
-        count
     }
 }
 
@@ -1220,7 +1172,6 @@ impl Home {
             embeddings: None,
             shared_home: Some(self.dir.path().to_path_buf()),
             telemetry: None,
-            clock: None,
         })
         .await
         .expect("Gateway 起得来");

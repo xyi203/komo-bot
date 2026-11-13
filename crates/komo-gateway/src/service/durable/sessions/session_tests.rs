@@ -1515,10 +1515,7 @@ mod task_list {
             contracts: BTreeMap::new(),
             last_run: last,
             continued: None,
-            reply: None,
             stopped: false,
-            thread: None,
-            session: None,
             goals: Vec::new(),
         };
         let root = record.root_conversation;

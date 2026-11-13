@@ -198,7 +198,6 @@ impl TestGateway {
             // 共享 skill 目录钉在临时数据目录上（§5.6）：测试不受这台机器上装过什么影响。
             shared_home: Some(home.path().to_path_buf()),
             telemetry: None,
-            clock: None,
         })
         .await
         .expect("Gateway 起得来");
@@ -472,69 +471,6 @@ impl komo_kernel::traits::Tool for GateTool {
             artifacts: vec![],
             images: vec![],
             preview: Some("门开了".into()),
-        })
-    }
-}
-
-/// 一个声明为"对外"的测试工具（`docs/confirm.md`）：每执行一次记一笔。无人值守的 Run 调它要先过确认。
-pub struct OutwardProbe {
-    calls: std::sync::atomic::AtomicUsize,
-}
-
-impl OutwardProbe {
-    pub fn new() -> std::sync::Arc<OutwardProbe> {
-        std::sync::Arc::new(OutwardProbe {
-            calls: std::sync::atomic::AtomicUsize::new(0),
-        })
-    }
-
-    /// 当成工具挂上去（名字 `outward_ping`）。
-    pub fn tool(self: &std::sync::Arc<Self>) -> std::sync::Arc<dyn komo_kernel::traits::Tool> {
-        std::sync::Arc::new(OutwardTool(std::sync::Arc::clone(self)))
-    }
-
-    /// 真的执行过几次。
-    pub fn calls(&self) -> usize {
-        self.calls.load(std::sync::atomic::Ordering::SeqCst)
-    }
-}
-
-struct OutwardTool(std::sync::Arc<OutwardProbe>);
-
-#[async_trait::async_trait]
-impl komo_kernel::traits::Tool for OutwardTool {
-    fn definition(&self) -> komo_kernel::types::tool::ToolDefinition {
-        test_definition("outward_ping", "测试用：对外动作，每执行一次记一笔")
-    }
-
-    async fn prepare(
-        &self,
-        args: serde_json::Value,
-        ctx: &komo_kernel::types::tool::ToolContext,
-    ) -> Result<komo_kernel::types::plan::ExecutionPlan, komo_kernel::types::tool::ToolError> {
-        Ok(test_plan("outward_ping", args, ctx))
-    }
-
-    fn outward(&self) -> bool {
-        true
-    }
-
-    async fn execute(
-        &self,
-        _plan: komo_kernel::types::plan::ExecutionPlan,
-        _ctx: &komo_kernel::types::tool::ToolContext,
-        _sink: &mut dyn komo_kernel::traits::OutputWriter,
-    ) -> Result<komo_kernel::types::tool::ToolOutput, komo_kernel::types::tool::ToolError> {
-        self.0
-            .calls
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        Ok(komo_kernel::types::tool::ToolOutput {
-            status: komo_kernel::types::refs::ToolResultStatus::Completed,
-            result: serde_json::json!({ "sent": true }),
-            exit_code: Some(0),
-            artifacts: vec![],
-            images: vec![],
-            preview: Some("已发出".into()),
         })
     }
 }

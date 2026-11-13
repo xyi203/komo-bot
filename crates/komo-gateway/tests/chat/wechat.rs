@@ -74,8 +74,7 @@ async fn a_replayed_client_id_produces_one_run() {
     // 让重投再来几轮。
     wired.polled_at_least(5).await;
 
-    // 私聊落到主会话：它不起 run，消息是主线上的一条展示 entry，重投不该落第二条（也就不会有第二个分发任务）。
-    let inputs = wired.gateway.main_messages(&home).await;
+    let inputs = wired.gateway.inputs(&home).await;
     assert_eq!(inputs, 1, "重投不该开第二个 Run");
 }
 
@@ -143,7 +142,7 @@ async fn the_backlog_is_flushed_before_the_new_message() {
         "第一条要是积压的那条投递：{texts:?}"
     );
     assert!(
-        texts[1].contains("现在手上没有事"),
+        texts[1].contains("待处理（共 0 条）"),
         "第二条才是 `/status` 的回执：{texts:?}"
     );
     assert!(

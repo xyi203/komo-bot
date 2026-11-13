@@ -3,6 +3,7 @@
 > 状态：**草案未批准，未实施**（2026-11-10 提议）。来源：DeepSeek Harness 团队《Super-agent 设计探索》（`roadmap-muse.md` §5 参考）
 > 的"Session 应当是实现细节"与双层架构；`roadmap-muse.md` S 已借了其中五条，本文接着做它没做的那一半：用户看到什么。
 > §6 列出要拍板的决定，认可后分别写回 `komo_bot.md`、`background-tasks.md`、`web.md`、`session-tree.md`。
+> 2026-11-13：§4（Router - Worker）已被 `docs/redesign.md`（P18）取代，Router 已于同日删除（分发判断、分发任务与结果直投、`router_model`）；§4 正文原样保留作历史记录。
 > 文中 §x 不带文件名时指 `komo_bot.md`。
 
 ## 0. 结论

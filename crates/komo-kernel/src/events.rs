@@ -256,8 +256,9 @@ event_payload! {
     ContextCompacted(ContextCompacted) => "context.compacted",
     /// 这一段对话钉住的记忆注入段（§9.4）：渲染好的正文与选中的条目，重启之后照它逐字复用。
     MemoryInjected(MemoryInjected) => "memory.injected",
-    /// 主线（或群的线）上 Agent 说的一句话：任务的回复、清单、"好，先停了。"（`main.reply` entry）。
-    /// **不挂 Run**——线本身不跑模型，客户端会丢弃没有 Run 的 `message.assistant`，所以单独一种。
+    /// Router 时期主线上 Agent 说的一句话：任务的回复、清单、"好，先停了。"（`main.reply` entry）。
+    /// 已不再产生，旧库里已落盘的 entry 仍投影成它。**不挂 Run**——客户端会丢弃没有 Run 的
+    /// `message.assistant`，所以单独一种。
     LineReply(LineReply) => "line.reply",
 }
 
@@ -405,7 +406,7 @@ pub struct MessageUser {
     pub shell: Option<ShellCommand>,
 }
 
-/// 线上的一句回复（`main.reply` entry）。
+/// Router 时期线上的一句回复（`main.reply` entry，已不再写，旧数据仍读）。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LineReply {
     pub text: String,

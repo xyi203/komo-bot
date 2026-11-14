@@ -23,8 +23,13 @@ pub fn user_home() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
-/// 连上本机 Gateway；**没起来就请服务管理器起它**（§3 第 3 步）。
+/// 连上 Gateway：有 `komo login` 存下的远程登录（`remote.json`）就连那台远程的（设备令牌，不启动
+/// 任何东西）；否则连本机的，**没起来就请服务管理器起它**（§3 第 3 步）。
 pub async fn connect_or_start(home: &Path) -> Result<KomoClient, String> {
+    if let Some(remote) = komo_client::remote::read_remote(home)? {
+        return KomoClient::new(&remote.base_url, Some(remote.token))
+            .map_err(|error| error.to_string());
+    }
     match discovery::discover(home).await {
         Ok(found) => return found.client().map_err(|error| error.to_string()),
         // 身份 / 协议 / 数据目录不符不是"还没起来"，再等也不会变。

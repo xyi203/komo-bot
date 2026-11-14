@@ -85,6 +85,11 @@ tower-http = { version = "0.7.1", default-features = false, features = [
 # §13.4：仅 bin。
 clap = { version = "4.6.7", features = ["derive"] }
 
+# §13.4：仅 komo-gateway（OIDC ID token 的签名校验：RS256 / ES256 / EdDSA）。**已在依赖树里**
+# （rustls 的 ring provider 拉进来的同一个 0.17.14），不新增包也不新增重复版本；只开 `alloc`
+# （`RsaPublicKeyComponents` 要它）。
+ring = { version = "0.17.14", default-features = false, features = ["alloc"] }
+
 # §13.4：仅 komo (bin) 的 `komo update`——解发布包（release.yml 打的 tar.gz）。
 # flate2 显式写 rust_backend（miniz_oxide，纯 Rust），不随上游默认后端变；两者都不带 C 工具链。
 flate2 = { version = "1", default-features = false, features = [
@@ -108,7 +113,7 @@ arc-swap = "1.9.2"
 croner = { version = "4.0.1", default-features = false }
 async-trait = "0.1.92"
 thiserror = "2.0.21"
-uuid = { version = "1.28.0", features = ["v7", "serde"] }
+uuid = { version = "1.28.0", features = ["v4", "v7", "serde"] }
 time = { version = "0.3.55", features = [
     "serde",
     "formatting",

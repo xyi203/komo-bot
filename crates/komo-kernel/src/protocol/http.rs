@@ -9,8 +9,10 @@
 //!
 //! | 端点 | 请求体 | 响应体 |
 //! |---|---|---|
-//! | `POST /v1/web/pair-code` | — | [`PairCodeResponse`] |
-//! | `POST /v1/web/session` | [`PairRequest`] | `{}` + `Set-Cookie` |
+//! | `GET /auth/me` | — | [`AuthMeResponse`] |
+//! | `POST /auth/device/token` | [`DeviceTokenRequest`] | [`DeviceTokenResponse`] |
+//! | `GET /v1/auth/sessions` | — | [`AuthSessionsResponse`] |
+//! | `DELETE /v1/auth/sessions/{id}` | — | [`AuthRevokeResponse`] |
 //! | `POST /v1/sessions` | [`CreateSessionRequest`] | [`SessionSummary`] |
 //! | `POST /v1/memories/{id}/confirm` | [`MemoryRevisionRequest`] | [`MemoryDetail`] |
 //! | `POST /v1/memories/{id}/classify` | [`MemoryClassifyRequest`] | [`MemoryDetail`] |
@@ -147,22 +149,115 @@ pub struct TelemetryHealth {
     pub last_error: Option<String>,
 }
 
-// ---- /v1/web/*：浏览器配对（docs/clients.md D6） ----
+// ---- /auth/*、/v1/auth/*：登录（docs/redesign.md §2.9） ----
 
-/// `POST /v1/web/pair-code`（只认 Bearer）的响应：一次性配对码。只在 Gateway 内存里，用一次作废。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// 这次请求是用哪种凭据认出来的。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
-pub struct PairCodeResponse {
-    pub code: String,
-    /// 多少秒后失效。
-    pub expires_in_secs: u32,
+#[serde(rename_all = "snake_case")]
+pub enum AuthCredentialKind {
+    /// 浏览器的会话 cookie（OIDC 登录换来的）。
+    Web,
+    /// 桌面端 / CLI 的设备令牌（Bearer）。
+    Device,
+    /// 本机令牌（`runtime/gateway.json`，机器上的命令行用）。
+    Local,
 }
 
-/// `POST /v1/web/session` 的请求体：用配对码换会话 cookie（`Set-Cookie`，响应体为空对象）。
+/// `GET /auth/me`（不需要登录，网页据此判断要不要跳去 `/auth/login`）：当前登录状态。永远是 200。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
-pub struct PairRequest {
+#[cfg_attr(feature = "ts", ts(optional_fields))]
+pub struct AuthMeResponse {
+    pub authenticated: bool,
+    /// 这台 Gateway 配了 `[auth.oidc]` 没有。`false` 时网页没有登录可走。
+    pub oidc_configured: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential: Option<AuthCredentialKind>,
+    /// OIDC 的 `sub`（本机令牌没有）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
+    /// 当前这条登录状态的 id（本机令牌没有）；与 `GET /v1/auth/sessions` 里的 `id` 对得上。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum AuthSessionKind {
+    Web,
+    Device,
+}
+
+/// 一条登录状态（网页会话或设备令牌）。不含令牌，也不含令牌的哈希。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(optional_fields))]
+pub struct AuthSessionView {
+    pub id: String,
+    pub kind: AuthSessionKind,
+    /// 给人看的名字：网页是浏览器的 User-Agent 摘要，设备是客户端报的名字。
+    pub label: String,
+    pub subject: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
+    #[cfg_attr(feature = "ts", ts(type = "string"))]
+    #[serde(with = "time::serde::rfc3339")]
+    pub created_at: OffsetDateTime,
+    #[cfg_attr(feature = "ts", ts(type = "string"))]
+    #[serde(with = "time::serde::rfc3339")]
+    pub last_used_at: OffsetDateTime,
+    /// 设备令牌不过期（`None`）；网页会话滑动续期。
+    #[cfg_attr(feature = "ts", ts(type = "string | null"))]
+    #[serde(default, with = "time::serde::rfc3339::option")]
+    pub expires_at: Option<OffsetDateTime>,
+    /// 就是发这次请求的那一条。
+    pub current: bool,
+}
+
+/// `GET /v1/auth/sessions`：没过期的登录状态，最近用过的在前（设置页「通用」或「关于」的设备清单）。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct AuthSessionsResponse {
+    #[serde(default)]
+    pub sessions: Vec<AuthSessionView>,
+}
+
+/// `DELETE /v1/auth/sessions/{id}`：吊销一条（该 cookie / 令牌立刻失效）。id 不存在是 404。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct AuthRevokeResponse {
+    pub revoked: bool,
+}
+
+/// `POST /auth/device/token` 的请求体：用设备登录回跳带回来的一次性授权码换长期设备令牌。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct DeviceTokenRequest {
     pub code: String,
+    /// 发起登录时那个 `code_challenge` 的原像。
+    pub code_verifier: String,
+    /// 与发起登录时的 `redirect_uri` 完全相同。
+    pub redirect_uri: String,
+}
+
+/// `POST /auth/device/token` 的响应。令牌只在这里出现一次，Gateway 只存它的哈希。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(optional_fields))]
+pub struct DeviceTokenResponse {
+    /// 当 `Authorization: Bearer <token>` 用。
+    pub token: String,
+    /// 恒为 `Bearer`。
+    pub token_type: String,
+    /// 对应 `GET /v1/auth/sessions` 里的 `id`，吊销用。
+    pub session_id: String,
+    pub subject: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
 }
 
 // ---- /v1/sessions ----
@@ -1954,7 +2049,7 @@ pub struct McpServerView {
     /// 整台开关（`[mcp.servers.<name>] enabled`，持久）。`false` 时 `state` 是 `disabled`，不连接。
     #[serde(default = "default_true")]
     pub enabled: bool,
-    /// 它在哪：stdio 是命令加参数，http 是 URL（去掉查询串与账号）。设置页「连接」表的说明行。
+    /// 它在哪：stdio 只有程序名（basename，不带参数——参数里可能有令牌），http 是 URL（去掉查询串与账号）。设置页「连接」表的说明行。
     /// 凭证不在里面（`env` / `bearer_token_env` 只是变量名，不给）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,

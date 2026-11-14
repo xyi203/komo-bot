@@ -81,6 +81,7 @@ pub fn snapshot_fixture() -> ConfigSnapshot {
             otlp_endpoint: None,
             web_dir: None,
             trusted_hosts: vec![],
+            oidc: None,
         },
         model_catalog,
         model: main,

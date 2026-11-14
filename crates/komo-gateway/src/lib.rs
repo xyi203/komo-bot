@@ -4,6 +4,7 @@ pub mod auth;
 pub mod http;
 pub mod inbox;
 pub mod lock;
+pub mod oidc;
 pub mod reload;
 pub mod service;
 pub mod sse;

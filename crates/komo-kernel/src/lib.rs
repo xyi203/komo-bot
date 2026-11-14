@@ -5,6 +5,7 @@ pub mod cron;
 pub mod durable;
 pub mod events;
 pub mod fold;
+pub mod pkce;
 pub mod projection;
 pub mod protocol;
 pub mod session;

@@ -16,6 +16,7 @@
 pub mod api;
 pub mod discovery;
 pub mod error;
+pub mod remote;
 pub mod render;
 pub mod sse;
 #[cfg(test)]

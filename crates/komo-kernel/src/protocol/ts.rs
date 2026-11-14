@@ -3,7 +3,7 @@
 //! 生成物提交在 `packages/protocol/src/generated/`，由下面的测试保证它是最新的：
 //! `cargo test -p komo-kernel --features ts`；类型改了要重新生成，加 `KOMO_UPDATE_TS=1`。
 //!
-//! 导出的是客户端用得到的集合（会话列表与生命周期、提交 Run、模型清单、每轮改动、事件页与 SSE 帧、错误体、healthz、配对）。其余
+//! 导出的是客户端用得到的集合（会话列表与生命周期、提交 Run、模型清单、每轮改动、事件页与 SSE 帧、错误体、healthz、登录）。其余
 //! 协议类型留到界面迁移（C1）用到时再加：给类型补 `cfg_attr(feature = "ts", derive(ts_rs::TS))`，
 //! 再把它列进 [`export_all`]。
 //!
@@ -32,7 +32,8 @@ use super::{
     EnabledRequest, McpReconnectRequest, McpReconnectResponse, McpServersResponse, SkillsResponse, MemoryAddRequest,
     MemoryAddResponse, MemoryClassifyRequest, MemoryDetail, MemoryIndexStatus, MemoryListResponse,
     MemoryRevisionRequest, ModelUpsertRequest, ModelsResponse, MonitorListResponse,
-    NameSessionRequest, PairCodeResponse, PairRequest, ProviderModelsRequest,
+    NameSessionRequest, ProviderModelsRequest,
+    AuthMeResponse, AuthRevokeResponse, AuthSessionsResponse, DeviceTokenRequest, DeviceTokenResponse,
     ProviderModelsResponse, ProviderUpsertRequest, PurgeBlocked, PurgeSessionResponse,
     RebuildIndexResponse, SessionChanges, SessionLifecycleResponse, SessionListResponse,
     SettingRequest, SseFrame, SubmitRunRequest, SubmitRunResponse, TaskListResponse,
@@ -72,8 +73,11 @@ pub fn export_all(dir: &Path) -> Result<(), String> {
     each(EventQuery::export_all(&cfg))?;
     each(EventPage::export_all(&cfg))?;
     each(SseFrame::export_all(&cfg))?;
-    each(PairCodeResponse::export_all(&cfg))?;
-    each(PairRequest::export_all(&cfg))?;
+    each(AuthMeResponse::export_all(&cfg))?;
+    each(AuthSessionsResponse::export_all(&cfg))?;
+    each(AuthRevokeResponse::export_all(&cfg))?;
+    each(DeviceTokenRequest::export_all(&cfg))?;
+    each(DeviceTokenResponse::export_all(&cfg))?;
     each(WireEvent::export_all(&cfg))?;
     // C1：会话列表与菜单、对话、改动页用到的。
     each(CreateSessionRequest::export_all(&cfg))?;

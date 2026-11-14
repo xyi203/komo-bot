@@ -215,7 +215,7 @@ Web 设置页要一张服务器表，而不是"点重连才看得到状态"。`G
   `PUT /v1/mcp/{name}/tools/{tool}` 体 `{"enabled": bool}`，都返回 `McpServersResponse`（写完、重载完的各台此刻的样子）。
   名字不在配置里 404；关一个服务器没列出过的工具 400（还没连上过就没有清单）；开不核对，好清掉服务器已经没有的名字。
   配置文件里 `enabled = true` 与不写等价；`komo config check` 对没写 `enabled` 的旧配置零影响。
-- `GET /v1/mcp` 每台多 `enabled`、`endpoint`（stdio 是命令加参数，http 是去掉账号与查询串的 URL；设置页说明行用）；
+- `GET /v1/mcp` 每台多 `enabled`、`endpoint`（stdio 只给程序名（basename，不带参数，参数里可能有令牌），http 是去掉账号与查询串的 URL；设置页说明行用）；
   每个工具多 `enabled`。`McpServerState` 多 `disabled`。
 - 被接续的 Run（Gateway 重启后）调到整台关着或单个关着的工具：`await_tools` 给"已在设置里关闭"的原因，不是一句
   "没有这个工具"。

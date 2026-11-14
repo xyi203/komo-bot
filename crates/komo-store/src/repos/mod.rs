@@ -8,6 +8,7 @@
 //! 理由：**`rows affected` 是唯一可用的信号**（toasty 的类型化 `UPDATE` 恒返回 `Ok(())`，
 //! 命中 0 行与 1 行不可区分，§8.2 那张表）。
 
+pub mod auth;
 pub mod cron;
 pub mod cron_backfill;
 pub mod matter;

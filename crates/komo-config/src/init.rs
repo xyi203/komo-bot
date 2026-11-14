@@ -127,6 +127,14 @@ default = "chat"
 # 记忆检索：没有配 embedding 模型时只能用关键词检索（默认的 hybrid 要求有 embedding）。
 [memory.retrieval]
 mode = "keyword"
+
+# 登录（部署成服务时用）：接标准 OIDC（Pocket ID、Cloudflare Access、公司 SSO 都行）。不配时网页登不了，
+# 机器上的命令行仍用本机令牌。客户端密钥写在 .env 的 KOMO_OIDC_CLIENT_SECRET，不写在这里。
+# [auth.oidc]
+# issuer = "https://id.example.com"
+# client_id = "komo"
+# public_url = "https://komo.example.com"      # 回调地址 = <public_url>/auth/callback
+# allowed_subjects = ["<你的 sub>"]            # 或 allowed_emails = ["me@example.com"]；不在名单里一律拒绝
 "#
     )
 }

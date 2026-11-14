@@ -1,5 +1,9 @@
-//! 网页壳的网关侧（`docs/clients.md` D5、D6）：Host 校验、配对换 cookie、cookie 鉴权与同源核对、
-//! 静态文件。真数据目录、真 `service::start`、真 TCP。
+//! 网页壳的网关侧（`docs/clients.md` D5）：Host 校验、静态文件、登录路由的未登录行为。真数据目录、
+//! 真 `service::start`、真 TCP。
+//!
+//! 配对码已删（`docs/redesign.md` P21）。原先靠配对码换 cookie 的几条测试（cookie 的写请求核对
+//! Origin、cookie 开 SSE、cookie 不能再铸别的凭据）已删除，待统一验证阶段改成「直接往 `auth_sessions`
+//! 写一条会话再带 cookie 请求」重写。
 
 use komo_gateway::service::test_support::harness::{
     FakeLlm, GatewayBuilder, TestGateway, config_toml,
@@ -29,40 +33,6 @@ async fn start(extra: &str) -> (TestGateway, tempfile::TempDir) {
     (gateway, web)
 }
 
-async fn pair_code(gateway: &TestGateway) -> String {
-    let response = client()
-        .post(format!("{}/v1/web/pair-code", gateway.base_url()))
-        .bearer_auth(gateway.token())
-        .send()
-        .await
-        .expect("请求");
-    assert_eq!(response.status(), 200);
-    let body: serde_json::Value = response.json().await.expect("JSON");
-    body["code"].as_str().expect("码").to_string()
-}
-
-/// 配对换 cookie，返回 `komo_session=...` 这一对。
-async fn open_session(gateway: &TestGateway, code: &str) -> String {
-    let response = client()
-        .post(format!("{}/v1/web/session", gateway.base_url()))
-        .json(&serde_json::json!({ "code": code }))
-        .send()
-        .await
-        .expect("请求");
-    assert_eq!(response.status(), 200);
-    let set_cookie = response
-        .headers()
-        .get("set-cookie")
-        .expect("Set-Cookie")
-        .to_str()
-        .unwrap()
-        .to_string();
-    for part in ["HttpOnly", "SameSite=Strict", "Path=/"] {
-        assert!(set_cookie.contains(part), "{set_cookie}");
-    }
-    set_cookie.split(';').next().unwrap().to_string()
-}
-
 #[tokio::test]
 async fn a_foreign_host_is_refused_on_every_route() {
     let (gateway, _web) = start("").await;
@@ -76,14 +46,13 @@ async fn a_foreign_host_is_refused_on_every_route() {
             .expect("请求");
         assert_eq!(response.status(), 403, "{path}");
     }
-    let paired = client()
-        .post(format!("{}/v1/web/session", gateway.base_url()))
+    let login = client()
+        .get(format!("{}/auth/me", gateway.base_url()))
         .header("host", "evil.example.com")
-        .json(&serde_json::json!({ "code": "x" }))
         .send()
         .await
         .expect("请求");
-    assert_eq!(paired.status(), 403);
+    assert_eq!(login.status(), 403);
 }
 
 #[tokio::test]
@@ -99,136 +68,62 @@ async fn a_trusted_host_from_config_is_let_through() {
 }
 
 #[tokio::test]
-async fn a_pair_code_needs_the_bearer_token() {
+async fn without_a_login_the_api_is_closed_and_me_says_so() {
     let (gateway, _web) = start("").await;
-    let response = client()
-        .post(format!("{}/v1/web/pair-code", gateway.base_url()))
+    let base = gateway.base_url();
+    let bare = client()
+        .get(format!("{base}/v1/sessions"))
         .send()
         .await
         .expect("请求");
-    assert_eq!(response.status(), 401);
-}
-
-#[tokio::test]
-async fn a_pair_code_opens_a_cookie_session_once() {
-    let (gateway, _web) = start("").await;
-    let code = pair_code(&gateway).await;
-    let cookie = open_session(&gateway, &code).await;
-
-    // 同一个码第二次不行。
-    let again = client()
-        .post(format!("{}/v1/web/session", gateway.base_url()))
-        .json(&serde_json::json!({ "code": code }))
-        .send()
-        .await
-        .expect("请求");
-    assert_eq!(again.status(), 401);
-
-    // cookie 能列会话；没带的 401。
-    let url = format!("{}/v1/sessions", gateway.base_url());
-    let listed = client()
-        .get(&url)
-        .header("cookie", &cookie)
-        .send()
-        .await
-        .expect("请求");
-    assert_eq!(listed.status(), 200);
-    let bare = client().get(&url).send().await.expect("请求");
     assert_eq!(bare.status(), 401);
     let forged = client()
-        .get(&url)
+        .get(format!("{base}/v1/sessions"))
         .header("cookie", "komo_session=forged")
         .send()
         .await
         .expect("请求");
     assert_eq!(forged.status(), 401);
-}
-
-#[tokio::test]
-async fn a_cookie_cannot_mint_another_pair_code() {
-    let (gateway, _web) = start("").await;
-    let cookie = open_session(&gateway, &pair_code(&gateway).await).await;
-    let response = client()
-        .post(format!("{}/v1/web/pair-code", gateway.base_url()))
-        .header("cookie", &cookie)
-        .header("origin", gateway.base_url())
+    let device = client()
+        .get(format!("{base}/v1/sessions"))
+        .bearer_auth("komodev_forged")
         .send()
         .await
         .expect("请求");
-    assert_eq!(response.status(), 403);
-}
+    assert_eq!(device.status(), 401);
 
-#[tokio::test]
-async fn a_cookie_write_from_another_origin_is_refused() {
-    let (gateway, _web) = start("").await;
-    let cookie = open_session(&gateway, &pair_code(&gateway).await).await;
-    let url = format!("{}/v1/sessions", gateway.base_url());
-
-    let cross = client()
-        .post(&url)
-        .header("cookie", &cookie)
-        .header("origin", "http://evil.example.com")
-        .json(&serde_json::json!({}))
+    // /auth/me 不要登录，永远 200；没配 OIDC 就这么说。
+    let me: serde_json::Value = client()
+        .get(format!("{base}/auth/me"))
         .send()
         .await
-        .expect("请求");
-    assert_eq!(cross.status(), 403);
-
-    let no_origin = client()
-        .post(&url)
-        .header("cookie", &cookie)
-        .json(&serde_json::json!({}))
-        .send()
+        .expect("请求")
+        .json()
         .await
-        .expect("请求");
-    assert_eq!(no_origin.status(), 403);
+        .expect("JSON");
+    assert_eq!(me["authenticated"], false);
+    assert_eq!(me["oidc_configured"], false);
 
-    let same = client()
-        .post(&url)
-        .header("cookie", &cookie)
-        .header("origin", gateway.base_url())
-        .json(&serde_json::json!({}))
-        .send()
-        .await
-        .expect("请求");
-    assert_eq!(same.status(), 200, "同源的写请求放行");
-
-    // Bearer 不受 Origin 约束（CLI 不带 Origin）。
-    let bearer = client()
-        .post(&url)
+    // 本机令牌照常认，并报成 local。
+    let me: serde_json::Value = client()
+        .get(format!("{base}/auth/me"))
         .bearer_auth(gateway.token())
-        .json(&serde_json::json!({}))
         .send()
         .await
-        .expect("请求");
-    assert_eq!(bearer.status(), 200);
-}
+        .expect("请求")
+        .json()
+        .await
+        .expect("JSON");
+    assert_eq!(me["authenticated"], true);
+    assert_eq!(me["credential"], "local");
 
-#[tokio::test]
-async fn an_sse_stream_opens_with_the_cookie() {
-    let (gateway, _web) = start("").await;
-    let cookie = open_session(&gateway, &pair_code(&gateway).await).await;
-    let (code, body) = gateway.post("/v1/sessions", serde_json::json!({})).await;
-    assert_eq!(code, 200, "{body}");
-    let session = serde_json::from_str::<serde_json::Value>(&body).unwrap()["session"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    let response = client()
-        .get(format!(
-            "{}/v1/sessions/{session}/events",
-            gateway.base_url()
-        ))
-        .header("cookie", &cookie)
-        .header("accept", "text/event-stream")
+    // 没配 OIDC：发起登录是一张 404 页，设备登录同理。
+    let login = client()
+        .get(format!("{base}/auth/login"))
         .send()
         .await
         .expect("请求");
-    assert_eq!(response.status(), 200);
-    assert_eq!(
-        response.headers().get("content-type").unwrap(),
-        "text/event-stream"
-    );
+    assert_eq!(login.status(), 404);
 }
 
 #[tokio::test]

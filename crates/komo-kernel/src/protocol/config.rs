@@ -79,6 +79,40 @@ pub struct StartOnly {
     /// `[gateway] trusted_hosts`：除回环与监听地址外还接受哪些 `Host`（经反向代理 / 隧道访问时填域名）。
     #[serde(default)]
     pub trusted_hosts: Vec<String>,
+    /// `[auth.oidc]`：网页与设备登录接的 OIDC 身份提供方（`docs/redesign.md` §2.9）。`None` = 没配登录：
+    /// 网页没法登录，命令行仍用本机令牌（`runtime/gateway.json`）。
+    #[serde(default)]
+    pub oidc: Option<OidcConfig>,
+}
+
+/// `[auth.oidc]` 的默认客户端密钥变量名。
+pub const DEFAULT_OIDC_SECRET_ENV: &str = "KOMO_OIDC_CLIENT_SECRET";
+
+/// OIDC 登录配置（只有变量名，没有密钥的值：值在 `.env`，见 [`OidcConfig::client_secret_env`]）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OidcConfig {
+    /// 签发方地址；按它的 `/.well-known/openid-configuration` 发现各端点，不写死任何提供方的路径。
+    pub issuer: String,
+    pub client_id: String,
+    /// 客户端密钥放在 `.env` 的哪个变量里（默认 [`DEFAULT_OIDC_SECRET_ENV`]）。变量没有值就按
+    /// 公开客户端（只靠 PKCE）去换令牌。
+    pub client_secret_env: String,
+    /// 允许登录的 `sub`。与 `allowed_emails` 任一命中即放行；两个都空是配置错误。
+    #[serde(default)]
+    pub allowed_subjects: Vec<String>,
+    /// 允许登录的邮箱（小写比较；提供方明确说 `email_verified = false` 的不算）。
+    #[serde(default)]
+    pub allowed_emails: Vec<String>,
+    /// 这台 Gateway 的公开地址（`https://komo.example.com`）：回调地址由它拼成
+    /// `<public_url>/auth/callback`，Pocket ID 那边的回调要填同一个值。
+    pub public_url: String,
+}
+
+impl OidcConfig {
+    /// 在提供方登记的回调地址。
+    pub fn callback_url(&self) -> String {
+        format!("{}/auth/callback", self.public_url.trim_end_matches('/'))
+    }
 }
 
 /// 一个 MCP 服务器（`docs/mcp.md`）。凭证不在这里：`env` / `bearer_token_env` 写的是
@@ -805,6 +839,7 @@ mod tests {
                 otlp_endpoint: None,
                 web_dir: None,
                 trusted_hosts: vec![],
+                oidc: None,
             },
             model_catalog: ModelCatalog::default(),
             model: model("chat-a"),

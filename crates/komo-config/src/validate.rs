@@ -145,12 +145,82 @@ fn check_start_only(snapshot: &ConfigSnapshot, issues: &mut Vec<ConfigIssue>) {
             format!("`{}` 不是目录：Gateway 不提供网页", dir.display()),
         ));
     }
+    check_oidc(snapshot, issues);
     if !snapshot.start_only.data_dir.is_absolute() {
         issues.push(error(
             "start_only.data_dir",
             format!(
                 "数据目录要是绝对路径，现在是 `{}`",
                 snapshot.start_only.data_dir.display()
+            ),
+        ));
+    }
+}
+
+/// `[auth.oidc]`：能不能登录。没配这一段不是错误（命令行仍用本机令牌），只是网页登不了；
+/// 那条提示在 Gateway 的 `config check` 里补（它知道有没有配，这里没配就什么都不说，
+/// 免得每份不登录的配置都带一条警告）。
+fn check_oidc(snapshot: &ConfigSnapshot, issues: &mut Vec<ConfigIssue>) {
+    let Some(oidc) = &snapshot.start_only.oidc else {
+        return;
+    };
+    let loopback = |url: &reqwest::Url| {
+        matches!(
+            url.host_str(),
+            Some("localhost" | "127.0.0.1" | "[::1]" | "::1")
+        )
+    };
+    match reqwest::Url::parse(&oidc.issuer) {
+        Ok(url)
+            if url.host().is_some()
+                && url.query().is_none()
+                && (url.scheme() == "https" || (url.scheme() == "http" && loopback(&url))) => {}
+        _ => issues.push(error(
+            "auth.oidc.issuer",
+            format!(
+                "`{}` 要是 https 地址（只有回环地址可以用 http），不带查询串，如 https://id.example.com",
+                oidc.issuer
+            ),
+        )),
+    }
+    if oidc.client_id.is_empty() {
+        issues.push(error("auth.oidc.client_id", "client_id 不能是空的"));
+    }
+    match reqwest::Url::parse(&oidc.public_url) {
+        Ok(url)
+            if url.host().is_some()
+                && matches!(url.path(), "" | "/")
+                && url.query().is_none()
+                && url.fragment().is_none()
+                && matches!(url.scheme(), "http" | "https") =>
+        {
+            if url.scheme() == "http" && !loopback(&url) {
+                issues.push(warning(
+                    "auth.oidc.public_url",
+                    "公开地址是 http：会话 cookie 不带 Secure，令牌明文过网。经 Cloudflare / Tailscale 访问时应填 https 地址",
+                ));
+            }
+        }
+        _ => issues.push(error(
+            "auth.oidc.public_url",
+            format!(
+                "`{}` 要写成 komo 的公开根地址（http(s)://主机[:端口]，不带路径），回调地址由它拼成 <public_url>/auth/callback",
+                oidc.public_url
+            ),
+        )),
+    }
+    if oidc.allowed_subjects.is_empty() && oidc.allowed_emails.is_empty() {
+        issues.push(error(
+            "auth.oidc.allowed_subjects",
+            "allowed_subjects 与 allowed_emails 至少要写一个：不在名单里的账号一律拒绝，名单为空就没有人能登录",
+        ));
+    }
+    if !snapshot.credentials.contains_key(&oidc.client_secret_env) {
+        issues.push(warning(
+            "auth.oidc.client_secret_env",
+            format!(
+                "环境变量 {} 没有值：按公开客户端（只靠 PKCE、不带 secret）去换令牌，身份提供方那边的客户端要勾「公开客户端」",
+                oidc.client_secret_env
             ),
         ));
     }

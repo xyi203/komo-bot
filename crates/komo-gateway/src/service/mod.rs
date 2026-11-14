@@ -281,6 +281,11 @@ pub async fn start(options: ServiceOptions) -> Result<Running, ServiceError> {
     durable::background::spawn(&state, &shutdown);
 
     // 9. HTTP。
+    if snapshot.start_only.oidc.is_none() {
+        tracing::warn!(
+            "未配置登录（config.toml 的 [auth.oidc]）：网页没法登录，桌面端 / CLI 也换不到设备令牌；机器上的命令行仍用本机令牌"
+        );
+    }
     let app = crate::http::router(Api::new(Arc::clone(&state), addr));
     let serving = shutdown.clone();
     tokio::spawn(async move {

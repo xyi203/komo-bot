@@ -710,13 +710,14 @@ impl McpConnection {
         }
     }
 
-    /// 这台服务器在哪：stdio 的命令加参数，http 的 URL（去掉账号与查询串，那里最容易带 token）。
+    /// 这台服务器在哪：stdio 只给程序名（basename，参数里可能带令牌所以不给），http 的 URL
+    /// （去掉账号与查询串，那里最容易带 token）。
     fn endpoint(&self) -> String {
         match &self.config.transport {
-            McpTransport::Stdio { command, args, .. } => std::iter::once(command.as_str())
-                .chain(args.iter().map(String::as_str))
-                .collect::<Vec<_>>()
-                .join(" "),
+            McpTransport::Stdio { command, .. } => std::path::Path::new(command)
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| command.clone()),
             McpTransport::Http { url, .. } => {
                 let without_query = url.split(['?', '#']).next().unwrap_or(url);
                 match without_query.split_once("://") {

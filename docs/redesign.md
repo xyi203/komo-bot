@@ -217,16 +217,17 @@
 
 - [x] 命令在哪里执行：都在远程那台机器上（P20），不做本机执行端
 - [ ] 现状：通过 Cloudflare 隧道与 Tailscale 访问远程机器上的 komo（操作者 2026-11-13 说明）。入口和传输加密已经有了
-- [ ] 登录接 OIDC（操作者 2026-11-13 定）：komo 作为接入方，走授权码流程（带 PKCE）
-  - 配置：签发方地址、客户端 ID、客户端密钥（放 `.env`）、允许登录的账号（邮箱或 subject，单人就一个）、回调地址
-  - 路由：发起登录、回调（校验签名、签发方、受众、nonce、有效期，再核对允许名单）、退出
-  - 登录成功后发 komo 自己的会话 cookie（`HttpOnly`），会话要落盘，服务重启不掉登录
-  - 网页：没登录或会话过期时跳去登录；设置的「关于」里显示当前账号与退出
-  - 身份提供方：自己搭的 Pocket ID（操作者 2026-11-13 定）。在它那边建一个客户端，回调地址填 komo 的回调路由；komo 这边签发方地址填 Pocket ID 的地址。它对 PKCE、发现文档的支持情况未核实，落地前看它的文档
-  - **配对码去掉**（操作者 2026-11-13 定）：删 `komo web` 的配对链接、`/pair` 页面与 `routes/pair.tsx`、`/v1/web/pair-code`、`/v1/web/session` 里换 cookie 的那条路、未配对时的提示组件。桌面端现在怎么鉴权未核实，若走配对要一并改
-  - 机器上的命令行仍用本机令牌（`runtime/gateway.json`），不经 OIDC；这也是 Pocket ID 不可用时的唯一后路：登到机器上处理
-  - 新依赖（OIDC 客户端库）要补 `docs/komo_bot.md` §13.4 的依赖表
-  - 用哪家身份提供方不写死：按标准发现文档（`.well-known/openid-configuration`）接，Cloudflare Access、公司的 SSO、自建的都行
+- [x] 登录接 OIDC（操作者 2026-11-13 定）：komo 作为接入方，走授权码流程（带 PKCE）。**服务端 2026-11-14 已做（5a），未对真实 Pocket ID 实测**，实测步骤见 `docs/clients.md` §9.1；网页一侧见本条下面单独的未勾条目
+  - 配置：签发方地址、客户端 ID、客户端密钥（放 `.env`）、允许登录的账号（邮箱或 subject，单人就一个）、回调地址。（已做：`[auth.oidc]` 的 `issuer` / `client_id` / `client_secret_env`（默认 `KOMO_OIDC_CLIENT_SECRET`）/ `allowed_subjects` / `allowed_emails` / `public_url`，回调地址 = `<public_url>/auth/callback`）
+  - 路由：发起登录、回调（校验签名、签发方、受众、nonce、有效期，再核对允许名单）、退出。（已做：`GET /auth/login`、`GET /auth/callback`、`POST /auth/logout`，另有 `GET /auth/me`）
+  - 登录成功后发 komo 自己的会话 cookie（`HttpOnly`），会话要落盘，服务重启不掉登录。（已做：`aux.db` 的 `auth_sessions`，只存令牌哈希，30 天滑动续期，可列出可吊销）
+  - 网页：没登录或会话过期时跳去登录；设置的「关于」里显示当前账号与退出。（**服务端接口已备好：`GET /auth/me`、`POST /auth/logout`、`GET /v1/auth/sessions`；网页一侧未做**）
+  - 身份提供方：自己搭的 Pocket ID（操作者 2026-11-13 定）。在它那边建一个客户端，回调地址填 komo 的回调路由；komo 这边签发方地址填 Pocket ID 的地址。它对 PKCE、发现文档的支持情况未核实，落地前看它的文档（**仍未核实**：komo 按标准发现文档与 PKCE S256 接，没有写任何 Pocket ID 专有路径；ID token 只认 RS256 / ES256 / EdDSA）
+  - **配对码去掉**（操作者 2026-11-13 定）：删 `komo web` 的配对链接、`/pair` 页面与 `routes/pair.tsx`、`/v1/web/pair-code`、`/v1/web/session` 里换 cookie 的那条路、未配对时的提示组件。桌面端现在怎么鉴权未核实，若走配对要一并改。（**服务端部分已删（5a）**：`komo web` 只打开地址、两个接口、`PairCodeResponse` / `PairRequest`、内存会话表与对应测试、文档；`/pair` 页面与 `routes/pair.tsx`、未配对提示组件在网页一侧，未做。桌面端不走配对，不受影响。存量：配对出来的 cookie 本来只在内存里，升级重启即失效，没有需要迁移的；本机令牌不变）
+  - 机器上的命令行仍用本机令牌（`runtime/gateway.json`），不经 OIDC；这也是 Pocket ID 不可用时的唯一后路：登到机器上处理。（已保持；另加 `komo login` / `komo logout` 给别的机器上的命令行连远程用，存 `remote.json`）
+  - 新依赖（OIDC 客户端库）要补 `docs/komo_bot.md` §13.4 的依赖表。（已做：不引 OIDC / JWT 库，验签直接用工作区已有的 `ring`，登记了 `ring` / `base64` / `uuid` v4 特性）
+  - 用哪家身份提供方不写死：按标准发现文档（`.well-known/openid-configuration`）接，Cloudflare Access、公司的 SSO、自建的都行（已做）
+- [ ] 网页登录（网页一步，未做）：没登录跳 `/auth/login`、设置「关于」里账号与退出与设备清单（接 `GET /auth/me`、`POST /auth/logout`、`GET /v1/auth/sessions`、`DELETE /v1/auth/sessions/{id}`）、删 `/pair` 页面与 `routes/pair.tsx` 及未配对提示组件
 - [ ] 网页与接口放在同一个域名下：网页的静态文件发布到 Cloudflare（Workers 静态资源或 Pages），同一个域名下 `/v1/*` 转到隧道后面的 Gateway。这样仍是同源，cookie 与事件流不用改；「分开部署」指两个产物各自发布，不是跨域。**同一域名下静态资源与隧道按路径分流的具体配法、事件流经过这层是否正常，未核实**
 - [ ] Gateway 不再托管网页（做成可关的开关，本机开发时仍可用）
 - [ ] 传输加密已由 Cloudflare 与 Tailscale 承担；Gateway 的 Host 校验把用到的域名加进 `trusted_hosts`（现有配置）
@@ -234,13 +235,13 @@
 - [ ] 版本错位：网页与服务端分开发布后，网页启动时核对服务端的协议版本，不兼容时提示刷新或升级
 - [ ] MCP 的授权回调：现在听本机随机端口，要改走服务的公开地址（`docs/tasks.md` §5.3 记过）
 - [ ] Codex 等登录流程搬进网页（设备码显示在网页上）
-- [ ] 公网那条路上登录是唯一的墙（命令执行没有限制）：登录的失败限制由身份提供方承担；除登录相关的路由与健康检查外，所有路由都要过会话校验，不留绕过的路
+- [x] 公网那条路上登录是唯一的墙（命令执行没有限制）：登录的失败限制由身份提供方承担；除登录相关的路由与健康检查外，所有路由都要过会话校验，不留绕过的路（已做：所有 `/v1/**`，含 SSE，经同一层鉴权，只认本机令牌 / 设备令牌 / 登录 cookie；`/healthz`、`/auth/*` 与静态文件不要登录。没有 WebSocket 路由）
 - [ ] 只为「装在自己电脑上」存在的东西可以删：macOS 的 launchd 托管、桌面端的「本机模式」（自己拉起 Gateway）、本机发现文件的客户端读取路径。Linux 的 systemd 托管与更新方式按实际部署保留
 - [ ] 桌面端只剩「连远程」一种用法：保留还是只用网页，待定
 - [ ] 桌面端改成 OIDC 登录（已核对 `apps/desktop/src/main/`）：现在远程模式是手填地址加令牌，主进程转发请求时带上令牌；不走配对码，删配对码不影响它
   - 连接页的「设备令牌」输入框换成「登录」按钮：用系统浏览器打开 komo 的登录地址，由服务端走完 OIDC
   - 登录完成后服务端跳回 `komo://`（深链处理已有，现在只认 `komo://session/<id>`，加一种形状），带一个一次性的码；桌面端用它换一个长期的设备令牌
-  - 服务端要新做：这条「登录后给桌面端发设备令牌」的路，以及设备令牌本身的签发、保存与吊销（`docs/clients.md` 里计划在 C3，代码里还没有）
+  - 服务端要新做：这条「登录后给桌面端发设备令牌」的路，以及设备令牌本身的签发、保存与吊销（`docs/clients.md` 里计划在 C3，代码里还没有）。（**服务端已做（5a）**：`GET /auth/device/authorize` → `POST /auth/device/token`，`komo://auth/callback` 与本机回环回跳白名单，令牌只存哈希，`GET /v1/auth/sessions` / `DELETE /v1/auth/sessions/{id}` 列出与吊销；桌面端一侧未做，勾选留给 5b）
   - 不用改：令牌的加密保存、`app://` 转发时带令牌、额外请求头、连接测试
   - 删：本机模式（读本机的发现文件、拉起本机 Gateway）
 - [ ] 文档：`PRODUCT.md` 的定位与「本地优先」、`docs/clients.md` D5 / D6、`AGENTS.md` 的命令表与发布约定
@@ -256,6 +257,7 @@
 - [x] `cron_jobs`：并进 `matters`，表不再用（表与模型留着，回填之后不读写）
 - [x] `cron_firings`：保留，键从定时任务 id 换成目标 id
 - [x] `matters.chat_session`：绑定的支线对话（会话 id，可空；3a-2，`ColumnSpec` 带老库补列，旧行读成没绑定）。`MatterRepo` 加 `chat` / `chats` / `set_chat`，`CronRepo` 加 `firings_page`（默认实现，运行历史分页）
+- [x] `auth_sessions`（新表，2026-11-14，5a）：登录状态——网页会话与设备令牌，`kind` / `token_hash`（SHA-256，唯一索引）/ `subject` / `email` / `label` / 三个时间；与 `durable.db` 的对话 `sessions` 无关，建表走 `aux.db` 的 `TABLES` 迁移
 - [x] `sessions`：补最后一句话的时间（`SessionRecord.last_message_at`，会话行 JSON 里加一格，没有迁移）
 - [ ] 配置文件：MCP 工具启停、服务器启用、技能与渠道启用；删群聊相关键
 - [x] 回填：存量定时任务 → 目标（单元测试覆盖；对 `~/.komo` 副本的演练待统一验证阶段补）

@@ -5,6 +5,7 @@
 use axum::Json;
 use axum::extract::{Path, State};
 use komo_config::{CatalogRow, EditError, EmbeddingFields, ModelFields, ProviderFields};
+use komo_kernel::protocol::config::{ConfigIssue, IssueSeverity, KeyPath};
 use komo_kernel::protocol::http::{
     ConfigCheckResponse, ConfigEditResponse, ConfigEnvResponse, ConfigModelsResponse,
     ConfigReloadResponse, ConfigSettingsResponse, ConfigVersionRequest, DefaultModelRequest,
@@ -90,6 +91,14 @@ pub async fn check(State(api): State<Api>) -> Json<ConfigCheckResponse> {
         if !stale && !issues.contains(&warning) {
             issues.push(warning);
         }
+    }
+    // 没配登录是合法的（命令行用本机令牌），但网页因此登不了——提一句，免得操作者以为是网页坏了。
+    if snapshot.start_only.oidc.is_none() {
+        issues.push(ConfigIssue {
+            key: KeyPath::new("auth.oidc"),
+            severity: IssueSeverity::Warning,
+            message: "未配置登录：网页没法登录，桌面端 / CLI 也换不到设备令牌（机器上的命令行仍用本机令牌）；要登录请写 [auth.oidc]，见 docs/clients.md「操作者怎么实测」".into(),
+        });
     }
     Json(ConfigCheckResponse {
         issues,

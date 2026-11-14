@@ -82,6 +82,7 @@ pub fn sample_snapshot() -> ConfigSnapshot {
             otlp_endpoint: None,
             web_dir: None,
             trusted_hosts: vec![],
+            oidc: None,
         },
         model_catalog: ModelCatalog {
             default: "main".into(),

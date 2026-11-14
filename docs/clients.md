@@ -1,6 +1,6 @@
 # 客户端：网页、macOS、手机
 
-> 状态：部分实施。草案（2026-11-01）；**C0 已实现（2026-11-02，§6.1）、C1 已实现（2026-11-03，§6.2）、C2 已实现（§6.3，未签名）**，C3（远程访问、设备配对、PWA 与 Web Push）、C4 未做。已由操作者拍板的有三条：前端栈用 TanStack Start、macOS 用 Electron、网页由 Gateway 托管
+> 状态：部分实施。草案（2026-11-01）；**C0 已实现（2026-11-02，§6.1）、C1 已实现（2026-11-03，§6.2）、C2 已实现（§6.3，未签名）**，C3（远程访问、PWA 与 Web Push）、C4 未做；**2026-11-14 起登录改成 OIDC（服务端已做、未对真实提供方实测，§9），D6 与「设备配对」按 §9 为准**。已由操作者拍板的有三条：前端栈用 TanStack Start、macOS 用 Electron、网页由 Gateway 托管
 > （借鉴 Hermes Agent 与 DeepSeek Harness，见 §7）；2026-11-02 补拍板：新版界面要多语言，语言偏好只存在各端（D9）；
 > 同日操作者认可按 §2 的建议做 D1–D6、D9（文案表用 Paraglide JS）。D7、D8 仍是建议。
 > 取代 [`roadmap-muse.md`](roadmap-muse.md) §4.4"手机端先用飞书，不做原生 App"。界面规格在 [`web.md`](web.md)（C1 起是新版的规格），
@@ -29,7 +29,7 @@ macOS 应用和手机端，需要一套标准的前端栈，以及一份所有�
 | D3 | 协议类型 | kernel `protocol::http` 生成 TypeScript 类型，提交进仓库，加一条测试确认生成物是最新的 | 前后端字段对不上的错误在编译期暴露。要给 kernel 加 `ts-rs`（放在 feature 后面），需先补 §13.4 的依赖表 |
 | D4 | 仓库结构 | 仓库根加 pnpm workspace：`apps/client`（Start SPA）、`apps/desktop`（Electron）、`packages/protocol`（生成的类型）、`packages/api`（HTTP + SSE 客户端与 Query hooks）；以后加 `apps/mobile` | 界面、协议、各端的壳各管一摊。原型 `apps/web` 留到新版对齐后再删（C1 已删） |
 | D5 | 网页由谁提供 | Gateway 同源提供 SPA 产物：`/v1/*` 是 API，其余路径先找静态文件，找不到回落 `_shell.html`（已拍板，同 Hermes） | 去掉 `serve.mjs`；浏览器、PWA、手机都只认 Gateway 一个地址（web.md §9 第 1 条）。网页跟 Gateway 一起发布，协议不会错位；同源时 cookie 鉴权可用。不放到 Cloudflare Worker：浏览器反正要连到 Gateway，放在 Worker 上只多一处部署，还会跨域、版本错位 |
-| D6 | 浏览器怎么鉴权 | 配对换 cookie：`komo web` 打开 `http://127.0.0.1:7777/pair#code=<一次性码>`，Gateway 换成 `HttpOnly; SameSite=Strict` 的会话 cookie；`auth` 层同时接受 Bearer 与这个 cookie；会改东西的请求另外核对 `Origin`。另加 **Host 校验**：只接受回环地址、监听地址和 `[gateway] trusted_hosts` 里列出的 Host，其余一律 403（同 DeepSeek Harness） | `EventSource` 带不了请求头，cookie 能带；`HttpOnly` 让 JS 拿不到；一次性码用完作废，不进日志。Host 校验挡的是 DNS 重绑定：恶意网页把自己的域名改解析到 `127.0.0.1`，就能以"同源"身份读 Gateway 的响应。cookie 按主机名隔离，带不过去，但不需要鉴权的路由（静态文件、`/healthz`、配对换 cookie）照样暴露。校验只负责放行，鉴权仍靠令牌和 cookie |
+| D6 | 浏览器怎么鉴权 | **（2026-11-14 改写，原配对码方案已删，P21）** OIDC 登录换 cookie：网页没登录时跳 `/auth/login`，Gateway 走 OIDC 授权码 + PKCE 到操作者自建的身份提供方，回调里核对允许名单后种 `komo_session`（`HttpOnly; SameSite=Lax`，公开地址是 https 时带 `Secure`），会话落 `aux.db`、重启不掉；`auth` 层认本机令牌 / 设备令牌（Bearer）与这个 cookie；会改东西的 cookie 请求另外核对 `Origin`（同 `Host` 或等于 `public_url` 的源）。**Host 校验**不变：只接受回环地址、监听地址、`[gateway] trusted_hosts` 与 `public_url` 的主机，其余一律 403（同 DeepSeek Harness）。细节见 §9 | `EventSource` 带不了请求头，cookie 能带；`HttpOnly` 让 JS 拿不到；自己不存密码、不做登录失败限制，那是身份提供方的事。Host 校验挡的是 DNS 重绑定：恶意网页把自己的域名改解析到 `127.0.0.1`，就能以"同源"身份读 Gateway 的响应。不需要鉴权的路由（静态文件、`/healthz`、`/auth/*`）照样暴露，所以 `/auth/*` 里不放任何不经校验就能用的东西。校验只负责放行，鉴权仍靠令牌和 cookie |
 | D7 | macOS | **Electron**（已拍板），用 electron-builder 打包和自动更新；连接分本机与远程两种模式 | 跟网页同一套代码。见 §4 |
 | D8 | 手机 | 先做 PWA；PWA 不够用时再用 Capacitor 套壳 | 见 §5 |
 | D9 | 多语言 | 新版从第一行界面代码起就走文案表，先做 `zh-CN` 与 `en`；文案表用 Paraglide JS（编译期生成带类型的消息函数）。语言偏好**只存在各端**（已拍板）：浏览器与 PWA 存 `localStorage`，Electron 存在自己的设置里，Capacitor 存在 App 偏好里；没选过就跟系统语言（`zh*` 用中文，其余用英文） | 原型里几百处写死的中文不再搬第二次：C1 迁移一节就抽一节的文案。消息函数带类型，漏翻、键名写错在编译期报错，没用到的文案不进产物。偏好不进 Gateway：语言是看界面的人的事，同一个 Gateway 可以有人用中文、有人用英文；代价是换设备要重选一次 |
@@ -92,11 +92,10 @@ macOS 应用和手机端，需要一套标准的前端栈，以及一份所有�
    网页由 Gateway 托管，所以经隧道打开时仍然同源，D6 的 cookie 照样能用。
 
    经反向代理或隧道访问时，Gateway 看不到浏览器实际用的地址，需要两项配置（同 DeepSeek Harness 的 `--public-url` /
-   `--trusted-host`）：`[gateway] public_url` 告诉 Gateway 对外地址，用在 `komo web` 打印的链接和配对二维码里；
-   `trusted_hosts` 把这个域名加进 D6 的 Host 校验。代理要原样转发 `Host`，不要改写成 `127.0.0.1:7777`。浏览器那一段
-   必须是 HTTPS，否则配对码和 cookie 都是明文；cookie 在 HTTPS 下加 `Secure`。
-2. **设备配对**：电脑上出二维码，手机扫码后换到一个只属于这台设备的令牌，可以单独吊销。设备清单的存放位置待定：
-   按 §11.2"身份在配置里"的先例，倾向于放进 `config.toml`，令牌的哈希放进 `.env`。
+   `--trusted-host`）：`[auth.oidc] public_url` 告诉 Gateway 对外地址（OIDC 回调、cookie 的 `Secure`、`Origin` 核对都看它，它的主机自动进 D6 的 Host 校验；2026-11-14 取代原先设想的 `[gateway] public_url`）；
+   `trusted_hosts` 仍可再加别的域名。代理要原样转发 `Host`，不要改写成 `127.0.0.1:7777`（改写了也行：`Origin` 另认 `public_url` 的源）。浏览器那一段
+   必须是 HTTPS，否则令牌和 cookie 都是明文；cookie 在 `public_url` 是 https 时加 `Secure`。
+2. **设备令牌**（2026-11-14 已做服务端，§9）：不再用二维码配对。桌面端 / CLI 走「跳系统浏览器登录再跳回」换一个只属于这台设备的长期令牌，可以单独吊销；令牌哈希与设备清单落在 `aux.db` 的 `auth_sessions`（原先「放进 `config.toml` / `.env`」的设想作废）。手机 PWA 直接用网页的 OIDC 登录。
 3. **PWA**：manifest、图标、service worker。推送用 Web Push：Gateway 拿 VAPID 密钥直接推，不需要自建推送服务。
    iOS 要先"添加到主屏幕"才能收推送（16.4 起支持）。
 4. **原生壳（按需）**：碰到 PWA 的硬限制再做，比如 iOS 推送不够稳，要分享扩展、小组件、快捷指令，或者要读位置、
@@ -109,7 +108,7 @@ macOS 应用和手机端，需要一套标准的前端栈，以及一份所有�
 | C0（**已做**，§6.1） | workspace、协议类型生成、`packages/api`、Start SPA 壳与 token、多语言骨架（文案表、语言切换、lint）、Gateway 提供静态文件与 cookie 鉴权 | `komo web` 打开 7777 上的新壳，能列会话、能收 SSE，能在中英文之间切换 |
 | C1（**已做**，§6.2） | 按 §3 的顺序逐节迁移，对齐原型；每节的文案同时进中英文两份 | web.md 每一节都有新版对应，且两种语言下都检查过；`apps/web` 与 `serve.mjs` 删除 |
 | C2（**已做**，§6.3） | Electron 壳（§4） | 签名后的 `.app` 能连本机 Gateway，通知与托盘可用 |
-| C3 | 远程访问（Tailscale 或 Tunnel，`public_url` / `trusted_hosts`）、设备配对、PWA 与 Web Push（§5 的 1–3） | iPhone 主屏幕上的 PWA 能聊天、收确认卡推送 |
+| C3 | 远程访问（Tailscale 或 Tunnel，`public_url` / `trusted_hosts`）、设备令牌（服务端 2026-11-14 已做，§9）、PWA 与 Web Push（§5 的 1–3） | iPhone 主屏幕上的 PWA 能聊天、收确认卡推送 |
 | C4 | Capacitor 原生壳（§5 的 4） | 按需 |
 
 ### 6.1 C0 实际做了什么（2026-11-02）
@@ -117,12 +116,12 @@ macOS 应用和手机端，需要一套标准的前端栈，以及一份所有�
 | 项 | 位置 | 状态 |
 |---|---|---|
 | pnpm workspace（D4） | 根 `package.json` / `pnpm-workspace.yaml`；`apps/client`、`packages/protocol`、`packages/api`；`apps/desktop` 不在 C0，原型 `apps/web` 不动 | 完成。`pnpm install` / `build` / `lint` / `typecheck` 都过 |
-| 协议类型（D3） | kernel 的 `ts` feature（默认关）；`protocol/ts.rs` 导出到 `packages/protocol/src/generated/`；`cargo test -p komo-kernel --features ts` 核对生成物是最新的，`KOMO_UPDATE_TS=1` 重新生成；§13.4 已登记 `ts-rs` | 完成，**导出的是最小集合**：`ErrorBody`（`ApiError`、`ErrorCode`）、`HealthResponse`、`SessionListResponse`（`SessionSummary`、`RunState`、`WaitReason`…）、`EventQuery`、`EventPage`、`SseFrame`、配对的两个类型 |
+| 协议类型（D3） | kernel 的 `ts` feature（默认关）；`protocol/ts.rs` 导出到 `packages/protocol/src/generated/`；`cargo test -p komo-kernel --features ts` 核对生成物是最新的，`KOMO_UPDATE_TS=1` 重新生成；§13.4 已登记 `ts-rs` | 完成，**导出的是最小集合**：`ErrorBody`（`ApiError`、`ErrorCode`）、`HealthResponse`、`SessionListResponse`（`SessionSummary`、`RunState`、`WaitReason`…）、`EventQuery`、`EventPage`、`SseFrame`、登录的几个类型（2026-11-14 起；原配对的两个类型已删） |
 | `packages/api` | `fetch` 封装（同源相对路径、cookie、失败统一成 `ApiError`）、`subscribeSession`（SSE 带游标续传）、按资源组织的 Query key、`useSessions` / `useHealth` / `useSessionStream`、`invalidateOnFrame` | 完成 |
 | SPA 壳 | `apps/client`：TanStack Start SPA 模式 + Tailwind v4（DESIGN.md token 在 `src/styles.css` 的 `@theme`）+ shadcn/ui 初始化（`components.json`、`cn`、一个 Button）；左栏会话列表、选中后显示 SSE 帧、语言切换 | 完成，界面只到"列会话、看事件流"，其余留给 C1 |
 | 多语言（D9） | Paraglide JS（`messages/{zh-CN,en}.json`）；偏好存 `localStorage`，没选过按系统语言（`zh*` 中文，其余英文）；日期、相对时间、数字走 `Intl`；`pnpm lint` 里 `scripts/lint-i18n.mjs` 在 JSX 里发现中文字面量就报错 | 完成 |
 | Gateway 静态文件（D5） | `[web] dir`（没配退到二进制旁的 `web/`）；`/v1/*`、`/healthz` 照旧，其余先找文件、无扩展名回落壳 html；目录不存在只是没有网页；`komo config check` 对不存在的目录给警告 | 完成；`[web] dir` 与 `trusted_hosts` 是**启动期键**（改了重载会报"需要 `komo gateway restart`"） |
-| 鉴权（D6） | `komo web [--no-open]`；`POST /v1/web/pair-code`（只认 Bearer）与 `POST /v1/web/session`；`auth` 层认 Bearer 或 cookie，cookie 的写请求核对 Origin；所有路由先过 Host 校验；Rust 单测与 `tests/web` 集成测试 | 完成，见下面的偏离 |
+| 鉴权（D6） | C0 时是配对码换 cookie；**2026-11-14 改成 OIDC 登录 + 设备令牌（§9）**：`komo web [--no-open]` 只打开地址，`/auth/*` 与 `/v1/auth/sessions`，`auth` 层认本机令牌、设备令牌或 cookie，cookie 的写请求核对 Origin；所有路由先过 Host 校验；Rust 单测与 `tests/web` 集成测试 | 服务端完成（真实提供方未实测），网页一侧待做 |
 | 开发流程 | `apps/client/vite-gateway-proxy.ts`：`pnpm dev` 把 `/v1`、`/healthz` 转给本机 Gateway，令牌每次请求现读 `$KOMO_HOME/runtime/gateway.json` | 完成；开发模式下令牌由代理带，**不需要配对** |
 | 发布约定（§13.6） | 包里多 `web/`；`release.yml` 构建并打进归档，`install.sh`、`update.rs` 装到二进制旁（`web` 是指向 `komo-web/<代次>/` 的符号链接，一次 `rename` 换上） | 完成，三处一起改；`update.rs` 有单测，`release.yml` / `install.sh` 没法本地跑，只对过路径 |
 
@@ -131,8 +130,8 @@ macOS 应用和手机端，需要一套标准的前端栈，以及一份所有�
 - **构建产物在 `apps/client/dist/client/`，不是 `dist/`**：Start 的 client 环境这么输出（旁边的 `dist/server` 用不到）。开发时 `[web] dir` 指 `apps/client/dist/client`，`release.yml` 拷的也是这个目录。壳 html 是 `_shell.html`，Gateway 回落时先找它，再找 `index.html`。
 - **SSE 自己重连，不用 `EventSource` 的自动重连**：浏览器只记最后一个 `id:`，而 `run_status` / `assistant_delta` 这类派生帧与源事件同号，拿它当游标可能跳过还没送到的源事件。`subscribeSession` 记的是原始事件（`event` 帧）的 seq，`error` 来了就关掉自动重连，按退避自己重开并带 `?from=<seq>`。
 - **`Event` 没有 derive 能描述的形状**（自定义序列化），线上给 `WireEvent` 这个裸信封（`type` + `data`），`data` 是 `unknown`，由界面按 `type` 收窄；`SseEvent::NestedCalls.calls` 同样是 `unknown[]`。线上 `skip_serializing_if` 的 `Vec`（如 `ApiError.keys`）为空时不出现，TS 里仍是必填，`ApiError` 读的时候补成空数组。
-- **配对码两分钟失效、最多同时 64 个；会话 cookie 30 天、最多 64 个，Gateway 重启就全部失效**（重新 `komo web`）。`Secure` 靠请求的 `X-Forwarded-Proto: https` 判断（Gateway 自己不终止 TLS）；`public_url` 与二维码留给 C3。
-- **Host 校验只比主机名，端口不参与**；监听地址 `0.0.0.0` 时 `0.0.0.0` 本身也放行（本机客户端用发现文件里的 `base_url` 连）。cookie 写请求缺 `Origin` 按不同源处理（浏览器发 POST 一定带）；`POST /v1/web/session` 没有 cookie，所以只在带了 `Origin` 时核对同源，curl 照常能换。
+- **（C0 当时的做法，已被 §9 取代）配对码两分钟失效、会话 cookie 在内存里、Gateway 重启就全部失效。** 现在会话落盘、`Secure` 看 `public_url` 的协议，不再看 `X-Forwarded-Proto`。
+- **Host 校验只比主机名，端口不参与**；监听地址 `0.0.0.0` 时 `0.0.0.0` 本身也放行（本机客户端用发现文件里的 `base_url` 连）。cookie 写请求缺 `Origin` 按不同源处理（浏览器发 POST 一定带）。
 - **Paraglide 构建时从 jsDelivr 取 inlang 的 message-format 插件**（`project.inlang/settings.json` 的 `modules`），缓存在 `project.inlang/cache`（已忽略）；第一次构建需要联网。
 - **TypeScript 7**（原生 `tsc`）；`pnpm lint` = 自写的 i18n 检查脚本（oxc-parser 解析 JSX）+ oxlint 默认规则（不带配置文件，按 `.gitignore` 跳过生成物）。ESLint 与 typescript-eslint 已移除——后者只支持 TypeScript <6.1。
 - pnpm 11 的"发布满一定天数才装"策略把三个新版本拦下，已按提示加进 `pnpm-workspace.yaml` 的 `minimumReleaseAgeExclude`。
@@ -193,7 +192,7 @@ macOS 应用和手机端，需要一套标准的前端栈，以及一份所有�
 - **打开会话**：`onOpenSession(id => router.navigate(...))`。**登记过才会收到**；没登记时主进程退回整页跳转到 `app://komo/sessions/<id>`（现有 C0 路由），所以不接也能用，只是会整页重载。
 - **连接设置入口**：连接设置页是壳自带的 `app://komo/_desktop/page.html?kind=settings`（菜单 ⌘, 与托盘也能进）。界面的设置页放个按钮调 `komoDesktop.connection.openSettings()` 即可，别再自己做一份；Gateway 地址与令牌不进 SPA。
 - **版本不一致/连不上**：主进程在进入 SPA 之前就拦在 `_desktop/page.html?kind=mismatch|error`，SPA 不需要处理；SPA 里 Gateway 掉线后的错误提示照常走 `ErrorBody`（转发失败会得到 502 + `error.code = "internal"`）。设置页可以用 `connection.get()` 显示两边版本。
-- 请求照旧用同源相对路径 `/v1/*`；Electron 里不会有 cookie，也不要走 `/pair`。
+- 请求照旧用同源相对路径 `/v1/*`；Electron 里不走 cookie（配对页 `/pair` 已删）；桌面端的登录要改成设备令牌（§9，桌面端一侧是 5b）。
 - 开发：`pnpm desktop:dev` 用的是 SPA 的构建产物，没有热更新；改界面仍用 `pnpm dev` 在浏览器里调。
 
 ## 7. 参考：Hermes Agent 与 DeepSeek Harness
@@ -222,7 +221,7 @@ DeepSeek Harness（`deepseek-ai/deepseek-harness`，同日读的公开部署文�
   `dsh-app://app/` 加载打包好的网页，请求由主进程转发给后端，凭据只附加在自己的窗口上，渲染进程拿不到令牌。Electron
   壳与 dsh 永远同一个版本号，后端升级就是一次桌面发布。
 
-komo 照搬的：启动令牌换 cookie、Host 校验（D6）、`public_url` / `trusted_hosts`（§5）、同版本
+komo 照搬的：Host 校验（D6）、`public_url` / `trusted_hosts`（§5）、同版本
 发布（§4）。不照搬的：dsh 桌面版自己持有后端进程，komo 的 App 只连接常驻的 Gateway。
 
 ## 8. 待定
@@ -232,5 +231,71 @@ komo 照搬的：启动令牌换 cookie、Host 校验（D6）、`public_url` / `
 - D3 的新依赖（`ts-rs`）要先补 §13.4 的依赖表；不加的话，退路是用 `schemars` 出 JSON Schema 再转 TypeScript，依赖一样要登记。
 - 包管理器用 pnpm；Node 版本跟 Electron 内置的版本对齐。
 - Apple Developer 账号与签名证书（C2 前）。
-- 设备清单与令牌放在哪（C3 前）。
+- ~~设备清单与令牌放在哪（C3 前）~~：已定，`aux.db` 的 `auth_sessions`（§9）。
 - 远程访问先用 Tailscale 还是 Cloudflare Tunnel + Access（C3 前；Tunnel 连的是本机地址，Gateway 不用改，Tailscale 要加监听配置）。
+
+## 9. 登录：OIDC、设备令牌、操作者怎么实测（2026-11-14）
+
+> 状态：**服务端已实现，未对真实的身份提供方实测**；网页（跳登录、「关于」里的账号与退出）、桌面端（连接页「登录」按钮、`komo://` 回跳）由各自的步骤做。设计在 `redesign.md` §2.9（P19–P21），接口与配置键的权威描述在 `komo_bot.md` §13.1「登录」。
+
+**一图看流程**
+
+```text
+网页      浏览器 ──GET /auth/login──▶ Gateway ──303──▶ 提供方（登录）
+                                                        │ 303 带 code + state
+          浏览器 ◀──303 + Set-Cookie komo_session── Gateway ◀── GET /auth/callback
+
+设备      客户端 起回跳端口 ─ 打开 /auth/device/authorize?code_challenge=…&redirect_uri=http://127.0.0.1:P/callback
+          └▶（同上走一遍 OIDC，已登录的浏览器可跳过）─▶ Gateway 303 到 redirect_uri?code=一次性码
+          客户端 ──POST /auth/device/token {code, code_verifier, redirect_uri}──▶ 设备令牌（Bearer）
+```
+
+**凭据与权限**：所有 `/v1/**` 接受本机令牌、设备令牌或登录 cookie；`/healthz`、`/auth/*` 不要求登录。本机令牌（`runtime/gateway.json`）只给机器上的命令行，不经 OIDC——身份提供方挂了，登到机器上处理。没配 `[auth.oidc]` 时网页与设备都登不了（`GET /auth/me` 报 `oidc_configured: false`，`komo config check` 有警告）。
+
+**设备登录的回跳白名单**（`GET /auth/device/authorize` 的 `redirect_uri`）：`komo://auth/callback`（桌面端深链；注意这与现有的 `komo://session/<id>` 是另一种形状，桌面端要加一条处理）与本机回环地址的任意端口（`http://127.0.0.1:端口/…`、`localhost`、`[::1]`）。不在白名单里的地址 Gateway 页面报错，不跳转、不发码。
+
+**给网页 / 桌面端手写对接的协议类型**（`komo-kernel/src/protocol/http.rs`，TS 由 `KOMO_UPDATE_TS=1 cargo test -p komo-kernel --features ts` 重新生成到 `packages/protocol`）：`AuthMeResponse`、`AuthCredentialKind`（`web` / `device` / `local`）、`AuthSessionView`、`AuthSessionKind`（`web` / `device`）、`AuthSessionsResponse`、`AuthRevokeResponse`、`DeviceTokenRequest`、`DeviceTokenResponse`。网页的路由别占用 `/auth/*` 这几个路径（它们是 Gateway 的接口，不会回落到壳）。
+
+### 9.1 操作者怎么实测（**未实测**：本机没有真实的 Pocket ID，下面是照标准写的步骤，第一次跑要边做边核对）
+
+**1. 在 Pocket ID 里建 OIDC 客户端**（管理界面 → OIDC Clients → Add）
+
+- 回调地址（Callback URLs）：`<public_url>/auth/callback`，例如 `https://komo.example.com/auth/callback`。**只填这一个**；设备登录的回跳是 Gateway 与客户端之间的事，不经过 Pocket ID。
+- 登出回调可不填。要用 client secret 就保持默认的机密客户端（记下 Client ID 与 Client Secret）；不想放 secret 就勾「公开客户端」并开启 PKCE（komo 两种都支持，没有 secret 时只靠 PKCE）。
+- 记下 Pocket ID 的地址作为 `issuer`（它的发现文档在 `<issuer>/.well-known/openid-configuration`，先 `curl` 一下确认 `issuer` 字段与你填的一致、`jwks_uri` 能打开）。
+- 在 Pocket ID 里查到你自己的 `sub`（用户的 ID），或确认你的邮箱已验证——二选一写进名单。
+
+**2. 配 komo**（在跑 Gateway 的那台机器上）
+
+`config.toml`：
+
+```toml
+[auth.oidc]
+issuer = "https://id.example.com"
+client_id = "<Pocket ID 给的 Client ID>"
+public_url = "https://komo.example.com"
+allowed_subjects = ["<你的 sub>"]      # 或 allowed_emails = ["me@example.com"]
+```
+
+`.env`（权限 600）：`KOMO_OIDC_CLIENT_SECRET=<Client Secret>`（公开客户端不用写）。变量名可用 `client_secret_env` 改。`[auth.oidc]` 是启动期键：改完 `komo gateway restart`。再跑 `komo config check`：不应再有 `auth.oidc` 的「未配置登录」警告，也不应有 error。公开地址的域名要能打到 Gateway（Cloudflare 隧道 / Tailscale 已有，`public_url` 的主机会自动放进 Host 校验）。
+
+**3. 验网页登录**
+
+1. 浏览器打开 `<public_url>/auth/login`：应跳到 Pocket ID 登录，登完回到 `/`；开发者工具里应有 `komo_session`（HttpOnly、SameSite=Lax、https 下 Secure）。
+2. `curl -b 'komo_session=…'`（或浏览器里）`GET <public_url>/auth/me`：`authenticated: true`、`credential: "web"`、`subject` 是你的 sub。`GET /v1/sessions` 能通。
+3. **名单外的账号**：用另一个 Pocket ID 账号登录应得到「不允许登录」页（403），Gateway 日志有一条 warn。
+4. **重启不掉登录**：`komo gateway restart` 后同一个 cookie 仍然有效。
+5. **退出**：`POST /auth/logout`（浏览器里带同源 Origin）后 cookie 作废，`/auth/me` 回 `authenticated: false`。
+6. **跨站写被挡**：带 cookie 但 `Origin` 不是 `public_url` 的 `POST /v1/sessions` 应 403。
+7. **没有 SSE 断流**：登录后打开一个会话，事件流（`/v1/sessions/{id}/events`）经 Cloudflare 隧道应照常（`docs/redesign.md` §2.9 里「事件流经过这层是否正常」仍待核实）。
+
+**4. 验设备登录（命令行）**
+
+1. 在**另一台机器**（或同一台，先 `KOMO_HOME` 指个空目录）：`komo login https://komo.example.com --name my-laptop`。命令会打印并打开 `…/auth/device/authorize?…`，在浏览器里登录（已登录网页的浏览器会直接跳回），终端应打印「已登录 …（账号 <sub>）」，数据目录里多了 `remote.json`（0600）。
+2. `komo session list` 之类的命令应连到远程 Gateway；`GET /v1/auth/sessions`（网页或 `curl -H 'Authorization: Bearer <设备令牌>'`）应列出这台设备（`kind: "device"`、`current: true`）。
+3. `komo logout`：服务端该设备消失（`DELETE /v1/auth/sessions/{id}`），`remote.json` 删除，命令回到连本机。
+4. **回跳白名单**：手工打开 `…/auth/device/authorize?code_challenge=<43 字符>&redirect_uri=https://evil.example.com/cb` 应得到「不能发起设备登录」页，不跳转。
+
+**5. 桌面端**（5b 做完后再验）：连接页点「登录」→ 系统浏览器走完登录 → 跳回 `komo://auth/callback?code=…&state=…` → 桌面端 `POST /auth/device/token` 拿令牌。需确认：macOS 上浏览器从 303 重定向打开自定义协议是否弹确认、Chrome / Safari 是否放行。
+
+**已知没有的东西**：登录失败次数限制（交给身份提供方）、`next` 之外的登录后落点、多用户、会话的绝对寿命上限（网页会话只要 30 天内用过就一直续）、设备令牌过期（要靠吊销）。

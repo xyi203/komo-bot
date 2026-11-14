@@ -4,10 +4,11 @@
 //! 模块之间再发 HTTP。」——所以这一层很薄：请求体 / 响应体就是 kernel 的协议类型，
 //! 真正的动作在 [`GatewayState`] 上。
 //!
-//! **除 `GET /healthz`、配对换 cookie 与静态文件外统一认证**，由 [`crate::auth`] 的 layer 一次性挡住；
-//! 所有路由之外还有一层 Host 校验（[`crate::web::host_guard`]）。
+//! **除 `GET /healthz`、`/auth/*` 与静态文件外统一认证**（所有 `/v1/**`），由 [`crate::auth`] 的 layer
+//! 一次性挡住；所有路由之外还有一层 Host 校验（[`crate::web::host_guard`]）。
 
 pub mod attachments;
+pub mod auth;
 pub mod config;
 pub mod schedule;
 pub mod error;
@@ -27,6 +28,7 @@ use axum::{Router, extract::State};
 use komo_kernel::protocol::PROTOCOL_VERSION;
 use komo_kernel::protocol::http::HealthResponse;
 
+use crate::auth::AuthService;
 use crate::service::state::GatewayState;
 use crate::web::{self, WebAuth};
 
@@ -37,8 +39,10 @@ use idempotency::Idempotency;
 pub struct Api {
     pub state: Arc<GatewayState>,
     pub idempotency: Arc<Idempotency>,
-    /// 配对码 / 会话 cookie / Host 策略 / 静态目录（`docs/clients.md` D5、D6）。
+    /// Host 策略 / 静态目录（`docs/clients.md` D5、D6）。
     pub web: Arc<WebAuth>,
+    /// 登录：OIDC、网页会话、设备令牌（`docs/redesign.md` §2.9）。
+    pub auth: Arc<AuthService>,
 }
 
 impl std::fmt::Debug for Api {
@@ -56,15 +60,29 @@ impl Api {
             .web_dir
             .clone()
             .or_else(crate::web::default_web_dir);
-        let web = Arc::new(WebAuth::new(
-            listen,
-            &snapshot.start_only.trusted_hosts,
-            web_dir,
+        // 公开地址的主机自动放行：它是操作者在 `[auth.oidc]` 里写的，回调就落在它上面。
+        let mut trusted = snapshot.start_only.trusted_hosts.clone();
+        if let Some(oidc) = &snapshot.start_only.oidc
+            && let Ok(url) = reqwest::Url::parse(&oidc.public_url)
+            && let Some(host) = url.host_str()
+        {
+            trusted.push(match url.port() {
+                Some(port) => format!("{host}:{port}"),
+                None => host.to_string(),
+            });
+        }
+        let web = Arc::new(WebAuth::new(listen, &trusted, web_dir));
+        let auth = Arc::new(AuthService::new(
+            state.db.clone(),
+            Arc::clone(&state.config),
+            Arc::clone(&state.clock),
+            state.token.clone(),
         ));
         Api {
             state,
             idempotency: Arc::new(Idempotency::new()),
             web,
+            auth,
         }
     }
 }
@@ -75,18 +93,21 @@ impl Api {
 /// 会话、run、树、事件、intervention、导出在 [`v2::routes`]（路径与协议类型不变，handler
 /// 读写 `durable.db`）；memories、config、models、mcp、healthz 在这里。
 pub fn router(api: Api) -> Router {
-    let auth = crate::auth::AuthState {
-        token: api.state.token.clone(),
-        web: Arc::clone(&api.web),
-    };
+    let auth = Arc::clone(&api.auth);
     let hosts = Arc::clone(&api.web);
-    // 配对换 cookie 不需要别的鉴权（码本身就是凭据）；申请配对码要 Bearer（在 handler 里核对）。
+    // 登录相关的路由与健康检查不要求登录（`/auth/device/token` 的凭据是一次性授权码本身）。
     let open = Router::new()
         .route("/healthz", get(healthz))
-        .route("/v1/web/session", post(web::open_session));
+        .route("/auth/login", get(auth::login))
+        .route("/auth/callback", get(auth::callback))
+        .route("/auth/logout", post(auth::logout))
+        .route("/auth/me", get(auth::me))
+        .route("/auth/device/authorize", get(auth::device_authorize))
+        .route("/auth/device/token", post(auth::device_token));
     let guarded = shared_routes()
         .merge(v2::routes())
-        .route("/v1/web/pair-code", post(web::pair_code))
+        .route("/v1/auth/sessions", get(auth::sessions))
+        .route("/v1/auth/sessions/{id}", delete(auth::revoke))
         .layer(axum::middleware::from_fn_with_state(
             auth,
             crate::auth::check,
@@ -176,27 +197,4 @@ async fn healthz(State(api): State<Api>) -> Json<HealthResponse> {
             .map(|status| status.health())
             .unwrap_or_default(),
     })
-}
-
-/// `POST /v1/web/pair-code`，从进程外面要一个浏览器配对码（`komo web` 用它）。
-///
-/// 这个端点不在 `komo-client` 按 §13.1 写的接口表里，给一个最小调用，而不是去改 client。
-pub async fn request_pair_code(
-    base_url: &str,
-    token: Option<&str>,
-) -> Result<komo_kernel::protocol::http::PairCodeResponse, String> {
-    let mut request = reqwest::Client::new().post(format!(
-        "{}/v1/web/pair-code",
-        base_url.trim_end_matches('/')
-    ));
-    if let Some(token) = token {
-        request = request.bearer_auth(token);
-    }
-    let response = request.send().await.map_err(|error| error.to_string())?;
-    let status = response.status();
-    let body = response.text().await.map_err(|error| error.to_string())?;
-    if !status.is_success() {
-        return Err(format!("{status}：{body}"));
-    }
-    serde_json::from_str(&body).map_err(|error| format!("{error}（{body}）"))
 }

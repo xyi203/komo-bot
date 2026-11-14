@@ -18,7 +18,7 @@ v0.8 相对 v0.7 的变化：状态数据库改为 Turso + toasty（§8.2；2026
 | -------- | ------------------------------------------------------------------------------------------------ |
 | 部署     | Fedora Server 与 macOS 均可独立运行，每个实例保存自己的数据                                      |
 | 进程入口 | 单个可执行程序 `komo`，包含 CLI 客户端和 Gateway                                            |
-| 聊天     | 网页（`komo` / `komo web` 打开配对链接）；Gateway 未运行时自动启动。聊天渠道已删除（§11） |
+| 聊天     | 网页（`komo` / `komo web` 打开 Gateway 的地址，登录走 OIDC，§13.1）；Gateway 未运行时自动启动。聊天渠道已删除（§11） |
 | 执行方式 | LLM 原生 tool call，由 Rust 校验和执行；没有 Policy 与审批（§7）                                 |
 | 基础工具 | 严格保留 `read`、`write`、`edit`、`bash`、`codemode`（外加只读的 `rg`，§4）                      |
 | 能力扩展 | 可复用能力写成 Skill（`SKILL.md` + 脚本），由 `bash` 运行；没有 toolbox（2026-10-15 删除，§5.3）   |
@@ -81,7 +81,9 @@ Gateway 持有模型连接、数据库与提交线、工具环境和运行状态
 | 命令                                         | 行为                                                                        |
 | -------------------------------------------- | --------------------------------------------------------------------------- |
 | `komo`                                       | 确保本机 Gateway 就绪，再做 `komo web` 做的事（2026-11-12 起；此前是进 TUI 聊天，TUI 与 `komo resume` / `komo home` 已删除） |
-| `komo web [--no-open]`                       | 在浏览器里打开网页版（`docs/clients.md`）：经 Bearer 向 Gateway 要一个一次性配对码（`POST /v1/web/pair-code`，只在内存、两分钟失效、用一次作废），打开 `http://<Gateway>/pair#code=<码>`（码在 fragment 里，不进服务器日志），网页把码 POST 回去换 `HttpOnly; SameSite=Strict` 的会话 cookie。`--no-open` 只打印链接。会话 cookie 只在 Gateway 内存里，**Gateway 重启后要重新运行**。需要 Gateway 在跑（同 `komo`，没起就拉起） |
+| `komo web [--no-open]`                       | 在浏览器里打开网页版（`docs/clients.md`）：打印并打开 Gateway 的地址，登录由网页走 OIDC（没登录时跳去身份提供方，§13.1「登录」）。**没有配对码了**（2026-11-14 删除，`docs/redesign.md` P21）。`--no-open` 只打印链接。需要 Gateway 在跑（同 `komo`，没起就拉起）；有 `komo login` 存下的远程登录时连那台远程的 |
+| `komo login URL [--name N] [--no-open]`      | 登录**远程** Gateway（2026-11-14）：本机起一个只听 `127.0.0.1` 的临时端口，带 PKCE challenge 与回环回跳地址在浏览器里打开 `URL/auth/device/authorize`，走完 OIDC 后 Gateway 带一次性码跳回本机端口，命令用码 + verifier 换长期设备令牌，存进数据目录的 `remote.json`（0600）。之后的操作命令连这台远程 Gateway。机器上连本机 Gateway 不需要登录（本机令牌 `runtime/gateway.json`） |
+| `komo logout`                                | 吊销服务端的设备令牌（尽力而为）并删掉 `remote.json`，命令回到连本机 |
 | `komo session list [--all] [--limit N] [--cursor C]` | 查看会话列表和状态（最新创建的在前）；`--all` 才列出已逻辑删除的会话（§8.10）。一页 50 条，还有更多时末尾印出接着列的 `--cursor`；`--limit 0` 一次列完 |
 | `komo session search 关键词 [--limit N]`         | 跨会话找回：在会话标题与正文里找，给会话、片段与能接着查的 ID（§8.11「跨会话找回」） |
 | `komo monitor list [--all]`                   | 监听清单（`monitor` 挂的与转后台的 bash）：短号、已跑多久、距截止、标题、挂它的会话、脚本；只读（`docs/monitor.md`） |
@@ -118,7 +120,7 @@ Gateway 持有模型连接、数据库与提交线、工具环境和运行状态
 2. 检查 Gateway 健康状态与实例身份，不能只凭 PID 或端口判断。
 3. 本机实例未运行时，请求系统服务管理器启动。
 4. 等待服务就绪，超时则返回具体诊断信息。
-5. 做 `komo web` 的事：要一个一次性配对码、打开配对链接；对话在浏览器里发生。
+5. 做 `komo web` 的事：打印并打开 Gateway 的地址；对话在浏览器里发生（登录走 OIDC，§13.1）。
 
 Gateway 获得数据目录进程锁并完成存储校验后，引擎自动恢复未完成的任务；不必等用户打开 CLI 或发送 resume。恢复与新请求共用调度器，恢复本身不等待全部旧任务完成才提供服务。恢复就是 §8.4 的那张表加 §8.9 的 blob 引用检查：`running` 一律回 `pending`，从 checkpoint 所在阶段接着跑（上一代不是干净关闭时记一次崩溃，连续 5 次就停住等人，§8.4）；被引用的 blob 读不到的工具任务写成 faulted，在下一次调度之前判定完（§8.7）。
 
@@ -133,7 +135,7 @@ Gateway 对数据目录持有进程锁。多个 CLI 同时启动时，只允许�
    **不认识的键不算错**（2026-09-24）：`config.toml` 里多出来的键——升级后留下的退役键、拼错的键、写到了别的表下面的键（`default_agent` 落进前一个 `[agents.x]` 是最常见的一种）——被忽略，配置照常装上，但每一个都以完整路径（如 `gateway.listen_typo`）作为**警告**出现在 `komo config check`、`komo doctor` 与重载日志里。键认识、值的类型不对仍然是错误。
 2. 校验通过 → 原子替换进程内唯一的 `Arc<ConfigSnapshot>`（arc-swap）。**读配置的地方按用途读当前快照，不缓存**：每个阶段（每次模型请求、每次工具调用）按当前快照解析 Agent / 模型 / effort（§6.2）——所以模型改完，下一次请求用新模型，**已经开始的请求（checkpoint 里冻结的模型与 effort）与进行中的后台记忆任务继续用它们各自开始时抓的快照**（§13.3），不在半路换模型。
 3. 逐段比对新旧快照，只重建变化了的东西：模型 `base_url` / 凭证变了 → 换掉对应 `LlmClient` 实例；向量模型变了 → 走 §9.5 的空间指纹与索引代次流程，不在重载里偷偷重建索引。
-4. 一小组键**只在启动时生效**：数据目录 / `KOMO_HOME`、监听地址与端口、数据库路径、`[web] dir`、`[gateway] trusted_hosts`。这些键改了，重载照常完成其余部分，然后明确报告"以下键需要 `komo gateway restart`"，不静默忽略，也不假装已生效。
+4. 一小组键**只在启动时生效**：数据目录 / `KOMO_HOME`、监听地址与端口、数据库路径、`[web] dir`、`[gateway] trusted_hosts`、`[auth.oidc]`（登录配置在启动时读一次）。这些键改了，重载照常完成其余部分，然后明确报告"以下键需要 `komo gateway restart`"，不静默忽略，也不假装已生效。
 
 重载事件带新旧快照的差异（键名，不带值，凭证更不带）写进 Gateway 日志；`komo doctor` 显示当前生效配置的加载时间与来源文件 mtime，两者不一致就是"文件改了但没装上"，把上一次校验错误一并印出来。
 
@@ -556,7 +558,7 @@ project_files = false              # 省略 = true
 | 保存位置 | 内容 | 说明 |
 | --- | --- | --- |
 | `<data_dir>/durable.db`（Turso，WAL，一个新文件） | `conversations`、`entries`、`tasks`、`submissions`、`documents`、`sessions`、`durable_meta` | **会话内容、Run / 调用状态、可变状态、生命周期的唯一权威**；一条提交线写，读不经过线 |
-| `<data_dir>/aux.db`（Turso + toasty，同一套模型与 migration） | `cron_jobs`（**已退役**：定时并进了 `matters`，回填之后不再读写）、`cron_firings`（键是目标 id）、`deliveries`、`memory_items` / `memory_evidence` / `memory_terms` / `memory_vectors` / `memory_index_generations`、幂等键等辅助表 | 与 `durable.db` **分库**：跨库靠预分配 ID 与请求键幂等（cron：先在 `aux.db` 写 firing 行并预分配 Session ID，再一次 engine 提交建会话并受理 `request_id = cron:{job}:{slot}`；投递：先写后发、按逻辑键 `deliver_once`）；"同库同提交"推迟到以后 |
+| `<data_dir>/aux.db`（Turso + toasty，同一套模型与 migration） | `cron_jobs`（**已退役**：定时并进了 `matters`，回填之后不再读写）、`cron_firings`（键是目标 id）、`auth_sessions`（登录状态：网页会话与设备令牌，只存令牌的 SHA-256，§13.1「登录」；与 `durable.db` 的对话 `sessions` 无关）、`deliveries`、`memory_items` / `memory_evidence` / `memory_terms` / `memory_vectors` / `memory_index_generations`、幂等键等辅助表 | 与 `durable.db` **分库**：跨库靠预分配 ID 与请求键幂等（cron：先在 `aux.db` 写 firing 行并预分配 Session ID，再一次 engine 提交建会话并受理 `request_id = cron:{job}:{slot}`；投递：先写后发、按逻辑键 `deliver_once`）；"同库同提交"推迟到以后 |
 | `sessions/{session_id}/tool-output/{conversation}/{tool_task}/{attempt}/` | `output.json`，以及按需的 `stdout.txt` / `stderr.txt` / `image-<n>.<ext>` / `background.log` | 每次执行的完整工具输出，按尝试独立、完成后不可变；运行时先写 `.partial` |
 | `sessions/{session_id}/artifacts/…` | 工具生成的二进制文件、脚本快照与报告 | 独立产物；正文里以 `artifact://` 给出引用（§4.7） |
 
@@ -981,12 +983,37 @@ CLI 通过 HTTP 发命令，通过 SSE 观察运行。Gateway 内部采用函数
 | POST /v1/attachments             | 网页输入框的附件：请求体是原始字节（`?name=` 原文件名），存进 `{workspaces_dir}/inbox/web/`，交回路径、拼进正文的说明，图片另有缩略图地址；上限 20 MB，超了 413 |
 | GET /v1/attachments/{inbox}/{name} | 取回收件箱里按内容哈希命名的图片（网页缩略图；渠道删除前收进 `inbox/{平台}/` 的旧图也行）；别的名字一律 404，不是读文件的口子 |
 | GET /v1/home-session             | 操作者的 home session（§11.2）                 |
-| POST /v1/web/pair-code           | 要一个浏览器配对码（`PairCodeResponse`）：**只认 Bearer**（cookie 不能再铸码），码只在内存、两分钟失效、用一次作废（`docs/clients.md` D6） |
-| POST /v1/web/session             | 配对码换会话 cookie（`{"code": …}`，不需要别的鉴权——码本身就是凭据）；响应 `Set-Cookie: komo_session=…; HttpOnly; SameSite=Strict; Path=/`（经 HTTPS 代理时加 `Secure`）。cookie 只在内存，Gateway 重启后失效 |
+| GET /auth/login[?next=/路径]     | 不要登录。发起 OIDC 登录：记下 state / nonce / PKCE verifier（内存，10 分钟），种绑定浏览器的短命 cookie `komo_oidc`，303 跳去提供方授权端点；`next` 只认本站相对路径 |
+| GET /auth/callback               | 不要登录。提供方回调：核对 state（含 `komo_oidc` cookie）、用 code + verifier 换令牌、校验 ID token（签名 / iss / aud / exp / nonce）、核对允许名单，建登录会话并种 `komo_session`（HttpOnly + SameSite=Lax，公开地址是 https 时带 Secure），303 跳回 `next`。失败回一张 HTML 页 |
+| POST /auth/logout                | 不要登录。吊销当前 cookie 对应的会话并清 cookie；带 cookie 时核对 Origin |
+| GET /auth/me                     | 不要登录，永远 200：`AuthMeResponse`（`authenticated`、`oidc_configured`、`credential` = `web` / `device` / `local`、`subject`、`email`、`session_id`）。网页据此决定要不要跳 `/auth/login` |
+| GET /auth/device/authorize       | 不要登录。桌面端 / CLI 在系统浏览器里打开：`code_challenge`（S256）、`redirect_uri`（只认 `komo://auth/callback` 与本机回环 `http://127.0.0.1:端口/…`、`localhost`、`[::1]`）、可选 `state`、`name`。浏览器已登录就直接发码，否则走一遍 OIDC；最后 303 到 `redirect_uri?code=…&state=…`（码两分钟、用一次） |
+| POST /auth/device/token          | 不要登录（一次性码即凭据）。`DeviceTokenRequest {code, code_verifier, redirect_uri}` → `DeviceTokenResponse {token, token_type: "Bearer", session_id, subject, email}`；令牌只出现这一次，库里只存哈希 |
+| GET /v1/auth/sessions            | 没过期的登录状态（网页会话与设备令牌）：`AuthSessionsResponse`，每条 `id` / `kind` / `label` / `subject` / `email` / `created_at` / `last_used_at` / `expires_at`（设备令牌为 null）/ `current`（设置页「通用」或「关于」的设备清单） |
+| DELETE /v1/auth/sessions/{id}    | 吊销一条（`AuthRevokeResponse`），该 cookie / 令牌立刻失效；id 不存在 404 |
 
-除最小健康检查、配对换 cookie 与网页静态文件外统一认证：`Authorization: Bearer <令牌>`，或浏览器的会话 cookie；用 cookie 的**非 GET / HEAD** 请求另外核对 `Origin` 与 `Host` 同源，否则 403。
+除最小健康检查、`/auth/*` 与网页静态文件外，所有 `/v1/**` 统一认证（SSE 同），接受三种凭据：`Authorization: Bearer <本机令牌>`（`runtime/gateway.json`，机器上的命令行用，不经 OIDC）、`Authorization: Bearer <设备令牌>`（`komodev_…`）、浏览器的会话 cookie；用 cookie 的**非 GET / HEAD** 请求另外核对 `Origin`（与 `Host` 同源，或等于 `[auth.oidc] public_url` 的源），否则 403。失败一律 401，不区分「没带」与「带错」。
 
-**网页壳与 Host 校验（`docs/clients.md` D5、D6）。** `/v1/*` 与 `/healthz` 之外的路径是网页壳的静态文件：从 `[web] dir` 读（没配就退到 `komo` 二进制旁的 `web/`，发布包与 `install.sh` / `komo update` 装在那里，§13.6），先找文件，没有扩展名的路径回落壳 html（`_shell.html`，客户端路由），带扩展名而找不到的 404；目录不存在不报错，只是没有网页（`komo config check` 给一条警告）。文件不嵌进二进制，Rust 冷构建不依赖 Node。**所有路由**（含静态文件、`/healthz`、配对）都先过 Host 校验：只放行回环（`127.0.0.1`、`::1`、`localhost`）、监听地址的主机部分和 `[gateway] trusted_hosts`（主机名列表，经反向代理 / 隧道访问时填域名；端口不参与比较），其余一律 403——挡 DNS 重绑定，只负责放行、不替代鉴权。`[web] dir` 与 `trusted_hosts` 都是启动期键（§3 第 4 条）。
+**网页壳与 Host 校验（`docs/clients.md` D5、D6）。** `/v1/*` 与 `/healthz` 之外的路径是网页壳的静态文件：从 `[web] dir` 读（没配就退到 `komo` 二进制旁的 `web/`，发布包与 `install.sh` / `komo update` 装在那里，§13.6），先找文件，没有扩展名的路径回落壳 html（`_shell.html`，客户端路由），带扩展名而找不到的 404；目录不存在不报错，只是没有网页（`komo config check` 给一条警告）。文件不嵌进二进制，Rust 冷构建不依赖 Node。**所有路由**（含静态文件、`/healthz`、`/auth/*`）都先过 Host 校验：只放行回环（`127.0.0.1`、`::1`、`localhost`）、监听地址的主机部分、`[gateway] trusted_hosts`（主机名列表，经反向代理 / 隧道访问时填域名；端口不参与比较）和 `[auth.oidc] public_url` 的主机，其余一律 403——挡 DNS 重绑定，只负责放行、不替代鉴权。`[web] dir` 与 `trusted_hosts` 都是启动期键（§3 第 4 条）。
+
+**登录（OIDC，2026-11-14，`docs/redesign.md` §2.9、P21；真实提供方上的流程未实测，见 `docs/clients.md`「操作者怎么实测」）。** komo 是 OIDC 的接入方（授权码 + PKCE S256），身份提供方是操作者自己搭的（Pocket ID；不写死任何提供方，端点全按 `{issuer}/.well-known/openid-configuration` 发现）。配置在 `config.toml` 的 `[auth.oidc]`，客户端密钥放 `.env`：
+
+```toml
+[auth.oidc]
+issuer = "https://id.example.com"
+client_id = "komo"
+# client_secret_env = "KOMO_OIDC_CLIENT_SECRET"   # 默认；.env 里没有这个变量就按公开客户端（只靠 PKCE）换令牌
+public_url = "https://komo.example.com"            # 回调 = <public_url>/auth/callback；cookie 的 Secure 与 Origin 核对也看它
+allowed_subjects = ["<sub>"]                        # 与 allowed_emails 至少写一个；不在名单里一律拒绝
+allowed_emails = []                                 # 小写比较；提供方明说 email_verified=false 的不算
+```
+
+- **没配 `[auth.oidc]`**：配置照常装上，Gateway 起来 warn 一句、`komo config check` 给 `auth.oidc` 一条警告「未配置登录」；网页登不了（`/auth/login` 回 404 页，`/auth/me` 报 `oidc_configured: false`），设备登录也发不了；机器上的命令行与本机开发（`pnpm dev` 的代理自己带本机令牌）照常用本机令牌。配了但填错（issuer 不是 https、没有名单 …）是配置错误，不装上。
+- **登录状态落盘**：`aux.db` 的 `auth_sessions`（网页会话 `web`、设备令牌 `device`），**只存令牌的 SHA-256**，重启后仍有效；网页会话 30 天滑动续期（距上次记录超 10 分钟才写库，并重发 cookie），设备令牌不过期、可列出可吊销（`GET /v1/auth/sessions`、`DELETE /v1/auth/sessions/{id}`）。登录过程的临时状态（state / nonce / verifier、设备登录的一次性码）只在内存里，重启丢了重新登录即可。
+- **ID token 校验**：算法只认 RS256 / ES256 / EdDSA（拒 `none` 与 HS*），验签用工作区已有的 `ring`，JWKS 按 `kid` 取、对不上时（密钥轮换）强制重取一次（间隔至少 60 秒）；再核 `iss`、`aud`（含 `azp`）、`exp` / `nbf`（容 60 秒）、`nonce`，最后核允许名单。token 响应缺邮箱而名单是邮箱时，补问 `userinfo_endpoint`（只认同一个 `sub`）。
+- **防登录 CSRF**：`/auth/login` 种的 `komo_oidc` cookie（HttpOnly、SameSite=Lax、仅 `/auth` 路径、10 分钟）必须与回调的 `state` 一致，state 用一次作废。
+- **设备令牌**：桌面端 / CLI 走「跳系统浏览器登录再跳回」——`GET /auth/device/authorize` → OIDC → 带一次性码 303 回 `redirect_uri` → `POST /auth/device/token` 换令牌。回跳白名单：`komo://auth/callback`（桌面端深链）与本机回环地址的任意端口；其余一律不发码。PKCE 保证码被别人截获也换不出令牌。令牌形如 `komodev_…`，Gateway 只存哈希。
+- **上游已删**：配对码（`komo web` 的配对链接、`POST /v1/web/pair-code`、`POST /v1/web/session`）整套删除，不留兼容；`state.db` 时代没有落盘的会话，所以存量的内存 cookie 在升级重启时本来就会失效，没有需要迁移的登录状态。
 
 创建会话、提交输入、介入答复、Cron 与 Memory 变更都支持幂等请求键；同一键对应不同内容则拒绝。创建会话的请求键与正文哈希持久保存，同键同内容重发返回原会话，同键不同内容返回 409 `request_key_conflict`，重启后仍有效。
 
@@ -1239,7 +1266,7 @@ komo-kernel    值类型、`durable/` 模块（entry / conversation / task / sub
 
 komo-store     `durable/`：`Line`（一条提交线，唯一写连接）、Turso `Storage` 实现、新库 DDL 与字节对等测试、
                `blob`（先写文件后提交引用）、`ids`（取号器与高水位）——**裸 `turso`，不经 toasty**；
-               `aux.db` 的 toasty 模型 + `*_TABLE_DDL` + 仓库（cron / 投递 / Memory）、tool_output（输出存储）、
+               `aux.db` 的 toasty 模型 + `*_TABLE_DDL` + 仓库（cron / 投递 / Memory / 登录状态 `auth_sessions`）、tool_output（输出存储）、
                session_dir（`SessionPaths` 与落盘小工具）、purge（回收前的引用检查与删目录）。
                唯一依赖 toasty/turso 的 crate。deps: kernel, toasty(turso only), turso, tokio(fs, sync)
 
@@ -1283,14 +1310,15 @@ komo-agent     Agent 的身份、能力与上下文装配（`docs/bot.md` 批次
 komo-gateway   axum 路由（§13.1）、SSE、认证、进程锁与发现文件、launchd/systemd 集成、
                `service/durable/`（`DurableCore`：引擎 + harness + 钩子装配、会话与树服务、feed / watch / lifecycle / interventions / cron / memory 接线）、`http/v2/`、网页附件收件箱；聊天渠道进程宿主、Notifier、deliveries 已随渠道删除（§11）。
                组装 runtime 与 agent（两者互不依赖）。
-               deps: kernel, runtime, llm, config, tools, memory, agent, axum, tower-http, reqwest
+               登录（OIDC 客户端、网页会话、设备令牌，`auth` / `oidc` / `http/auth`，§13.1「登录」）也在这里。
+               deps: kernel, runtime, llm, config, tools, memory, agent, axum, tower-http, reqwest, ring, base64
 
 
-komo-client    HTTP + SSE 客户端、发现文件读取、操作子命令的输出渲染（2026-11-12 删除 ratatui TUI）。
+komo-client    HTTP + SSE 客户端、发现文件读取、`komo login` 存的远程登录记录（`remote`）、操作子命令的输出渲染（2026-11-12 删除 ratatui TUI）。
                只依赖 kernel——不认识 store / runtime。
                deps: kernel, reqwest, tokio
 
-komo (bin)     clap 分发：`komo` / `komo web` → 配对链接（经 gateway 的 HTTP 辅助函数）；操作子命令 → client；`komo gateway` → gateway；
+komo (bin)     clap 分发：`komo` / `komo web` → 打开 Gateway 地址；`komo login` / `logout` → 远程设备登录（`remote.json`）；操作子命令 → client；`komo gateway` → gateway；
                `komo update`（§13.6）是 bin 里唯一自己发 HTTP 的地方。
                deps: client, gateway, komo-tools（`__codemode-worker` 与 `spawn`）, clap, reqwest, flate2, tar
 ```
@@ -1330,6 +1358,9 @@ durable 引擎（约 1.5 万行生产代码）与 harness 是汇聚点，没有�
 | `croner` | `default-features = false`（W2 确认无 chrono 时的时刻表达） | kernel 已有 `time`，不要第二套日期时间库；croner 4 默认特性拉进 chrono + derive_builder / darling / strum |
 | `grep` + `ignore` | `0.4`，`default-features = false`；komo-tools（`rg` 工具），`grep` 另有 komo-llm（上下文超长的报错匹配） | 内嵌 ripgrep 的搜索与遍历，不起子进程：外部 `rg` 要么没装、要么各家版本不同，而遍历规则（隐藏文件、`.gitignore`、覆盖 glob）本来就该用这套实现。默认特性集是空的，写出来是钉住两件事：**不开 `pcre2`**（"正则语法 = Rust regex"是对模型可见的契约）与不引 SIMD 的 `avx-accel`。带进来的 13 个包（`globset`、`walkdir`、`termcolor`、`crossbeam-deque`、`encoding_rs_io`、`memmap2`、`bstr` 等）全是纯 Rust、无 C 工具链，且没有新的重复版本（2026-09-21 对 `cargo tree -d` 核过） |
 | `jiff` | `0.2`，默认特性（系统 tzdb + 系统时区）；komo-runtime、komo-memory、komo-tools、komo-client、与 komo-gateway | runtime：cron 的 `ZoneResolver`（IANA 区名 → 偏移，§10）；memory 与 tools（codemode）：本地日期与时刻。client：CLI 的时刻一律印成本机墙钟 + 偏移（`2026-09-25 14:00:00 +08:00`），偏移按每个时刻各自取，夏令时两侧不同。gateway：目标/领域接口的本地日期；飞书插件：话题上下文里每条消息的 `HH:MM`（§11.3，本机时区）；不用 `time` 的 `local-offset`，它只能取"现在"的偏移，且在多线程进程里拒绝返回。kernel 仍只用 `time` |
+| `ring` | `0.17.14`，`default-features = false, features = ["alloc"]`；仅 komo-gateway | OIDC ID token 的验签（RS256 `RSA_PKCS1_2048_8192_SHA256` / ES256 / EdDSA），`ring::signature` 直接验 JWK 里的公钥，不引 JWT / OIDC 库（`jsonwebtoken`、`openidconnect` 都要另选密码后端或再拉一串依赖）。**已在依赖树里**：rustls 的 ring provider 拉进来的同一个包，Cargo.lock 只在 komo-gateway 的依赖列表里多一行，不新增包也不新增重复版本 |
+| `base64` | `0.23.1`（工作区那份）；komo-gateway 新增直接依赖 | 解 JWT 的三段与 JWKS 的 `n` / `e` / `x` / `y`（base64url）；不新增包 |
+| `uuid` | 工作区特性加 `v4`（原有 `v7`、`serde`） | `komo-kernel::pkce::random_token` 用 `Uuid::new_v4` 取操作系统随机数拼 32 字节令牌（Gateway 的 `lock::random_token` 早就这么用，只是靠别的 crate 把 `v4` 带进来；kernel 单独编译时要自己声明）。不新增包 |
 | `arc-swap` | 默认；komo-config（`ConfigHolder`）与 komo-runtime（harness 钩子） | §3 热重载的唯一 `Arc<ConfigSnapshot>` 原子替换 |
 | `toml_edit` | `0.25`，默认特性；仅 komo-config（`edit`） | §3「从 Web 改模型配置」：在 `config.toml` 原文上改并保留注释与键序。与 `toml 1.1` 共用 `toml_parser` / `toml_datetime` / `toml_writer`，不多出重复版本 |
 | `serde_ignored` | `0.1`，默认；仅 komo-config | §3 的「不认识的键只警告」：包住 `toml::Deserializer`，把每个被忽略的键路径交给回调。只依赖 `serde`，不进别的 crate 的图 |
@@ -1618,6 +1649,7 @@ Memory 与模型验收覆盖：
 
 | 项 | 影响 | 若不成立 |
 |---|---|---|
+| **OIDC 登录在真实的 Pocket ID 上跑通**（授权码 + PKCE、发现文档、ID token 的签名算法与 `email` 声明、`komo login` 的回环回跳、桌面端 `komo://` 回跳；2026-11-14 服务端落地，**全部未实测**，步骤见 `docs/clients.md`「操作者怎么实测」） | §13.1 登录；`docs/redesign.md` §2.9 | 按实测结果改：提供方用了 komo 不认的签名算法（只认 RS256 / ES256 / EdDSA）→ 加算法；ID token 不带邮箱而 userinfo 也没有 → 名单改用 `allowed_subjects`；Safari 对 `Secure` cookie 在 http 本机的行为 → 开发走 https 或回环 |
 | Turso MVCC 模式提交是否 fsync；能否读回同步设置 | §8.2 权威边界 | **已核实（2026-09-16，spikes/store.md）：提交 fsync，MVCC 写 `state.db-log`、WAL 写 `state.db-wal`，默认 `synchronous=FULL` 且可读回可改写；`synchronous=OFF` 后 strace 里 fsync 全部消失，说明不是空实现。§8.2 的 outbox-先-确认保护不启用。** 附带：`state.db-log` 与主库同等重要；`data_sync_retry` 默认 false 时 fsync 出错是 panic，连接时设成 1。未核实：真正的断电 / 内核崩溃持久性（只做了 25/25 的进程 abort） |
 | toasty 0.10 是否支持带条件的 UPDATE 并返回受影响行数 | §8.7 领取代次 | **已核实（2026-09-16，spikes/store.md）：条件能表达，行数拿不到——查询目标的 `.exec()` 恒 `Ok(())`。改用 toasty 自带的 `toasty::sql::statement -> Result<u64>`，`Transaction` 上也能用，所以不需要第二个 `turso::Database` 句柄（§8.2、§13.5 已改）。并发正确性已验：220 轮 × 2–4 竞争者恰好一个赢家。附带纠正：autocommit 单语句写在 4 写入器下 200 次只成 6 次，每个写都必须进 `db.transaction()`（§8.2 已改）** |
 | `reqwest` `rustls-no-provider` 下没有其他依赖重新启用 `aws-lc-rs`；`openlark` 是否把它拉回来 | §13.4 冷编预算 | **已核实（2026-09-16，骨架实测）：拉回来了**，肇事者是 `openlark-core 0.20` 显式声明 reqwest 的 `rustls` 特性（= `__rustls-aws-lc-rs`），特性可加不可减，`default-features = false` 压不住，要挡只能 `[patch]` openlark-**core** 把该特性换成 `rustls-no-provider`。代价实测：`aws-lc-sys` 构建脚本 32s 但 8 核并行、不在关键路径，墙钟只 +1.7s（68.5s → 70.2s）。**决定：接受，不维护 patch。** |

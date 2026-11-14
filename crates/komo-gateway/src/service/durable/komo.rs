@@ -27,12 +27,14 @@ use crate::http::v2::{sessions, tasks};
 use crate::http::{Api, matters, memories};
 use crate::service::durable::sessions::SessionError;
 use crate::service::state::GatewayState;
+use crate::auth::AuthService;
 use crate::web::WebAuth;
 
 pub struct GatewayKomo {
     state: Weak<GatewayState>,
     idempotency: Arc<Idempotency>,
     web: Arc<WebAuth>,
+    auth: Arc<AuthService>,
 }
 
 impl GatewayKomo {
@@ -43,6 +45,7 @@ impl GatewayKomo {
             state: Arc::downgrade(state),
             idempotency: api.idempotency,
             web: api.web,
+            auth: api.auth,
         })
     }
 
@@ -54,6 +57,7 @@ impl GatewayKomo {
             state,
             idempotency: Arc::clone(&self.idempotency),
             web: Arc::clone(&self.web),
+            auth: Arc::clone(&self.auth),
         })
     }
 }

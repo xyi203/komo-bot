@@ -24,6 +24,7 @@ pub mod session_dir;
 pub mod tool_output;
 
 pub use db::{Db, DbOptions, RetryConfig};
+pub use repos::auth::{AuthKind, AuthSessionRecord, NewAuthSession, TursoAuthRepo};
 pub use repos::cron::TursoCronRepo;
 pub use repos::cron_backfill::{BackfillReport, Placement, backfill_cron_into_goals};
 pub use repos::matter::TursoMatterRepo;

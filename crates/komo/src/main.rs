@@ -6,6 +6,7 @@
 
 mod commands;
 mod connect;
+mod login;
 mod matters;
 mod telemetry;
 mod update;
@@ -28,14 +29,29 @@ enum Command {
     /// （`docs/codemode.md` §3）。不给人用，不进 `--help`。
     #[command(name = "__codemode-worker", hide = true)]
     CodemodeWorker,
-    /// 在浏览器里打开网页版：向 Gateway 要一个一次性配对码，打开 `/pair#code=…`，网页换出会话 cookie（`docs/clients.md` D6）。
+    /// 在浏览器里打开网页版：打开 Gateway 的地址，没登录时网页会跳去 OIDC 登录（`docs/redesign.md` §2.9）。
     ///
-    /// 码在 URL 的 fragment 里，不进服务器日志；用一次作废，两分钟失效。Gateway 重启后 cookie 失效，要重新运行。
+    /// 不再有配对码。Gateway 没配 `[auth.oidc]` 时网页登不了（`komo config check` 会提示）。
     Web {
         /// 只打印链接，不打开浏览器。
         #[arg(long)]
         no_open: bool,
     },
+    /// 登录远程 Gateway：跳浏览器走 OIDC，换一个设备令牌存在数据目录的 `remote.json`；之后的命令连它。
+    ///
+    /// 机器上连本机 Gateway 不需要登录（本机令牌）。
+    Login {
+        /// 远程 Gateway 的根地址，如 `https://komo.example.com`。
+        url: String,
+        /// 在设备清单里显示的名字。
+        #[arg(long)]
+        name: Option<String>,
+        /// 只打印登录链接，不打开浏览器。
+        #[arg(long)]
+        no_open: bool,
+    },
+    /// 退出远程 Gateway：吊销设备令牌并删掉 `remote.json`，命令回到连本机。
+    Logout,
     /// 会话列表与状态。
     Session {
         #[command(subcommand)]
@@ -484,21 +500,16 @@ fn command_of(cli: Cli) -> Command {
     cli.command.unwrap_or(Command::Web { no_open: false })
 }
 
-/// `komo web`：确保 Gateway 就绪，要一个一次性配对码，打开配对链接。
+/// `komo web`：确保 Gateway 就绪，打开它的地址（登录由网页走 OIDC）。
 async fn web(home: &Path, no_open: bool) -> Result<Option<String>, String> {
     init_tracing(None, None);
     let client = connect::connect_or_start(home).await?;
-    let discovery =
-        komo_client::discovery::read_discovery_file(home).map_err(|error| error.to_string())?;
-    let base_url = client.base_url();
-    let pair = komo_gateway::http::request_pair_code(&base_url, discovery.token.as_deref()).await?;
-    let url = format!("{}/pair#code={}", base_url.trim_end_matches('/'), pair.code);
+    let url = client.base_url();
     if !no_open && !commands::open_in_browser(&url) {
         eprintln!("没能自动打开浏览器，请手动打开下面的链接。");
     }
     Ok(Some(format!(
-        "{url}\n（一次性链接，{} 秒内有效，用过即作废）",
-        pair.expires_in_secs
+        "{url}\n（没登录时网页会跳去身份提供方；机器上没有浏览器就从自己的电脑打开 Gateway 的公开地址）"
     )))
 }
 
@@ -507,6 +518,15 @@ async fn dispatch(cli: Cli, home: &Path) -> Result<Option<String>, String> {
     match command_of(cli) {
         Command::CodemodeWorker => std::process::exit(komo_tools::codemode::worker::run()),
         Command::Web { no_open } => web(home, no_open).await,
+        // 不经本机 Gateway：登录与退出都直接对远程那台说话。
+        Command::Login {
+            url,
+            name,
+            no_open,
+        } => login::login(home, &url, name.as_deref(), no_open)
+            .await
+            .map(Some),
+        Command::Logout => login::logout(home).await.map(Some),
         Command::Gateway { foreground, action } => gateway(home, foreground, action).await,
         // 不经 Gateway（§3）：Gateway 起来要先有配置，这条命令就是生成那份配置。
         Command::Init => commands::init(home).map(Some),
@@ -919,7 +939,7 @@ mod tests {
     use super::*;
     use clap::CommandFactory;
 
-    /// 终端里没有对话入口：裸 `komo` 与 `komo web` 是同一件事（要配对链接、开浏览器）。
+    /// 终端里没有对话入口：裸 `komo` 与 `komo web` 是同一件事（打开 Gateway 的网页）。
     #[test]
     fn bare_komo_is_komo_web() {
         assert!(matches!(
@@ -936,14 +956,13 @@ mod tests {
         }
     }
 
-    /// `komo web` 连上发现文件指的 Gateway，要一个配对码，印出 `/pair#code=…` 链接。
-    /// 假 Gateway 在 loopback 上，身份、协议版本与数据目录都对得上；码在 fragment 里。
+    /// `komo web` 连上发现文件指的 Gateway，印出它的地址（没有配对码了）。
     #[tokio::test]
-    async fn web_prints_a_pairing_link_from_the_gateway_in_the_discovery_file() {
-        use axum::routing::{get, post};
+    async fn web_prints_the_gateway_address_from_the_discovery_file() {
+        use axum::routing::get;
         use axum::{Json, Router};
         use komo_kernel::protocol::PROTOCOL_VERSION;
-        use komo_kernel::protocol::http::{HealthResponse, PairCodeResponse};
+        use komo_kernel::protocol::http::HealthResponse;
 
         let _ = rustls::crypto::ring::default_provider().install_default();
         let dir = tempfile::tempdir().expect("临时数据目录");
@@ -956,17 +975,7 @@ mod tests {
             data_dir,
             telemetry: Default::default(),
         };
-        let app = Router::new()
-            .route("/healthz", get(move || async move { Json(health) }))
-            .route(
-                "/v1/web/pair-code",
-                post(|| async {
-                    Json(PairCodeResponse {
-                        code: "abc123".into(),
-                        expires_in_secs: 120,
-                    })
-                }),
-            );
+        let app = Router::new().route("/healthz", get(move || async move { Json(health) }));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("绑定 loopback");
@@ -991,11 +1000,8 @@ mod tests {
             .expect("komo web")
             .expect("有输出");
         server.abort();
-        assert!(
-            out.starts_with(&format!("{base_url}/pair#code=abc123\n")),
-            "{out}"
-        );
-        assert!(out.contains("120 秒"), "{out}");
+        assert!(out.starts_with(&format!("{base_url}\n")), "{out}");
+        assert!(!out.contains("/pair"), "{out}");
     }
 
     /// 指标事件（`komo::metrics`，DEBUG）不进文本日志：哪怕 `KOMO_LOG=debug`。

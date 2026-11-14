@@ -9,7 +9,7 @@ pub mod ts;
 
 pub use config::{
     ConfigIssue, ConfigSnapshot, IssueSeverity, KeyPath, MemoryConfig, PathsConfig,
-    RetrievalConfig, SourceFile, StartOnly,
+    OidcConfig, RetrievalConfig, SourceFile, StartOnly,
 };
 pub use http::*;
 pub use sse::{Cursor, SseEvent, SseFrame};

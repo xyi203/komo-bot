@@ -9,8 +9,8 @@ use std::path::{Path, PathBuf};
 
 use komo_kernel::protocol::config::{
     CompactionConfig, ConfigSnapshot, ConsolidateConfig, ExecutionConfig, KeyPath, McpExposure,
-    McpServerConfig, McpTransport, MemoryConfig, PathsConfig, RetrievalConfig, SourceFile,
-    StartOnly, TypesafeConfig,
+    McpServerConfig, McpTransport, MemoryConfig, OidcConfig, PathsConfig, RetrievalConfig, SourceFile,
+    StartOnly, TypesafeConfig, DEFAULT_OIDC_SECRET_ENV,
 };
 use komo_kernel::types::agent::{AgentConfig, AgentProfile, MemoryMode};
 use komo_kernel::types::memory::{MemoryScopeParseError, RetrievalMode};
@@ -36,6 +36,8 @@ pub(super) struct FileConfig {
     pub gateway: GatewaySection,
     #[serde(default)]
     pub web: WebSection,
+    #[serde(default)]
+    pub auth: AuthSection,
     #[serde(default)]
     pub paths: PathsSection,
     #[serde(default)]
@@ -79,6 +81,53 @@ pub(super) struct GatewaySection {
     /// 除回环与监听地址外还接受的 `Host`（`docs/clients.md` D6）。
     #[serde(default)]
     pub trusted_hosts: Vec<String>,
+}
+
+/// `[auth]`：登录（`docs/redesign.md` §2.9）。
+#[derive(Debug, Default, Deserialize)]
+pub(super) struct AuthSection {
+    pub oidc: Option<OidcSection>,
+}
+
+/// `[auth.oidc]`。
+#[derive(Debug, Default, Deserialize)]
+pub(super) struct OidcSection {
+    #[serde(default)]
+    pub issuer: String,
+    #[serde(default)]
+    pub client_id: String,
+    /// `.env` 里放客户端密钥的变量名；省略 = `KOMO_OIDC_CLIENT_SECRET`。
+    pub client_secret_env: Option<String>,
+    #[serde(default)]
+    pub allowed_subjects: Vec<String>,
+    #[serde(default)]
+    pub allowed_emails: Vec<String>,
+    #[serde(default)]
+    pub public_url: String,
+}
+
+impl OidcSection {
+    fn into_config(self) -> OidcConfig {
+        let trimmed = |items: Vec<String>| -> Vec<String> {
+            items
+                .into_iter()
+                .map(|item| item.trim().to_string())
+                .filter(|item| !item.is_empty())
+                .collect()
+        };
+        OidcConfig {
+            issuer: self.issuer.trim().trim_end_matches('/').to_string(),
+            client_id: self.client_id.trim().to_string(),
+            client_secret_env: self
+                .client_secret_env
+                .map(|name| name.trim().to_string())
+                .filter(|name| !name.is_empty())
+                .unwrap_or_else(|| DEFAULT_OIDC_SECRET_ENV.to_string()),
+            allowed_subjects: trimmed(self.allowed_subjects),
+            allowed_emails: trimmed(self.allowed_emails),
+            public_url: self.public_url.trim().trim_end_matches('/').to_string(),
+        }
+    }
 }
 
 /// `[web]`：网页壳（`docs/clients.md` D5）。
@@ -595,6 +644,7 @@ pub(super) fn assemble(
             .otlp_endpoint
             .map(|endpoint| endpoint.trim().to_string())
             .filter(|endpoint| !endpoint.is_empty()),
+        oidc: file.auth.oidc.map(OidcSection::into_config),
     };
 
     let mcp = file
@@ -722,7 +772,11 @@ pub(super) fn assemble(
         max_observations: file.memory.max_observations.unwrap_or(defaults.1),
     };
 
-    let credentials = credential_fingerprints(&model_catalog, secrets, &data_dir);
+    let mut credentials = credential_fingerprints(&model_catalog, secrets, &data_dir);
+    // OIDC 客户端密钥在不在，由 `validate` 靠这一行回答（值不进快照）。
+    if let Some(oidc) = &start_only.oidc {
+        credentials.extend(secrets.fingerprints([oidc.client_secret_env.as_str()]));
+    }
 
     Ok(ConfigSnapshot {
         start_only,

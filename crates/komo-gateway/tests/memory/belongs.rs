@@ -237,3 +237,46 @@ async fn a_private_or_off_session_cannot_attach_memory_to_a_matter() {
         assert_eq!(status, 403, "{agent}：{body}");
     }
 }
+
+/// 目标详情的 `overview.memories`：归属它、还生效的，新的在前；遗忘的与结案归档的不再列；没有归属的不混进来。
+#[tokio::test]
+async fn a_goals_detail_lists_its_live_clues_newest_first() {
+    let gateway = start().await;
+    let goal = matter(&gateway, "goal", "迁移告警规则").await;
+    let first = memory(&gateway, "旧规则在 grafana", Some(&goal)).await;
+    let second = memory(&gateway, "新规则放 alerts 仓库", Some(&goal)).await;
+    let _free = memory(&gateway, "与目标无关的一条", None).await;
+    let ids = |detail: &Value| -> Vec<String> {
+        detail["overview"]["memories"]
+            .as_array()
+            .map(|items| {
+                items
+                    .iter()
+                    .map(|item| item["id"].as_str().unwrap().to_string())
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let show = || async {
+        let (status, detail) = gateway.get_json(&format!("/v1/matters/{goal}")).await;
+        assert_eq!(status, 200, "{detail}");
+        detail
+    };
+    let (a, b) = (
+        first["id"].as_str().unwrap().to_string(),
+        second["id"].as_str().unwrap().to_string(),
+    );
+    assert_eq!(ids(&show().await), [b.clone(), a.clone()]);
+
+    let forget = post(
+        &gateway,
+        &format!("/v1/memories/{a}/forget"),
+        json!({"expected_revision": first["revision"]}),
+    )
+    .await;
+    assert_eq!(forget["memory"]["state"], "forgotten");
+    assert_eq!(ids(&show().await), [b.clone()], "遗忘的不列");
+
+    post(&gateway, &format!("/v1/matters/{goal}/done"), json!({})).await;
+    assert!(ids(&show().await).is_empty(), "结案归档之后不列");
+}

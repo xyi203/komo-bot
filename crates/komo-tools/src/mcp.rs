@@ -2177,4 +2177,205 @@ for line in sys.stdin:
                 .contains(&"mcp__demo__echo".to_string())
         );
     }
+
+    /// 整台关着（`enabled = false`）：从不起进程；状态是 `disabled`（不是 `disconnected`，重连与断开都改不了它）；
+    /// 调用一律没执行；打开 / 关上是改配置，热重载换一个新连接。
+    #[tokio::test]
+    async fn a_server_switched_off_in_config_is_never_started_and_reads_disabled() {
+        let fixture = Fixture::new();
+        let mut demo = fixture.server("a", &[]);
+        demo.enabled = false;
+        let hub = fixture.hub(&[("demo", demo.clone())]).await;
+
+        assert_eq!(hub.statuses()[0].state, McpServerState::Disabled);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            !fixture.prefix("a").with_extension("pid").exists(),
+            "关着的从来没起过进程"
+        );
+        assert!(hub.new_tools().is_empty());
+        let connection = Arc::clone(&hub.connections()[0]);
+        match connection.call("echo", JsonObject::new()).await {
+            Err(CallError::NotSent(message)) => {
+                assert!(message.contains("已在设置里关闭"), "{message}")
+            }
+            other => panic!("关着的服务器不该调得通：{other:?}"),
+        }
+        assert_eq!(connection.reconnect().await.state, McpServerState::Disabled);
+        assert_eq!(
+            connection.disconnect().await.state,
+            McpServerState::Disabled
+        );
+        let view = &hub.views()[0];
+        assert!(!view.enabled);
+        assert_eq!(view.state, McpServerState::Disabled);
+        assert!(view.tools.is_empty());
+
+        // 打开：换一个新连接，进程起来，工具挂上。
+        let mut on = demo.clone();
+        on.enabled = true;
+        let change = hub.reconcile(&servers_of(&[("demo", on.clone())]), &Secrets::new());
+        assert_eq!(change.removed, vec!["demo".to_string()]);
+        assert_eq!(change.added, vec!["demo".to_string()]);
+        assert!(change.withdrawn.is_empty());
+        assert_eq!(
+            wait_tools(&hub).await,
+            vec!["mcp__demo__echo", "mcp__demo__slow"]
+        );
+        let pid = fixture.pid("a").await;
+        assert!(hub.views()[0].enabled);
+
+        // 关上：工具撤掉（原因写明是设置里关的），进程退出，状态 disabled。
+        let change = hub.reconcile(&servers_of(&[("demo", demo)]), &Secrets::new());
+        assert_eq!(
+            withdrawn_names(&change),
+            vec!["mcp__demo__echo", "mcp__demo__slow"]
+        );
+        assert!(
+            change
+                .withdrawn
+                .iter()
+                .all(|(_, reason)| reason.contains("已在设置里关闭")),
+            "{change:?}"
+        );
+        wait_exit(pid).await;
+        assert_eq!(hub.statuses()[0].state, McpServerState::Disabled);
+        assert!(hub.new_tools().is_empty());
+    }
+
+    /// 单个工具的开关：热重载只换开关、不重连；关着的工具撤出目录、握着旧句柄也调不了、不挂回；重新打开后
+    /// 只挂回它（已挂的不重复）。
+    #[tokio::test]
+    async fn a_tool_switched_off_is_withdrawn_dead_to_old_handles_and_mounted_again_when_reopened()
+    {
+        let fixture = Fixture::new();
+        let hub = fixture.hub(&[("demo", fixture.server("a", &[]))]).await;
+        assert_eq!(hub.new_tools().len(), 2);
+        let pid = fixture.pid("a").await;
+        let connection = Arc::clone(&hub.connections()[0]);
+
+        let mut off = fixture.server("a", &[]);
+        off.disabled_tools = vec!["echo".into()];
+        let servers = servers_of(&[("demo", off)]);
+        let change = hub.reconcile(&servers, &Secrets::new());
+        assert!(
+            change.removed.is_empty() && change.added.is_empty(),
+            "不重连：{change:?}"
+        );
+        assert_eq!(withdrawn_names(&change), vec!["mcp__demo__echo"]);
+        assert!(change.withdrawn[0].1.contains("已在设置里关闭"));
+        assert!(Arc::ptr_eq(&connection, &hub.connections()[0]));
+        assert!(alive(pid), "进程没动");
+        assert_eq!(
+            hub.reconcile(&servers, &Secrets::new()),
+            McpChange::default(),
+            "再来一次没有变化"
+        );
+
+        match connection.call("echo", JsonObject::new()).await {
+            Err(CallError::NotSent(message)) => {
+                assert!(
+                    message.contains("工具 echo") && message.contains("已在设置里关闭"),
+                    "{message}"
+                )
+            }
+            other => panic!("关着的工具握着旧句柄也不该调得通：{other:?}"),
+        }
+        let flags: Vec<(String, bool)> = hub.views()[0]
+            .tools
+            .iter()
+            .map(|tool| (tool.name.clone(), tool.enabled))
+            .collect();
+        assert_eq!(
+            flags,
+            vec![("echo".to_string(), false), ("slow".to_string(), true)]
+        );
+        assert!(hub.new_tools().is_empty(), "关着的不挂");
+        let (_, unresolved) = hub.await_tools(&["mcp__demo__echo".to_string()]).await;
+        assert!(
+            unresolved["mcp__demo__echo"].contains("已在设置里关闭"),
+            "{unresolved:?}"
+        );
+
+        // 重新打开：只有它挂回来，其余的不重复；老句柄又调得通。
+        let change = hub.reconcile(
+            &servers_of(&[("demo", fixture.server("a", &[]))]),
+            &Secrets::new(),
+        );
+        assert_eq!(change, McpChange::default());
+        let names: Vec<String> = hub
+            .new_tools()
+            .iter()
+            .map(|tool| tool.definition().name)
+            .collect();
+        assert_eq!(names, vec!["mcp__demo__echo"]);
+        assert_eq!(
+            text_of(&connection.call("echo", JsonObject::new()).await.unwrap()),
+            "echoed"
+        );
+        assert!(hub.views()[0].tools.iter().all(|tool| tool.enabled));
+    }
+
+    /// 一开始就关着的工具连上时不挂；`endpoint` 对 stdio 只给程序名、对 http 去掉账号与查询串。
+    #[tokio::test]
+    async fn a_tool_off_at_connect_time_is_not_mounted_and_endpoints_hide_secrets() {
+        let fixture = Fixture::new();
+        let mut demo = fixture.server("a", &[]);
+        demo.disabled_tools = vec!["slow".into()];
+        let hub = fixture.hub(&[("demo", demo)]).await;
+        let names: Vec<String> = hub
+            .new_tools()
+            .iter()
+            .map(|tool| tool.definition().name)
+            .collect();
+        assert_eq!(names, vec!["mcp__demo__echo"]);
+        assert_eq!(hub.views()[0].endpoint.as_deref(), Some("python3"));
+
+        let stdio = |command: &str| McpServerConfig {
+            transport: McpTransport::Stdio {
+                command: command.into(),
+                args: vec!["--token=hunter2".into()],
+                env: vec![],
+            },
+            enabled: false,
+            ..fixture.server("x", &[])
+        };
+        let http = |url: &str| McpServerConfig {
+            transport: McpTransport::Http {
+                url: url.into(),
+                bearer_token_env: None,
+                oauth: false,
+            },
+            enabled: false,
+            ..fixture.server("x", &[])
+        };
+        let hub = fixture
+            .hub(&[
+                ("a", stdio("/usr/local/bin/mcp-server")),
+                ("b", stdio("npx")),
+                (
+                    "c",
+                    http("https://user:pw@mcp.example.com:8443/v1/mcp?token=abc#frag"),
+                ),
+                ("d", http("https://mcp.example.com")),
+            ])
+            .await;
+        let endpoint = |name: &str| {
+            hub.views()
+                .into_iter()
+                .find(|view| view.name == name)
+                .unwrap()
+                .endpoint
+                .unwrap()
+        };
+        assert_eq!(endpoint("a"), "mcp-server");
+        assert_eq!(endpoint("b"), "npx");
+        assert_eq!(endpoint("c"), "https://mcp.example.com:8443/v1/mcp");
+        assert_eq!(endpoint("d"), "https://mcp.example.com");
+        assert!(
+            hub.views()
+                .iter()
+                .all(|view| !view.endpoint.as_deref().unwrap().contains("hunter2"))
+        );
+    }
 }

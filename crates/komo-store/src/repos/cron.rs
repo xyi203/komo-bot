@@ -183,8 +183,16 @@ impl CronRepo for TursoCronRepo {
                         None => job.version.max(1),
                     };
                     job.name = row.title.clone();
+                    let mut def = ScheduleDef::of(&job);
+                    // 读出来的 `prompt` 是现取的目标说明（`job_from_row`）：原样写回去会把它冻成快照，
+                    // 说明之后再改就不跟了。没有命令、提示词又正好等于当前说明的，仍存成「没写」。
+                    if job.command.is_none()
+                        && row.description.as_deref() == Some(job.prompt.as_str())
+                    {
+                        def.prompt = String::new();
+                    }
                     row.update()
-                        .schedule(Some(encode(&ScheduleDef::of(&job))?))
+                        .schedule(Some(encode(&def)?))
                         .schedule_status(job.status.as_str())
                         .next_run_at(to_ts_opt(job.next_run_at))
                         .last_error(job.last_error.clone())
@@ -680,6 +688,68 @@ mod tests {
             .unwrap();
         assert_eq!(matter.description.as_deref(), Some("新的说明"));
         assert_eq!(matter.revision, 2);
+    }
+
+    /// 没写提示词也没写命令的定时，到点做的事取目标**现在**的说明：读出来再整体写回（改定时的别的字段时
+    /// 就是这么做的）不能把它冻成快照，说明之后再改要照样跟着；明确写了提示词的不受说明影响。
+    #[tokio::test]
+    async fn a_schedule_without_a_prompt_follows_the_goals_description_even_after_a_round_trip() {
+        let (repo, db, _dir) = repo_with(&["g-1"]).await;
+        let matters = TursoMatterRepo::new(db.clone());
+        let id = CronJobId::from_raw("g-1");
+        let describe = |text: &'static str| {
+            let matters = matters.clone();
+            async move {
+                let current = matters
+                    .get(&MatterId::from_raw("g-1"))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let edited = transition(
+                    &current,
+                    &MatterChange::Edit {
+                        title: None,
+                        due: None,
+                        standard: None,
+                        description: Some(Some(text.into())),
+                    },
+                    NOW,
+                )
+                .unwrap()
+                .unwrap();
+                matters
+                    .put(edited.clone(), Some(current.revision))
+                    .await
+                    .unwrap();
+            }
+        };
+        describe("说明一").await;
+        let mut blank = job("g-1");
+        blank.prompt = String::new();
+        repo.put(blank).await.unwrap();
+        assert_eq!(repo.get(&id).await.unwrap().unwrap().prompt, "说明一");
+
+        // 读出来（prompt 已是「说明一」）再整体写回，随后说明改了：仍然跟着。
+        let round_trip = repo.get(&id).await.unwrap().unwrap();
+        repo.put(round_trip).await.unwrap();
+        describe("说明二").await;
+        assert_eq!(repo.get(&id).await.unwrap().unwrap().prompt, "说明二");
+
+        // 明确的提示词：钉住，不跟说明走；命令型也不取说明。
+        let mut explicit = job("g-1");
+        explicit.prompt = "自己写的".into();
+        repo.put(explicit).await.unwrap();
+        describe("说明三").await;
+        assert_eq!(repo.get(&id).await.unwrap().unwrap().prompt, "自己写的");
+        let mut command = job("g-1");
+        command.prompt = String::new();
+        command.command = Some("true".into());
+        repo.put(command).await.unwrap();
+        let read = repo.get(&id).await.unwrap().unwrap();
+        assert_eq!(
+            (read.prompt.as_str(), read.command.as_deref()),
+            ("", Some("true"))
+        );
     }
 
     /// 推进一个不存在 / 没有定时的目标是错误，不是无声无息。

@@ -733,6 +733,7 @@ pub async fn check(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use time::macros::datetime;
 
     #[test]
     fn only_loopback_and_the_deep_link_may_receive_a_device_code() {
@@ -809,5 +810,507 @@ mod tests {
         assert_eq!(hash(&token), hash(&token));
         assert!(!hash(&token).contains(&token));
         assert_eq!(hash(&token).len(), 64);
+    }
+
+    // ------------------------------------------------------------ AuthService（库是真的，时钟可拨）
+
+    use crate::service::test_support::harness::{DEFAULT_ENV, config_toml, write_home};
+    use komo_config::LoadOptions;
+    use komo_kernel::test_support::TestClock;
+
+    struct Fixture {
+        auth: AuthService,
+        clock: TestClock,
+        _dir: tempfile::TempDir,
+    }
+
+    async fn fixture(local_token: &str) -> Fixture {
+        let dir = tempfile::tempdir().unwrap();
+        write_home(dir.path(), &config_toml(""), DEFAULT_ENV);
+        let holder = Arc::new(ConfigHolder::load(&LoadOptions::at(dir.path())).unwrap());
+        let clock = TestClock::fixed();
+        let auth = AuthService::new(
+            Db::open_memory().await.unwrap(),
+            holder,
+            Arc::new(clock.clone()),
+            local_token.to_string(),
+        );
+        Fixture {
+            auth,
+            clock,
+            _dir: dir,
+        }
+    }
+
+    fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut map = HeaderMap::new();
+        for (name, value) in pairs {
+            map.insert(
+                header::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                HeaderValue::from_str(value).unwrap(),
+            );
+        }
+        map
+    }
+
+    fn cookie(token: &str) -> HeaderMap {
+        headers(&[("cookie", &format!("{SESSION_COOKIE}={token}"))])
+    }
+
+    fn bearer_header(token: &str) -> HeaderMap {
+        headers(&[("authorization", &format!("Bearer {token}"))])
+    }
+
+    fn device_request(verifier: &str) -> DeviceRequest {
+        DeviceRequest {
+            challenge: s256_challenge(verifier),
+            redirect_uri: "http://127.0.0.1:5000/cb".into(),
+            state: Some("s".into()),
+            name: "桌面".into(),
+        }
+    }
+
+    /// 签发 → 查找：只认对的令牌与对的种类；库里没有令牌本身；清单里带名字与账号。
+    #[tokio::test]
+    async fn an_issued_web_session_is_found_by_its_token_and_only_as_a_cookie() {
+        let f = fixture("local-token").await;
+        let token = f
+            .auth
+            .issue_web(
+                "u-1",
+                Some("me@example.com"),
+                "Mozilla/5.0 Chrome/130 Safari/537",
+            )
+            .await
+            .unwrap();
+        let found = f
+            .auth
+            .authenticate(&cookie(&token), &Method::GET)
+            .await
+            .unwrap()
+            .expect("cookie 认得");
+        assert!(matches!(found.credential, Credential::Web { .. }));
+        assert_eq!(found.subject.as_deref(), Some("u-1"));
+        assert_eq!(found.email.as_deref(), Some("me@example.com"));
+        assert!(found.reissue_cookie.is_none(), "刚签发不用续");
+
+        // 别的令牌、没带、网页令牌当 Bearer 用：都不认。
+        assert!(
+            f.auth
+                .authenticate(&cookie("nope"), &Method::GET)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            f.auth
+                .authenticate(&HeaderMap::new(), &Method::GET)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            f.auth
+                .authenticate(&bearer_header(&token), &Method::GET)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        let list = f.auth.list(found.credential.session_id()).await.unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].label, "网页 · Chrome");
+        assert_eq!(list[0].kind, AuthSessionKind::Web);
+        assert!(list[0].current);
+        assert_eq!(list[0].expires_at, Some(f.clock.now() + WEB_TTL));
+        assert!(!format!("{list:?}").contains(&token), "清单里没有令牌");
+        assert!(!f.auth.list(None).await.unwrap()[0].current);
+    }
+
+    /// 本机令牌恒定时间比较；空本机令牌的 Gateway 一切都算本机。
+    #[tokio::test]
+    async fn the_local_token_and_the_open_gateway() {
+        let f = fixture("local-token").await;
+        let local = f
+            .auth
+            .authenticate(&bearer_header("local-token"), &Method::POST)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(local.credential, Credential::Local);
+        assert!(local.subject.is_none());
+        assert!(
+            f.auth
+                .authenticate(&bearer_header("local-tokeX"), &Method::GET)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            f.auth
+                .authenticate(&bearer_header("local"), &Method::GET)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        let open = fixture("").await;
+        let anyone = open
+            .auth
+            .authenticate(&HeaderMap::new(), &Method::DELETE)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(anyone.credential, Credential::Local);
+    }
+
+    /// 网页会话 30 天滑动续期：10 分钟内不写库不重发 cookie；超过 10 分钟的下一次请求续期并要求重发 cookie；
+    /// 距上次续期超过 30 天才过期。
+    #[tokio::test]
+    async fn a_web_session_slides_and_finally_expires() {
+        let f = fixture("t").await;
+        let token = f.auth.issue_web("u-1", None, "").await.unwrap();
+        let headers = cookie(&token);
+        let authenticate = || f.auth.authenticate(&headers, &Method::GET);
+
+        f.clock.advance(Duration::minutes(5));
+        let early = authenticate().await.unwrap().unwrap();
+        assert!(early.reissue_cookie.is_none(), "5 分钟：不续");
+        let created = f.auth.list(None).await.unwrap()[0].expires_at.unwrap();
+        assert_eq!(created, TestClock::fixed().now() + WEB_TTL, "也没写库");
+
+        f.clock.advance(Duration::minutes(6));
+        let renewed = authenticate().await.unwrap().unwrap();
+        assert_eq!(
+            renewed.reissue_cookie.as_deref(),
+            Some(token.as_str()),
+            "11 分钟：续并重发 cookie"
+        );
+        assert_eq!(
+            f.auth.list(None).await.unwrap()[0].expires_at,
+            Some(f.clock.now() + WEB_TTL)
+        );
+        assert!(
+            authenticate()
+                .await
+                .unwrap()
+                .unwrap()
+                .reissue_cookie
+                .is_none(),
+            "续完马上再来不重复"
+        );
+
+        // 每隔不到 30 天用一次就一直有效。
+        for _ in 0..3 {
+            f.clock.advance(Duration::days(29));
+            assert!(authenticate().await.unwrap().is_some());
+        }
+        // 超过 30 天没用：过期，清单里也没了。
+        f.clock.advance(Duration::days(31));
+        assert!(authenticate().await.unwrap().is_none());
+        assert!(f.auth.list(None).await.unwrap().is_empty());
+        assert_eq!(f.auth.purge_expired().await.unwrap(), 1);
+        assert_eq!(f.auth.purge_expired().await.unwrap(), 0);
+    }
+
+    /// 带 cookie 的写请求要核对 Origin；GET / HEAD 与 Bearer 不看。
+    #[tokio::test]
+    async fn a_cookie_write_needs_a_same_origin_request() {
+        let f = fixture("t").await;
+        let token = f.auth.issue_web("u-1", None, "").await.unwrap();
+        let with_origin = |origin: Option<&str>| {
+            let mut map = cookie(&token);
+            map.insert(header::HOST, HeaderValue::from_static("komo.local:7878"));
+            if let Some(origin) = origin {
+                map.insert(header::ORIGIN, HeaderValue::from_str(origin).unwrap());
+            }
+            map
+        };
+        for method in [Method::GET, Method::HEAD] {
+            assert!(
+                f.auth
+                    .authenticate(&with_origin(None), &method)
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+        }
+        for method in [Method::POST, Method::PUT, Method::PATCH, Method::DELETE] {
+            let denied = f.auth.authenticate(&with_origin(None), &method).await;
+            assert!(
+                matches!(&denied, Err(failure) if failure.code() == ErrorCode::Denied),
+                "{method}"
+            );
+            let cross = f
+                .auth
+                .authenticate(&with_origin(Some("http://evil.example.com")), &method)
+                .await;
+            assert!(cross.is_err(), "{method} 跨源");
+            let same = f
+                .auth
+                .authenticate(&with_origin(Some("http://komo.local:7878")), &method)
+                .await;
+            assert!(same.unwrap().is_some(), "{method} 同源");
+        }
+        // 设备令牌（Bearer）不被 CSRF 影响，不核对 Origin。
+        let (device, _) = redeem_device(&f).await;
+        assert!(
+            f.auth
+                .authenticate(&bearer_header(&device), &Method::POST)
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    async fn redeem_device(f: &Fixture) -> (String, AuthSessionRecord) {
+        let verifier = random_token();
+        let code = f
+            .auth
+            .issue_code(device_request(&verifier), "u-1", Some("me@example.com"));
+        f.auth
+            .redeem_code(&code, &verifier, "http://127.0.0.1:5000/cb")
+            .await
+            .unwrap()
+    }
+
+    /// 授权码：一次性、两分钟、PKCE 与 redirect_uri 都要对；换到的设备令牌不过期。
+    #[tokio::test]
+    async fn a_device_code_is_single_use_short_lived_and_bound_to_pkce_and_redirect() {
+        let f = fixture("t").await;
+        let redirect = "http://127.0.0.1:5000/cb";
+        let verifier = random_token();
+
+        let code = f.auth.issue_code(device_request(&verifier), "u-1", None);
+        let (token, record) = f
+            .auth
+            .redeem_code(&code, &verifier, redirect)
+            .await
+            .unwrap();
+        assert!(token.starts_with(DEVICE_PREFIX));
+        assert_eq!(
+            (record.label.as_str(), record.subject.as_str()),
+            ("桌面", "u-1")
+        );
+        assert!(record.expires_at.is_none());
+        assert!(matches!(
+            f.auth.redeem_code(&code, &verifier, redirect).await,
+            Err(AuthError::BadRequest(_))
+        ));
+
+        // 错的 verifier、错的 redirect_uri、过期：都拒，而且码作废。
+        for (name, verifier_used, redirect_used, wait) in [
+            ("verifier", "x".repeat(43), redirect, 0),
+            ("redirect", verifier.clone(), "http://127.0.0.1:5001/cb", 0),
+            ("过期", verifier.clone(), redirect, 3),
+        ] {
+            let code = f.auth.issue_code(device_request(&verifier), "u-1", None);
+            f.clock.advance(Duration::minutes(wait));
+            assert!(
+                matches!(
+                    f.auth
+                        .redeem_code(&code, &verifier_used, redirect_used)
+                        .await,
+                    Err(AuthError::BadRequest(_))
+                ),
+                "{name}"
+            );
+            assert!(
+                matches!(
+                    f.auth.redeem_code(&code, &verifier, redirect).await,
+                    Err(AuthError::BadRequest(_))
+                ),
+                "{name}：码已作废"
+            );
+        }
+        assert!(matches!(
+            f.auth
+                .redeem_code("never-issued", &verifier, redirect)
+                .await,
+            Err(AuthError::BadRequest(_))
+        ));
+
+        // 设备令牌长期有效，且不会要求重发 cookie。
+        f.clock.advance(Duration::days(400));
+        let found = f
+            .auth
+            .authenticate(&bearer_header(&token), &Method::GET)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(found.credential, Credential::Device { .. }));
+        assert!(found.reissue_cookie.is_none());
+        // 设备令牌放在 cookie 里不认。
+        assert!(
+            f.auth
+                .authenticate(&cookie(&token), &Method::GET)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// 吊销：按 id、按退出；清单按最近使用排序；吊销了就认不出，再吊销答没有。
+    #[tokio::test]
+    async fn revoking_and_logging_out_end_a_session_and_the_list_orders_by_last_use() {
+        let f = fixture("t").await;
+        let web = f.auth.issue_web("u-1", None, "Firefox/130").await.unwrap();
+        f.clock.advance(Duration::minutes(1));
+        let (device, device_record) = redeem_device(&f).await;
+        let list = f.auth.list(None).await.unwrap();
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0].kind, AuthSessionKind::Device, "后用的在前");
+        assert_eq!(list[1].label, "网页 · Firefox");
+
+        assert!(f.auth.revoke(&device_record.id).await.unwrap());
+        assert!(!f.auth.revoke(&device_record.id).await.unwrap());
+        assert!(
+            f.auth
+                .authenticate(&bearer_header(&device), &Method::GET)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        // 退出只吊销这个 cookie 的会话；没带 cookie 也算成功。
+        f.auth.logout(&HeaderMap::new()).await.unwrap();
+        assert!(
+            f.auth
+                .authenticate(&cookie(&web), &Method::GET)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        f.auth.logout(&cookie(&web)).await.unwrap();
+        f.auth.logout(&cookie(&web)).await.unwrap();
+        assert!(
+            f.auth
+                .authenticate(&cookie(&web), &Method::GET)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(f.auth.list(None).await.unwrap().is_empty());
+    }
+
+    /// 重开库之后登录状态仍有效（落盘的是令牌的哈希）。
+    #[tokio::test]
+    async fn sessions_are_still_valid_after_the_database_is_reopened() {
+        let dir = tempfile::tempdir().unwrap();
+        write_home(dir.path(), &config_toml(""), DEFAULT_ENV);
+        let holder = Arc::new(ConfigHolder::load(&LoadOptions::at(dir.path())).unwrap());
+        let clock = TestClock::fixed();
+        let path = dir.path().join("aux.db");
+        let make = || async {
+            AuthService::new(
+                Db::connect(&path).await.unwrap(),
+                Arc::clone(&holder),
+                Arc::new(clock.clone()),
+                "t".into(),
+            )
+        };
+        let first = make().await;
+        let web = first
+            .issue_web("u-1", Some("me@example.com"), "")
+            .await
+            .unwrap();
+        let verifier = random_token();
+        let code = first.issue_code(device_request(&verifier), "u-1", None);
+        let (device, _) = first
+            .redeem_code(&code, &verifier, "http://127.0.0.1:5000/cb")
+            .await
+            .unwrap();
+        drop(first);
+
+        let second = make().await;
+        assert!(
+            second
+                .authenticate(&cookie(&web), &Method::GET)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            second
+                .authenticate(&bearer_header(&device), &Method::GET)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(second.list(None).await.unwrap().len(), 2);
+        // 内存里的临时状态（授权码、待完成的登录）不跟着走：重启后换不了。
+        assert!(
+            second
+                .redeem_code(&code, &verifier, "http://127.0.0.1:5000/cb")
+                .await
+                .is_err()
+        );
+    }
+
+    /// 没配 `[auth.oidc]`：发起与回调都是 NotConfigured，cookie 不加 Secure。
+    #[tokio::test]
+    async fn without_oidc_login_is_not_configured() {
+        let f = fixture("t").await;
+        assert!(!f.auth.oidc_configured());
+        assert!(f.auth.oidc_config().is_none());
+        assert!(!f.auth.secure_cookies());
+        assert!(f.auth.public_origin().is_none());
+        assert!(matches!(
+            f.auth.begin(Purpose::Web { next: "/".into() }).await,
+            Err(AuthError::NotConfigured)
+        ));
+        assert!(matches!(
+            f.auth.finish("s", Some("s"), "c").await,
+            Err(AuthError::NotConfigured)
+        ));
+        assert!(!f.auth.session_cookie("tok").contains("Secure"));
+        assert!(f.auth.session_cookie("tok").contains("HttpOnly"));
+        assert!(f.auth.clear_session_cookie().contains("Max-Age=0"));
+    }
+
+    /// 内存里的待完成登录有上限：先清过期的，仍满了就丢最早到期的。
+    #[test]
+    fn the_pending_table_is_bounded_and_drops_the_oldest_first() {
+        let table: Mutex<HashMap<String, OffsetDateTime>> = Mutex::new(HashMap::new());
+        let now = datetime!(2026-09-15 08:00:00 UTC);
+        for index in 0..(MAX_PENDING + 20) {
+            insert_bounded(
+                &table,
+                format!("k{index}"),
+                now + Duration::seconds(index as i64 + 1),
+                now,
+                |expires| *expires,
+            );
+        }
+        let table = table.lock().unwrap();
+        assert_eq!(table.len(), MAX_PENDING);
+        assert!(!table.contains_key("k0"), "最早到期的先丢");
+        assert!(table.contains_key(&format!("k{}", MAX_PENDING + 19)));
+
+        // 过期的在下一次插入时被清掉。
+        drop(table);
+        let table: Mutex<HashMap<String, OffsetDateTime>> = Mutex::new(HashMap::from([
+            ("old".to_string(), now - Duration::seconds(1)),
+            ("live".to_string(), now + Duration::seconds(1)),
+        ]));
+        insert_bounded(&table, "new".into(), now + Duration::seconds(5), now, |e| {
+            *e
+        });
+        let keys: std::collections::BTreeSet<_> = table.lock().unwrap().keys().cloned().collect();
+        assert_eq!(keys, ["live".to_string(), "new".to_string()].into());
+    }
+
+    #[test]
+    fn a_browser_label_names_the_browser_with_edge_before_chrome() {
+        for (agent, label) in [
+            ("Mozilla/5.0 Edg/130 Chrome/130 Safari/537", "网页 · Edge"),
+            ("Mozilla/5.0 Firefox/130", "网页 · Firefox"),
+            ("Mozilla/5.0 Chrome/130 Safari/537", "网页 · Chrome"),
+            ("Mozilla/5.0 Version/17 Safari/605", "网页 · Safari"),
+            ("curl/8", "网页 · 浏览器"),
+            ("", "网页 · 浏览器"),
+        ] {
+            assert_eq!(browser_label(agent), label, "{agent}");
+        }
     }
 }

@@ -567,7 +567,15 @@ mode = "keyword"
 
         // ── session / task
         let hits = ok(&tool, &mut ctx, "session.search", json!({ "q": "空调" })).await;
-        assert_eq!(hits["hits"][0]["session"], session.as_str(), "{hits}");
+        // goal.run 跑出的定时会话标题也含「空调」，命中不止这一个：按会话找，不依赖顺序。
+        assert!(
+            hits["hits"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|hit| hit["session"] == session.as_str() && hit["kind"] == "normal"),
+            "{hits}"
+        );
         let sessions = ok(&tool, &mut ctx, "session.list", json!({})).await;
         assert!(
             sessions["sessions"]
@@ -653,9 +661,16 @@ mode = "keyword"
                 session: task_session.clone(),
             },
         );
+        // 定时是承诺类：设置与去掉在任务会话里同样被拒；`goal.run` 是推进，不在此列。
+        let scheduled = new_matter(&gateway, "goal", "给定时用").await;
         for (action, params) in [
             ("goal.add", json!({ "title": "替别人记的事" })),
             ("memory.add", json!({ "content": "任务正文不是用户原话" })),
+            (
+                "goal.schedule",
+                json!({ "id": scheduled, "schedule": "0 9 * * *", "command": "true" }),
+            ),
+            ("goal.unschedule", json!({ "id": scheduled })),
         ] {
             let error = call(&tool, &mut ctx, action, params).await.unwrap_err();
             let ToolError::InvalidArguments { message } = &error else {
@@ -682,13 +697,23 @@ mode = "keyword"
                 job_version: 1,
             },
         );
-        let error = call(&tool, &mut ctx, "goal.add", json!({ "title": "发布观察" }))
-            .await
-            .unwrap_err();
-        let ToolError::InvalidArguments { message } = &error else {
-            panic!("{error:?}")
-        };
-        assert!(message.contains("找不到用户说的话"), "{message}");
+        for (action, params) in [
+            ("goal.add", json!({ "title": "发布观察" })),
+            (
+                "goal.schedule",
+                json!({ "id": scheduled, "schedule": "0 9 * * *", "command": "true" }),
+            ),
+            ("goal.unschedule", json!({ "id": scheduled })),
+        ] {
+            let error = call(&tool, &mut ctx, action, params).await.unwrap_err();
+            let ToolError::InvalidArguments { message } = &error else {
+                panic!("{action}：{error:?}")
+            };
+            assert!(message.contains("找不到用户说的话"), "{action}：{message}");
+        }
+        // 什么都没设上。
+        let (_, shown) = gateway.get_json(&format!("/v1/matters/{scheduled}")).await;
+        assert!(shown.get("schedule").is_none(), "{shown}");
         gateway.running.stop().await;
     }
 

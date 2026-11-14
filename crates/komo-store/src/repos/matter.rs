@@ -414,4 +414,52 @@ mod tests {
             ["g-2"]
         );
     }
+
+    /// 绑定的支线只由 `set_chat` 写：改目标内容（`put`）不覆盖它，绑定也不动目标的版本；`None` 与空串都读成没绑；
+    /// 目标不存在是 NotFound；清单只含绑着的。
+    #[tokio::test]
+    async fn the_bound_chat_survives_edits_and_is_written_only_by_set_chat() {
+        let (repo, _dir) = temp().await;
+        let stored = repo.put(goal("g-1"), None).await.unwrap();
+        repo.put(goal("g-2"), None).await.unwrap();
+        let id = stored.id.clone();
+        assert_eq!(repo.chat(&id).await.unwrap(), None);
+        assert!(repo.chats().await.unwrap().is_empty());
+
+        repo.set_chat(&id, Some("sess-chat".into())).await.unwrap();
+        assert_eq!(repo.chat(&id).await.unwrap().as_deref(), Some("sess-chat"));
+        assert_eq!(
+            repo.get(&id).await.unwrap().unwrap().revision,
+            stored.revision,
+            "绑定不升版"
+        );
+        assert_eq!(
+            repo.chats().await.unwrap(),
+            vec![(id.clone(), "sess-chat".to_string())]
+        );
+
+        // 用绑定之前读到的旧状态改目标：revision 对得上就写进去，绑定还在。
+        let edited = transition(&stored, &MatterChange::Wait("SRE 审批".into()), T0)
+            .unwrap()
+            .unwrap();
+        repo.put(edited, Some(stored.revision)).await.unwrap();
+        assert_eq!(repo.chat(&id).await.unwrap().as_deref(), Some("sess-chat"));
+
+        repo.set_chat(&id, Some(String::new())).await.unwrap();
+        assert_eq!(repo.chat(&id).await.unwrap(), None, "空串当没绑");
+        repo.set_chat(&id, Some("again".into())).await.unwrap();
+        repo.set_chat(&id, None).await.unwrap();
+        assert_eq!(repo.chat(&id).await.unwrap(), None);
+        assert!(repo.chats().await.unwrap().is_empty());
+
+        let missing = MatterId::from_raw("nope");
+        assert!(matches!(
+            repo.set_chat(&missing, Some("x".into())).await,
+            Err(RepoError::NotFound { .. })
+        ));
+        assert!(matches!(
+            repo.chat(&missing).await,
+            Err(RepoError::NotFound { .. })
+        ));
+    }
 }

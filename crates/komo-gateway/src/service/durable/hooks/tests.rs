@@ -260,6 +260,78 @@ async fn setup_resolves_task_doc_model_names_against_current_config() {
     assert!(message.contains("fast"), "{message}");
 }
 
+/// `[models] main` 只给主对话用：支线、任务会话不受影响；sticky 的 `komo.agent.model` 比它优先；
+/// 热重载拿掉它，主对话回到 Agent 的默认模型。
+#[tokio::test]
+async fn the_main_model_applies_to_the_main_chat_only_and_a_sticky_model_beats_it() {
+    use crate::service::durable::sessions::NewSession;
+    use komo_kernel::durable::SessionKind;
+
+    let with_main = config_with("", NO_MEMORY)
+        .replace("default = \"main\"", "default = \"main\"\nmain = \"fast\"");
+    let world = World::new(&with_main, finisher()).await;
+    let hooks = world.hooks();
+    let core = world.core();
+    let main = core
+        .create_session(NewSession::new("assistant").kind(SessionKind::Main))
+        .await
+        .unwrap();
+    let side = core
+        .create_session(NewSession::new("assistant"))
+        .await
+        .unwrap();
+
+    let model_of = |conversation| {
+        let hooks = Arc::clone(&hooks);
+        async move { hooks.setup(conversation, &[]).await.unwrap().model.model }
+    };
+    assert_eq!(
+        model_of(main.root_conversation).await,
+        "fast-test",
+        "主对话用 main"
+    );
+    assert_eq!(
+        model_of(side.root_conversation).await,
+        "gpt-test",
+        "支线仍是默认模型"
+    );
+
+    // 主对话派出的任务会话（fresh）按 Agent 的默认模型，不沾 main。
+    let task = world
+        .task_conversation(main.root_conversation, None, |doc| doc)
+        .await;
+    assert_eq!(model_of(task).await, "gpt-test");
+
+    // sticky：操作者在这段对话里切过模型，就用他选的。
+    let mut sticky = agent("assistant");
+    sticky.model = Some("main".into());
+    let root = main.root_conversation;
+    core.engine
+        .commit(move |tx| {
+            let sticky = sticky.clone();
+            Box::pin(async move {
+                agent_doc::write_in(tx, root, &sticky).await?;
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        model_of(main.root_conversation).await,
+        "gpt-test",
+        "sticky 优先于 main"
+    );
+
+    // 拿掉 `main`：热重载之后主对话（没有 sticky 的话）也回到默认。
+    world.write_config_and_reload(&config_with("", NO_MEMORY));
+    assert_eq!(model_of(side.root_conversation).await, "gpt-test");
+    let other_main = core
+        .create_session(NewSession::new("assistant").kind(SessionKind::Main))
+        .await
+        .unwrap();
+    assert_eq!(model_of(other_main.root_conversation).await, "gpt-test");
+}
+
 /// `komo.agent` → 默认 Agent：没有 document 的 conversation 用 `default_agent`；document 指向已经
 /// 删掉的 Agent 时退回默认 Agent，不让输入失败；`komo.agent.model` / `effort` / `workdir` 生效。
 #[tokio::test]

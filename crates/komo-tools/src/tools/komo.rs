@@ -1249,7 +1249,6 @@ mod tests {
                 json!({ "action": "goal.list", "params": "x" }),
                 "要是一个对象",
             ),
-            (json!({ "action": "cron.list" }), "komo 不认识 action"),
         ] {
             let error = tool.prepare(args.clone(), &ctx).await.unwrap_err();
             let ToolError::InvalidArguments { message } = &error else {
@@ -1271,6 +1270,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         for action in [
             "memory.confirm",
+            "cron.list",
             "area.add",
             "gateway.restart",
             "memory",

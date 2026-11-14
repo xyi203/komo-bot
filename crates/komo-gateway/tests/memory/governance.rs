@@ -101,6 +101,56 @@ async fn confirm_and_forget_are_idempotent_over_http() {
     assert!(body["memories"].as_array().unwrap().is_empty(), "{body}");
 }
 
+/// 候选（模型推断、证据不够硬）被操作者确认就转成生效，才进召回；重复确认幂等，不再升版也不回退。
+/// 已经生效的确认只抬确认等级，不动状态（上一条测试）。
+#[tokio::test]
+async fn confirming_a_candidate_makes_it_active_and_recallable() {
+    let (gateway, _embeddings) = super::with_memories(
+        "keyword",
+        vec![seeded(
+            "m-cand",
+            "书房空调设 25 度",
+            Provenance::ModelInference,
+            MemoryState::Candidate,
+        )],
+    )
+    .await;
+    // 带关键词是召回路径：只放行生效的（候选不进召回）。
+    let recalled = || async {
+        let (status, body) = gateway
+            .get_json("/v1/memories?query=%E4%B9%A6%E6%88%BF")
+            .await;
+        assert_eq!(status, 200, "{body}");
+        body["memories"].as_array().unwrap().len()
+    };
+    assert_eq!(recalled().await, 0, "候选还不召回");
+    let (_, shown) = gateway.get_json("/v1/memories/m-cand").await;
+    assert_eq!(shown["memory"]["state"], "candidate");
+
+    let (status, body) = gateway
+        .post_json(
+            "/v1/memories/m-cand/confirm",
+            serde_json::json!({"expected_revision": 1}),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["memory"]["state"], "active", "{body}");
+    assert_eq!(body["memory"]["confirmation"], "user_confirmed");
+    assert_eq!(body["memory"]["revision"], 1, "确认不产生新版本");
+    assert_eq!(recalled().await, 1, "确认之后才召回得到");
+
+    // 再确认一次：仍是生效、仍是同一版。
+    let (status, again) = gateway
+        .post_json(
+            "/v1/memories/m-cand/confirm",
+            serde_json::json!({"expected_revision": 1}),
+        )
+        .await;
+    assert_eq!(status, 200, "{again}");
+    assert_eq!(again["memory"]["state"], "active");
+    assert_eq!(again["memory"]["revision"], 1);
+}
+
 /// §14 ⑦ 的后半：**已遗忘的内容不会回到后面的轮次**（§9.7）。
 ///
 /// 第一轮注入了它；`forget` 之后第二轮的 `TurnRequest::memories` 里就没有它了——

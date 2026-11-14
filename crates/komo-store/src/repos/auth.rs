@@ -290,3 +290,148 @@ fn record_of(row: &AuthSessionRow) -> Option<AuthSessionRecord> {
         expires_at: from_ts_opt(row.expires_at),
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use time::Duration;
+    use time::macros::datetime;
+
+    const T0: OffsetDateTime = datetime!(2026-11-01 08:00:00 UTC);
+
+    fn new(kind: AuthKind, hash: &str, expires: Option<OffsetDateTime>) -> NewAuthSession {
+        NewAuthSession {
+            kind,
+            token_hash: hash.into(),
+            subject: "u-1".into(),
+            email: None,
+            label: "x".into(),
+            now: T0,
+            expires_at: expires,
+        }
+    }
+
+    /// 找：哈希对得上且种类对得上才算；`expires_at` 正好等于现在就是过期（边界取过期）；
+    /// 续期只往后推；吊销的 id 再续期什么也不做。
+    #[tokio::test]
+    async fn find_is_scoped_by_kind_and_expiry_and_touch_only_moves_forward() {
+        let db = Db::open_memory().await.unwrap();
+        let repo = TursoAuthRepo::new(db);
+        let web = repo
+            .create(new(AuthKind::Web, "h-web", Some(T0 + Duration::days(30))))
+            .await
+            .unwrap();
+        let device = repo
+            .create(new(AuthKind::Device, "h-dev", None))
+            .await
+            .unwrap();
+
+        assert!(
+            repo.find(AuthKind::Web, "h-web", T0)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            repo.find(AuthKind::Device, "h-web", T0)
+                .await
+                .unwrap()
+                .is_none(),
+            "种类不符"
+        );
+        assert!(
+            repo.find(AuthKind::Web, "nope", T0)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let edge = T0 + Duration::days(30);
+        assert!(
+            repo.find(AuthKind::Web, "h-web", edge - Duration::seconds(1))
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            repo.find(AuthKind::Web, "h-web", edge)
+                .await
+                .unwrap()
+                .is_none(),
+            "到点即过期"
+        );
+        assert!(
+            repo.find(AuthKind::Device, "h-dev", T0 + Duration::days(9999))
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        // 续期：给了新的过期时间才动它；不给只记使用时刻。
+        let later = T0 + Duration::hours(1);
+        repo.touch(&web.id, later, None).await.unwrap();
+        let record = repo
+            .find(AuthKind::Web, "h-web", later)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.last_used_at, later);
+        assert_eq!(record.expires_at, Some(T0 + Duration::days(30)));
+        repo.touch(&web.id, later, Some(later + Duration::days(30)))
+            .await
+            .unwrap();
+        let record = repo
+            .find(AuthKind::Web, "h-web", later)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.expires_at, Some(later + Duration::days(30)));
+        // 设备令牌没有过期时间，带不带 `expires_at` 以外都不会凭空长出一个。
+        repo.touch(&device.id, later, None).await.unwrap();
+        assert_eq!(
+            repo.find(AuthKind::Device, "h-dev", later)
+                .await
+                .unwrap()
+                .unwrap()
+                .expires_at,
+            None
+        );
+
+        // 按哈希吊销只动同种类的；吊销之后续期是空操作。
+        assert!(
+            !repo
+                .revoke_by_hash(AuthKind::Device, "h-web")
+                .await
+                .unwrap()
+        );
+        assert!(repo.revoke_by_hash(AuthKind::Web, "h-web").await.unwrap());
+        assert!(!repo.revoke_by_hash(AuthKind::Web, "h-web").await.unwrap());
+        repo.touch(&web.id, later, Some(later)).await.unwrap();
+        assert!(
+            repo.find(AuthKind::Web, "h-web", later)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(repo.revoke(&device.id).await.unwrap());
+        assert!(!repo.revoke(&device.id).await.unwrap());
+    }
+
+    /// 清过期：到点的删、没到点与不过期的留；清单不含过期的。
+    #[tokio::test]
+    async fn purge_removes_only_what_has_expired() {
+        let db = Db::open_memory().await.unwrap();
+        let repo = TursoAuthRepo::new(db);
+        repo.create(new(AuthKind::Web, "a", Some(T0 + Duration::days(1))))
+            .await
+            .unwrap();
+        repo.create(new(AuthKind::Web, "b", Some(T0 + Duration::days(3))))
+            .await
+            .unwrap();
+        repo.create(new(AuthKind::Device, "c", None)).await.unwrap();
+        let now = T0 + Duration::days(2);
+        assert_eq!(repo.list(now).await.unwrap().len(), 2, "清单不含过期的");
+        assert_eq!(repo.purge_expired(now).await.unwrap(), 1);
+        assert_eq!(repo.purge_expired(now).await.unwrap(), 0);
+        assert_eq!(repo.list(T0 + Duration::days(4)).await.unwrap().len(), 1);
+    }
+}

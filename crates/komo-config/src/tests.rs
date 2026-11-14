@@ -870,3 +870,96 @@ fn a_telemetry_endpoint_that_is_not_an_http_url_refuses_the_load() {
         assert_eq!(keys, vec!["start_only.otlp_endpoint"], "{bad}");
     }
 }
+
+/// 旧配置（没有 `[auth.oidc]`、`[web]`、`[push]`）照常加载：不登录、托管网页、推送开着但没有 subject。
+#[test]
+fn a_config_without_auth_web_or_push_sections_loads_with_the_old_behaviour() {
+    let fixture = Fixture::valid();
+    let loaded = load_config(&fixture.options()).unwrap();
+    assert!(loaded.issues.is_empty(), "{:?}", loaded.issues);
+    let start = &loaded.snapshot.start_only;
+    assert!(start.oidc.is_none());
+    assert!(start.web_serve);
+    assert!(start.web_dir.is_none());
+    assert!(start.push.enabled);
+    assert!(start.push.subject.is_none());
+}
+
+/// `[auth.oidc]` 读得出来：地址去掉尾斜杠、名单去空白与空项、密钥变量名有默认值；`[web] serve = false`
+/// 与 `[push]` 一并读。
+#[test]
+fn the_oidc_web_and_push_sections_are_read_and_normalised() {
+    let fixture = Fixture::valid();
+    let text = format!(
+        r#"{}
+[auth.oidc]
+issuer = " https://id.example.com/ "
+client_id = "komo"
+allowed_subjects = [" u-1 ", ""]
+allowed_emails = ["Me@Example.com"]
+public_url = "https://komo.example.com/"
+
+[web]
+serve = false
+
+[push]
+enabled = false
+subject = "mailto:me@example.com"
+"#,
+        Fixture::config_text("chat-a", "medium")
+    );
+    write(&fixture.sources().config, &text);
+    let loaded = load_config(&fixture.options()).unwrap();
+    let start = &loaded.snapshot.start_only;
+    let oidc = start.oidc.as_ref().expect("读到 [auth.oidc]");
+    assert_eq!(oidc.issuer, "https://id.example.com");
+    assert_eq!(oidc.public_url, "https://komo.example.com");
+    assert_eq!(oidc.allowed_subjects, ["u-1"]);
+    assert_eq!(oidc.allowed_emails, ["Me@Example.com"]);
+    assert_eq!(oidc.client_secret_env, "KOMO_OIDC_CLIENT_SECRET");
+    assert_eq!(
+        oidc.callback_url(),
+        "https://komo.example.com/auth/callback"
+    );
+    assert!(!start.web_serve);
+    assert!(!start.push.enabled);
+    assert_eq!(start.push.subject.as_deref(), Some("mailto:me@example.com"));
+    // 没有密钥变量：只是一条警告，仍能加载。
+    assert!(
+        loaded
+            .issues
+            .iter()
+            .any(|issue| issue.key.as_str() == "auth.oidc.client_secret_env"),
+        "{:?}",
+        loaded.issues
+    );
+}
+
+/// `[models] main` 指向没有的 alias：整份配置拒绝加载并点名这个键；不写就是没有。
+#[test]
+fn a_main_model_alias_that_does_not_exist_refuses_the_load() {
+    let fixture = Fixture::valid();
+    let loaded = load_config(&fixture.options()).unwrap();
+    assert!(loaded.snapshot.model_catalog.main.is_none());
+
+    let text = Fixture::config_text("chat-a", "medium").replacen(
+        "[models]\n",
+        "[models]\nmain = \"chat\"\n",
+        1,
+    );
+    write(&fixture.sources().config, &text);
+    let loaded = load_config(&fixture.options()).unwrap();
+    assert_eq!(loaded.snapshot.model_catalog.main.as_deref(), Some("chat"));
+
+    let text = Fixture::config_text("chat-a", "medium").replacen(
+        "[models]\n",
+        "[models]\nmain = \"ghost\"\n",
+        1,
+    );
+    write(&fixture.sources().config, &text);
+    let error = load_config(&fixture.options()).unwrap_err().to_string();
+    assert!(
+        error.contains("models.main") && error.contains("ghost"),
+        "{error}"
+    );
+}

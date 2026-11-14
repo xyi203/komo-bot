@@ -41,7 +41,11 @@ class Handler(BaseHTTPRequestHandler):
                 "issuer": base,
                 "authorization_endpoint": base + "/authorize",
                 "token_endpoint": base + "/token",
+                "registration_endpoint": base + "/register",
                 "response_types_supported": ["code"],
+                "grant_types_supported": ["authorization_code", "refresh_token"],
+                "code_challenge_methods_supported": ["S256"],
+                "token_endpoint_auth_methods_supported": ["none"],
             })
         else:
             # /mcp 的 SSE 流不支持。
@@ -52,6 +56,23 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         body = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+        # 网页里的 MCP 授权（tests/mcp/web_auth.rs）要的两个端点：动态注册与换 token。换出去的
+        # token 就是服务器此刻认的那个，所以授权完成后 Gateway 能连上。
+        if self.path == "/register":
+            request = json.loads(body or b"{}")
+            self.send_json(201, {
+                "client_id": "komo-web-test",
+                "redirect_uris": request.get("redirect_uris", []),
+                "token_endpoint_auth_method": "none",
+                "grant_types": ["authorization_code"],
+                "response_types": ["code"],
+            })
+            return
+        if self.path == "/token":
+            with open(VALID) as f:
+                valid = f.read().strip()
+            self.send_json(200, {"access_token": valid, "token_type": "Bearer"})
+            return
         with open(VALID) as f:
             valid = f.read().strip()
         if self.headers.get("Authorization") != "Bearer " + valid:

@@ -5,6 +5,8 @@
 //! Origin、cookie 开 SSE、cookie 不能再铸别的凭据）已删除，待统一验证阶段改成「直接往 `auth_sessions`
 //! 写一条会话再带 cookie 请求」重写。
 
+mod oidc;
+
 use komo_gateway::service::test_support::harness::{
     FakeLlm, GatewayBuilder, TestGateway, config_toml,
 };
@@ -201,4 +203,45 @@ async fn a_missing_web_dir_just_means_no_web_ui() {
         .await
         .expect("请求");
     assert_eq!(health.status(), 200);
+}
+
+/// `[web] serve = false`：Gateway 不托管网页，非接口路径一律 404（目录里有文件也不给）；接口、`/healthz`、
+/// `/auth/me` 照常。
+#[tokio::test]
+async fn with_serve_off_only_the_api_answers() {
+    let (gateway, _web) = start("serve = false\n").await;
+    let base = gateway.base_url();
+    for path in ["/", "/sessions/abc", "/assets/app.js", "/_shell.html"] {
+        let response = client()
+            .get(format!("{base}{path}"))
+            .send()
+            .await
+            .expect("请求");
+        assert_eq!(response.status(), 404, "{path}");
+    }
+    let api = client()
+        .get(format!("{base}/v1/nope"))
+        .send()
+        .await
+        .expect("请求");
+    assert_eq!(api.status(), 404);
+    assert!(
+        api.text().await.unwrap().contains("not_found"),
+        "接口的 404 仍是 JSON"
+    );
+    for (path, status) in [("/healthz", 200), ("/auth/me", 200), ("/v1/sessions", 401)] {
+        let response = client()
+            .get(format!("{base}{path}"))
+            .send()
+            .await
+            .expect("请求");
+        assert_eq!(response.status(), status, "{path}");
+    }
+    let sessions = client()
+        .get(format!("{base}/v1/sessions"))
+        .bearer_auth(gateway.token())
+        .send()
+        .await
+        .expect("请求");
+    assert_eq!(sessions.status(), 200);
 }

@@ -725,7 +725,7 @@ fn check_agents(snapshot: &ConfigSnapshot, issues: &mut Vec<ConfigIssue>) {
 mod tests {
     use super::*;
     use crate::testing::snapshot_fixture;
-    use komo_kernel::protocol::config::{McpServerConfig, McpTransport};
+    use komo_kernel::protocol::config::{McpServerConfig, McpTransport, OidcConfig};
     use komo_kernel::types::model::Effort;
 
     fn keys(issues: &[ConfigIssue]) -> Vec<&str> {
@@ -794,6 +794,143 @@ mod tests {
         assert_eq!(keys(&issues), vec!["execution.model_result_bytes"]);
         assert_eq!(issues[0].severity, IssueSeverity::Warning);
         assert!(issues[0].message.contains("30720"), "{:?}", issues[0]);
+    }
+
+    fn oidc() -> OidcConfig {
+        OidcConfig {
+            issuer: "https://id.example.com".into(),
+            client_id: "komo".into(),
+            client_secret_env: "KOMO_OIDC_CLIENT_SECRET".into(),
+            allowed_subjects: vec!["u-1".into()],
+            allowed_emails: vec![],
+            public_url: "https://komo.example.com".into(),
+        }
+    }
+
+    /// 带着 `[auth.oidc]` 校验一遍，只给 `auth.oidc` 与 `push` 下的问题。
+    fn oidc_issues(edit: impl FnOnce(&mut OidcConfig), with_secret: bool) -> Vec<ConfigIssue> {
+        let mut snapshot = snapshot_fixture();
+        let mut config = oidc();
+        edit(&mut config);
+        if with_secret {
+            snapshot.credentials.insert(
+                config.client_secret_env.clone(),
+                komo_kernel::types::digest::ContentHash::of_str("s3cret"),
+            );
+        }
+        snapshot.start_only.oidc = Some(config);
+        validate(&snapshot)
+    }
+
+    #[test]
+    fn a_complete_oidc_block_is_clean_and_no_block_says_nothing() {
+        assert_eq!(oidc_issues(|_| {}, true), vec![]);
+        // 没配 [auth.oidc] 不是配置错误（命令行仍用本机令牌）。
+        assert_eq!(validate(&snapshot_fixture()), vec![]);
+    }
+
+    #[test]
+    fn every_oidc_field_that_cannot_work_is_refused_at_its_own_key() {
+        let cases: Vec<(&str, Box<dyn FnOnce(&mut OidcConfig)>)> = vec![
+            (
+                "auth.oidc.issuer",
+                Box::new(|c| c.issuer = "http://id.example.com".into()),
+            ),
+            (
+                "auth.oidc.issuer",
+                Box::new(|c| c.issuer = "https://id.example.com/?x=1".into()),
+            ),
+            (
+                "auth.oidc.issuer",
+                Box::new(|c| c.issuer = "not a url".into()),
+            ),
+            (
+                "auth.oidc.client_id",
+                Box::new(|c| c.client_id = String::new()),
+            ),
+            (
+                "auth.oidc.public_url",
+                Box::new(|c| c.public_url = "komo.example.com".into()),
+            ),
+            (
+                "auth.oidc.public_url",
+                Box::new(|c| c.public_url = "https://komo.example.com/app".into()),
+            ),
+            (
+                "auth.oidc.public_url",
+                Box::new(|c| c.public_url = "ftp://komo.example.com".into()),
+            ),
+            (
+                "auth.oidc.allowed_subjects",
+                Box::new(|c| c.allowed_subjects.clear()),
+            ),
+        ];
+        for (key, edit) in cases {
+            let issues = oidc_issues(edit, true);
+            assert_eq!(keys(&issues), vec![key], "{issues:?}");
+            assert_eq!(issues[0].severity, IssueSeverity::Error, "{key}");
+        }
+        // 一个邮箱名单就够了。
+        let issues = oidc_issues(
+            |c| {
+                c.allowed_subjects.clear();
+                c.allowed_emails = vec!["me@example.com".into()];
+            },
+            true,
+        );
+        assert_eq!(issues, vec![]);
+    }
+
+    #[test]
+    fn loopback_may_use_http_but_a_public_http_address_is_only_a_warning() {
+        let local = oidc_issues(
+            |c| {
+                c.issuer = "http://127.0.0.1:9000".into();
+                c.public_url = "http://localhost:8080".into();
+            },
+            true,
+        );
+        assert_eq!(local, vec![]);
+        let public = oidc_issues(|c| c.public_url = "http://komo.example.com".into(), true);
+        assert_eq!(keys(&public), vec!["auth.oidc.public_url"]);
+        assert_eq!(public[0].severity, IssueSeverity::Warning);
+    }
+
+    #[test]
+    fn a_missing_client_secret_is_a_warning_about_a_public_client() {
+        let issues = oidc_issues(|_| {}, false);
+        assert_eq!(keys(&issues), vec!["auth.oidc.client_secret_env"]);
+        assert_eq!(issues[0].severity, IssueSeverity::Warning);
+        assert!(issues[0].message.contains("KOMO_OIDC_CLIENT_SECRET"));
+    }
+
+    #[test]
+    fn the_push_subject_must_be_mailto_or_https() {
+        for ok in ["mailto:me@example.com", "https://komo.example.com"] {
+            let mut snapshot = snapshot_fixture();
+            snapshot.start_only.push.subject = Some(ok.into());
+            assert_eq!(validate(&snapshot), vec![], "{ok}");
+        }
+        for bad in ["me@example.com", "http://komo.example.com", ""] {
+            let mut snapshot = snapshot_fixture();
+            snapshot.start_only.push.subject = Some(bad.into());
+            assert_eq!(keys(&validate(&snapshot)), vec!["push.subject"], "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_web_dir_beside_serve_false_is_a_warning_and_a_missing_dir_is_ignored_then() {
+        let mut snapshot = snapshot_fixture();
+        snapshot.start_only.web_serve = false;
+        snapshot.start_only.web_dir = Some("/definitely/not/here".into());
+        let issues = validate(&snapshot);
+        assert_eq!(keys(&issues), vec!["start_only.web_dir"], "{issues:?}");
+        assert!(issues[0].message.contains("serve = false"));
+        // 托管时目录不存在才是「不提供网页」的那条提示。
+        snapshot.start_only.web_serve = true;
+        let issues = validate(&snapshot);
+        assert_eq!(keys(&issues), vec!["start_only.web_dir"]);
+        assert!(issues[0].message.contains("不是目录"), "{issues:?}");
     }
 
     #[test]

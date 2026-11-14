@@ -235,3 +235,107 @@ async fn a_resumed_segment_keeps_the_skills_catalog_it_was_accepted_with() {
         "{after_new}"
     );
 }
+
+/// `GET /v1/skills` 与 `PUT /v1/skills/{name}`（设置页的技能表）：来源与门控说明；开关落进 `skills-disabled.json`
+/// （与 `komo skills disable` 同一个文件），重启后仍在，不删 SKILL.md；被关的从新会话的系统提示里消失；
+/// 不存在的 skill 404。
+#[tokio::test]
+async fn the_skills_table_lists_sources_and_switches_persist() {
+    let skills = tempfile::tempdir().expect("临时 skills 目录");
+    write_skill(
+        skills.path(),
+        "pr-review",
+        "name: pr-review\ndescription: 怎么审一个 PR\n",
+        "第一步……\n",
+    );
+    let elsewhere = if std::env::consts::OS == "macos" {
+        "linux"
+    } else {
+        "macos"
+    };
+    write_skill(
+        skills.path(),
+        "other-platform",
+        &format!("name: other-platform\ndescription: 别的平台\nplatforms: [{elsewhere}]\n"),
+        "x\n",
+    );
+    let home = Home::with_config(&config_with_skills(&[skills.path()]));
+    let gw = home.start(FakeLlm::finisher("好")).await;
+
+    let (status, body) = gw.get_json("/v1/skills").await;
+    assert_eq!(status, 200, "{body}");
+    let row = |body: &serde_json::Value, name: &str| {
+        body["skills"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["name"] == name)
+            .cloned()
+            .unwrap_or_else(|| panic!("没有 {name}：{body}"))
+    };
+    let review = row(&body, "pr-review");
+    assert_eq!(review["enabled"], true);
+    assert_eq!(review["source"], "configured");
+    assert_eq!(review["description"], "怎么审一个 PR");
+    assert!(
+        review
+            .get("unavailable")
+            .is_none_or(serde_json::Value::is_null),
+        "{review}"
+    );
+    let other = row(&body, "other-platform");
+    assert!(
+        other["unavailable"].is_string(),
+        "开着也进不了目录行要说原因：{other}"
+    );
+
+    // 关：响应与清单都是 false；停用名单落盘；文件还在；新会话的提示里没有它。
+    let (status, body) = gw
+        .request(
+            reqwest::Method::PUT,
+            "/v1/skills/pr-review",
+            Some(serde_json::json!({"enabled": false})),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let after: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(row(&after, "pr-review")["enabled"], false);
+    let disabled =
+        std::fs::read_to_string(home.path().join("runtime/skills-disabled.json")).unwrap();
+    assert!(disabled.contains("pr-review"), "{disabled}");
+    assert!(
+        skills.path().join("pr-review/SKILL.md").exists(),
+        "不删文件"
+    );
+    let llm = FakeLlm::finisher("好");
+    drop(gw);
+    let gw = home.start(Arc::clone(&llm)).await;
+    let (_, again) = gw.get_json("/v1/skills").await;
+    assert_eq!(row(&again, "pr-review")["enabled"], false, "重启后仍关着");
+    let session = gw.open_session().await;
+    let prompt = prompt_of(&gw, &llm, &session, "你好", "k1").await;
+    assert!(!prompt.contains("pr-review"), "{prompt}");
+
+    // 开：回来；重复开幂等；没有的 skill 404。
+    for _ in 0..2 {
+        let (status, body) = gw
+            .request(
+                reqwest::Method::PUT,
+                "/v1/skills/pr-review",
+                Some(serde_json::json!({"enabled": true})),
+            )
+            .await;
+        assert_eq!(status, 200, "{body}");
+    }
+    let (_, on) = gw.get_json("/v1/skills").await;
+    assert_eq!(row(&on, "pr-review")["enabled"], true);
+    let (status, body) = gw
+        .request(
+            reqwest::Method::PUT,
+            "/v1/skills/ghost",
+            Some(serde_json::json!({"enabled": false})),
+        )
+        .await;
+    assert_eq!(status, 404, "{body}");
+    gw.stop().await;
+}

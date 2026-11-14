@@ -143,3 +143,69 @@ impl TursoPushRepo {
             .await
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use time::macros::datetime;
+
+    const T0: OffsetDateTime = datetime!(2026-11-01 08:00:00 UTC);
+
+    fn sub(endpoint: &str, p256dh: &str, now: OffsetDateTime) -> NewPushSubscription {
+        NewPushSubscription {
+            endpoint: endpoint.into(),
+            p256dh: p256dh.into(),
+            auth: "auth".into(),
+            user_agent: Some("Chrome".into()),
+            now,
+        }
+    }
+
+    /// 同一个 endpoint 再订阅是更新（id 与创建时刻不变，密钥与 UA 换新）；列表按订阅先后；退订答有没有这条。
+    #[tokio::test]
+    async fn resubscribing_updates_in_place_and_unsubscribing_reports_whether_it_was_there() {
+        let db = Db::open_memory().await.unwrap();
+        let repo = TursoPushRepo::new(db);
+        let first = repo
+            .upsert(sub("https://push.example/a", "k1", T0))
+            .await
+            .unwrap();
+        let other = repo
+            .upsert(sub(
+                "https://push.example/b",
+                "k2",
+                T0 + time::Duration::minutes(1),
+            ))
+            .await
+            .unwrap();
+        assert_ne!(first, other);
+        let again = repo
+            .upsert(NewPushSubscription {
+                user_agent: None,
+                ..sub(
+                    "https://push.example/a",
+                    "k1-new",
+                    T0 + time::Duration::hours(1),
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(again, first, "同一个 endpoint 同一个 id");
+
+        let list = repo.list().await.unwrap();
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0].endpoint, "https://push.example/a", "最早订阅的在前");
+        assert_eq!(list[0].p256dh, "k1-new");
+        assert_eq!(list[0].user_agent, None);
+        assert_eq!(list[0].created_at, T0, "创建时刻不动");
+        assert_eq!(list[0].updated_at, T0 + time::Duration::hours(1));
+
+        assert!(repo.remove("https://push.example/a").await.unwrap());
+        assert!(
+            !repo.remove("https://push.example/a").await.unwrap(),
+            "再删没有了"
+        );
+        assert!(!repo.remove("https://push.example/never").await.unwrap());
+        assert_eq!(repo.list().await.unwrap().len(), 1);
+    }
+}

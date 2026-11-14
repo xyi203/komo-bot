@@ -731,4 +731,277 @@ mod tests {
         ]));
         assert!(!prefers_basic(&[]));
     }
+
+    // ------------------------------------------------------------ ID token 验签与声明校验（本地签的 token）
+
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
+    use ring::rand::SystemRandom;
+    use ring::signature::{ECDSA_P256_SHA256_FIXED_SIGNING, EcdsaKeyPair, Ed25519KeyPair, KeyPair};
+    use serde_json::{Value, json};
+
+    const NOW: i64 = 1_800_000_000;
+
+    struct Es256 {
+        pair: EcdsaKeyPair,
+    }
+
+    impl Es256 {
+        fn new() -> Es256 {
+            let rng = SystemRandom::new();
+            let pkcs8 =
+                EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &rng).unwrap();
+            Es256 {
+                pair: EcdsaKeyPair::from_pkcs8(
+                    &ECDSA_P256_SHA256_FIXED_SIGNING,
+                    pkcs8.as_ref(),
+                    &rng,
+                )
+                .unwrap(),
+            }
+        }
+
+        fn jwk(&self, kid: Option<&str>) -> Jwk {
+            let point = self.pair.public_key().as_ref();
+            Jwk {
+                kty: "EC".into(),
+                kid: kid.map(str::to_string),
+                alg: None,
+                usage: None,
+                n: None,
+                e: None,
+                crv: Some("P-256".into()),
+                x: Some(B64.encode(&point[1..33])),
+                y: Some(B64.encode(&point[33..65])),
+            }
+        }
+
+        fn sign(&self, kid: Option<&str>, claims: &Value) -> String {
+            let mut header = json!({ "alg": "ES256", "typ": "JWT" });
+            if let Some(kid) = kid {
+                header["kid"] = json!(kid);
+            }
+            let input = format!(
+                "{}.{}",
+                B64.encode(header.to_string()),
+                B64.encode(claims.to_string())
+            );
+            let signature = self
+                .pair
+                .sign(&SystemRandom::new(), input.as_bytes())
+                .unwrap();
+            format!("{input}.{}", B64.encode(signature.as_ref()))
+        }
+    }
+
+    fn claims() -> Value {
+        json!({ "iss": "https://id.example.com", "sub": "u-1", "aud": "komo",
+                "exp": NOW + 600, "nonce": "n-1", "email": "me@example.com", "email_verified": true })
+    }
+
+    fn verify(token: &str, keys: Vec<Jwk>) -> Result<IdentityClaims, VerifyFailure> {
+        verify_id_token(token, &JwkSet { keys }, &config(), "n-1", NOW)
+    }
+
+    fn rejected(result: Result<IdentityClaims, VerifyFailure>, needle: &str) {
+        match result {
+            Err(VerifyFailure::Invalid(message)) => {
+                assert!(message.contains(needle), "{message} 里该有 {needle}")
+            }
+            other => panic!("该被拒（{needle}）：{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_valid_es256_token_yields_the_claims() {
+        let key = Es256::new();
+        let token = key.sign(Some("k1"), &claims());
+        let got = verify(&token, vec![key.jwk(Some("k1"))]).unwrap();
+        assert_eq!(got.subject, "u-1");
+        assert_eq!(got.email.as_deref(), Some("me@example.com"));
+        assert_eq!(got.email_verified, Some(true));
+        // `email_verified` 写成字符串的提供方也认；`aud` 是数组、含本客户端也行。
+        let mut odd = claims();
+        odd["email_verified"] = json!("true");
+        odd["aud"] = json!(["other", "komo"]);
+        odd["azp"] = json!("komo");
+        assert_eq!(
+            verify(&key.sign(Some("k1"), &odd), vec![key.jwk(Some("k1"))])
+                .unwrap()
+                .email_verified,
+            Some(true)
+        );
+        odd["email_verified"] = json!("false");
+        assert_eq!(
+            verify(&key.sign(Some("k1"), &odd), vec![key.jwk(Some("k1"))])
+                .unwrap()
+                .email_verified,
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn a_valid_eddsa_token_is_verified_too() {
+        let rng = SystemRandom::new();
+        let pkcs8 = Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
+        let pair = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
+        let header = B64.encode(json!({ "alg": "EdDSA", "kid": "e1" }).to_string());
+        let input = format!("{header}.{}", B64.encode(claims().to_string()));
+        let token = format!(
+            "{input}.{}",
+            B64.encode(pair.sign(input.as_bytes()).as_ref())
+        );
+        let jwk = Jwk {
+            kty: "OKP".into(),
+            kid: Some("e1".into()),
+            alg: Some("EdDSA".into()),
+            usage: Some("sig".into()),
+            n: None,
+            e: None,
+            crv: Some("Ed25519".into()),
+            x: Some(B64.encode(pair.public_key().as_ref())),
+            y: None,
+        };
+        assert_eq!(verify(&token, vec![jwk.clone()]).unwrap().subject, "u-1");
+        let mut tampered = token.clone();
+        tampered.replace_range(token.len() - 3.., "AAA");
+        rejected(verify(&tampered, vec![jwk]), "签名");
+    }
+
+    #[test]
+    fn claims_are_checked_after_the_signature_with_a_sixty_second_leeway() {
+        let key = Es256::new();
+        let jwks = || vec![key.jwk(Some("k1"))];
+        let with = |edit: &dyn Fn(&mut Value)| {
+            let mut value = claims();
+            edit(&mut value);
+            verify(&key.sign(Some("k1"), &value), jwks())
+        };
+        rejected(
+            with(&|c| c["iss"] = json!("https://evil.example.com")),
+            "iss",
+        );
+        rejected(with(&|c| c["aud"] = json!("someone-else")), "aud");
+        // 多个 aud 而没写 azp：只要含本客户端就认（azp 缺席不算错）。
+        assert!(with(&|c| c["aud"] = json!(["komo", "other"])).is_ok());
+        rejected(
+            with(&|c| {
+                c["aud"] = json!(["komo", "other"]);
+                c["azp"] = json!("other");
+            }),
+            "azp",
+        );
+        rejected(with(&|c| c["nonce"] = json!("other")), "nonce");
+        rejected(
+            with(&|c| {
+                c.as_object_mut().unwrap().remove("nonce");
+            }),
+            "nonce",
+        );
+        rejected(
+            with(&|c| {
+                c.as_object_mut().unwrap().remove("exp");
+            }),
+            "exp",
+        );
+        rejected(with(&|c| c["sub"] = json!("")), "sub");
+        rejected(
+            with(&|c| {
+                c.as_object_mut().unwrap().remove("sub");
+            }),
+            "sub",
+        );
+        // exp 的边界：过期 60 秒内还认，刚好 60 秒就不认了。
+        assert!(with(&|c| c["exp"] = json!(NOW - 59)).is_ok());
+        rejected(with(&|c| c["exp"] = json!(NOW - 60)), "过期");
+        // nbf：未来 60 秒内还认，再晚就不认。
+        assert!(with(&|c| c["nbf"] = json!(NOW + 60)).is_ok());
+        rejected(with(&|c| c["nbf"] = json!(NOW + 61)), "生效");
+        // iss 尾斜杠不影响。
+        assert!(with(&|c| c["iss"] = json!("https://id.example.com/")).is_ok());
+    }
+
+    #[test]
+    fn the_key_is_picked_by_kid_and_a_wrong_or_unknown_key_is_refused() {
+        let (a, b) = (Es256::new(), Es256::new());
+        let token = a.sign(Some("ka"), &claims());
+        // 两把钥匙，按 kid 取对的那把。
+        assert!(verify(&token, vec![b.jwk(Some("kb")), a.jwk(Some("ka"))]).is_ok());
+        // token 指名的 kid 在 JWKS 里没有：NoKey（调用方据此强制重取一次）。
+        assert!(matches!(
+            verify(&token, vec![b.jwk(Some("kb"))]),
+            Err(VerifyFailure::NoKey)
+        ));
+        // JWKS 里的钥匙没有 kid、token 却指了 kid：不认。
+        assert!(matches!(
+            verify(&token, vec![a.jwk(None)]),
+            Err(VerifyFailure::NoKey)
+        ));
+        // 同 kid 但是另一把钥匙：签名不对。
+        rejected(verify(&token, vec![b.jwk(Some("ka"))]), "签名");
+        // token 没带 kid：只有一把同类钥匙才试；两把以上宁可当没有。
+        let bare = a.sign(None, &claims());
+        assert!(verify(&bare, vec![a.jwk(Some("ka"))]).is_ok());
+        assert!(matches!(
+            verify(&bare, vec![a.jwk(Some("ka")), b.jwk(Some("kb"))]),
+            Err(VerifyFailure::NoKey)
+        ));
+        // 钥匙类型与算法对不上（RSA 钥匙验 ES256）：当没有这把钥匙。
+        let rsa = Jwk {
+            kty: "RSA".into(),
+            crv: None,
+            x: None,
+            y: None,
+            n: Some("AQAB".into()),
+            e: Some("AQAB".into()),
+            ..a.jwk(Some("ka"))
+        };
+        assert!(matches!(
+            verify(&token, vec![rsa]),
+            Err(VerifyFailure::NoKey)
+        ));
+        // 用途不是签名的钥匙不用。
+        let mut enc = a.jwk(Some("ka"));
+        enc.usage = Some("enc".into());
+        assert!(matches!(
+            verify(&token, vec![enc]),
+            Err(VerifyFailure::NoKey)
+        ));
+        // JWK 里 alg 与 token 不一致的钥匙不用。
+        let mut other_alg = a.jwk(Some("ka"));
+        other_alg.alg = Some("RS256".into());
+        assert!(matches!(
+            verify(&token, vec![other_alg]),
+            Err(VerifyFailure::NoKey)
+        ));
+    }
+
+    #[test]
+    fn a_short_ec_point_is_an_invalid_key_not_a_panic() {
+        let key = Es256::new();
+        let token = key.sign(Some("k1"), &claims());
+        let mut jwk = key.jwk(Some("k1"));
+        jwk.x = Some(B64.encode([1u8; 31]));
+        rejected(verify(&token, vec![jwk]), "签名");
+    }
+
+    #[test]
+    fn the_http_discovery_endpoints_must_be_https_or_loopback() {
+        for ok in [
+            "https://id.example.com/authorize",
+            "http://127.0.0.1:9000/token",
+            "http://localhost/x",
+            "http://[::1]:1/x",
+        ] {
+            assert!(secure_or_loopback(ok), "{ok}");
+        }
+        for bad in [
+            "http://id.example.com/authorize",
+            "ftp://127.0.0.1/x",
+            "not a url",
+            "http://127.0.0.1.evil.com/x",
+        ] {
+            assert!(!secure_or_loopback(bad), "{bad}");
+        }
+        assert_eq!(clip(&"x".repeat(1000)).chars().count(), 300);
+    }
 }

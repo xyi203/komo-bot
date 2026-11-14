@@ -22,6 +22,11 @@ fn daily() -> serde_json::Value {
 
 /// 默认的 home 加一台 `demo` 服务器，`bump` 声明为对外。
 fn home_with_outward() -> (Home, PathBuf) {
+    outward_home("")
+}
+
+/// 同上，`extra` 是追加在 config.toml 末尾的段（例如 `[push]`）。
+pub(crate) fn outward_home(extra: &str) -> (Home, PathBuf) {
     let home = Home::new();
     let server = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/mcp/server.py");
     let counter = home.path().join("bump.count");
@@ -32,6 +37,7 @@ command = "python3"
 args = ["{}", "{}"]
 exposure = "direct"
 outward = ["bump"]
+{extra}
 "#,
         home_config(),
         server.display(),
@@ -41,7 +47,7 @@ outward = ["bump"]
     (home, counter)
 }
 
-fn bump_then(text: &str) -> Arc<FakeLlm> {
+pub(crate) fn bump_then(text: &str) -> Arc<FakeLlm> {
     FakeLlm::new(vec![vec![
         call_round(1, "pc-1", "mcp__demo__bump", serde_json::json!({})),
         text_round(2, text),

@@ -167,3 +167,5 @@ async fn mounted(gw: &Gw) -> Vec<String> {
 }
 
 mod durable;
+mod switches;
+mod web_auth;

@@ -1611,4 +1611,106 @@ default = "magpie-sol"
         let used = remove_env_value(CONFIG, "MAGPIE_API_KEY=x\n", "MAGPIE_API_KEY");
         assert!(matches!(used, Err(EditError::InUse(m)) if m.contains("provider magpie")));
     }
+
+    const MCP_CONFIG: &str = r#"default_agent = "assistant"
+
+[agents.assistant]
+
+# 内部搜索：别删
+[mcp.servers.search]
+command = "npx"  # 行尾注释
+args = ["-y", "search-mcp"]
+disabled_tools = ["zeta", "alpha"]
+
+[mcp.servers.docs]
+url = "https://docs.example.com/mcp"
+enabled = false
+"#;
+
+    /// 整台开关：关 = 写 `enabled = false`，开 = 删键（文件里不留 `enabled = true`）；注释与别的键原样不动；
+    /// 重复关不重复写；不存在的服务器是 NotFound。
+    #[test]
+    fn switching_a_server_off_writes_the_key_and_on_removes_it_keeping_comments() {
+        let off = set_mcp_server_enabled(MCP_CONFIG, "search", false).unwrap();
+        assert!(off.contains("[mcp.servers.search]"));
+        assert_eq!(off.matches("enabled = false").count(), 2, "{off}");
+        assert!(
+            off.contains("# 内部搜索：别删") && off.contains("# 行尾注释"),
+            "{off}"
+        );
+        assert_eq!(
+            set_mcp_server_enabled(&off, "search", false).unwrap(),
+            off,
+            "幂等"
+        );
+
+        let on = set_mcp_server_enabled(&off, "search", true).unwrap();
+        assert_eq!(on, MCP_CONFIG, "开回去就是原文，一个字节不多");
+        let docs_on = set_mcp_server_enabled(MCP_CONFIG, "docs", true).unwrap();
+        assert!(!docs_on.contains("enabled"), "{docs_on}");
+        assert_eq!(
+            set_mcp_server_enabled(&docs_on, "docs", true).unwrap(),
+            docs_on,
+            "本来就开着：不变"
+        );
+        assert!(matches!(
+            set_mcp_server_enabled(MCP_CONFIG, "nope", false),
+            Err(EditError::NotFound(message)) if message.contains("nope")
+        ));
+        assert!(matches!(
+            set_mcp_server_enabled("= not toml", "search", false),
+            Err(EditError::Unreadable(_))
+        ));
+    }
+
+    /// 单个工具：关 = 加进 `disabled_tools`（去重、排序），开 = 摘掉，摘空了连键一起删；注释保留。
+    #[test]
+    fn switching_a_tool_off_and_on_edits_the_disabled_list_and_drops_it_when_empty() {
+        let more = set_mcp_tool_enabled(MCP_CONFIG, "search", "mid", false).unwrap();
+        assert!(
+            more.contains(r#"disabled_tools = ["alpha", "mid", "zeta"]"#),
+            "{more}"
+        );
+        assert_eq!(
+            set_mcp_tool_enabled(&more, "search", "mid", false).unwrap(),
+            more,
+            "不重复加"
+        );
+        assert!(more.contains("# 内部搜索：别删") && more.contains("# 行尾注释"));
+
+        let less = set_mcp_tool_enabled(&more, "search", "alpha", true).unwrap();
+        assert!(
+            less.contains(r#"disabled_tools = ["mid", "zeta"]"#),
+            "{less}"
+        );
+        let none = set_mcp_tool_enabled(&less, "search", "zeta", true).unwrap();
+        let none = set_mcp_tool_enabled(&none, "search", "mid", true).unwrap();
+        assert!(!none.contains("disabled_tools"), "摘空了连键一起删：{none}");
+        assert_eq!(
+            set_mcp_tool_enabled(&none, "search", "mid", true).unwrap(),
+            none,
+            "本来就开着"
+        );
+
+        // 第一个关着的工具：键从无到有。
+        let first = set_mcp_tool_enabled(MCP_CONFIG, "docs", "fetch", false).unwrap();
+        assert!(first.contains(r#"disabled_tools = ["fetch"]"#), "{first}");
+
+        assert!(matches!(
+            set_mcp_tool_enabled(MCP_CONFIG, "nope", "x", false),
+            Err(EditError::NotFound(_))
+        ));
+        assert!(matches!(
+            set_mcp_tool_enabled(MCP_CONFIG, "search", "  ", false),
+            Err(EditError::Invalid(_))
+        ));
+        let broken = MCP_CONFIG.replace(
+            r#"disabled_tools = ["zeta", "alpha"]"#,
+            "disabled_tools = 3",
+        );
+        assert!(matches!(
+            set_mcp_tool_enabled(&broken, "search", "x", false),
+            Err(EditError::Invalid(message)) if message.contains("不是数组")
+        ));
+    }
 }

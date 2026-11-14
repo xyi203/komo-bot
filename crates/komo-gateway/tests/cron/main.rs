@@ -29,4 +29,6 @@ mod command;
 mod confirm;
 mod definition;
 mod firing;
+mod goals;
 mod notify;
+mod push;

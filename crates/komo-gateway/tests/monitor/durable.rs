@@ -562,3 +562,67 @@ async fn a_monitor_event_interjects_into_the_still_running_host() {
         "{event:?}"
     );
 }
+
+/// 浏览器推送的「不是操作者发起的那一轮」：监听事件触发的回复推给订阅的设备（每个触发一轮推一条），
+/// 操作者自己发消息开始的那一轮（挂监听的回执）他正看着，不推。订阅用 RFC 8291 附录 A 的接收端公钥，
+/// 推送服务是本机假服务（只数请求）。
+#[tokio::test]
+async fn a_monitor_triggered_reply_is_pushed_but_the_operators_own_turn_is_not() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let hits = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&hits);
+    let app = axum::Router::new().fallback(move || {
+        let counter = Arc::clone(&counter);
+        async move {
+            counter.fetch_add(1, Ordering::SeqCst);
+            axum::http::StatusCode::CREATED
+        }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let llm = MonitorLlm::new(Duration::ZERO);
+    let config = format!(
+        "{}\n[push]\nsubject = \"mailto:ops@example.com\"\n",
+        config()
+    );
+    let mut gateway = GatewayBuilder::new(&config)
+        .llm(Arc::clone(&llm) as Arc<dyn LlmClient>)
+        .stream(DriverStream::new(Arc::clone(&llm) as Arc<dyn LlmClient>))
+        .start()
+        .await;
+    komo_store::TursoPushRepo::new(gateway.state().db.clone())
+        .upsert(komo_store::NewPushSubscription {
+            endpoint: format!("{origin}/push"),
+            p256dh: "BCVxsr7N_eNgVRqvHtD0zTZsEc6-VV-JvLexhqUzORcxaOzi6-AYWXvTBHm4bjyPjs7Vd8pZGH6SRpkNtoIAiw4".into(),
+            auth: "BTBZMqHH6r4Tts7J_aSIgg".into(),
+            user_agent: None,
+            now: time::OffsetDateTime::now_utc(),
+        })
+        .await
+        .unwrap();
+
+    // 走 HTTP 提交：看客（以及推送）挂在 HTTP 提交那条路上。
+    let (_session, run) = gateway.say("挂：echo tick; sleep 0.2", "push-arm").await;
+    gateway.wait_run(&run).await;
+    wait_keyed(&gateway, "monitor-end:", Duration::from_secs(20)).await;
+    let events = llm.events().len();
+    assert!(events >= 1, "监听至少交回一条输入：{events}");
+    for _ in 0..200 {
+        if hits.load(Ordering::SeqCst) >= events {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        events,
+        "每个监听触发的回复推一条；操作者那一轮（挂监听）不推"
+    );
+    gateway.stop().await;
+}

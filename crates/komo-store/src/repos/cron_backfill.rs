@@ -656,6 +656,88 @@ mod tests {
         assert_eq!(counts(&db).await, after_first);
     }
 
+    /// 链接指向已经不存在的任务：不并入、不报错，那条悬空的 `cron` 触发器也摘掉；目标上别的触发器
+    /// （监听）留着；结案的目标照样接住定时（状态跟着走，只是调度器不会触发它）。
+    #[tokio::test]
+    async fn a_dangling_link_is_stripped_and_other_triggers_and_a_closed_goal_survive() {
+        let (db, _dir) = temp().await;
+        insert_job(&db, "job-1", "晨间摘要", "paused", 5_000).await;
+        let matters = TursoMatterRepo::new(db.clone());
+        goal_linking(&db, "goal-dangling", &["job-gone"]).await;
+        // 再挂一个监听，并另有一个结了案、链着 job-1 的目标。
+        let mut dangling = matters
+            .get(&MatterId::from_raw("goal-dangling"))
+            .await
+            .unwrap()
+            .unwrap();
+        dangling = transition(
+            &dangling,
+            &MatterChange::Link(MatterTrigger::Monitor {
+                session: komo_kernel::types::ids::SessionId::from_raw("sess-9"),
+                monitor: "aa".into(),
+            }),
+            T0,
+        )
+        .unwrap()
+        .unwrap();
+        matters
+            .put(dangling.clone(), Some(dangling.revision - 1))
+            .await
+            .unwrap();
+        goal_linking(&db, "goal-closed", &["job-1"]).await;
+        let closed = matters
+            .get(&MatterId::from_raw("goal-closed"))
+            .await
+            .unwrap()
+            .unwrap();
+        let closed = transition(&closed, &MatterChange::Drop, T0)
+            .unwrap()
+            .unwrap();
+        matters
+            .put(closed.clone(), Some(closed.revision - 1))
+            .await
+            .unwrap();
+        assert_eq!(closed.state, MatterState::Dropped);
+
+        let report = backfill_cron_into_goals(&db).await.unwrap();
+        assert_eq!(
+            report.placed,
+            vec![(
+                "job-1".to_string(),
+                Placement::MergedInto("goal-closed".to_string())
+            )]
+        );
+        let mut stripped = report.triggers_stripped.clone();
+        stripped.sort();
+        assert_eq!(stripped, ["goal-closed", "goal-dangling"]);
+
+        let kept = matters
+            .get(&MatterId::from_raw("goal-dangling"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(kept.triggers.len(), 1, "只摘 cron，监听留着");
+        assert!(matches!(kept.triggers[0], MatterTrigger::Monitor { .. }));
+        let cron = TursoCronRepo::new(db.clone());
+        assert!(
+            cron.get(&CronJobId::from_raw("goal-dangling"))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let job = cron
+            .get(&CronJobId::from_raw("goal-closed"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(job.status, JobStatus::Paused, "任务的启停带过来");
+        assert!(
+            cron.due(from_ts(9_999_999)).await.unwrap().is_empty(),
+            "结案的目标不触发"
+        );
+        assert!(backfill_cron_into_goals(&db).await.unwrap().is_noop());
+    }
+
     /// 回填演练：对**真实 aux.db 的副本**跑回填函数两遍，打印前后的数量与每个任务对应的目标 id。
     ///
     /// 手动跑，`KOMO_BACKFILL_AUX_DB` 指向副本里的 aux.db（只读复制 `~/.komo`，绝不对原件跑）：

@@ -41,7 +41,7 @@ function renderStarting(info: ConnectionInfo) {
   root.append(
     el("div", { class: "spinner" }),
     el("h1", {}, t("正在连接 Gateway…", "Connecting to the Gateway…")),
-    el("p", { class: "muted" }, info.message ?? (info.mode === "local" ? t("本机模式", "Local mode") : info.baseUrl ?? "")),
+    el("p", { class: "muted" }, info.message ?? info.remote?.url ?? ""),
   );
 }
 
@@ -52,11 +52,9 @@ function renderProblem(info: ConnectionInfo) {
       ? info.older === "gateway"
         ? t("Gateway 版本比 App 旧", "The Gateway is older than this app")
         : t("App 版本比 Gateway 旧", "This app is older than the Gateway")
-      : info.status === "unauthorized"
-        ? t("令牌被拒绝", "Token rejected")
-        : t("连不上 Gateway", "Can't reach the Gateway");
+      : t("连不上 Gateway", "Can't reach the Gateway");
   root.append(el("h1", {}, title), el("p", {}, info.message ?? ""));
-  if (info.baseUrl) root.append(el("p", { class: "muted" }, info.baseUrl));
+  if (info.remote?.url) root.append(el("p", { class: "muted" }, info.remote.url));
   if (info.status === "mismatch" || info.gateway) {
     root.append(
       el(
@@ -77,37 +75,18 @@ function renderProblem(info: ConnectionInfo) {
 
 function renderSettings(info: ConnectionInfo) {
   clear();
-  const remoteSaved = info.remote;
-  const url = el("input", { type: "text", placeholder: "https://komo.example.com", value: remoteSaved?.url ?? "", spellcheck: false });
-  const token = el("input", { type: "password", placeholder: t("设备令牌（每次保存都要重新填）", "Device token (re-enter on every save)"), autocomplete: "off" });
+  const url = el("input", { type: "text", placeholder: "https://komo.example.com", value: info.remote?.url ?? "", spellcheck: false });
+  const names = info.remote?.headerNames ?? [];
   const headers = el("textarea", {
-    placeholder: remoteSaved?.headerNames.length
-      ? t(`已保存的头：${remoteSaved.headerNames.join(", ")}（值不显示，需重新填写）`, `Saved headers: ${remoteSaved.headerNames.join(", ")} (values hidden; re-enter)`)
+    placeholder: names.length
+      ? t(`已保存的头：${names.join(", ")}（值不显示；留空且地址不变则沿用）`, `Saved headers: ${names.join(", ")} (values hidden; leave empty to keep them while the URL is unchanged)`)
       : "CF-Access-Client-Id: …\nCF-Access-Client-Secret: …",
     spellcheck: false,
   });
   const result = el("div");
-  const local = el("input", { type: "radio", name: "mode", checked: info.mode === "local" });
-  const remote = el("input", { type: "radio", name: "mode", checked: info.mode === "remote" });
-  const remoteForm = el(
-    "div",
-    {},
-    el("label", {}, t("Gateway 地址", "Gateway URL")),
-    url,
-    el("label", {}, t("设备令牌", "Device token")),
-    token,
-    el("label", {}, t("额外请求头（可选，每行 名字: 值）", "Extra request headers (optional, one `Name: value` per line)")),
-    headers,
-    el("p", { class: "muted hint" }, t("不能设置 Authorization、Cookie、Host、Origin。令牌和请求头用系统钥匙串加密保存。", "Authorization, Cookie, Host and Origin can't be set. The token and headers are encrypted with the system keychain.")),
-  );
-  // 已经连着本机时，"使用本机"什么也不会变：置灰，回去用"返回"
-  const alreadyLocal = info.mode === "local" && info.status === "ok";
   let busy = false;
   const sync = () => {
-    remoteForm.hidden = !remote.checked;
-    save.textContent = remote.checked ? t("测试并保存", "Test and save") : t("使用本机", "Use local");
-    test.hidden = !remote.checked;
-    save.disabled = busy || (!remote.checked && alreadyLocal);
+    signIn.disabled = busy || Boolean(info.signingIn);
     test.disabled = busy;
   };
   // 请求进行中按钮置灰：连点不会并发出几个请求、结果也不会被来回覆盖
@@ -122,23 +101,7 @@ function renderSettings(info: ConnectionInfo) {
       sync();
     }
   };
-  const test = button(t("只测试", "Test only"), () => void run(async () => {
-    result.replaceChildren(el("p", { class: "muted" }, t("测试中…", "Testing…")));
-    showTest(await api.connection.test({ url: url.value, token: token.value, headers: headers.value }));
-  }));
-  const save = button("", () => void run(async () => {
-    if (!remote.checked) {
-      result.replaceChildren();
-      const switched = await api.connection.useLocal();
-      if (!switched.ok) showTest(undefined, switched.error);
-      return;
-    }
-    result.replaceChildren(el("p", { class: "muted" }, t("测试中…", "Testing…")));
-    const saved = await api.connection.saveRemote({ url: url.value, token: token.value, headers: headers.value });
-    if (!saved.ok) {
-      showTest(saved.test, saved.error);
-    }
-  }), true);
+  const input = () => ({ url: url.value, headers: headers.value });
   const showTest = (test: TestResult | undefined, error?: string) => {
     result.replaceChildren();
     if (error) result.append(el("p", { class: "bad" }, error));
@@ -150,22 +113,66 @@ function renderSettings(info: ConnectionInfo) {
       result.append(list);
     }
   };
-  local.onchange = remote.onchange = sync;
+  const test = button(t("只测试", "Test only"), () => void run(async () => {
+    result.replaceChildren(el("p", { class: "muted" }, t("测试中…", "Testing…")));
+    showTest(await api.connection.test(input()));
+  }));
+  const signIn = button(info.account ? t("重新登录", "Sign in again") : t("登录", "Sign in"), () => void run(async () => {
+    result.replaceChildren(el("p", { class: "muted" }, t("测试中…", "Testing…")));
+    const started = await api.connection.signIn(input());
+    if (!started.ok) return showTest(started.test, started.error);
+    // 浏览器已打开：换成等待态，回跳后主进程会整页换掉这里；超时 / 取消由下面的轮询发现。
+    renderSettings(await api.connection.get());
+  }), true);
 
+  root.append(el("h1", {}, t("连接设置", "Connection settings")));
+  if (info.account) {
+    const who = info.account.email ?? info.account.subject;
+    root.append(
+      el("p", { class: "muted" }, `${t("已登录", "Signed in")}: ${who} · ${info.baseUrl ?? ""}`),
+      el("div", { class: "row" }, button(t("退出登录", "Sign out"), () => void api.connection.signOut())),
+    );
+  } else {
+    root.append(el("p", { class: "muted" }, info.message ?? t("还没有登录。填 Gateway 地址，点「登录」，在系统浏览器里完成登录。", "Not signed in. Enter the Gateway URL and sign in from your browser.")));
+  }
+  if (info.notice) root.append(el("p", { class: info.notice.error ? "bad" : "good" }, info.notice.text));
+  if (info.signingIn) {
+    root.append(
+      el("p", {}, t("已在系统浏览器里打开登录页。登录完成后会自动回到这里（最长等 5 分钟）。", "The sign-in page is open in your browser. You'll be brought back here when it's done (waits up to 5 minutes).")),
+      el("div", { class: "row" }, button(t("取消", "Cancel"), () => void api.connection.cancelSignIn().then(async () => renderSettings(await api.connection.get())))),
+    );
+  }
   root.append(
-    el("h1", {}, t("连接设置", "Connection settings")),
-    el("p", { class: "muted" }, info.status === "ok" ? `${t("当前", "Current")}: ${info.baseUrl ?? ""}` : info.message ?? ""),
+    el("label", {}, t("Gateway 地址", "Gateway URL")),
+    url,
+    el("p", { class: "muted hint" }, t("https；开发时连本机可以写 http://127.0.0.1:端口。", "https only; http://127.0.0.1:port is allowed for local development.")),
     el(
-      "div",
-      { class: "field" },
-      el("span", {}, t("连接到", "Connect to")),
-      el("div", { class: "mode", role: "radiogroup" }, el("label", {}, local, t("本机", "Local")), el("label", {}, remote, t("远程", "Remote"))),
+      "details",
+      {},
+      el("summary", {}, t("额外请求头（可选）", "Extra request headers (optional)")),
+      el("label", {}, t("每行 名字: 值", "One `Name: value` per line")),
+      headers,
+      el("p", { class: "muted hint" }, t("Gateway 前面有访问代理（如 Cloudflare Access 的 service token）才需要。不能设置 Authorization、Cookie、Host、Origin。登录令牌和请求头用系统钥匙串加密保存。", "Only needed behind an access proxy (e.g. a Cloudflare Access service token). Authorization, Cookie, Host and Origin can't be set. The sign-in token and headers are encrypted with the system keychain.")),
     ),
-    remoteForm,
-    el("div", { class: "row" }, save, test, button(t("返回", "Back"), () => void api.connection.retry())),
+    el("div", { class: "row" }, signIn, test, button(t("返回", "Back"), () => void api.connection.retry())),
     result,
   );
   sync();
+  if (info.signingIn) waitForSignIn();
+}
+
+let waiting: ReturnType<typeof setInterval> | undefined;
+/** 登录等待中：每 700ms 看一眼主进程。超时 / 取消后（signingIn 没了）重画；成功时主进程会换页，不用管。 */
+function waitForSignIn() {
+  if (waiting) clearInterval(waiting);
+  waiting = setInterval(() => {
+    void api.connection.get().then((info) => {
+      if (info.signingIn) return;
+      clearInterval(waiting);
+      waiting = undefined;
+      renderSettings(info);
+    });
+  }, 700);
 }
 
 async function render() {

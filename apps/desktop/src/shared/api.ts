@@ -1,15 +1,14 @@
 // 主进程、preload 与界面共用的类型（只有类型，没有运行时代码）。
 // `window.komoDesktop` 的形状就是 KomoDesktopApi；给 apps/client 的约定见 docs/clients.md §6.3。
 
-export type ConnectionMode = "local" | "remote";
-
-/** connecting：正在探测或拉起；ok：可用；其余都停在提示页。 */
-export type ConnectionStatus = "connecting" | "ok" | "unreachable" | "unauthorized" | "mismatch" | "error";
+/**
+ * connecting：正在探测；ok：可用；signed-out：还没登录或登录失效，停在连接设置页；其余停在提示页。
+ */
+export type ConnectionStatus = "connecting" | "ok" | "signed-out" | "unreachable" | "mismatch" | "error";
 
 export interface ConnectionInfo {
-  mode: ConnectionMode;
   status: ConnectionStatus;
-  /** 当前 Gateway 的地址（不含令牌）。 */
+  /** 当前 Gateway 的地址（已登录时才有，不含令牌）。 */
   baseUrl?: string;
   /** 给人看的说明：为什么停在这里、下一步做什么。 */
   message?: string;
@@ -17,19 +16,25 @@ export interface ConnectionInfo {
   app: { version: string; protocolVersion: number };
   /** status 为 mismatch 时，哪一边旧。 */
   older?: "gateway" | "app";
-  /** 远程配置的现状。令牌与额外请求头的值永远不会出现在这里，只给名字。 */
+  /** 已填的 Gateway 地址与额外请求头的名字（值永远不会出现在这里）。 */
   remote?: { url: string; headerNames: string[] };
+  /** 已登录的账号；令牌与 session_id 不给界面。 */
+  account?: { subject: string; email?: string };
+  /** 系统浏览器里的登录还在等（最长 5 分钟）。 */
+  signingIn?: boolean;
+  /** 最近一次登录 / 退出 / 登录失效的结果，设置页显示；error 为真时按错误样式。 */
+  notice?: { text: string; error: boolean };
 }
 
-export interface RemoteInput {
+export interface SignInInput {
+  /** Gateway 地址：https，回环地址（127.0.0.1 / localhost / [::1]）允许 http。 */
   url: string;
-  token: string;
-  /** 额外请求头，每行 `Name: value`。 */
+  /** 额外请求头，每行 `Name: value`。留空且地址没变时沿用已保存的。 */
   headers: string;
 }
 
 export interface TestStep {
-  name: "health" | "protocol" | "auth" | "sse";
+  name: "health" | "protocol" | "oidc" | "auth" | "sse";
   ok: boolean;
   message: string;
 }
@@ -39,11 +44,19 @@ export interface TestResult {
   steps: TestStep[];
 }
 
-export interface SaveResult {
+export interface SignInResult {
   ok: boolean;
-  /** 保存失败（或没测通）的原因。成功时界面会被主进程整页重载，收不到这个结果。 */
+  /** 没能开始登录的原因。成功只表示浏览器已打开；登录结果之后由主进程整页重载通知。 */
   error?: string;
   test?: TestResult;
+}
+
+export interface SignOutResult {
+  ok: boolean;
+  /** 服务端确认吊销了这台设备的令牌。 */
+  revoked: boolean;
+  /** 没吊销成功时的说明（本地登录状态照样清了）。 */
+  warning?: string;
 }
 
 export interface NotifyInput {
@@ -100,13 +113,15 @@ export interface KomoDesktopApi {
   readonly protocolVersion: number;
   connection: {
     get(): Promise<ConnectionInfo>;
-    /** 只测不存：HTTP、协议版本、令牌、SSE。 */
-    test(input: RemoteInput): Promise<TestResult>;
-    /** 测通后保存并切换到远程；成功则整页重载。 */
-    saveRemote(input: RemoteInput): Promise<SaveResult>;
-    /** 切回本机并整页重载。 */
-    useLocal(): Promise<SaveResult>;
-    /** 重新探测（本机模式会再试着拉起 Gateway）并整页重载。 */
+    /** 只测不登录：HTTP、协议版本、这台 Gateway 配没配登录（已登录时还测令牌与 SSE）。 */
+    test(input: SignInInput): Promise<TestResult>;
+    /** 测通后在系统浏览器里打开登录页；完成登录后系统会唤回桌面端（komo://auth/callback），主进程整页重载。 */
+    signIn(input: SignInInput): Promise<SignInResult>;
+    /** 放弃正在等的登录。 */
+    cancelSignIn(): Promise<void>;
+    /** 吊销设备令牌并清本地登录状态，然后回到连接设置页（网络失败也清，结果里有 warning）。 */
+    signOut(): Promise<SignOutResult>;
+    /** 重新探测并整页重载。 */
     retry(): Promise<void>;
     /** 跳到壳自带的连接设置页（离开 SPA）。 */
     openSettings(): Promise<void>;

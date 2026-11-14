@@ -4,8 +4,9 @@
 export const channels = {
   connectionGet: "komo:connection:get",
   connectionTest: "komo:connection:test",
-  connectionSaveRemote: "komo:connection:save-remote",
-  connectionUseLocal: "komo:connection:use-local",
+  connectionSignIn: "komo:connection:sign-in",
+  connectionCancelSignIn: "komo:connection:cancel-sign-in",
+  connectionSignOut: "komo:connection:sign-out",
   connectionRetry: "komo:connection:retry",
   connectionOpenSettings: "komo:connection:open-settings",
   notify: "komo:notify",

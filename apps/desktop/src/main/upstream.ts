@@ -26,22 +26,21 @@ export function parseExtraHeaders(text: string): Record<string, string> {
   return headers;
 }
 
-/** 规范成 `scheme://host[:port][/prefix]`（无结尾斜杠）。只收 http / https，不收地址里的账号密码。 */
-export function normalizeBaseUrl(input: string): { url: string; warning?: string } {
+/** 规范成 `scheme://host[:port][/prefix]`（无结尾斜杠）。只收 https；回环地址（开发时连本机 Gateway）允许 http。 */
+export function normalizeBaseUrl(input: string): string {
   let parsed: URL;
   try {
     parsed = new URL(input.trim());
   } catch {
     throw new Error("地址不是合法的 URL（例如 https://komo.example.com）");
   }
-  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") throw new Error("地址只支持 http 或 https");
-  if (parsed.username || parsed.password) throw new Error("地址里不要带账号密码；令牌在下面单独填");
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") throw new Error("地址只支持 https（回环地址可用 http）");
+  if (parsed.username || parsed.password) throw new Error("地址里不要带账号密码");
   const loopback = ["localhost", "127.0.0.1", "[::1]"].includes(parsed.hostname);
-  return {
-    url: `${parsed.origin}${parsed.pathname.replace(/\/+$/, "")}`,
-    warning:
-      parsed.protocol === "http:" && !loopback ? "这是明文 HTTP：令牌会在网络上明文传输，除非前面有 Tailscale 之类的加密链路。" : undefined,
-  };
+  if (parsed.protocol === "http:" && !loopback) {
+    throw new Error("非回环地址必须用 https：设备令牌会在这条连接上传输，不能走明文 HTTP");
+  }
+  return `${parsed.origin}${parsed.pathname.replace(/\/+$/, "")}`;
 }
 
 export interface Target {
@@ -86,10 +85,35 @@ export async function fetchHealth(target: Target): Promise<Health> {
   return body as Health;
 }
 
-/** 完整测一遍：HTTP、协议版本、令牌、SSE。`appProtocol` 是 App 打包时的 PROTOCOL_VERSION。 */
-export async function probe(target: Target, appProtocol: number): Promise<{ result: TestResult; health?: Health }> {
+/** `GET /auth/me` 的响应里本壳用到的字段（crates/komo-kernel/src/protocol/http.rs 的 AuthMeResponse）。 */
+export interface AuthMe {
+  authenticated: boolean;
+  oidc_configured: boolean;
+  subject?: string;
+  email?: string;
+  session_id?: string;
+}
+
+export async function fetchAuthMe(target: Target): Promise<AuthMe> {
+  const response = await request(target, "/auth/me");
+  if (!response.ok) throw new Error(`/auth/me 返回 ${describeStatus(response)}`);
+  const body = (await response.json()) as Partial<AuthMe>;
+  if (typeof body.authenticated !== "boolean" || typeof body.oidc_configured !== "boolean") {
+    throw new Error("/auth/me 的响应不像 komo Gateway");
+  }
+  return body as AuthMe;
+}
+
+/**
+ * 完整测一遍：HTTP、协议版本、登录状态（`/auth/me`）。没登录就停在"这台 Gateway 能不能登录"；
+ * 已登录再测令牌与 SSE。`appProtocol` 是 App 打包时的 PROTOCOL_VERSION。
+ */
+export async function probe(
+  target: Target,
+  appProtocol: number,
+): Promise<{ result: TestResult; health?: Health; me?: AuthMe }> {
   const steps: TestStep[] = [];
-  const done = (health?: Health) => ({ result: { ok: steps.every((step) => step.ok), steps }, health });
+  const done = (health?: Health, me?: AuthMe) => ({ result: { ok: steps.every((step) => step.ok), steps }, health, me });
 
   let health: Health;
   try {
@@ -110,22 +134,38 @@ export async function probe(target: Target, appProtocol: number): Promise<{ resu
   });
   if (!protocolOk) return done(health);
 
+  let me: AuthMe;
+  try {
+    me = await fetchAuthMe(target);
+  } catch (error) {
+    steps.push({ name: "oidc", ok: false, message: errorMessage(error) });
+    return done(health);
+  }
+  if (!me.oidc_configured) {
+    steps.push({ name: "oidc", ok: false, message: "这台 Gateway 没有配置登录（缺 [auth.oidc]），桌面端没法登录。" });
+    return done(health, me);
+  }
+  if (!me.authenticated) {
+    steps.push({ name: "oidc", ok: true, message: "Gateway 已配置登录，可以登录" });
+    return done(health, me);
+  }
+  steps.push({ name: "auth", ok: true, message: `已登录${me.email ? `（${me.email}）` : me.subject ? `（${me.subject}）` : ""}` });
+
   let sessions: Array<{ session: string }>;
   try {
     const response = await request(target, "/v1/sessions");
     if (response.status === 401) throw new Error("令牌被拒绝（401）");
     if (!response.ok) throw new Error(`/v1/sessions 返回 ${describeStatus(response)}`);
     sessions = ((await response.json()) as { sessions?: Array<{ session: string }> }).sessions ?? [];
-    steps.push({ name: "auth", ok: true, message: "令牌有效" });
   } catch (error) {
     steps.push({ name: "auth", ok: false, message: errorMessage(error) });
-    return done(health);
+    return done(health, me);
   }
 
   const first = sessions[0]?.session;
   if (!first) {
     steps.push({ name: "sse", ok: true, message: "还没有会话，SSE 没法实测（有会话后会自动用上）" });
-    return done(health);
+    return done(health, me);
   }
   const controller = new AbortController();
   try {
@@ -150,7 +190,7 @@ export async function probe(target: Target, appProtocol: number): Promise<{ resu
   } finally {
     controller.abort();
   }
-  return done(health);
+  return done(health, me);
 }
 
 export function errorMessage(error: unknown): string {
@@ -159,4 +199,15 @@ export function errorMessage(error: unknown): string {
     return cause?.code ? `${error.message}（${cause.code}）` : error.message;
   }
   return String(error);
+}
+
+/** 取 Gateway 的 ErrorBody（`{ error: { message } }`）里的说明；不是这个形状就给 HTTP 状态。 */
+export async function serverMessage(response: Response): Promise<string> {
+  try {
+    const body = (await response.json()) as { error?: { message?: string } };
+    if (body.error?.message) return body.error.message;
+  } catch {
+    // 不是 JSON：用状态码。
+  }
+  return `HTTP ${response.status}`;
 }

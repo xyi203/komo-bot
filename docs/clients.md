@@ -30,7 +30,7 @@ macOS 应用和手机端，需要一套标准的前端栈，以及一份所有�
 | D4 | 仓库结构 | 仓库根加 pnpm workspace：`apps/client`（Start SPA）、`apps/desktop`（Electron）、`packages/protocol`（生成的类型）、`packages/api`（HTTP + SSE 客户端与 Query hooks）；以后加 `apps/mobile` | 界面、协议、各端的壳各管一摊。原型 `apps/web` 留到新版对齐后再删（C1 已删） |
 | D5 | 网页由谁提供 | Gateway 同源提供 SPA 产物：`/v1/*` 是 API，其余路径先找静态文件，找不到回落 `_shell.html`（已拍板，同 Hermes） | 去掉 `serve.mjs`；浏览器、PWA、手机都只认 Gateway 一个地址（web.md §9 第 1 条）。网页跟 Gateway 一起发布，协议不会错位；同源时 cookie 鉴权可用。不放到 Cloudflare Worker：浏览器反正要连到 Gateway，放在 Worker 上只多一处部署，还会跨域、版本错位 |
 | D6 | 浏览器怎么鉴权 | **（2026-11-14 改写，原配对码方案已删，P21）** OIDC 登录换 cookie：网页没登录时跳 `/auth/login`，Gateway 走 OIDC 授权码 + PKCE 到操作者自建的身份提供方，回调里核对允许名单后种 `komo_session`（`HttpOnly; SameSite=Lax`，公开地址是 https 时带 `Secure`），会话落 `aux.db`、重启不掉；`auth` 层认本机令牌 / 设备令牌（Bearer）与这个 cookie；会改东西的 cookie 请求另外核对 `Origin`（同 `Host` 或等于 `public_url` 的源）。**Host 校验**不变：只接受回环地址、监听地址、`[gateway] trusted_hosts` 与 `public_url` 的主机，其余一律 403（同 DeepSeek Harness）。细节见 §9 | `EventSource` 带不了请求头，cookie 能带；`HttpOnly` 让 JS 拿不到；自己不存密码、不做登录失败限制，那是身份提供方的事。Host 校验挡的是 DNS 重绑定：恶意网页把自己的域名改解析到 `127.0.0.1`，就能以"同源"身份读 Gateway 的响应。不需要鉴权的路由（静态文件、`/healthz`、`/auth/*`）照样暴露，所以 `/auth/*` 里不放任何不经校验就能用的东西。校验只负责放行，鉴权仍靠令牌和 cookie |
-| D7 | macOS | **Electron**（已拍板），用 electron-builder 打包和自动更新；连接分本机与远程两种模式 | 跟网页同一套代码。见 §4 |
+| D7 | macOS | **Electron**（已拍板），用 electron-builder 打包和自动更新；只连远程 Gateway（点「登录」跳系统浏览器走 OIDC，换设备令牌，§4、§9），不再有本机模式（2026-11-14，P20） | 跟网页同一套代码。见 §4 |
 | D8 | 手机 | 先做 PWA；PWA 不够用时再用 Capacitor 套壳 | 见 §5 |
 | D9 | 多语言 | 新版从第一行界面代码起就走文案表，先做 `zh-CN` 与 `en`；文案表用 Paraglide JS（编译期生成带类型的消息函数）。语言偏好**只存在各端**（已拍板）：浏览器与 PWA 存 `localStorage`，Electron 存在自己的设置里，Capacitor 存在 App 偏好里；没选过就跟系统语言（`zh*` 用中文，其余用英文） | 原型里几百处写死的中文不再搬第二次：C1 迁移一节就抽一节的文案。消息函数带类型，漏翻、键名写错在编译期报错，没用到的文案不进产物。偏好不进 Gateway：语言是看界面的人的事，同一个 Gateway 可以有人用中文、有人用英文；代价是换设备要重选一次 |
 
@@ -60,18 +60,16 @@ macOS 应用和手机端，需要一套标准的前端栈，以及一份所有�
 ## 4. macOS：Electron
 
 - **加载**：用自定义协议 `app://` 加载打进包里的 SPA 产物，不用 `file://`。打开即用，不依赖 Gateway 先起来。
-- **两种连接**（同 Hermes Desktop 的本机 / 远程）：
-  - **本机**：主进程读 `<数据目录>/runtime/gateway.json` 拿地址和令牌。Gateway 重启换了令牌，就重读一次。Gateway 没在跑时
-    调用 `komo gateway` 拉起它（与 `komo` 命令的"需要时启动"同一个行为）。
-  - **远程**：填 Gateway 地址和设备令牌（§5），可选再加几个额外请求头，给挡在前面的访问代理用（比如 Cloudflare Access 的
-    service token）。保存前先测一次 HTTP 和 SSE 都通。令牌用 Electron 的 `safeStorage` 加密保存。远程模式下工具都跑在
-    Gateway 那台机器上，不在显示界面的这台。
-  - 两种模式下，界面都把 API 请求发到 `app://` 自己的 `/v1/*`，由主进程的协议处理器转发给当前 Gateway，并在转发时加上
-    `Authorization` 和额外请求头（同 DeepSeek Harness）。界面看来一直是同源，不需要 CORS；渲染进程看不到令牌。SSE 也是
-    HTTP，转发时原样把响应流接过去。额外请求头不能覆盖 `Authorization`、`Cookie`、`Host`、`Origin` 这几个。
-  - 切换连接时，清掉跟上一个 Gateway 绑定的前端状态，让所有查询缓存失效，避免旧 Gateway 的会话混进新的界面。
+- **连接**（2026-11-14 改，P19–P21：komo 只跑在远程机器上，桌面端只剩「连远程」一种，本机模式——读 `runtime/gateway.json`、拉起本机 Gateway——已删）：
+  - 连接设置只填 Gateway 地址（https；回环地址允许 http，开发时连 `http://127.0.0.1:端口` 当作普通远程地址、走同样的登录），可选再加几个额外请求头，给挡在前面的访问代理用（比如 Cloudflare Access 的 service token）。不再手填令牌。
+  - **登录**：点「登录」→ 主进程先测 `/healthz`、协议版本与 `GET /auth/me`（`oidc_configured` 为假就报「这台 Gateway 没有配置登录」，不开浏览器）→ 生成 `code_verifier` / S256 `code_challenge` / `state`（只在内存，5 分钟有效）→ `shell.openExternal(<gateway>/auth/device/authorize?…&redirect_uri=komo://auth/callback&name=…)` → 系统浏览器完成 OIDC → Gateway 303 到 `komo://auth/callback?code&state` → 系统唤回桌面端（macOS `open-url`；Windows / Linux 为 `second-instance` 的 argv，冷启动则在本进程的 argv）→ 校验 state 与有效期 → `POST /auth/device/token {code, code_verifier, redirect_uri}` → 设备令牌。state 不符、过期、没有进行中的登录、换令牌失败都在连接设置页给出原因。
+  - **令牌存放**：地址、`session_id`、`subject` / `email` 明文放 `userData/connection.json`（0600）；令牌与额外请求头用 `safeStorage` 加密后放同一文件。加密不可用（含 Linux 退到 `basic_text`）时**拒绝登录**，不退化成明文；这个检查在打开浏览器之前，免得换到令牌才发现存不了。
+  - **转发**：界面把 API 请求发到 `app://` 自己的 `/v1/*`（外加 `/healthz`、`/auth/me`），由主进程的协议处理器转给 Gateway，带 `Authorization: Bearer <设备令牌>` 和额外请求头（同 DeepSeek Harness）。界面看来一直是同源，不需要 CORS；渲染进程看不到令牌。SSE 也是 HTTP，原样接流。额外请求头不能覆盖 `Authorization`、`Cookie`、`Host`、`Origin`。其余 `/auth/*`（授权、回调、换令牌）只由主进程自己调，不转发。
+  - **401**：转发或托盘轮询拿到 Gateway 的 401，就清掉本地登录（保留地址与请求头）并回到连接设置页提示重新登录。
+  - **退出登录**：`DELETE /v1/auth/sessions/<session_id>` 吊销设备令牌，再清本地；网络失败也清本地，并提示服务端令牌可能仍然有效。
+  - 换登录（重新登录或换 Gateway）时整页重载，清掉跟上一个 Gateway 绑定的前端状态，让所有查询缓存失效。
 - **系统能力**：菜单栏图标（有待处理时带数字）、原生通知（确认卡、任务结束，来源是 SSE）、全局快捷键唤起 ⌘K、
-  `komo://` 深链（打开某个会话）。
+  `komo://` 深链（`komo://session/<id>` 打开某个会话；`komo://auth/callback` 是登录回跳，不是给人点的）。
 - **安全**：`contextIsolation` 开、`nodeIntegration` 关，preload 只暴露通知和窗口控制这几个函数；导航只允许 `app://`。
 - **分发**：需要 Apple Developer ID 签名和公证（操作者动作）。自动更新走 GitHub Release，跟 `komo update` 用同一个仓库，
   但更新的是另一个产物。
@@ -107,7 +105,7 @@ macOS 应用和手机端，需要一套标准的前端栈，以及一份所有�
 |---|---|---|
 | C0（**已做**，§6.1） | workspace、协议类型生成、`packages/api`、Start SPA 壳与 token、多语言骨架（文案表、语言切换、lint）、Gateway 提供静态文件与 cookie 鉴权 | `komo web` 打开 7777 上的新壳，能列会话、能收 SSE，能在中英文之间切换 |
 | C1（**已做**，§6.2） | 按 §3 的顺序逐节迁移，对齐原型；每节的文案同时进中英文两份 | web.md 每一节都有新版对应，且两种语言下都检查过；`apps/web` 与 `serve.mjs` 删除 |
-| C2（**已做**，§6.3） | Electron 壳（§4） | 签名后的 `.app` 能连本机 Gateway，通知与托盘可用 |
+| C2（**已做**，§6.3；连接部分 2026-11-14 改成登录远程，§9） | Electron 壳（§4） | 签名后的 `.app` 能登录远程 Gateway，通知与托盘可用 |
 | C3 | 远程访问（Tailscale 或 Tunnel，`public_url` / `trusted_hosts`）、设备令牌（服务端 2026-11-14 已做，§9）、PWA 与 Web Push（§5 的 1–3） | iPhone 主屏幕上的 PWA 能聊天、收确认卡推送 |
 | C4 | Capacitor 原生壳（§5 的 4） | 按需 |
 
@@ -159,14 +157,14 @@ macOS 应用和手机端，需要一套标准的前端栈，以及一份所有�
 | 项 | 实现 | 状态 |
 |---|---|---|
 | 加载 | 特权协议 `app://komo`（standard/secure/stream），`src/main/protocol.ts`：无扩展名回落 `_shell.html`，目录穿越拒绝；开发读 `apps/client/dist/client`，打包读 `Resources/client`（`KOMO_DESKTOP_CLIENT_DIR` 可覆盖）；壳 html 的 CSP 按内联脚本内容算 sha256（不开 `unsafe-inline` 脚本） | 完成，冒烟通过 |
-| 转发 | `/v1/*`、`/healthz` 由协议处理器转给当前 Gateway，加 `Authorization` 与额外请求头；响应以流转发，渲染进程取消读取时上游随之断开；3xx（访问代理要登录）转成 502 的 `ErrorBody` | 完成；SSE 冒烟通过（24 帧）。**断开传播只按代码路径写，没有单独测** |
-| 本机连接 | 读 `$KOMO_HOME/runtime/gateway.json`（默认 `~/.komo`）；401 或连不上时重读一次；没在跑就拉起，找 `komo` 的顺序：`KOMO_BIN` → PATH → `~/.local/bin` → `/opt/homebrew/bin` → `/usr/local/bin`。默认数据目录执行 `komo gateway`；**非默认 `KOMO_HOME` 改用分离的 `komo gateway --foreground`**（komo 自己拒绝让非默认目录碰全局服务单元，`units::owns_unit`） | 完成；非默认目录的拉起分支用临时目录实测通过，默认目录的 `komo gateway` 分支**未实测**（会动真实 launchd 服务） |
-| 远程连接 | 地址 + 设备令牌 + 额外请求头（禁止 Authorization/Cookie/Host/Origin 及分帧类头）；保存前测 health、协议版本、令牌、SSE（没有会话时 SSE 无从实测，如实标注）；令牌与请求头值一起用 `safeStorage` 加密存 `userData/connection.json`（0600），加密不可用就拒绝保存、不退化成明文；渲染进程只能看到头的名字 | 完成；`test` 的各失败分支冒烟通过。**`saveRemote` 的落盘与 safeStorage 未实测**（会改 userData；需要钥匙串授权） |
-| 切换连接 | 保存或切回后主进程让窗口整页重载到 `app://komo/`（清 Query 缓存与前端状态），托盘通知基线同时作废 | 完成（代码路径），未端到端实测 |
+| 转发 | `/v1/*`、`/healthz`、`/auth/me` 由协议处理器转给当前 Gateway，加设备令牌与额外请求头；响应以流转发，渲染进程取消读取时上游随之断开；3xx（访问代理要登录）转成 502 的 `ErrorBody`；401 清本地登录（2026-11-14） | 转发的旧版完成并冒烟过（SSE 24 帧）；带设备令牌与 401 处理是 5b 改的，**未编译、未实测**。断开传播只按代码路径写，没有单独测 |
+| ~~本机连接~~ | **已删（2026-11-14，5b）**：读发现文件、拉起本机 Gateway、`KOMO_BIN` 查找都不在了；开发时连 `http://127.0.0.1:端口` 当普通远程地址 | 代码已删，**未编译** |
+| 登录 | 见 §4「连接」：`src/main/auth.ts`（PKCE、state、换令牌、吊销）、`connection.ts`（登录状态机、401 / 退出）、`store.ts`（`safeStorage` 加密存 `connection.json`；旧版 `{mode, remote}` 文件只沿用地址与额外请求头，旧令牌作废）、`pages/page.ts`（连接设置页：地址 + 额外请求头 + 登录 / 退出） | 2026-11-14（5b）写完，**未编译、未实测**（§9.1 第 5 步是实测清单） |
+| 切换连接 | 登录成功后主进程让窗口整页重载到 `app://komo/`（清 Query 缓存与前端状态），托盘通知基线同时作废 | 完成（代码路径），未端到端实测 |
 | 版本 | 构建时 `scripts/build-info.mjs` 从 `crates/komo-kernel/src/protocol/mod.rs` 的 `PROTOCOL_VERSION` 与根 `Cargo.toml` 读出，写进 `dist/build-info.json`（读不到就构建失败）；连接时与 `/healthz` 比，不一致停在提示页并说明哪边旧、怎么更新；`version` 不同而协议相同照常用 | 完成；提示页文案与布局做了，**不一致的真实场景没造出来**（只有一个 Gateway 版本） |
 | 托盘 / 通知 | **轮询**每 5 秒：`GET /v1/interventions`（托盘标题显示数字；新出现的条目发通知，覆盖 confirm/verify/blocked）与 `GET /v1/sessions`（`kind=task` 的会话由未终态变 `completed`/`failed` 发通知）。选轮询是因为 Gateway 的 SSE 只有每会话一条、没有全局流；第一轮只记基线；窗口在前台时不弹；点击通知打开对应会话 | 完成，**未实测**（没有真实的待处理与任务结束事件，也没点过托盘） |
 | 快捷键 | 全局 `CommandOrControl+Shift+K`（`KOMO_DESKTOP_SHORTCUT` 可改）唤起窗口并让界面开 ⌘K | 已注册，**未实测**（自动按键被系统权限挡住） |
-| 深链 | `komo://session/<id>`（id 只收 `[A-Za-z0-9._-]`），打包后注册协议；冷启动先记下，连上后打开 | 完成，未实测（需要已安装的 .app） |
+| 深链 | `komo://session/<id>`（id 只收 `[A-Za-z0-9._-]`）与登录回跳 `komo://auth/callback?code&state`，打包后注册协议；冷启动（macOS 的 `open-url` 先于 ready、Windows / Linux 的 argv）先记下，主进程就绪后处理；登录回跳冷启动时没有进行中的登录，会得到「没有正在进行的登录」 | 会话深链完成未实测；登录回跳 2026-11-14 新加，**未编译、未实测**（需要已安装的 .app；`pnpm desktop:dev` 没注册协议，收不到回跳） |
 | 安全 | `contextIsolation` 开、`nodeIntegration` 关、`sandbox` 开；preload 只 `require("electron")`；导航只允许 `app://`，外链（http/https/mailto）交给系统浏览器；权限请求一律拒绝；非 `app:/devtools:/data:/blob:` 的请求在会话层取消；IPC 校验发送方 frame 在 `app://komo`；CSP | 冒烟确认：`window` 上、cookie、storage、DOM 里都找不到令牌，`require/process` 不存在，跨源 fetch 被挡 |
 | 打包 | `electron-builder.yml`：macOS arm64 + x64 的 dmg 与 zip，`latest-mac.yml`，`komo://` 协议；`scripts/package.mjs` 把版本对齐 `[workspace.package].version`，签名与公证由环境变量驱动（`CSC_LINK`/`CSC_NAME`、`APPLE_ID`+`APPLE_APP_SPECIFIC_PASSWORD`+`APPLE_TEAM_ID` 或 `APPLE_API_*`），没有就关掉身份自动发现并出未签名包 | 未签名包本机出成（四个产物 + latest-mac.yml） |
 | 发布 | `release.yml` 新增 `desktop` job（macos-latest，同 tag），`release` 等它；产物名 `Komo-<版本>-<架构>.*` 与 `komo-*.tar.gz` / `SHA256SUMS` 不重名 | **CI 没法本地跑**；只核对了产物名与 `sha256sum komo-*.tar.gz` 的通配不会误收 |
@@ -185,14 +183,14 @@ macOS 应用和手机端，需要一套标准的前端栈，以及一份所有�
 **界面接口约定**（C1 已接 ⌘K 事件与设置里的连接按钮）（类型在 `apps/desktop/src/shared/api.ts`，界面里按 `window.komoDesktop?` 判断是否在 Electron 里；浏览器里没有这个对象）
 
 - `window.komoDesktop`：`apiVersion: 1`、`platform`、`appVersion`、`protocolVersion`；
-  `connection.get()`（`ConnectionInfo`，不含令牌）、`connection.test(input)`、`connection.saveRemote(input)`、`connection.useLocal()`、`connection.retry()`、`connection.openSettings()`；
+  `connection.get()`（`ConnectionInfo`，不含令牌；`status` 多了 `signed-out`，没有 `mode` 了；`account` 是已登录账号，`signingIn` 表示在等浏览器，`notice` 是最近一次登录 / 退出 / 失效的说明）、`connection.test({url, headers})`、`connection.signIn({url, headers})`（只负责打开系统浏览器，结果靠整页重载通知）、`connection.cancelSignIn()`、`connection.signOut()`（成功后主进程回到连接设置页）、`connection.retry()`、`connection.openSettings()`；
   `notify({ title, body?, session? })`；`window.do("minimize" | "toggle-maximize" | "toggle-fullscreen" | "close")`；
   `onCommandPalette(handler)` 与 `onOpenSession(handler)`，都返回取消订阅函数。
 - **⌘K**：全局快捷键触发后，主进程在窗口加载完的 SPA 上发事件。界面二选一：`window.komoDesktop.onCommandPalette(() => openPalette())`，或监听 DOM 事件 `komo-desktop:command-palette`（无 detail）。
 - **打开会话**：`onOpenSession(id => router.navigate(...))`。**登记过才会收到**；没登记时主进程退回整页跳转到 `app://komo/sessions/<id>`（现有 C0 路由），所以不接也能用，只是会整页重载。
-- **连接设置入口**：连接设置页是壳自带的 `app://komo/_desktop/page.html?kind=settings`（菜单 ⌘, 与托盘也能进）。界面的设置页放个按钮调 `komoDesktop.connection.openSettings()` 即可，别再自己做一份；Gateway 地址与令牌不进 SPA。
+- **连接设置入口**：连接设置页是壳自带的 `app://komo/_desktop/page.html?kind=settings`（菜单 ⌘, 与托盘也能进）。界面的设置页放个按钮调 `komoDesktop.connection.openSettings()` 即可（要显示账号、做退出按钮可用 `connection.get()` 的 `account` 与 `connection.signOut()`），别再自己做一份登录表单；令牌不进 SPA。
 - **版本不一致/连不上**：主进程在进入 SPA 之前就拦在 `_desktop/page.html?kind=mismatch|error`，SPA 不需要处理；SPA 里 Gateway 掉线后的错误提示照常走 `ErrorBody`（转发失败会得到 502 + `error.code = "internal"`）。设置页可以用 `connection.get()` 显示两边版本。
-- 请求照旧用同源相对路径 `/v1/*`；Electron 里不走 cookie（配对页 `/pair` 已删）；桌面端的登录要改成设备令牌（§9，桌面端一侧是 5b）。
+- 请求照旧用同源相对路径 `/v1/*`；Electron 里不走 cookie，带的是设备令牌（§9）。`GET /auth/me` 也转发（带令牌，所以回 `credential: "device"`），网页的账号区块在桌面壳里可以照常用；网页的「退出」在桌面壳里要调 `komoDesktop.connection.signOut()`，不要 `POST /auth/logout`（那条只认 cookie 会话）。
 - 开发：`pnpm desktop:dev` 用的是 SPA 的构建产物，没有热更新；改界面仍用 `pnpm dev` 在浏览器里调。
 
 ## 7. 参考：Hermes Agent 与 DeepSeek Harness
@@ -296,6 +294,16 @@ allowed_subjects = ["<你的 sub>"]      # 或 allowed_emails = ["me@example.com
 3. `komo logout`：服务端该设备消失（`DELETE /v1/auth/sessions/{id}`），`remote.json` 删除，命令回到连本机。
 4. **回跳白名单**：手工打开 `…/auth/device/authorize?code_challenge=<43 字符>&redirect_uri=https://evil.example.com/cb` 应得到「不能发起设备登录」页，不跳转。
 
-**5. 桌面端**（5b 做完后再验）：连接页点「登录」→ 系统浏览器走完登录 → 跳回 `komo://auth/callback?code=…&state=…` → 桌面端 `POST /auth/device/token` 拿令牌。需确认：macOS 上浏览器从 303 重定向打开自定义协议是否弹确认、Chrome / Safari 是否放行。
+**5. 桌面端**（2026-11-14 5b 写完，**未编译、未实测**；要用打包产物验：`pnpm desktop:build` 出 `.app`，装到「应用程序」再开。`pnpm desktop:dev` 没注册 `komo://`，收不到回跳）
+
+1. 用一个全新的 userData 起（`KOMO_DESKTOP_USER_DATA=/tmp/komo-desktop-x` 或直接用 .app）：窗口应停在「连接设置」，没有「本机」选项。
+2. 填 `https://komo.example.com` → 「只测试」：应看到 health、协议版本一致、「Gateway 已配置登录，可以登录」。填一台没配 `[auth.oidc]` 的 Gateway（含 `http://127.0.0.1:端口`）：应提示「这台 Gateway 没有配置登录」，且不会打开浏览器。填非回环的 `http://…`：应直接报必须用 https。
+3. 点「登录」：系统浏览器打开 `…/auth/device/authorize?…`，页面上等待态；在 Pocket ID 登完，浏览器 303 到 `komo://auth/callback?code=…&state=…`，**需确认**：macOS 上 Safari / Chrome 是否弹「要打开 komo 吗」、是否放行；桌面端被唤到前台、进入主界面；`connection.json` 里没有令牌明文（`secret` 是 base64 密文）；服务端 `GET /v1/auth/sessions` 多一条 `kind: "device"`、名字是「komo 桌面端 @ <主机名>」。
+4. **失败路径**：点「登录」后等 5 分钟不操作 → 设置页显示「登录超时」；点「登录」后手动打开 `komo://auth/callback?code=x&state=y`（`open 'komo://…'`）→ 「state 对不上」，原登录仍可完成；没点「登录」就打开 `komo://auth/callback?code=x&state=y` → 「没有正在进行的登录」；把 `code` 改坏或回跳两次 → 「Gateway 拒绝了授权码」。
+5. **冷启动由深链拉起**：登录途中把桌面端退出，再在浏览器里完成登录 → 桌面端被拉起，应显示「没有正在进行的登录…」而不是白屏或崩溃。已登录状态下冷启动打开 `komo://session/<id>` 应进该会话。
+6. **401**：已登录时在服务端吊销这台设备（`DELETE /v1/auth/sessions/{id}`）→ 几秒内（托盘轮询或下一次请求）窗口回到连接设置页，提示登录已失效，地址仍在。
+7. **退出**：在设置页点「退出登录」→ 服务端该设备消失、回到设置页；断网时退出 → 本地照样退出，页面提示服务端令牌可能仍有效。
+8. **safeStorage 不可用**（Linux 无钥匙串）：点「登录」直接报「系统钥匙串不可用」，不开浏览器。
+9. 旧版 `connection.json`（`{mode:"remote", remote:{…}}`）升级后：地址与额外请求头保留，处于未登录。
 
 **已知没有的东西**：登录失败次数限制（交给身份提供方）、`next` 之外的登录后落点、多用户、会话的绝对寿命上限（网页会话只要 30 天内用过就一直续）、设备令牌过期（要靠吊销）。

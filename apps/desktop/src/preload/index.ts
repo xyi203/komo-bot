@@ -8,8 +8,9 @@ import type { KomoDesktopApi } from "../shared/api";
 const channels: typeof ChannelNames = {
   connectionGet: "komo:connection:get",
   connectionTest: "komo:connection:test",
-  connectionSaveRemote: "komo:connection:save-remote",
-  connectionUseLocal: "komo:connection:use-local",
+  connectionSignIn: "komo:connection:sign-in",
+  connectionCancelSignIn: "komo:connection:cancel-sign-in",
+  connectionSignOut: "komo:connection:sign-out",
   connectionRetry: "komo:connection:retry",
   connectionOpenSettings: "komo:connection:open-settings",
   notify: "komo:notify",
@@ -49,8 +50,9 @@ const api: KomoDesktopApi = {
   connection: {
     get: () => ipcRenderer.invoke(channels.connectionGet),
     test: (input) => ipcRenderer.invoke(channels.connectionTest, input),
-    saveRemote: (input) => ipcRenderer.invoke(channels.connectionSaveRemote, input),
-    useLocal: () => ipcRenderer.invoke(channels.connectionUseLocal),
+    signIn: (input) => ipcRenderer.invoke(channels.connectionSignIn, input),
+    cancelSignIn: () => ipcRenderer.invoke(channels.connectionCancelSignIn),
+    signOut: () => ipcRenderer.invoke(channels.connectionSignOut),
     retry: () => ipcRenderer.invoke(channels.connectionRetry),
     openSettings: () => ipcRenderer.invoke(channels.connectionOpenSettings),
   },

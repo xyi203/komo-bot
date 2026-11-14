@@ -126,7 +126,7 @@ export class SystemIntegration {
     try {
       const get = async <T>(url: string): Promise<T> => {
         const response = await request(target, url, { timeoutMs: 4000 });
-        if (response.status === 401) this.connection.reloadLocal();
+        if (response.status === 401) this.connection.handleUnauthorized(target);
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
         return (await response.json()) as T;
       };

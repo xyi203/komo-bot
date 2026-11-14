@@ -31,11 +31,10 @@ async fn model_menu_and_job_selection_use_catalog_aliases() {
     assert_eq!(menu["models"][1]["default"], true);
 
     let (status, body) = gw
-         .post_cron(serde_json::json!({
-                "name": "x", "schedule": "0 9 * * *", "timezone": "UTC", "prompt": "p",
-                "model": "not-configured",
-            }),
-        )
+        .post_cron(serde_json::json!({
+            "name": "x", "schedule": "0 9 * * *", "timezone": "UTC", "prompt": "p",
+            "model": "not-configured",
+        }))
         .await;
     assert_eq!(status, 400, "{body}");
     assert!(body.contains("job") && body.contains("main"), "{body}");
@@ -130,11 +129,10 @@ async fn an_unsupported_effort_is_refused_before_the_request_with_its_supported_
     let gw = home.start(FakeLlm::new(vec![])).await;
 
     let (status, body) = gw
-         .post_cron(serde_json::json!({
-                "name": "x", "schedule": "0 9 * * *", "timezone": "UTC", "prompt": "p",
-                "effort": "ultra",
-            }),
-        )
+        .post_cron(serde_json::json!({
+            "name": "x", "schedule": "0 9 * * *", "timezone": "UTC", "prompt": "p",
+            "effort": "ultra",
+        }))
         .await;
     assert_eq!(status, 400, "{body}");
     assert!(body.contains("ultra"), "说出是哪一档：{body}");
@@ -155,10 +153,9 @@ async fn an_unknown_timezone_is_refused_with_what_to_write() {
     let gw = home.start(FakeLlm::new(vec![])).await;
 
     let (status, body) = gw
-         .post_cron(serde_json::json!({
-                "name": "x", "schedule": "0 9 * * *", "timezone": "Mars/Olympus", "prompt": "p",
-            }),
-        )
+        .post_cron(serde_json::json!({
+            "name": "x", "schedule": "0 9 * * *", "timezone": "Mars/Olympus", "prompt": "p",
+        }))
         .await;
     assert_eq!(status, 400, "{body}");
     assert!(body.contains("Mars/Olympus"), "{body}");
@@ -173,10 +170,9 @@ async fn a_six_field_expression_is_refused_rather_than_read_as_seconds() {
     let home = Home::new();
     let gw = home.start(FakeLlm::new(vec![])).await;
     let (status, body) = gw
-         .post_cron(serde_json::json!({
-                "name": "x", "schedule": "0 0 9 * * *", "timezone": "UTC", "prompt": "p",
-            }),
-        )
+        .post_cron(serde_json::json!({
+            "name": "x", "schedule": "0 0 9 * * *", "timezone": "UTC", "prompt": "p",
+        }))
         .await;
     assert_eq!(status, 400, "{body}");
     gw.stop().await;
@@ -192,8 +188,7 @@ async fn changing_the_definition_bumps_the_version_but_pausing_does_not() {
 
     // pause / resume：只改 status。
     let (status, body) = gw
-         .patch_cron(&job.id, serde_json::json!({"status": "paused"}),
-        )
+        .patch_cron(&job.id, serde_json::json!({"status": "paused"}))
         .await;
     assert_eq!(status, 200, "{body}");
     let paused: komo_kernel::cron::CronJob = serde_json::from_str(&body).unwrap();
@@ -201,8 +196,7 @@ async fn changing_the_definition_bumps_the_version_but_pausing_does_not() {
     assert_eq!(paused.version, 1, "暂停不是定义变更");
 
     let (_, body) = gw
-         .patch_cron(&job.id, serde_json::json!({"status": "active"}),
-        )
+        .patch_cron(&job.id, serde_json::json!({"status": "active"}))
         .await;
     let resumed: komo_kernel::cron::CronJob = serde_json::from_str(&body).unwrap();
     assert_eq!(resumed.status, JobStatus::Active);
@@ -211,8 +205,7 @@ async fn changing_the_definition_bumps_the_version_but_pausing_does_not() {
 
     // 改 prompt：这是定义变更。
     let (_, body) = gw
-         .patch_cron(&job.id, serde_json::json!({"prompt": "换一句话"}),
-        )
+        .patch_cron(&job.id, serde_json::json!({"prompt": "换一句话"}))
         .await;
     let edited: komo_kernel::cron::CronJob = serde_json::from_str(&body).unwrap();
     assert_eq!(edited.version, 2);
@@ -228,9 +221,7 @@ async fn changing_the_definition_bumps_the_version_but_pausing_does_not() {
         serde_json::json!({"skills": ["memos"]}),
     ] {
         let before = gw.job(&job.id).await.version;
-        let (status, body) = gw
-             .patch_cron(&job.id, patch.clone())
-            .await;
+        let (status, body) = gw.patch_cron(&job.id, patch.clone()).await;
         assert_eq!(status, 200, "{patch} → {body}");
         let after: komo_kernel::cron::CronJob = serde_json::from_str(&body).unwrap();
         assert_eq!(after.version, before + 1, "{patch} 是定义变更");
@@ -272,9 +263,7 @@ async fn a_one_shot_is_done_after_it_fires_and_refuses_to_run_again() {
     assert!(gw.tick().await.fired.is_empty());
 
     // 手动 run 也不受理。
-    let (status, body) = gw
-         .run_cron(&job.id)
-        .await;
+    let (status, body) = gw.run_cron(&job.id).await;
     assert_eq!(status, 400, "{body}");
     assert!(body.contains("一次性"), "{body}");
 
@@ -291,10 +280,9 @@ async fn an_at_in_the_past_is_refused_while_the_person_is_still_there() {
     let home = Home::new();
     let gw = home.start(FakeLlm::new(vec![])).await;
     let (status, body) = gw
-         .post_cron(serde_json::json!({
-                "name": "x", "schedule": "@at 2020-01-01 09:00", "timezone": "UTC", "prompt": "p",
-            }),
-        )
+        .post_cron(serde_json::json!({
+            "name": "x", "schedule": "@at 2020-01-01 09:00", "timezone": "UTC", "prompt": "p",
+        }))
         .await;
     assert_eq!(status, 400, "{body}");
     gw.stop().await;
@@ -310,9 +298,7 @@ async fn a_manual_run_writes_no_firing_and_does_not_advance_the_slot() {
     let job = gw.add_job(daily("整理")).await;
     let slot = job.next_run_at.expect("有槽位");
 
-    let (status, body) = gw
-         .run_cron(&job.id)
-        .await;
+    let (status, body) = gw.run_cron(&job.id).await;
     assert_eq!(status, 200, "{body}");
     let response: komo_kernel::protocol::http::ManualCronRunResponse =
         serde_json::from_str(&body).unwrap();

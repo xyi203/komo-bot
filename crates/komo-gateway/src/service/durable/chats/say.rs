@@ -25,8 +25,8 @@ use komo_runtime::durable::harness::{SubmissionDraft, WriteDraft};
 use serde_json::{Map, Value, json};
 
 use super::super::DurableCore;
-use crate::push::PushMessage;
 use super::super::sessions::{SessionError, ensure_open};
+use crate::push::PushMessage;
 
 pub use komo_kernel::durable::legacy_events::MAIN_REPLY_ENTRY;
 
@@ -175,7 +175,9 @@ impl DurableCore {
 }
 
 /// 一段对话在网页里的站内路径：主对话 `/`，支线 `/chats/<会话 id>`（`apps/client` 的路由）。
-pub(in crate::service::durable) fn chat_url(record: &komo_kernel::durable::SessionRecord) -> String {
+pub(in crate::service::durable) fn chat_url(
+    record: &komo_kernel::durable::SessionRecord,
+) -> String {
     if record.kind == SessionKind::Main {
         "/".to_owned()
     } else {

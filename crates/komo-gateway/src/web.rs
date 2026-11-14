@@ -320,7 +320,10 @@ mod tests {
     fn the_session_cookie_is_found_among_others() {
         let map = headers(&[("cookie", "a=1; komo_session=tok; b=2")]);
         assert_eq!(cookie_value(&map, "komo_session").as_deref(), Some("tok"));
-        assert_eq!(cookie_value(&headers(&[("cookie", "a=1")]), "komo_session"), None);
+        assert_eq!(
+            cookie_value(&headers(&[("cookie", "a=1")]), "komo_session"),
+            None
+        );
     }
 
     #[test]
@@ -340,7 +343,10 @@ mod tests {
             ("host", "127.0.0.1:7777"),
             ("origin", "https://komo.example.com"),
         ]);
-        assert!(same_origin(&behind_tunnel, Some("https://komo.example.com")));
+        assert!(same_origin(
+            &behind_tunnel,
+            Some("https://komo.example.com")
+        ));
         assert!(!same_origin(&behind_tunnel, None));
         let missing = headers(&[("host", "127.0.0.1:7777")]);
         assert!(!same_origin(&missing, None));

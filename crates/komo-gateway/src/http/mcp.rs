@@ -4,8 +4,8 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use axum::Json;
 use axum::Extension;
+use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
@@ -207,7 +207,10 @@ pub async fn oauth_start(
     let Some(config) = snapshot.mcp.get(&name) else {
         return Err(ApiFailure::not_found(format!("MCP 服务器 `{name}`")));
     };
-    let McpTransport::Http { url, oauth: true, .. } = &config.transport else {
+    let McpTransport::Http {
+        url, oauth: true, ..
+    } = &config.transport
+    else {
         return Err(ApiFailure::invalid(format!(
             "[mcp.servers.{name}] 不是 oauth = true 的 HTTP 服务器"
         )));
@@ -270,12 +273,23 @@ pub async fn oauth_callback(
 ) -> Response {
     if let Some(error) = &query.error {
         let detail = query.error_description.clone().unwrap_or_default();
-        return result_page(StatusCode::BAD_REQUEST, "授权没有完成", &format!("授权服务器返回：{error} {detail}"));
+        return result_page(
+            StatusCode::BAD_REQUEST,
+            "授权没有完成",
+            &format!("授权服务器返回：{error} {detail}"),
+        );
     }
     let (Some(code), Some(state)) = (&query.code, &query.state) else {
-        return result_page(StatusCode::BAD_REQUEST, "授权没有完成", "回调缺少 code 或 state");
+        return result_page(
+            StatusCode::BAD_REQUEST,
+            "授权没有完成",
+            "回调缺少 code 或 state",
+        );
     };
-    let Some(session) = api.mcp_logins.take(state, &name, credential.session_id(), api.state.clock.now()) else {
+    let Some(session) =
+        api.mcp_logins
+            .take(state, &name, credential.session_id(), api.state.clock.now())
+    else {
         return result_page(
             StatusCode::BAD_REQUEST,
             "授权已失效",
@@ -284,7 +298,11 @@ pub async fn oauth_callback(
     };
     // 用会话自己记的回调地址拼出完整的回跳地址（授权服务器带回来的参数照原样放进去）。
     let Ok(mut callback) = reqwest::Url::parse(&session.redirect_uri) else {
-        return result_page(StatusCode::INTERNAL_SERVER_ERROR, "授权没有完成", "回调地址不合法");
+        return result_page(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "授权没有完成",
+            "回调地址不合法",
+        );
     };
     {
         let mut pairs = callback.query_pairs_mut();
@@ -323,8 +341,14 @@ fn result_page(status: StatusCode, title: &str, detail: &str) -> Response {
     );
     let mut response = (status, body).into_response();
     let headers = response.headers_mut();
-    headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("text/html; charset=utf-8"));
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/html; charset=utf-8"),
+    );
     headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-    headers.insert(header::REFERRER_POLICY, HeaderValue::from_static("no-referrer"));
+    headers.insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("no-referrer"),
+    );
     response
 }

@@ -13,8 +13,8 @@ use komo_kernel::protocol::http::{
     MatterActionRequest, MatterAddRequest, MatterListQuery, ScheduleSpec,
 };
 use komo_kernel::types::ids::{MatterId, RunId, SessionId};
-use komo_kernel::types::model::Effort;
 use komo_kernel::types::matter::{MatterKind, MatterTrigger, MatterVerb, parse_due};
+use komo_kernel::types::model::Effort;
 
 use crate::commands::Outcome;
 

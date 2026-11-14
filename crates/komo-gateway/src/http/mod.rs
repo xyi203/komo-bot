@@ -10,14 +10,14 @@
 pub mod attachments;
 pub mod auth;
 pub mod config;
-pub mod schedule;
 pub mod error;
 pub mod idempotency;
 pub mod matters;
 pub mod mcp;
-pub mod skills;
 pub mod memories;
 pub mod push;
+pub mod schedule;
+pub mod skills;
 pub mod v2;
 
 use std::net::SocketAddr;

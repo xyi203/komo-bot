@@ -143,18 +143,30 @@ const SCHEDULE_FIELDS: [Field; 12] = [
         false,
         "定时：五字段 cron 表达式（分 时 日 月 周）或 `@at YYYY-MM-DD HH:MM`；第一次设置时必给",
     ),
-    field("timezone", false, "IANA 时区名，例如 Asia/Shanghai；不给就是 UTC"),
+    field(
+        "timezone",
+        false,
+        "IANA 时区名，例如 Asia/Shanghai；不给就是 UTC",
+    ),
     field(
         "prompt",
         false,
         "到点交给模型做的事（与 command 二选一）；都不给就取目标的 description",
     ),
-    field("command", false, "命令直跑：到点不经模型，直接跑这条 shell 命令"),
+    field(
+        "command",
+        false,
+        "命令直跑：到点不经模型，直接跑这条 shell 命令",
+    ),
     field("workdir", false, "这个定时的工作目录"),
     field("model", false, "这个定时用的模型：模型目录里的 alias"),
     field("effort", false, "这个定时的 effort"),
     field("skills", false, "到点预载的技能名，字符串数组"),
-    field("overlap", false, "上一次还没跑完时：skip（默认，跳过并记录）/ allow"),
+    field(
+        "overlap",
+        false,
+        "上一次还没跑完时：skip（默认，跳过并记录）/ allow",
+    ),
     field("max_rounds", false, "一次最多跑几轮模型"),
     field(
         "notify",
@@ -771,7 +783,10 @@ fn build(
                 None | Some(Value::Null) => false,
                 Some(Value::Bool(flag)) => flag,
                 Some(other) => {
-                    return Err(wrong(spec, format!("`ongoing` 要是 true / false，收到 {other}")));
+                    return Err(wrong(
+                        spec,
+                        format!("`ongoing` 要是 true / false，收到 {other}"),
+                    ));
                 }
             };
             // 没有终点的目标复用「领域」。
@@ -1093,10 +1108,7 @@ mod tests {
         assert_eq!(spec.timezone.as_deref(), Some("Asia/Shanghai"));
         assert_eq!(spec.prompt.as_deref(), Some("巡检"));
         assert_eq!(spec.enabled, Some(true));
-        assert_eq!(
-            spec.notify,
-            Some(komo_kernel::cron::NotifyPolicy::OnError)
-        );
+        assert_eq!(spec.notify, Some(komo_kernel::cron::NotifyPolicy::OnError));
         let KomoCall::GoalAct { verb, .. } = &calls[13] else {
             panic!("{:?}", calls[13])
         };
@@ -1237,10 +1249,7 @@ mod tests {
                 json!({ "action": "goal.list", "params": "x" }),
                 "要是一个对象",
             ),
-            (
-                json!({ "action": "cron.list" }),
-                "komo 不认识 action",
-            ),
+            (json!({ "action": "cron.list" }), "komo 不认识 action"),
         ] {
             let error = tool.prepare(args.clone(), &ctx).await.unwrap_err();
             let ToolError::InvalidArguments { message } = &error else {

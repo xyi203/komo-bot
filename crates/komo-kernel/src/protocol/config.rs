@@ -473,10 +473,6 @@ impl MemoryConfig {
     }
 }
 
-fn default_true() -> bool {
-    true
-}
-
 fn default_extract_idle_secs() -> u64 {
     600
 }

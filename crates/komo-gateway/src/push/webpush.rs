@@ -56,7 +56,8 @@ pub fn encrypt(plaintext: &[u8], p256dh: &str, auth: &str) -> Result<Vec<u8>, We
     let rng = SystemRandom::new();
     let mut salt = [0u8; 16];
     rng.fill(&mut salt).map_err(|_| WebPushError::Crypto)?;
-    let ephemeral = EphemeralPrivateKey::generate(&ECDH_P256, &rng).map_err(|_| WebPushError::Crypto)?;
+    let ephemeral =
+        EphemeralPrivateKey::generate(&ECDH_P256, &rng).map_err(|_| WebPushError::Crypto)?;
     encrypt_with(plaintext, p256dh, auth, ephemeral, &salt)
 }
 
@@ -111,7 +112,8 @@ fn encrypt_with(
     let mut record = Vec::with_capacity(plaintext.len() + 1 + 16);
     record.extend_from_slice(plaintext);
     record.push(0x02);
-    let key = LessSafeKey::new(UnboundKey::new(&AES_128_GCM, &cek).map_err(|_| WebPushError::Crypto)?);
+    let key =
+        LessSafeKey::new(UnboundKey::new(&AES_128_GCM, &cek).map_err(|_| WebPushError::Crypto)?);
     key.seal_in_place_append_tag(
         Nonce::assume_unique_for_key(nonce),
         Aad::empty(),
@@ -138,7 +140,9 @@ pub struct Vapid {
 
 impl std::fmt::Debug for Vapid {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Vapid").field("public_key", &self.public_key).finish_non_exhaustive()
+        f.debug_struct("Vapid")
+            .field("public_key", &self.public_key)
+            .finish_non_exhaustive()
     }
 }
 
@@ -181,7 +185,10 @@ impl Vapid {
             .sign(&SystemRandom::new(), signing_input.as_bytes())
             .map_err(|_| WebPushError::Crypto)?;
         // ES256 的 JWT 签名是 r || s（各 32 字节）：`FIXED` 变体正是这个形状。
-        let jwt = format!("{signing_input}.{}", URL_SAFE_NO_PAD.encode(signature.as_ref()));
+        let jwt = format!(
+            "{signing_input}.{}",
+            URL_SAFE_NO_PAD.encode(signature.as_ref())
+        );
         Ok(format!("vapid t={jwt}, k={}", self.public_key))
     }
 }

@@ -716,7 +716,10 @@ async fn a_cron_run_recalls_nothing_but_a_user_message_in_its_session_does() {
 
     let (status, detail) = gateway
         .post_json(
-            &format!("/v1/matters/{}/run", created["matter"]["id"].as_str().unwrap()),
+            &format!(
+                "/v1/matters/{}/run",
+                created["matter"]["id"].as_str().unwrap()
+            ),
             serde_json::json!({}),
         )
         .await;

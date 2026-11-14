@@ -127,7 +127,9 @@ impl TursoAuthRepo {
                 let token_hash = token_hash.clone();
                 Box::pin(async move {
                     let rows = AuthSessionRow::filter(
-                        AuthSessionRow::fields().token_hash().eq(token_hash.as_str()),
+                        AuthSessionRow::fields()
+                            .token_hash()
+                            .eq(token_hash.as_str()),
                     )
                     .exec(ex)
                     .await
@@ -230,7 +232,9 @@ impl TursoAuthRepo {
                 let token_hash = token_hash.clone();
                 Box::pin(async move {
                     let rows = AuthSessionRow::filter(
-                        AuthSessionRow::fields().token_hash().eq(token_hash.as_str()),
+                        AuthSessionRow::fields()
+                            .token_hash()
+                            .eq(token_hash.as_str()),
                     )
                     .exec(ex)
                     .await
@@ -254,7 +258,7 @@ impl TursoAuthRepo {
             .with_write_retry(move |ex| {
                 Box::pin(async move {
                     let rows = AuthSessionRow::all().exec(ex).await.map_err(map_toasty)?;
-                    let mut removed = 0;
+                    let mut removed = 0usize;
                     for row in rows {
                         let stale = from_ts_opt(row.expires_at).is_some_and(|at| at <= now);
                         if stale {

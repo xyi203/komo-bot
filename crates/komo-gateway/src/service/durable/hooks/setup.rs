@@ -158,9 +158,7 @@ fn resolve_at<'a>(
             (None, _) => match doc.as_ref().and_then(|doc| doc.model.as_deref()) {
                 Some(alias) => catalog_model(config, alias)?,
                 None => match config.model_catalog.main.as_deref() {
-                    Some(alias) if kind == Some(SessionKind::Main) => {
-                        catalog_model(config, alias)?
-                    }
+                    Some(alias) if kind == Some(SessionKind::Main) => catalog_model(config, alias)?,
                     _ => profile_model(state, config, &profile),
                 },
             },

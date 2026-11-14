@@ -128,11 +128,7 @@ impl MatterManager {
     }
 
     /// 记下 / 清掉（`None`）绑定。不升事项的版本、不看事项状态：能不能绑由调用方定。
-    pub async fn set_chat(
-        &self,
-        id: &MatterId,
-        chat: Option<String>,
-    ) -> Result<(), MatterFailure> {
+    pub async fn set_chat(&self, id: &MatterId, chat: Option<String>) -> Result<(), MatterFailure> {
         Ok(self.repo.set_chat(id, chat).await?)
     }
 

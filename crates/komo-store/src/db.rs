@@ -1013,7 +1013,10 @@ mod tests {
         )
         .await;
         let before = plain_columns(&path, "matters").await;
-        assert!(!before.iter().any(|name| name == "next_run_at"), "{before:?}");
+        assert!(
+            !before.iter().any(|name| name == "next_run_at"),
+            "{before:?}"
+        );
 
         let db = Db::connect(&path).await.unwrap();
         let after = plain_columns(&path, "matters").await;
@@ -1026,7 +1029,10 @@ mod tests {
             "migrated_from",
             "chat_session",
         ] {
-            assert!(after.iter().any(|name| name == column), "{column}：{after:?}");
+            assert!(
+                after.iter().any(|name| name == column),
+                "{column}：{after:?}"
+            );
         }
 
         use komo_kernel::cron::{CronJob, JobStatus, OverlapPolicy, TimeZone, Trigger};

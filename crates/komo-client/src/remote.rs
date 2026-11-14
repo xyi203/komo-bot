@@ -38,16 +38,20 @@ pub fn read_remote(home: &Path) -> Result<Option<RemoteLogin>, String> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(format!("读 {} 失败：{error}", path.display())),
     };
-    serde_json::from_str(&text)
-        .map(Some)
-        .map_err(|error| format!("{} 不是合法的登录记录：{error}（`komo logout` 可以清掉它）", path.display()))
+    serde_json::from_str(&text).map(Some).map_err(|error| {
+        format!(
+            "{} 不是合法的登录记录：{error}（`komo logout` 可以清掉它）",
+            path.display()
+        )
+    })
 }
 
 /// 写（先写临时文件再 rename，权限 0600）。
 pub fn write_remote(home: &Path, remote: &RemoteLogin) -> Result<(), String> {
     let path = remote_path(home);
     let text = serde_json::to_string_pretty(remote).map_err(|error| error.to_string())?;
-    std::fs::create_dir_all(home).map_err(|error| format!("建 {} 失败：{error}", home.display()))?;
+    std::fs::create_dir_all(home)
+        .map_err(|error| format!("建 {} 失败：{error}", home.display()))?;
     let tmp = path.with_extension("json.tmp");
     write_private(&tmp, &text).map_err(|error| format!("写 {} 失败：{error}", tmp.display()))?;
     std::fs::rename(&tmp, &path).map_err(|error| format!("写 {} 失败：{error}", path.display()))

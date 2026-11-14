@@ -593,8 +593,7 @@ impl McpConnection {
     /// pi 只等直出的（`hasDirectTools`），因为它的脚本侧工具调用时才按名字找服务器；komo 的能力面
     /// 在受理时按名字冻结，没挂上的工具这条 Run 从头到尾调不到，所以只在脚本里调的也要等。
     fn has_callable_tools(&self) -> bool {
-        self.config.enabled
-            && self.config.exposure != McpExposure::Hidden
+        self.config.enabled && self.config.exposure != McpExposure::Hidden
             || self
                 .config
                 .tool_exposure
@@ -1189,7 +1188,10 @@ impl McpHub {
                 let Some(model_name) = tool_name(name, &tool) else {
                     continue;
                 };
-                if registered.get(&model_name).is_some_and(|owner| owner == name) {
+                if registered
+                    .get(&model_name)
+                    .is_some_and(|owner| owner == name)
+                {
                     registered.remove(&model_name);
                     change.withdrawn.push((
                         model_name,
@@ -2071,6 +2073,7 @@ for line in sys.stdin:
                 name: "echo".into(),
                 description: None,
                 exposure: McpExposure::Direct,
+                enabled: true,
                 outward: true,
                 read_only: true,
             }],

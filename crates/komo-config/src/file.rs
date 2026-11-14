@@ -8,9 +8,9 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use komo_kernel::protocol::config::{
-    CompactionConfig, ConfigSnapshot, ConsolidateConfig, ExecutionConfig, KeyPath, McpExposure,
-    McpServerConfig, McpTransport, MemoryConfig, OidcConfig, PathsConfig, PushConfig, RetrievalConfig, SourceFile,
-    StartOnly, TypesafeConfig, DEFAULT_OIDC_SECRET_ENV,
+    CompactionConfig, ConfigSnapshot, ConsolidateConfig, DEFAULT_OIDC_SECRET_ENV, ExecutionConfig,
+    KeyPath, McpExposure, McpServerConfig, McpTransport, MemoryConfig, OidcConfig, PathsConfig,
+    PushConfig, RetrievalConfig, SourceFile, StartOnly, TypesafeConfig,
 };
 use komo_kernel::types::agent::{AgentConfig, AgentProfile, MemoryMode};
 use komo_kernel::types::memory::{MemoryScopeParseError, RetrievalMode};

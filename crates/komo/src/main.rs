@@ -519,11 +519,7 @@ async fn dispatch(cli: Cli, home: &Path) -> Result<Option<String>, String> {
         Command::CodemodeWorker => std::process::exit(komo_tools::codemode::worker::run()),
         Command::Web { no_open } => web(home, no_open).await,
         // 不经本机 Gateway：登录与退出都直接对远程那台说话。
-        Command::Login {
-            url,
-            name,
-            no_open,
-        } => login::login(home, &url, name.as_deref(), no_open)
+        Command::Login { url, name, no_open } => login::login(home, &url, name.as_deref(), no_open)
             .await
             .map(Some),
         Command::Logout => login::logout(home).await.map(Some),
@@ -1285,7 +1281,10 @@ mod tests {
             assert_eq!(spec.prompt.as_deref(), Some("整理"));
             assert_eq!(spec.workdir.as_deref(), Some("/tmp"));
             assert_eq!(spec.model.as_deref(), Some("job-model"));
-            assert_eq!(spec.effort.as_ref().map(|e| e.to_string()), Some("high".into()));
+            assert_eq!(
+                spec.effort.as_ref().map(|e| e.to_string()),
+                Some("high".into())
+            );
             assert_eq!(
                 spec.skills,
                 Some(vec!["memos".to_string(), "search".to_string()])
@@ -1303,15 +1302,31 @@ mod tests {
     fn schedule_flags_are_checked_before_any_request_goes_out() {
         assert!(
             Cli::try_parse_from([
-                "komo", "goal", "schedule", "g-1", "--schedule", "0 9 * * *", "--prompt", "整理",
-                "--command", "echo hi",
+                "komo",
+                "goal",
+                "schedule",
+                "g-1",
+                "--schedule",
+                "0 9 * * *",
+                "--prompt",
+                "整理",
+                "--command",
+                "echo hi",
             ])
             .is_err(),
             "两个都给，clap 该在解析这一步就拒绝"
         );
         let parsed = Cli::parse_from([
-            "komo", "goal", "schedule", "g-1", "--schedule", "0 3 * * *", "--command",
-            "tar czf /tmp/backup.tgz /data", "--notify", "nerver",
+            "komo",
+            "goal",
+            "schedule",
+            "g-1",
+            "--schedule",
+            "0 3 * * *",
+            "--command",
+            "tar czf /tmp/backup.tgz /data",
+            "--notify",
+            "nerver",
         ]);
         let Some(Command::Goal {
             action: matters::GoalCommand::Schedule { args, .. },

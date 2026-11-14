@@ -8,8 +8,8 @@ pub mod sse;
 pub mod ts;
 
 pub use config::{
-    ConfigIssue, ConfigSnapshot, IssueSeverity, KeyPath, MemoryConfig, PathsConfig,
-    OidcConfig, PushConfig, RetrievalConfig, SourceFile, StartOnly,
+    ConfigIssue, ConfigSnapshot, IssueSeverity, KeyPath, MemoryConfig, OidcConfig, PathsConfig,
+    PushConfig, RetrievalConfig, SourceFile, StartOnly,
 };
 pub use http::*;
 pub use sse::{Cursor, SseEvent, SseFrame};

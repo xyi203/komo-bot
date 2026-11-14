@@ -182,7 +182,7 @@ async fn never_keeps_quiet_even_about_a_failure_but_the_firing_still_settles_as_
 async fn a_misspelled_notify_is_refused() {
     let home = Home::new();
     let gw = home.start(FakeLlm::new(vec![])).await;
-    let (status, body) = gw .post_cron(daily("nerver")).await;
+    let (status, body) = gw.post_cron(daily("nerver")).await;
     assert!(status == 400 || status == 422, "{status} {body}");
     assert!(body.contains("nerver"), "说出是哪个词：{body}");
     assert!(body.contains("on_error"), "列出接受的写法：{body}");

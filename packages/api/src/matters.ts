@@ -3,7 +3,7 @@ import type {
   MatterAddRequest,
   MatterChatResponse,
   MatterDetail,
-  MatterListWithWaiting,
+  MatterListResponse,
   MatterRunsResponse,
   ScheduleSpec,
 } from "@komo/protocol";
@@ -16,7 +16,7 @@ import { keys } from "./keys";
 
 const enc = encodeURIComponent;
 
-export const fetchMatters = (all = false) => get<MatterListWithWaiting>("/v1/matters", { all: all || undefined });
+export const fetchMatters = (all = false) => get<MatterListResponse>("/v1/matters", { all: all || undefined });
 
 /** 一个目标的详情：带定时、绑定的支线、监听、活动与为它记的记忆（`overview`）。 */
 export const fetchMatter = (id: string) => get<MatterDetail>(`/v1/matters/${enc(id)}`);

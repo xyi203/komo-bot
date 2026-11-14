@@ -11,10 +11,10 @@ use komo_client::render;
 use komo_gateway::config::{LoadOptions, load_config};
 use komo_gateway::skills::{OfferContext, SkillRegistry, one_line};
 use komo_kernel::protocol::http::{
-    CancelRunRequest, InterventionAnswerRequest, InterventionListQuery,
-    InterventionVerdict, MemoryAddRequest, MemoryClassifyRequest, MemoryConsolidateRequest,
-    MemoryListQuery, MemoryRevisionRequest, MemorySweepRequest, MonitorListQuery,
-    RebuildIndexRequest, SessionListQuery, SessionSearchQuery,
+    CancelRunRequest, InterventionAnswerRequest, InterventionListQuery, InterventionVerdict,
+    MemoryAddRequest, MemoryClassifyRequest, MemoryConsolidateRequest, MemoryListQuery,
+    MemoryRevisionRequest, MemorySweepRequest, MonitorListQuery, RebuildIndexRequest,
+    SessionListQuery, SessionSearchQuery,
 };
 use komo_kernel::types::ids::{MatterId, MemoryId, RunId, SessionId};
 use komo_kernel::types::memory::{

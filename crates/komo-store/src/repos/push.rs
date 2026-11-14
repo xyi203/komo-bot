@@ -48,7 +48,9 @@ impl TursoPushRepo {
                 let fresh_id = fresh_id.clone();
                 Box::pin(async move {
                     let existing = PushSubscriptionRow::filter(
-                        PushSubscriptionRow::fields().endpoint().eq(new.endpoint.as_str()),
+                        PushSubscriptionRow::fields()
+                            .endpoint()
+                            .eq(new.endpoint.as_str()),
                     )
                     .exec(ex)
                     .await
@@ -104,7 +106,11 @@ impl TursoPushRepo {
                             updated_at: from_ts(row.updated_at),
                         })
                         .collect();
-                    out.sort_by(|a, b| a.created_at.cmp(&b.created_at).then_with(|| a.id.cmp(&b.id)));
+                    out.sort_by(|a, b| {
+                        a.created_at
+                            .cmp(&b.created_at)
+                            .then_with(|| a.id.cmp(&b.id))
+                    });
                     Ok(out)
                 }) as BoxFuture<'_, Result<Vec<PushSubscription>, StoreError>>
             })
@@ -119,7 +125,9 @@ impl TursoPushRepo {
                 let endpoint = endpoint.clone();
                 Box::pin(async move {
                     let rows = PushSubscriptionRow::filter(
-                        PushSubscriptionRow::fields().endpoint().eq(endpoint.as_str()),
+                        PushSubscriptionRow::fields()
+                            .endpoint()
+                            .eq(endpoint.as_str()),
                     )
                     .exec(ex)
                     .await

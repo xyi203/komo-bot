@@ -21,13 +21,13 @@ use komo_tools::tools::komo::{KomoCall, KomoService};
 use serde::Serialize;
 use serde_json::{Value, json};
 
+use crate::auth::AuthService;
 use crate::http::error::{ApiFailure, ApiResult};
 use crate::http::idempotency::Idempotency;
 use crate::http::v2::{sessions, tasks};
 use crate::http::{Api, matters, memories};
 use crate::service::durable::sessions::SessionError;
 use crate::service::state::GatewayState;
-use crate::auth::AuthService;
 use crate::web::WebAuth;
 
 pub struct GatewayKomo {
@@ -35,6 +35,7 @@ pub struct GatewayKomo {
     idempotency: Arc<Idempotency>,
     web: Arc<WebAuth>,
     auth: Arc<AuthService>,
+    mcp_logins: Arc<crate::http::mcp::McpLogins>,
 }
 
 impl GatewayKomo {
@@ -46,6 +47,7 @@ impl GatewayKomo {
             idempotency: api.idempotency,
             web: api.web,
             auth: api.auth,
+            mcp_logins: api.mcp_logins,
         })
     }
 
@@ -58,6 +60,7 @@ impl GatewayKomo {
             idempotency: Arc::clone(&self.idempotency),
             web: Arc::clone(&self.web),
             auth: Arc::clone(&self.auth),
+            mcp_logins: Arc::clone(&self.mcp_logins),
         })
     }
 }
@@ -509,10 +512,21 @@ mode = "keyword"
             json!({ "id": goal, "schedule": "0 9 * * *", "timezone": "UTC", "command": "true" }),
         )
         .await;
-        assert_eq!(scheduled["schedule"]["job"]["id"], goal.as_str(), "{scheduled}");
-        assert_eq!(scheduled["matter"]["revision"], resumed["matter"]["revision"], "定时不升版");
+        assert_eq!(
+            scheduled["schedule"]["job"]["id"],
+            goal.as_str(),
+            "{scheduled}"
+        );
+        assert_eq!(
+            scheduled["matter"]["revision"], resumed["matter"]["revision"],
+            "定时不升版"
+        );
         let listed = ok(&tool, &mut ctx, "goal.list", json!({})).await;
-        assert_eq!(listed["schedules"][0]["job"]["id"], goal.as_str(), "{listed}");
+        assert_eq!(
+            listed["schedules"][0]["job"]["id"],
+            goal.as_str(),
+            "{listed}"
+        );
         let fired = ok(&tool, &mut ctx, "goal.run", json!({ "id": goal })).await;
         assert_eq!(fired["fired"]["job"], goal.as_str(), "{fired}");
         gateway
@@ -527,10 +541,17 @@ mode = "keyword"
         )
         .await;
         assert_eq!(ongoing["matter"]["kind"], "area", "{ongoing}");
-        assert_eq!(ongoing["schedule"]["job"]["prompt"], "看一眼告警", "{ongoing}");
+        assert_eq!(
+            ongoing["schedule"]["job"]["prompt"], "看一眼告警",
+            "{ongoing}"
+        );
         let ongoing_id = ongoing["matter"]["id"].as_str().unwrap().to_string();
         let listed = ok(&tool, &mut ctx, "goal.list", json!({})).await;
-        assert_eq!(listed["matters"].as_array().map(Vec::len), Some(2), "没有终点的也列：{listed}");
+        assert_eq!(
+            listed["matters"].as_array().map(Vec::len),
+            Some(2),
+            "没有终点的也列：{listed}"
+        );
         let retired = ok(&tool, &mut ctx, "goal.retire", json!({ "id": ongoing_id })).await;
         assert_eq!(retired["matter"]["state"], "retired", "{retired}");
         let unscheduled = ok(&tool, &mut ctx, "goal.unschedule", json!({ "id": goal })).await;

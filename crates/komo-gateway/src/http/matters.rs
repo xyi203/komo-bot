@@ -443,7 +443,9 @@ async fn act_on_schedule(
     }
     // 只有 schedule 认 `schedule` 字段；别的动词带了别的字段报错，同其余动词。
     if verb != MatterVerb::Schedule && request.schedule.is_some() {
-        return Err(ApiFailure::invalid(format!("{verb} 不认 `schedule` 这个字段")));
+        return Err(ApiFailure::invalid(format!(
+            "{verb} 不认 `schedule` 这个字段"
+        )));
     }
     let other_fields = request.title.is_some()
         || request.next.is_some()
@@ -498,7 +500,10 @@ async fn act_on_schedule(
         }
         MatterVerb::Unschedule => {
             if !api.state.cron.remove(&job_id).await? {
-                return Err(ApiFailure::invalid(format!("{} {id} 没有定时", matter.kind.label())));
+                return Err(ApiFailure::invalid(format!(
+                    "{} {id} 没有定时",
+                    matter.kind.label()
+                )));
             }
             detail_of(api, matter, None).await
         }

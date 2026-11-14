@@ -61,7 +61,11 @@ const SETTINGS: &[Spec] = &[
         ..spec("default_agent", SettingKind::Choice, Options::Agents)
     },
     // 主对话这一段会话用的模型；不写跟默认模型（`[models] default` 走 `PUT /v1/config/default-model`）。
-    spec("models.main", SettingKind::Choice, Options::CompletionModels),
+    spec(
+        "models.main",
+        SettingKind::Choice,
+        Options::CompletionModels,
+    ),
     spec("memory.enabled", SettingKind::Bool, Options::None),
     spec(
         "memory.model",

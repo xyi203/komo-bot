@@ -121,7 +121,10 @@ async fn revoke(login: &RemoteLogin) -> Result<(), String> {
         .map_err(|error| error.to_string())?;
     let status = response.status();
     // 401 / 404 = 已经被吊销过了，目的达到。
-    if status.is_success() || status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::NOT_FOUND {
+    if status.is_success()
+        || status == reqwest::StatusCode::UNAUTHORIZED
+        || status == reqwest::StatusCode::NOT_FOUND
+    {
         Ok(())
     } else {
         Err(format!("Gateway 回了 {status}"))
@@ -131,7 +134,8 @@ async fn revoke(login: &RemoteLogin) -> Result<(), String> {
 /// 地址 → 去掉结尾 `/` 的根地址；只认 http(s)。
 fn normalize_base(url: &str) -> Result<String, String> {
     let url = url.trim().trim_end_matches('/');
-    let parsed = reqwest::Url::parse(url).map_err(|error| format!("`{url}` 不是合法地址：{error}"))?;
+    let parsed =
+        reqwest::Url::parse(url).map_err(|error| format!("`{url}` 不是合法地址：{error}"))?;
     if !matches!(parsed.scheme(), "http" | "https") || parsed.host().is_none() {
         return Err(format!("`{url}` 要以 http:// 或 https:// 开头"));
     }
@@ -168,16 +172,20 @@ async fn wait_for_callback(listener: &TcpListener, state: &str) -> Result<String
             .await
             .map_err(|error| format!("接收回跳失败：{error}"))?;
         let mut buffer = vec![0u8; 8192];
-        let read = match tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buffer)).await
-        {
-            Ok(Ok(read)) => read,
-            _ => continue,
-        };
+        let read =
+            match tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buffer)).await {
+                Ok(Ok(read)) => read,
+                _ => continue,
+            };
         let outcome = parse_callback(&buffer[..read], state);
         let (status, text) = match &outcome {
             CallbackOutcome::Ignore => ("404 Not Found", "not found".to_string()),
-            CallbackOutcome::Code(_) => ("200 OK", "登录完成，可以关掉这个页面回到终端。".to_string()),
-            CallbackOutcome::Failed(reason) => ("400 Bad Request", format!("登录没有完成：{reason}")),
+            CallbackOutcome::Code(_) => {
+                ("200 OK", "登录完成，可以关掉这个页面回到终端。".to_string())
+            }
+            CallbackOutcome::Failed(reason) => {
+                ("400 Bad Request", format!("登录没有完成：{reason}"))
+            }
         };
         let body = format!(
             "<!doctype html><meta charset=\"utf-8\"><title>komo</title><p>{}</p>",
@@ -240,18 +248,33 @@ mod tests {
     #[test]
     fn the_callback_needs_the_matching_state_and_a_code() {
         let ok = b"GET /callback?code=abc&state=s1 HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n";
-        assert_eq!(parse_callback(ok, "s1"), CallbackOutcome::Code("abc".into()));
-        assert!(matches!(parse_callback(ok, "other"), CallbackOutcome::Failed(_)));
+        assert_eq!(
+            parse_callback(ok, "s1"),
+            CallbackOutcome::Code("abc".into())
+        );
+        assert!(matches!(
+            parse_callback(ok, "other"),
+            CallbackOutcome::Failed(_)
+        ));
         let no_code = b"GET /callback?state=s1 HTTP/1.1\r\n\r\n";
-        assert!(matches!(parse_callback(no_code, "s1"), CallbackOutcome::Failed(_)));
+        assert!(matches!(
+            parse_callback(no_code, "s1"),
+            CallbackOutcome::Failed(_)
+        ));
         let other = b"GET /favicon.ico HTTP/1.1\r\n\r\n";
         assert_eq!(parse_callback(other, "s1"), CallbackOutcome::Ignore);
-        assert_eq!(parse_callback(b"POST /callback HTTP/1.1\r\n\r\n", "s1"), CallbackOutcome::Ignore);
+        assert_eq!(
+            parse_callback(b"POST /callback HTTP/1.1\r\n\r\n", "s1"),
+            CallbackOutcome::Ignore
+        );
     }
 
     #[test]
     fn the_gateway_address_must_be_a_bare_http_origin() {
-        assert_eq!(normalize_base("https://komo.example.com/").unwrap(), "https://komo.example.com");
+        assert_eq!(
+            normalize_base("https://komo.example.com/").unwrap(),
+            "https://komo.example.com"
+        );
         assert!(normalize_base("komo.example.com").is_err());
         assert!(normalize_base("https://komo.example.com/app").is_err());
         assert!(normalize_base("ftp://komo.example.com").is_err());

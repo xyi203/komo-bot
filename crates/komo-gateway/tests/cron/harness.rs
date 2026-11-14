@@ -135,7 +135,10 @@ impl CronOps for Gw {
         }
         let detail: komo_kernel::protocol::MatterDetail =
             serde_json::from_str(&text).expect("matter detail");
-        (200, serde_json::to_string(&detail.schedule.expect("带定时").job).unwrap())
+        (
+            200,
+            serde_json::to_string(&detail.schedule.expect("带定时").job).unwrap(),
+        )
     }
 
     async fn run_cron(&self, id: &CronJobId) -> (u16, String) {
@@ -147,7 +150,10 @@ impl CronOps for Gw {
         }
         let detail: komo_kernel::protocol::MatterDetail =
             serde_json::from_str(&text).expect("matter detail");
-        (200, serde_json::to_string(&detail.fired.expect("带 fired")).unwrap())
+        (
+            200,
+            serde_json::to_string(&detail.fired.expect("带 fired")).unwrap(),
+        )
     }
 
     async fn cron_list(&self) -> CronList {

@@ -188,13 +188,22 @@ pub fn matter_show(detail: &MatterDetail) -> String {
     }
     if let Some(overview) = &detail.overview {
         match &overview.chat {
-            Some(chat) => out.push(format!("对话    {}（会话 {}）", flat(&chat.title), chat.session)),
+            Some(chat) => out.push(format!(
+                "对话    {}（会话 {}）",
+                flat(&chat.title),
+                chat.session
+            )),
             None => out.push("对话    （没有绑定支线；结果与提问发到主对话）".into()),
         }
         if !overview.monitors.is_empty() {
             out.push("监听".into());
             out.extend(overview.monitors.iter().map(|monitor| {
-                format!("  #{} {} · {}", monitor.handle, flat(&monitor.title), monitor.state)
+                format!(
+                    "  #{} {} · {}",
+                    monitor.handle,
+                    flat(&monitor.title),
+                    monitor.state
+                )
             }));
         }
         if overview.activity.is_empty() {
@@ -217,12 +226,14 @@ pub fn matter_show(detail: &MatterDetail) -> String {
         }
         if !overview.memories.is_empty() {
             out.push("为它记的记忆".into());
-            out.extend(
-                overview
-                    .memories
-                    .iter()
-                    .map(|memory| format!("  {}@{} {}", memory.id, memory.revision, flat(&memory.content))),
-            );
+            out.extend(overview.memories.iter().map(|memory| {
+                format!(
+                    "  {}@{} {}",
+                    memory.id,
+                    memory.revision,
+                    flat(&memory.content)
+                )
+            }));
         }
     }
     let mut times = format!(

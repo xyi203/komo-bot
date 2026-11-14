@@ -453,7 +453,6 @@ fn job_from_row(row: &MatterRow) -> Result<Option<CronJob>, StoreError> {
     }))
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -646,9 +645,14 @@ mod tests {
 
         // 这时调度器推进了槽位。
         let next = NOW + time::Duration::days(1);
-        repo.advance(&id, Some(next), JobStatus::Active, Some("上次的问题".into()))
-            .await
-            .unwrap();
+        repo.advance(
+            &id,
+            Some(next),
+            JobStatus::Active,
+            Some("上次的问题".into()),
+        )
+        .await
+        .unwrap();
 
         // 网页带着 revision 1 改标题：不冲突。
         let edited = transition(
@@ -864,7 +868,9 @@ mod tests {
                     .await
                     .map_err(map_toasty)?;
                 row.update()
-                    .schedule(Some(r#"{"version":1,"trigger":{"kind":"from_the_future"}}"#.to_string()))
+                    .schedule(Some(
+                        r#"{"version":1,"trigger":{"kind":"from_the_future"}}"#.to_string(),
+                    ))
                     .exec(&mut *ex)
                     .await
                     .map_err(map_toasty)

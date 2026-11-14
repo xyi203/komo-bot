@@ -185,25 +185,23 @@ async fn prompt_and_command_are_mutually_exclusive() {
     let gw = home.start(FakeLlm::new(vec![])).await;
 
     let (status, body) = gw
-         .post_cron(serde_json::json!({
-                "name": "both",
-                "schedule": "0 9 * * *",
-                "timezone": "UTC",
-                "prompt": "整理今天的动态",
-                "command": "echo hi",
-            }),
-        )
+        .post_cron(serde_json::json!({
+            "name": "both",
+            "schedule": "0 9 * * *",
+            "timezone": "UTC",
+            "prompt": "整理今天的动态",
+            "command": "echo hi",
+        }))
         .await;
     assert_eq!(status, 400, "{body}");
 
     let (status, body) = gw
-         .post_cron(serde_json::json!({
-                "name": "neither",
-                "schedule": "0 9 * * *",
-                "timezone": "UTC",
-                "prompt": "",
-            }),
-        )
+        .post_cron(serde_json::json!({
+            "name": "neither",
+            "schedule": "0 9 * * *",
+            "timezone": "UTC",
+            "prompt": "",
+        }))
         .await;
     assert_eq!(status, 400, "{body}");
     assert!(gw.cron_list().await.jobs.is_empty(), "一个 Job 都没留下");

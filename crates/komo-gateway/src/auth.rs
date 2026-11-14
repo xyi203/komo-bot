@@ -62,8 +62,12 @@ const MAX_PENDING: usize = 256;
 pub enum Credential {
     /// 本机令牌；空令牌的 Gateway（测试或显式关掉鉴权）也算这一档。
     Local,
-    Device { id: String },
-    Web { id: String },
+    Device {
+        id: String,
+    },
+    Web {
+        id: String,
+    },
 }
 
 impl Credential {
@@ -263,7 +267,11 @@ impl AuthService {
     }
 
     fn secure_attr(&self) -> &'static str {
-        if self.secure_cookies() { "; Secure" } else { "" }
+        if self.secure_cookies() {
+            "; Secure"
+        } else {
+            ""
+        }
     }
 
     fn now(&self) -> OffsetDateTime {
@@ -507,7 +515,9 @@ impl AuthService {
         let now = self.now();
         let entry = self.codes.lock().expect("授权码表").remove(code);
         let Some(entry) = entry.filter(|entry| entry.expires > now) else {
-            return Err(AuthError::BadRequest("授权码无效或已过期，请重新登录".into()));
+            return Err(AuthError::BadRequest(
+                "授权码无效或已过期，请重新登录".into(),
+            ));
         };
         if entry.request.redirect_uri != redirect_uri
             || !constant_time_eq(
@@ -515,7 +525,9 @@ impl AuthService {
                 entry.request.challenge.as_bytes(),
             )
         {
-            return Err(AuthError::BadRequest("授权码与 code_verifier / redirect_uri 对不上".into()));
+            return Err(AuthError::BadRequest(
+                "授权码与 code_verifier / redirect_uri 对不上".into(),
+            ));
         }
         let token = format!("{DEVICE_PREFIX}{}", random_token());
         let record = self
@@ -653,7 +665,9 @@ pub fn redirect_allowed(uri: &str) -> bool {
         return false;
     }
     match url.scheme() {
-        "komo" => url.host_str() == Some("auth") && url.path() == "/callback" && url.port().is_none(),
+        "komo" => {
+            url.host_str() == Some("auth") && url.path() == "/callback" && url.port().is_none()
+        }
         "http" => {
             matches!(url.host_str(), Some("127.0.0.1" | "localhost" | "[::1]"))
                 && url.port().is_some()
@@ -772,7 +786,10 @@ mod tests {
     #[test]
     fn bearer_is_read_case_insensitively_and_other_schemes_are_not_tokens() {
         let mut headers = HeaderMap::new();
-        headers.insert(header::AUTHORIZATION, HeaderValue::from_static("bearer abc"));
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("bearer abc"),
+        );
         assert_eq!(bearer(&headers).as_deref(), Some("abc"));
         headers.insert(header::AUTHORIZATION, HeaderValue::from_static("Basic abc"));
         assert_eq!(bearer(&headers), None);

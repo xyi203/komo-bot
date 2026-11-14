@@ -10,11 +10,10 @@ use komo_kernel::cron::{CronJob, FiringStatus, JobStatus, NotifyPolicy, OverlapP
 use komo_kernel::protocol::config::{ConfigIssue, IssueSeverity, SourceFile};
 use komo_kernel::protocol::http::{
     CompactionSummary, ConfigCheckResponse, ConfigReloadResponse, ConsolidateAction,
-    ConsolidateGroupStatus, ConsolidateOutcome, HealthResponse, IndexState,
-    InterventionDetail, InterventionKind, InterventionListResponse, InterventionSummary,
-    InterventionVerdict, McpReconnectResponse, McpServerState, McpServerStatus,
-    MatterSchedule, MemoryConsolidateResponse, MemoryIndexStatus, MemoryListResponse,
-    MemorySweepResponse,
+    ConsolidateGroupStatus, ConsolidateOutcome, HealthResponse, IndexState, InterventionDetail,
+    InterventionKind, InterventionListResponse, InterventionSummary, InterventionVerdict,
+    MatterSchedule, McpReconnectResponse, McpServerState, McpServerStatus,
+    MemoryConsolidateResponse, MemoryIndexStatus, MemoryListResponse, MemorySweepResponse,
     ModelWindow, MonitorListResponse, RunDetail, SessionListResponse, SessionSearchResponse,
     SessionSummary, SweepRule, TelemetryHealth, ToolCallSummary, WindowSource,
 };

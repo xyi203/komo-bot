@@ -85,7 +85,12 @@ enum Outcome {
 }
 
 impl PushService {
-    pub fn new(home: &std::path::Path, db: Db, config: Arc<ConfigHolder>, clock: Arc<dyn Clock>) -> Self {
+    pub fn new(
+        home: &std::path::Path,
+        db: Db,
+        config: Arc<ConfigHolder>,
+        clock: Arc<dyn Clock>,
+    ) -> Self {
         PushService {
             repo: TursoPushRepo::new(db),
             config,
@@ -129,15 +134,24 @@ impl PushService {
         let url = reqwest::Url::parse(endpoint)
             .map_err(|_| PushError::Invalid("endpoint 不是合法的地址".into()))?;
         if endpoint.len() > ENDPOINT_MAX || url.scheme() != "https" || url.host_str().is_none() {
-            return Err(PushError::Invalid("endpoint 必须是 https 地址（不超过 2048 字符）".into()));
+            return Err(PushError::Invalid(
+                "endpoint 必须是 https 地址（不超过 2048 字符）".into(),
+            ));
         }
         // 提前验：解不出来的密钥存了也发不了。
         let decoded = |value: &str| URL_SAFE_NO_PAD.decode(value.trim().trim_end_matches('='));
-        if decoded(p256dh).map(|key| key.len() != 65 || key[0] != 0x04).unwrap_or(true) {
-            return Err(PushError::Invalid("keys.p256dh 不是未压缩的 P-256 公钥".into()));
+        if decoded(p256dh)
+            .map(|key| key.len() != 65 || key[0] != 0x04)
+            .unwrap_or(true)
+        {
+            return Err(PushError::Invalid(
+                "keys.p256dh 不是未压缩的 P-256 公钥".into(),
+            ));
         }
         if decoded(auth).map(|key| key.len() != 16).unwrap_or(true) {
-            return Err(PushError::Invalid("keys.auth 应是 16 字节的 base64url".into()));
+            return Err(PushError::Invalid(
+                "keys.auth 应是 16 字节的 base64url".into(),
+            ));
         }
         let user_agent = user_agent
             .map(|ua| clip(ua, 300))
@@ -194,14 +208,17 @@ impl PushService {
             body: clip(&message.body, BODY_CHARS),
             ..message
         };
-        let payload = serde_json::to_vec(&message)
-            .map_err(|error| PushError::Invalid(error.to_string()))?;
+        let payload =
+            serde_json::to_vec(&message).map_err(|error| PushError::Invalid(error.to_string()))?;
         let payload = payload.as_slice();
         let vapid = self.vapid().await?;
         let expires = self.clock.now().unix_timestamp() + JWT_TTL_SECS;
-        let sends = subscriptions
-            .iter()
-            .map(|sub| async move { (sub, self.send_one(vapid, subject, expires, sub, payload).await) });
+        let sends = subscriptions.iter().map(|sub| async move {
+            (
+                sub,
+                self.send_one(vapid, subject, expires, sub, payload).await,
+            )
+        });
         for (sub, outcome) in futures_util::future::join_all(sends).await {
             match outcome {
                 Outcome::Sent => {}
@@ -230,10 +247,11 @@ impl PushService {
         let Ok(url) = reqwest::Url::parse(&sub.endpoint) else {
             return Outcome::Gone;
         };
-        let authorization = match vapid.authorization(&url.origin().ascii_serialization(), subject, expires) {
-            Ok(value) => value,
-            Err(error) => return Outcome::Failed(error.to_string()),
-        };
+        let authorization =
+            match vapid.authorization(&url.origin().ascii_serialization(), subject, expires) {
+                Ok(value) => value,
+                Err(error) => return Outcome::Failed(error.to_string()),
+            };
         let body = match webpush::encrypt(payload, &sub.p256dh, &sub.auth) {
             Ok(body) => body,
             // 存下来的密钥解不开：这条订阅永远发不了。
@@ -280,8 +298,9 @@ fn load_or_create(path: &std::path::Path) -> Result<Vapid, PushError> {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(io(error)),
         };
-        let value: serde_json::Value = serde_json::from_str(&text)
-            .map_err(|error| PushError::Io(format!("{} 不是合法的 JSON：{error}", path.display())))?;
+        let value: serde_json::Value = serde_json::from_str(&text).map_err(|error| {
+            PushError::Io(format!("{} 不是合法的 JSON：{error}", path.display()))
+        })?;
         let pkcs8 = value
             .get("pkcs8")
             .and_then(|field| field.as_str())

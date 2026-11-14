@@ -7,7 +7,7 @@ import type { OverlapPolicy } from "./OverlapPolicy";
 import type { Trigger } from "./Trigger";
 
 /**
- * 一个定时任务（`cron_jobs`）。
+ * 一个目标上的定时（`matters` 的定时列；`id` 是目标 id，`name` 是目标标题，`docs/redesign.md` P8）。
  */
 export type CronJob = { id: CronJobId, name: string, 
 /**

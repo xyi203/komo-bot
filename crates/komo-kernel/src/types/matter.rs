@@ -744,7 +744,9 @@ mod tests {
             MatterVerb::Edit => MatterChange::Edit {
                 title: Some("改过的标题".into()),
                 due: None,
-                standard: None, description: None },
+                standard: None,
+                description: None,
+            },
             MatterVerb::Link => MatterChange::Link(cron("job-1")),
             MatterVerb::Unlink => MatterChange::Unlink(cron("job-1")),
             MatterVerb::Schedule | MatterVerb::Unschedule | MatterVerb::Run => {
@@ -965,7 +967,9 @@ mod tests {
                 &MatterChange::Edit {
                     title: None,
                     due: Some(None),
-                    standard: None, description: None },
+                    standard: None,
+                    description: None
+                },
                 T1
             ),
             Err(MatterError::Invalid(_))
@@ -976,7 +980,9 @@ mod tests {
                 &MatterChange::Edit {
                     title: None,
                     due: None,
-                    standard: Some(Some("x".into())), description: None },
+                    standard: Some(Some("x".into())),
+                    description: None
+                },
                 T1
             ),
             Err(MatterError::Invalid(_))
@@ -987,7 +993,9 @@ mod tests {
                 &MatterChange::Edit {
                     title: None,
                     due: None,
-                    standard: None, description: None },
+                    standard: None,
+                    description: None
+                },
                 T1
             ),
             Err(MatterError::Invalid(_))
@@ -998,7 +1006,9 @@ mod tests {
             &MatterChange::Edit {
                 title: None,
                 due: Some(None),
-                standard: None, description: None },
+                standard: None,
+                description: None,
+            },
             T1,
         )
         .unwrap()

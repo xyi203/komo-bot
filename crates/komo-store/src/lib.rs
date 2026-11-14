@@ -28,8 +28,8 @@ pub use repos::auth::{AuthKind, AuthSessionRecord, NewAuthSession, TursoAuthRepo
 pub use repos::cron::TursoCronRepo;
 pub use repos::cron_backfill::{BackfillReport, Placement, backfill_cron_into_goals};
 pub use repos::matter::TursoMatterRepo;
-pub use repos::push::{NewPushSubscription, PushSubscription, TursoPushRepo};
 pub use repos::memory::{TursoMemoryRepo, lexical_terms};
+pub use repos::push::{NewPushSubscription, PushSubscription, TursoPushRepo};
 pub use session_dir::SessionPaths;
 pub use tool_output::FileToolOutputStore;
 

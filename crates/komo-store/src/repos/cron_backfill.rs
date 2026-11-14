@@ -214,10 +214,7 @@ fn schedule_json(job: &CronJobRow) -> String {
     def.to_string()
 }
 
-async fn create_goal(
-    ex: &mut dyn toasty::Executor,
-    job: &CronJobRow,
-) -> Result<(), StoreError> {
+async fn create_goal(ex: &mut dyn toasty::Executor, job: &CronJobRow) -> Result<(), StoreError> {
     let finished = JobStatus::parse(&job.status) == Some(JobStatus::Done);
     let description = match (&job.command, job.prompt.trim()) {
         (Some(command), _) => Some(command.clone()),
@@ -641,7 +638,11 @@ mod tests {
         let first = backfill_cron_into_goals(&db).await.unwrap();
         assert!(!first.is_noop());
         let after_first = counts(&db).await;
-        assert_eq!(after_first, (3, 3, 1), "三个任务三个目标（goal-1 / job-1 / job-3），firing 一条");
+        assert_eq!(
+            after_first,
+            (3, 3, 1),
+            "三个任务三个目标（goal-1 / job-1 / job-3），firing 一条"
+        );
 
         let second = backfill_cron_into_goals(&db).await.unwrap();
         assert!(second.is_noop(), "{second:?}");
@@ -649,11 +650,7 @@ mod tests {
 
         // 把并入的那个定时清掉：任务已处理过，不会再长出新目标。
         let cron = TursoCronRepo::new(db.clone());
-        assert!(
-            cron.remove(&CronJobId::from_raw("goal-1"))
-                .await
-                .unwrap()
-        );
+        assert!(cron.remove(&CronJobId::from_raw("goal-1")).await.unwrap());
         let third = backfill_cron_into_goals(&db).await.unwrap();
         assert!(third.is_noop(), "{third:?}");
         assert_eq!(counts(&db).await, after_first);

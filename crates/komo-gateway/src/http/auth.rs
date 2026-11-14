@@ -81,7 +81,11 @@ pub async fn callback(
         return response;
     }
     let (Some(code), Some(state)) = (query.code.as_deref(), query.state.as_deref()) else {
-        return page(StatusCode::BAD_REQUEST, "登录没有完成", "回调缺少 code 或 state");
+        return page(
+            StatusCode::BAD_REQUEST,
+            "登录没有完成",
+            "回调缺少 code 或 state",
+        );
     };
     let bound = cookie_value(&headers, LOGIN_COOKIE);
     let finished = api.auth.finish(state, bound.as_deref(), code).await;
@@ -115,7 +119,12 @@ pub async fn callback(
 }
 
 /// 发码并跳回客户端。
-fn device_redirect(api: &Api, request: DeviceRequest, subject: &str, email: Option<&str>) -> Response {
+fn device_redirect(
+    api: &Api,
+    request: DeviceRequest,
+    subject: &str,
+    email: Option<&str>,
+) -> Response {
     let (uri, state) = (request.redirect_uri.clone(), request.state.clone());
     let code = api.auth.issue_code(request, subject, email);
     match redirect_with_code(&uri, &code, state.as_deref()) {
@@ -201,12 +210,17 @@ pub async fn device_authorize(
         .as_deref()
         .is_some_and(|method| method != "S256")
     {
-        return page(StatusCode::BAD_REQUEST, "不能发起设备登录", "只支持 code_challenge_method=S256");
+        return page(
+            StatusCode::BAD_REQUEST,
+            "不能发起设备登录",
+            "只支持 code_challenge_method=S256",
+        );
     }
-    let Some(challenge) = query
-        .code_challenge
-        .filter(|c| c.len() == 43 && c.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_'))
-    else {
+    let Some(challenge) = query.code_challenge.filter(|c| {
+        c.len() == 43
+            && c.chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
+    }) else {
         return page(
             StatusCode::BAD_REQUEST,
             "不能发起设备登录",
@@ -306,7 +320,11 @@ fn redirect(location: &str) -> Response {
             response.headers_mut().insert(header::LOCATION, value);
         }
         Err(_) => {
-            return page(StatusCode::INTERNAL_SERVER_ERROR, "登录没有完成", "跳转地址不合法");
+            return page(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "登录没有完成",
+                "跳转地址不合法",
+            );
         }
     }
     no_store(&mut response);
@@ -351,7 +369,10 @@ fn page(status: StatusCode, title: &str, detail: &str) -> Response {
         HeaderValue::from_static("text/html; charset=utf-8"),
     );
     headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-    headers.insert(header::REFERRER_POLICY, HeaderValue::from_static("no-referrer"));
+    headers.insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("no-referrer"),
+    );
     headers.insert(
         HeaderName::from_static("x-frame-options"),
         HeaderValue::from_static("DENY"),
@@ -373,6 +394,9 @@ mod tests {
 
     #[test]
     fn page_text_is_escaped() {
-        assert_eq!(escape("<a href=\"x\">&'"), "&lt;a href=&quot;x&quot;&gt;&amp;&#39;");
+        assert_eq!(
+            escape("<a href=\"x\">&'"),
+            "&lt;a href=&quot;x&quot;&gt;&amp;&#39;"
+        );
     }
 }

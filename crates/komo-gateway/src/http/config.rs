@@ -440,7 +440,11 @@ pub(super) async fn write_config<F>(
     api: &Api,
     version: Option<&str>,
     change: F,
-) -> ApiResult<(String, String, komo_kernel::protocol::http::ConfigReloadResponse)>
+) -> ApiResult<(
+    String,
+    String,
+    komo_kernel::protocol::http::ConfigReloadResponse,
+)>
 where
     F: FnOnce(&str, &str) -> Result<(Option<String>, Option<String>), EditError>,
 {

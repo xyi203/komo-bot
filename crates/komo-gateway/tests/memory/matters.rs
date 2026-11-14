@@ -424,12 +424,7 @@ async fn a_goal_carries_its_schedule_without_bumping_its_revision() {
     assert_eq!(edit["schedule"]["job"]["prompt"], "只看 P1 告警");
 
     // 去掉：目标还在，定时没了；再去一次报错。
-    let gone = post(
-        &gateway,
-        &format!("/v1/matters/{id}/unschedule"),
-        json!({}),
-    )
-    .await;
+    let gone = post(&gateway, &format!("/v1/matters/{id}/unschedule"), json!({})).await;
     assert!(gone.get("schedule").is_none(), "{gone}");
     assert_eq!(gone["matter"]["revision"], 2);
     let (status, body) = gateway

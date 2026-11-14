@@ -272,14 +272,21 @@ impl OidcClient {
         now_unix: i64,
     ) -> Result<IdentityClaims, OidcError> {
         let doc = self.discovery().await?;
-        let tokens = self.exchange(&doc, code, code_verifier, client_secret).await?;
-        let mut claims = self.verify_with_rotation(&tokens.id_token, nonce, now_unix).await?;
+        let tokens = self
+            .exchange(&doc, code, code_verifier, client_secret)
+            .await?;
+        let mut claims = self
+            .verify_with_rotation(&tokens.id_token, nonce, now_unix)
+            .await?;
         if claims.email.is_none()
             && !self.config.allowed_emails.is_empty()
-            && let (Some(endpoint), Some(access)) =
-                (doc.userinfo_endpoint.as_deref(), tokens.access_token.as_deref())
+            && let (Some(endpoint), Some(access)) = (
+                doc.userinfo_endpoint.as_deref(),
+                tokens.access_token.as_deref(),
+            )
         {
-            self.fill_email_from_userinfo(endpoint, access, &mut claims).await;
+            self.fill_email_from_userinfo(endpoint, access, &mut claims)
+                .await;
         }
         Ok(claims)
     }
@@ -322,7 +329,10 @@ impl OidcClient {
             .map_err(|error| OidcError::Provider(format!("读令牌端点响应失败：{error}")))?;
         if !status.is_success() {
             // 响应体里是提供方的错误码（`invalid_grant` …），不含我们发出去的秘密。
-            return Err(OidcError::Exchange(format!("令牌端点回了 {status}：{}", clip(&body))));
+            return Err(OidcError::Exchange(format!(
+                "令牌端点回了 {status}：{}",
+                clip(&body)
+            )));
         }
         #[derive(Deserialize)]
         struct Raw {
@@ -334,7 +344,9 @@ impl OidcClient {
         let id_token = raw
             .id_token
             .filter(|token| !token.is_empty())
-            .ok_or_else(|| OidcError::Exchange("令牌响应里没有 id_token（scope 要含 openid）".into()))?;
+            .ok_or_else(|| {
+                OidcError::Exchange("令牌响应里没有 id_token（scope 要含 openid）".into())
+            })?;
         Ok(TokenResponse {
             id_token,
             access_token: raw.access_token,
@@ -353,7 +365,13 @@ impl OidcClient {
             email: Option<String>,
             email_verified: Option<bool>,
         }
-        let Ok(response) = self.http.get(endpoint).bearer_auth(access_token).send().await else {
+        let Ok(response) = self
+            .http
+            .get(endpoint)
+            .bearer_auth(access_token)
+            .send()
+            .await
+        else {
             return;
         };
         let Ok(info) = response.json::<UserInfo>().await else {
@@ -447,10 +465,14 @@ fn verify_id_token(
         #[serde(default)]
         kid: Option<String>,
     }
-    let header: Header = serde_json::from_slice(&b64(header_b64)?)
-        .map_err(|_| invalid("头部不是合法 JSON"))?;
-    let algorithm = Algorithm::parse(&header.alg)
-        .ok_or_else(|| invalid(format!("不支持的签名算法 {}（只认 RS256 / ES256 / EdDSA）", header.alg)))?;
+    let header: Header =
+        serde_json::from_slice(&b64(header_b64)?).map_err(|_| invalid("头部不是合法 JSON"))?;
+    let algorithm = Algorithm::parse(&header.alg).ok_or_else(|| {
+        invalid(format!(
+            "不支持的签名算法 {}（只认 RS256 / ES256 / EdDSA）",
+            header.alg
+        ))
+    })?;
 
     let message = format!("{header_b64}.{payload_b64}");
     let signature = b64(signature_b64)?;
@@ -471,9 +493,11 @@ fn verify_id_token(
     if candidates.is_empty() || (header.kid.is_none() && candidates.len() > 1) {
         return Err(VerifyFailure::NoKey);
     }
-    let verified = candidates
-        .iter()
-        .any(|key| algorithm.verify(key, message.as_bytes(), &signature).is_ok());
+    let verified = candidates.iter().any(|key| {
+        algorithm
+            .verify(key, message.as_bytes(), &signature)
+            .is_ok()
+    });
     if !verified {
         return Err(invalid("签名不对"));
     }
@@ -503,8 +527,8 @@ fn verify_id_token(
         Bool(bool),
         Text(String),
     }
-    let payload: Payload = serde_json::from_slice(&b64(payload_b64)?)
-        .map_err(|_| invalid("载荷不是合法 JSON"))?;
+    let payload: Payload =
+        serde_json::from_slice(&b64(payload_b64)?).map_err(|_| invalid("载荷不是合法 JSON"))?;
 
     let issuer = payload.iss.as_deref().unwrap_or_default();
     if issuer.trim_end_matches('/') != config.issuer.trim_end_matches('/') {
@@ -580,7 +604,9 @@ impl Algorithm {
 
     fn verify(self, key: &Jwk, message: &[u8], signature: &[u8]) -> Result<(), VerifyFailure> {
         let field = |value: &Option<String>, name: &str| -> Result<Vec<u8>, VerifyFailure> {
-            b64(value.as_deref().ok_or_else(|| invalid(format!("JWK 缺 {name}")))?)
+            b64(value
+                .as_deref()
+                .ok_or_else(|| invalid(format!("JWK 缺 {name}")))?)
         };
         let rejected = |_| invalid("签名不对");
         match self {
@@ -590,7 +616,11 @@ impl Algorithm {
                     e: field(&key.e, "e")?,
                 };
                 components
-                    .verify(&ring::signature::RSA_PKCS1_2048_8192_SHA256, message, signature)
+                    .verify(
+                        &ring::signature::RSA_PKCS1_2048_8192_SHA256,
+                        message,
+                        signature,
+                    )
                     .map_err(rejected)
             }
             Algorithm::Es256 => {

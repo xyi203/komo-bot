@@ -250,6 +250,24 @@ pub trait CronRepo: Send + Sync {
     async fn update_firing(&self, firing: CronFiring) -> Result<bool, RepoError>;
 
     async fn firings(&self, id: &CronJobId, limit: u32) -> Result<Vec<CronFiring>, RepoError>;
+
+    /// 一页触发记录（新的在前）：只要计划时间**早于** `before` 的（不给 = 从最新的起），至多 `limit` 条。
+    /// 运行历史的分页用它；游标就是上一页最后一条的 `scheduled_at`（同一目标的计划时间唯一）。
+    async fn firings_page(
+        &self,
+        id: &CronJobId,
+        before: Option<OffsetDateTime>,
+        limit: u32,
+    ) -> Result<Vec<CronFiring>, RepoError> {
+        // 默认实现整张读出来再切：存储本来就是整目标读出来排序的（见 `TursoCronRepo::firings`）。
+        Ok(self
+            .firings(id, u32::MAX)
+            .await?
+            .into_iter()
+            .filter(|firing| before.is_none_or(|before| firing.scheduled_at < before))
+            .take(limit as usize)
+            .collect())
+    }
 }
 
 // ---------------------------------------------------------------- Memory
@@ -349,6 +367,17 @@ pub trait MatterRepo: Send + Sync {
         matter: Matter,
         expected_revision: Option<u32>,
     ) -> Result<Matter, RepoError>;
+
+    /// 目标绑定的支线对话（会话 id，`docs/redesign.md` P22）；没绑定是 `None`，事项不存在
+    /// [`RepoError::NotFound`]。只是记下的 id：那段会话还活不活着由调用方看。
+    async fn chat(&self, id: &MatterId) -> Result<Option<String>, RepoError>;
+
+    /// 全部绑定：`(事项 id, 会话 id)`，按事项 id 排。
+    async fn chats(&self) -> Result<Vec<(MatterId, String)>, RepoError>;
+
+    /// 记下 / 清掉（`None`）绑定。**不升事项的版本**：绑定不进注入行，网页上绑一段支线不该让正在编辑
+    /// 的人撞上版本冲突（同定时那几列）。事项不存在 [`RepoError::NotFound`]。
+    async fn set_chat(&self, id: &MatterId, chat: Option<String>) -> Result<(), RepoError>;
 }
 
 // ---------------------------------------------------------------- 模型

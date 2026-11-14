@@ -11,6 +11,7 @@ use komo_runtime::durable::harness::orchestration::monitor::{self, MonitorState}
 
 use crate::http::Api;
 use crate::http::error::ApiResult;
+use crate::service::durable::DurableCore;
 use crate::service::durable::sessions::{SessionError, time_of};
 
 /// 清单里脚本最多留几个字。
@@ -26,10 +27,20 @@ async fn list(
     Query(query): Query<MonitorListQuery>,
 ) -> ApiResult<Json<MonitorListResponse>> {
     let core = api.state.core()?;
+    Ok(Json(MonitorListResponse {
+        monitors: summaries(core, query.all).await?,
+    }))
+}
+
+/// 监听清单（见 [`list`]）；目标详情（`matters::overview`）也用它。
+pub(crate) async fn summaries(
+    core: &DurableCore,
+    all: bool,
+) -> Result<Vec<MonitorSummary>, SessionError> {
     let mut records = monitor::list(&*core.storage)
         .await
         .map_err(SessionError::from)?;
-    records.retain(|record| query.all || record.is_live());
+    records.retain(|record| all || record.is_live());
     records.sort_by_key(|record| (!record.is_live(), record.started_at));
     let mut monitors = Vec::with_capacity(records.len());
     for record in records {
@@ -62,5 +73,5 @@ async fn list(
             detached: record.timeout_minutes == 0,
         });
     }
-    Ok(Json(MonitorListResponse { monitors }))
+    Ok(monitors)
 }

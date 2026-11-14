@@ -117,6 +117,25 @@ impl MatterManager {
         Ok(self.repo.list(kind, include_closed).await?)
     }
 
+    /// 目标绑定的支线对话（会话 id，P22）；没绑定是 `None`，事项不存在报 NotFound。
+    pub async fn chat_of(&self, id: &MatterId) -> Result<Option<String>, MatterFailure> {
+        Ok(self.repo.chat(id).await?)
+    }
+
+    /// 全部绑定：`(事项 id, 会话 id)`。
+    pub async fn chats(&self) -> Result<Vec<(MatterId, String)>, MatterFailure> {
+        Ok(self.repo.chats().await?)
+    }
+
+    /// 记下 / 清掉（`None`）绑定。不升事项的版本、不看事项状态：能不能绑由调用方定。
+    pub async fn set_chat(
+        &self,
+        id: &MatterId,
+        chat: Option<String>,
+    ) -> Result<(), MatterFailure> {
+        Ok(self.repo.set_chat(id, chat).await?)
+    }
+
     pub async fn get(&self, id: &MatterId) -> Result<Matter, MatterFailure> {
         self.repo.get(id).await?.ok_or_else(|| {
             MatterFailure::Repo(RepoError::NotFound {

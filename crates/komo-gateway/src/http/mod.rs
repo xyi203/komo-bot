@@ -114,6 +114,11 @@ fn shared_routes() -> Router<Api> {
         .route("/v1/memory-index/rebuild", post(memories::rebuild))
         .route("/v1/matters", get(matters::list).post(matters::add))
         .route("/v1/matters/{id}", get(matters::show))
+        .route("/v1/matters/{id}/runs", get(matters::runs))
+        .route(
+            "/v1/matters/{id}/chat",
+            post(matters::bind_chat).delete(matters::unbind_chat),
+        )
         .route("/v1/matters/{id}/{action}", post(matters::act))
         .route("/v1/models", get(config::models))
         .route("/v1/config/check", get(config::check))

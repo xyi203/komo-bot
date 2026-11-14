@@ -261,6 +261,7 @@ pub struct SessionListResponse {
 /// 对话列的一行（`docs/redesign.md` §2.1）：主对话或一段支线对话。字段是 camelCase（新主页的约定）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(optional_fields))]
 #[serde(rename_all = "camelCase")]
 pub struct ChatRow {
     /// 背后的会话。
@@ -278,6 +279,18 @@ pub struct ChatRow {
     pub waiting: bool,
     /// 这段对话此刻有一条 Run 在跑。
     pub running: bool,
+    /// 绑定了目标（P22：这个目标的定时结果与提问发到这段支线）；网页在行上画一面小旗。主对话没有。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal: Option<ChatGoal>,
+}
+
+/// 支线对话绑定的目标。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
+pub struct ChatGoal {
+    pub id: MatterId,
+    pub title: String,
 }
 
 /// `GET /v1/chats`：主对话固定第一，其余在等你的在前、再按 `lastMessageAt` 倒序。

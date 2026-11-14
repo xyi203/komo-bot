@@ -5,8 +5,8 @@
 //! 两件事：「更新本次触发状态」——终态 → `ok` / `error`，写进 `cron_firings`（手动 run 没有触发
 //! 记录，`settle` 什么都不写，§10：手动 run 不冒充定时触发）；以及按 `notify` 把结果投进对话
 //! （[`notify`]）：聊天渠道删除后（`docs/redesign.md` P17）不再有 home chat，结果作为 Komo 说的一句话
-//! 落进主对话（`durable::chats::say`；目标绑定了支线时改投那段支线是 3a 的事，接缝在
-//! `durable::chats::cron_route`）。
+//! 落进目标绑定的支线（P22）、没绑定落进主对话（`durable::chats::say`；投到哪由
+//! `DurableCore::cron_route` 定）。
 //!
 //! **订阅那一层在 [`super::durable::background::cron_watch`]**：等 submission 结算再读终态帧。这里是
 //! Cron 自己的那件事——回写触发状态。
@@ -99,7 +99,7 @@ pub(crate) async fn notify(
     };
     let posted = async {
         let session = core.session(watched.session.as_str()).await?;
-        let route = super::durable::chats::cron_route(&session);
+        let route = core.cron_route(&session).await?;
         let chat = core.resolve_route(route).await?;
         core.say_in(
             &chat.id,

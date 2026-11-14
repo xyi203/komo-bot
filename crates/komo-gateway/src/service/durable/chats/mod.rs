@@ -17,7 +17,13 @@ pub mod say;
 #[cfg(test)]
 mod tests;
 
+use std::collections::HashMap;
+
 use komo_kernel::durable::{SessionKind, SessionLifecycle, SessionRecord};
+use komo_kernel::protocol::http::ChatGoal;
+use komo_kernel::traits::RepoError;
+use komo_kernel::types::ids::MatterId;
+use komo_memory::matter::MatterFailure;
 
 use super::DurableCore;
 use super::sessions::SessionError;
@@ -42,11 +48,18 @@ pub enum Route {
     Main,
 }
 
-/// 定时触发的会话（`kind = cron`）的结果与提问投到哪。
-///
-/// **3a 的接缝**：目标绑定了支线时改投那段支线（`docs/redesign.md` P22、§2.2）；现在没有绑定，一律主对话。
-pub fn cron_route(_cron_session: &SessionRecord) -> Route {
-    Route::Main
+/// 定时触发的会话（`kind = cron`）属于哪个目标：建会话时写的来源 `cron:{目标 id}`（目标 id 就是定时的
+/// job id，见 `background::cron::new_session`）。这也是「定时触发的运行带着目标的键」的那个键：任务清单按它
+/// 认出这条运行（`sessions::task_list`），目标的活动里才有它。不是定时会话、或来源写得不对是 `None`。
+pub fn cron_goal(session: &SessionRecord) -> Option<&str> {
+    if session.kind != SessionKind::Cron {
+        return None;
+    }
+    session
+        .source
+        .as_deref()?
+        .strip_prefix("cron:")
+        .filter(|id| !id.is_empty())
 }
 
 /// 一个任务会话往上最多找几层父会话（防环；正常只有一两层）。
@@ -71,7 +84,7 @@ impl DurableCore {
                         Route::Main
                     });
                 }
-                SessionKind::Cron => return Ok(cron_route(&current)),
+                SessionKind::Cron => return self.cron_route(&current).await,
                 SessionKind::Task => {
                     let Some(parent) = current.parent_session.as_deref() else {
                         return Ok(Route::Main);
@@ -84,6 +97,63 @@ impl DurableCore {
             }
         }
         Ok(Route::Main)
+    }
+
+    /// 定时触发的会话的结果与提问投到哪（P16、P22）：它的目标绑定了一段**活着的**支线就是那段支线，
+    /// 否则（没绑定、支线已归档 / 删除、目标读不到）主对话。
+    pub async fn cron_route(&self, cron_session: &SessionRecord) -> Result<Route, SessionError> {
+        let Some(goal) = cron_goal(cron_session) else {
+            return Ok(Route::Main);
+        };
+        Ok(match self.bound_chat(goal).await? {
+            Some(chat) => Route::Chat(Box::new(chat)),
+            None => Route::Main,
+        })
+    }
+
+    /// 目标绑定的支线对话的会话行；没绑定、或那段会话已不是活着的支线（归档 / 删除 / 清除）是 `None`
+    /// ——**读取时视为未绑定**，不去改目标上记的 id（重新绑定时会被新的覆盖）。
+    pub async fn bound_chat(&self, goal: &str) -> Result<Option<SessionRecord>, SessionError> {
+        let Some(state) = self.gateway() else {
+            return Ok(None);
+        };
+        let session = match state.matters.chat_of(&MatterId::from_raw(goal)).await {
+            Ok(Some(session)) => session,
+            Ok(None) | Err(MatterFailure::Repo(RepoError::NotFound { .. })) => return Ok(None),
+            Err(error) => return Err(SessionError::Internal(error.to_string())),
+        };
+        let Some(record) = self.storage.session(&session).await? else {
+            return Ok(None);
+        };
+        let alive = record.lifecycle == SessionLifecycle::Active
+            && record.kind == SessionKind::Normal
+            && !is_channel_session(&record);
+        Ok(alive.then_some(record))
+    }
+
+    /// 绑了目标的支线：会话 id → 目标（`GET /v1/chats` 给每段支线画小旗用）。目标读不到的跳过。
+    pub(super) async fn bound_goals(&self) -> Result<HashMap<String, ChatGoal>, SessionError> {
+        let Some(state) = self.gateway() else {
+            return Ok(HashMap::new());
+        };
+        let pairs = state
+            .matters
+            .chats()
+            .await
+            .map_err(|error| SessionError::Internal(error.to_string()))?;
+        let mut out = HashMap::new();
+        for (id, session) in pairs {
+            if let Ok(matter) = state.matters.get(&id).await {
+                out.insert(
+                    session,
+                    ChatGoal {
+                        id,
+                        title: matter.title,
+                    },
+                );
+            }
+        }
+        Ok(out)
     }
 
     /// 默认 Agent 的名字（配置里的 `default_agent`）；Gateway 还没接上（只有测试里的裸核心）是 `None`。

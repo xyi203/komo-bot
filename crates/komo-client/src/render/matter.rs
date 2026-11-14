@@ -4,7 +4,7 @@
 //! 「已超期」，领域另带标准。Agent 经 bash 读它，所以一行就是一条，没有表头和对齐空格。
 //! 超期按响应里 Gateway 的今天读（`Matter::is_overdue`），不按本机时区再算。
 
-use komo_kernel::protocol::http::{MatterDetail, MatterListResponse};
+use komo_kernel::protocol::http::{MatterDetail, MatterListResponse, TaskState};
 use komo_kernel::types::matter::{Matter, MatterKind, MatterState};
 use time::Date;
 
@@ -186,6 +186,45 @@ pub fn matter_show(detail: &MatterDetail) -> String {
         out.push("触发器".into());
         out.extend(matter.triggers.iter().map(|t| format!("  {t}")));
     }
+    if let Some(overview) = &detail.overview {
+        match &overview.chat {
+            Some(chat) => out.push(format!("对话    {}（会话 {}）", flat(&chat.title), chat.session)),
+            None => out.push("对话    （没有绑定支线；结果与提问发到主对话）".into()),
+        }
+        if !overview.monitors.is_empty() {
+            out.push("监听".into());
+            out.extend(overview.monitors.iter().map(|monitor| {
+                format!("  #{} {} · {}", monitor.handle, flat(&monitor.title), monitor.state)
+            }));
+        }
+        if overview.activity.is_empty() {
+            out.push("活动    （还没有为它做过事）".into());
+        } else {
+            out.push("活动".into());
+            for item in &overview.activity {
+                let task = &item.task;
+                let mut line = format!(
+                    "  {} · {} · 会话 {}",
+                    stamp(task.started_at),
+                    state_word(task.state),
+                    task.session
+                );
+                if item.waiting.is_some() {
+                    line.push_str(" · 在等你");
+                }
+                out.push(line);
+            }
+        }
+        if !overview.memories.is_empty() {
+            out.push("为它记的记忆".into());
+            out.extend(
+                overview
+                    .memories
+                    .iter()
+                    .map(|memory| format!("  {}@{} {}", memory.id, memory.revision, flat(&memory.content))),
+            );
+        }
+    }
     let mut times = format!(
         "创建    {}   更新 {}",
         stamp(matter.created_at),
@@ -209,6 +248,16 @@ pub fn matter_show(detail: &MatterDetail) -> String {
         }
     }
     out.join("\n")
+}
+
+fn state_word(state: TaskState) -> &'static str {
+    match state {
+        TaskState::Running => "进行中",
+        TaskState::Waiting => "等你",
+        TaskState::Returned => "已交回",
+        TaskState::Idle => "空闲",
+        TaskState::Archived => "已归档",
+    }
 }
 
 /// 一行里不留换行与制表符：一行一条始终成立（入库时已拒换行，这里只兜旧数据）。
@@ -306,6 +355,7 @@ mod tests {
         let receipt = matter_changed(&MatterDetail {
             schedule: None,
             fired: None,
+            overview: None,
             still_linked: Vec::new(),
             matter: done.clone(),
             today: date!(2026 - 11 - 02),
@@ -329,6 +379,7 @@ mod tests {
         let reopened = matter_changed(&MatterDetail {
             schedule: None,
             fired: None,
+            overview: None,
             still_linked: Vec::new(),
             matter: goal("g-1", MatterState::Active),
             today: date!(2026 - 11 - 02),
@@ -344,6 +395,7 @@ mod tests {
         let plain = matter_changed(&MatterDetail {
             schedule: None,
             fired: None,
+            overview: None,
             still_linked: Vec::new(),
             matter: done,
             today: date!(2026 - 11 - 02),
@@ -357,6 +409,7 @@ mod tests {
         let detail = MatterDetail {
             schedule: None,
             fired: None,
+            overview: None,
             closure: None,
             matter: goal("g-2", MatterState::Waiting),
             today: date!(2026 - 11 - 02),
@@ -372,6 +425,7 @@ mod tests {
         let area = matter_show(&MatterDetail {
             schedule: None,
             fired: None,
+            overview: None,
             closure: None,
             matter: area(),
             today: date!(2026 - 11 - 02),
@@ -393,6 +447,7 @@ mod tests {
         let detail = MatterDetail {
             schedule: None,
             fired: None,
+            overview: None,
             closure: None,
             matter: matter.clone(),
             today,
@@ -413,6 +468,7 @@ mod tests {
         let plain = MatterDetail {
             schedule: None,
             fired: None,
+            overview: None,
             still_linked: Vec::new(),
             ..detail
         };

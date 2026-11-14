@@ -3,7 +3,7 @@
 //! 一个 Run 进入需要人答复的状态——任务出错（faulted）、连续被崩溃打断后停住、无人值守的 Run 要调对外工具
 //! （confirm）——时，往它所在的对话投一句话（[`DurableCore::say_in`]）：说清停在哪、要你决定什么、能怎么答，
 //! `data` 里带 `handle`。落在哪段对话见 [`DurableCore::route_of`]：支线里的 Run 投那段支线，主对话里的、
-//! 由主对话派出的任务会话（沿 `parent_session` 往上）投主对话，定时触发的会话投 [`cron_route`]。
+//! 由主对话派出的任务会话（沿 `parent_session` 往上）投主对话，定时触发的会话投 [`DurableCore::cron_route`]（目标绑了支线就是那段支线）。
 //!
 //! # 什么时候投
 //!
@@ -30,10 +30,11 @@ use komo_kernel::durable::{
     SessionKind, SessionLifecycle, SessionRecord, StorageWrite, legacy_ids,
 };
 use komo_kernel::protocol::http::{
-    InterventionAnswerResponse, InterventionDetail, InterventionSummary, InterventionVerdict,
+    ActivityWaiting, InterventionAnswerResponse, InterventionDetail, InterventionSummary,
+    InterventionVerdict,
 };
 use komo_kernel::traits::{GatewayError, Shutdown};
-use komo_kernel::types::ids::RunId;
+use komo_kernel::types::ids::{RunId, SessionId};
 use komo_runtime::durable::harness::is_trigger_input;
 use serde_json::json;
 use tokio::sync::mpsc;
@@ -250,6 +251,32 @@ impl DurableCore {
             }
             other => other.map(Some),
         }
+    }
+
+    /// 还没答复的介入：会话 id → 问话投在哪段对话、介入的句柄。目标活动 / 运行历史标「在等你」用
+    /// （P16）；同一会话有几条时留第一条。
+    pub async fn pending_asks(
+        &self,
+    ) -> Result<std::collections::HashMap<String, ActivityWaiting>, SessionError> {
+        let mut out = std::collections::HashMap::new();
+        for summary in self.interventions(&Default::default()).await? {
+            let session = summary.session.as_str().to_owned();
+            if out.contains_key(&session) {
+                continue;
+            }
+            // 会话读不出来（刚被清掉）的不标：这里只是个提示，不让它拖垮整张详情。
+            let Ok(chat) = self.intervention_chat(&session).await else {
+                continue;
+            };
+            out.insert(
+                session,
+                ActivityWaiting {
+                    chat: SessionId::from_raw(chat.id),
+                    handle: summary.handle.clone(),
+                },
+            );
+        }
+        Ok(out)
     }
 
     /// 指向 `chat` 这段对话、还没答复的介入。

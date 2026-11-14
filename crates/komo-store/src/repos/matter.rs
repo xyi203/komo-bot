@@ -120,6 +120,7 @@ impl MatterRepo for TursoMatterRepo {
                                 next_run_at: 0,
                                 last_error: None::<String>,
                                 migrated_from: None::<String>,
+                                chat_session: None::<String>,
                             })
                             .exec(ex)
                             .await
@@ -153,7 +154,7 @@ impl MatterRepo for TursoMatterRepo {
                                 .description(matter.description.clone())
                                 // 定时的列（schedule / schedule_status / next_run_at / last_error）
                                 // 一个字都不写：它们归 `CronRepo`，这里带着旧值写回会把调度器刚推进的
-                                // 槽位盖回去。
+                                // 槽位盖回去。绑定的支线（chat_session）同理，只由 `set_chat` 写。
                                 .exec(ex)
                                 .await
                                 .map_err(map_toasty)?;
@@ -161,6 +162,76 @@ impl MatterRepo for TursoMatterRepo {
                     }
                     Ok(matter)
                 }) as BoxFuture<'_, Result<Matter, StoreError>>
+            })
+            .await
+            .map_err(RepoError::from)
+    }
+
+    async fn chat(&self, id: &MatterId) -> Result<Option<String>, RepoError> {
+        let id = id.to_string();
+        self.db
+            .read(move |ex| {
+                let id = id.clone();
+                Box::pin(async move {
+                    match MatterRow::filter_by_id(&id)
+                        .first()
+                        .exec(ex)
+                        .await
+                        .map_err(map_toasty)?
+                    {
+                        Some(row) => Ok(row.chat_session.filter(|chat| !chat.is_empty())),
+                        None => Err(StoreError::NotFound {
+                            what: format!("事项 {id}"),
+                        }),
+                    }
+                }) as BoxFuture<'_, Result<Option<String>, StoreError>>
+            })
+            .await
+            .map_err(RepoError::from)
+    }
+
+    async fn chats(&self) -> Result<Vec<(MatterId, String)>, RepoError> {
+        self.db
+            .read(move |ex| {
+                Box::pin(async move {
+                    let mut rows = MatterRow::all().exec(ex).await.map_err(map_toasty)?;
+                    rows.sort_by(|a, b| a.id.cmp(&b.id));
+                    Ok(rows
+                        .into_iter()
+                        .filter_map(|row| {
+                            let chat = row.chat_session.filter(|chat| !chat.is_empty())?;
+                            Some((MatterId::from_raw(row.id), chat))
+                        })
+                        .collect())
+                }) as BoxFuture<'_, Result<Vec<(MatterId, String)>, StoreError>>
+            })
+            .await
+            .map_err(RepoError::from)
+    }
+
+    async fn set_chat(&self, id: &MatterId, chat: Option<String>) -> Result<(), RepoError> {
+        let id = id.to_string();
+        self.db
+            .with_write_retry(move |ex| {
+                let (id, chat) = (id.clone(), chat.clone());
+                Box::pin(async move {
+                    let Some(mut row) = MatterRow::filter_by_id(&id)
+                        .first()
+                        .exec(ex)
+                        .await
+                        .map_err(map_toasty)?
+                    else {
+                        return Err(StoreError::NotFound {
+                            what: format!("事项 {id}"),
+                        });
+                    };
+                    // 只写这一列：`revision` / `updated_at` 不动（绑定不是内容修改）。
+                    row.update()
+                        .chat_session(chat)
+                        .exec(ex)
+                        .await
+                        .map_err(map_toasty)
+                }) as BoxFuture<'_, Result<(), StoreError>>
             })
             .await
             .map_err(RepoError::from)

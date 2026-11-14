@@ -167,7 +167,8 @@ TUI 与聊天渠道之外的第三个入口，给电脑上的长会话用，之�
     字段 camelCase。`chats` 里主对话（默认 Agent 的 `kind = main` 会话，没有就建）固定第一，其余是活着的支线对话（`kind = normal`，
     排除 `source` 以 `chat:` 开头的存量渠道 / 群会话；`POST /v1/sessions` 建的带 `source = web`），在等你的在前、再按 `lastMessageAt` 倒序。
     每行：`id`、`main`、`title`、`lastMessage`（最后一句用户或 Komo 的话，80 字截断，Komo 投进来的也算）、`lastMessageAt`（RFC 3339）、
-    `waiting`（有指向这段对话、没答复的介入）、`running`（对话里有 Run 在跑）。`waitingCount` 是等你的事的条数（对话图标上的数字）。
+    `waiting`（有指向这段对话、没答复的介入）、`running`（对话里有 Run 在跑）、`goal`（可选，`{ id, title }`：这段支线绑定了目标，P22，网页画小旗；主对话没有）。
+    `waitingCount` 是等你的事的条数（对话图标上的数字）；目标的定时运行停住时，介入算在目标绑定的支线上（没绑定算主对话）。
     停住的运行与定时结果作为 Komo 的一句话落进对话，事件流里是 `line.reply`（不挂 Run）；用户在对话里回复后由模型调 `intervention.answer` 答复。
 
 ## 10. 未做与未验证
@@ -208,7 +209,7 @@ TUI 与聊天渠道之外的第三个入口，给电脑上的长会话用，之�
 
 ## 13. 定时页
 
-> **已删（2026-11-14，`docs/redesign.md` P8 / 3a-1）**：定时并进了目标，`features/cron/`、`routes/_app/cron/`、`packages/api/src/cron.ts`、`src/lib/cron-text.ts` 都删了；目标上的定时在 `GET /v1/matters` 的 `schedules`、`GET /v1/matters/{id}` 的 `schedule` 里，目标页（3b）接上。下面是被删页面的旧说明，作历史。
+> **已删（2026-11-14，`docs/redesign.md` P8 / 3a-1）**：定时并进了目标，`features/cron/`、`routes/_app/cron/`、`packages/api/src/cron.ts`、`src/lib/cron-text.ts` 都删了；目标上的定时在 `GET /v1/matters` 的 `schedules`、`GET /v1/matters/{id}` 的 `schedule` 里，目标页（3b）接上。**目标页要的接口（3a-2，服务端已做，网页是 3b）**：`GET /v1/matters/{id}` 的 `overview`（`chat` 绑定的支线 `{session, title}`、`monitors`、`activity`——最新 20 条，每条 `{ task: 任务清单一行, waiting?: { chat, handle } }`、`memories`）；`GET /v1/matters/{id}/runs?limit=&before=`（运行历史：`scheduled_at`、`fired_at`、`status`、`error`、`session`、`run`、`waiting`，翻页用 `next_before`）；`POST /v1/matters/{id}/chat` 新开支线并绑定（回 `{chat, created}`）、`DELETE` 解除；`GET /v1/chats` 每行的 `goal`。绑定的支线被归档后详情里读成没绑定。下面是被删页面的旧说明，作历史。
 
 `#/cron`。一个列表，点开看详情（2026-10-29 收简：去掉了"接下来七天"的时间表、新建与编辑表单）。发现一句：停在等你处理的 > 上一次出错 / 排不上下一次 > "下一次是「…」，明天 14:00" > 全暂停 / 空。
 

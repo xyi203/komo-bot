@@ -30,7 +30,8 @@
 //!
 //! # 按目标过滤
 //!
-//! 带 `goal` 时只留 `komo.task.goals` 里有这个 id 的任务；过滤发生在凑页的扫描里，所以一页仍然是
+//! 带 `goal` 时只留带着这个 id 的任务（`komo.task.goals`；定时触发的会话按来源 `cron:{目标 id}`，
+//! 它派出的任务也算；见 `carries_goal`）；过滤发生在凑页的扫描里，所以一页仍然是
 //! `limit` 条、续扫位置照旧，不会因为滤掉的而变短或重复。这是找回与显示用的键，不参与消息路由。
 //! 每行的 `goals` 只带 id 与（目标还在时的）标题：标题由 HTTP 处理函数用目标清单补上，这里不认识目标。
 
@@ -47,6 +48,7 @@ use komo_runtime::durable::harness::orchestration::monitor;
 use komo_runtime::durable::harness::{Harness, task_doc};
 
 use super::super::DurableCore;
+use super::super::chats::cron_goal;
 use super::{SCAN_PAGE, SessionError, SessionPageCursor, time_of};
 
 /// 任务清单的一页。
@@ -159,18 +161,37 @@ impl DurableCore {
         Ok(TaskPage { tasks, next })
     }
 
-    /// 任务会话的 `komo.task` 是不是带着这个目标的键。非任务会话没有 document，不带。
+    /// 这条会话是不是带着这个目标的键：
+    ///
+    /// - 定时触发的会话（`kind = cron`）：来源 `cron:{目标 id}` 就是键（[`cron_goal`]），手动触发的同样；
+    /// - 任务会话：`komo.task.goals` 里有，或它的派出方是这个目标的定时会话（定时运行里派出的任务算
+    ///   这个目标的活动；只看一层，任务再派任务不追）；
+    /// - 其余会话没有键。
     async fn carries_goal(
         &self,
         record: &SessionRecord,
         goal: &MatterId,
     ) -> Result<bool, SessionError> {
-        if record.kind != SessionKind::Task {
-            return Ok(false);
+        match record.kind {
+            SessionKind::Cron => Ok(cron_goal(record) == Some(goal.as_str())),
+            SessionKind::Task => {
+                if task_doc(&*self.storage, record.root_conversation)
+                    .await?
+                    .is_some_and(|doc| doc.goals.iter().any(|id| id == goal.as_str()))
+                {
+                    return Ok(true);
+                }
+                let Some(parent) = record.parent_session.as_deref() else {
+                    return Ok(false);
+                };
+                Ok(self
+                    .storage
+                    .session(parent)
+                    .await?
+                    .is_some_and(|parent| cron_goal(&parent) == Some(goal.as_str())))
+            }
+            _ => Ok(false),
         }
-        Ok(task_doc(&*self.storage, record.root_conversation)
-            .await?
-            .is_some_and(|doc| doc.goals.iter().any(|id| id == goal.as_str())))
     }
 
     /// 每个目标被几个**活着的**任务带着（目标 id → 个数），`goal.list` 用。归档的任务不算，
@@ -222,7 +243,7 @@ impl DurableCore {
         // 被用户停下的任务（`komo.task.stopped`）：不论之前交回过什么，都算"没有完成"，不是进行中，
         // 也不会因为上一次交回是完成而显示成已交回的好结果。再被 `continue` 做起来时标记清掉。
         let stopped = doc.as_ref().is_some_and(|doc| doc.stopped);
-        let goals = doc
+        let mut goals: Vec<TaskGoal> = doc
             .as_ref()
             .map(|doc| {
                 doc.goals
@@ -234,6 +255,13 @@ impl DurableCore {
                     .collect()
             })
             .unwrap_or_default();
+        // 定时触发的运行带着它的目标的键（来源 `cron:{目标 id}`，没有 `komo.task`）。
+        if let Some(goal) = cron_goal(record) {
+            goals.push(TaskGoal {
+                id: MatterId::from_raw(goal),
+                title: None,
+            });
+        }
         let last = doc.and_then(|doc| doc.last_run);
         let outcome = if stopped {
             Some(TaskOutcome::NotCompleted)

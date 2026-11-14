@@ -4,6 +4,7 @@
 > 的"Session 应当是实现细节"与双层架构；`roadmap-muse.md` S 已借了其中五条，本文接着做它没做的那一半：用户看到什么。
 > §6 列出要拍板的决定，认可后分别写回 `komo_bot.md`、`background-tasks.md`、`web.md`、`session-tree.md`。
 > 2026-11-14：**定时并进目标**（`docs/redesign.md` P8 / 3a-1）：定时不再是独立的一种东西，是目标上的配置，`/v1/cron*`、`komo cron`、`cron.list` / `cron.run` 已删（下面提到它们的段落是历史）；没有终点的目标复用「领域」，D10「去掉领域」改成「领域并入目标」（见 D10 与 §5.4）。
+> 2026-11-14（3a-2）：目标与支线对话一对一绑定（`docs/redesign.md` P22）：绑定后目标的定时结果与停住的提问投到那段支线，没绑定投主对话；定时会话的任务清单键是来源 `cron:{目标 id}`（`GET /v1/tasks?goal=` 与每行 `goals` 认它）；`GET /v1/matters/{id}` 带活动时间线（就是带这个目标键的任务清单行），`GET /v1/matters/{id}/runs` 是定时的运行历史。
 > 2026-11-13：§4（Router - Worker）已被 `docs/redesign.md`（P18）取代，Router 已于同日删除（分发判断、分发任务与结果直投、`router_model`）；§4 正文原样保留作历史记录。
 > 文中 §x 不带文件名时指 `komo_bot.md`。
 

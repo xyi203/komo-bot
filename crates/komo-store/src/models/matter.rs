@@ -44,6 +44,9 @@ pub struct MatterRow {
     /// 这个目标是回填自哪个旧定时任务（`cron_jobs.id`）；回填据此判断「这个旧任务已经处理过」，
     /// 即使之后定时被清掉也不会再造出一个目标。
     pub migrated_from: Option<String>,
+    /// 绑定的支线对话（会话 id，`docs/redesign.md` P22，附加列）；`NULL` = 没绑定。一个目标至多一段，
+    /// 一段支线至多被一个目标绑（只能从目标这边新开一段来绑，所以天然一对一）。改它不升 `revision`。
+    pub chat_session: Option<String>,
 }
 
 pub const SPEC: TableSpec = TableSpec {
@@ -52,7 +55,7 @@ pub const SPEC: TableSpec = TableSpec {
     columns: COLUMNS,
 };
 
-pub const DDL: &str = r#"CREATE TABLE "matters" ("id" TEXT NOT NULL, "revision" BIGINT NOT NULL, "kind" TEXT NOT NULL, "title" TEXT NOT NULL, "state" TEXT NOT NULL, "next" TEXT, "waiting_for" TEXT, "due" TEXT, "standard" TEXT, "evidence" TEXT NOT NULL, "created_at" BIGINT NOT NULL, "updated_at" BIGINT NOT NULL, "closed_at" BIGINT NOT NULL, "triggers" TEXT NOT NULL, "description" TEXT, "schedule" TEXT, "schedule_status" TEXT NOT NULL, "next_run_at" BIGINT NOT NULL, "last_error" TEXT, "migrated_from" TEXT, PRIMARY KEY ("id"))"#;
+pub const DDL: &str = r#"CREATE TABLE "matters" ("id" TEXT NOT NULL, "revision" BIGINT NOT NULL, "kind" TEXT NOT NULL, "title" TEXT NOT NULL, "state" TEXT NOT NULL, "next" TEXT, "waiting_for" TEXT, "due" TEXT, "standard" TEXT, "evidence" TEXT NOT NULL, "created_at" BIGINT NOT NULL, "updated_at" BIGINT NOT NULL, "closed_at" BIGINT NOT NULL, "triggers" TEXT NOT NULL, "description" TEXT, "schedule" TEXT, "schedule_status" TEXT NOT NULL, "next_run_at" BIGINT NOT NULL, "last_error" TEXT, "migrated_from" TEXT, "chat_session" TEXT, PRIMARY KEY ("id"))"#;
 
 pub const COLUMNS: &[ColumnSpec] = &[
     ColumnSpec::new("id", "TEXT NOT NULL DEFAULT ''"),
@@ -75,4 +78,5 @@ pub const COLUMNS: &[ColumnSpec] = &[
     ColumnSpec::new("next_run_at", "BIGINT NOT NULL DEFAULT 0"),
     ColumnSpec::new("last_error", "TEXT"),
     ColumnSpec::new("migrated_from", "TEXT"),
+    ColumnSpec::new("chat_session", "TEXT"),
 ];

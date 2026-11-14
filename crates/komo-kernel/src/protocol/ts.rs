@@ -23,11 +23,12 @@ use ts_rs::{Config, TS};
 use super::{
     CancelRunResponse, ChatListResponse, ConfigCheckResponse, ConfigEditResponse,
     ConfigEnvResponse, ConfigModelsResponse, ConfigReloadResponse, ConfigSettingsResponse,
-    ConfigVersionRequest, CreateSessionRequest, CronDeleteResponse, CronListResponse,
+    ConfigVersionRequest, CreateSessionRequest,
     DefaultModelRequest, DeleteSessionRequest, EmbeddingUpsertRequest, EnvSetRequest, ErrorBody,
     EventPage, EventQuery, FileDiff, ForkSessionResponse, HealthResponse,
     InterventionAnswerRequest, InterventionAnswerResponse, InterventionListResponse,
-    ManualCronRunResponse, MatterActionRequest, MatterAddRequest, MatterDetail, MatterListResponse,
+    ManualCronRunResponse, MatterActionRequest, MatterAddRequest, MatterChatResponse, MatterDetail,
+    MatterListResponse, MatterRunsResponse,
     McpReconnectRequest, McpReconnectResponse, McpServersResponse, MemoryAddRequest,
     MemoryAddResponse, MemoryClassifyRequest, MemoryDetail, MemoryIndexStatus, MemoryListResponse,
     MemoryRevisionRequest, ModelUpsertRequest, ModelsResponse, MonitorListResponse,
@@ -35,7 +36,7 @@ use super::{
     ProviderModelsResponse, ProviderUpsertRequest, PurgeBlocked, PurgeSessionResponse,
     RebuildIndexResponse, SessionChanges, SessionLifecycleResponse, SessionListResponse,
     SettingRequest, SseFrame, SubmitRunRequest, SubmitRunResponse, TaskListResponse,
-    UpdateCronRequest, UploadAttachmentResponse,
+    UploadAttachmentResponse,
 };
 
 /// `GET /v1/sessions/{id}/events` 与 SSE `event` 帧里一条事件的线上信封（[`crate::events::Event`] 的 JSON）。
@@ -107,10 +108,9 @@ pub fn export_all(dir: &Path) -> Result<(), String> {
     each(MatterDetail::export_all(&cfg))?;
     each(MatterAddRequest::export_all(&cfg))?;
     each(MatterActionRequest::export_all(&cfg))?;
-    each(CronListResponse::export_all(&cfg))?;
-    each(UpdateCronRequest::export_all(&cfg))?;
+    each(MatterChatResponse::export_all(&cfg))?;
+    each(MatterRunsResponse::export_all(&cfg))?;
     each(ManualCronRunResponse::export_all(&cfg))?;
-    each(CronDeleteResponse::export_all(&cfg))?;
     each(ConfigCheckResponse::export_all(&cfg))?;
     each(ConfigReloadResponse::export_all(&cfg))?;
     each(ConfigModelsResponse::export_all(&cfg))?;

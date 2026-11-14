@@ -12,12 +12,15 @@ use axum::Json;
 use axum::extract::{Path, Query, State};
 use komo_kernel::durable::SessionKind;
 use komo_kernel::protocol::http::{
-    ClosureConvention, ErrorCode, ManualCronRunResponse, MatterActionRequest, MatterAddRequest,
-    MatterClosure, MatterDetail, MatterListQuery, MatterListResponse, MatterShowQuery,
+    ActivityWaiting, ClosureConvention, ErrorCode, MATTER_ACTIVITY_LIMIT, MATTER_MEMORY_LIMIT,
+    ManualCronRunResponse, MatterActionRequest, MatterActivity, MatterAddRequest, MatterChat,
+    MatterChatResponse, MatterClosure, MatterDetail, MatterListQuery, MatterListResponse,
+    MatterOverview, MatterRun, MatterRunsQuery, MatterRunsResponse, MatterShowQuery,
 };
 use komo_kernel::types::agent::MemoryMode;
 use komo_kernel::types::ids::{CronJobId, MatterId, SessionId};
-use komo_kernel::types::matter::{Matter, MatterError, MatterVerb};
+use komo_kernel::types::matter::{Matter, MatterError, MatterTrigger, MatterVerb};
+use komo_kernel::types::memory::MemoryState;
 use komo_memory::matter::{Caller, MatterFailure};
 use time::{Date, Month, OffsetDateTime};
 
@@ -25,7 +28,9 @@ use super::Api;
 use super::error::{ApiFailure, ApiResult};
 use super::idempotency::body_hash;
 use super::schedule;
+use crate::service::durable::chats::WEB_SOURCE;
 use crate::service::durable::hooks;
+use crate::service::durable::sessions::{NewSession, time_of};
 
 /// `GET /v1/matters`：默认只列未结案的，`all=true` 带上结案的。
 pub async fn list(
@@ -64,7 +69,224 @@ pub async fn show(
         .get(&MatterId::from_raw(id))
         .await
         .map_err(failure)?;
-    Ok(Json(detail_of(&api, matter, None).await?))
+    let overview = overview_of(&api, &matter).await?;
+    let detail = MatterDetail {
+        overview: Some(overview),
+        ..detail_of(&api, matter, None).await?
+    };
+    Ok(Json(detail))
+}
+
+/// 目标页要的其余东西，一次取齐（`docs/redesign.md` §1.4）：绑定的支线、监听、活动、为它记的记忆。
+/// 定时本身在 [`MatterDetail::schedule`]（含下一次时间、最近错误与最近一次触发）。
+async fn overview_of(api: &Api, matter: &Matter) -> ApiResult<MatterOverview> {
+    let core = api.state.core()?;
+
+    // 绑定的支线：归档 / 删除了的读成没绑定（`DurableCore::bound_chat`）。
+    let chat = core
+        .bound_chat(matter.id.as_str())
+        .await?
+        .map(|record| chat_of(matter, &record));
+
+    // 监听：触发器里的 monitor 对上登记（含已结束的）；登记里找不到的不列。
+    let wanted: Vec<(&SessionId, &str)> = matter
+        .triggers
+        .iter()
+        .filter_map(|trigger| match trigger {
+            MatterTrigger::Monitor { session, monitor } => Some((session, monitor.as_str())),
+            MatterTrigger::Cron { .. } => None,
+        })
+        .collect();
+    let monitors = if wanted.is_empty() {
+        Vec::new()
+    } else {
+        super::v2::monitors::summaries(core, true)
+            .await?
+            .into_iter()
+            .filter(|summary| {
+                summary.session.as_ref().is_some_and(|session| {
+                    wanted.iter().any(|(wanted_session, wanted_monitor)| {
+                        *wanted_session == session
+                            && summary.handle.trim_start_matches('#') == *wanted_monitor
+                    })
+                })
+            })
+            .collect()
+    };
+
+    // 活动：带着这个目标的键的会话（定时触发的运行、挂了键的任务），最新的在前；在等你的标出来（P16）。
+    let asks = core.pending_asks().await?;
+    let page = core
+        .task_page_for_goal(false, Some(&matter.id), Some(MATTER_ACTIVITY_LIMIT), None)
+        .await?;
+    let activity = page
+        .tasks
+        .into_iter()
+        .map(|mut task| {
+            for goal in &mut task.goals {
+                if goal.id == matter.id {
+                    goal.title = Some(matter.title.clone());
+                }
+            }
+            let waiting = asks.get(task.session.as_str()).cloned();
+            MatterActivity { task, waiting }
+        })
+        .collect();
+
+    // 为它记的记忆：归属它、还没归档 / 遗忘 / 被取代的，新的在前。
+    let mut memories = api
+        .state
+        .memories
+        .catalog()
+        .belonging_to(&matter.id)
+        .await?;
+    memories.retain(|item| {
+        matches!(
+            item.state,
+            MemoryState::Candidate | MemoryState::Active | MemoryState::Contested
+        )
+    });
+    memories.reverse();
+    memories.truncate(MATTER_MEMORY_LIMIT);
+
+    Ok(MatterOverview {
+        chat,
+        monitors,
+        activity,
+        memories,
+    })
+}
+
+fn chat_of(matter: &Matter, record: &komo_kernel::durable::SessionRecord) -> MatterChat {
+    MatterChat {
+        session: SessionId::from_raw(record.id.clone()),
+        title: record
+            .title
+            .clone()
+            .filter(|title| !title.trim().is_empty())
+            .unwrap_or_else(|| matter.title.clone()),
+    }
+}
+
+/// `GET /v1/matters/{id}/runs`：定时触发的运行历史（`cron_firings`，键是目标 id），新的在前，翻页用
+/// `before`。每条带计划时间、实际时间、结果状态、错误，以及点进去看过程的会话与 Run；此刻在等你的标出来。
+pub async fn runs(
+    State(api): State<Api>,
+    Path(id): Path<String>,
+    Query(query): Query<MatterRunsQuery>,
+) -> ApiResult<Json<MatterRunsResponse>> {
+    let id = MatterId::from_raw(id);
+    api.state.matters.get(&id).await.map_err(failure)?;
+    let limit = query.limit.unwrap_or(RUNS_PAGE).clamp(1, RUNS_PAGE_MAX);
+    let mut firings = api
+        .state
+        .cron
+        .firings_page(&CronJobId::from_raw(id.as_str()), query.before, limit + 1)
+        .await?;
+    let next_before = if firings.len() > limit as usize {
+        firings.truncate(limit as usize);
+        firings.last().map(|firing| firing.scheduled_at)
+    } else {
+        None
+    };
+    let core = api.state.core()?;
+    let asks = core.pending_asks().await?;
+    let mut runs = Vec::with_capacity(firings.len());
+    for firing in firings {
+        // 实际触发的时刻 = 建出来的会话的创建时刻；读不出来不让整页失败。
+        let fired_at = match &firing.session {
+            Some(session) => core
+                .storage
+                .session(session.as_str())
+                .await
+                .ok()
+                .flatten()
+                .map(|record| time_of(record.created_at)),
+            None => None,
+        };
+        let waiting: Option<ActivityWaiting> = firing
+            .session
+            .as_ref()
+            .and_then(|session| asks.get(session.as_str()).cloned());
+        runs.push(MatterRun {
+            scheduled_at: firing.scheduled_at,
+            fired_at,
+            status: firing.status,
+            error: firing.error,
+            job_version: firing.job_version,
+            session: firing.session,
+            run: firing.run,
+            waiting,
+        });
+    }
+    Ok(Json(MatterRunsResponse { runs, next_before }))
+}
+
+/// 运行历史一页默认 / 最多几条。
+const RUNS_PAGE: u32 = 20;
+const RUNS_PAGE_MAX: u32 = 100;
+
+/// `POST /v1/matters/{id}/chat`：给目标新开一段支线对话并绑定（P22）。标题取目标的标题。已经绑着一段
+/// **活着的**支线就原样返回它（`created = false`），不再开第二段；不再追踪（结案）的目标不给绑。
+/// 只有网页调：模型侧的 `komo` 工具没有这个动作。
+///
+/// 先建会话、再记绑定：两步不在同一个库里，第二步失败时留下一段没绑定的普通支线（用户在对话列表里看得到、
+/// 能自己归档），不会出现「绑了一段不存在的会话」。
+pub async fn bind_chat(
+    State(api): State<Api>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<MatterChatResponse>> {
+    let id = MatterId::from_raw(id);
+    let matter = api.state.matters.get(&id).await.map_err(failure)?;
+    let core = api.state.core()?;
+    if let Some(record) = core.bound_chat(id.as_str()).await? {
+        return Ok(Json(MatterChatResponse {
+            chat: Some(chat_of(&matter, &record)),
+            created: false,
+        }));
+    }
+    if matter.state.is_closed() {
+        return Err(ApiFailure::new(
+            ErrorCode::Conflict,
+            format!(
+                "{} {id} 已经是 {}，不再追踪：先 reopen 再绑定对话",
+                matter.kind.label(),
+                matter.state
+            ),
+        ));
+    }
+    let spec = NewSession::new(api.state.snapshot().agent.default_agent.clone())
+        .source(WEB_SOURCE)
+        .title(matter.title.clone());
+    let record = core.create_session(spec).await?;
+    api.state
+        .matters
+        .set_chat(&id, Some(record.id.clone()))
+        .await
+        .map_err(failure)?;
+    Ok(Json(MatterChatResponse {
+        chat: Some(chat_of(&matter, &record)),
+        created: true,
+    }))
+}
+
+/// `DELETE /v1/matters/{id}/chat`：解除绑定。那段支线留着，变回普通支线；之后这个目标的结果与提问回到主对话。
+/// 本来就没绑定也成功（幂等）。
+pub async fn unbind_chat(
+    State(api): State<Api>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<MatterChatResponse>> {
+    let id = MatterId::from_raw(id);
+    api.state.matters.get(&id).await.map_err(failure)?;
+    api.state
+        .matters
+        .set_chat(&id, None)
+        .await
+        .map_err(failure)?;
+    Ok(Json(MatterChatResponse {
+        chat: None,
+        created: false,
+    }))
 }
 
 /// 一条事项的详情：目标本身加它的定时（`fired` 只有 `run` 动词带）。
@@ -78,6 +300,7 @@ async fn detail_of(
         matter,
         schedule,
         fired,
+        overview: None,
         today: today(api),
         still_linked: Vec::new(),
         closure: None,

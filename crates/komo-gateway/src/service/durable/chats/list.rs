@@ -7,6 +7,8 @@
 //! - **在等你**：有指向这段对话的、还没答复的介入（faulted、崩溃停住、待确认），指向关系见
 //!   [`DurableCore::route_of`]。`waitingCount` 是这类介入的条数。
 //! - **在跑**：这段对话当前有 Run（含停在等你上的）。
+//! - **绑定的目标**：支线绑了目标（P22）的行带 `goal`（id 与标题）；读取时只看绑定记录与目标，
+//!   不核对目标是否结案（结案的目标，旗仍在）。已归档的支线本来就不在列表里，绑定自然看不到。
 //! - 支线对话取活着的 `kind = normal` 会话、排除 `source` 以 `chat:` 开头的存量渠道 / 群会话；
 //!   最多给 [`MAX_SIDE_CHATS`] 段（等你的在前，所以不会被截掉）。
 
@@ -141,6 +143,9 @@ impl DurableCore {
             *waiting.entry(chat).or_default() += 1;
         }
 
+        // 绑了目标的支线（P22）：行上带目标的 id 与标题，网页画小旗。
+        let mut goals = self.bound_goals().await?;
+
         let mut sides = self.side_chats().await?;
         sides.sort_by(|a, b| {
             let wa = waiting.contains_key(&a.id);
@@ -171,6 +176,11 @@ impl DurableCore {
                 last_message_at: time_of(record.last_message_ms()),
                 waiting: count > 0,
                 running: live.run.is_some(),
+                goal: if is_main {
+                    None
+                } else {
+                    goals.remove(&record.id)
+                },
             });
         }
         Ok(ChatListResponse {

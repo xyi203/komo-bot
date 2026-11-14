@@ -247,6 +247,7 @@ async fn create_goal(
         next_run_at: job.next_run_at,
         last_error: job.last_error.clone(),
         migrated_from: Some(job.id.clone()),
+        chat_session: None::<String>,
     })
     .exec(ex)
     .await

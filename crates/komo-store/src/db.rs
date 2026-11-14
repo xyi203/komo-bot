@@ -1024,6 +1024,7 @@ mod tests {
             "next_run_at",
             "last_error",
             "migrated_from",
+            "chat_session",
         ] {
             assert!(after.iter().any(|name| name == column), "{column}：{after:?}");
         }

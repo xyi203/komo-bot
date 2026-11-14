@@ -1,17 +1,19 @@
 //! 目标与领域的线格式（`docs/goals.md` §4）：`GET/POST /v1/matters`、`GET /v1/matters/{id}`、
-//! `POST /v1/matters/{id}/{action}`。
+//! `POST /v1/matters/{id}/{action}`，以及目标页要的 `GET /v1/matters/{id}/runs`（定时的运行历史）、
+//! `POST|DELETE /v1/matters/{id}/chat`（新开一段支线并绑定 / 解除，`docs/redesign.md` P22）。
 //!
 //! 带 `session` + `run` 的写 = Agent 在 Run 里推进（bash 子进程带着 `KOMO_SESSION` /
 //! `KOMO_RUN`）：改承诺的操作要这个 Run 里有用户原话；都不带 = 操作者在终端。只给一个报错，
 //! 同 `memory add`。
 
 use serde::{Deserialize, Serialize};
-use time::Date;
+use time::{Date, OffsetDateTime};
 
-use crate::cron::{CronFiring, CronJob, NotifyPolicy, OverlapPolicy};
-use crate::protocol::http::ManualCronRunResponse;
+use crate::cron::{CronFiring, CronJob, FiringStatus, NotifyPolicy, OverlapPolicy};
+use crate::protocol::http::{ManualCronRunResponse, MonitorSummary, TaskSummary};
 use crate::types::ids::{MemoryId, RequestKey, RunId, SessionId};
 use crate::types::matter::{Matter, MatterKind, MatterTrigger, iso_date};
+use crate::types::memory::MemoryItem;
 use crate::types::model::{Effort, ModelConfig};
 
 /// 一个目标上的定时：配置与运行面（`docs/redesign.md` P8）。`job.id` 就是目标 id。
@@ -117,6 +119,10 @@ pub struct MatterDetail {
     /// 只在 `run` 动词的回应里带：这次手动触发建出的会话与 Run。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fired: Option<ManualCronRunResponse>,
+    /// 目标页要的其余东西（绑定的支线、监听、活动、记忆）：只有 `GET /v1/matters/{id}` 带；
+    /// 写接口的回应不带（要的话再读一次）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overview: Option<MatterOverview>,
     #[serde(with = "iso_date")]
     #[cfg_attr(feature = "ts", ts(type = "string"))]
     pub today: Date,
@@ -129,6 +135,144 @@ pub struct MatterDetail {
     /// （`docs/goals.md` §6）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub closure: Option<MatterClosure>,
+}
+
+/// 目标绑定的支线对话（`docs/redesign.md` P22）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct MatterChat {
+    pub session: SessionId,
+    pub title: String,
+}
+
+/// 一条在等你的事：问话投在哪段对话里、对应哪条介入（那句话上 `data.handle` 就是它）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct ActivityWaiting {
+    /// 问话所在的对话（绑定了支线是那段支线，否则主对话）。
+    pub chat: SessionId,
+    /// 介入的句柄。
+    pub handle: String,
+}
+
+/// 目标活动里的一条：为这个目标做的一次事——定时触发的运行（含手动触发）、以及带着这个目标的键的
+/// 任务（`goal.attach`，或定时运行派出的任务）。最新的在前。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(optional_fields))]
+pub struct MatterActivity {
+    /// 背后的会话：状态、结局、起止时刻、点进去看过程都用它（同任务清单的一行）。
+    pub task: TaskSummary,
+    /// 这件事此刻在等你（P16）：有，就是「在等你」，点了去 `waiting.chat` 里那句话。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waiting: Option<ActivityWaiting>,
+}
+
+/// 目标详情页要的、不属于目标本身的那几块（`GET /v1/matters/{id}`）。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(optional_fields))]
+pub struct MatterOverview {
+    /// 绑定的支线对话；没绑定、或那段支线已归档 / 删除时没有（读取时视为未绑定）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chat: Option<MatterChat>,
+    /// 挂着的监听（`matter.triggers` 里的 monitor 对上登记的那些；登记里已经找不到的不在这里，
+    /// 触发器引用仍在 `matter.triggers`）。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "ts", ts(as = "Option<Vec<MonitorSummary>>"))]
+    pub monitors: Vec<MonitorSummary>,
+    /// 活动时间线，最新的在前，最多 [`MATTER_ACTIVITY_LIMIT`] 条；更早的定时触发看运行历史。
+    /// 「近况」取第一条，不另存。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "ts", ts(as = "Option<Vec<MatterActivity>>"))]
+    pub activity: Vec<MatterActivity>,
+    /// 为它记的记忆（归属它、还没归档 / 遗忘的），最多 [`MATTER_MEMORY_LIMIT`] 条。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "ts", ts(as = "Option<Vec<MemoryItem>>"))]
+    pub memories: Vec<MemoryItem>,
+}
+
+/// 详情里带的活动条数上限。
+pub const MATTER_ACTIVITY_LIMIT: usize = 20;
+/// 详情里带的记忆条数上限。
+pub const MATTER_MEMORY_LIMIT: usize = 50;
+
+/// `POST /v1/matters/{id}/chat`（新开一段支线并绑定）与 `DELETE /v1/matters/{id}/chat`（解除）的回应。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(optional_fields))]
+pub struct MatterChatResponse {
+    /// 现在绑定的支线；解除之后没有。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chat: Option<MatterChat>,
+    /// 这一次新开了一段（已经绑着活的支线时不再开，原样返回，`false`）。
+    #[serde(default)]
+    pub created: bool,
+}
+
+/// `GET /v1/matters/{id}/runs` 的 query：翻页用 `before`（上一页的 `next_before`）。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MatterRunsQuery {
+    /// 一页几条；不给 20，上限 100。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+    /// 只要计划时间早于它的（RFC 3339）。
+    #[serde(
+        default,
+        with = "time::serde::rfc3339::option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub before: Option<OffsetDateTime>,
+}
+
+/// 定时触发的一条记录（`cron_firings` 的一行，加上读出来的实际时间与「在等你」）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(optional_fields))]
+pub struct MatterRun {
+    /// 计划时间。
+    #[serde(with = "time::serde::rfc3339")]
+    #[cfg_attr(feature = "ts", ts(type = "string"))]
+    pub scheduled_at: OffsetDateTime,
+    /// 实际触发的时刻（建出来的会话的创建时刻）；跳过的、没投成的没有。
+    #[serde(
+        default,
+        with = "time::serde::rfc3339::option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[cfg_attr(feature = "ts", ts(type = "string"))]
+    pub fired_at: Option<OffsetDateTime>,
+    /// 记录里的状态：`queued` / `ok` / `error` / `waiting` / `skipped`。
+    pub status: FiringStatus,
+    /// `skipped` 的原因或 `error` 的错误。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// 触发时定时的版本。
+    pub job_version: u64,
+    /// 点进去看过程的句柄：会话与 Run。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<SessionId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run: Option<RunId>,
+    /// 此刻停在等你上（同 [`MatterActivity::waiting`]）；`status` 不会变成 `waiting`，这一格是现读的。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waiting: Option<ActivityWaiting>,
+}
+
+/// `GET /v1/matters/{id}/runs`：新的在前。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(optional_fields))]
+pub struct MatterRunsResponse {
+    pub runs: Vec<MatterRun>,
+    /// 还有更早的：下一页的 `before`（这一页最后一条的计划时间）；没有更多就缺省。
+    #[serde(
+        default,
+        with = "time::serde::rfc3339::option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[cfg_attr(feature = "ts", ts(type = "string"))]
+    pub next_before: Option<OffsetDateTime>,
 }
 
 /// 结案时它名下的记忆怎么处理了（`memory.md` §9.6「结案归档」）。

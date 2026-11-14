@@ -79,7 +79,7 @@ area:  active → retired →（reopen）active
 - `list` 默认只列未结案的，`--all` 带上结案的。一条一行：`id@版本 状态 标题`，goal 另带下一步或在等什么、截止日期与"已超期"，area 另带标准。
 - 状态不允许的操作报错并说明当前状态，不静默忽略。状态没变（对 `parked` 再 park）返回原样、不升版。
 - 所有改动都可带 `--revision N`（预期版本，不符报冲突）；不带就按当前版本改。事项由 Agent 频繁推进，每次都要先查版本只会多一轮，冲突的代价也小（改的是一行清单）。
-- 经 Gateway：`GET/POST /v1/matters`、`GET /v1/matters/{id}`、`POST /v1/matters/{id}/{action}`（action 即上表动词）。CLI 不开 state（§3）。
+- 经 Gateway：`GET/POST /v1/matters`、`GET /v1/matters/{id}`、`POST /v1/matters/{id}/{action}`（action 即上表动词）。CLI 不开 state（§3）。2026-11-14（`docs/redesign.md` 3a-2）另有：`GET /v1/matters/{id}` 的回应多一块 `overview`（绑定的支线、监听、活动、为它记的记忆），`GET /v1/matters/{id}/runs`（定时的运行历史，分页），`POST|DELETE /v1/matters/{id}/chat`（新开一段支线并绑定 / 解除，只有网页调，`komo` 工具与 CLI 不做）。绑定记在 `matters.chat_session`、不升版本；定时到点的运行带这个目标的键（会话来源 `cron:{目标 id}`），状态映射见 `redesign.md` §2.2：只有进行中 / 等待中的目标触发定时。
 
 **谁能改什么。** 按改的是不是"承诺"分：
 
@@ -194,5 +194,7 @@ area:  active → retired →（reopen）active
 ## 10. 任务与目标的关联（2026-11-12）
 
 任务带上某个目标的 id，就表示"这件事是为这个目标做的"。键记在任务自己的 `komo.task.goals`（目标 id 列表，附加字段，旧 document 读成空），不建表、不设单独的归属参数；一个任务可以带几个目标，一个目标可以被几个任务带着。**它只用于找回与显示，不参与消息路由**——路由归属只属于对话位置（`komo.task.thread`）。任务自己用 `komo` 工具的 `goal.attach` / `goal.detach` 增减：只有任务会话（有 `komo.task`）里能用，群里派出的任务照旧被拒（`sessions::is_group_task`）；改的是任务自己的关联、不是目标的承诺，所以不要 Run 里的用户原话，只由监听事件起的一轮也能挂。挂的时候目标必须存在且是目标（不是领域），重复挂无变化；摘的时候没挂过也算成功。只有这件事明显是在推进某个已有目标时才挂，不为挂而挂，也不为此新建目标。
+
+（2026-11-14）定时触发的会话没有 `komo.task`，它的键是来源 `cron:{目标 id}`；`?goal=` 与每行的 `goals` 也认它，定时运行里派出的任务（派出方是这个目标的定时会话）同样算。`goal.list` 的任务计数仍只数 `komo.task.goals`。
 
 读出来：`GET /v1/tasks` 每行带 `goals`（`{id, title}`，目标已不存在时只有 id），`?goal=<id>` 只返回带着这个键的任务（分页规则不变）；`komo` 的 `task.list` 认同样的 `goal` 参数，`goal.list` 每项带 `tasks`——活着的（未归档）任务里有几个带着它。目标完成或放弃后任务上的键**原样留着**（历史关联仍有意义），不做级联清理。网页显示、Router 的判断里带目标、自动推断任务属于哪个目标都不在这一版。

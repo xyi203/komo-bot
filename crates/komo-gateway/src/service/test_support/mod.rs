@@ -85,6 +85,7 @@ pub fn sample_snapshot() -> ConfigSnapshot {
         },
         model_catalog: ModelCatalog {
             default: "main".into(),
+            main: None,
             entries: std::collections::BTreeMap::from([(
                 "main".into(),
                 CatalogModel::Completion {

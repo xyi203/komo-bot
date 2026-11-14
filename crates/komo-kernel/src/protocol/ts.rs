@@ -29,7 +29,7 @@ use super::{
     InterventionAnswerRequest, InterventionAnswerResponse, InterventionListResponse,
     ManualCronRunResponse, MatterActionRequest, MatterAddRequest, MatterChatResponse, MatterDetail,
     MatterListResponse, MatterRunsResponse,
-    McpReconnectRequest, McpReconnectResponse, McpServersResponse, MemoryAddRequest,
+    EnabledRequest, McpReconnectRequest, McpReconnectResponse, McpServersResponse, SkillsResponse, MemoryAddRequest,
     MemoryAddResponse, MemoryClassifyRequest, MemoryDetail, MemoryIndexStatus, MemoryListResponse,
     MemoryRevisionRequest, ModelUpsertRequest, ModelsResponse, MonitorListResponse,
     NameSessionRequest, PairCodeResponse, PairRequest, ProviderModelsRequest,
@@ -129,6 +129,8 @@ pub fn export_all(dir: &Path) -> Result<(), String> {
     each(McpServersResponse::export_all(&cfg))?;
     each(McpReconnectRequest::export_all(&cfg))?;
     each(McpReconnectResponse::export_all(&cfg))?;
+    each(EnabledRequest::export_all(&cfg))?;
+    each(SkillsResponse::export_all(&cfg))?;
 
     let names: BTreeSet<String> = std::fs::read_dir(dir)
         .map_err(|error| error.to_string())?

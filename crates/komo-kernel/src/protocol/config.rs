@@ -105,6 +105,17 @@ pub struct McpServerConfig {
     /// （`docs/confirm.md`）。同 `read_only`，不信服务器自报。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub outward: Vec<String>,
+    /// 整台关闭（设置页的开关，持久）：不连接，工具不进模型的工具表；重新打开才连。默认开。
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub enabled: bool,
+    /// 单独关掉的工具（服务器上的原名，不含通配）：不进模型的工具表，也调不了。比 `tools` 白名单
+    /// 晚一层——白名单决定"有哪些"，这里决定"哪些先关着"。改它不重连服务器。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub disabled_tools: Vec<String>,
+}
+
+fn is_true(value: &bool) -> bool {
+    *value
 }
 
 /// MCP 工具给模型的方式（照 pi 的 `exposure`，没有 `deferred`：komo 没有 `tool_search`）。
@@ -911,6 +922,8 @@ mod tests {
             exposure: McpExposure::default(),
             tool_exposure: BTreeMap::new(),
             outward: vec![],
+            enabled: true,
+            disabled_tools: vec![],
         };
         let empty = snapshot();
         let mut one = snapshot();
@@ -939,6 +952,8 @@ mod tests {
             exposure: McpExposure::Codemode,
             tool_exposure: BTreeMap::new(),
             outward: vec!["issue_transit".into(), "apollo_*".into()],
+            enabled: true,
+            disabled_tools: vec![],
         };
         assert!(server.outward_of("issue_transit"));
         assert!(server.outward_of("apollo_apply_change"));
@@ -959,6 +974,8 @@ mod tests {
             exposure: McpExposure::Direct,
             tool_exposure: BTreeMap::new(),
             outward: vec![],
+            enabled: true,
+            disabled_tools: vec![],
         };
         server
             .tool_exposure

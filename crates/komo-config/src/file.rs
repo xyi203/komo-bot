@@ -144,6 +144,9 @@ pub(super) struct ModelSection {
 #[derive(Debug, Clone, Deserialize)]
 pub(super) struct ModelsSection {
     pub default: String,
+    /// 主对话的模型 alias；不写跟 `default`。
+    #[serde(default)]
+    pub main: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -340,6 +343,15 @@ pub(super) struct McpServerSection {
     pub tool_exposure: BTreeMap<String, McpExposure>,
     #[serde(default)]
     pub outward: Vec<String>,
+    /// 整台关闭写 `enabled = false`；不写 = 开。
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub disabled_tools: Vec<String>,
+}
+
+fn default_enabled() -> bool {
+    true
 }
 
 impl McpServerSection {
@@ -385,6 +397,8 @@ impl McpServerSection {
             exposure: self.exposure,
             tool_exposure: self.tool_exposure,
             outward: self.outward,
+            enabled: self.enabled,
+            disabled_tools: self.disabled_tools,
         })
     }
 }
@@ -631,12 +645,27 @@ pub(super) fn assemble(
             message: "没有 [models] 段：需要用 default 指定主模型 alias".into(),
         });
     };
-    let model_catalog = assemble_catalog(
+    let mut model_catalog = assemble_catalog(
         file.model_providers,
         file.model,
         models.default,
         &sources.config,
     )?;
+    if let Some(alias) = models
+        .main
+        .as_deref()
+        .map(str::trim)
+        .filter(|alias| !alias.is_empty())
+    {
+        if model_catalog.completion(alias).is_none() {
+            return Err(ConfigError::Missing {
+                key: KeyPath::new("models.main"),
+                file: sources.config.clone(),
+                message: format!("`{alias}` 不是一个已配置的 completion 模型"),
+            });
+        }
+        model_catalog.main = Some(alias.to_string());
+    }
     let model = model_catalog
         .completion(&model_catalog.default)
         .cloned()
@@ -817,6 +846,7 @@ fn assemble_catalog(
 
     Ok(ModelCatalog {
         default: default.trim().to_string(),
+        main: None,
         entries,
     })
 }

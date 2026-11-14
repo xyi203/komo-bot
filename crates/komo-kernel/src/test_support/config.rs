@@ -41,6 +41,7 @@ pub fn snapshot_fixture() -> ConfigSnapshot {
     };
     let model_catalog = ModelCatalog {
         default: "chat".into(),
+        main: None,
         entries: BTreeMap::from([
             (
                 "chat".into(),

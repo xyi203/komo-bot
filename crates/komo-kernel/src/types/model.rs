@@ -101,10 +101,13 @@ impl CatalogModel {
     }
 }
 
-/// `model.<alias>` 的完整目录，以及 `[models].default` 指向的默认生成模型。
+/// `model.<alias>` 的完整目录，以及 `[models].default` 指向的默认生成模型（`main` 只管主对话）。
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelCatalog {
     pub default: String,
+    /// `[models] main`：主对话这一段会话用的 completion alias；没写 = 跟 `default`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub main: Option<String>,
     #[serde(default)]
     pub entries: BTreeMap<String, CatalogModel>,
 }

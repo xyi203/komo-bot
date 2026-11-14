@@ -39,6 +39,8 @@ description      = "内部文档检索"      # 系统提示里这台服务器的
 exposure         = "codemode"          # 默认；direct / hidden（§3）
 tool_exposure    = { lookup = "direct", "delete_*" = "hidden" }
 outward          = ["publish_*"]       # 对外工具：无人值守的 Run 调它先确认（docs/confirm.md）
+enabled          = false               # 整台关闭（§2.8）；省略 = 开
+disabled_tools   = ["delete_issue"]    # 单独关掉的工具（原名，§2.8）；省略 = 都开
 ```
 
 - `command` 与 `url` 恰好写一个；`args` / `env` 只配 `command`，`bearer_token_env` 只配 `url`。
@@ -186,12 +188,37 @@ mtime、`komo config reload`、`SIGHUP`）的变化键有 `mcp` / `mcp.*` 时，
 Web 设置页要一张服务器表，而不是"点重连才看得到状态"。`GET /v1/mcp` 读 `McpHub` 此刻的状态，**不等握手、
 不重连**（`McpHub::views`）：每台的状态与原因、传输方式、是否 OAuth、`description`、服务器级 exposure，和
 最近一次握手列出、按 `tools` 挑过的工具（每个的实际 exposure、`outward`、`read_only`）。工具清单在
-`adopt` 时记下，重连连上时换成新的那份；没连上过就是空的。命令、参数、URL 与变量名不返回（`docs/komo_bot.md`
-§3「Web 看 MCP 服务器与向量模型」）。
+`adopt` 时记下，重连连上时换成新的那份；没连上过就是空的。变量名不返回；命令参数与 URL 在
+2026-11-14 起作为 `endpoint` 返回（URL 去掉账号与查询串），见 §2.8（`docs/komo_bot.md` §3「Web 看 MCP 服务器与向量模型」）。
 
 ### 2.7 手动断开：`POST /v1/mcp/disconnect`（2026-10-30）
 
-设置页的服务器详情里"断开连接"。请求同重连（`{"servers": [...]}`，空 = 全部；名字不在配置里 400，一台也不动），交回断开后的状态。断开 = 放掉会话（stdio 子进程在最后一个在途调用返回后退出），停在新状态 `disconnected`：后台不再隔一阵重连，调用也不当场重连，直接报"已手动断开，这次调用没有执行"并指出怎么重连。工具名照旧挂着（下一条 Run 还看得见，调了得到那句原因），不撤下——撤下要动已受理 Run 的工具面。重连（`POST /v1/mcp/reconnect` 或 `komo mcp reconnect`）把它带回正常的连接流程。只在内存里，不写配置：Gateway 重启、或配置重载换掉这台服务器后照常连上；要长期不用就从配置里删掉。`McpServerState` 多一个 `disconnected`（CLI 的 `komo mcp` 列表写"已断开"）。测试 `mcp::tests::disconnect_stays_down_until_reconnected`。
+设置页的服务器详情里"断开连接"。请求同重连（`{"servers": [...]}`，空 = 全部；名字不在配置里 400，一台也不动），交回断开后的状态。断开 = 放掉会话（stdio 子进程在最后一个在途调用返回后退出），停在新状态 `disconnected`：后台不再隔一阵重连，调用也不当场重连，直接报"已手动断开，这次调用没有执行"并指出怎么重连。工具名照旧挂着（下一条 Run 还看得见，调了得到那句原因），不撤下——撤下要动已受理 Run 的工具面。重连（`POST /v1/mcp/reconnect` 或 `komo mcp reconnect`）把它带回正常的连接流程。只在内存里，不写配置：Gateway 重启、或配置重载换掉这台服务器后照常连上；要长期不用用 §2.8 的持久关闭（`enabled = false`）。`McpServerState` 多一个 `disconnected`（CLI 的 `komo mcp` 列表写"已断开"）。测试 `mcp::tests::disconnect_stays_down_until_reconnected`。
+
+### 2.8 持久关闭与逐个工具开关（2026-11-14，设置页，`docs/redesign.md` P10）
+
+`disconnect`（§2.7）只管到重启。设置页要的是**持久**的两层开关，都写进 `config.toml`（与别的常用设置同一条路：
+`toml_edit` 改原文、与加载同一个校验、原子写、重载；注释与键序保留），不另起存储：
+
+- **整台**：`[mcp.servers.<name>] enabled = false`。关着的服务器**不连接**（`McpConnection` 初始就是
+  `Link::Disabled`，没有后台连、没有重试），工具不挂；状态 `disabled`；重启后仍是这样。打开 = 删掉这个键，热重载
+  把配置变了的服务器先删后加，后台连，工具连上后从下一条 Run 起可用。关的时候已挂的工具走 §2.3 同一条撤销路径
+  （`McpChange::withdrawn`，原因"已在设置里关闭"）：不进之后受理 Run 的工具表与 codemode 的发现函数，也不进系统提示
+  的服务器段；已受理的 Run 再调它拿到那句原因，正在执行的那一次照常返回。关着的服务器上 `reconnect` / `disconnect`
+  不动它（先在设置里打开）。
+- **逐个工具**：`disabled_tools = ["原名", …]`。关着的工具不挂（`McpHub::new_tools` 跳过），已挂的撤掉，**不重连服务器**
+  ——热重载比较配置时忽略这一个键（`same_server`），只就地换（`McpConnection::set_disabled_tools`）；重新打开的工具
+  从最近一次握手的完整清单（`McpConnection::all`，没按 `tools` 白名单挑过）放回待挂，下一次 `new_tools` 挂回目录。
+  兜底：`McpConnection::call` 先看开关，被在途 Run 握着旧句柄的关着的工具也调不了（`NotSent`）。`tools` 白名单决定
+  "有哪些"，`disabled_tools` 决定"哪些先关着"；`GET /v1/mcp` 的工具清单含关着的（`enabled = false`），好让设置页还能打开它。
+- 接口（不带 `version`：一项开关，重复写无害）：`PUT /v1/mcp/{name}` 体 `{"enabled": bool}`、
+  `PUT /v1/mcp/{name}/tools/{tool}` 体 `{"enabled": bool}`，都返回 `McpServersResponse`（写完、重载完的各台此刻的样子）。
+  名字不在配置里 404；关一个服务器没列出过的工具 400（还没连上过就没有清单）；开不核对，好清掉服务器已经没有的名字。
+  配置文件里 `enabled = true` 与不写等价；`komo config check` 对没写 `enabled` 的旧配置零影响。
+- `GET /v1/mcp` 每台多 `enabled`、`endpoint`（stdio 是命令加参数，http 是去掉账号与查询串的 URL；设置页说明行用）；
+  每个工具多 `enabled`。`McpServerState` 多 `disabled`。
+- 被接续的 Run（Gateway 重启后）调到整台关着或单个关着的工具：`await_tools` 给"已在设置里关闭"的原因，不是一句
+  "没有这个工具"。
 
 ## 3. 暴露方式（2026-10-14，照 pi）
 

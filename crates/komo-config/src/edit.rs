@@ -755,6 +755,9 @@ pub fn remove_model(config_text: &str, alias: &str) -> Result<String, EditError>
     if sub_table_value(&doc, "models", "default").as_deref() == Some(alias) {
         users.push("默认模型（[models] default）".to_string());
     }
+    if sub_table_value(&doc, "models", "main").as_deref() == Some(alias) {
+        users.push("主对话的模型（[models] main）".to_string());
+    }
     for key in ["model", "embedding"] {
         if sub_table_value(&doc, "memory", key).as_deref() == Some(alias) {
             users.push(format!("[memory] {key}"));
@@ -796,6 +799,75 @@ pub fn set_default_model(config_text: &str, alias: &str) -> Result<String, EditE
         doc.insert("models", Item::Table(Table::new()));
     }
     doc["models"]["default"] = value(alias);
+    Ok(doc.to_string())
+}
+
+/// `[mcp.servers.<name>]` 那一项（表或内联表）；不在就是 `NotFound`。
+fn mcp_server_mut<'a>(
+    doc: &'a mut DocumentMut,
+    name: &str,
+) -> Result<&'a mut dyn toml_edit::TableLike, EditError> {
+    doc.get_mut("mcp")
+        .and_then(|mcp| mcp.get_mut("servers"))
+        .and_then(|servers| servers.get_mut(name))
+        .and_then(Item::as_table_like_mut)
+        .ok_or_else(|| EditError::NotFound(format!("MCP 服务器 `{name}`")))
+}
+
+/// 整台开 / 关一台 MCP 服务器：`[mcp.servers.<name>] enabled`。开 = 删掉这个键（默认就是开），
+/// 文件里不留一串 `enabled = true`；关 = 写 `enabled = false`。
+pub fn set_mcp_server_enabled(
+    config_text: &str,
+    name: &str,
+    enabled: bool,
+) -> Result<String, EditError> {
+    let mut doc = parse(config_text)?;
+    let server = mcp_server_mut(&mut doc, name)?;
+    if enabled {
+        server.remove("enabled");
+    } else {
+        server.insert("enabled", value(false));
+    }
+    Ok(doc.to_string())
+}
+
+/// 开 / 关一台 MCP 服务器上的一个工具：增删 `[mcp.servers.<name>] disabled_tools` 里那个原名。
+/// 全开时把空数组也删掉。`tool` 是不是服务器真有的名字这里不管（config 层看不到握手），调用方核对。
+pub fn set_mcp_tool_enabled(
+    config_text: &str,
+    name: &str,
+    tool: &str,
+    enabled: bool,
+) -> Result<String, EditError> {
+    if tool.trim().is_empty() {
+        return Err(EditError::Invalid("工具名不能是空的".into()));
+    }
+    let mut doc = parse(config_text)?;
+    let server = mcp_server_mut(&mut doc, name)?;
+    let mut disabled: Vec<String> = match server.get("disabled_tools") {
+        None => Vec::new(),
+        Some(item) => item
+            .as_array()
+            .ok_or_else(|| {
+                EditError::Invalid(format!(
+                    "[mcp.servers.{name}] disabled_tools 不是数组，先在文件里改"
+                ))
+            })?
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect(),
+    };
+    disabled.retain(|existing| existing != tool);
+    if !enabled {
+        disabled.push(tool.to_string());
+    }
+    disabled.sort();
+    if disabled.is_empty() {
+        server.remove("disabled_tools");
+    } else {
+        let array: Array = disabled.iter().map(String::as_str).collect();
+        server.insert("disabled_tools", value(array));
+    }
     Ok(doc.to_string())
 }
 

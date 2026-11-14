@@ -14,6 +14,7 @@ pub mod error;
 pub mod idempotency;
 pub mod matters;
 pub mod mcp;
+pub mod skills;
 pub mod memories;
 pub mod v2;
 
@@ -152,6 +153,10 @@ fn shared_routes() -> Router<Api> {
         .route("/v1/mcp", get(mcp::list))
         .route("/v1/mcp/reconnect", post(mcp::reconnect))
         .route("/v1/mcp/disconnect", post(mcp::disconnect))
+        .route("/v1/mcp/{name}", put(mcp::set_server))
+        .route("/v1/mcp/{name}/tools/{tool}", put(mcp::set_tool))
+        .route("/v1/skills", get(skills::list))
+        .route("/v1/skills/{name}", put(skills::set))
 }
 
 /// `GET /healthz`：最小健康检查与**实例标识**。

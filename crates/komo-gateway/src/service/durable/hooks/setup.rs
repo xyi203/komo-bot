@@ -144,15 +144,25 @@ fn resolve_at<'a>(
             .unwrap_or_else(|| config.paths.workspaces_dir.clone());
         let workspace = paths::real_root(&workspace);
 
+        // 对话的类型决定要不要用 `[models] main`，所以在选模型之前就取。
+        let own_session = task.is_some();
+        let (session, kind) = session_of(storage, conversation, own_session).await?;
+
         let mut model = match (&task, &parent) {
             // fork：沿用父此刻的模型与 effort（缓存才命中）。
             (Some(task), Some(parent)) if task.fork => parent.model.clone(),
             // fresh 任务：Agent 的默认模型。
             (Some(_), _) => profile_model(state, config, &profile),
             // 对话：sticky 的 `komo.agent.model`，没有就 Profile 的。
+            // 主对话再先看 `[models] main`（不写跟默认模型，也就是 Profile 的）。
             (None, _) => match doc.as_ref().and_then(|doc| doc.model.as_deref()) {
                 Some(alias) => catalog_model(config, alias)?,
-                None => profile_model(state, config, &profile),
+                None => match config.model_catalog.main.as_deref() {
+                    Some(alias) if kind == Some(SessionKind::Main) => {
+                        catalog_model(config, alias)?
+                    }
+                    _ => profile_model(state, config, &profile),
+                },
             },
         };
         match &task {
@@ -174,8 +184,6 @@ fn resolve_at<'a>(
         // 配置没写窗口时用探到的；探测还没回来就是 None。
         model.context_window = state.windows.effective(&model);
 
-        let own_session = task.is_some();
-        let (session, kind) = session_of(storage, conversation, own_session).await?;
         let cache_key = match (&task, &parent) {
             (Some(task), Some(parent)) if task.fork => parent.session.to_string(),
             _ => session.to_string(),

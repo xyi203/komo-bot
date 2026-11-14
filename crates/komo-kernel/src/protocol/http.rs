@@ -1951,9 +1951,20 @@ pub struct McpServerView {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     pub exposure: McpExposure,
-    /// 最近一次握手列出、按 `tools` 白名单挑过的；没连上过就是空的。
+    /// 整台开关（`[mcp.servers.<name>] enabled`，持久）。`false` 时 `state` 是 `disabled`，不连接。
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// 它在哪：stdio 是命令加参数，http 是 URL（去掉查询串与账号）。设置页「连接」表的说明行。
+    /// 凭证不在里面（`env` / `bearer_token_env` 只是变量名，不给）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+    /// 最近一次握手列出、按 `tools` 白名单挑过的（含关着的）；没连上过就是空的。
     #[serde(default)]
     pub tools: Vec<McpToolView>,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1975,6 +1986,9 @@ pub struct McpToolView {
     pub description: Option<String>,
     /// `tool_exposure` 覆盖之后的实际值。
     pub exposure: McpExposure,
+    /// 这个工具有没有开着（`disabled_tools` 里没有它）。关着的不进模型的工具表，也调不了。
+    #[serde(default = "default_true")]
+    pub enabled: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     #[cfg_attr(feature = "ts", ts(as = "Option<bool>"))]
     pub outward: bool,
@@ -1993,7 +2007,56 @@ pub enum McpServerState {
     NeedsAuth,
     Failed,
     /// 操作者手动断开（`POST /v1/mcp/disconnect`）：重连之前不自动再连，调它的工具报错。
+    /// 只管到重启；要持久关闭用 [`McpServerState::Disabled`]。
     Disconnected,
+    /// 配置里整台关着（`enabled = false`，`PUT /v1/mcp/{name}`）：不连接、工具不挂，重启后仍是这样。
+    Disabled,
+}
+
+/// `PUT /v1/mcp/{name}`、`PUT /v1/mcp/{name}/tools/{tool}`、`PUT /v1/skills/{name}` 的请求体：开或关。
+/// 不带 `version`——一项开关，重复写同一个值无害（MCP 的写 `config.toml`，与别的设置同一把锁）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct EnabledRequest {
+    pub enabled: bool,
+}
+
+/// `GET /v1/skills`：每个 skill 一行（搜索路径顺序，同名被盖住的不列）。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(optional_fields))]
+pub struct SkillsResponse {
+    #[serde(default)]
+    pub skills: Vec<SkillView>,
+}
+
+/// 一个 skill。`enabled = false` 的不进系统提示的目录行，`skill://` 也读不到。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(optional_fields))]
+pub struct SkillView {
+    pub name: String,
+    /// frontmatter 的 `description`，折成一行；没写就是空串。
+    pub description: String,
+    /// `SKILL.md` 所在的目录（它的搜索根下的那个子目录）。
+    pub path: String,
+    /// 来自哪一类根。
+    pub source: SkillSource,
+    pub enabled: bool,
+    /// 开着、却不进目录行的原因（平台或工具不满足、`SKILL.md` 缺 description）；进了就没有。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unavailable: Option<String>,
+}
+
+/// skill 的来源：配置里 `paths.skill_dirs` 声明的、komo 自己的 `~/.komo/skills`、与其他本地 agent
+/// 共享的 `~/.agents/skills`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum SkillSource {
+    Configured,
+    Komo,
+    Shared,
 }
 
 // ---------------------------------------------------------------- 一轮改了哪些文件

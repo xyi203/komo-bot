@@ -350,6 +350,9 @@ enum Link {
     /// 人手动断开（[`McpConnection::disconnect`]）。和 `Failed` 不同：后台不再连，用到时也不
     /// 当场连，直到人点重连（或 Gateway 重启）。会话同样放掉，在途调用用完才断。
     Disconnected,
+    /// 配置里整台关着（`enabled = false`）：从来没连过，也不会连。和 `Disconnected` 不同，这是
+    /// 持久的——重启之后仍是这样；打开它是改配置，热重载换上一个新的连接。
+    Disabled,
 }
 
 /// 调用没成的两种情况：确定没到服务器（没连上、凭证被拒），或发出去之后断了——后一种
@@ -378,6 +381,12 @@ pub struct McpConnection {
     /// 最近一次连上时按 `tools` 挑过的工具，给 `GET /v1/mcp` 看（`docs/mcp.md` §2.6）。与
     /// `pending` 不同，交出工具不清空它。
     listed: Mutex<Vec<McpToolView>>,
+    /// 最近一次连上时服务器列出的全部工具（没按 `tools` 挑）：重新打开一个关着的工具时拿它再挂，
+    /// 不必重连服务器。
+    all: Mutex<Vec<rmcp::model::Tool>>,
+    /// 关着的工具（服务器上的原名）。从配置的 `disabled_tools` 来，热重载就地换
+    /// （[`McpConnection::set_disabled_tools`]），不重连。
+    disabled_tools: Mutex<BTreeSet<String>>,
     /// 已从配置移除。不进锁：重连可能握着锁好几秒，移除不该等它。
     closed: AtomicBool,
     /// 后台正隔一阵再连（[`McpConnection::retry_while_failed`]）：同一时刻只有一个。
@@ -415,7 +424,11 @@ impl McpConnection {
             config: config.clone(),
             secrets: secrets.clone(),
             data_dir: data_dir.to_path_buf(),
-            link: tokio::sync::Mutex::new(Link::Connecting),
+            link: tokio::sync::Mutex::new(if config.enabled {
+                Link::Connecting
+            } else {
+                Link::Disabled
+            }),
             namespace: Mutex::new(ToolNamespace {
                 name: namespace_name(name),
                 server: name.to_string(),
@@ -424,9 +437,12 @@ impl McpConnection {
             }),
             pending: Mutex::new(Vec::new()),
             listed: Mutex::new(Vec::new()),
+            all: Mutex::new(Vec::new()),
+            disabled_tools: Mutex::new(config.disabled_tools.iter().cloned().collect()),
             closed: AtomicBool::new(false),
             retrying: AtomicBool::new(false),
-            settled: tokio::sync::watch::Sender::new(false),
+            // 关着的没有"第一次连接"可等
+            settled: tokio::sync::watch::Sender::new(!config.enabled),
             started: Instant::now(),
             startup_wait,
             retry_first,
@@ -441,6 +457,9 @@ impl McpConnection {
     /// 握手。调用先到、已经连过了，这里就什么也不做。没连上（不是登录的问题）就接着在后台
     /// 隔一阵再连。
     fn connect_in_background(self: &Arc<Self>) {
+        if !self.config.enabled {
+            return;
+        }
         let connection = Arc::clone(self);
         tokio::spawn(async move {
             {
@@ -494,6 +513,10 @@ impl McpConnection {
     /// 等到有结果，交回这时的状态。连着的会话换掉——在途调用握着旧的那份，返回之后才断开。没连上
     /// 就同第一次没连上一样，后台隔一阵再连。
     async fn reconnect(self: &Arc<Self>) -> McpServerStatus {
+        // 整台关着的不重连：先在设置里打开它
+        if !self.config.enabled {
+            return self.status();
+        }
         let failed = {
             let mut link = self.link.lock().await;
             if !self.is_closed() {
@@ -531,6 +554,10 @@ impl McpConnection {
     /// [`Link::Disconnected`]，后台不再连、用到时也不连。正在连的那次连完才拿得到锁，连完照样
     /// 断开。交回断开后的状态。
     async fn disconnect(&self) -> McpServerStatus {
+        // 整台关着的本来就没连：别把"已关闭"盖成"已断开"
+        if !self.config.enabled {
+            return self.status();
+        }
         {
             let mut link = self.link.lock().await;
             if !self.is_closed() {
@@ -550,6 +577,13 @@ impl McpConnection {
         )
     }
 
+    fn disabled_message(&self) -> String {
+        format!(
+            "MCP 服务器 {} 已在设置里关闭，这次调用没有执行；先在设置里打开它",
+            self.name
+        )
+    }
+
     fn removed_message(&self) -> String {
         format!("MCP 服务器 {} 已从配置移除，它的工具不能再调", self.name)
     }
@@ -559,7 +593,8 @@ impl McpConnection {
     /// pi 只等直出的（`hasDirectTools`），因为它的脚本侧工具调用时才按名字找服务器；komo 的能力面
     /// 在受理时按名字冻结，没挂上的工具这条 Run 从头到尾调不到，所以只在脚本里调的也要等。
     fn has_callable_tools(&self) -> bool {
-        self.config.exposure != McpExposure::Hidden
+        self.config.enabled
+            && self.config.exposure != McpExposure::Hidden
             || self
                 .config
                 .tool_exposure
@@ -615,6 +650,7 @@ impl McpConnection {
             Link::NeedsAuth { .. } => Err(self.login_hint()),
             Link::Closed => Err(self.removed_message()),
             Link::Disconnected => Err(self.disconnected_message()),
+            Link::Disabled => Err(self.disabled_message()),
             Link::Failed(error) => Err(format!(
                 "MCP 服务器 {} 连接失败（{error}），这次调用没有执行",
                 self.name
@@ -636,6 +672,7 @@ impl McpConnection {
                     Link::Failed(error) => (McpServerState::Failed, Some(error.clone())),
                     Link::Closed => (McpServerState::Failed, Some(self.removed_message())),
                     Link::Disconnected => (McpServerState::Disconnected, None),
+                    Link::Disabled => (McpServerState::Disabled, None),
                 },
             }
         };
@@ -660,8 +697,66 @@ impl McpConnection {
             oauth: self.is_oauth(),
             description: self.config.description.clone(),
             exposure: self.config.exposure,
-            tools: self.listed.lock().expect("MCP 工具清单").clone(),
+            enabled: self.config.enabled,
+            endpoint: Some(self.endpoint()),
+            tools: {
+                let disabled = self.disabled_tools.lock().expect("MCP 关着的工具");
+                let mut tools = self.listed.lock().expect("MCP 工具清单").clone();
+                for tool in &mut tools {
+                    tool.enabled = !disabled.contains(&tool.name);
+                }
+                tools
+            },
         }
+    }
+
+    /// 这台服务器在哪：stdio 的命令加参数，http 的 URL（去掉账号与查询串，那里最容易带 token）。
+    fn endpoint(&self) -> String {
+        match &self.config.transport {
+            McpTransport::Stdio { command, args, .. } => std::iter::once(command.as_str())
+                .chain(args.iter().map(String::as_str))
+                .collect::<Vec<_>>()
+                .join(" "),
+            McpTransport::Http { url, .. } => {
+                let without_query = url.split(['?', '#']).next().unwrap_or(url);
+                match without_query.split_once("://") {
+                    Some((scheme, rest)) => {
+                        // 账号只可能在第一个 `/` 之前
+                        let (authority, path) = match rest.find('/') {
+                            Some(at) => rest.split_at(at),
+                            None => (rest, ""),
+                        };
+                        let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+                        format!("{scheme}://{host}{path}")
+                    }
+                    None => without_query.to_string(),
+                }
+            }
+        }
+    }
+
+    /// 这个工具（服务器上的原名）此刻是关着的。
+    fn tool_disabled(&self, tool: &str) -> bool {
+        self.disabled_tools
+            .lock()
+            .expect("MCP 关着的工具")
+            .contains(tool)
+    }
+
+    /// 热重载换了 `disabled_tools`：就地换，不重连。交回（刚关上的原名，有没有刚重新打开的）。
+    /// 重新打开的工具从 `all` 里放回待挂，下一次 [`McpHub::new_tools`] 再挂进目录。
+    fn set_disabled_tools(&self, next: &[String]) -> (Vec<String>, bool) {
+        let next: BTreeSet<String> = next.iter().cloned().collect();
+        let mut current = self.disabled_tools.lock().expect("MCP 关着的工具");
+        let closed: Vec<String> = next.difference(&current).cloned().collect();
+        let reopened = current.difference(&next).next().is_some();
+        *current = next;
+        drop(current);
+        if reopened {
+            *self.pending.lock().expect("MCP 待挂工具") =
+                self.all.lock().expect("MCP 全部工具").clone();
+        }
+        (closed, reopened)
     }
 
     pub fn namespace(&self) -> ToolNamespace {
@@ -789,6 +884,8 @@ impl McpConnection {
                     .and_then(|text| text.lines().map(str::trim).find(|line| !line.is_empty()))
                     .map(str::to_string),
                 exposure: self.config.exposure_of(&tool.name),
+                // 开关此刻的值在读的时候（`view`）按 `disabled_tools` 填
+                enabled: true,
                 outward: self.config.outward_of(&tool.name),
                 read_only: self
                     .config
@@ -798,6 +895,7 @@ impl McpConnection {
             })
             .collect();
         *self.pending.lock().expect("MCP 待挂工具") = connected.tools.clone();
+        *self.all.lock().expect("MCP 全部工具") = connected.tools.clone();
         tracing::info!(server = %self.name, tools = count, "MCP 服务器已连上");
     }
 
@@ -812,7 +910,7 @@ impl McpConnection {
             Link::Connecting | Link::Failed(_) => true,
             Link::Connected(server) => server.is_closed(),
             Link::NeedsAuth { tokens } => self.stored_tokens() != *tokens,
-            Link::Closed | Link::Disconnected => false,
+            Link::Closed | Link::Disconnected | Link::Disabled => false,
         };
         // 等锁的时候被移除了：不再连。
         if self.is_closed() {
@@ -828,6 +926,7 @@ impl McpConnection {
             Link::Failed(error) => Err(format!("MCP 服务器 {} 连不上：{error}", self.name)),
             Link::Closed => Err(self.removed_message()),
             Link::Disconnected => Err(self.disconnected_message()),
+            Link::Disabled => Err(self.disabled_message()),
             // `connect_into` 总会写一个结果，走不到这里；真走到了也只是这次调用报错。
             Link::Connecting => Err(format!("MCP 服务器 {} 还在连", self.name)),
         }
@@ -840,6 +939,13 @@ impl McpConnection {
         tool: &str,
         arguments: JsonObject,
     ) -> Result<CallToolResult, CallError> {
+        // 关着的工具哪怕被在途的 Run 握着也调不了（目录里已撤，这里兜住拿着旧句柄的）
+        if self.tool_disabled(tool) {
+            return Err(CallError::NotSent(format!(
+                "MCP 工具 {tool}（服务器 {}）已在设置里关闭，这次调用没有执行",
+                self.name
+            )));
+        }
         let server = self.ready().await.map_err(CallError::NotSent)?;
         match server.call(tool, arguments).await {
             Ok(result) => Ok(result),
@@ -888,6 +994,13 @@ impl McpConnection {
         tracing::info!(server = %self.name, "MCP 凭证文件变了，重连");
         self.connect_into(&mut link).await;
     }
+}
+
+/// 两份配置除了 `disabled_tools` 之外相同：只差它的不必重连（[`McpConnection::set_disabled_tools`]）。
+fn same_server(a: &McpServerConfig, b: &McpServerConfig) -> bool {
+    let mut a = a.clone();
+    a.disabled_tools = b.disabled_tools.clone();
+    a == *b
 }
 
 /// 一次 [`McpHub::reconcile`] 做了什么。
@@ -1032,7 +1145,11 @@ impl McpHub {
         let mut change = McpChange::default();
         let stale: Vec<String> = connections
             .iter()
-            .filter(|(name, connection)| servers.get(*name) != Some(&connection.config))
+            .filter(|(name, connection)| {
+                !servers
+                    .get(*name)
+                    .is_some_and(|config| same_server(config, &connection.config))
+            })
             .map(|(name, _)| name.clone())
             .collect();
         for name in stale {
@@ -1040,10 +1157,14 @@ impl McpHub {
                 continue;
             };
             connection.close();
-            let reason = if servers.contains_key(&name) {
-                format!("MCP 服务器 {name} 的配置改了，正在重连；连上后从下一条 Run 起可用")
-            } else {
-                connection.removed_message()
+            let reason = match servers.get(&name) {
+                Some(config) if !config.enabled => {
+                    format!("MCP 服务器 {name} 已在设置里关闭，它的工具不能再调")
+                }
+                Some(_) => {
+                    format!("MCP 服务器 {name} 的配置改了，正在重连；连上后从下一条 Run 起可用")
+                }
+                None => connection.removed_message(),
             };
             registered.retain(|tool, owner| {
                 if *owner == name {
@@ -1055,6 +1176,26 @@ impl McpHub {
             });
             tracing::info!(server = %name, "MCP 服务器已断开（配置删了或改了）");
             change.removed.push(name);
+        }
+        // 留下来的服务器只换了 `disabled_tools` 的：就地换，不重连。刚关上的撤掉，重新打开的在下一次
+        // `new_tools` 里挂回来。
+        for (name, config) in servers {
+            let Some(connection) = connections.get(name) else {
+                continue;
+            };
+            let (closed, _reopened) = connection.set_disabled_tools(&config.disabled_tools);
+            for tool in closed {
+                let Some(model_name) = tool_name(name, &tool) else {
+                    continue;
+                };
+                if registered.get(&model_name).is_some_and(|owner| owner == name) {
+                    registered.remove(&model_name);
+                    change.withdrawn.push((
+                        model_name,
+                        format!("MCP 工具 {tool}（服务器 {name}）已在设置里关闭，不能再调"),
+                    ));
+                }
+            }
         }
         for (name, config) in servers {
             if connections.contains_key(name) {
@@ -1191,6 +1332,15 @@ impl McpHub {
                 .collect();
             if !reasons.is_empty() {
                 unresolved.insert(name.clone(), reasons.join("；"));
+            } else if owners.iter().any(|owner| {
+                owner
+                    .disabled_tools
+                    .lock()
+                    .expect("MCP 关着的工具")
+                    .iter()
+                    .any(|tool| tool_name(owner.name(), tool).as_deref() == Some(name.as_str()))
+            }) {
+                unresolved.insert(name.clone(), "这个工具已在设置里关闭，不能调".to_string());
             }
         }
         (tools, unresolved)
@@ -1224,6 +1374,10 @@ impl McpHub {
             let config = &connection.config;
             let (selected, _missing) = select(config, &listed);
             for remote in selected {
+                // 单独关着的工具不挂（模型的工具表与脚本都看不到）
+                if connection.tool_disabled(&remote.name) {
+                    continue;
+                }
                 let exposure = match config.exposure_of(&remote.name) {
                     McpExposure::Hidden => continue,
                     McpExposure::Codemode => ToolExposure::Codemode,
@@ -1296,6 +1450,8 @@ mod tests {
             exposure: Default::default(),
             tool_exposure: Default::default(),
             outward: vec![],
+            enabled: true,
+            disabled_tools: vec![],
         };
         let (kept, missing) = select(&config, &listed);
         assert_eq!(
@@ -1378,6 +1534,8 @@ for line in sys.stdin:
                 exposure: McpExposure::Codemode,
                 tool_exposure: BTreeMap::new(),
                 outward: vec![],
+                enabled: true,
+                disabled_tools: vec![],
             }
         }
 

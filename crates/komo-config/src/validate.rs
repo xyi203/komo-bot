@@ -660,6 +660,8 @@ mod tests {
             exposure: Default::default(),
             tool_exposure: Default::default(),
             outward: vec![],
+            enabled: true,
+            disabled_tools: vec![],
         }
     }
 

@@ -137,7 +137,7 @@ Gateway 对数据目录持有进程锁。多个 CLI 同时启动时，只允许�
 
 重载事件带新旧快照的差异（键名，不带值，凭证更不带）写进 Gateway 日志；`komo doctor` 显示当前生效配置的加载时间与来源文件 mtime，两者不一致就是"文件改了但没装上"，把上一次校验错误一并印出来。
 
-**从 Web 改模型配置（2026-10-29，认可）。** 文件仍是唯一的配置权威，Web 客户端改的也是同一个文件：Gateway 代写 `config.toml` 与 `.env`，写完走上面同一个重载函数。先只开放模型这一组——`[model_providers.<id>]`、completion 类的 `[model.<alias>]` 与 `[models] default`；Agent、MCP、记忆等其余各节仍只能编辑文件。
+**从 Web 改模型配置（2026-10-29，认可）。** 文件仍是唯一的配置权威，Web 客户端改的也是同一个文件：Gateway 代写 `config.toml` 与 `.env`，写完走上面同一个重载函数。先只开放模型这一组——`[model_providers.<id>]`、completion 类的 `[model.<alias>]` 与 `[models] default`；Agent、记忆等其余各节仍只能编辑文件。（2026-11-14 起 MCP 的整台 / 逐个工具开关也能从 Web 写，同一套写法但不带 `version`，见 `docs/mcp.md` §2.8。）
 
 - **读**：`GET /v1/config/models` 返回文件里写着的 provider 与模型（不是展开后的快照：看到的就是要改的），每个 provider 带"凭证在不在"（`env_key` 指向的变量在当前 `.env` / 进程环境里有没有值、`auth = "chatgpt"` 不用变量），**不返回任何凭证值**；另带一个 `version`（`config.toml` 与 `.env` 内容的哈希）。
 - **写**：provider 与模型的增、改、删，改默认模型。每次写都带读到的 `version`，文件此刻的哈希对不上（有人在编辑器里改过、或另一个窗口先写了）就 409，什么都不写。
@@ -157,7 +157,7 @@ Gateway 对数据目录持有进程锁。多个 CLI 同时启动时，只允许�
 
 **Web 看 MCP 服务器与向量模型（2026-10-30，认可）。** 两样此前在设置页看不到的东西补上，都只读：
 
-- `GET /v1/mcp`：每台配置过的 MCP 服务器**此刻**的样子，不等握手、不触发重连（`McpHub` 手里的状态）：名字、状态与原因（同 `McpServerStatus`）、传输方式（`stdio` / `http`）、是否走 OAuth、`description`、服务器级的 `exposure`，以及**最近一次握手**列出、按 `tools` 白名单挑过的工具——每个带一行说明、实际的 exposure（`tool_exposure` 覆盖后的）、是否声明为对外（`outward`）与只读（`read_only`）。从没连上过的服务器工具清单为空。命令行、参数、URL 与凭证变量名不返回：设置页不讲东西在哪儿配。
+- `GET /v1/mcp`：每台配置过的 MCP 服务器**此刻**的样子，不等握手、不触发重连（`McpHub` 手里的状态）：名字、状态与原因（同 `McpServerStatus`）、传输方式（`stdio` / `http`）、是否走 OAuth、`description`、服务器级的 `exposure`，以及**最近一次握手**列出、按 `tools` 白名单挑过的工具——每个带一行说明、实际的 exposure（`tool_exposure` 覆盖后的）、是否声明为对外（`outward`）与只读（`read_only`）。从没连上过的服务器工具清单为空。凭证变量名不返回；命令行与 URL 在 2026-11-14 起作为 `endpoint` 返回（URL 去掉账号与查询串，`docs/mcp.md` §2.8）。
 - Web 的 MCP 一节是一张服务器表（服务器 / 方式 / 状态），点一行进详情：状态与工具数、说明、工具清单、"重连这台"（`POST /v1/mcp/reconnect` 点名这一台）；要登录的给出 `komo auth mcp login <名字>`。增删改服务器仍在配置文件里。
 - `GET /v1/config/models` 加 `embeddings`：每个 `type = "embedding"` 的模型项（alias、`model`、协议、`base_url`、`model_provider`、凭证变量名与在不在、`dimensions`），和 `memory_embedding`（`[memory] embedding` 指的 alias）。（最初只读，2026-10-30 同日开放写，见下一段。）
 - **实现（2026-10-30）。** kernel `protocol::http` 的 `McpServersResponse` / `McpServerView` / `McpTransportKind` / `McpToolView`，`ConfigModelsResponse` 加 `embeddings`（`EmbeddingModelEntry`）与 `memory_embedding`；runtime `McpConnection` 在 `adopt` 时记下挑过的工具（`listed`，交出工具不清空），`McpConnection::view` / `McpHub::views`；`config::edit::models_view` 列出 embedding 模型项（凭证变量名没写就继承 provider）；gateway `http::mcp::list`。测试：runtime `mcp::tests::views_list_the_selected_tools_with_their_flags`（白名单外不列、实际 exposure / 对外 / 只读、交出工具后清单还在、连不上的为空且带原因），`config::edit::tests` 的视图那条加了 embedding。另在临时数据目录起前台 Gateway，配一台演示 stdio 服务器（四个工具：只读、直出、对外、不挂各一）、一台起不来的、一台要 OAuth 的，经 Web 看了表、两种详情、单台重连，桌面与手机各截了图；没碰真实的 `~/.komo`。`cargo test --workspace`：2527 通过、0 失败、12 忽略；`cargo fmt --check` 通过。已装到本机，7777 上的 `GET /v1/mcp` 能读到。
@@ -368,7 +368,8 @@ Skills 是**人写的程序性说明**——"做 X 时按这几步、跑这个�
 - **没有 skill 工具。**模型通过 `read` 读 `SKILL.md`——写本地路径，或者写 `skill://<名字>/SKILL.md`（§4.7，逻辑入口，审计显示的是它）；skills 目录是只读根（§4.7 的资源根也在 `ToolContext.roots` 里）。
 - **目录行的门控按这条 Run 的能力面**：某个 Agent 的面里没有 `bash` 时，`requires_tools: [bash]` 的 skill 不进它的目录行；而 `skill://` 仍然读得到——门控管的是"要不要摆在眼前"，不是"能不能读"。
 - Cron Job 可以声明 `skills = ["…"]`，触发时把这些 SKILL.md 正文预载进首轮上下文。
-- `komo skills list | inspect <name> | enable | disable`；`disable` 只从目录行隐藏，不删文件。没有安装 / 候选 / 治理流程——Skills 由人写、由人放进目录。
+- `komo skills list | inspect <name> | enable | disable`；`disable` 只从目录行隐藏，不删文件（名单在 `runtime/skills-disabled.json`）。没有安装 / 候选 / 治理流程——Skills 由人写、由人放进目录。
+- **设置页的开关（2026-11-14）**：`GET /v1/skills` 列出（名字、说明、来源、启用与否）、`PUT /v1/skills/{name}` 开关，写的是同一个名单文件，写完当场重渲目录行（之后受理的 Run 生效，在跑的冻结着旧的）。停用的 skill 另外不在 `skill://` 的挂载里（`skill://<名字>` 读不到）；模型没有 `skill` 工具，所以"不可被调用"就是这两处。CLI 仍直接读写文件、不经 Gateway，改完要等下一次配置重载（或网页上点一下）目录行才跟上。
 
 ## 6. Agent Loop
 
@@ -973,6 +974,10 @@ CLI 通过 HTTP 发命令，通过 SSE 观察运行。Gateway 内部采用函数
 | GET /v1/mcp                      | 每台 MCP 服务器此刻的状态、传输方式与最近一次握手列出的工具；不等握手、不重连（§3「Web 看 MCP 服务器与向量模型」） |
 | POST /v1/mcp/reconnect           | 点名的 MCP 服务器（空 = 全部）断开重连，等握手完交回各自状态；名字不在配置里 400（`docs/mcp.md` §2.5） |
 | POST /v1/mcp/disconnect          | 点名的 MCP 服务器（空 = 全部）手动断开，停到重连为止：后台不再连，调用报"已手动断开"；只在内存里，重启后照常连（`docs/mcp.md` §2.7） |
+| PUT /v1/mcp/{name}               | 整台持久开 / 关（体 `{"enabled": bool}`，写 `[mcp.servers.<name>] enabled`，热重载生效）；回 `McpServersResponse`（`docs/mcp.md` §2.8） |
+| PUT /v1/mcp/{name}/tools/{tool}  | 逐个工具持久开 / 关（写 `disabled_tools`，不重连服务器）；回 `McpServersResponse`（`docs/mcp.md` §2.8） |
+| GET /v1/skills                   | skill 列表：名字、说明、来源（配置目录 / komo / 共享）、是否启用、开着却进不了目录行的原因（§5.6） |
+| PUT /v1/skills/{name}            | 开 / 关一个 skill（体 `{"enabled": bool}`，写 `runtime/skills-disabled.json`，与 `komo skills enable|disable` 同一个文件）；关掉的不进目录行、`skill://` 不挂；回 `SkillsResponse` |
 | POST /v1/attachments             | 网页输入框的附件：请求体是原始字节（`?name=` 原文件名），存进 `{workspaces_dir}/inbox/web/`，交回路径、拼进正文的说明，图片另有缩略图地址；上限 20 MB，超了 413 |
 | GET /v1/attachments/{inbox}/{name} | 取回收件箱里按内容哈希命名的图片（网页缩略图；渠道删除前收进 `inbox/{平台}/` 的旧图也行）；别的名字一律 404，不是读文件的口子 |
 | GET /v1/home-session             | 操作者的 home session（§11.2）                 |
@@ -1027,6 +1032,7 @@ Axum 已提供 SSE 响应；toasty 的 turso 驱动提供连接与事务，MVCC 
 | `model.<alias>`          | 一项模型；`type = "completion"` 或 `"embedding"`，可覆盖 provider 的任一连接字段 |
 | `auth`                   | 凭证不走 `.env` 变量，走另一种机制；目前只有 `"chatgpt"`（ChatGPT 账号 OAuth，给 Codex 模型用）。与 `env_key` 互斥，只允许 `api_backend = "responses"`（下方单独一段） |
 | `models.default`         | 默认对话模型 alias；Session / Cron 的 `model` 参数也使用 alias |
+| `models.main`            | 主对话这一段会话用的 completion alias（2026-11-14，`docs/redesign.md` §2.3）；省略时使用 `models.default`。优先级：会话里 sticky 的模型 > `models.main`（只对主对话）> Agent 的 `model` > `models.default`；支线、任务、定时会话不看它。写了不存在或非 completion 的 alias 配置判无效；设置白名单里 `models.main` 可改可清 |
 | `memory.model`           | 记忆提取模型 alias；省略时使用 `models.default` |
 | `memory.embedding`       | 向量模型 alias；hybrid / vector 检索时必填 |
 

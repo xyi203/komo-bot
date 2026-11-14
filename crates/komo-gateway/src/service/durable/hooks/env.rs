@@ -101,6 +101,8 @@ pub(crate) fn build(
     let cwd = resolved.workspace.clone();
     let skills = state.skills.read().expect("skills 注册表");
     let skill_dirs = skills.dirs().to_vec();
+    // 停用的 skill 不挂：`skill://<名字>` 读不到，与它不在目录行里一致（设置页的开关，持久）
+    let disabled_skills = skills.disabled();
     let roots = run_roots(Some(sessions_dir), session, cwd.clone(), &skill_dirs);
 
     // 资源命名空间的挂载点（§六）：skill 那一份是**这一次**的活注册表（只决定 `skill://` 按名字
@@ -111,6 +113,7 @@ pub(crate) fn build(
         skills: skills
             .list()
             .into_iter()
+            .filter(|skill| !disabled_skills.contains(&skill.name))
             .filter_map(|skill| {
                 // `Skill.path` 是 SKILL.md 的字面路径；拿不到父目录就跳过这一份。
                 let dir = skill.path.parent()?.to_path_buf();

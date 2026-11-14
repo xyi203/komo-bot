@@ -415,10 +415,32 @@ async fn edit<F>(api: &Api, version: &str, change: F) -> ApiResult<Json<ConfigEd
 where
     F: FnOnce(&str, &str) -> Result<(Option<String>, Option<String>), EditError>,
 {
+    let (config_after, env_after, reload) = write_config(api, Some(version), change).await?;
+    // 生效值从重载后的快照读，三份视图共用这个新 version
+    Ok(Json(ConfigEditResponse {
+        models: view(api, &config_after, &env_after)?,
+        settings: settings_view(api, &config_after, &env_after)?,
+        env: env_view(api, &config_after, &env_after)?,
+        reload,
+    }))
+}
+
+/// [`edit`] 的主体，返回改后的两份文本与重载报告。`version = None` 不比版本：给"设成某个值"这种
+/// 一项开关用（MCP 的整台 / 逐个工具开关），重复写同一个值无害，不必先 GET 一个 version 回来。
+pub(super) async fn write_config<F>(
+    api: &Api,
+    version: Option<&str>,
+    change: F,
+) -> ApiResult<(String, String, komo_kernel::protocol::http::ConfigReloadResponse)>
+where
+    F: FnOnce(&str, &str) -> Result<(Option<String>, Option<String>), EditError>,
+{
     let holder = &api.state.config;
     let _writing = holder.edit_lock().lock().await;
     let (config, env) = holder.read_texts().map_err(io_failure)?;
-    if komo_config::config_version(&config, &env) != version {
+    if let Some(version) = version
+        && komo_config::config_version(&config, &env) != version
+    {
         return Err(ApiFailure::new(
             ErrorCode::VersionConflict,
             "配置文件在你打开之后被改过了（编辑器里，或另一个窗口）：刷新再改",
@@ -443,13 +465,7 @@ where
             return Err(failure);
         }
     };
-    // 生效值从重载后的快照读，三份视图共用这个新 version
-    Ok(Json(ConfigEditResponse {
-        models: view(api, config_after, env_after)?,
-        settings: settings_view(api, config_after, env_after)?,
-        env: env_view(api, config_after, env_after)?,
-        reload,
-    }))
+    Ok((config_after.to_string(), env_after.to_string(), reload))
 }
 
 fn secrets(api: &Api, env: &str) -> ApiResult<komo_llm::Secrets> {

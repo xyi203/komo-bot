@@ -33,7 +33,7 @@ pub use edit::{
     CatalogRow, EditError, EmbeddingFields, ModelFields, ProviderFields, config_version, env_view,
     models_view, remove_embedding_model, remove_env_value, remove_model, remove_provider,
     rename_embedding_model, rename_provider, set_default_model, set_env_value, set_env_values,
-    set_provider_models, upsert_embedding_model, upsert_model, upsert_provider,
+    set_mcp_server_enabled, set_mcp_tool_enabled, set_provider_models, upsert_embedding_model, upsert_model, upsert_provider,
 };
 pub use env::{HomeError, KOMO_HOME, KOMO_LISTEN, secrets_from_text, user_home};
 pub use error::ConfigError;

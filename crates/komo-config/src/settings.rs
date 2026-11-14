@@ -60,6 +60,8 @@ const SETTINGS: &[Spec] = &[
         clearable: false,
         ..spec("default_agent", SettingKind::Choice, Options::Agents)
     },
+    // 主对话这一段会话用的模型；不写跟默认模型（`[models] default` 走 `PUT /v1/config/default-model`）。
+    spec("models.main", SettingKind::Choice, Options::CompletionModels),
     spec("memory.enabled", SettingKind::Bool, Options::None),
     spec(
         "memory.model",
@@ -151,6 +153,7 @@ fn models_of_type(doc: &DocumentMut, kind: &str) -> Vec<String> {
 fn effective(key: &str, snapshot: &ConfigSnapshot, doc: &DocumentMut) -> Option<Value> {
     Some(match key {
         "default_agent" => Value::String(snapshot.agent.default_agent.clone()),
+        "models.main" => Value::String(snapshot.model_catalog.main.clone()?),
         "memory.enabled" => Value::Bool(snapshot.memory.enabled),
         // 快照里放的是展开后的模型，不是 alias；没写时继承默认模型（file.rs 同一条规则）。
         "memory.model" => lookup(doc, "memory.model")

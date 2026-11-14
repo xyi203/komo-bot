@@ -158,13 +158,14 @@
 
 ### 2.3 设置
 
-- [ ] MCP 逐个工具的启停（现在没有接口）
-- [ ] MCP 整台的持久关闭（现在 `disconnect` 到重启就恢复）
+- [x] MCP 逐个工具的启停（2026-11-14，4a）：`PUT /v1/mcp/{name}/tools/{tool}`，持久在 `[mcp.servers.<name>] disabled_tools`，不重连，细节见 `docs/mcp.md` §2.8
+- [x] MCP 整台的持久关闭（2026-11-14，4a）：`PUT /v1/mcp/{name}`，持久在 `enabled = false`；原来的 `disconnect` 仍是"到重启为止"的临时断开
 - [ ] 网页添加 MCP 服务器：待定（现在只能改配置文件）
-- [ ] 技能的列表与启停接口（现在只有命令行）
-- [ ] 渠道的启用开关（现在只有列表与探测）
+- [x] 技能的列表与启停接口（2026-11-14，4a）：`GET /v1/skills`、`PUT /v1/skills/{name}`，名单沿用 `runtime/skills-disabled.json`（与 `komo skills` 同一个文件），`docs/komo_bot.md` §5.6
+- [x] ~~渠道的启用开关~~ 不做（P17，渠道已整个删除）
 - [x] `router_model` 随 Router 删掉（2026-11-13）。已核实配置层对不认识的键只给一条警告、不判配置无效（`komo-config/src/lib.rs` 的 `read_config`），所以旧配置里留着 `router_model` 或 `stall_*` 服务照常起，`komo config check` 各报一条"不认识这个键，已忽略"，没有另做"退役"处理
-- [ ] 设置里「主对话的模型」的含义改成主对话这段会话用的模型（不设就跟默认模型）
+- [x] 设置里「主对话的模型」的含义改成主对话这段会话用的模型（不设就跟默认模型）（2026-11-14，4a）：新键 `[models] main`，只对 `kind = main` 的会话生效，写进设置白名单（`PUT /v1/config/settings/models.main`，可清）；默认 / 记忆 / 向量模型的读写本来就有（`PUT /v1/config/default-model`、白名单的 `memory.model` / `memory.embedding`、`PUT /v1/config/embedding-models/{alias}`）
+- 4a 盘点（2026-11-14）：提供商增删改、模型目录、环境变量、配置检查、重建记忆索引（`POST /v1/memory-index/rebuild`）、关于页的版本与启动时间（`GET /healthz`）都已有，没动；渠道的启用开关随 P17 不做（渠道已删）；「Gateway 地址可改」是浏览器端行为，不涉及服务端
 - [ ] 浏览器里改 Gateway 地址：实际是跳到另一台并重新配对，不涉及服务端；桌面壳把已有的连接设置并进弹窗
 
 ### 2.4 去掉群聊（已被 §2.6 包含，不单做）

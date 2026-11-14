@@ -14,6 +14,7 @@ import { Route as PairRouteImport } from './routes/pair'
 import { Route as AppIndexRouteImport } from './routes/_app/index'
 import { Route as AppChatsIdRouteImport } from './routes/_app/chats.$id'
 import { Route as AppChatsNewRouteImport } from './routes/_app/chats.new'
+import { Route as AppChatsIndexRouteImport } from './routes/_app/chats.index'
 import { Route as AppGoalsIndexRouteImport } from './routes/_app/goals/index'
 import { Route as AppGoalsIdRouteImport } from './routes/_app/goals/$id'
 import { Route as AppMattersIndexRouteImport } from './routes/_app/matters/index'
@@ -46,6 +47,11 @@ const AppChatsIdRoute = AppChatsIdRouteImport.update({
 const AppChatsNewRoute = AppChatsNewRouteImport.update({
   id: '/chats/new',
   path: '/chats/new',
+  getParentRoute: () => AppRoute,
+} as any)
+const AppChatsIndexRoute = AppChatsIndexRouteImport.update({
+  id: '/chats/',
+  path: '/chats/',
   getParentRoute: () => AppRoute,
 } as any)
 const AppGoalsIndexRoute = AppGoalsIndexRouteImport.update({
@@ -104,6 +110,7 @@ export interface FileRoutesByFullPath {
   '/memory/$id': typeof AppMemoryIdRoute
   '/sessions/$sessionId': typeof AppSessionsSessionIdRoute
   '/settings/$section': typeof AppSettingsSectionRoute
+  '/chats/': typeof AppChatsIndexRoute
   '/goals/': typeof AppGoalsIndexRoute
   '/matters/': typeof AppMattersIndexRoute
   '/memory/': typeof AppMemoryIndexRoute
@@ -119,6 +126,7 @@ export interface FileRoutesByTo {
   '/memory/$id': typeof AppMemoryIdRoute
   '/sessions/$sessionId': typeof AppSessionsSessionIdRoute
   '/settings/$section': typeof AppSettingsSectionRoute
+  '/chats': typeof AppChatsIndexRoute
   '/goals': typeof AppGoalsIndexRoute
   '/matters': typeof AppMattersIndexRoute
   '/memory': typeof AppMemoryIndexRoute
@@ -136,6 +144,7 @@ export interface FileRoutesById {
   '/_app/memory/$id': typeof AppMemoryIdRoute
   '/_app/sessions/$sessionId': typeof AppSessionsSessionIdRoute
   '/_app/settings/$section': typeof AppSettingsSectionRoute
+  '/_app/chats/': typeof AppChatsIndexRoute
   '/_app/goals/': typeof AppGoalsIndexRoute
   '/_app/matters/': typeof AppMattersIndexRoute
   '/_app/memory/': typeof AppMemoryIndexRoute
@@ -153,6 +162,7 @@ export interface FileRouteTypes {
     | '/memory/$id'
     | '/sessions/$sessionId'
     | '/settings/$section'
+    | '/chats/'
     | '/goals/'
     | '/matters/'
     | '/memory/'
@@ -168,6 +178,7 @@ export interface FileRouteTypes {
     | '/memory/$id'
     | '/sessions/$sessionId'
     | '/settings/$section'
+    | '/chats'
     | '/goals'
     | '/matters'
     | '/memory'
@@ -184,6 +195,7 @@ export interface FileRouteTypes {
     | '/_app/memory/$id'
     | '/_app/sessions/$sessionId'
     | '/_app/settings/$section'
+    | '/_app/chats/'
     | '/_app/goals/'
     | '/_app/matters/'
     | '/_app/memory/'
@@ -230,6 +242,13 @@ declare module '@tanstack/react-router' {
       path: '/chats/new'
       fullPath: '/chats/new'
       preLoaderRoute: typeof AppChatsNewRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/_app/chats/': {
+      id: '/_app/chats/'
+      path: '/chats'
+      fullPath: '/chats/'
+      preLoaderRoute: typeof AppChatsIndexRouteImport
       parentRoute: typeof AppRoute
     }
     '/_app/goals/': {
@@ -307,6 +326,7 @@ interface AppRouteChildren {
   AppMemoryIdRoute: typeof AppMemoryIdRoute
   AppSessionsSessionIdRoute: typeof AppSessionsSessionIdRoute
   AppSettingsSectionRoute: typeof AppSettingsSectionRoute
+  AppChatsIndexRoute: typeof AppChatsIndexRoute
   AppGoalsIndexRoute: typeof AppGoalsIndexRoute
   AppMattersIndexRoute: typeof AppMattersIndexRoute
   AppMemoryIndexRoute: typeof AppMemoryIndexRoute
@@ -322,6 +342,7 @@ const AppRouteChildren: AppRouteChildren = {
   AppMemoryIdRoute: AppMemoryIdRoute,
   AppSessionsSessionIdRoute: AppSessionsSessionIdRoute,
   AppSettingsSectionRoute: AppSettingsSectionRoute,
+  AppChatsIndexRoute: AppChatsIndexRoute,
   AppGoalsIndexRoute: AppGoalsIndexRoute,
   AppMattersIndexRoute: AppMattersIndexRoute,
   AppMemoryIndexRoute: AppMemoryIndexRoute,

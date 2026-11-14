@@ -26,7 +26,7 @@ export function ChatMenu({ id, title, current, className }: { id: string; title:
             aria-label={m.chat_menu()}
             title={m.chat_menu()}
             className={cn(
-              "grid size-7 cursor-pointer place-items-center rounded-control text-muted transition-colors hover:bg-hover-on-white hover:text-text data-[state=open]:bg-hover-on-white data-[state=open]:text-text",
+              "grid size-7 cursor-pointer place-items-center rounded-control narrow:size-11 text-muted transition-colors hover:bg-hover-on-white hover:text-text data-[state=open]:bg-hover-on-white data-[state=open]:text-text",
               className,
             )}
           >

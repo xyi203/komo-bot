@@ -18,7 +18,7 @@ export function Page({
   children: ReactNode;
 }) {
   return (
-    <section aria-label={title} className="px-8 pt-7 pb-10 max-[600px]:px-4 max-[600px]:pt-4 max-[600px]:pb-8">
+    <section aria-label={title} className="px-8 pt-7 pb-10 max-[600px]:px-4 max-[600px]:pt-4 narrow:pb-[calc(2rem+env(safe-area-inset-bottom))]">
       <header hidden={bare} className="mb-5 grid grid-cols-[minmax(0,1fr)_auto] items-start gap-x-3">
         <div className="min-w-0">
           <h1 className="text-page-title font-semibold tracking-tight">{title}</h1>

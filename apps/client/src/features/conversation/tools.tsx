@@ -15,7 +15,7 @@ export function ReplyTools({ text, run, recall = [], always }: { text?: string; 
   const { openProcess, processRun } = useConversation();
   const [memoryOpen, setMemoryOpen] = useState(false);
   const chip =
-    "inline-flex h-6 cursor-pointer items-center gap-1.25 rounded-sm px-1.5 text-small text-faint transition-colors hover:bg-hover-on-white hover:text-text";
+    "inline-flex h-6 cursor-pointer items-center gap-1.25 rounded-sm px-1.5 text-small text-faint transition-colors narrow:relative narrow:after:absolute narrow:after:-inset-x-0.5 narrow:after:-inset-y-2.5 hover:bg-hover-on-white hover:text-text";
   return (
     <>
       <div

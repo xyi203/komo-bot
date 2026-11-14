@@ -14,21 +14,22 @@ const row = "grid w-full cursor-pointer grid-cols-[minmax(0,1fr)_auto] items-cen
 /**
  * 对话列（264 宽，只在对话页出现）：顶上"对话"与新对话的加号；主对话固定最上，下面是支线（在等你的在前，顺序由 `GET /v1/chats` 给）。
  * 一行：标题、最后一句话、时间；在等你的带黄圈，在跑的带橙点。
+ * 窄屏上它不常驻：只在 `/chats` 以 `full`（铺满一屏）出现，点一行进对话页。
  */
-export function ChatColumn() {
+export function ChatColumn({ full }: { full?: boolean }) {
   const chats = useChats();
   const current = chatKeyOf(useRouterState({ select: (s) => s.location.pathname }));
   const main = chats.data?.chats.find((chat) => chat.main);
   const branches = chats.data?.chats.filter((chat) => !chat.main) ?? [];
   return (
-    <aside aria-label={m.chats_title()} className="flex min-h-0 flex-col border-r border-border bg-ground max-[900px]:hidden">
+    <aside aria-label={m.chats_title()} className={cn("flex min-h-0 flex-col border-r border-border bg-ground", full ? "min-w-0 flex-1 border-r-0" : "narrow:hidden")}>
       <header className="flex h-14 shrink-0 items-center pr-2 pl-4 text-section-title font-semibold">
         {m.chats_title()}
         <Link
           to="/chats/new"
           aria-label={m.chats_new()}
           title={m.chats_new()}
-          className="ml-auto grid size-8 cursor-pointer place-items-center rounded-control text-muted no-underline transition-colors hover:bg-hover hover:text-text"
+          className="ml-auto grid size-8 cursor-pointer place-items-center rounded-control text-muted no-underline transition-colors hover:bg-hover hover:text-text narrow:size-11"
         >
           <Icon name="plus" className="size-4" />
         </Link>
@@ -110,7 +111,7 @@ function ChatItem({ chat, current }: { chat: ChatRow; current: boolean }) {
   // 「…」菜单不能放进链接里：悬停、键盘聚焦或菜单开着时盖在时间的位置
   return (
     <div className="group/row relative">
-      <Link to="/chats/$id" params={{ id: chat.id }} aria-current={current ? "page" : undefined} className={cn(className, "group-has-[:focus-visible]/row:[&>span:nth-child(2)]:invisible group-has-[[data-state=open]]/row:[&>span:nth-child(2)]:invisible [@media(hover:hover)]:group-hover/row:[&>span:nth-child(2)]:invisible")}>
+      <Link to="/chats/$id" params={{ id: chat.id }} aria-current={current ? "page" : undefined} className={cn(className, "group-has-[:focus-visible]/row:[&>span:nth-child(2)]:invisible group-has-[[data-state=open]]/row:[&>span:nth-child(2)]:invisible [@media(hover:hover)]:group-hover/row:[&>span:nth-child(2)]:invisible [@media(hover:none)]:pr-11 [@media(hover:none)]:[&>span:nth-child(2)]:invisible")}>
         {body}
       </Link>
       <ChatMenu

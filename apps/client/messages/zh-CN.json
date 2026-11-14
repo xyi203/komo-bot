@@ -1172,5 +1172,14 @@
   "memory_from_main": "主对话",
   "memory_keep": "记住",
   "memory_drop": "不用记",
-  "memory_row_used": "用上 {count} 次"
+  "memory_row_used": "用上 {count} 次",
+  "push_title": "通知",
+  "push_desc": "Komo 问你一句或定时有结果时，在这台设备上发系统通知。",
+  "push_unsupported": "这个浏览器或打开方式不支持通知（需要 https，桌面 App 里也没有）。",
+  "push_denied": "浏览器已拒绝通知。要开启，请在浏览器或系统的网站设置里允许通知后再回来。",
+  "push_ios_install": "iPhone 和 iPad 上要先添加到主屏幕：在 Safari 点分享按钮，选「添加到主屏幕」，再从主屏幕上的图标打开 Komo，回到这里开启。",
+  "push_failed": "没能完成：{message}",
+  "push_incomplete": "浏览器给出的订阅信息不完整",
+  "nav_back_chats": "返回对话列表",
+  "nav_back": "返回"
 }

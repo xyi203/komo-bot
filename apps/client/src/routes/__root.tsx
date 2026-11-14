@@ -9,10 +9,24 @@ export const Route = createRootRouteWithContext<{ queryClient: QueryClient }>()(
   head: () => ({
     meta: [
       { charSet: "utf-8" },
-      { name: "viewport", content: "width=device-width, initial-scale=1" },
+      // viewport-fit=cover：env(safe-area-inset-*) 才有值（iPhone 的主屏幕横条）；
+      // interactive-widget=resizes-content：Android Chrome 的软键盘缩小布局视口，输入框不被遮（iOS 靠 app-shell 的 visualViewport 定高）
+      { name: "viewport", content: "width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content" },
+      { name: "theme-color", content: "#f4f4f5" },
+      // 添加到 iOS 主屏幕后以独立窗口打开；状态栏用 default（内容在状态栏下面，不用处理顶部安全区）
+      { name: "apple-mobile-web-app-capable", content: "yes" },
+      { name: "mobile-web-app-capable", content: "yes" },
+      { name: "apple-mobile-web-app-status-bar-style", content: "default" },
+      { name: "apple-mobile-web-app-title", content: "Komo" },
       { title: "komo" },
     ],
-    links: [{ rel: "stylesheet", href: appCss }],
+    links: [
+      { rel: "stylesheet", href: appCss },
+      { rel: "manifest", href: "/manifest.webmanifest" },
+      { rel: "icon", href: "/icon.svg", type: "image/svg+xml" },
+      // iOS 只认 PNG 的 apple-touch-icon；这是临时用的桌面图标（带透明边），换正式图标见 docs/web.md
+      { rel: "apple-touch-icon", href: "/icon-1024.png" },
+    ],
   }),
   shellComponent: RootDocument,
   component: RootComponent,

@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <!-- 临时图标：整幅铺满（iOS / Android 自己切圆角），三个圆取自网页里的 Komo 标志。操作者换成正式图标时替换本文件与 icon-1024.png。 -->
+  <rect width="512" height="512" fill="#f4f4f5"/>
+  <circle cx="214" cy="230" r="146" fill="#b95736"/>
+  <circle cx="372" cy="330" r="82" fill="#b95736" fill-opacity="0.55"/>
+  <circle cx="366" cy="134" r="46" fill="#b95736" fill-opacity="0.3"/>
+</svg>

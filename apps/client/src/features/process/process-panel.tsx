@@ -21,7 +21,7 @@ import { useNow } from "@/lib/hooks";
 import { m } from "@/paraglide/messages.js";
 
 /**
- * 过程面板（docs/redesign.md P5，docs/web.md §4）：对话右侧滑出，宽 380（≤1180 浮在对话上面）。
+ * 过程面板（docs/redesign.md P5，docs/web.md §4）：对话右侧滑出，宽 380（≤1180 浮在对话上面；窄屏 ≤900 是盖住整屏、从右滑入的全屏层）。
  * 标题栏：当前看的是第几轮（上一轮 / 下一轮来回切）与关闭；三个标签：步骤（这一轮的思考、工具调用、召回、插话，
  * 这段对话派出的后台任务）、改动（这一轮的文件对比）、轨迹（整段对话的轨迹，定位到这一轮）。
  */
@@ -69,13 +69,13 @@ export function ProcessPanel({
   const steps = parts.reduce((sum, p) => sum + (p.kind === "steps" ? p.steps.filter((x) => x.kind === "call").length : 0), 0);
   const spent = turn ? formatDuration((turn.end ? new Date(turn.end).getTime() : now) - new Date(turn.start).getTime()) : "";
 
-  const nav = "grid size-7 cursor-pointer place-items-center rounded-control text-muted transition-colors hover:bg-hover-on-white hover:text-text disabled:cursor-default disabled:opacity-35 disabled:hover:bg-transparent";
+  const nav = "grid size-7 max-[900px]:size-11 cursor-pointer place-items-center rounded-control text-muted transition-colors hover:bg-hover-on-white hover:text-text disabled:cursor-default disabled:opacity-35 disabled:hover:bg-transparent";
   return (
     <aside
       aria-label={m.proc_title()}
-      className="flex min-h-0 flex-col border-l border-border bg-surface max-[1180px]:fixed max-[1180px]:inset-y-0 max-[1180px]:right-0 max-[1180px]:z-20 max-[1180px]:w-[min(380px,100%)] max-[1180px]:shadow-[-16px_0_48px_rgb(0_0_0/0.12)]"
+      className="flex min-h-0 flex-col border-l border-border bg-surface max-[1180px]:fixed max-[1180px]:inset-y-0 max-[1180px]:right-0 max-[1180px]:z-20 max-[1180px]:w-[min(380px,100%)] max-[1180px]:shadow-[-16px_0_48px_rgb(0_0_0/0.12)] max-[900px]:inset-x-0 max-[900px]:top-[var(--app-top,0px)] max-[900px]:bottom-auto max-[900px]:z-30 max-[900px]:h-[var(--app-height,100dvh)] max-[900px]:w-full max-[900px]:animate-[sheet-in-right_220ms_var(--ease-out-expo)] max-[900px]:border-l-0 max-[900px]:shadow-none"
     >
-      <header className="flex h-14 shrink-0 items-center gap-1 pr-3 pl-5">
+      <header className="flex h-14 shrink-0 items-center gap-1 pr-3 pl-5 max-[900px]:pr-1.5 max-[900px]:pl-4">
         <h2 className="text-section-title font-semibold">{m.proc_title()}</h2>
         {turns.length > 1 && (
           <div className="ml-2 flex items-center text-label text-muted tabular-nums">
@@ -93,7 +93,7 @@ export function ProcessPanel({
         </button>
       </header>
       <Tabs value={tab} onValueChange={(value) => onTab(value as ProcessTab)} className="flex min-h-0 flex-1 flex-col">
-        <div className="min-h-0 flex-1 overflow-y-auto px-5 pb-6">
+        <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain px-5 pb-6 max-[900px]:pb-[calc(1.5rem+env(safe-area-inset-bottom))]">
           {ask && <p className="line-clamp-3 rounded-[12px] bg-raised px-3 py-2 text-label leading-5 break-words whitespace-pre-wrap">{ask}</p>}
           {turn && (
             <p className="mt-2 flex items-center gap-1.5 text-small text-faint tabular-nums">
@@ -107,7 +107,7 @@ export function ProcessPanel({
               <TabsTrigger
                 key={key}
                 value={key}
-                className="h-7 rounded-sm px-3 text-label text-muted hover:text-text data-[state=active]:bg-surface data-[state=active]:text-text data-[state=active]:shadow-ring"
+                className="h-7 rounded-sm px-3 text-label text-muted hover:text-text max-[900px]:h-9 data-[state=active]:bg-surface data-[state=active]:text-text data-[state=active]:shadow-ring"
               >
                 {key === "steps" ? m.proc_tab_steps() : key === "changes" ? m.proc_tab_changes() : m.proc_tab_trace()}
               </TabsTrigger>

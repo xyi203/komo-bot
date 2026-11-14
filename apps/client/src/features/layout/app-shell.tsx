@@ -6,11 +6,15 @@ import { Unauthorized } from "@/components/unauthorized";
 import { ChatColumn } from "@/features/chats/chat-column";
 import { Palette } from "@/features/palette/palette";
 import { togglePalette } from "@/features/palette/store";
+import { useNarrow } from "@/lib/hooks";
+import { useServiceWorker } from "@/lib/pwa";
+import { useViewportVars } from "@/lib/viewport";
 import { SettingsDialog } from "@/features/settings/settings-dialog";
 import { openSettings, settingsSectionOf } from "@/features/settings/store";
 import { cn } from "@/lib/utils";
-import { isChatPath } from "./paths";
+import { hidesTabBar, isChatListPath, isChatPath } from "./paths";
 import { Rail } from "./rail";
+import { TabBar } from "./tab-bar";
 
 // C2（Electron 壳）给界面的约定见 `komo-desktop.d.ts`：`window.komoDesktop?.onCommandPalette(fn)` 返回取消函数；也会在 window 上派发
 // DOM 事件 `komo-desktop:command-palette`。没有桌面壳（`komoDesktop` 不存在）时什么也不做。
@@ -41,22 +45,40 @@ function usePaletteShortcut() {
 
 /**
  * 外壳（docs/web.md §2）：64 的图标栏 + 264 的对话列 + 主区；不在对话页（目标、记忆）时没有对话列。
- * 主区放当前路由的页面；没配对（401）时整块换成配对提示。≤900 先不处理窄屏（5d 做）：对话列收起，图标栏留着。
+ * 主区放当前路由的页面；没配对（401）时整块换成配对提示。
+ * 窄屏（≤900，docs/web.md「手机与 PWA」）一次只显示一栏：`/chats` 是铺满的对话列表，其余是主区；
+ * 图标栏换成底部标签栏（对话页与详情页不画，让出整屏）。外壳按可见区域（visualViewport）定高，软键盘弹出时输入框不被遮。
  */
 export function AppShell() {
   const chats = useChats();
-  const chatPage = isChatPath(useRouterState({ select: (s) => s.location.pathname }));
+  const pathname = useRouterState({ select: (s) => s.location.pathname });
+  const chatPage = isChatPath(pathname);
   usePaletteShortcut();
+  useServiceWorker();
+  const narrow = useNarrow();
+  useViewportVars(narrow);
   const unauthorized = chats.isError && isApiError(chats.error) && chats.error.unauthorized;
+  const page = unauthorized ? <Unauthorized /> : <Outlet />;
   return (
     <>
       {/* 桌面壳的拖窗口条（只在 macOS 桌面壳里显示，见 styles.css）：要排在最前，后面的按钮才能从拖动区里挖出来 */}
       <div aria-hidden="true" className="titlebar" />
-      <div className={cn("grid h-svh overflow-hidden", chatPage ? "grid-cols-[64px_264px_minmax(0,1fr)] max-[900px]:grid-cols-[64px_minmax(0,1fr)]" : "grid-cols-[64px_minmax(0,1fr)]")}>
-        <Rail />
-        {chatPage && <ChatColumn />}
-        <main className="flex min-h-0 min-w-0 flex-col overflow-y-auto bg-surface">{unauthorized ? <Unauthorized /> : <Outlet />}</main>
-      </div>
+      {narrow ? (
+        <div className="fixed inset-x-0 top-[var(--app-top,0px)] flex h-[var(--app-height,100dvh)] flex-col overflow-hidden bg-surface pr-[env(safe-area-inset-right)] pl-[env(safe-area-inset-left)]">
+          {isChatListPath(pathname) && !unauthorized ? (
+            <ChatColumn full />
+          ) : (
+            <main className="flex min-h-0 min-w-0 flex-1 flex-col overflow-y-auto overscroll-contain bg-surface">{page}</main>
+          )}
+          {!hidesTabBar(pathname) && <TabBar />}
+        </div>
+      ) : (
+        <div className={cn("grid h-svh overflow-hidden", chatPage ? "grid-cols-[64px_264px_minmax(0,1fr)]" : "grid-cols-[64px_minmax(0,1fr)]")}>
+          <Rail />
+          {chatPage && <ChatColumn />}
+          <main className="flex min-h-0 min-w-0 flex-col overflow-y-auto bg-surface">{page}</main>
+        </div>
+      )}
       <Palette />
       <SettingsDialog />
       <Toaster />

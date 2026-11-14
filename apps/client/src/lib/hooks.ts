@@ -12,6 +12,12 @@ export function useNow(active: boolean, intervalMs = 1000): number {
   return now;
 }
 
+/** 窄屏（单栏布局）的断点；`styles.css` 里的 `narrow:` 变体用同一个值。 */
+export const NARROW_QUERY = "(max-width: 900px)";
+
+/** 现在是不是窄屏布局。 */
+export const useNarrow = () => useMediaQuery(NARROW_QUERY);
+
 /** 媒体查询是否命中（窄屏布局用）。服务端预渲染壳时当作宽屏。 */
 export function useMediaQuery(query: string): boolean {
   return useSyncExternalStore(

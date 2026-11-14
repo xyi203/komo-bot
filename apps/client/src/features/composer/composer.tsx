@@ -112,7 +112,7 @@ export function Composer({
   };
 
   return (
-    <div className="shrink-0 px-8 pb-3 max-[600px]:px-3 max-[600px]:pb-2">
+    <div className="shrink-0 px-8 pb-3 max-[600px]:px-3 narrow:pb-[max(0.5rem,env(safe-area-inset-bottom))]">
       <form
         onSubmit={submit}
         onDragOver={(event) => event.dataTransfer.types.includes("Files") && event.preventDefault()}
@@ -208,7 +208,7 @@ export function Composer({
             }}
             onKeyDown={onKeyDown}
             onPaste={onPaste}
-            className="max-h-60 min-h-8 min-w-0 flex-1 resize-none bg-transparent px-1 py-1.5 text-read leading-5 text-text outline-none placeholder:text-faint max-[600px]:min-h-11 max-[600px]:py-3"
+            className="max-h-60 min-h-8 min-w-0 flex-1 resize-none bg-transparent px-1 py-1.5 text-read leading-5 text-text outline-none placeholder:text-faint max-[600px]:min-h-11 max-[600px]:py-3 narrow:text-[16px]"
           />
           {warn && (
             <span role="img" aria-label={ringLabel(context)} title={ringLabel(context)} className="flex h-8 shrink-0 items-center gap-1.5 text-small text-accent tabular-nums">
@@ -222,7 +222,7 @@ export function Composer({
             title={m.composer_send()}
             disabled={disabled}
             className={cn(
-              "grid size-8 shrink-0 cursor-pointer place-items-center rounded-full bg-primary text-white transition-[transform,opacity] hover:opacity-90 active:scale-95 max-[600px]:m-1.5",
+              "relative grid size-8 shrink-0 cursor-pointer place-items-center rounded-full bg-primary text-white transition-[transform,opacity] hover:opacity-90 active:scale-95 max-[600px]:m-1.5 narrow:after:absolute narrow:after:-inset-1.5",
               disabled && "cursor-not-allowed opacity-35",
             )}
           >
@@ -282,7 +282,7 @@ function DraftList({ drafts, onRemove }: { drafts: readonly Draft[]; onRemove: (
 }
 
 const plusClass =
-  "grid size-8 shrink-0 cursor-pointer place-items-center rounded-full text-text transition-colors hover:bg-hover-on-white disabled:cursor-not-allowed disabled:opacity-35 max-[600px]:m-1.5";
+  "relative grid size-8 shrink-0 cursor-pointer place-items-center rounded-full text-text transition-colors hover:bg-hover-on-white disabled:cursor-not-allowed disabled:opacity-35 max-[600px]:m-1.5 narrow:after:absolute narrow:after:-inset-1.5";
 
 /** 上下文占用的一句话：`上下文 12%（24k / 200k）`；还没请求过模型时写明。 */
 function ringLabel({ total, win, measured }: ContextView): string {

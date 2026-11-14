@@ -1,4 +1,6 @@
+import { Link } from "@tanstack/react-router";
 import type { ReactNode, RefObject } from "react";
+import { Icon } from "@/components/icon";
 import { useConnection } from "@/lib/connection";
 import { cn } from "@/lib/utils";
 import { m } from "@/paraglide/messages.js";
@@ -43,6 +45,15 @@ export function ChatLayout({
     >
       <div className="relative flex min-h-0 min-w-0 flex-col">
         <div aria-hidden="true" className="pointer-events-none absolute inset-x-0 top-0 z-10 h-18 bg-linear-to-b from-surface from-30% to-transparent" />
+        {/* 窄屏：左上角返回对话列表（单栏下对话页是全屏的，没有别处可回） */}
+        <Link
+          to="/chats"
+          aria-label={m.nav_back_chats()}
+          title={m.nav_back_chats()}
+          className="absolute top-2 left-1 z-20 hidden size-11 place-items-center rounded-full text-muted no-underline transition-colors active:bg-hover narrow:grid"
+        >
+          <Icon name="left" className="size-5" />
+        </Link>
         <header className="pointer-events-none absolute top-2.5 left-1/2 z-20 flex max-w-[60%] -translate-x-1/2 flex-col items-center gap-0.5">
           <span className="grid size-11 place-items-center rounded-full bg-surface shadow-[0_0_0_1px_rgb(0_0_0/0.08),0_2px_8px_rgb(0_0_0/0.06)]">
             <svg viewBox="0 0 28 28" aria-hidden="true" className="size-6.5">
@@ -53,7 +64,7 @@ export function ChatLayout({
           </span>
           <h1 className="max-w-full truncate rounded-[10px] bg-surface px-2.5 py-px text-small font-medium shadow-[0_0_0_1px_rgb(0_0_0/0.06)]">{name}</h1>
         </header>
-        {corner && <div className="absolute top-3 right-4 z-20 flex gap-1">{corner}</div>}
+        {corner && <div className="absolute top-3 right-4 z-20 flex gap-1 narrow:top-2.5 narrow:right-2">{corner}</div>}
         <div
           ref={scroller}
           onScroll={onScroll ? (event) => onScroll(event.currentTarget) : undefined}

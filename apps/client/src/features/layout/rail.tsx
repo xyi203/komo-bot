@@ -84,12 +84,17 @@ function RailLink({
   );
 }
 
-function Settings({ open }: { open: boolean }) {
+/** 设置入口上的提醒：连不上与重连中的点 2c 已做；配置检查有提醒时也带一个黄点（连接问题优先，红点盖过黄点）。图标栏与底部标签栏共用。 */
+export function useSettingsProblem() {
   const connection = useConnection();
-  // 连不上与重连中的点 2c 已做；配置检查有提醒时也带一个黄点（连接问题优先，红点盖过黄点）
   const issues = useConfigIssueCount();
   const problem = connection ?? (issues > 0 ? "config" : null);
   const label = problem === "down" ? m.conn_down() : problem === "retrying" ? m.conn_retrying() : problem === "config" ? m.nav_settings_issues({ count: issues }) : m.nav_settings();
+  return { problem, label };
+}
+
+function Settings({ open }: { open: boolean }) {
+  const { problem, label } = useSettingsProblem();
   return (
     <button type="button" aria-label={label} title={label} aria-pressed={open} onClick={() => openSettings()} className={cn(button, open && on)}>
       <Icon name="gear" />

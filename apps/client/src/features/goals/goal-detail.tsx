@@ -62,7 +62,7 @@ interface Receipt {
 }
 
 const Back = () => (
-  <Link to="/goals" className="-ml-1.5 inline-flex h-7 items-center gap-1 rounded-control px-1.5 text-label text-muted no-underline hover:bg-hover-on-white hover:text-text">
+  <Link to="/goals" className="-ml-1.5 inline-flex h-7 items-center gap-1 rounded-control px-1.5 narrow:h-11 text-label text-muted no-underline hover:bg-hover-on-white hover:text-text">
     <Icon name="left" className="size-3.5" />
     {m.nav_goals()}
   </Link>

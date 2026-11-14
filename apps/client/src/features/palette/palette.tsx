@@ -30,7 +30,7 @@ interface Section {
 }
 
 /**
- * ⌘K 搜索弹窗（docs/redesign.md P4，docs/web.md §3）：浮在当前页上。没输入时列最近的对话；输入后分「对话」「目标」两组，
+ * ⌘K 搜索弹窗（docs/redesign.md P4，docs/web.md §3）：浮在当前页上（窄屏铺满全屏）。没输入时列最近的对话；输入后分「对话」「目标」两组，
  * 回车或点击进入。内容只在打开时挂着：关掉再开，输入回到初始。记忆不进搜索结果（待定）。
  */
 export function Palette() {
@@ -41,7 +41,7 @@ export function Palette() {
         <Dialog.Overlay className="fixed inset-0 z-30 bg-[rgb(0_0_0/0.08)]" />
         <Dialog.Content
           aria-describedby={undefined}
-          className="fixed top-[18vh] left-1/2 z-35 flex max-h-[min(560px,calc(100svh-96px))] w-[min(560px,calc(100vw-32px))] -translate-x-1/2 flex-col overflow-hidden rounded-[20px] bg-surface p-2 text-text shadow-[0_0_0_1px_rgb(0_0_0/0.08),0_16px_48px_rgb(0_0_0/0.16)] outline-none max-[600px]:top-4 max-[600px]:max-h-[calc(100svh-32px)]"
+          className="fixed top-[18vh] left-1/2 z-35 flex max-h-[min(560px,calc(100svh-96px))] w-[min(560px,calc(100vw-32px))] -translate-x-1/2 flex-col overflow-hidden rounded-[20px] bg-surface p-2 text-text shadow-[0_0_0_1px_rgb(0_0_0/0.08),0_16px_48px_rgb(0_0_0/0.16)] outline-none max-[900px]:top-[var(--app-top,0px)] max-[900px]:left-0 max-[900px]:h-[var(--app-height,100dvh)] max-[900px]:max-h-none max-[900px]:w-full max-[900px]:translate-x-0 max-[900px]:rounded-none max-[900px]:pb-[env(safe-area-inset-bottom)] max-[900px]:shadow-none"
         >
           <Dialog.Title className="sr-only">{m.palette_title()}</Dialog.Title>
           <PaletteBody />
@@ -179,6 +179,10 @@ function PaletteBody() {
           onKeyDown={onKeyDown}
           className="h-7 min-w-0 flex-1 bg-transparent text-section-title text-text outline-none placeholder:text-faint [&::-webkit-search-cancel-button]:hidden"
         />
+        {/* 窄屏铺满全屏，没有遮罩可点，补一个取消 */}
+        <button type="button" onClick={closePalette} className="-mr-1 hidden h-11 shrink-0 cursor-pointer px-2 text-body text-text narrow:block">
+          {m.cancel()}
+        </button>
       </div>
       <div ref={list} id="palette-results" role="listbox" aria-label={m.palette_results()} className="min-h-0 flex-1 overflow-y-auto overscroll-contain">
         {sections.length ? (

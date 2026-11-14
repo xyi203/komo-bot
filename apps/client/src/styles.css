@@ -74,11 +74,18 @@
   --ease-out-expo: cubic-bezier(0.16, 1, 0.3, 1);
 }
 
+/* 窄屏（单栏、底部标签栏）的断点，用法 `narrow:hidden`。和 `src/lib/hooks.ts` 的 NARROW_QUERY 是同一个值，要改两处一起改。 */
+@custom-variant narrow (@media (max-width: 900px));
+
 @layer base {
   html,
   body,
   #root {
     height: 100%;
+  }
+  html {
+    -webkit-tap-highlight-color: transparent;
+    -webkit-text-size-adjust: 100%;
   }
   body {
     margin: 0;
@@ -260,5 +267,13 @@
     opacity: 0;
     scale: 0.985;
     translate: 0 8px;
+  }
+}
+
+/* 手机：外壳是固定定位的整屏（app-shell），页面本身不该再被拖着滚或回弹 */
+@media (max-width: 900px) {
+  html,
+  body {
+    overscroll-behavior: none;
   }
 }

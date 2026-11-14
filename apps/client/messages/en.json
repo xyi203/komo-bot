@@ -1180,5 +1180,14 @@
   "memory_from_main": "the main chat",
   "memory_keep": "Keep",
   "memory_drop": "Don't keep",
-  "memory_row_used": "Used {count}×"
+  "memory_row_used": "Used {count}×",
+  "push_title": "Notifications",
+  "push_desc": "Get a system notification on this device when Komo asks you something or a scheduled run has a result.",
+  "push_unsupported": "This browser or the way it's opened doesn't support notifications (needs https; not available in the desktop app).",
+  "push_denied": "The browser has blocked notifications. Allow them in the browser or system site settings, then come back.",
+  "push_ios_install": "On iPhone and iPad, add Komo to the Home Screen first: tap Share in Safari, choose Add to Home Screen, open Komo from its icon, then turn this on here.",
+  "push_failed": "Couldn't finish: {message}",
+  "push_incomplete": "The browser returned an incomplete subscription",
+  "nav_back_chats": "Back to chats",
+  "nav_back": "Back"
 }

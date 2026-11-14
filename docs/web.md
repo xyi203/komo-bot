@@ -18,11 +18,11 @@ TUI 与聊天渠道之外的第三个入口，给电脑上的长会话用，之�
 
 | 宽度 | 变化 |
 |---|---|
-| ≤ 900 | 对话列收起，图标栏留着（窄屏怎么切对话 5d 做，现在只能从 ⌘K 或旧链接进） |
-| ≤ 600 | 输入框只留加号、文字、发送（没有输入框下的一行了） |
+| ≤ 900 | 单栏布局（5d，见 §18「手机与 PWA」）：图标栏换成底部标签栏，对话列变成独立的一屏 `/chats`，过程面板盖住整屏 |
+| ≤ 600 | 输入框只留加号、文字、发送（没有输入框下的一行了）；设置弹窗铺满全屏 |
 | ≤ 1180 | 过程面板不占列，浮在对话上面（宽 min(380, 100%)） |
 
-窄屏整体还没重做（`docs/redesign.md` §1.7、§1.8），这一步只保证不横向溢出。
+窄屏（≤900）的做法集中在 §18；宽屏（>900）的布局没有改。
 
 ## 3. 图标栏、对话列与路由
 
@@ -307,3 +307,42 @@ C1 的原则是行为以本文为准、只搬不改、只修 bug；下面是有�
 **目标页（3b）、设置与记忆页（4b、4c，2026-11-14）还没有编译或在浏览器里验证过**（操作者定的：全部步骤做完后统一编译、点一遍）；上面「验证」里写的事项、定时的点验是旧页面的，已随旧页面删除；记忆与设置的点验记录是旧版的，新版版式要重点一遍。
 
 **留给之后**：记忆页的候选 / 有争议状态等有真实数据时再看一遍样式。
+
+## 18. 手机与 PWA
+
+> 5d（2026-11-14）网页侧。代码：`features/layout/`（`app-shell.tsx`、`tab-bar.tsx`、`paths.ts`）、`routes/_app/chats.index.tsx`、`lib/{viewport,pwa,push}.ts`、`features/settings/sections/push-row.tsx`、`public/{manifest.webmanifest,sw.js,icon.svg,icon-1024.png}`、`routes/__root.tsx` 的 `head`；接口在 `packages/api/src/push.ts`，类型在 `packages/protocol/src/push.ts`（手写，不在 `generated/`）。**没编译、没在手机或浏览器里点过**（全部步骤做完后统一做）。推送的服务端（VAPID、存订阅、发送）是之后另一步，这里只按下面的接口形状写网页侧。
+
+**单栏布局**。断点 ≤ 900（Tailwind 变体 `narrow:`，定义在 `styles.css`；脚本里用 `useNarrow()`，同一个值在 `lib/hooks.ts` 的 `NARROW_QUERY`，要改两处一起改）。>900 的宽屏布局原样不动。
+
+- 外壳（`app-shell.tsx`）：窄屏是一个固定定位的整屏容器，一次只显示一栏——`/chats` 是铺满的对话列表（`ChatColumn full`），其余地址显示主区；高度取 `visualViewport.height`（`lib/viewport.ts` 写进 `--app-height` / `--app-top`，没有 visualViewport 时回落 `100dvh`），所以软键盘弹出时输入框贴在键盘上方；viewport 另带 `interactive-widget=resizes-content`（Android Chrome）。左右留 `env(safe-area-inset-left/right)`，底部安全区由标签栏与输入框各自留。
+- 底部标签栏（`tab-bar.tsx`）：对话、搜索、目标、记忆、设置，角标与图标栏一致（对话上等你的条数，记忆与设置上的点）。对话页（输入框贴底）和目标 / 记忆的详情页不画它（`paths.ts` 的 `hidesTabBar`）。「对话」指向 `/chats`；**直接打开 `/` 仍是主对话**。
+- 对话：对话页全屏，左上角返回箭头回 `/chats`（`chat-layout.tsx`）；`/chats` 在宽屏上没有内容，跳回 `/`。过程面板在窄屏是盖住整屏、从右滑入的全层（`process-panel.tsx`，右上角关闭）。
+- 目标、记忆：本来就是「列表 → 详情盖住列表」，详情里已有返回。搜索弹窗铺满全屏并带「取消」；设置弹窗 ≤600 本来就铺满。
+- 触屏：可点区域补到 44px 的办法是 `narrow:` 下用 `::after` 伪元素外扩（`IconButton`、复制、看过程 / 用上的记忆、输入框的加号与发送、开关），外观不变；对话列表、标签栏、返回等本身就 ≥44。输入框与表单字段在窄屏用 16px 字号（iOS 小于 16px 的输入框聚焦会放大页面）。回复下的复制 / 看过程 / 用上的记忆本来就只在 `(hover: hover)` 的设备上悬停才出现，触屏一直显示；对话列表行上的「…」同理，触屏上盖住时间的位置（时间隐藏）。
+
+**可安装**。`public/manifest.webmanifest`（`name` Komo、`display: standalone`、`start_url: "/"`、主题色 `#f4f4f5`），`<head>` 带 manifest、`theme-color`、`apple-mobile-web-app-capable`、`apple-touch-icon`。`public/` 里的文件由 Vite 原样复制到 `dist/client/`，Gateway 的静态托管直接按路径给（`.webmanifest` 与 `sw.js` 的 content-type 已对，`no-cache`）。
+
+- 图标是临时的：`icon.svg`（三个圆的标志，整幅铺满）与 `icon-1024.png`（复制自 `apps/desktop/assets/icon.png`，带 macOS 圆角留白与透明边，iOS 上主屏幕图标四角可能发黑）。**操作者要换成正式图标**：一张整幅铺满、不带透明边的 1024 方形 PNG，另按需补 192 / 512 的 PNG 与 maskable 版（Chrome 的安装条件按 PNG 图标判断）；换文件后在 `manifest.webmanifest`、`routes/__root.tsx` 的 `links` 里改名字与 `sizes`。
+
+**service worker**（`public/sw.js`，手写，不引 workbox）。只做两件事：`push` 事件显示通知（`title`、`body`、`data.url`，同一个 `tag` 互相替换）；`notificationclick` 时关通知，已有同源窗口就聚焦并 `postMessage({type:"komo:navigate", url})` 让页面用路由跳（不整页刷新），没有就 `openWindow(url)`。**不做离线缓存、不拦截 fetch**：网页壳每次都问 Gateway 要最新的，不会被旧版本缓住。`install` 时 `skipWaiting`、`activate` 时 `clients.claim`，新版本马上接管。
+
+- 注册在应用启动处（`lib/pwa.ts` 的 `useServiceWorker`，挂在 `AppShell`）：只在浏览器支持、安全上下文（https 或 localhost）、不是桌面壳（`window.komoDesktop` 不存在，`app://komo` 协议没开 service worker）时 `register("/sw.js", {scope: "/"})`；失败只记一条控制台警告。注册路径与作用域都是根，所以 `sw.js` 必须由网页同源的根路径给出（Gateway 托管时就是；`pnpm dev` 由 Vite 从 `public/` 给）。
+- 推送负载：`{ "title": string, "body": string, "url": string, "tag"?: string }`，`url` 是站内路径（`/chats/<id>` 或 `/`），不是站内路径的（不以 `/` 开头）一律当 `/`。
+
+**推送订阅**（`lib/push.ts`，设置「通用」里的「通知」一行 `push-row.tsx`）。状态五种：不支持 / iOS 未装到主屏幕 / 被浏览器拒绝 / 未开启 / 已开启，前三种只写原因不给开关。
+
+- 开启：`Notification.requestPermission()` → `GET /v1/push/key` 取 VAPID 公钥 → `pushManager.subscribe({userVisibleOnly: true, applicationServerKey})` → `POST /v1/push/subscriptions`。已有浏览器侧订阅就复用；服务端那步失败就把刚建的浏览器订阅退掉，界面不会显示「已开启」却收不到。
+- 关闭：先 `DELETE /v1/push/subscriptions`（失败则保持开启并提示重试），再 `subscription.unsubscribe()`。
+- iOS（含 iPadOS）只有装到主屏幕的网页才支持推送：检测到 iOS 且不是 standalone（`display-mode: standalone` 或 `navigator.standalone`）时显示「先添加到主屏幕」的说明。
+- 接口（服务端稍后照此实现；类型在 `packages/protocol/src/push.ts`）：
+  - `GET /v1/push/key` → `{ "public_key": string }`（base64url）
+  - `POST /v1/push/subscriptions`，体 `{ "endpoint", "keys": { "p256dh", "auth" }, "user_agent"? }` → `{ "id" }`
+  - `DELETE /v1/push/subscriptions`，体 `{ "endpoint" }` → 204
+
+**操作者怎么实测**（**未实测**）：
+
+1. 条件：Gateway 用 https 的公开地址（iOS 推送和 service worker 都要安全上下文），且服务端的推送部分已做好。
+2. iPhone：Safari 打开地址并登录 → 分享 → 添加到主屏幕 → 从主屏幕图标打开（独立窗口，没有地址栏）。注意 iOS 上主屏幕应用与 Safari 的登录状态分开，要在应用里再登一次（`docs/redesign.md` §1.8）。
+3. 设置（底部标签栏最右）→ 通用 → 通知，打开开关，在系统弹窗里允许。
+4. 让 Komo 找你一次（让目标的定时跑一次、或在对话里让它稍后问你一句），退到后台或锁屏；收到系统通知，点开应落在对应的对话（`/chats/<id>` 或主对话）。
+5. 关掉开关，再触发一次：不应再收到。

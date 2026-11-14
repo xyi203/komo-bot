@@ -46,7 +46,7 @@ export function Field({ label, htmlFor, hint, children, className }: { label: Re
 }
 
 const fieldBase =
-  "h-9 min-w-0 rounded-control bg-surface px-3 text-text shadow-ring-control outline-none placeholder:text-faint focus:shadow-[0_0_0_2px_var(--color-primary)] disabled:cursor-progress disabled:text-muted";
+  "h-9 min-w-0 narrow:h-11 narrow:text-[16px] rounded-control bg-surface px-3 text-text shadow-ring-control outline-none placeholder:text-faint focus:shadow-[0_0_0_2px_var(--color-primary)] disabled:cursor-progress disabled:text-muted";
 
 export function TextInput({ mono, className, ...props }: { mono?: boolean } & ComponentProps<"input">) {
   return <input className={cn(fieldBase, mono && "font-mono text-label", className)} {...props} />;
@@ -73,7 +73,7 @@ export function Switch({ checked, onChange, label, disabled }: { checked: boolea
       disabled={disabled}
       onClick={() => onChange(!checked)}
       className={cn(
-        "relative h-6 w-10 shrink-0 cursor-pointer rounded-xl border-0 p-0 transition-colors disabled:cursor-progress disabled:opacity-60",
+        "relative h-6 w-10 shrink-0 cursor-pointer rounded-xl border-0 p-0 transition-colors narrow:after:absolute narrow:after:-inset-2.5 disabled:cursor-progress disabled:opacity-60",
         checked ? "bg-primary" : "bg-control",
       )}
     >

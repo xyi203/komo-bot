@@ -12,6 +12,7 @@ import { CardRow, FormError, Notice, Segmented, SettingsCard, Switch, TextButton
 import { EditNoticeView } from "../rich";
 import { SectionHead } from "../section-head";
 import { useConfigEdit } from "../use-config-edit";
+import { PushRow } from "./push-row";
 
 const NAMES = { "zh-CN": () => m.language_zh_cn(), en: () => m.language_en() } as const;
 
@@ -43,6 +44,7 @@ export function GeneralSection() {
           control={<Segmented label={m.language_label()} value={locale} onChange={select} options={locales.map((code) => ({ value: code, label: NAMES[code]() }))} />}
         />
       </SettingsCard>
+      <PushRow />
       <EditNoticeView notice={edit.notice} />
       {settings.isError ? (
         <BlockError message={m.config_load_error({ message: errorText(settings.error) })} onRetry={() => void settings.refetch()} />

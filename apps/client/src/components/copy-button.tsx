@@ -25,7 +25,7 @@ export function CopyButton({ text, label, className }: { text: string; label?: s
         );
       }}
       className={cn(
-        "grid size-6.5 shrink-0 cursor-pointer place-items-center rounded-sm text-muted transition-colors hover:bg-hover-on-white hover:text-text",
+        "grid size-6.5 shrink-0 cursor-pointer place-items-center rounded-sm text-muted narrow:relative narrow:after:absolute narrow:after:-inset-2.5 transition-colors hover:bg-hover-on-white hover:text-text",
         done && "text-text",
         className,
       )}

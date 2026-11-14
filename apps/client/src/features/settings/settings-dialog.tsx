@@ -27,7 +27,7 @@ const LABELS: Record<SettingsSection, () => string> = {
 
 // 左栏搜索：分节名加这一节里各项的名字，输入的字出现在里面就留着
 const SEARCH: Record<SettingsSection, () => string[]> = {
-  general: () => [m.language_label(), m.config_memory_enabled(), m.config_compaction(), m.settings_index_title()],
+  general: () => [m.language_label(), m.config_memory_enabled(), m.config_compaction(), m.settings_index_title(), m.push_title()],
   models: () => [m.models_default(), m.models_main(), m.config_memory_model(), m.config_memory_embedding(), m.models_providers(), m.models_add_provider()],
   connect: () => [m.connect_tab_tools(), m.connect_tab_skills(), "MCP"],
   about: () => [m.conn_url(), m.gateway_version(), m.gateway_started(), m.config_check_ok(), m.settings_sec_env(), "Gateway"],
@@ -63,7 +63,7 @@ export function SettingsDialog() {
           <div
             id="settings-main"
             key={section}
-            className="min-h-0 min-w-0 overflow-y-auto overscroll-contain px-(--pad) pb-(--pad) [--pad:28px] max-[900px]:[--pad:20px] max-[600px]:[--pad:16px] max-[900px]:pb-6"
+            className="min-h-0 min-w-0 overflow-y-auto overscroll-contain px-(--pad) pb-(--pad) [--pad:28px] max-[900px]:[--pad:20px] max-[600px]:[--pad:16px] max-[900px]:pb-6 max-[600px]:pb-[calc(1.5rem+env(safe-area-inset-bottom))]"
           >
             {BODIES[section]()}
           </div>

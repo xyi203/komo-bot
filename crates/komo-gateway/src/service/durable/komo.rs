@@ -24,7 +24,7 @@ use serde_json::{Value, json};
 use crate::http::error::{ApiFailure, ApiResult};
 use crate::http::idempotency::Idempotency;
 use crate::http::v2::{sessions, tasks};
-use crate::http::{Api, cron, matters, memories};
+use crate::http::{Api, matters, memories};
 use crate::service::durable::sessions::SessionError;
 use crate::service::state::GatewayState;
 use crate::web::WebAuth;
@@ -80,10 +80,6 @@ impl KomoService for GatewayKomo {
                 )
                 .await,
             ),
-            KomoCall::CronList => reply(cron::list(State(api)).await),
-            KomoCall::CronRun { job, request } => {
-                reply(cron::run_now(State(api), Path(job.to_string()), Json(request)).await)
-            }
             KomoCall::SessionSearch(query) => {
                 reply(sessions::search(State(api), Query(query)).await)
             }
@@ -495,40 +491,46 @@ mode = "keyword"
         )
         .await;
         assert_eq!(resumed["matter"]["state"], "active", "{resumed}");
-        // goal.list：只列目标；只读动作不要求用户原话。
+        // goal.list：只读动作不要求用户原话。
         let listed = ok(&tool, &mut ctx, "goal.list", json!({})).await;
         assert_eq!(listed["matters"][0]["id"], goal.as_str(), "{listed}");
         assert_eq!(listed["matters"].as_array().map(Vec::len), Some(1));
 
-        // ── cron：建一个命令 Job（不经模型），goal.link 挂上，cron.list 看得到，cron.run 触发
-        let (status, job) = gateway
-            .post_json(
-                "/v1/cron",
-                json!({ "name": "每日巡检", "schedule": "0 9 * * *", "timezone": "UTC",
-                        "prompt": "", "command": "true" }),
-            )
-            .await;
-        assert_eq!(status, 200, "{job}");
-        let job = job["id"].as_str().unwrap().to_string();
-        let linked = ok(
+        // ── 定时是目标的配置：goal.schedule 设一个命令定时（不经模型），goal.list 带着它，
+        //    goal.run 触发；goal.add 的 ongoing 建没有终点的目标，goal.retire 不再追踪它。
+        let scheduled = ok(
             &tool,
             &mut ctx,
-            "goal.link",
-            json!({ "id": goal, "cron": job }),
+            "goal.schedule",
+            json!({ "id": goal, "schedule": "0 9 * * *", "timezone": "UTC", "command": "true" }),
         )
         .await;
-        assert_eq!(
-            linked["matter"]["triggers"][0]["job"],
-            job.as_str(),
-            "{linked}"
-        );
-        let jobs = ok(&tool, &mut ctx, "cron.list", json!({})).await;
-        assert_eq!(jobs["jobs"][0]["id"], job.as_str(), "{jobs}");
-        let fired = ok(&tool, &mut ctx, "cron.run", json!({ "id": job })).await;
-        assert_eq!(fired["job"], job.as_str(), "{fired}");
+        assert_eq!(scheduled["schedule"]["job"]["id"], goal.as_str(), "{scheduled}");
+        assert_eq!(scheduled["matter"]["revision"], resumed["matter"]["revision"], "定时不升版");
+        let listed = ok(&tool, &mut ctx, "goal.list", json!({})).await;
+        assert_eq!(listed["schedules"][0]["job"]["id"], goal.as_str(), "{listed}");
+        let fired = ok(&tool, &mut ctx, "goal.run", json!({ "id": goal })).await;
+        assert_eq!(fired["fired"]["job"], goal.as_str(), "{fired}");
         gateway
-            .wait_terminal(&RunId::from_raw(fired["run"].as_str().unwrap()))
+            .wait_terminal(&RunId::from_raw(fired["fired"]["run"].as_str().unwrap()))
             .await;
+        let ongoing = ok(
+            &tool,
+            &mut ctx,
+            "goal.add",
+            json!({ "title": "每日巡检", "ongoing": true, "description": "看一眼告警",
+                    "schedule": "0 9 * * *", "timezone": "UTC" }),
+        )
+        .await;
+        assert_eq!(ongoing["matter"]["kind"], "area", "{ongoing}");
+        assert_eq!(ongoing["schedule"]["job"]["prompt"], "看一眼告警", "{ongoing}");
+        let ongoing_id = ongoing["matter"]["id"].as_str().unwrap().to_string();
+        let listed = ok(&tool, &mut ctx, "goal.list", json!({})).await;
+        assert_eq!(listed["matters"].as_array().map(Vec::len), Some(2), "没有终点的也列：{listed}");
+        let retired = ok(&tool, &mut ctx, "goal.retire", json!({ "id": ongoing_id })).await;
+        assert_eq!(retired["matter"]["state"], "retired", "{retired}");
+        let unscheduled = ok(&tool, &mut ctx, "goal.unschedule", json!({ "id": goal })).await;
+        assert!(unscheduled.get("schedule").is_none(), "{unscheduled}");
 
         let done = ok(&tool, &mut ctx, "goal.done", json!({ "id": goal })).await;
         assert_eq!(done["matter"]["state"], "done", "{done}");

@@ -1,5 +1,5 @@
 import { actMatter, keys } from "@komo/api";
-import type { CronJob, Evidence, Matter, MatterActionRequest, MatterDetail, MatterTrigger, MemoryItem, SessionSummary } from "@komo/protocol";
+import type { Evidence, Matter, MatterActionRequest, MatterDetail, MatterTrigger, MemoryItem, SessionSummary } from "@komo/protocol";
 import { useQueryClient } from "@tanstack/react-query";
 import { Link } from "@tanstack/react-router";
 import { useState, type FormEvent, type ReactNode } from "react";
@@ -10,10 +10,10 @@ import { errorText } from "@/lib/errors";
 import { formatDateTime, formatRelative } from "@/lib/format";
 import { m } from "@/paraglide/messages.js";
 import { dueOf, formatInstantDay, isClosed, statusLabel } from "./dates";
-import { ArrowLink, DetailTop, FormError, Hint, Input, Kv, Label, linkClass, Notice, Pill, Select, SubHeading, TextButton } from "./parts";
+import { ArrowLink, DetailTop, FormError, Hint, Input, Kv, Label, linkClass, Notice, Pill, SubHeading, TextButton } from "./parts";
 
 // 每个状态能做什么（docs/goals.md §4 的表）。
-type Verb = "done" | "next" | "wait" | "park" | "edit" | "link" | "drop" | "resume" | "reopen" | "retire" | "unlink";
+type Verb = "done" | "next" | "wait" | "park" | "edit" | "drop" | "resume" | "reopen" | "retire" | "unlink";
 interface Action {
   verb: Verb;
   label: string;
@@ -27,10 +27,9 @@ interface Action {
 function actionsOf(matter: Matter): Action[] {
   if (isClosed(matter)) return [{ verb: "reopen", label: m.matter_act_reopen(), primary: true }];
   const edit: Action = { verb: "edit", label: m.matter_act_edit(), form: true, text: true };
-  const link: Action = { verb: "link", label: m.matter_act_link(), form: true, text: true };
   const drop: Action = { verb: "drop", label: m.matter_act_drop(), text: true };
   if (matter.kind === "area")
-    return [{ ...edit, label: m.matter_act_edit_area(), text: false }, { ...link, text: false }, { verb: "retire", label: m.matter_act_retire(), text: true }];
+    return [{ ...edit, label: m.matter_act_edit_area(), text: false }, { verb: "retire", label: m.matter_act_retire(), text: true }];
   if (matter.state === "active")
     return [
       { verb: "done", label: m.matter_act_done(), primary: true },
@@ -38,7 +37,6 @@ function actionsOf(matter: Matter): Action[] {
       { verb: "wait", label: m.matter_act_wait(), form: true },
       { verb: "park", label: m.matter_act_park() },
       edit,
-      link,
       drop,
     ];
   if (matter.state === "waiting")
@@ -48,7 +46,6 @@ function actionsOf(matter: Matter): Action[] {
       { verb: "done", label: m.matter_act_done() },
       { verb: "park", label: m.matter_act_park() },
       edit,
-      link,
       drop,
     ];
   return [{ verb: "resume", label: m.matter_act_resume(), form: true, primary: true }, { verb: "done", label: m.matter_act_done() }, edit, drop];
@@ -64,7 +61,6 @@ export function MatterDetailView({
   matter,
   today,
   memories,
-  jobs,
   sessions,
   compact,
   onBack,
@@ -72,7 +68,6 @@ export function MatterDetailView({
   matter: Matter;
   today: string | undefined;
   memories: MemoryItem[];
-  jobs: CronJob[];
   sessions: SessionSummary[];
   compact: boolean;
   onBack: () => void;
@@ -120,8 +115,6 @@ export function MatterDetailView({
         return void run("wait", { waiting_for: v("waiting_for") });
       case "resume":
         return void run("resume", v("next") ? { next: v("next") } : {});
-      case "link":
-        return void run("link", { trigger: { kind: "cron", job: v("job") } });
       case "edit": {
         const fields: MatterActionRequest = { title: v("title") };
         if (matter.kind === "goal") {
@@ -202,13 +195,13 @@ export function MatterDetailView({
             ))}
         </div>
       )}
-      {form && <ActionForm key={form} verb={form} matter={matter} jobs={jobs} busy={busy !== null} onSubmit={submit} onCancel={() => (setForm(null), setFail(""))} />}
+      {form && <ActionForm key={form} verb={form} matter={matter} busy={busy !== null} onSubmit={submit} onCancel={() => (setForm(null), setFail(""))} />}
 
       <SubHeading count={triggers.length}>{m.matter_triggers()}</SubHeading>
       {triggers.length ? (
         <ul>
           {triggers.map((trigger, i) => (
-            <TriggerRow key={i} trigger={trigger} jobs={jobs} sessions={sessions} canUnlink={!closed} busy={busy !== null} onUnlink={() => void run("unlink", { trigger })} />
+            <TriggerRow key={i} trigger={trigger} sessions={sessions} canUnlink={!closed} busy={busy !== null} onUnlink={() => void run("unlink", { trigger })} />
           ))}
         </ul>
       ) : (
@@ -290,14 +283,12 @@ function ReceiptView({ receipt }: { receipt: Receipt }) {
 function ActionForm({
   verb,
   matter,
-  jobs,
   busy,
   onSubmit,
   onCancel,
 }: {
   verb: Verb;
   matter: Matter;
-  jobs: CronJob[];
   busy: boolean;
   onSubmit: (event: FormEvent<HTMLFormElement>) => void;
   onCancel: () => void;
@@ -359,44 +350,17 @@ function ActionForm({
         {buttons(m.matter_save())}
       </>,
     );
-  // link：只列还没挂着的定时任务
-  const linked = new Set(matter.triggers?.flatMap((t) => (t.kind === "cron" ? [t.job] : [])));
-  const free = jobs.filter((job) => !linked.has(job.id));
-  if (!free.length)
-    return (
-      <Hint className="mt-4">
-        {m.matter_no_jobs_before()}
-        <Link to="/cron" className="font-medium text-text underline underline-offset-3">
-          {m.nav_cron()}
-        </Link>
-        {m.matter_no_jobs_after()}
-      </Hint>
-    );
-  return wrap(
-    <>
-      <Label htmlFor="mf-job">{m.matter_form_job()}</Label>
-      <Select id="mf-job" name="job">
-        {free.map((job) => (
-          <option key={job.id} value={job.id}>
-            {job.name}
-          </option>
-        ))}
-      </Select>
-      {buttons(m.matter_submit_link())}
-    </>,
-  );
+  return null;
 }
 
 function TriggerRow({
   trigger,
-  jobs,
   sessions,
   canUnlink,
   busy,
   onUnlink,
 }: {
   trigger: MatterTrigger;
-  jobs: CronJob[];
   sessions: SessionSummary[];
   canUnlink: boolean;
   busy: boolean;
@@ -408,18 +372,12 @@ function TriggerRow({
     </TextButton>
   );
   if (trigger.kind === "cron") {
-    const job = jobs.find((x) => x.id === trigger.job);
+    // 定时已经并进目标本身（docs/redesign.md P8）；这里只会是回填之前残留的引用，不再有去处。
     return (
       <li className="flex flex-col gap-0.5 border-b border-rule py-2 text-label last:border-b-0">
         <span className="text-muted">{m.matter_trigger_cron()}</span>
         <span className="flex min-w-0 items-center gap-2.5">
-          {job ? (
-            <Link to="/cron/$id" params={{ id: job.id }} className={linkClass}>
-              <ArrowLink>{job.name}</ArrowLink>
-            </Link>
-          ) : (
-            <span className="text-muted">{m.matter_trigger_cron_gone()}</span>
-          )}
+          <span className="text-muted">{m.matter_trigger_cron_gone()}</span>
           {unlink}
         </span>
       </li>

@@ -154,7 +154,7 @@ fn the_main_prompt_tells_the_model_to_query_komo_with_its_tool() {
     );
     assert!(prompt.contains("komo 自己的状态"), "{prompt}");
     assert!(prompt.contains("komo 工具"), "{prompt}");
-    assert!(prompt.contains("cron.list"), "{prompt}");
+    assert!(prompt.contains("goal.schedule"), "{prompt}");
     assert!(!prompt.contains("`komo <子命令>`"), "{prompt}");
     let own = prompt.find("komo 自己的状态").unwrap();
     let skills = prompt.find("cron-scheduler").unwrap();

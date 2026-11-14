@@ -784,6 +784,10 @@ mod tests {
             .await;
         }
         for index in crate::models::INDEXES {
+            // 老库的 matters 表没有 `next_run_at`，也就没有这条索引：它要等补列之后才建。
+            if matches!(&legacy, Some(("matters", _))) && index.contains("matters_next_run") {
+                continue;
+            }
             plain_exec(path, index).await;
         }
     }
@@ -983,13 +987,107 @@ mod tests {
         insert(&db, "after-alter".to_string()).await.unwrap();
     }
 
+    /// 去掉 `from` 起（含）的所有列的 matters DDL：老库的 matters 表就是这样建出来的。
+    fn old_matters_ddl(from: &str) -> String {
+        let ddl = crate::models::matter::DDL;
+        let start = ddl.find(from).expect("DDL 里有这一列");
+        let end = ddl.find(r#"PRIMARY KEY"#).expect("有主键");
+        format!("{}{}", &ddl[..start], &ddl[end..])
+    }
+
+    /// 定时并进目标（`docs/redesign.md` P8）：说明与定时那几列在**旧形状**的 matters 表上补得回来，
+    /// 旧行读出来没有定时、没有说明；`matters_next_run` 索引也建出来；之后能设定时、调度器能读到。
+    #[tokio::test]
+    async fn the_schedule_columns_are_added_to_an_existing_matters_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("aux.db");
+
+        let legacy = old_matters_ddl(r#""description" TEXT"#);
+        assert!(!legacy.contains("schedule"), "旧形状里不该有定时列");
+        plain_build_old(&path, Some(("matters", legacy))).await;
+        plain_exec(
+            &path,
+            "INSERT INTO matters (id, revision, kind, title, state, evidence, created_at, \
+             updated_at, closed_at, triggers) \
+             VALUES ('g-old', 1, 'goal', '旧事项', 'active', '[]', 0, 0, 0, '[]')",
+        )
+        .await;
+        let before = plain_columns(&path, "matters").await;
+        assert!(!before.iter().any(|name| name == "next_run_at"), "{before:?}");
+
+        let db = Db::connect(&path).await.unwrap();
+        let after = plain_columns(&path, "matters").await;
+        for column in [
+            "description",
+            "schedule",
+            "schedule_status",
+            "next_run_at",
+            "last_error",
+            "migrated_from",
+        ] {
+            assert!(after.iter().any(|name| name == column), "{column}：{after:?}");
+        }
+
+        use komo_kernel::cron::{CronJob, JobStatus, OverlapPolicy, TimeZone, Trigger};
+        use komo_kernel::traits::{CronRepo, MatterRepo};
+        use komo_kernel::types::ids::{CronJobId, MatterId};
+        let matters = crate::repos::matter::TursoMatterRepo::new(db.clone());
+        let old = matters
+            .get(&MatterId::from_raw("g-old"))
+            .await
+            .unwrap()
+            .expect("旧行还在");
+        assert_eq!(old.description, None);
+        let cron = crate::repos::cron::TursoCronRepo::new(db);
+        assert!(
+            cron.get(&CronJobId::from_raw("g-old"))
+                .await
+                .unwrap()
+                .is_none(),
+            "旧行没有定时"
+        );
+        // 旧行上设定时、被调度器读到：新列真的读写得通。
+        let at = time::OffsetDateTime::now_utc();
+        cron.put(CronJob {
+            id: CronJobId::from_raw("g-old"),
+            name: String::new(),
+            version: 1,
+            trigger: Trigger::Cron {
+                expr: "0 3 * * *".into(),
+                tz: TimeZone::utc(),
+            },
+            prompt: String::new(),
+            command: Some("tar czf /tmp/backup.tgz /data".into()),
+            workdir: None,
+            status: JobStatus::Active,
+            overlap: OverlapPolicy::Skip,
+            model: None,
+            effort: None,
+            skills: vec![],
+            max_rounds: None,
+            notify: Default::default(),
+            next_run_at: Some(at - time::Duration::minutes(1)),
+            last_error: None,
+        })
+        .await
+        .unwrap();
+        let due = cron.due(at).await.unwrap();
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].name, "旧事项", "名字是目标的标题");
+        assert_eq!(
+            due[0].command.as_deref(),
+            Some("tar czf /tmp/backup.tgz /data")
+        );
+    }
+
     /// `triggers`（P1e）在旧形状的 matters 表上补得回来，旧行读出来是没有触发器。
     #[tokio::test]
     async fn the_triggers_column_is_added_to_an_existing_matters_table() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("aux.db");
 
-        let legacy = crate::models::matter::DDL.replace(r#""triggers" TEXT NOT NULL, "#, "");
+        // 旧形状 = 没有 `triggers`，也没有它之后加的列（说明与定时那几列）。
+        let legacy = old_matters_ddl(r#""triggers" TEXT NOT NULL, "#);
         assert!(!legacy.contains("triggers"), "旧形状里不该有这一列");
         plain_build_old(&path, Some(("matters", legacy))).await;
         plain_exec(
@@ -1125,7 +1223,7 @@ mod tests {
     }
 
     /// `cron_jobs.command`（命令直跑模式，Cron 加法字段）在**旧形状**的表上补得回来，
-    /// 旧行读成 `None`（这一列本来就没有），新写的命令 Job 逐字往返。
+    /// 旧行读成 `None`（这一列本来就没有），命令 Job 经回填逐字进到目标的定时里。
     #[tokio::test]
     async fn the_command_column_is_added_to_an_existing_cron_jobs_table_and_round_trips() {
         let dir = tempfile::tempdir().unwrap();
@@ -1148,39 +1246,54 @@ mod tests {
             "补回来了，而且落盘：{after:?}"
         );
 
-        // 命令 Job 逐字往返：新列既补得回来，也真的读写得通。
-        use komo_kernel::cron::{CronJob, JobStatus, OverlapPolicy, TimeZone, Trigger};
+        // 命令 Job 逐字往返：新列既补得回来，也真的读写得通——回填（读 `cron_jobs`）要用它。
+        use crate::models::CronJobRow;
         use komo_kernel::traits::CronRepo;
         use komo_kernel::types::ids::CronJobId;
+        db.with_write_retry(|ex| {
+            Box::pin(async move {
+                toasty::create!(CronJobRow {
+                    id: "job-cmd",
+                    name: "backup",
+                    version: 1,
+                    trigger: r#"{"kind":"cron","expr":"0 3 * * *","tz":"UTC"}"#,
+                    prompt: "",
+                    command: Some("tar czf /tmp/backup.tgz /data".to_string()),
+                    workdir: None::<String>,
+                    status: "active",
+                    overlap: "skip",
+                    model: None::<String>,
+                    effort: None::<String>,
+                    skills: "[]",
+                    max_rounds: 0,
+                    notify: "always",
+                    next_run_at: 0,
+                    last_error: None::<String>,
+                    created_at: 0,
+                    updated_at: 0,
+                })
+                .exec(ex)
+                .await
+                .map_err(map_toasty)?;
+                Ok(())
+            }) as BoxFuture<'_, Result<(), StoreError>>
+        })
+        .await
+        .unwrap();
+        crate::repos::cron_backfill::backfill_cron_into_goals(&db)
+            .await
+            .unwrap();
         let repo = crate::repos::cron::TursoCronRepo::new(db);
-        let job = CronJob {
-            id: CronJobId::from_raw("job-cmd"),
-            name: "backup".into(),
-            version: 1,
-            trigger: Trigger::Cron {
-                expr: "0 3 * * *".into(),
-                tz: TimeZone::utc(),
-            },
-            prompt: String::new(),
-            command: Some("tar czf /tmp/backup.tgz /data".into()),
-            workdir: None,
-            status: JobStatus::Active,
-            overlap: OverlapPolicy::Skip,
-            model: None,
-            effort: None,
-            skills: vec![],
-            max_rounds: None,
-            notify: Default::default(),
-            next_run_at: None,
-            last_error: None,
-        };
-        let stored = repo.put(job).await.unwrap();
-        let read = repo.get(&stored.id).await.unwrap().unwrap();
+        let read = repo
+            .get(&CronJobId::from_raw("job-cmd"))
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(
             read.command.as_deref(),
             Some("tar czf /tmp/backup.tgz /data")
         );
-        assert_eq!(read.prompt, "", "命令 Job 的 prompt 列写空串");
+        assert_eq!(read.prompt, "", "命令 Job 的 prompt 写空串");
     }
 
     /// 时间列是 unix 纳秒，`0` 是"未设置"。

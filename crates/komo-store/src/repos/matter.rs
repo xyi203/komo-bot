@@ -113,6 +113,13 @@ impl MatterRepo for TursoMatterRepo {
                                 updated_at: to_ts(matter.updated_at),
                                 closed_at: to_ts_opt(matter.closed_at),
                                 triggers: triggers,
+                                description: matter.description.clone(),
+                                // 新建的目标没有定时；定时只由 `CronRepo` 写。
+                                schedule: None::<String>,
+                                schedule_status: "active",
+                                next_run_at: 0,
+                                last_error: None::<String>,
+                                migrated_from: None::<String>,
                             })
                             .exec(ex)
                             .await
@@ -143,6 +150,10 @@ impl MatterRepo for TursoMatterRepo {
                                 .updated_at(to_ts(matter.updated_at))
                                 .closed_at(to_ts_opt(matter.closed_at))
                                 .triggers(triggers)
+                                .description(matter.description.clone())
+                                // 定时的列（schedule / schedule_status / next_run_at / last_error）
+                                // 一个字都不写：它们归 `CronRepo`，这里带着旧值写回会把调度器刚推进的
+                                // 槽位盖回去。
                                 .exec(ex)
                                 .await
                                 .map_err(map_toasty)?;
@@ -173,6 +184,7 @@ fn matter_from_row(row: &MatterRow) -> Result<Matter, StoreError> {
             .transpose()
             .map_err(corrupt)?,
         standard: row.standard.clone(),
+        description: row.description.clone(),
         evidence: decode::<Vec<Evidence>>(&row.evidence, "事项证据")?,
         triggers: decode::<Vec<MatterTrigger>>(&row.triggers, "事项触发器")?,
         created_at: from_ts(row.created_at),

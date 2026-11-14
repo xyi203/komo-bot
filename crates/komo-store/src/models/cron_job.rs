@@ -1,4 +1,5 @@
-//! `cron_jobs`：定时任务定义与版本（§10）。耐久表。
+//! `cron_jobs`：定时任务定义与版本（§10）。**已退役**（`docs/redesign.md` P8）：定时并进了
+//! `matters`，回填之后不再读写；表与模型留着，回填（`repos::cron_backfill`）与老库升级要读它。
 
 use super::{ColumnSpec, TableSpec};
 

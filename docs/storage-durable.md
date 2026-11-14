@@ -102,7 +102,7 @@ komo 已经借过它的重放判据（§8.6"已存 / 当前 replay 双 Safe"）�
 | `submissions` | id、conversation、type、status、entry / answer、reason、`request_id` | pi-durable |
 | `documents` | id、kind、scope（session 级 / conversation 级 / task 级）、key、整值、版本、生命周期 | pi-durable，去掉 delta |
 | `sessions` | 对外 UUIDv7、标题、来源、cwd、生命周期（§8.10）、**当前分支**（conversation id）、根 conversation | komo |
-| `cron_jobs` / `cron_firings` | 同今天；firing 与它创建的 submission **同一提交** | komo |
+| `cron_firings`（`cron_jobs` 已退役，定时在 `matters` 上） | 同今天；`job_id` 现在存目标 id；firing 与它创建的 submission **同一提交** | komo |
 | `deliveries` | 同今天；run 收尾时与答复 entry **同一提交**生成 | komo |
 | `memory_*` | 同今天；证据引用改为 `entry id`（旧证据见 §8） | komo |
 

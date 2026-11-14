@@ -141,18 +141,18 @@
 
 ### 2.2 目标与定时
 
-- [ ] 没有终点的目标：复用 `matters.kind` 的领域一类，`standard` 当说明；`docs/tasks.md` D10「去掉领域」改成「领域并入目标」
-- [ ] 有终点的目标加说明字段
-- [ ] 定时配置放进目标（节奏、重叠、通知、模型），到点做的事取目标的说明
-- [ ] 目标表与定时任务表合成一张：运行状态（下一次时间、上次错误）也放在目标那一行，`cron_jobs` 不再用。调度器更新这两列时不加目标的版本号（版本号只管内容修改），否则网页编辑目标会无故冲突；「下一次时间」单独成列并建索引
-- [ ] 触发记录（`cron_firings`）保留，键换成目标 id
+- [x] 没有终点的目标：复用 `matters.kind` 的领域一类；`docs/tasks.md` D10「去掉领域」已改成「领域并入目标」（3a-1，2026-11-14）。说明统一放新列 `description`（领域也用它，`standard` 仍是「要维持的标准」，没有拿它当说明）；`komo` 工具 `goal.add` 带 `ongoing: true` 建这种目标，`goal.retire` 不再追踪
+- [x] 有终点的目标加说明字段（`matters.description`；`MatterAddRequest` / `MatterActionRequest` 的 `description`，不进注入行，多行、≤ 8000 字）
+- [x] 定时配置放进目标（节奏、重叠、通知、模型），到点做的事取目标的说明（`matters.schedule` JSON；字段与旧 `cron_jobs` 一一对应，提示词 / 命令也在里面；创建时没给 prompt / command 就取目标的 `description`，读时现取，说明改了下一次跟着改）
+- [x] 目标表与定时任务表合成一张（3a-1）：运行状态（下一次时间、上次错误）也放在目标那一行，`cron_jobs` 不再用。调度器更新这两列时不加目标的版本号（版本号只管内容修改），否则网页编辑目标会无故冲突；「下一次时间」单独成列并建索引
+- [x] 触发记录（`cron_firings`）保留，键换成目标 id（列名 `job_id` 没改，存目标 id；回填时已链到目标的任务的 firing 改挂，主键哈希随之重算）
 - [ ] 定时触发的运行带上目标的键
 - [ ] 目标与支线绑定（P22）：目标上记绑定的会话，会话上记目标的键，一对一；绑定与解绑的接口。定时运行仍在它自己的会话里做，只把结果与提问作为一条消息投到绑定的支线（没绑定投主对话），下一轮进那段对话的上下文。支线被归档或删除时解除绑定、回落到主对话
 - [ ] 运行历史接口（数据在 `cron_firings`）
 - [ ] 目标详情接口：说明、定时、监听、活动一次返回；「近况」从最近一次活动取，不存
-- [ ] `/v1/cron` 与 `komo` 工具的 `cron.*` 并进目标的接口与 `goal.*`
-- [ ] 存量定时任务各转成一个带定时配置的目标（数据回填）
-- [ ] 状态映射：进行中 / 等待中 → 追踪中；搁置 / 完成 / 放弃 → 不再追踪。待确认
+- [x] `/v1/cron` 与 `komo` 工具的 `cron.*` 并进目标的接口与 `goal.*`（3a-1：`POST /v1/matters` 带 `schedule`、`POST /v1/matters/{id}/{schedule|unschedule|run}`；`komo goal|area schedule / unschedule / run`；工具 `goal.schedule / unschedule / run / retire`；`/v1/cron*`、`komo cron`、`cron.list` / `cron.run` 已删）
+- [x] 存量定时任务各转成一个带定时配置的目标（数据回填：`komo_store::backfill_cron_into_goals`，Gateway 启动时跑，可重入；规则见 `repos/cron_backfill.rs` 的模块注释）
+- [ ] 状态映射：进行中 / 等待中 → 追踪中；搁置 / 完成 / 放弃 → 不再追踪。待确认（3a-1 先按这个做：调度器只触发进行中 / 等待中的目标的定时，搁置与结案的不触发，重开后恢复；网页上的说法是 3b）
 - [ ] 监听与目标的关联现在怎么写入、目标结案时怎么清：未核实
 
 ### 2.3 设置
@@ -247,12 +247,12 @@
 
 ## 3. 数据
 
-- [ ] `matters`：加说明列、定时配置（一个 JSON 字段）、下一次运行时间（单独一列，建索引）、上次错误
-- [ ] `cron_jobs`：并进 `matters`，表不再用
-- [ ] `cron_firings`：保留，键从定时任务 id 换成目标 id
+- [x] `matters`：加说明列、定时配置（一个 JSON 字段）、下一次运行时间（单独一列，建索引 `matters_next_run`）、上次错误（3a-1；另有 `schedule_status` 启停列与 `migrated_from` 回填标记列）
+- [x] `cron_jobs`：并进 `matters`，表不再用（表与模型留着，回填之后不读写）
+- [x] `cron_firings`：保留，键从定时任务 id 换成目标 id
 - [x] `sessions`：补最后一句话的时间（`SessionRecord.last_message_at`，会话行 JSON 里加一格，没有迁移）
 - [ ] 配置文件：MCP 工具启停、服务器启用、技能与渠道启用；删群聊相关键
-- [ ] 回填：存量定时任务 → 目标
+- [x] 回填：存量定时任务 → 目标（单元测试覆盖；对 `~/.komo` 副本的演练待统一验证阶段补）
 - [ ] 记下不做的：把 `aux.db` 并进 `durable.db`（与这次无关，单独一笔）
 
 ## 4. 文档

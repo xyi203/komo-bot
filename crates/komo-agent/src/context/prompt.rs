@@ -280,6 +280,8 @@ const KOMO_TOOL: &str = "komo";
 ///
 /// 动作清单一句话带过，字段在 `tool://komo/doc`，不抄进提示。
 ///
+/// 2026-11-14 起定时并进了目标：没有独立的定时动作，`goal.schedule` 等是目标的动作。
+///
 /// 「记住」那句（2026-10-20）：记忆原本只能等后台提取，用户说"记住这个习惯"时只能回一句
 /// "等它出现在列表里再确认"。
 ///
@@ -296,10 +298,11 @@ const KOMO_TOOL: &str = "komo";
 /// 「目标」那句（2026-10-29，`docs/goals.md` §4）：事项由 Agent 在 Run 里当场记，用户在场、
 /// 上下文齐全；后台提取不建事项。静态文字，不影响前缀。末尾补一句挂触发器（P1e，§8）：等待时 monitor
 /// 盯着、交回来再 resume。
-const SELF_BLOCK: &str = "komo 自己的状态（记忆、目标、定时任务、别的会话、任务清单）用 komo 工具查和改，\
+const SELF_BLOCK: &str = "komo 自己的状态（记忆、目标与它们的定时、别的会话、任务清单）用 komo 工具查和改，\
                           不要去翻系统 crontab、launchctl 或同名 skill，也不要在 bash 里找。\
-                          动作：memory.add / search / forget，goal.add / next / wait / resume / done / link，\
-                          cron.list / run，session.search / list，task.list；各动作的 params 字段先 read \
+                          动作：memory.add / search / forget，goal.add / next / wait / resume / done / retire / link，\
+                          goal.schedule / unschedule / run（定时是目标的配置，不是另一种东西），\
+                          session.search / list，task.list；各动作的 params 字段先 read \
                           tool://komo/doc。\
                           用户要你记住什么，当场用 memory.add 记下，它记成用户原话、未确认，由用户自己\
                           确认；别替用户确认。用户表达了长期意图（\"以后\"\"默认\"\"每次都\"）的偏好，带 \
@@ -312,7 +315,10 @@ const SELF_BLOCK: &str = "komo 自己的状态（记忆、目标、定时任务�
                           找到会话与片段，别 export 整个会话去 grep。\
                           用户说开始做某事、在等某人某事、办完了，就当场用 goal.add / goal.wait / \
                           goal.done 记下；推进时用 goal.next 更新下一步；目标转等待时通常顺手挂个 \
-                          monitor 盯着，用 goal.link 挂上，monitor 交回来就 goal.resume。";
+                          monitor 盯着，用 goal.link 挂上，monitor 交回来就 goal.resume。\
+                          用户要你定时做某件事（\"每天早上看一下告警\"），就是给一个目标设定时：\
+                          例行的、没有终点的事用 goal.add（ongoing = true，带 schedule 与时区）新建，\
+                          已有的目标用 goal.schedule；去掉用 goal.unschedule，立刻跑一次用 goal.run。";
 
 /// 能跑命令时的一句提醒（2026-10-15）：会话里 6 次在 Run 里重启 Gateway，8 个调用因此记成
 /// uncertain，最长的一条两个多小时后才收尾。`komo gateway` 是给人用的命令，不在 komo 工具里。

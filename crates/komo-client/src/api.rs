@@ -9,7 +9,7 @@
 
 use komo_kernel::protocol::http::*;
 use komo_kernel::types::ids::{
-    CronJobId, MatterId, MemoryId, RequestKey, RunId, SessionId, uuid_v7_at,
+    MatterId, MemoryId, RequestKey, RunId, SessionId, uuid_v7_at,
 };
 use komo_kernel::types::matter::MatterVerb;
 use serde::Serialize;
@@ -494,47 +494,6 @@ impl KomoClient {
             request,
         )
         .await
-    }
-
-    // ---- /v1/cron ----
-
-    pub async fn cron_list(&self) -> ClientResult<CronListResponse> {
-        self.get("/v1/cron").await
-    }
-
-    pub async fn cron_create(
-        &self,
-        request: &CreateCronRequest,
-    ) -> ClientResult<komo_kernel::cron::CronJob> {
-        self.post("/v1/cron", request).await
-    }
-
-    /// 手动触发。**独立请求幂等键，不冒充定时触发**（§10）。
-    pub async fn cron_run(
-        &self,
-        job: &CronJobId,
-        request: &ManualCronRunRequest,
-    ) -> ClientResult<ManualCronRunResponse> {
-        self.post(&format!("/v1/cron/{job}/run"), request).await
-    }
-
-    pub async fn cron_update(
-        &self,
-        job: &CronJobId,
-        request: &UpdateCronRequest,
-    ) -> ClientResult<komo_kernel::cron::CronJob> {
-        self.send(|client| {
-            client
-                .http
-                .patch(client.url(&format!("/v1/cron/{job}")))
-                .json(request)
-        })
-        .await
-    }
-
-    pub async fn cron_delete(&self, job: &CronJobId) -> ClientResult<CronDeleteResponse> {
-        self.send(|client| client.http.delete(client.url(&format!("/v1/cron/{job}"))))
-            .await
     }
 
     // ---- /v1/memories ----
@@ -1256,30 +1215,6 @@ mod wire_tests {
             .unwrap();
         // 不带 `kind`：两类一起要——结果不明与阻塞是同一张清单（§7.5）。
         assert_eq!(server.requests()[0].query, "");
-    }
-
-    #[tokio::test]
-    async fn a_manual_cron_run_carries_its_own_key() {
-        let server = FakeGateway::spawn(|_, _| {
-            Reply::ok(serde_json::json!({
-                "job": "job-1", "session": "sess-1", "run": "run-9",
-                "request_key": "cli:manual-1"
-            }))
-        })
-        .await;
-        let response = server
-            .client()
-            .cron_run(
-                &CronJobId::from_raw("job-1"),
-                &ManualCronRunRequest {
-                    request_key: Some(RequestKey::new("cli:manual-1")),
-                },
-            )
-            .await
-            .unwrap();
-        // §10：手动触发不冒充定时触发。
-        assert_eq!(response.request_key.as_str(), "cli:manual-1");
-        assert!(server.requests()[0].body.contains("cli:manual-1"));
     }
 
     #[tokio::test]

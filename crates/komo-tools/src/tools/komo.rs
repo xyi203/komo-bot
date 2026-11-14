@@ -38,14 +38,11 @@ use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
 use komo_kernel::protocol::http::{
-    InterventionVerdict, ManualCronRunRequest, MatterActionRequest, MatterAddRequest,
-    MatterListQuery, MemoryAddRequest, MemoryListQuery, MemoryRevisionRequest, SessionListQuery,
-    SessionSearchQuery, TaskListQuery,
+    InterventionVerdict, MatterActionRequest, MatterAddRequest, MatterListQuery, MemoryAddRequest,
+    MemoryListQuery, MemoryRevisionRequest, SessionListQuery, SessionSearchQuery, TaskListQuery,
 };
 use komo_kernel::traits::{OutputWriter, Tool};
-use komo_kernel::types::ids::{
-    CronJobId, MatterId, MemoryId, OperationId, RequestKey, RunId, SessionId,
-};
+use komo_kernel::types::ids::{MatterId, MemoryId, OperationId, RequestKey, RunId, SessionId};
 use komo_kernel::types::matter::{MatterKind, MatterTrigger, MatterVerb};
 use komo_kernel::types::memory::{MEMORY_QUERY_MARKER, MemoryScope};
 use komo_kernel::types::plan::{ExecutionPlan, Operation, PlanVersions, RecoveryMode, Replay};
@@ -74,8 +71,10 @@ pub enum Action {
     GoalList,
     GoalAttach,
     GoalDetach,
-    CronList,
-    CronRun,
+    GoalSchedule,
+    GoalUnschedule,
+    GoalRun,
+    GoalRetire,
     SessionSearch,
     SessionList,
     TaskList,
@@ -136,7 +135,96 @@ const TASK_LIST_FIELDS: [Field; 4] = [
     ),
 ];
 
-const SPECS: [Spec; 19] = [
+/// 定时的字段（`goal.add` 随目标一起给，`goal.schedule` 给出的才改）；服务端那份是
+/// `ScheduleSpec`，这里平铺成 params，`build` 再收进 `schedule` 对象。
+const SCHEDULE_FIELDS: [Field; 12] = [
+    field(
+        "schedule",
+        false,
+        "定时：五字段 cron 表达式（分 时 日 月 周）或 `@at YYYY-MM-DD HH:MM`；第一次设置时必给",
+    ),
+    field("timezone", false, "IANA 时区名，例如 Asia/Shanghai；不给就是 UTC"),
+    field(
+        "prompt",
+        false,
+        "到点交给模型做的事（与 command 二选一）；都不给就取目标的 description",
+    ),
+    field("command", false, "命令直跑：到点不经模型，直接跑这条 shell 命令"),
+    field("workdir", false, "这个定时的工作目录"),
+    field("model", false, "这个定时用的模型：模型目录里的 alias"),
+    field("effort", false, "这个定时的 effort"),
+    field("skills", false, "到点预载的技能名，字符串数组"),
+    field("overlap", false, "上一次还没跑完时：skip（默认，跳过并记录）/ allow"),
+    field("max_rounds", false, "一次最多跑几轮模型"),
+    field(
+        "notify",
+        false,
+        "结果要不要投到对话：always（默认）/ on_error / never；停住等你不受它约束",
+    ),
+    field("enabled", false, "false = 暂停定时，true = 恢复"),
+];
+
+const SCHEDULE_KEYS: [&str; 12] = [
+    "schedule",
+    "timezone",
+    "prompt",
+    "command",
+    "workdir",
+    "model",
+    "effort",
+    "skills",
+    "overlap",
+    "max_rounds",
+    "notify",
+    "enabled",
+];
+
+const GOAL_ADD_FIELDS: [Field; 17] = [
+    field("title", true, "一句能独立看懂的话，≤ 80 字"),
+    field("next", false, "下一步"),
+    field("due", false, "截止日期，YYYY-MM-DD（没有终点的目标不能有）"),
+    field(
+        "description",
+        false,
+        "说明：这件事是什么、到点要做什么（可以几行）",
+    ),
+    field(
+        "ongoing",
+        false,
+        "true = 没有终点的目标（例行的事，如每天巡检）：不能「完成」，只能不再追踪（goal.retire）",
+    ),
+    SCHEDULE_FIELDS[0],
+    SCHEDULE_FIELDS[1],
+    SCHEDULE_FIELDS[2],
+    SCHEDULE_FIELDS[3],
+    SCHEDULE_FIELDS[4],
+    SCHEDULE_FIELDS[5],
+    SCHEDULE_FIELDS[6],
+    SCHEDULE_FIELDS[7],
+    SCHEDULE_FIELDS[8],
+    SCHEDULE_FIELDS[9],
+    SCHEDULE_FIELDS[10],
+    SCHEDULE_FIELDS[11],
+];
+
+const GOAL_SCHEDULE_FIELDS: [Field; 14] = [
+    field("id", true, "目标 id"),
+    REVISION,
+    SCHEDULE_FIELDS[0],
+    SCHEDULE_FIELDS[1],
+    SCHEDULE_FIELDS[2],
+    SCHEDULE_FIELDS[3],
+    SCHEDULE_FIELDS[4],
+    SCHEDULE_FIELDS[5],
+    SCHEDULE_FIELDS[6],
+    SCHEDULE_FIELDS[7],
+    SCHEDULE_FIELDS[8],
+    SCHEDULE_FIELDS[9],
+    SCHEDULE_FIELDS[10],
+    SCHEDULE_FIELDS[11],
+];
+
+const SPECS: [Spec; 21] = [
     Spec {
         action: Action::MemoryAdd,
         name: "memory.add",
@@ -207,12 +295,8 @@ const SPECS: [Spec; 19] = [
         action: Action::GoalAdd,
         name: "goal.add",
         read_only: false,
-        summary: "新建一个目标（进行中）。要这个 Run 里有用户说的话作依据；任务会话与定时任务会话不能新建",
-        fields: &[
-            field("title", true, "一句能独立看懂的话，≤ 80 字"),
-            field("next", false, "下一步"),
-            field("due", false, "截止日期，YYYY-MM-DD"),
-        ],
+        summary: "新建一个目标（进行中）；可以同时给它一个定时（schedule 等字段）。要这个 Run 里有用户说的话作依据；任务会话与定时任务会话不能新建",
+        fields: &GOAL_ADD_FIELDS,
     },
     Spec {
         action: Action::GoalNext,
@@ -258,13 +342,12 @@ const SPECS: [Spec; 19] = [
         action: Action::GoalLink,
         name: "goal.link",
         read_only: false,
-        summary: "给目标挂一个触发器（Cron Job 或 monitor），二选一；已挂着的无变化",
+        summary: "给目标挂一个 monitor（定时不是挂上去的，是目标自己的配置：用 goal.schedule）；已挂着的无变化",
         fields: &[
             field("id", true, "目标 id"),
-            field("cron", false, "Cron Job id（cron.list 看得到）"),
             field(
                 "monitor",
-                false,
+                true,
                 "monitor：挂它的会话 id 与 monitor 短号，写成 SESSION_ID:MONITOR_ID（# 可省）",
             ),
             REVISION,
@@ -274,7 +357,7 @@ const SPECS: [Spec; 19] = [
         action: Action::GoalList,
         name: "goal.list",
         read_only: true,
-        summary: "列出目标（只读），带状态、下一步、截止，以及每个目标被几个任务带着（tasks，不含已归档的任务）；默认只列未结案的",
+        summary: "列出目标（只读；含没有终点的目标），带状态、下一步、截止、定时（下一次与最近一次触发），以及每个目标被几个任务带着（tasks，不含已归档的任务）；默认只列未结案的",
         fields: &[field("all", false, "true = 带上已结案的")],
     },
     Spec {
@@ -294,18 +377,34 @@ const SPECS: [Spec; 19] = [
         fields: &[field("id", true, "目标 id")],
     },
     Spec {
-        action: Action::CronList,
-        name: "cron.list",
-        read_only: true,
-        summary: "列出定时任务，带下一次与最近一次触发（只读）",
-        fields: &[],
+        action: Action::GoalSchedule,
+        name: "goal.schedule",
+        read_only: false,
+        summary: "给目标设置或修改定时（给出的字段才改；第一次设置时 schedule 必给）；暂停 / 恢复用 enabled。\
+                  改的是用户要它什么时候做什么，要这个 Run 里有用户说的话作依据；任务会话与定时任务会话不行。\
+                  目标要还在追踪（未结案）",
+        fields: &GOAL_SCHEDULE_FIELDS,
     },
     Spec {
-        action: Action::CronRun,
-        name: "cron.run",
+        action: Action::GoalUnschedule,
+        name: "goal.unschedule",
         read_only: false,
-        summary: "立即手动触发一个定时任务（不冒充定时触发，不写触发记录）",
-        fields: &[field("id", true, "Cron Job id")],
+        summary: "去掉目标的定时（目标与已有的触发历史保留）。要这个 Run 里有用户说的话作依据",
+        fields: &[field("id", true, "目标 id"), REVISION],
+    },
+    Spec {
+        action: Action::GoalRun,
+        name: "goal.run",
+        read_only: false,
+        summary: "立即手动触发目标的定时做的事一次（不冒充计划触发，不写触发记录）",
+        fields: &[field("id", true, "目标 id")],
+    },
+    Spec {
+        action: Action::GoalRetire,
+        name: "goal.retire",
+        read_only: false,
+        summary: "没有终点的目标不再追踪（它没有「完成」）。要这个 Run 里有用户说的话作依据；任务会话与定时任务会话不行",
+        fields: &[field("id", true, "目标 id"), REVISION],
     },
     Spec {
         action: Action::SessionSearch,
@@ -438,11 +537,6 @@ pub enum KomoCall {
         verb: MatterVerb,
         request: MatterActionRequest,
     },
-    CronList,
-    CronRun {
-        job: CronJobId,
-        request: ManualCronRunRequest,
-    },
     SessionSearch(SessionSearchQuery),
     SessionList(SessionListQuery),
     TaskList(TaskListQuery),
@@ -516,8 +610,8 @@ fn doc() -> String {
     let mut text = String::from(
         "`params` 是一个对象，字段按动作不同（下面逐个列出，必填的标明）；给了不认识的字段会被拒绝并列出该动作认的字段。\
          身份（哪个会话、哪个 Run）由宿主填，不要在 params 里给 session / run。\n\
-         写动作按顺序一个个执行；只读动作（memory.search、goal.list、cron.list、session.*、task.list、intervention.list）可以和别的只读调用放同一轮并行。\n\
-         改承诺的写动作（goal.add、goal.done）要这个 Run 里有用户说的话作依据；后台任务会话与定时任务会话被拒绝——\
+         写动作按顺序一个个执行；只读动作（memory.search、goal.list、session.*、task.list、intervention.list）可以和别的只读调用放同一轮并行。\n\
+         改承诺的写动作（goal.add、goal.done、goal.retire、goal.schedule、goal.unschedule）要这个 Run 里有用户说的话作依据；后台任务会话与定时任务会话被拒绝——\
          把要记的在交回的结果里写明，由主会话来做。\n\
          goal.attach / goal.detach 改的是任务自己的关联、不是目标的承诺，不要用户原话；但只有任务会话里能用。\
          intervention.answer 替操作者答复一个待处理事项（停住的运行在对话里问过他的问题）：只有他在这一轮里明确回答了\
@@ -618,13 +712,29 @@ fn build(
     };
     let matter = |map: &mut Map<String, Value>, verb: MatterVerb| -> Result<KomoCall, ToolError> {
         let id = MatterId::from_raw(text_of(spec, map, "id")?);
-        map.insert("kind".into(), json!(MatterKind::Goal));
+        // 定时与「不再追踪」对没有终点的目标（领域）同样适用，所以不核对种类。
+        if !matches!(
+            verb,
+            MatterVerb::Schedule | MatterVerb::Unschedule | MatterVerb::Run | MatterVerb::Retire
+        ) {
+            map.insert("kind".into(), json!(MatterKind::Goal));
+        }
         identity(map);
         Ok(KomoCall::GoalAct {
             id,
             verb,
             request: decode(spec, std::mem::take(map))?,
         })
+    };
+    // 平铺的定时字段收进 `schedule` 对象（服务端的 `ScheduleSpec`）。
+    let take_schedule = |map: &mut Map<String, Value>| -> Option<Value> {
+        let mut spec_map = Map::new();
+        for key in SCHEDULE_KEYS {
+            if let Some(value) = map.remove(key) {
+                spec_map.insert(key.into(), value);
+            }
+        }
+        (!spec_map.is_empty()).then_some(Value::Object(spec_map))
     };
     match action {
         Action::MemoryAdd => {
@@ -657,12 +767,27 @@ fn build(
             })
         }
         Action::GoalAdd => {
-            map.insert("kind".into(), json!(MatterKind::Goal));
+            let ongoing = match map.remove("ongoing") {
+                None | Some(Value::Null) => false,
+                Some(Value::Bool(flag)) => flag,
+                Some(other) => {
+                    return Err(wrong(spec, format!("`ongoing` 要是 true / false，收到 {other}")));
+                }
+            };
+            // 没有终点的目标复用「领域」。
+            let kind = if ongoing {
+                MatterKind::Area
+            } else {
+                MatterKind::Goal
+            };
+            map.insert("kind".into(), json!(kind));
+            if let Some(schedule) = take_schedule(&mut map) {
+                map.insert("schedule".into(), schedule);
+            }
             identity(&mut map);
             Ok(KomoCall::GoalAdd(decode(spec, map)?))
         }
         Action::GoalList => {
-            map.insert("kind".into(), json!(MatterKind::Goal));
             // 带会话：`memory = private / off` 的会话被拒，同路由。
             map.insert("session".into(), json!(ctx.session));
             Ok(KomoCall::GoalList(decode(spec, map)?))
@@ -678,17 +803,14 @@ fn build(
         Action::GoalResume => matter(&mut map, MatterVerb::Resume),
         Action::GoalDone => matter(&mut map, MatterVerb::Done),
         Action::GoalLink => {
-            let trigger = match (map.remove("cron"), map.remove("monitor")) {
-                (Some(Value::String(job)), None) => {
-                    MatterTrigger::cron(CronJobId::from_raw(job.trim()))
-                }
-                (None, Some(Value::String(monitor))) => {
+            let trigger = match map.remove("monitor") {
+                Some(Value::String(monitor)) => {
                     MatterTrigger::parse_monitor(&monitor).map_err(|why| wrong(spec, why))?
                 }
                 _ => {
                     return Err(wrong(
                         spec,
-                        "要给 cron（Job id）或 monitor（SESSION_ID:MONITOR_ID）其中一个，且是字符串",
+                        "要给 monitor（SESSION_ID:MONITOR_ID），且是字符串",
                     ));
                 }
             };
@@ -696,16 +818,16 @@ fn build(
             map.insert("trigger".into(), json!(trigger));
             matter(&mut map, MatterVerb::Link)
         }
-        Action::CronList => Ok(KomoCall::CronList),
-        Action::CronRun => {
-            let job = CronJobId::from_raw(text_of(spec, &mut map, "id")?);
-            Ok(KomoCall::CronRun {
-                job,
-                request: ManualCronRunRequest {
-                    request_key: Some(key),
-                },
-            })
+        Action::GoalSchedule => {
+            let Some(schedule) = take_schedule(&mut map) else {
+                return Err(wrong(spec, "至少要给一个定时的字段（schedule、enabled …）"));
+            };
+            map.insert("schedule".into(), schedule);
+            matter(&mut map, MatterVerb::Schedule)
         }
+        Action::GoalUnschedule => matter(&mut map, MatterVerb::Unschedule),
+        Action::GoalRun => matter(&mut map, MatterVerb::Run),
+        Action::GoalRetire => matter(&mut map, MatterVerb::Retire),
         Action::SessionSearch => Ok(KomoCall::SessionSearch(decode(spec, map)?)),
         Action::SessionList => Ok(KomoCall::SessionList(decode(spec, map)?)),
         Action::TaskList => Ok(KomoCall::TaskList(decode(spec, map)?)),
@@ -736,10 +858,10 @@ impl Tool for KomoTool {
         ToolDefinition {
             name: KOMO_TOOL.into(),
             description: "操作 komo 自己的状态，不经 shell：记忆（memory.add / search / forget）、\
-                          目标（goal.add / list / next / wait / resume / done / link / attach / detach）、定时任务（cron.list / run）、\
+                          目标（goal.add / list / next / wait / resume / done / retire / link / attach / detach；定时是目标的配置：goal.schedule / unschedule / run）、\
                           找会话（session.search / list）、任务清单（task.list）、\
                           待处理事项（intervention.list / answer：操作者在对话里答复了你问过的问题，才替他提交）。\
-                          用户要你记住什么、提到别的会话里的事、问有哪些定时任务或任务时用它，\
+                          用户要你记住什么、提到别的会话里的事、要你定时做什么（给目标设定时）、问有哪些目标、定时或任务时用它，\
                           别去翻系统 crontab 或读数据文件。\n\
                           用前先 read tool://komo/doc（各动作的 params 字段）。"
                 .into(),
@@ -887,12 +1009,18 @@ mod tests {
             ("goal.wait", json!({ "id": "g-1", "waiting_for": "审批" })),
             ("goal.resume", json!({ "id": "g-1" })),
             ("goal.done", json!({ "id": "g-1", "revision": 3 })),
-            ("goal.link", json!({ "id": "g-1", "cron": "job-1" })),
+            ("goal.link", json!({ "id": "g-1", "monitor": "s-1:m1" })),
             ("goal.list", json!({ "all": true })),
             ("goal.attach", json!({ "id": "g-1" })),
             ("goal.detach", json!({ "id": "g-1" })),
-            ("cron.list", json!({})),
-            ("cron.run", json!({ "id": "job-1" })),
+            (
+                "goal.schedule",
+                json!({ "id": "g-1", "schedule": "0 9 * * *", "timezone": "Asia/Shanghai",
+                        "prompt": "巡检", "notify": "on_error", "enabled": true }),
+            ),
+            ("goal.unschedule", json!({ "id": "g-1" })),
+            ("goal.run", json!({ "id": "g-1" })),
+            ("goal.retire", json!({ "id": "a-1" })),
             ("session.search", json!({ "q": "飞书" })),
             ("session.list", json!({ "all": true, "limit": 5 })),
             ("task.list", json!({})),
@@ -933,13 +1061,13 @@ mod tests {
         assert_eq!(request.kind, Some(MatterKind::Goal));
         assert_eq!(
             request.trigger,
-            Some(MatterTrigger::cron(CronJobId::from_raw("job-1")))
+            Some(MatterTrigger::parse_monitor("s-1:m1").unwrap())
         );
-        // goal.list：只列目标，带会话（同路由的闸）。
+        // goal.list：目标与没有终点的目标都列，带会话（同路由的闸）。
         let KomoCall::GoalList(list) = &calls[9] else {
             panic!("{:?}", calls[9])
         };
-        assert_eq!(list.kind, Some(MatterKind::Goal));
+        assert_eq!(list.kind, None);
         assert!(list.all);
         assert_eq!(list.session.as_ref().unwrap().as_str(), "sess-1");
         assert_eq!(
@@ -954,6 +1082,68 @@ mod tests {
                 id: MatterId::from_raw("g-1")
             }
         );
+        // 平铺的定时字段收进 `schedule`；定时动词不核对种类（没有终点的目标也能定时）。
+        let KomoCall::GoalAct { verb, request, .. } = &calls[12] else {
+            panic!("{:?}", calls[12])
+        };
+        assert_eq!(*verb, MatterVerb::Schedule);
+        assert_eq!(request.kind, None);
+        let spec = request.schedule.as_ref().unwrap();
+        assert_eq!(spec.schedule.as_deref(), Some("0 9 * * *"));
+        assert_eq!(spec.timezone.as_deref(), Some("Asia/Shanghai"));
+        assert_eq!(spec.prompt.as_deref(), Some("巡检"));
+        assert_eq!(spec.enabled, Some(true));
+        assert_eq!(
+            spec.notify,
+            Some(komo_kernel::cron::NotifyPolicy::OnError)
+        );
+        let KomoCall::GoalAct { verb, .. } = &calls[13] else {
+            panic!("{:?}", calls[13])
+        };
+        assert_eq!(*verb, MatterVerb::Unschedule);
+        let KomoCall::GoalAct { verb, .. } = &calls[14] else {
+            panic!("{:?}", calls[14])
+        };
+        assert_eq!(*verb, MatterVerb::Run);
+        let KomoCall::GoalAct { verb, request, .. } = &calls[15] else {
+            panic!("{:?}", calls[15])
+        };
+        assert_eq!((*verb, request.kind), (MatterVerb::Retire, None));
+    }
+
+    /// `goal.add` 的 `ongoing` 是没有终点的目标（领域），平铺的定时字段随它一起收进 `schedule`。
+    #[tokio::test]
+    async fn goal_add_takes_ongoing_and_an_inline_schedule() {
+        let (tool, recorder) = tool();
+        run_action(
+            &tool,
+            json!({ "action": "goal.add", "params": {
+                "title": "每天看告警", "ongoing": true, "description": "看昨晚的告警",
+                "schedule": "0 9 * * *", "timezone": "Asia/Shanghai" } }),
+        )
+        .await
+        .unwrap();
+        run_action(
+            &tool,
+            json!({ "action": "goal.add", "params": { "title": "发布观察" } }),
+        )
+        .await
+        .unwrap();
+        let calls = recorder.calls.lock().unwrap();
+        let KomoCall::GoalAdd(ongoing) = &calls[0] else {
+            panic!("{:?}", calls[0])
+        };
+        assert_eq!(ongoing.kind, MatterKind::Area);
+        assert_eq!(ongoing.description.as_deref(), Some("看昨晚的告警"));
+        assert_eq!(
+            ongoing.schedule.as_ref().unwrap().schedule.as_deref(),
+            Some("0 9 * * *")
+        );
+        let KomoCall::GoalAdd(plain) = &calls[1] else {
+            panic!("{:?}", calls[1])
+        };
+        assert_eq!(plain.kind, MatterKind::Goal);
+        assert!(plain.schedule.is_none());
     }
 
     #[tokio::test]
@@ -1032,15 +1222,24 @@ mod tests {
             ),
             (
                 json!({ "action": "goal.link", "params": { "id": "g-1" } }),
-                "cron",
-            ),
-            (
-                json!({ "action": "goal.link", "params": { "id": "g-1", "cron": "a", "monitor": "s:m" } }),
                 "monitor",
             ),
             (
-                json!({ "action": "cron.list", "params": "x" }),
+                // 定时不再是挂上去的引用。
+                json!({ "action": "goal.link", "params": { "id": "g-1", "cron": "a" } }),
+                "不认识的字段 `cron`",
+            ),
+            (
+                json!({ "action": "goal.schedule", "params": { "id": "g-1" } }),
+                "至少要给一个定时的字段",
+            ),
+            (
+                json!({ "action": "goal.list", "params": "x" }),
                 "要是一个对象",
+            ),
+            (
+                json!({ "action": "cron.list" }),
+                "komo 不认识 action",
             ),
         ] {
             let error = tool.prepare(args.clone(), &ctx).await.unwrap_err();
@@ -1096,8 +1295,9 @@ mod tests {
             "goal.next" => json!({ "id": "g", "next": "x" }),
             "goal.wait" => json!({ "id": "g", "waiting_for": "x" }),
             "goal.resume" | "goal.done" | "goal.attach" | "goal.detach" => json!({ "id": "g" }),
-            "goal.link" => json!({ "id": "g", "cron": "j" }),
-            "cron.run" => json!({ "id": "j" }),
+            "goal.link" => json!({ "id": "g", "monitor": "s:m" }),
+            "goal.schedule" => json!({ "id": "g", "schedule": "0 9 * * *" }),
+            "goal.unschedule" | "goal.run" | "goal.retire" => json!({ "id": "g" }),
             "session.search" => json!({ "q": "x" }),
             "intervention.answer" => json!({ "handle": "7", "verdict": "approve" }),
             _ => json!({}),
@@ -1129,7 +1329,6 @@ mod tests {
             [
                 "memory.search",
                 "goal.list",
-                "cron.list",
                 "session.search",
                 "session.list",
                 "task.list",
@@ -1152,7 +1351,7 @@ mod tests {
         .unwrap();
         let preview = output.preview.unwrap();
         assert!(preview.starts_with(MEMORY_QUERY_MARKER), "{preview}");
-        let other = run_action(&tool, json!({ "action": "cron.list" }))
+        let other = run_action(&tool, json!({ "action": "goal.list" }))
             .await
             .unwrap();
         assert!(!other.preview.unwrap().contains(MEMORY_QUERY_MARKER));
@@ -1161,7 +1360,7 @@ mod tests {
     #[tokio::test]
     async fn an_unwired_tool_fails_cleanly() {
         let tool = KomoTool::new(Arc::new(KomoSlot::default()));
-        let error = run_action(&tool, json!({ "action": "cron.list" }))
+        let error = run_action(&tool, json!({ "action": "goal.list" }))
             .await
             .unwrap_err();
         let ToolError::Failed { message } = &error else {

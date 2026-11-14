@@ -8,7 +8,7 @@ use komo_kernel::protocol::http::{MatterDetail, MatterListResponse};
 use komo_kernel::types::matter::{Matter, MatterKind, MatterState};
 use time::Date;
 
-use super::{evidence_ref, provenance, stamp};
+use super::{evidence_ref, provenance, schedule_brief, schedule_lines, stamp};
 
 /// `komo goal list` / `komo area list`。
 pub fn matter_list(response: &MatterListResponse) -> String {
@@ -18,7 +18,18 @@ pub fn matter_list(response: &MatterListResponse) -> String {
     response
         .matters
         .iter()
-        .map(|matter| matter_line(matter, response.today))
+        .map(|matter| {
+            let mut line = matter_line(matter, response.today);
+            if let Some(schedule) = response
+                .schedules
+                .iter()
+                .find(|schedule| schedule.job.id.as_str() == matter.id.as_str())
+            {
+                line.push_str(" · ");
+                line.push_str(&schedule_brief(&schedule.job));
+            }
+            line
+        })
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -64,6 +75,15 @@ pub fn matter_line(matter: &Matter, today: Date) -> String {
 /// 由 Agent 转给用户问去向（`docs/goals.md` §6）；还挂着的触发器没有自动删，交给操作者定去留（§8）。
 pub fn matter_changed(detail: &MatterDetail) -> String {
     let mut out = vec![matter_line(&detail.matter, detail.today)];
+    if let Some(schedule) = &detail.schedule {
+        out.push(schedule_brief(&schedule.job));
+    }
+    if let Some(fired) = &detail.fired {
+        out.push(format!(
+            "已手动触发：run {}（会话 {}）；这一次不算定时触发，不推进槽位",
+            fired.run, fired.session
+        ));
+    }
     if let Some(closure) = &detail.closure {
         if closure.restored > 0 {
             out.push(format!("恢复了 {} 条归档的线索", closure.restored));
@@ -97,7 +117,7 @@ pub fn matter_changed(detail: &MatterDetail) -> String {
     }
     if !detail.still_linked.is_empty() {
         out.push(format!(
-            "仍挂着 {} 个触发器（没有自动删除；不再需要就 `komo {} unlink`，或去 `komo cron` 处理）：",
+            "仍挂着 {} 个触发器（没有自动删除；不再需要就 `komo {} unlink`）：",
             detail.still_linked.len(),
             detail.matter.kind
         ));
@@ -145,6 +165,20 @@ pub fn matter_show(detail: &MatterDetail) -> String {
             "标准    {}",
             matter.standard.as_deref().unwrap_or("（无）")
         )),
+    }
+    if let Some(description) = &matter.description {
+        out.push(format!("说明    {description}"));
+    }
+    match &detail.schedule {
+        Some(schedule) => {
+            out.push("定时".into());
+            out.extend(
+                schedule_lines(schedule, time::OffsetDateTime::now_utc())
+                    .into_iter()
+                    .map(|line| format!("  {line}")),
+            );
+        }
+        None => out.push("定时    （无）".into()),
     }
     if matter.triggers.is_empty() {
         out.push("触发器  （无）".into());
@@ -226,6 +260,7 @@ mod tests {
     #[test]
     fn a_matter_list_is_one_line_per_matter() {
         let response = MatterListResponse {
+            schedules: vec![],
             matters: vec![
                 goal("g-1", MatterState::Active),
                 goal("g-2", MatterState::Waiting),
@@ -241,6 +276,7 @@ mod tests {
         );
         // 截止当天不算超期；结案的不算。
         let on_time = MatterListResponse {
+            schedules: vec![],
             matters: vec![
                 goal("g-1", MatterState::Active),
                 goal("g-3", MatterState::Done),
@@ -250,6 +286,7 @@ mod tests {
         assert!(!matter_list(&on_time).contains("已超期"));
         assert_eq!(
             matter_list(&MatterListResponse {
+                schedules: vec![],
                 matters: vec![],
                 today: date!(2026 - 11 - 01)
             }),
@@ -267,6 +304,8 @@ mod tests {
         let mut done = goal("g-1", MatterState::Done);
         done.closed_at = Some(T0);
         let receipt = matter_changed(&MatterDetail {
+            schedule: None,
+            fired: None,
             still_linked: Vec::new(),
             matter: done.clone(),
             today: date!(2026 - 11 - 02),
@@ -288,6 +327,8 @@ mod tests {
         assert_eq!(lines[3], "- m-9@2 发布观察先看 5xx · 条件：发布观察时");
 
         let reopened = matter_changed(&MatterDetail {
+            schedule: None,
+            fired: None,
             still_linked: Vec::new(),
             matter: goal("g-1", MatterState::Active),
             today: date!(2026 - 11 - 02),
@@ -301,6 +342,8 @@ mod tests {
 
         // 没有 closure（推进类动作）就只有那一行。
         let plain = matter_changed(&MatterDetail {
+            schedule: None,
+            fired: None,
             still_linked: Vec::new(),
             matter: done,
             today: date!(2026 - 11 - 02),
@@ -312,6 +355,8 @@ mod tests {
     #[test]
     fn a_matter_detail_shows_every_field_and_the_overdue_mark() {
         let detail = MatterDetail {
+            schedule: None,
+            fired: None,
             closure: None,
             matter: goal("g-2", MatterState::Waiting),
             today: date!(2026 - 11 - 02),
@@ -325,6 +370,8 @@ mod tests {
         assert!(shown.contains("证据    （无）"), "{shown}");
         assert!(shown.contains("触发器  （无）"), "{shown}");
         let area = matter_show(&MatterDetail {
+            schedule: None,
+            fired: None,
             closure: None,
             matter: area(),
             today: date!(2026 - 11 - 02),
@@ -344,6 +391,8 @@ mod tests {
         ];
         let today = date!(2026 - 11 - 02);
         let detail = MatterDetail {
+            schedule: None,
+            fired: None,
             closure: None,
             matter: matter.clone(),
             today,
@@ -362,6 +411,8 @@ mod tests {
         assert_eq!(lines[2], "  cron job-1");
         // 没有挂着的：回执还是一行。
         let plain = MatterDetail {
+            schedule: None,
+            fired: None,
             still_linked: Vec::new(),
             ..detail
         };

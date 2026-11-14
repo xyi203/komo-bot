@@ -51,11 +51,55 @@ pub fn lines(path: &Path) -> usize {
         .unwrap_or(0)
 }
 
+/// 目标清单里带定时的那些，按旧 `GET /v1/cron` 的形状摆：`jobs` 与按 `job` 对齐的运行面。
+pub struct CronList {
+    pub jobs: Vec<CronJob>,
+    pub status: Vec<CronJobStatus>,
+}
+
+/// 一个定时的运行面：下一次，上一次。
+pub struct CronJobStatus {
+    pub job: CronJobId,
+    pub next_run_at: Option<time::OffsetDateTime>,
+    pub last: Option<komo_kernel::cron::CronFiring>,
+}
+
+/// 旧 `POST /v1/cron` 的请求体 → `POST /v1/matters`（没有终点的目标 = 领域，带定时）。
+///
+/// 定时并进目标之后，「建一个定时任务」就是「建一个带定时的目标」：`name` 是目标标题，其余是
+/// [`komo_kernel::protocol::ScheduleSpec`] 的字段。空的 `prompt`（命令任务那时写的空串）不给。
+pub fn create_body(old: serde_json::Value) -> serde_json::Value {
+    let mut spec = old;
+    let name = spec
+        .as_object_mut()
+        .and_then(|map| map.remove("name"))
+        .unwrap_or(serde_json::json!("定时"));
+    if spec.get("prompt").and_then(|p| p.as_str()) == Some("") {
+        spec.as_object_mut().unwrap().remove("prompt");
+    }
+    serde_json::json!({ "kind": "area", "title": name, "schedule": spec })
+}
+
+/// 旧 `PATCH /v1/cron/{id}` 的请求体 → `schedule` 动词（`status` 是 `enabled`）。
+pub fn schedule_body(old: serde_json::Value) -> serde_json::Value {
+    let mut spec = old;
+    if let Some(status) = spec.as_object_mut().and_then(|map| map.remove("status")) {
+        spec["enabled"] = serde_json::json!(status == "active");
+    }
+    serde_json::json!({ "schedule": spec })
+}
+
 /// Cron 特有的那几个动作。挂在共用的 [`Gw`] 上，测试照旧写 `gw.tick()`。
 #[async_trait]
 pub trait CronOps {
     async fn add_job(&self, body: serde_json::Value) -> CronJob;
-    async fn cron_list(&self) -> komo_kernel::protocol::http::CronListResponse;
+    /// 旧 `POST /v1/cron`：成功时正文是那个 `CronJob` 的 JSON。
+    async fn post_cron(&self, body: serde_json::Value) -> (u16, String);
+    /// 旧 `PATCH /v1/cron/{id}`：成功时正文是改完的 `CronJob` 的 JSON。
+    async fn patch_cron(&self, id: &CronJobId, body: serde_json::Value) -> (u16, String);
+    /// 旧 `POST /v1/cron/{id}/run`：成功时正文是 `ManualCronRunResponse` 的 JSON。
+    async fn run_cron(&self, id: &CronJobId) -> (u16, String);
+    async fn cron_list(&self) -> CronList;
     async fn job(&self, id: &CronJobId) -> CronJob;
     async fn firings(&self, id: &CronJobId) -> Vec<komo_kernel::cron::CronFiring>;
     async fn make_due(&self, id: &CronJobId);
@@ -64,17 +108,65 @@ pub trait CronOps {
 
 #[async_trait]
 impl CronOps for Gw {
-    /// 造一个 Job，`schedule` 按 UTC。
+    /// 造一个带定时的目标，`schedule` 按 UTC。
     async fn add_job(&self, body: serde_json::Value) -> CronJob {
-        let (status, text) = self.post("/v1/cron", body).await;
+        let (status, text) = self.post_cron(body).await;
         assert_eq!(status, 200, "{text}");
         serde_json::from_str(&text).expect("cron job")
     }
 
-    async fn cron_list(&self) -> komo_kernel::protocol::http::CronListResponse {
-        let (status, text) = self.get("/v1/cron").await;
+    async fn post_cron(&self, body: serde_json::Value) -> (u16, String) {
+        let (status, text) = self.post("/v1/matters", create_body(body)).await;
+        if status != 200 {
+            return (status, text);
+        }
+        let detail: komo_kernel::protocol::MatterDetail =
+            serde_json::from_str(&text).expect("matter detail");
+        let job = detail.schedule.expect("带定时").job;
+        (200, serde_json::to_string(&job).unwrap())
+    }
+
+    async fn patch_cron(&self, id: &CronJobId, body: serde_json::Value) -> (u16, String) {
+        let (status, text) = self
+            .post(&format!("/v1/matters/{id}/schedule"), schedule_body(body))
+            .await;
+        if status != 200 {
+            return (status, text);
+        }
+        let detail: komo_kernel::protocol::MatterDetail =
+            serde_json::from_str(&text).expect("matter detail");
+        (200, serde_json::to_string(&detail.schedule.expect("带定时").job).unwrap())
+    }
+
+    async fn run_cron(&self, id: &CronJobId) -> (u16, String) {
+        let (status, text) = self
+            .post(&format!("/v1/matters/{id}/run"), serde_json::json!({}))
+            .await;
+        if status != 200 {
+            return (status, text);
+        }
+        let detail: komo_kernel::protocol::MatterDetail =
+            serde_json::from_str(&text).expect("matter detail");
+        (200, serde_json::to_string(&detail.fired.expect("带 fired")).unwrap())
+    }
+
+    async fn cron_list(&self) -> CronList {
+        let (status, text) = self.get("/v1/matters?all=true").await;
         assert_eq!(status, 200, "{text}");
-        serde_json::from_str(&text).expect("cron list")
+        let list: komo_kernel::protocol::MatterListResponse =
+            serde_json::from_str(&text).expect("matter list");
+        CronList {
+            status: list
+                .schedules
+                .iter()
+                .map(|schedule| CronJobStatus {
+                    job: schedule.job.id.clone(),
+                    next_run_at: schedule.job.next_run_at,
+                    last: schedule.last.clone(),
+                })
+                .collect(),
+            jobs: list.schedules.into_iter().map(|s| s.job).collect(),
+        }
     }
 
     async fn job(&self, id: &CronJobId) -> CronJob {

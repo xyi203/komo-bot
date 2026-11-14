@@ -17,7 +17,6 @@ export const keys = {
   mattersAll: ["matters", "all"] as const,
   monitors: ["monitors"] as const,
   monitorsAll: ["monitors", "all"] as const,
-  cron: ["cron"] as const,
   sessionSearch: (query: string, limit: number) => ["session-search", query, limit] as const,
   memoryFind: (query: string) => ["memories", "find", query] as const,
   memorySearch: (query: string, limit: number) => ["memories", "search", query, limit] as const,

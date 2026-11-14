@@ -13,7 +13,7 @@
 use std::sync::Arc;
 
 use komo_kernel::protocol::http::{MatterActionRequest, MatterAddRequest};
-use komo_kernel::traits::{Clock, CronRepo, MatterRepo, RepoError};
+use komo_kernel::traits::{Clock, MatterRepo, RepoError};
 use komo_kernel::types::ids::{MatterId, RunId, SessionId};
 use komo_kernel::types::matter::{
     MAX_TITLE_CHARS, Matter, MatterChange, MatterError, MatterKind, MatterTrigger, MatterVerb,
@@ -88,8 +88,6 @@ pub struct MatterManager {
     repo: Arc<dyn MatterRepo>,
     events: Arc<dyn SessionEvents>,
     clock: Arc<dyn Clock>,
-    /// 挂 Cron Job 时查它在不在（§8）；没有就不查（只有测试里没接 cron）。
-    cron: Option<Arc<dyn CronRepo>>,
 }
 
 impl std::fmt::Debug for MatterManager {
@@ -108,14 +106,7 @@ impl MatterManager {
             repo,
             events,
             clock,
-            cron: None,
         }
-    }
-
-    /// 接上 Cron 仓储：`link --cron` 据此核对 Job 存在。
-    pub fn with_cron(mut self, cron: Arc<dyn CronRepo>) -> Self {
-        self.cron = Some(cron);
-        self
     }
 
     pub async fn list(
@@ -149,6 +140,7 @@ impl MatterManager {
         };
         let now = self.clock.now();
         let mut matter = draft.build(MatterId::new_at(now), now)?;
+        matter.description = optional_text("说明", request.description.as_deref())?.flatten();
         matter.evidence = self.commitment_evidence(caller, "add").await?;
         Ok(self.repo.put(matter, None).await?)
     }
@@ -185,15 +177,6 @@ impl MatterManager {
         let now = self.clock.now();
         // 状态不允许的先报：比"缺原话"更说明问题。
         let changed = transition(&existing, &change, now)?;
-        // 只核对挂 Cron：Job 得存在。monitor 只查形状（transition 里），不查它还在不在跑：
-        // monitor 的登记在 Session 里，事项这一层不碰；挂在已结束的 monitor 上无害，摘掉就是。
-        if let (MatterChange::Link(MatterTrigger::Cron { job }), Some(cron)) = (&change, &self.cron)
-            && cron.get(job).await?.is_none()
-        {
-            return Err(MatterFailure::Invalid(format!(
-                "没有这个 Cron Job：{job}（komo 工具的 cron.list，或 `komo cron list`，看现有的）"
-            )));
-        }
         let evidence = if verb.is_commitment() {
             self.commitment_evidence(caller, verb.as_str()).await?
         } else {
@@ -217,7 +200,7 @@ impl MatterManager {
     /// 改承诺要的证据：终端里不要；Run 里要这个 Run 里用户说的话，一句都没有就拒；
     /// 后台任务会话直接拒（§4「谁能改什么」）。Cron 的 Run 不必单列：它的提示词不算用户原话
     /// （[`run_user_evidence`] 的口径），一句都没有，照样被拒。
-    async fn commitment_evidence(
+    pub async fn commitment_evidence(
         &self,
         caller: &Caller,
         verb: &str,
@@ -258,6 +241,8 @@ fn change_of(
         ("due", request.due.is_some()),
         ("clear_due", request.clear_due),
         ("standard", request.standard.is_some()),
+        ("description", request.description.is_some()),
+        ("schedule", request.schedule.is_some()),
         ("trigger", request.trigger.is_some()),
     ]
     .into_iter()
@@ -266,7 +251,7 @@ fn change_of(
     let accepted: &[&str] = match verb {
         MatterVerb::Next | MatterVerb::Resume => &["next"],
         MatterVerb::Wait => &["waiting_for"],
-        MatterVerb::Edit => &["title", "due", "clear_due", "standard"],
+        MatterVerb::Edit => &["title", "due", "clear_due", "standard", "description"],
         MatterVerb::Link | MatterVerb::Unlink => &["trigger"],
         _ => &[],
     };
@@ -289,6 +274,12 @@ fn change_of(
         MatterVerb::Resume => MatterChange::Resume {
             next: optional_line("下一步", request.next.as_deref())?.flatten(),
         },
+        // 定时三个动词不走状态机：Gateway 对着定时仓储做（`http::matters`），到不了这里。
+        MatterVerb::Schedule | MatterVerb::Unschedule | MatterVerb::Run => {
+            return Err(MatterFailure::Invalid(format!(
+                "{verb} 是定时的操作，不改目标的内容"
+            )));
+        }
         MatterVerb::Park => MatterChange::Park,
         MatterVerb::Done => MatterChange::Done,
         MatterVerb::Drop => MatterChange::Drop,
@@ -299,6 +290,12 @@ fn change_of(
                 MatterFailure::Invalid(format!("{verb} 要给 trigger（Cron Job 或 monitor）"))
             })?;
             trigger.check_shape().map_err(MatterFailure::Invalid)?;
+            // 定时不再是挂在目标上的引用，而是目标自己的配置；老数据里残留的 cron 触发器仍可摘掉。
+            if verb == MatterVerb::Link && matches!(trigger, MatterTrigger::Cron { .. }) {
+                return Err(MatterFailure::Invalid(
+                    "定时现在是目标自己的配置，不再挂 Cron Job：用 schedule 给目标设定时".into(),
+                ));
+            }
             if verb == MatterVerb::Link {
                 MatterChange::Link(trigger)
             } else {
@@ -323,6 +320,7 @@ fn change_of(
                     request.due.map(Some)
                 },
                 standard: optional_line("标准", request.standard.as_deref())?,
+                description: optional_text("说明", request.description.as_deref())?,
             }
         }
     })
@@ -358,6 +356,27 @@ fn optional_line(what: &str, raw: Option<&str>) -> Result<Option<Option<String>>
         None => Ok(None),
         Some(raw) if raw.trim().is_empty() => Ok(Some(None)),
         Some(raw) => Ok(Some(Some(line(what, raw, MAX_CONTENT_CHARS)?))),
+    }
+}
+
+/// 说明的字数上限。说明不进注入行，可以写成几行；到点（定时）做的事就取它。
+pub const MAX_DESCRIPTION_CHARS: usize = 8000;
+
+/// 可空的多行文字（说明）：`None` = 没给；`Some(None)` = 给了空串（清空）。
+fn optional_text(what: &str, raw: Option<&str>) -> Result<Option<Option<String>>, MatterFailure> {
+    match raw {
+        None => Ok(None),
+        Some(raw) if raw.trim().is_empty() => Ok(Some(None)),
+        Some(raw) => {
+            let text = raw.trim();
+            let chars = text.chars().count();
+            if chars > MAX_DESCRIPTION_CHARS {
+                return Err(MatterFailure::Invalid(format!(
+                    "{what} {chars} 字，超过 {MAX_DESCRIPTION_CHARS}"
+                )));
+            }
+            Ok(Some(Some(text.to_string())))
+        }
     }
 }
 
@@ -438,6 +457,8 @@ mod tests {
             next: Some("看 AB 组的 5xx".into()),
             due: None,
             standard: None,
+            description: None,
+            schedule: None,
             session: None,
             run: None,
             request_key: None,

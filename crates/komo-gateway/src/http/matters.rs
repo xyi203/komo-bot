@@ -12,18 +12,19 @@ use axum::Json;
 use axum::extract::{Path, Query, State};
 use komo_kernel::durable::SessionKind;
 use komo_kernel::protocol::http::{
-    ClosureConvention, ErrorCode, MatterActionRequest, MatterAddRequest, MatterClosure,
-    MatterDetail, MatterListQuery, MatterListResponse, MatterShowQuery,
+    ClosureConvention, ErrorCode, ManualCronRunResponse, MatterActionRequest, MatterAddRequest,
+    MatterClosure, MatterDetail, MatterListQuery, MatterListResponse, MatterShowQuery,
 };
 use komo_kernel::types::agent::MemoryMode;
-use komo_kernel::types::ids::{MatterId, SessionId};
-use komo_kernel::types::matter::{MatterError, MatterVerb};
+use komo_kernel::types::ids::{CronJobId, MatterId, SessionId};
+use komo_kernel::types::matter::{Matter, MatterError, MatterVerb};
 use komo_memory::matter::{Caller, MatterFailure};
 use time::{Date, Month, OffsetDateTime};
 
 use super::Api;
 use super::error::{ApiFailure, ApiResult};
 use super::idempotency::body_hash;
+use super::schedule;
 use crate::service::durable::hooks;
 
 /// `GET /v1/matters`：默认只列未结案的，`all=true` 带上结案的。
@@ -40,8 +41,10 @@ pub async fn list(
         .list(query.kind, query.all)
         .await
         .map_err(failure)?;
+    let schedules = schedule::schedules_of(&api, &matters).await?;
     Ok(Json(MatterListResponse {
         matters,
+        schedules,
         today: today(&api),
     }))
 }
@@ -61,15 +64,27 @@ pub async fn show(
         .get(&MatterId::from_raw(id))
         .await
         .map_err(failure)?;
-    Ok(Json(MatterDetail {
-        matter,
-        today: today(&api),
-        still_linked: Vec::new(),
-        closure: None,
-    }))
+    Ok(Json(detail_of(&api, matter, None).await?))
 }
 
-/// `POST /v1/matters`：新建，`active`。
+/// 一条事项的详情：目标本身加它的定时（`fired` 只有 `run` 动词带）。
+async fn detail_of(
+    api: &Api,
+    matter: Matter,
+    fired: Option<ManualCronRunResponse>,
+) -> ApiResult<MatterDetail> {
+    let schedule = schedule::schedule_of(api, &matter.id).await?;
+    Ok(MatterDetail {
+        matter,
+        schedule,
+        fired,
+        today: today(api),
+        still_linked: Vec::new(),
+        closure: None,
+    })
+}
+
+/// `POST /v1/matters`：新建，`active`；带 `schedule` 就同时给它一个定时。
 pub async fn add(
     State(api): State<Api>,
     Json(request): Json<MatterAddRequest>,
@@ -82,18 +97,33 @@ pub async fn add(
         return Ok(Json(previous));
     }
     let caller = caller(&api, &request.session, &request.run).await?;
+    // 定时先校验（时区、表达式、effort、工作目录……），过了再建目标：不留一个建了一半的目标。
+    let job = match &request.schedule {
+        Some(spec) => {
+            let title = request.title.trim();
+            Some(schedule::build_job(
+                &api,
+                &MatterId::from_raw("pending"),
+                title,
+                request.description.as_deref(),
+                None,
+                spec,
+            )?)
+        }
+        None => None,
+    };
     let matter = api
         .state
         .matters
         .add(&request, &caller)
         .await
         .map_err(failure)?;
-    let detail = MatterDetail {
-        matter,
-        today: today(&api),
-        still_linked: Vec::new(),
-        closure: None,
-    };
+    if let Some(mut job) = job {
+        job.id = CronJobId::from_raw(matter.id.as_str());
+        job.name = matter.title.clone();
+        api.state.cron.put(job).await?;
+    }
+    let detail = detail_of(&api, matter, None).await?;
     api.idempotency
         .remember(request.request_key.as_ref(), &hash, &detail);
     Ok(Json(detail))
@@ -116,6 +146,12 @@ pub async fn act(
         return Ok(Json(previous));
     }
     let caller = caller(&api, &request.session, &request.run).await?;
+    if verb.is_schedule() {
+        let detail = act_on_schedule(&api, &id, verb, &request, &caller).await?;
+        api.idempotency
+            .remember(request.request_key.as_ref(), &hash, &detail);
+        return Ok(Json(detail));
+    }
     let matter = api
         .state
         .matters
@@ -133,14 +169,113 @@ pub async fn act(
     };
     let closure = settle_memories(&api, &matter, verb).await?;
     let detail = MatterDetail {
-        matter,
-        today: today(&api),
         still_linked,
         closure,
+        ..detail_of(&api, matter, None).await?
     };
     api.idempotency
         .remember(request.request_key.as_ref(), &hash, &detail);
     Ok(Json(detail))
+}
+
+/// `schedule` / `unschedule` / `run`：定时是目标上的另一块，不经状态机、不升目标的版本。
+///
+/// 设置与去掉改的是用户要它什么时候做什么，是承诺类操作（Run 里要有用户原话，任务会话与定时会话被拒，
+/// 同 `goal.add`）；`run` 是推进，不要原话。定时只给还在追踪（未结案）的目标设、触发；去掉随时可以。
+async fn act_on_schedule(
+    api: &Api,
+    id: &MatterId,
+    verb: MatterVerb,
+    request: &MatterActionRequest,
+    caller: &Caller,
+) -> ApiResult<MatterDetail> {
+    let matter = api.state.matters.get(id).await.map_err(failure)?;
+    if let Some(kind) = request.kind
+        && kind != matter.kind
+    {
+        return Err(ApiFailure::invalid(format!(
+            "{id} 是{}，不是{}：用 `komo {}`",
+            matter.kind.label(),
+            kind.label(),
+            matter.kind
+        )));
+    }
+    if let Some(expected) = request.expected_revision
+        && expected != matter.revision
+    {
+        return Err(komo_kernel::traits::RepoError::VersionConflict {
+            expected,
+            actual: matter.revision,
+        }
+        .into());
+    }
+    // 只有 schedule 认 `schedule` 字段；别的动词带了别的字段报错，同其余动词。
+    if verb != MatterVerb::Schedule && request.schedule.is_some() {
+        return Err(ApiFailure::invalid(format!("{verb} 不认 `schedule` 这个字段")));
+    }
+    let other_fields = request.title.is_some()
+        || request.next.is_some()
+        || request.waiting_for.is_some()
+        || request.due.is_some()
+        || request.clear_due
+        || request.standard.is_some()
+        || request.description.is_some()
+        || request.trigger.is_some();
+    if other_fields {
+        return Err(ApiFailure::invalid(format!(
+            "{verb} 只认定时的字段，不改目标的内容：改内容用 edit"
+        )));
+    }
+    if verb.is_commitment() {
+        api.state
+            .matters
+            .commitment_evidence(caller, verb.as_str())
+            .await
+            .map_err(failure)?;
+    }
+    if verb != MatterVerb::Unschedule && matter.state.is_closed() {
+        return Err(ApiFailure::new(
+            ErrorCode::Conflict,
+            format!(
+                "{} {id} 已经是 {}，不再追踪：定时不给结案的{}设置或触发（先 reopen）",
+                matter.kind.label(),
+                matter.state,
+                matter.kind.label()
+            ),
+        ));
+    }
+
+    let job_id = CronJobId::from_raw(id.as_str());
+    match verb {
+        MatterVerb::Schedule => {
+            let spec = request.schedule.as_ref().ok_or_else(|| {
+                ApiFailure::invalid("schedule 要给定时的字段（schedule、timezone、prompt …）")
+            })?;
+            let existing = api.state.cron.get(&job_id).await?;
+            let definition_changed = existing.is_none() || schedule::changes_definition(spec);
+            let job = schedule::build_job(
+                api,
+                id,
+                &matter.title,
+                matter.description.as_deref(),
+                existing,
+                spec,
+            )?;
+            schedule::store_job(api, job, definition_changed).await?;
+            detail_of(api, matter, None).await
+        }
+        MatterVerb::Unschedule => {
+            if !api.state.cron.remove(&job_id).await? {
+                return Err(ApiFailure::invalid(format!("{} {id} 没有定时", matter.kind.label())));
+            }
+            detail_of(api, matter, None).await
+        }
+        MatterVerb::Run => {
+            let fired = schedule::run_now(api, id).await?;
+            detail_of(api, matter, Some(fired)).await
+        }
+        _ => unreachable!("is_schedule 只有这三个"),
+    }
 }
 
 /// 结案归档 / 重开恢复（`memory.md` §9.6「结案归档」）：事项写完之后，按事项**现在**的状态

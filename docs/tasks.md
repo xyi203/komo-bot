@@ -3,6 +3,7 @@
 > 状态：**草案未批准，未实施**（2026-11-10 提议）。来源：DeepSeek Harness 团队《Super-agent 设计探索》（`roadmap-muse.md` §5 参考）
 > 的"Session 应当是实现细节"与双层架构；`roadmap-muse.md` S 已借了其中五条，本文接着做它没做的那一半：用户看到什么。
 > §6 列出要拍板的决定，认可后分别写回 `komo_bot.md`、`background-tasks.md`、`web.md`、`session-tree.md`。
+> 2026-11-14：**定时并进目标**（`docs/redesign.md` P8 / 3a-1）：定时不再是独立的一种东西，是目标上的配置，`/v1/cron*`、`komo cron`、`cron.list` / `cron.run` 已删（下面提到它们的段落是历史）；没有终点的目标复用「领域」，D10「去掉领域」改成「领域并入目标」（见 D10 与 §5.4）。
 > 2026-11-13：§4（Router - Worker）已被 `docs/redesign.md`（P18）取代，Router 已于同日删除（分发判断、分发任务与结果直投、`router_model`）；§4 正文原样保留作历史记录。
 > 文中 §x 不带文件名时指 `komo_bot.md`。
 
@@ -332,7 +333,7 @@ Router 与 Worker 可以用较轻的模型（R7），一次可恢复的小错不
 
 ### 4.13 定时任务与群聊的会话（2026-11-11）
 
-**定时任务：不经过 Router，直接算一个任务（操作者已定）。** 到点由程序开，自己把事做完；结果按现有的 `notify`
+**定时任务（2026-11-14 起是目标上的定时，`docs/redesign.md` P8）：不经过 Router，直接算一个任务（操作者已定）。** 到点由程序开，自己把事做完；结果按现有的 `notify`
 （`always` / `on_error` / `never`）投出去，`cron_watch` 不变。运行期间出现在"正在做的事"里。它仍然不能再派任务。
 
 **群聊：经过 Router（操作者已定），可能要审批，操作者也可能自己直接回。** 现状（已核对，`komo_bot.md` §11.3）：飞书群里 @机器人 的
@@ -466,7 +467,7 @@ Router 与 Worker 可以用较轻的模型（R7），一次可恢复的小错不
   随之可以删掉而不是藏起来（并存一个版本后删），D8 因此真的只剩启动服务。主会话不挂 `bash`（§4.2）。
 - **命名：工具叫 `komo`，参数是 `action` 与 `params`。** `action` 用"领域.动作"的写法并列成 enum，模型从 schema 就看得到全部动作：
   `memory.add`、`memory.search`、`memory.forget`、`goal.add`、`goal.next`、`goal.wait`、`goal.resume`、`goal.done`、`goal.link`、
-  `cron.list`、`cron.run`、`session.search`、`session.list`（以现有子命令为准，不含 `memory.confirm`——那是用户的动作，
+  `session.search`、`session.list`（以现有子命令为准；2026-11-14 起另有 `goal.retire` / `goal.schedule` / `goal.unschedule` / `goal.run`，原 `cron.list` / `cron.run` 已并进目标，不再有，不含 `memory.confirm`——那是用户的动作，
   也不含 Gateway 的重启与停止）。`params` 在 schema 里只是一个对象，各动作的字段写在 `tool://komo/doc`，填错时 `prepare` 的报错列出
   该动作认的字段。写法照 OpenClaw 的 `gateway` 工具（`config.get`、`update.run` …）。没选的名字：`self`、`state`、`manage` 看不出
   管的是什么；`gateway` 在 komo 里指进程；按领域起名就回到四个工具。
@@ -649,7 +650,7 @@ Hermes 之后操作者定加一个 `komo` 工具；操作者再指出 komo 可�
 | D8 | CLI 留多少 | 人只需启动服务：给人用的命令删掉、安装与登录搬进网页；Agent 用的命令由 `komo` 工具取代后删掉（§4.4、§5.3） | 连 Agent 的命令也换成四个带类型的工具；或 §5.2 的折中，安装与登录也留在 CLI |
 | D7 | 去掉 TUI | 去掉（§5.1）：斜杠命令整套消失，裸 `komo` 改为打开网页；CLI 子命令留着 | 留一个只能对话、没有斜杠命令的最小 TUI |
 | D9 | Memos | 移出核心概念，当普通 Skill（操作者 2026-11-11 定，§5.4） | — |
-| D10 | 目标与领域 | 去掉领域，长期职责记成约定，只留目标（操作者 2026-11-11 认可，§5.4） | — |
+| D10 | 目标与领域 | ~~去掉领域，长期职责记成约定，只留目标（2026-11-11）~~ → **领域并入目标**（2026-11-13 P7、P8，`docs/redesign.md`）：没有终点的目标也是目标，复用领域这个 kind，不能完成只能不再追踪；定时是目标上的配置；存量定时任务回填成这样的目标（3a-1，2026-11-14） | — |
 
 D3 取代 10-31 的"先统计再定"：操作者直接定了 Router - Worker，但不是恢复旧分发器（§4.1）。D5 删的是 10-25
 实现并测过的功能，删之前由操作者确认自己没有在用。

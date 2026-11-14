@@ -1,19 +1,20 @@
 //! 操作子命令的输出渲染（§3、§13.4）。
 //!
 //! 全是**纯函数**：协议类型进去，字符串出来。没有 I/O、没有时钟——「现在几点」由调用
-//! 方传进来，否则 `cron list` 的「还有多久」就没法测。
+//! 方传进来，否则定时清单的「还有多久」就没法测。
 //!
 //! 一条贯穿的规矩：**不知道就说不知道**。`??` 是 uncertain 的记号（§8.6：副作用是否
 //! 发生未知，不能在这里假装失败）。
 
-use komo_kernel::cron::{FiringStatus, JobStatus, NotifyPolicy, OverlapPolicy, Trigger};
+use komo_kernel::cron::{CronJob, FiringStatus, JobStatus, NotifyPolicy, OverlapPolicy, Trigger};
 use komo_kernel::protocol::config::{ConfigIssue, IssueSeverity, SourceFile};
 use komo_kernel::protocol::http::{
     CompactionSummary, ConfigCheckResponse, ConfigReloadResponse, ConsolidateAction,
-    ConsolidateGroupStatus, ConsolidateOutcome, CronListResponse, HealthResponse, IndexState,
+    ConsolidateGroupStatus, ConsolidateOutcome, HealthResponse, IndexState,
     InterventionDetail, InterventionKind, InterventionListResponse, InterventionSummary,
     InterventionVerdict, McpReconnectResponse, McpServerState, McpServerStatus,
-    MemoryConsolidateResponse, MemoryIndexStatus, MemoryListResponse, MemorySweepResponse,
+    MatterSchedule, MemoryConsolidateResponse, MemoryIndexStatus, MemoryListResponse,
+    MemorySweepResponse,
     ModelWindow, MonitorListResponse, RunDetail, SessionListResponse, SessionSearchResponse,
     SessionSummary, SweepRule, TelemetryHealth, ToolCallSummary, WindowSource,
 };
@@ -472,64 +473,79 @@ fn intervention_head(summary: &InterventionSummary) -> Vec<String> {
     out
 }
 
-/// `komo cron list`。
+/// 带定时的目标的定时清单（表头 + 每个目标两三行）。
 ///
-/// 每一行是"这个 Job 是什么"，下一行是"它上一次怎么样了"——§10 的
+/// 每一行是"这个定时是什么"，下一行是"它上一次怎么样了"——§10 的
 /// 「Cron 的结果去原 Session 查看」需要先知道有没有结果、是哪一个 Session。
-pub fn cron_list(response: &CronListResponse, now: OffsetDateTime) -> String {
-    if response.jobs.is_empty() {
-        return "没有定时任务".into();
+pub fn schedule_list(schedules: &[MatterSchedule], now: OffsetDateTime) -> String {
+    if schedules.is_empty() {
+        return "没有定时".into();
     }
     let mut out = vec![format!(
         "{:<38} {:<10} {:<8} {:<8} {:<36} {}",
-        "JOB", "状态", "重叠", "投递", "下次", "名称 / 触发"
+        "目标", "状态", "重叠", "投递", "下次", "标题 / 触发"
     )];
-    for job in &response.jobs {
-        out.push(format!(
-            "{:<38} {:<10} {:<8} {:<8} {:<36} {} · {}",
-            job.id,
-            job_status(job.status),
-            overlap(job.overlap),
-            notify(job.notify),
-            match job.next_run_at {
-                Some(next) => format!("{} ({})", stamp(next), relative(next, now)),
-                None => "—".into(),
-            },
-            job.name,
-            trigger(&job.trigger)
-        ));
-        // 命令直跑模式（§10）：这是判断"这个 Job 会不会经过模型"的第一眼，命令本身
-        // 也要看得见——过长截断，不然一行把整张表拉宽。
-        if let Some(command) = &job.command {
-            out.push(format!("  [命令] {}", truncate(command, 80)));
-        }
-        if let Some(last) = response
-            .status
-            .iter()
-            .find(|status| status.job == job.id)
-            .and_then(|status| status.last.as_ref())
-        {
-            // 「更新本次触发状态」（§10）：ok / error / waiting / skipped 都要看得见，
-            // 否则一个天天被跳过的 Job 和一个天天跑成的 Job 长得一样。
-            let mut line = format!(
-                "  上次 {} · {}",
-                stamp(last.scheduled_at),
-                firing_status(last.status)
-            );
-            if let Some(session) = &last.session {
-                line.push_str(&format!(" · 会话 {session}"));
-            }
-            if let Some(error) = &last.error {
-                line.push_str(&format!(" · {error}"));
-            }
-            out.push(line);
-        }
-        if let Some(error) = &job.last_error {
-            // 一个再也不响的 Job 应当在清单里看得见。
-            out.push(format!("  ⚠ {error}"));
-        }
+    for schedule in schedules {
+        out.extend(schedule_lines(schedule, now));
     }
     out.join("\n")
+}
+
+/// 一个目标的定时：第一行是配置与下一次，往下是命令、上一次触发、触发层面的问题。
+pub fn schedule_lines(schedule: &MatterSchedule, now: OffsetDateTime) -> Vec<String> {
+    let job = &schedule.job;
+    let mut out = vec![format!(
+        "{:<38} {:<10} {:<8} {:<8} {:<36} {} · {}",
+        job.id,
+        job_status(job.status),
+        overlap(job.overlap),
+        notify(job.notify),
+        match job.next_run_at {
+            Some(next) => format!("{} ({})", stamp(next), relative(next, now)),
+            None => "—".into(),
+        },
+        job.name,
+        trigger(&job.trigger)
+    )];
+    // 命令直跑模式（§10）：这是判断"这个定时会不会经过模型"的第一眼，命令本身
+    // 也要看得见——过长截断，不然一行把整张表拉宽。
+    if let Some(command) = &job.command {
+        out.push(format!("  [命令] {}", truncate(command, 80)));
+    }
+    if let Some(last) = &schedule.last {
+        // 「更新本次触发状态」（§10）：ok / error / waiting / skipped 都要看得见，
+        // 否则一个天天被跳过的定时和一个天天跑成的长得一样。
+        let mut line = format!(
+            "  上次 {} · {}",
+            stamp(last.scheduled_at),
+            firing_status(last.status)
+        );
+        if let Some(session) = &last.session {
+            line.push_str(&format!(" · 会话 {session}"));
+        }
+        if let Some(error) = &last.error {
+            line.push_str(&format!(" · {error}"));
+        }
+        out.push(line);
+    }
+    if let Some(error) = &job.last_error {
+        // 一个再也不响的定时应当在清单里看得见。
+        out.push(format!("  ⚠ {error}"));
+    }
+    out
+}
+
+/// 目标清单行尾的一小段：有定时就说一句节奏、启停与下一次。
+pub fn schedule_brief(job: &CronJob) -> String {
+    let next = match job.next_run_at {
+        Some(next) => stamp(next),
+        None => "—".into(),
+    };
+    format!(
+        "定时 {} · {} · 下次 {next}",
+        trigger(&job.trigger),
+        job_status(job.status)
+    )
 }
 
 /// 过长截断，按字符数（不是字节数）算，免得在多字节字符中间切断。
@@ -1322,7 +1338,7 @@ fn stale_warning(loaded_at: OffsetDateTime, sources: &[SourceFile]) -> Option<St
 
 // ---- 小工具 ----
 
-/// 一个可读的时刻。`komo cron` 那几条回执也印它，所以它是公开的——两处各写一遍
+/// 一个可读的时刻。定时的那几条回执也印它，所以它是公开的——两处各写一遍
 /// 格式，迟早有一处会和另一处不一样。
 ///
 /// 本机时区的墙钟时刻，带偏移（`2026-09-25 14:00:00 +08:00`）。

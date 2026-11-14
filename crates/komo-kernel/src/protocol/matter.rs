@@ -8,8 +8,66 @@
 use serde::{Deserialize, Serialize};
 use time::Date;
 
+use crate::cron::{CronFiring, CronJob, NotifyPolicy, OverlapPolicy};
+use crate::protocol::http::ManualCronRunResponse;
 use crate::types::ids::{MemoryId, RequestKey, RunId, SessionId};
 use crate::types::matter::{Matter, MatterKind, MatterTrigger, iso_date};
+use crate::types::model::{Effort, ModelConfig};
+
+/// 一个目标上的定时：配置与运行面（`docs/redesign.md` P8）。`job.id` 就是目标 id。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(optional_fields))]
+pub struct MatterSchedule {
+    pub job: CronJob,
+    /// 最近一次触发（跳过也算）；没有就是还没响过。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last: Option<CronFiring>,
+}
+
+/// 设置或修改一个目标的定时：创建目标时随 [`MatterAddRequest::schedule`] 给全，之后用
+/// `schedule` 动词，**给出的字段才改**。
+///
+/// `prompt` 与 `command` 二选一（命令直跑，不经模型）；都不给时到点做的事取目标的说明。
+/// 时区与 effort 在请求前校验，并指出支持值。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(optional_fields))]
+pub struct ScheduleSpec {
+    /// 五字段 cron 表达式或 `@at YYYY-MM-DD HH:MM`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schedule: Option<String>,
+    /// IANA 时区名。新建时必给；之后不给就沿用。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timezone: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workdir: Option<String>,
+    /// 模型目录里的 alias。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// **完整**模型配置覆盖；给了它就整份用它，`model` 被忽略。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(type = "unknown"))]
+    pub model_config: Option<ModelConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<Effort>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skills: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overlap: Option<OverlapPolicy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_rounds: Option<u32>,
+    /// 触发结果的投递规则。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notify: Option<NotifyPolicy>,
+    /// 暂停 / 恢复：`false` 暂停，`true` 恢复。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+}
 
 /// `GET /v1/matters`。
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -33,22 +91,32 @@ pub struct MatterShowQuery {
 
 /// 清单。`today` 是 Gateway 本地时区的今天：超期按它读（[`Matter::is_overdue`]），客户端
 /// 不拿自己的时区再算一遍。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts", ts(optional_fields))]
 pub struct MatterListResponse {
     pub matters: Vec<Matter>,
+    /// 带定时的目标的定时（`job.id` 对得上 `matters[].id`）；没有定时的目标不在里面。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "ts", ts(as = "Option<Vec<MatterSchedule>>"))]
+    pub schedules: Vec<MatterSchedule>,
     #[serde(with = "iso_date")]
     #[cfg_attr(feature = "ts", ts(type = "string"))]
     pub today: Date,
 }
 
 /// 一条事项，以及读它时的今天（同 [`MatterListResponse::today`]）。所有写接口也回它。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts", ts(optional_fields))]
 pub struct MatterDetail {
     pub matter: Matter,
+    /// 这个目标的定时（没有就不带）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schedule: Option<MatterSchedule>,
+    /// 只在 `run` 动词的回应里带：这次手动触发建出的会话与 Run。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fired: Option<ManualCronRunResponse>,
     #[serde(with = "iso_date")]
     #[cfg_attr(feature = "ts", ts(type = "string"))]
     pub today: Date,
@@ -95,7 +163,7 @@ pub struct ClosureConvention {
 }
 
 /// `POST /v1/matters`：新建，`active`。`next` / `due` 只给 goal，`standard` 只给 area。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts", ts(optional_fields))]
 pub struct MatterAddRequest {
@@ -112,6 +180,12 @@ pub struct MatterAddRequest {
     pub due: Option<Date>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub standard: Option<String>,
+    /// 说明。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// 同时给它一个定时：要给全（表达式、时区）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schedule: Option<ScheduleSpec>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session: Option<SessionId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -128,9 +202,11 @@ pub struct MatterAddRequest {
 /// | `wait` | `waiting_for`（必填） |
 /// | `resume` | `next`（可选） |
 /// | `link` / `unlink` | `trigger`（必填：Cron Job 或 monitor） |
-/// | `edit` | `title` / `due` / `clear_due`（goal）/ `standard`（area；空 = 清空），至少一样 |
+/// | `edit` | `title` / `due` / `clear_due`（goal）/ `standard`（area；空 = 清空）/ `description`（空 = 清空），至少一样 |
+/// | `schedule` | `schedule`（[`ScheduleSpec`]，给出的字段才改；还没有定时时要给全） |
+/// | `unschedule` / `run` | 无 |
 /// | 其余 | 无 |
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts", ts(optional_fields))]
 pub struct MatterActionRequest {
@@ -157,6 +233,12 @@ pub struct MatterActionRequest {
     pub clear_due: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub standard: Option<String>,
+    /// 说明；空串清空。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// `schedule` 动词的内容。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schedule: Option<ScheduleSpec>,
     /// `link` / `unlink` 要挂 / 摘的触发器。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trigger: Option<MatterTrigger>,
@@ -184,6 +266,8 @@ mod tests {
             next: None,
             due: Some(date!(2026 - 11 - 01)),
             standard: None,
+            description: None,
+            schedule: None,
             session: None,
             run: None,
             request_key: None,

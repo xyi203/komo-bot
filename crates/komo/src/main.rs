@@ -66,11 +66,6 @@ enum Command {
         #[command(subcommand)]
         action: MonitorCommand,
     },
-    /// 管理定时任务（§10）。
-    Cron {
-        #[command(subcommand)]
-        action: CronCommand,
-    },
     /// 查看自动记忆、来源与确认状态（§9）。
     Memory {
         #[command(subcommand)]
@@ -233,79 +228,6 @@ enum InterventionCommand {
         /// 结论词。
         verdict: String,
     },
-}
-
-#[derive(Subcommand)]
-enum CronCommand {
-    /// 创建定时任务。
-    ///
-    /// **装箱**：§10 的 Job 字段还会长，而 clap 的子命令枚举按最大变体定大小——一个
-    /// 只在启动时解析一次的枚举不值得让其余每个变体都跟着它变胖。
-    Add(Box<CronAddArgs>),
-    /// 列出定时任务。
-    List,
-    /// 手动触发一次。
-    Run {
-        /// 定时任务 ID。
-        job_id: String,
-    },
-    /// 暂停调度。
-    Pause {
-        /// 定时任务 ID。
-        job_id: String,
-    },
-    /// 恢复调度。
-    Resume {
-        /// 定时任务 ID。
-        job_id: String,
-    },
-    /// 移除后续调度，已有执行历史保留。
-    Remove {
-        /// 定时任务 ID。
-        job_id: String,
-    },
-}
-
-/// `komo cron add` 的 flag（§10 的 Job 字段表）。
-#[derive(clap::Args)]
-struct CronAddArgs {
-    #[arg(long)]
-    name: String,
-    /// 五字段 cron 表达式，或 `@at YYYY-MM-DD HH:MM`。
-    #[arg(long)]
-    schedule: String,
-    /// IANA 时区名。
-    #[arg(long, default_value = "UTC")]
-    timezone: String,
-    /// 与 `--command` 二选一：交给模型的任务描述。
-    #[arg(long, conflicts_with = "command")]
-    prompt: Option<String>,
-    /// 命令直跑模式：不经模型，触发时固定跑这一条 shell 命令（§10）。与 `--prompt`
-    /// 二选一。
-    #[arg(long, conflicts_with = "prompt")]
-    command: Option<String>,
-    /// 这个 Job 的工作目录；**创建时就核实**（§10）。
-    #[arg(long)]
-    workdir: Option<String>,
-    /// 这个 Job 的主模型。**按完整模型配置解析**：只换模型名，端点与凭证仍是
-    /// 主模型那一份；记忆整理与向量模型一个字都不动（§10、§13.3）。
-    #[arg(long)]
-    model: Option<String>,
-    /// 这个 Job 的 effort。不支持的档位**在请求前**被拒绝并指出支持值（§13.3）。
-    #[arg(long)]
-    effort: Option<String>,
-    /// 触发时预载进首轮上下文的 SKILL.md（§5.6）。可重复。
-    #[arg(long = "skill")]
-    skills: Vec<String>,
-    /// 执行预算：一次触发最多跑几轮模型。
-    #[arg(long)]
-    max_rounds: Option<u32>,
-    /// 上一次还没结束时：skip（默认）/ allow。
-    #[arg(long, default_value = "skip")]
-    overlap: String,
-    /// 结果投递：always（默认）/ on_error / never。停着等人（结果不明 / 阻塞）**不受它约束**。
-    #[arg(long, default_value = "always")]
-    notify: String,
 }
 
 #[derive(Subcommand)]
@@ -668,51 +590,6 @@ async fn operator(command: Command, client: &komo_client::KomoClient) -> Result<
             InterventionCommand::Answer { handle, verdict } => {
                 commands::intervention_answer(client, &handle, &verdict).await
             }
-        },
-        Command::Cron { action } => match action {
-            CronCommand::Add(args) => {
-                let CronAddArgs {
-                    name,
-                    schedule,
-                    timezone,
-                    prompt,
-                    command,
-                    workdir,
-                    model,
-                    effort,
-                    skills,
-                    max_rounds,
-                    overlap,
-                    notify,
-                } = *args;
-                commands::cron_add(
-                    client,
-                    commands::CronAdd {
-                        name,
-                        schedule,
-                        timezone,
-                        prompt,
-                        command,
-                        workdir,
-                        model,
-                        effort,
-                        skills,
-                        max_rounds,
-                        overlap,
-                        notify,
-                    },
-                )
-                .await
-            }
-            CronCommand::List => commands::cron_list(client).await,
-            CronCommand::Run { job_id } => commands::cron_run(client, &job_id).await,
-            CronCommand::Pause { job_id } => {
-                commands::cron_status(client, &job_id, komo_kernel::cron::JobStatus::Paused).await
-            }
-            CronCommand::Resume { job_id } => {
-                commands::cron_status(client, &job_id, komo_kernel::cron::JobStatus::Active).await
-            }
-            CronCommand::Remove { job_id } => commands::cron_remove(client, &job_id).await,
         },
         Command::Memory { action } => match action {
             MemoryCommand::List {
@@ -1321,11 +1198,10 @@ mod tests {
         };
     }
 
-    /// `komo goal|area link|unlink`（docs/goals.md §8）：`--cron` 与 `--monitor` 二选一。
+    /// `komo goal|area link|unlink`（docs/goals.md §8）：只挂 monitor；定时不再是挂上去的引用。
     #[test]
-    fn link_commands_take_a_cron_job_or_a_monitor() {
+    fn link_commands_take_a_monitor_and_no_longer_a_cron_job() {
         for args in [
-            &["goal", "link", "g-1", "--cron", "job-1"][..],
             &[
                 "goal",
                 "link",
@@ -1334,8 +1210,8 @@ mod tests {
                 "sess-1:#3f2a",
                 "--revision",
                 "2",
-            ],
-            &["goal", "unlink", "g-1", "--cron", "job-1"],
+            ][..],
+            &["goal", "unlink", "g-1", "--monitor", "sess-1:#3f2a"],
             &["area", "link", "a-1", "--monitor", "sess-1:3f2a"],
             &["area", "unlink", "a-1", "--monitor", "sess-1:3f2a"],
         ] {
@@ -1343,54 +1219,114 @@ mod tests {
             assert!(Cli::try_parse_from(argv).is_ok(), "{args:?}");
         }
         assert!(
-            Cli::try_parse_from([
-                "komo",
-                "goal",
-                "link",
-                "g-1",
-                "--cron",
-                "job-1",
-                "--monitor",
-                "s:1"
-            ])
-            .is_err(),
-            "两种不能同时给"
+            Cli::try_parse_from(["komo", "goal", "link", "g-1", "--cron", "job-1"]).is_err(),
+            "定时不再挂在目标上"
+        );
+        assert!(
+            Cli::try_parse_from(["komo", "goal", "link", "g-1"]).is_err(),
+            "没给 monitor"
+        );
+        assert!(
+            Cli::try_parse_from(["komo", "cron", "list"]).is_err(),
+            "独立的 komo cron 已经没有了"
         );
     }
 
-    /// `komo cron add` 的四个必填项。
+    /// 定时的全部字段（§10）在 `komo goal|area schedule` 上都有 flag——和 `add` 随目标一起给是同一组。
     #[test]
-    fn cron_add_requires_a_schedule_and_a_prompt() {
+    fn schedule_covers_every_job_field_for_goals_and_areas() {
+        for kind in ["goal", "area"] {
+            let parsed = Cli::parse_from([
+                "komo",
+                kind,
+                "schedule",
+                "g-1",
+                "--schedule",
+                "0 9 * * *",
+                "--timezone",
+                "Asia/Shanghai",
+                "--prompt",
+                "整理",
+                "--workdir",
+                "/tmp",
+                "--model",
+                "job-model",
+                "--effort",
+                "high",
+                "--skill",
+                "memos",
+                "--skill",
+                "search",
+                "--max-rounds",
+                "12",
+                "--overlap",
+                "allow",
+                "--notify",
+                "on_error",
+                "--pause",
+            ]);
+            let spec = match parsed.command {
+                Some(Command::Goal {
+                    action: matters::GoalCommand::Schedule { args, .. },
+                }) => args.into_spec().unwrap().unwrap(),
+                Some(Command::Area {
+                    action: matters::AreaCommand::Schedule { args, .. },
+                }) => args.into_spec().unwrap().unwrap(),
+                _ => panic!("解析不出 {kind} schedule"),
+            };
+            assert_eq!(spec.schedule.as_deref(), Some("0 9 * * *"));
+            assert_eq!(spec.timezone.as_deref(), Some("Asia/Shanghai"));
+            assert_eq!(spec.prompt.as_deref(), Some("整理"));
+            assert_eq!(spec.workdir.as_deref(), Some("/tmp"));
+            assert_eq!(spec.model.as_deref(), Some("job-model"));
+            assert_eq!(spec.effort.as_ref().map(|e| e.to_string()), Some("high".into()));
+            assert_eq!(
+                spec.skills,
+                Some(vec!["memos".to_string(), "search".to_string()])
+            );
+            assert_eq!(spec.max_rounds, Some(12));
+            assert_eq!(spec.overlap, Some(komo_kernel::cron::OverlapPolicy::Allow));
+            assert_eq!(spec.notify, Some(komo_kernel::cron::NotifyPolicy::OnError));
+            assert_eq!(spec.enabled, Some(false));
+        }
+    }
+
+    /// 命令直跑模式（§10）：`--command` 与 `--prompt` 二选一，clap 在解析这一步就挡住
+    /// "两个都给"；打错的 `--notify` / `--overlap` 在发请求之前被拒，不当默认。
+    #[test]
+    fn schedule_flags_are_checked_before_any_request_goes_out() {
+        assert!(
+            Cli::try_parse_from([
+                "komo", "goal", "schedule", "g-1", "--schedule", "0 9 * * *", "--prompt", "整理",
+                "--command", "echo hi",
+            ])
+            .is_err(),
+            "两个都给，clap 该在解析这一步就拒绝"
+        );
         let parsed = Cli::parse_from([
-            "komo",
-            "cron",
-            "add",
-            "--name",
-            "morning",
-            "--schedule",
-            "0 9 * * *",
-            "--timezone",
-            "Asia/Shanghai",
-            "--prompt",
-            "整理今天的动态",
+            "komo", "goal", "schedule", "g-1", "--schedule", "0 3 * * *", "--command",
+            "tar czf /tmp/backup.tgz /data", "--notify", "nerver",
         ]);
-        let Some(Command::Cron {
-            action: CronCommand::Add(args),
+        let Some(Command::Goal {
+            action: matters::GoalCommand::Schedule { args, .. },
         }) = parsed.command
         else {
-            panic!("解析不出 cron add");
+            panic!("解析不出 goal schedule");
         };
-        assert_eq!(args.name, "morning");
-        assert_eq!(args.schedule, "0 9 * * *");
-        assert_eq!(args.timezone, "Asia/Shanghai");
-        // 没写的那些是默认值，不是空——`notify` 缺省是 `always`（§10）。
-        assert_eq!(args.notify, "always");
-        assert_eq!(args.overlap, "skip");
-        assert!(args.model.is_none());
-        assert!(args.skills.is_empty());
-
-        // 少一个必填项就该失败，而不是用一个猜出来的默认值跑起来。
-        assert!(Cli::try_parse_from(["komo", "cron", "add", "--name", "x"]).is_err());
+        assert!(args.into_spec().is_err(), "写错的 notify 不能当默认");
+        // 一个定时字段都没给：`schedule` 没东西可改。
+        let parsed = Cli::parse_from(["komo", "goal", "schedule", "g-1"]);
+        let Some(Command::Goal {
+            action: matters::GoalCommand::Schedule { args, .. },
+        }) = parsed.command
+        else {
+            panic!("解析不出 goal schedule");
+        };
+        assert_eq!(args.into_spec().unwrap(), None);
+        for cmd in [["goal", "unschedule", "g-1"], ["area", "run", "a-1"]] {
+            let argv = std::iter::once("komo").chain(cmd);
+            assert!(Cli::try_parse_from(argv).is_ok(), "{cmd:?}");
+        }
     }
 
     /// `komo mcp reconnect` 不点名就是全部，点名可以点几台。
@@ -1406,101 +1342,6 @@ mod tests {
         assert_eq!(
             servers(&["komo", "mcp", "reconnect", "devops-mcp-prod", "cloudflare"]),
             vec!["devops-mcp-prod", "cloudflare"]
-        );
-    }
-
-    /// §10 的 Job 字段在 CLI 上**全都有 flag**：`komo cron add` 是唯一的写入口
-    /// （「模型需要管理 Cron 时通过 bash 调这些命令」），少一个 flag 就等于那个字段
-    /// 只能改配置文件——而它根本不在配置文件里。
-    #[test]
-    fn cron_add_covers_every_job_field() {
-        let parsed = Cli::parse_from([
-            "komo",
-            "cron",
-            "add",
-            "--name",
-            "morning",
-            "--schedule",
-            "0 9 * * *",
-            "--timezone",
-            "Asia/Shanghai",
-            "--prompt",
-            "整理",
-            "--workdir",
-            "/tmp",
-            "--model",
-            "job-model",
-            "--effort",
-            "high",
-            "--skill",
-            "memos",
-            "--skill",
-            "search",
-            "--max-rounds",
-            "12",
-            "--overlap",
-            "allow",
-            "--notify",
-            "on_error",
-        ]);
-        let Some(Command::Cron {
-            action: CronCommand::Add(args),
-        }) = parsed.command
-        else {
-            panic!("解析不出 cron add");
-        };
-        assert_eq!(args.workdir.as_deref(), Some("/tmp"));
-        assert_eq!(args.model.as_deref(), Some("job-model"));
-        assert_eq!(args.effort.as_deref(), Some("high"));
-        assert_eq!(args.skills, vec!["memos".to_string(), "search".to_string()]);
-        assert_eq!(args.max_rounds, Some(12));
-        assert_eq!(args.overlap, "allow");
-        assert_eq!(args.notify, "on_error");
-    }
-
-    /// 命令直跑模式（§10）：`--command` 与 `--prompt` 二选一，clap 在解析这一步就挡住
-    /// "两个都给"——不必等到发请求才发现。
-    #[test]
-    fn cron_add_command_and_prompt_are_mutually_exclusive_at_parse_time() {
-        let parsed = Cli::parse_from([
-            "komo",
-            "cron",
-            "add",
-            "--name",
-            "backup",
-            "--schedule",
-            "0 3 * * *",
-            "--command",
-            "tar czf /tmp/backup.tgz /data",
-        ]);
-        let Some(Command::Cron {
-            action: CronCommand::Add(args),
-        }) = parsed.command
-        else {
-            panic!("解析不出 cron add");
-        };
-        assert_eq!(
-            args.command.as_deref(),
-            Some("tar czf /tmp/backup.tgz /data")
-        );
-        assert!(args.prompt.is_none());
-
-        assert!(
-            Cli::try_parse_from([
-                "komo",
-                "cron",
-                "add",
-                "--name",
-                "both",
-                "--schedule",
-                "0 9 * * *",
-                "--prompt",
-                "整理",
-                "--command",
-                "echo hi",
-            ])
-            .is_err(),
-            "两个都给，clap 该在解析这一步就拒绝"
         );
     }
 }

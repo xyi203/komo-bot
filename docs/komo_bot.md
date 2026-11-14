@@ -93,11 +93,11 @@ Gateway 持有模型连接、数据库与提交线、工具环境和运行状态
 | `komo gateway --foreground`                  | 前台运行 Gateway，供服务管理器及调试使用                                    |
 | `komo gateway status/stop/restart`           | 管理后台进程。在 Gateway 自己的 `bash` 里跑 `stop` / `restart`（模型发起的都算）不当场做，推迟到这条命令结束、结果记进会话之后（见下文"在 Gateway 里重启自己"） |
 | `komo intervention list/show/answer`         | 待处理清单：结果不明、阻塞两类一张表；等价于聊天里的 `/pending` 与 `/answer`（§7.5、§11.3） |
-| `komo cron add/list/run/pause/resume/remove` | 管理定时任务                                                                |
+| （无 `komo cron`）                          | 2026-11-14 起定时并进目标：设置、暂停 / 恢复、去掉、立刻触发都是 `komo goal|area schedule / unschedule / run`（见下一行；`docs/redesign.md` P8） |
 | `komo memory list/search/show`               | 查看自动记忆、来源与确认状态；`--include-archived` 带上随事项结案归档的条目（默认不列，`--state archived` 明确问时不受限）；search 支持 hybrid / keyword / vector，输出同 `list --full` 的列、约定与线索分开列；list --full 一条一行不截断，列为 `id@版本 状态 来源 确认 用量 使用方式 条件 归属 正文`（无条件、无归属写 `-`，旧条目使用方式写「未分类」）；show 同样显示使用方式与条件。在 Run 里（bash 子进程带 `KOMO_SESSION`）跑 list / search 时按该会话 Profile 放行的作用域答（`memory = off` 的会话被拒），输出首行是宿主标记「记忆查询结果：已有记忆，不是新证据」，提取不把它当证据（`docs/memory.md` §9.4）；终端里不带会话，照旧 |
 | `komo memory add`                            | 手动记一条（§9.3）；在 Run 里（带 `KOMO_SESSION` / `KOMO_RUN`）记成未确认、引用户原话，终端里直接记成已确认；`--application convention --applies-when "条件"` 记成长期约定，省略记成线索（`docs/memory.md` §9.2）；`--for <事项 id>` 记明为哪件目标或领域记的（事项要存在且未结案） |
 | `komo memory confirm/forget`                 | 确认具体版本或停用自动记忆；不删除 Memos 原文                               |
-| `komo goal …` / `komo area …`               | 目标与领域（`docs/goals.md`，2026-10-29 认可，P1a–P1e 已实现）：add / list / show / edit，goal 另有 next / wait / resume / park / done / drop / reopen，area 另有 retire / reopen；两者都有 link / unlink 挂 Cron Job 或 monitor（P1e，结案时提示仍挂着的）；done / drop / retire 归档名下线索、列出名下约定问去向，reopen 恢复（P1c）；在 Run 里改承诺类操作要有用户原话，推进类（含 link / unlink）不要；`memory = private` / `off` 的会话被拒 |
+| `komo goal …` / `komo area …`               | 目标与领域（`docs/goals.md`，2026-10-29 认可，P1a–P1e 已实现）：add / list / show / edit，goal 另有 next / wait / resume / park / done / drop / reopen，area 另有 retire / reopen；两者都有 link / unlink 挂 monitor（P1e，结案时提示仍挂着的；定时不再挂在目标上，见下）、`schedule`（设置 / 修改目标的定时：给出的字段才改，`--pause` / `--resume` 暂停恢复）/ `unschedule` / `run`（立刻触发一次）；add / edit 另有 `--description`，add 可直接带定时的全部 flag；done / drop / retire 归档名下线索、列出名下约定问去向，reopen 恢复（P1c）；在 Run 里改承诺类操作要有用户原话，推进类（含 link / unlink）不要；`memory = private` / `off` 的会话被拒 |
 | `komo memory classify`                       | 操作者给指定 revision 定使用方式（约定 / 线索）、条件与归属，升一版；`--for <事项 id\|none>` 改挂 / 清空归属（事项要存在且未结案；带 private / off 会话被拒），`--application` 可省；存量分类用（`docs/memory.md` §9.3、§9.6） |
 | `komo memory consolidate`                    | 离线整理（§9.8）：对已有记忆去重、取代、标冲突，不新增正文；`--scope` `--kind` `--instruction`，默认预演，`--apply` 才写 |
 | `komo memory index status/rebuild`           | 查看索引覆盖率或重建当前向量索引                                            |
@@ -243,9 +243,9 @@ task(prompt, title, task_id?, model?, effort?, contract?, context?)
 
 **MCP 工具也不是第七个工具，是操作者接进来的外部能力。** `[mcp.servers.<name>]` 里配的服务器在 Gateway 启动时连上（要登录的，登录后下一条 Run 受理时连上，不用重启；`docs/mcp.md` §2.2），每个工具注册成 `mcp__<server>__<tool>`，与内置工具走同一条 `prepare` / 落账的路；只读与否由操作者声明，不信服务器自报——它决定恢复时能不能直接重读（§8.6）。codemode 脚本里 MCP 工具都能调，只读声明只决定中断后能不能重做（2026-10-13 之前它还决定 codemode 能不能调）。**默认不声明给模型**（2026-10-14，照 pi 的 `exposure`）：`exposure = "codemode"` 的 MCP 工具不进 schema、只在 codemode 脚本里调，脚本用 `search_tools` / `describe_tool` / `describe_namespace` 找；系统提示只给每台服务器一行摘要（配置的 `description`，没写就是服务器 instructions 的第一行），instructions 全文只在脚本里读。`direct` 照常声明，`hidden` 不挂。见 `docs/mcp.md` §3。
 
-**`komo` 工具也不是第七个基础工具，是"自己的状态"这一层（2026-11-11 定，理由见 `docs/tasks.md` §4.4）。** 它不做事——读写文件、搜索、跑命令仍是上面那六个——只让模型操作 komo 自己的状态：记忆、目标、定时任务、找会话、任务清单。此前这些由系统提示教模型在 `bash` 里跑 `komo <子命令>`，而命令执行的地方不一定有 `komo` 二进制、也不一定连得到 Gateway。参数只有 `action`（"领域.动作"，enum：`memory.add` / `memory.search` / `memory.forget`、`goal.add` / `goal.next` / `goal.wait` / `goal.resume` / `goal.done` / `goal.link` / `goal.list` / `goal.attach` / `goal.detach`、`cron.list` / `cron.run`、`session.search` / `session.list`、`task.list`，共 17 个）与 `params`（对象）；`goal.attach` / `goal.detach` 是任务把自己挂到目标上 / 摘下（见 `docs/goals.md` §10），只有任务会话里能用、不要用户原话；`task.list` 认 `goal` 过滤，`goal.list` 每项带 `tasks` 计数；各动作的字段不进 schema，写在 `tool://komo/doc`，`params` 填错时 `prepare` 的报错列出该动作认的字段。
+**`komo` 工具也不是第七个基础工具，是"自己的状态"这一层（2026-11-11 定，理由见 `docs/tasks.md` §4.4）。** 它不做事——读写文件、搜索、跑命令仍是上面那六个——只让模型操作 komo 自己的状态：记忆、目标（含它们的定时）、找会话、任务清单。此前这些由系统提示教模型在 `bash` 里跑 `komo <子命令>`，而命令执行的地方不一定有 `komo` 二进制、也不一定连得到 Gateway。参数只有 `action`（"领域.动作"，enum：`memory.add` / `memory.search` / `memory.forget`、`goal.add` / `goal.next` / `goal.wait` / `goal.resume` / `goal.done` / `goal.link` / `goal.list` / `goal.attach` / `goal.detach`、`goal.retire` / `goal.schedule` / `goal.unschedule` / `goal.run`、`session.search` / `session.list`、`task.list`，共 17 个）与 `params`（对象）；`goal.attach` / `goal.detach` 是任务把自己挂到目标上 / 摘下（见 `docs/goals.md` §10），只有任务会话里能用、不要用户原话；`task.list` 认 `goal` 过滤，`goal.list` 每项带 `tasks` 计数；各动作的字段不进 schema，写在 `tool://komo/doc`，`params` 填错时 `prepare` 的报错列出该动作认的字段。
 
-- **在 Gateway 进程里执行，不经 shell，不走 HTTP 回环。** 工具本体在 `komo-tools`（它不能依赖 gateway）：`prepare` 把 `params` 反序列化成 kernel 里现成的请求类型（`MemoryAddRequest`、`MatterAddRequest`、`MatterActionRequest`、`ManualCronRunRequest` …），`execute` 经 `KomoService` 这个接缝交给 Gateway——接缝是个空槽（同 `bash` 的 `DetachSlot`：服务要等整份 `GatewayState` 才造得出来，装配完再接上），Gateway 的实现调 HTTP 路由背后的**同一个处理函数**，不另写业务逻辑，规则只有一份：`docs/goals.md` §4 的"改承诺类操作要有这个 Run 里的用户原话、任务会话与 Cron 被拒"、`memory = off` / `private` 的会话被拒、版本冲突，工具与路由自然一致。
+- **在 Gateway 进程里执行，不经 shell，不走 HTTP 回环。** 工具本体在 `komo-tools`（它不能依赖 gateway）：`prepare` 把 `params` 反序列化成 kernel 里现成的请求类型（`MemoryAddRequest`、`MatterAddRequest`、`MatterActionRequest`、`ScheduleSpec` …），`execute` 经 `KomoService` 这个接缝交给 Gateway——接缝是个空槽（同 `bash` 的 `DetachSlot`：服务要等整份 `GatewayState` 才造得出来，装配完再接上），Gateway 的实现调 HTTP 路由背后的**同一个处理函数**，不另写业务逻辑，规则只有一份：`docs/goals.md` §4 的"改承诺类操作要有这个 Run 里的用户原话、任务会话与 Cron 被拒"、`memory = off` / `private` 的会话被拒、版本冲突，工具与路由自然一致。
 - **身份取自 `ToolContext`**，不读 `KOMO_SESSION` / `KOMO_RUN`：会话是这个会话，Run 是输入 Run（与 `bash` 子进程的 `KOMO_RUN` 同一个口径）；`params` 里给 `session` / `run` 会被当成未知字段拒绝。请求键取这次工具调用的 id。
 - **只读动作**（`*.search`、`*.list`）：计划是 `Operation::Komo` + `SafeReread`，可与相邻的只读调用并发、中断后可直接重跑；写动作是 `NoSafeRecovery`，顺序执行、中断后不重跑，交给模型判断。同一个工具里读写混着，所以 `Tool::replay` 声明 `Safe`（只否决不放行：两边都 `Safe` 才重跑），并发分组按动作判断（`Tool::parallel_for`，分组在 `prepare` 之前，只看工具名与原始参数）。`memory.search` 的输出首行带 `MEMORY_QUERY_MARKER`，记忆提取据此不把查到的已有记忆当新证据（§9.4）。
 - **不含** `memory.confirm`（那是用户的动作）、`area.*`（领域并进约定）、Gateway 的重启与停止。所有会话都挂（主会话、任务会话、定时任务会话）；codemode 脚本里能否调用跟随现有规则（只放行读写文件、bash、MCP），不单独处理。现有的 `komo memory|goal|area|session|cron …` 子命令并存一个版本，之后 Agent 用的那几组再删。
@@ -555,7 +555,7 @@ project_files = false              # 省略 = true
 | 保存位置 | 内容 | 说明 |
 | --- | --- | --- |
 | `<data_dir>/durable.db`（Turso，WAL，一个新文件） | `conversations`、`entries`、`tasks`、`submissions`、`documents`、`sessions`、`durable_meta` | **会话内容、Run / 调用状态、可变状态、生命周期的唯一权威**；一条提交线写，读不经过线 |
-| `<data_dir>/aux.db`（Turso + toasty，同一套模型与 migration） | `cron_jobs`、`cron_firings`、`deliveries`、`memory_items` / `memory_evidence` / `memory_terms` / `memory_vectors` / `memory_index_generations`、幂等键等辅助表 | 与 `durable.db` **分库**：跨库靠预分配 ID 与请求键幂等（cron：先在 `aux.db` 写 firing 行并预分配 Session ID，再一次 engine 提交建会话并受理 `request_id = cron:{job}:{slot}`；投递：先写后发、按逻辑键 `deliver_once`）；"同库同提交"推迟到以后 |
+| `<data_dir>/aux.db`（Turso + toasty，同一套模型与 migration） | `cron_jobs`（**已退役**：定时并进了 `matters`，回填之后不再读写）、`cron_firings`（键是目标 id）、`deliveries`、`memory_items` / `memory_evidence` / `memory_terms` / `memory_vectors` / `memory_index_generations`、幂等键等辅助表 | 与 `durable.db` **分库**：跨库靠预分配 ID 与请求键幂等（cron：先在 `aux.db` 写 firing 行并预分配 Session ID，再一次 engine 提交建会话并受理 `request_id = cron:{job}:{slot}`；投递：先写后发、按逻辑键 `deliver_once`）；"同库同提交"推迟到以后 |
 | `sessions/{session_id}/tool-output/{conversation}/{tool_task}/{attempt}/` | `output.json`，以及按需的 `stdout.txt` / `stderr.txt` / `image-<n>.<ext>` / `background.log` | 每次执行的完整工具输出，按尝试独立、完成后不可变；运行时先写 `.partial` |
 | `sessions/{session_id}/artifacts/…` | 工具生成的二进制文件、脚本快照与报告 | 独立产物；正文里以 `artifact://` 给出引用（§4.7） |
 
@@ -826,22 +826,21 @@ Cron Scheduler 只负责产生 Run，复用 AgentLoop、工具和存储。
  → 更新本次触发状态
 ```
 
-每个 Job 包含名称、五字段 cron 表达式、时区、prompt、工作目录、enabled、执行预算、重叠策略、`notify` 与版本。`notify` 三档 `always`（默认）/ `on_error` / `never` **只过滤结果的投递**；prompt Job 的回答整段是 `NO_REPLY` 时触发照记 `ok`、三档都不投（2026-10-31，同命令型 Job 的空 stdout，`docs/background-tasks.md` §2d）；Run 因任务 faulted（§7.5）停下时三档都投 home chat——那是任务在问，不是在报告，一条没人看见的提问等于这个 Job 从此停在那里。每次触发是一条带状态的记录（`queued` / `running` / `ok` / `error` / `waiting` / `skipped`），重叠跳过与错过太久（超过 Job 自己的间隔）都留一条 `skipped`，`@at` 一次性永不过期。可指定该 Job 的主模型与 effort；覆盖按完整模型配置解析，不能影响记忆整理或向量模型。下面示例所需的搜索与 Memos 操作仍须匹配具体的已启用模块版本。
+**2026-11-14 起定时是目标（`matters`）的一项配置（`docs/redesign.md` P8），不再是独立的一种东西**：一个目标至多一个定时，`Job` 的 id 就是目标 id、名称就是目标标题；定时配置存在 `matters.schedule`（JSON），启停、下一次时间、上次错误是 `matters` 上的独立列（`next_run_at` 带索引），调度器读它们，更新这几列不升目标的 `revision`；`cron_firings` 的 `job_id` 现在存目标 id。目标不再追踪（搁置、结案）时定时不触发。存量 `cron_jobs` 由启动时的回填迁成目标（可重入，见 `docs/redesign.md` §3）。
+
+每个定时包含五字段 cron 表达式、时区、prompt（不给就取目标的说明）、工作目录、enabled、执行预算、重叠策略、`notify` 与版本（定义改一次 +1，暂停不算）。目标的名称、说明是目标自己的内容、时区、prompt、工作目录、enabled、执行预算、重叠策略、`notify` 与版本。`notify` 三档 `always`（默认）/ `on_error` / `never` **只过滤结果的投递**；prompt Job 的回答整段是 `NO_REPLY` 时触发照记 `ok`、三档都不投（2026-10-31，同命令型 Job 的空 stdout，`docs/background-tasks.md` §2d）；Run 因任务 faulted（§7.5）停下时三档都投 home chat——那是任务在问，不是在报告，一条没人看见的提问等于这个 Job 从此停在那里。每次触发是一条带状态的记录（`queued` / `running` / `ok` / `error` / `waiting` / `skipped`），重叠跳过与错过太久（超过 Job 自己的间隔）都留一条 `skipped`，`@at` 一次性永不过期。可指定该 Job 的主模型与 effort；覆盖按完整模型配置解析，不能影响记忆整理或向量模型。下面示例所需的搜索与 Memos 操作仍须匹配具体的已启用模块版本。
 
 ```bash
-komo cron add --name morning-summary \
-  --schedule "0 9 * * *" \
-  --timezone Asia/Shanghai \
-  --prompt "搜索今天关注的技术动态，整理后保存到 Memos"
-
-komo cron list
-komo cron run JOB_ID
-komo cron pause JOB_ID
-komo cron resume JOB_ID
-komo cron remove JOB_ID
+# 新建一个没有终点的目标并给它定时；之后改、暂停、去掉、立刻跑
+komo area add "每天早上看告警" --description "看昨晚的告警，挑要处理的" \
+  --schedule "0 9 * * *" --timezone Asia/Shanghai
+komo area schedule AREA_ID --schedule "0 10 * * *"      # 给出的字段才改
+komo area schedule AREA_ID --pause                      # 暂停；--resume 恢复
+komo area run AREA_ID                                   # 立刻触发一次
+komo area unschedule AREA_ID                            # 去掉定时，目标与历史保留
 ```
 
-模型查看与手动触发 Cron 用 `komo` 工具的 `cron.list` / `cron.run`（§4，在 Gateway 里调同一个处理函数）；新建、暂停、恢复、删除这几条仍由 CLI 做，CLI 连接 Gateway，不直接访问数据库。修改调度属于持久副作用，执行计划展示完整调度与指令。
+模型用 `komo` 工具的 `goal.add`（`ongoing` 建没有终点的目标，可带 schedule 等字段）、`goal.schedule` / `goal.unschedule` / `goal.run` / `goal.retire`（§4，在 Gateway 里调同一个处理函数）；HTTP 是 `POST /v1/matters`（带 `schedule`）与 `POST /v1/matters/{id}/{schedule|unschedule|run}`。设置与去掉是承诺类操作（Run 里要有用户原话，任务会话与定时会话被拒），`run` 是推进。CLI 连接 Gateway，不直接访问数据库。修改调度属于持久副作用，执行计划展示完整调度与指令。
 
 默认行为：
 
@@ -856,22 +855,19 @@ komo cron remove JOB_ID
 
 ### 10.1 命令直跑模式：`command` 与 `prompt` 二选一
 
-Job 加一个 `command: Option<String>` 字段，与 `prompt` 二选一——CLI（`--command`）与
-HTTP（`CreateCronRequest.command`）两处都校验：不能同时给，也不能都不给。命令 Job 的
-`prompt` 列写空串（退役字段照写空的惯例，反过来给两种 Job 共用一张表用，§8.2）。
+定时加一个 `command: Option<String>` 字段，与 `prompt` 二选一——CLI（`--command`）与
+HTTP（`ScheduleSpec.command`）两处都校验：不能同时给；创建时两个都没给则取目标的说明。命令定时的
+`prompt` 写空串。
 
 ```bash
-komo cron add --name nightly-backup \
-  --schedule "0 3 * * *" \
-  --timezone Asia/Shanghai \
-  --command "tar czf /backups/$(date +%F).tgz /data" \
-  --workdir /srv/app
+komo area add "每晚备份" --schedule "0 3 * * *" --timezone Asia/Shanghai \
+  --command "tar czf /backups/$(date +%F).tgz /data" --workdir /srv/app
 
-komo cron list   # 命令 Job 那一行下面多印一行 `[命令] tar czf ...`（过长截断）
+komo area list   # 带定时的目标行尾有「定时 … · 启用 · 下次 …」；show 里命令那一行 `[命令] tar czf ...`（过长截断）
 ```
 
 **命令 Job 不建 harness run，也不碰模型。** 触发时一次提交建好 Session（`kind = cron`），之后由 gateway 直接用 `bash` 工具跑那条命令（`service/durable/submit/shell.rs` 的 `run_command`，与 `shell` 提交（原 TUI 的 `!` 命令，TUI 已删，路径还在）共用；工作目录就是 Session 的 `cwd`，已经从 Job 的 `workdir` 落到 Session 上），输出落 `tool-output/` 下的 blob，再提交一条 `shell.command` write entry 落账（RunId = 那条 write submission 的 ID）；**不做崩溃重放**——命令跑到一半崩溃，重启后 `recover` 只补做"queued 的触发记录"：有 Run 重挂看客、有 Session 无 Run 补投、都没有记 error，不会再跑一遍命令。**全程零模型请求**，也不触发记忆提取（没有对话可提取，提取本身还要发一次模型请求，会打破"零模型请求"这条硬约束，§9.3）。命令照样过 `bash` 的 `prepare`（受保护路径等）。
-目前没有 `cron edit`：命令改了要 remove 重建。`remove` 只删 `cron_jobs` 那一行
+改命令用 `schedule --command`（定时版本 +1）；`unschedule` 只清目标上的定时列，目标与 `cron_firings` 都留着
 （§13.1「移除后续调度，已有执行历史保留」）。
 
 触发输入与 Session 在同一次提交里落地；firing 行（`aux.db`）与它们跨库，靠预分配的 ID 与请求键幂等：启动时 `recover` 补做 queued 的触发记录，重复触发拿回原 Run。
@@ -943,11 +939,9 @@ CLI 通过 HTTP 发命令，通过 SSE 观察运行。Gateway 内部采用函数
 | GET /v1/interventions            | 待处理清单：faulted 的任务与崩溃循环保护停住的任务（§7.5）。每条带句柄、问题与可答的结论 |
 | GET /v1/interventions/{handle}   | 单项详情：问题（fault 原因）与可答的结论 |
 | POST /v1/interventions/{handle}/answer | 答复：faulted 只有 `abandon`，停住的任务 `resolve` / `abandon`（其余 422）；已答复的返回原结论，不报错 |
-| GET /v1/cron                     | 列出定时任务                                   |
-| POST /v1/cron                    | 创建定时任务                                   |
-| POST /v1/cron/{id}/run           | 手动触发                                       |
-| PATCH /v1/cron/{id}              | 更新定义或启停                                 |
-| DELETE /v1/cron/{id}             | 移除后续调度，已有执行历史保留                 |
+| POST /v1/matters/{id}/schedule   | 设置 / 修改目标的定时（给出的字段才改，`enabled` 暂停恢复）；创建目标时在 `POST /v1/matters` 里带 `schedule`。清单与详情里带着定时（`schedules` / `schedule`）；原 `/v1/cron*` 已删（2026-11-14） |
+| POST /v1/matters/{id}/unschedule | 去掉定时，目标与已有执行历史保留                 |
+| POST /v1/matters/{id}/run        | 立刻触发一次（不冒充计划触发）；回应的 `fired` 带会话与 Run |
 | GET /v1/memories                 | 按作用域、状态和查询条件列出记忆               |
 | POST /v1/memories                | 手动记一条（§9.3）；拒绝后台任务会话           |
 | GET /v1/memories/{id}            | 内容、版本、证据与确认记录                     |
@@ -1512,7 +1506,7 @@ pub trait Clock: Send + Sync {
 - `Tool::execute(&self, plan: ExecutionPlan, ctx: &ToolContext, sink: &mut dyn OutputWriter)`（2026-10-11 起按值收 `ExecutionPlan`，此前是 `ApprovedPlan`）：工具**借用**本次尝试的流式写入器，发布仍在工具任务手里（§8.5 的下一步）。
 - `CronRepo::advance(&self, id, next_run_at, status, last_error)`：推进槽位**不递增版本**：版本只在定义变了时才变（当初的理由是不作废绑定该 Job 的授权，授权 2026-10-11 删掉）。
 - `StoreError::VersionConflict` + `From<StoreError> for RepoError`：`aux.db` 的仓库事务闭包只有一条错误通道。
-- protocol：`ManualCronRunRequest`、`BoundaryRequest`、`MemoryScope` 的 `Display` / `FromStr`（`personal` | `project:<id>` | `environment:<id>`）、`GET /v1/models` → `ModelsResponse`、`GET /v1/config/check`、`POST /v1/config/reload`、`SseEvent::AssistantDelta`（**只在 SSE 上，不落库**：由 `komo.live` 节流提交的部分回复与上次发出的比较后给后缀；assistant entry 仍是一次完整回复）。§13.1 的接口表相应多这三个端点。
+- protocol：`ManualCronRunRequest`（2026-11-14 随 `/v1/cron` 删除）、`BoundaryRequest`、`MemoryScope` 的 `Display` / `FromStr`（`personal` | `project:<id>` | `environment:<id>`）、`GET /v1/models` → `ModelsResponse`、`GET /v1/config/check`、`POST /v1/config/reload`、`SseEvent::AssistantDelta`（**只在 SSE 上，不落库**：由 `komo.live` 节流提交的部分回复与上次发出的比较后给后缀；assistant entry 仍是一次完整回复）。§13.1 的接口表相应多这三个端点。
 - 旧的 `Ledger` / `RunQueue`（预留 → JSONL → 数据库的串行写入口、领取代次与租约）已随存储重写移除，由 `Storage` + `Line`（§8.2）取代。
 
 ### 13.6 安装与升级

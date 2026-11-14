@@ -148,7 +148,7 @@ area:  active → retired →（reopen）active
 
 ## 8. 挂触发器（P1e，已实现）
 
-事项可挂若干 Cron Job（`CronJobId`）与 monitor（会话 + monitor id），记在事项上，`komo goal link/unlink`、`komo area link/unlink`。`wait` 时 Agent 通常顺手挂一个 monitor（盯审批、盯回复）；等到了，monitor 交回会话，Agent `resume`。事项结案时提示它挂着的触发器，不自动删（触发器可能另有用途）。通知判断（触发器跑完说不说）是 P2，在这之前触发器照它自己的 `notify` 投递。
+事项可挂若干 monitor（会话 + monitor id），记在事项上，`komo goal link/unlink`、`komo area link/unlink`。**定时不再是挂上去的 Cron Job 引用（2026-11-14，`docs/redesign.md` P8）**：它是目标自己的配置（`komo goal|area schedule`），存量挂着的 Cron Job 由启动回填并入目标、触发器摘掉；`link --cron` 一律拒绝，老数据里残留的 `cron` 触发器仍读得出、`unlink` 摘得掉。事项另有 `description`（说明，不进注入行；到点做的事在没写 prompt 时取它）。`wait` 时 Agent 通常顺手挂一个 monitor（盯审批、盯回复）；等到了，monitor 交回会话，Agent `resume`。事项结案时提示它挂着的触发器，不自动删（触发器可能另有用途）。通知判断（触发器跑完说不说）是 P2，在这之前触发器照它自己的 `notify` 投递。
 
 **实现记录（P1e，2026-10-29）。** 接缝：kernel `types::matter::MatterTrigger`（`Cron { job }` / `Monitor { session, monitor }`，`parse_monitor` 解析 `SESSION_ID:MONITOR_ID`、`check_shape`）、`Matter.triggers`、`MatterVerb::{Link, Unlink}` / `MatterChange::{Link, Unlink}`（并进 `transition` 与 `rule`）；协议 `MatterActionRequest.trigger`、`MatterDetail.still_linked`；store `matters.triggers`（`TEXT NOT NULL DEFAULT '[]'`，JSON 列表，附加列）；runtime `MatterManager::with_cron`（挂 Cron 时查 Job 存在）；gateway `POST /v1/matters/{id}/link|unlink`，done / drop / retire 的响应带 `still_linked`；client `render::matter_*`（show 逐条列、list 行带「触发器 N」、结案回执提醒）；bin `komo goal|area link|unlink ID (--cron JOB_ID | --monitor SESSION_ID:MONITOR_ID)`；`SELF_BLOCK` 补一句等待时挂 monitor、交回后 resume。
 

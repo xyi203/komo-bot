@@ -31,9 +31,7 @@ async fn model_menu_and_job_selection_use_catalog_aliases() {
     assert_eq!(menu["models"][1]["default"], true);
 
     let (status, body) = gw
-        .post(
-            "/v1/cron",
-            serde_json::json!({
+         .post_cron(serde_json::json!({
                 "name": "x", "schedule": "0 9 * * *", "timezone": "UTC", "prompt": "p",
                 "model": "not-configured",
             }),
@@ -45,7 +43,7 @@ async fn model_menu_and_job_selection_use_catalog_aliases() {
     gw.stop().await;
 }
 
-/// §10 的字段表**全部**过得去一次 `POST /v1/cron`，并且原样读得回来。
+/// §10 的字段表**全部**过得去一次 `POST /v1/matters`（带 `schedule`），并且原样读得回来。
 ///
 /// 一个写得进去但读不回来的字段，最坏的形态是 03:00 才发现——那时人已经走了。
 #[tokio::test]
@@ -132,9 +130,7 @@ async fn an_unsupported_effort_is_refused_before_the_request_with_its_supported_
     let gw = home.start(FakeLlm::new(vec![])).await;
 
     let (status, body) = gw
-        .post(
-            "/v1/cron",
-            serde_json::json!({
+         .post_cron(serde_json::json!({
                 "name": "x", "schedule": "0 9 * * *", "timezone": "UTC", "prompt": "p",
                 "effort": "ultra",
             }),
@@ -159,9 +155,7 @@ async fn an_unknown_timezone_is_refused_with_what_to_write() {
     let gw = home.start(FakeLlm::new(vec![])).await;
 
     let (status, body) = gw
-        .post(
-            "/v1/cron",
-            serde_json::json!({
+         .post_cron(serde_json::json!({
                 "name": "x", "schedule": "0 9 * * *", "timezone": "Mars/Olympus", "prompt": "p",
             }),
         )
@@ -179,9 +173,7 @@ async fn a_six_field_expression_is_refused_rather_than_read_as_seconds() {
     let home = Home::new();
     let gw = home.start(FakeLlm::new(vec![])).await;
     let (status, body) = gw
-        .post(
-            "/v1/cron",
-            serde_json::json!({
+         .post_cron(serde_json::json!({
                 "name": "x", "schedule": "0 0 9 * * *", "timezone": "UTC", "prompt": "p",
             }),
         )
@@ -200,9 +192,7 @@ async fn changing_the_definition_bumps_the_version_but_pausing_does_not() {
 
     // pause / resume：只改 status。
     let (status, body) = gw
-        .patch(
-            &format!("/v1/cron/{}", job.id),
-            serde_json::json!({"status": "paused"}),
+         .patch_cron(&job.id, serde_json::json!({"status": "paused"}),
         )
         .await;
     assert_eq!(status, 200, "{body}");
@@ -211,9 +201,7 @@ async fn changing_the_definition_bumps_the_version_but_pausing_does_not() {
     assert_eq!(paused.version, 1, "暂停不是定义变更");
 
     let (_, body) = gw
-        .patch(
-            &format!("/v1/cron/{}", job.id),
-            serde_json::json!({"status": "active"}),
+         .patch_cron(&job.id, serde_json::json!({"status": "active"}),
         )
         .await;
     let resumed: komo_kernel::cron::CronJob = serde_json::from_str(&body).unwrap();
@@ -223,9 +211,7 @@ async fn changing_the_definition_bumps_the_version_but_pausing_does_not() {
 
     // 改 prompt：这是定义变更。
     let (_, body) = gw
-        .patch(
-            &format!("/v1/cron/{}", job.id),
-            serde_json::json!({"prompt": "换一句话"}),
+         .patch_cron(&job.id, serde_json::json!({"prompt": "换一句话"}),
         )
         .await;
     let edited: komo_kernel::cron::CronJob = serde_json::from_str(&body).unwrap();
@@ -240,11 +226,10 @@ async fn changing_the_definition_bumps_the_version_but_pausing_does_not() {
         serde_json::json!({"overlap": "allow"}),
         serde_json::json!({"notify": "never"}),
         serde_json::json!({"skills": ["memos"]}),
-        serde_json::json!({"name": "别的名字"}),
     ] {
         let before = gw.job(&job.id).await.version;
         let (status, body) = gw
-            .patch(&format!("/v1/cron/{}", job.id), patch.clone())
+             .patch_cron(&job.id, patch.clone())
             .await;
         assert_eq!(status, 200, "{patch} → {body}");
         let after: komo_kernel::cron::CronJob = serde_json::from_str(&body).unwrap();
@@ -288,12 +273,12 @@ async fn a_one_shot_is_done_after_it_fires_and_refuses_to_run_again() {
 
     // 手动 run 也不受理。
     let (status, body) = gw
-        .post(&format!("/v1/cron/{}/run", job.id), serde_json::json!({}))
+         .run_cron(&job.id)
         .await;
     assert_eq!(status, 400, "{body}");
     assert!(body.contains("一次性"), "{body}");
 
-    // 但**行留着**：`komo cron list` 还看得见它，触发历史也在。
+    // 但**行留着**：目标的清单里还看得见它，触发历史也在。
     assert!(gw.cron_list().await.jobs.iter().any(|j| j.id == job.id));
     assert_eq!(gw.firings(&job.id).await.len(), 1);
 
@@ -306,9 +291,7 @@ async fn an_at_in_the_past_is_refused_while_the_person_is_still_there() {
     let home = Home::new();
     let gw = home.start(FakeLlm::new(vec![])).await;
     let (status, body) = gw
-        .post(
-            "/v1/cron",
-            serde_json::json!({
+         .post_cron(serde_json::json!({
                 "name": "x", "schedule": "@at 2020-01-01 09:00", "timezone": "UTC", "prompt": "p",
             }),
         )
@@ -328,7 +311,7 @@ async fn a_manual_run_writes_no_firing_and_does_not_advance_the_slot() {
     let slot = job.next_run_at.expect("有槽位");
 
     let (status, body) = gw
-        .post(&format!("/v1/cron/{}/run", job.id), serde_json::json!({}))
+         .run_cron(&job.id)
         .await;
     assert_eq!(status, 200, "{body}");
     let response: komo_kernel::protocol::http::ManualCronRunResponse =
@@ -356,9 +339,9 @@ async fn a_manual_run_writes_no_firing_and_does_not_advance_the_slot() {
     gw.stop().await;
 }
 
-/// 移除：后续调度没了，**已有执行历史保留**（§13.1）。
+/// 去掉定时：后续调度没了，**目标与已有执行历史都保留**（§13.1）。
 #[tokio::test]
-async fn removing_a_job_keeps_its_firings() {
+async fn removing_a_schedule_keeps_the_goal_and_its_firings() {
     let home = Home::new();
     let gw = home
         .start(FakeLlm::always(vec![text_round(1, "做完了")]))
@@ -369,20 +352,26 @@ async fn removing_a_job_keeps_its_firings() {
     assert_eq!(gw.firings(&job.id).await.len(), 1);
 
     let (status, body) = gw
-        .request(
-            reqwest::Method::DELETE,
-            &format!("/v1/cron/{}", job.id),
-            None,
+        .post(
+            &format!("/v1/matters/{}/unschedule", job.id),
+            serde_json::json!({}),
         )
         .await;
     assert_eq!(status, 200, "{body}");
-    let response: komo_kernel::protocol::http::CronDeleteResponse =
-        serde_json::from_str(&body).unwrap();
-    assert!(response.removed);
-    assert_eq!(response.firings_kept, 1);
+    let detail: komo_kernel::protocol::MatterDetail = serde_json::from_str(&body).unwrap();
+    assert!(detail.schedule.is_none(), "定时没了");
+    assert_eq!(detail.matter.id.as_str(), job.id.as_str(), "目标还在");
 
     assert!(gw.cron_list().await.jobs.is_empty());
     assert_eq!(gw.firings(&job.id).await.len(), 1, "历史保留");
+    // 再去掉一次：本来就没有。
+    let (status, body) = gw
+        .post(
+            &format!("/v1/matters/{}/unschedule", job.id),
+            serde_json::json!({}),
+        )
+        .await;
+    assert_eq!(status, 400, "{body}");
 
     gw.stop().await;
 }

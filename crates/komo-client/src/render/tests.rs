@@ -619,7 +619,36 @@ fn an_intervention_detail_says_what_to_check_and_what_it_takes() {
     );
 }
 
-// ---- cron ----
+// ---- 定时（目标上的定时，原独立的 cron 清单）----
+
+/// 这几条测试只关心「一个定时怎么渲染」；按 Job 摆样本比按 `MatterSchedule` 摆省事，这里转一道。
+#[allow(dead_code)]
+struct CronJobStatus {
+    job: CronJobId,
+    next_run_at: Option<OffsetDateTime>,
+    last: Option<komo_kernel::cron::CronFiring>,
+}
+
+struct CronListResponse {
+    jobs: Vec<CronJob>,
+    status: Vec<CronJobStatus>,
+}
+
+fn cron_list(response: &CronListResponse, now: OffsetDateTime) -> String {
+    let schedules: Vec<MatterSchedule> = response
+        .jobs
+        .iter()
+        .map(|job| MatterSchedule {
+            job: job.clone(),
+            last: response
+                .status
+                .iter()
+                .find(|status| status.job == job.id)
+                .and_then(|status| status.last.clone()),
+        })
+        .collect();
+    schedule_list(&schedules, now)
+}
 
 #[test]
 fn a_cron_list_shows_the_next_slot_and_how_far_off_it_is() {
@@ -664,10 +693,10 @@ fn a_cron_list_shows_the_next_slot_and_how_far_off_it_is() {
             last_error: Some("时区 Mars/Olympus 解析不了".into()),
         },
     ];
-    let response = komo_kernel::protocol::http::CronListResponse {
+    let response = CronListResponse {
         status: vec![
             // 上一次跑成了，会话号在这一行上——「Cron 的结果去原 Session 查看」（§10）。
-            komo_kernel::protocol::http::CronJobStatus {
+            CronJobStatus {
                 job: CronJobId::from_raw("job-1"),
                 next_run_at: jobs[0].next_run_at,
                 last: Some(komo_kernel::cron::CronFiring {
@@ -683,7 +712,7 @@ fn a_cron_list_shows_the_next_slot_and_how_far_off_it_is() {
             },
             // 上一次被跳过了，**原因在同一行**：一个天天被跳过的 Job 不该和一个天天
             // 跑成的 Job 长得一样。
-            komo_kernel::protocol::http::CronJobStatus {
+            CronJobStatus {
                 job: CronJobId::from_raw("job-2"),
                 next_run_at: None,
                 last: Some(komo_kernel::cron::CronFiring {
@@ -748,8 +777,8 @@ fn a_waiting_firing_says_it_is_waiting_for_a_person() {
         next_run_at: Some(NOW + time::Duration::hours(5)),
         last_error: None,
     }];
-    let response = komo_kernel::protocol::http::CronListResponse {
-        status: vec![komo_kernel::protocol::http::CronJobStatus {
+    let response = CronListResponse {
+        status: vec![CronJobStatus {
             job: CronJobId::from_raw("job-3"),
             next_run_at: jobs[0].next_run_at,
             last: Some(komo_kernel::cron::CronFiring {
@@ -796,8 +825,8 @@ fn a_command_job_shows_its_command_truncated() {
         next_run_at: Some(NOW + time::Duration::hours(1)),
         last_error: None,
     }];
-    let response = komo_kernel::protocol::http::CronListResponse {
-        status: vec![komo_kernel::protocol::http::CronJobStatus {
+    let response = CronListResponse {
+        status: vec![CronJobStatus {
             job: CronJobId::from_raw("job-4"),
             next_run_at: jobs[0].next_run_at,
             last: None,

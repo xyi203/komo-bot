@@ -38,7 +38,7 @@ komo session list|delete|purge|export SESSION_ID [-o FILE]   # export = pi v3 �
 komo session search 关键词     # 跨会话找回（标题与正文）
 komo monitor list [--all]      # 监听清单（只读）
 komo intervention list|show|answer
-komo cron … | komo memory … | komo goal … | komo area … | komo skills … | komo doctor
+komo memory … | komo goal … | komo area …（含 schedule / unschedule / run，定时是目标的配置）| komo skills … | komo doctor
 komo update                    # swap the on-disk binary from the GitHub release (§13.6)
 ```
 

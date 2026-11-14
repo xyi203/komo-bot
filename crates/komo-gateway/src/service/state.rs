@@ -223,6 +223,21 @@ impl GatewayState {
         let executor = ExecutorId::from_raw(instance_id.clone());
         let hub: SharedHub = Arc::new(EventHub::new());
 
+        // 存量定时任务回填成目标上的定时（可重入，跑过了就什么都不改）。必须先于调度器起：之后
+        // 调度器只读目标。回填失败就不往下走——带着没迁完的定时起服务，它们会安静地再也不响。
+        match komo_store::backfill_cron_into_goals(&db).await {
+            Ok(report) if report.is_noop() => {}
+            Ok(report) => tracing::info!(
+                jobs = report.placed.len(),
+                firings_rekeyed = report.firings_rekeyed,
+                triggers_stripped = report.triggers_stripped.len(),
+                "存量定时任务已并入目标"
+            ),
+            Err(error) => {
+                tracing::error!(%error, "定时任务并入目标的回填失败，Gateway 不起");
+                return Err(GatewayError::from(error));
+            }
+        }
         let cron: Arc<dyn CronRepo> = Arc::new(TursoCronRepo::new(db.clone()));
         let memory: Arc<dyn MemoryRepo> = Arc::new(TursoMemoryRepo::new(db.clone()));
 
@@ -240,14 +255,11 @@ impl GatewayState {
         // 事项的承诺类操作与 `memory add` 读同一份事件找用户原话（`docs/goals.md` §4）。
         let matter_repo: Arc<dyn komo_kernel::traits::MatterRepo> =
             Arc::new(TursoMatterRepo::new(db.clone()));
-        let matters = Arc::new(
-            MatterManager::new(
-                Arc::clone(&matter_repo),
-                Arc::clone(&events),
-                Arc::clone(&clock),
-            )
-            .with_cron(Arc::clone(&cron)),
-        );
+        let matters = Arc::new(MatterManager::new(
+            Arc::clone(&matter_repo),
+            Arc::clone(&events),
+            Arc::clone(&clock),
+        ));
         let memories = Arc::new(MemoryManager::new(MemoryParts {
             matters: Some(matter_repo),
             config: snapshot.memory.clone(),

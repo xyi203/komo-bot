@@ -12,9 +12,6 @@
 //! | `POST /v1/web/pair-code` | — | [`PairCodeResponse`] |
 //! | `POST /v1/web/session` | [`PairRequest`] | `{}` + `Set-Cookie` |
 //! | `POST /v1/sessions` | [`CreateSessionRequest`] | [`SessionSummary`] |
-//! | `POST /v1/cron` | [`CreateCronRequest`] | [`CronJob`] |
-//! | `PATCH /v1/cron/{id}` | [`UpdateCronRequest`] | [`CronJob`] |
-//! | `POST /v1/cron/{id}/run` | [`ManualCronRunRequest`] | [`ManualCronRunResponse`] |
 //! | `POST /v1/memories/{id}/confirm` | [`MemoryRevisionRequest`] | [`MemoryDetail`] |
 //! | `POST /v1/memories/{id}/classify` | [`MemoryClassifyRequest`] | [`MemoryDetail`] |
 //! | `POST /v1/memories/{id}/forget` | [`MemoryRevisionRequest`] | [`MemoryDetail`] |
@@ -58,12 +55,11 @@ pub mod matter;
 pub use matter::*;
 
 use super::config::{ConfigIssue, KeyPath, McpExposure, SourceFile};
-use crate::cron::{CronFiring, CronJob, JobStatus, NotifyPolicy, OverlapPolicy};
 use crate::types::ids::{CronJobId, MatterId, MemoryId, RequestKey, RunId, Seq, SessionId};
 use crate::types::memory::{
     ArmScore, MemoryApplication, MemoryItem, MemoryKind, MemoryScope, MemoryState, RetrievalMode,
 };
-use crate::types::model::{Effort, EmbeddingSpace, ModelConfig};
+use crate::types::model::{Effort, EmbeddingSpace};
 use crate::types::plan::{PlanHash, PlanSource};
 use crate::types::status::{RunState, SessionState, WaitReason};
 
@@ -989,143 +985,7 @@ pub struct InterventionAnswerResponse {
     pub already_answered: bool,
 }
 
-// ---- /v1/cron ----
-
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
-#[cfg_attr(feature = "ts", ts(optional_fields))]
-pub struct CronListResponse {
-    pub jobs: Vec<CronJob>,
-    /// 每个 Job 的**最近一次触发**与下一次时间（§10「Cron 的结果去原 Session 查看」的
-    /// 入口）。与 `jobs` 按 `job` 对齐，不按下标——一个读不出来的 Job 会从 `jobs` 里
-    /// 掉出去，按下标配对就会错位。
-    #[serde(default)]
-    pub status: Vec<CronJobStatus>,
-}
-
-/// 一个 Job 的运行面：下一次什么时候，上一次怎么样。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
-#[cfg_attr(feature = "ts", ts(optional_fields))]
-pub struct CronJobStatus {
-    pub job: CronJobId,
-    #[serde(
-        default,
-        with = "time::serde::rfc3339::option",
-        skip_serializing_if = "Option::is_none"
-    )]
-    #[cfg_attr(feature = "ts", ts(type = "string"))]
-    pub next_run_at: Option<OffsetDateTime>,
-    /// 最近一次触发。没有就是这个 Job 还没响过。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub last: Option<CronFiring>,
-    // 审批删掉之前这里还有 `authorized`（命令 Job 有没有 Cron 授权）。旧客户端读不到
-    // 它时按默认值走，新客户端读到旧响应里的它会忽略。
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct CreateCronRequest {
-    pub name: String,
-    /// 五字段 cron 表达式或 `@at YYYY-MM-DD HH:MM`。
-    pub schedule: String,
-    /// IANA 名字。Gateway 侧解析成偏移。
-    pub timezone: String,
-    /// 与 `command` 二选一：给了 `command` 这一个必须是空串（§10）。
-    pub prompt: String,
-    /// 命令直跑模式：不经模型，触发时固定跑这一条 shell 命令（§10）。与 `prompt`
-    /// 二选一——旧客户端不传这个字段就是 `None`，行为和以前一样。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub command: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub workdir: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub model: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub effort: Option<Effort>,
-    #[serde(default)]
-    pub skills: Vec<String>,
-    #[serde(default)]
-    pub overlap: OverlapPolicy,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_rounds: Option<u32>,
-    /// 触发结果的投递规则（§10 的 `notify`）。缺省 `always`。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub notify: Option<NotifyPolicy>,
-    /// **完整**模型配置覆盖（§10：「覆盖按完整模型配置解析」）。给了它就整份用它，
-    /// `model` 那个名字被忽略——不拿一个模型名去配另一个端点。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub model_config: Option<ModelConfig>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub request_key: Option<RequestKey>,
-}
-
-/// `PATCH /v1/cron/{id}`：给出的字段才改。
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
-#[cfg_attr(feature = "ts", ts(optional_fields))]
-pub struct UpdateCronRequest {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub schedule: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub timezone: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub prompt: Option<String>,
-    /// `pause` / `resume` 就是把它改成 `paused` / `active`。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub status: Option<JobStatus>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub overlap: Option<OverlapPolicy>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_rounds: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub workdir: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub skills: Option<Vec<String>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub model: Option<String>,
-    /// 见 [`CreateCronRequest::model_config`]。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "ts", ts(type = "unknown"))]
-    pub model_config: Option<ModelConfig>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub effort: Option<Effort>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub notify: Option<NotifyPolicy>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub request_key: Option<RequestKey>,
-}
-
-impl UpdateCronRequest {
-    /// 这次 PATCH 改的是**定义**吗（§10：改定义 → 版本 +1）。
-    ///
-    /// `status` 单独一个不算：`pause` / `resume` 不是定义变更，版本回答的是"定义改没
-    /// 改过"。
-    pub fn changes_definition(&self) -> bool {
-        self.name.is_some()
-            || self.schedule.is_some()
-            || self.timezone.is_some()
-            || self.prompt.is_some()
-            || self.overlap.is_some()
-            || self.max_rounds.is_some()
-            || self.workdir.is_some()
-            || self.skills.is_some()
-            || self.model.is_some()
-            || self.model_config.is_some()
-            || self.effort.is_some()
-            || self.notify.is_some()
-    }
-}
-
-/// `POST /v1/cron/{id}/run`：手动触发。
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ManualCronRunRequest {
-    /// 不给就由服务端铸一个。无论哪种，它都是一个**独立**的键——手动触发不冒充定时
-    /// 触发（§10）。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub request_key: Option<RequestKey>,
-}
+// ---- 目标的手动触发（原 /v1/cron/{id}/run；定时并进目标，见 `protocol::matter`）----
 
 /// **使用独立请求幂等键，不冒充定时触发**（§10）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1136,18 +996,6 @@ pub struct ManualCronRunResponse {
     pub session: SessionId,
     pub run: RunId,
     pub request_key: RequestKey,
-}
-
-/// `DELETE /v1/cron/{id}`：移除后续调度，已有执行历史保留。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
-#[cfg_attr(feature = "ts", ts(optional_fields))]
-pub struct CronDeleteResponse {
-    pub job: CronJobId,
-    pub removed: bool,
-    /// 保留下来的历史触发条数。
-    #[serde(default)]
-    pub firings_kept: u32,
 }
 
 // ---- /v1/memories ----

@@ -1,4 +1,4 @@
-import { useCronList, useMatterList, useOwnedMemories, useSessions } from "@komo/api";
+import { useMatterList, useOwnedMemories, useSessions } from "@komo/api";
 import type { Matter, MemoryItem } from "@komo/protocol";
 import { useNavigate } from "@tanstack/react-router";
 import { useMemo, useState } from "react";
@@ -61,7 +61,6 @@ const COLUMNS = "grid-cols-[16px_minmax(0,1fr)_104px_84px_76px] max-[600px]:grid
 export function MattersPage({ selected }: { selected: string | null }) {
   const query = useMatterList();
   const memories = useOwnedMemories().data;
-  const cron = useCronList().data;
   const sessions = useSessions(true).data;
   const navigate = useNavigate();
   const [creating, setCreating] = useState(false);
@@ -115,7 +114,6 @@ export function MattersPage({ selected }: { selected: string | null }) {
           matter={current}
           today={today}
           memories={ownedBy.get(current.id) ?? []}
-          jobs={cron?.jobs ?? []}
           sessions={sessions ?? []}
           compact
           onBack={back}

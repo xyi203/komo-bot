@@ -704,22 +704,24 @@ async fn a_cron_run_recalls_nothing_but_a_user_message_in_its_session_does() {
         )
         .await;
     assert_eq!(status, 200, "{body}");
-    let (status, job) = gateway
+    let (status, created) = gateway
         .post_json(
-            "/v1/cron",
-            serde_json::json!({"name": "watchdog", "schedule": "*/30 * * * *",
-                   "timezone": "Asia/Shanghai", "prompt": "空调设多少度来着"}),
+            "/v1/matters",
+            serde_json::json!({"kind": "area", "title": "watchdog",
+                   "schedule": {"schedule": "*/30 * * * *", "timezone": "Asia/Shanghai",
+                                "prompt": "空调设多少度来着"}}),
         )
         .await;
-    assert_eq!(status, 200, "{job}");
+    assert_eq!(status, 200, "{created}");
 
-    let (status, fired) = gateway
+    let (status, detail) = gateway
         .post_json(
-            &format!("/v1/cron/{}/run", job["id"].as_str().unwrap()),
+            &format!("/v1/matters/{}/run", created["matter"]["id"].as_str().unwrap()),
             serde_json::json!({}),
         )
         .await;
-    assert_eq!(status, 200, "{fired}");
+    assert_eq!(status, 200, "{detail}");
+    let fired = detail["fired"].clone();
     let session: komo_kernel::types::ids::SessionId =
         serde_json::from_value(fired["session"].clone()).expect("会话 id");
     let run: komo_kernel::types::ids::RunId =

@@ -423,7 +423,26 @@ pub enum JobStatus {
     Done,
 }
 
-/// 一个定时任务（`cron_jobs`）。
+impl JobStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            JobStatus::Active => "active",
+            JobStatus::Paused => "paused",
+            JobStatus::Done => "done",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Option<JobStatus> {
+        match raw {
+            "active" => Some(JobStatus::Active),
+            "paused" => Some(JobStatus::Paused),
+            "done" => Some(JobStatus::Done),
+            _ => None,
+        }
+    }
+}
+
+/// 一个目标上的定时（`matters` 的定时列；`id` 是目标 id，`name` 是目标标题，`docs/redesign.md` P8）。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts", ts(optional_fields))]

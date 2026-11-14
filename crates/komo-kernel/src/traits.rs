@@ -202,14 +202,18 @@ pub trait OutputWriter: Send + Sync {
 
 // ---------------------------------------------------------------- Cron
 
-/// 调度器 + CLI + Gateway API 三方共用。
+/// 调度器 + Gateway API 共用：**目标上的定时配置与运行状态**（`docs/redesign.md` P8）。
+///
+/// 一个 [`CronJob`] 就是一个带定时的目标：`id` 是目标 id，`name` 是目标标题。生产实现
+/// （`komo-store`）读写 `matters` 表里的定时列；改它们不升目标的 `revision`（版本号只管
+/// 内容修改，网页编辑目标才不会因为一次定时运行而冲突）。
 #[async_trait]
 pub trait CronRepo: Send + Sync {
     async fn list(&self) -> Result<Vec<CronJob>, RepoError>;
 
     async fn get(&self, id: &CronJobId) -> Result<Option<CronJob>, RepoError>;
 
-    /// 创建或整体替换一个 Job。**版本递增**。
+    /// 设置或整体替换一个目标的定时。**定时版本递增**（目标必须已存在）。
     async fn put(&self, job: CronJob) -> Result<CronJob, RepoError>;
 
     /// 只写调度状态：下一个槽位、生命周期、触发层面的错误。
@@ -225,9 +229,10 @@ pub trait CronRepo: Send + Sync {
         last_error: Option<String>,
     ) -> Result<(), RepoError>;
 
+    /// 去掉目标的定时（目标本身与触发历史保留）；本来就没有定时答 `false`。
     async fn remove(&self, id: &CronJobId) -> Result<bool, RepoError>;
 
-    /// 到期的 Job。
+    /// 到期的 Job：只含目标还在追踪（进行中 / 等待中）、定时启用的。
     async fn due(&self, now: OffsetDateTime) -> Result<Vec<CronJob>, RepoError>;
 
     /// 插入一条触发记录并占住它。唯一键是 `job_id + scheduled_at`，**已经存在就返回

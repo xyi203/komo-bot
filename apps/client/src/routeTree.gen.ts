@@ -14,8 +14,6 @@ import { Route as PairRouteImport } from './routes/pair'
 import { Route as AppIndexRouteImport } from './routes/_app/index'
 import { Route as AppChatsIdRouteImport } from './routes/_app/chats.$id'
 import { Route as AppChatsNewRouteImport } from './routes/_app/chats.new'
-import { Route as AppCronIndexRouteImport } from './routes/_app/cron/index'
-import { Route as AppCronIdRouteImport } from './routes/_app/cron/$id'
 import { Route as AppMattersIndexRouteImport } from './routes/_app/matters/index'
 import { Route as AppMattersIdRouteImport } from './routes/_app/matters/$id'
 import { Route as AppMemoryIndexRouteImport } from './routes/_app/memory/index'
@@ -46,16 +44,6 @@ const AppChatsIdRoute = AppChatsIdRouteImport.update({
 const AppChatsNewRoute = AppChatsNewRouteImport.update({
   id: '/chats/new',
   path: '/chats/new',
-  getParentRoute: () => AppRoute,
-} as any)
-const AppCronIndexRoute = AppCronIndexRouteImport.update({
-  id: '/cron/',
-  path: '/cron/',
-  getParentRoute: () => AppRoute,
-} as any)
-const AppCronIdRoute = AppCronIdRouteImport.update({
-  id: '/cron/$id',
-  path: '/cron/$id',
   getParentRoute: () => AppRoute,
 } as any)
 const AppMattersIndexRoute = AppMattersIndexRouteImport.update({
@@ -99,12 +87,10 @@ export interface FileRoutesByFullPath {
   '/pair': typeof PairRoute
   '/chats/$id': typeof AppChatsIdRoute
   '/chats/new': typeof AppChatsNewRoute
-  '/cron/$id': typeof AppCronIdRoute
   '/matters/$id': typeof AppMattersIdRoute
   '/memory/$id': typeof AppMemoryIdRoute
   '/sessions/$sessionId': typeof AppSessionsSessionIdRoute
   '/settings/$section': typeof AppSettingsSectionRoute
-  '/cron/': typeof AppCronIndexRoute
   '/matters/': typeof AppMattersIndexRoute
   '/memory/': typeof AppMemoryIndexRoute
   '/settings/': typeof AppSettingsIndexRoute
@@ -114,12 +100,10 @@ export interface FileRoutesByTo {
   '/': typeof AppIndexRoute
   '/chats/$id': typeof AppChatsIdRoute
   '/chats/new': typeof AppChatsNewRoute
-  '/cron/$id': typeof AppCronIdRoute
   '/matters/$id': typeof AppMattersIdRoute
   '/memory/$id': typeof AppMemoryIdRoute
   '/sessions/$sessionId': typeof AppSessionsSessionIdRoute
   '/settings/$section': typeof AppSettingsSectionRoute
-  '/cron': typeof AppCronIndexRoute
   '/matters': typeof AppMattersIndexRoute
   '/memory': typeof AppMemoryIndexRoute
   '/settings': typeof AppSettingsIndexRoute
@@ -131,12 +115,10 @@ export interface FileRoutesById {
   '/_app/': typeof AppIndexRoute
   '/_app/chats/$id': typeof AppChatsIdRoute
   '/_app/chats/new': typeof AppChatsNewRoute
-  '/_app/cron/$id': typeof AppCronIdRoute
   '/_app/matters/$id': typeof AppMattersIdRoute
   '/_app/memory/$id': typeof AppMemoryIdRoute
   '/_app/sessions/$sessionId': typeof AppSessionsSessionIdRoute
   '/_app/settings/$section': typeof AppSettingsSectionRoute
-  '/_app/cron/': typeof AppCronIndexRoute
   '/_app/matters/': typeof AppMattersIndexRoute
   '/_app/memory/': typeof AppMemoryIndexRoute
   '/_app/settings/': typeof AppSettingsIndexRoute
@@ -148,12 +130,10 @@ export interface FileRouteTypes {
     | '/pair'
     | '/chats/$id'
     | '/chats/new'
-    | '/cron/$id'
     | '/matters/$id'
     | '/memory/$id'
     | '/sessions/$sessionId'
     | '/settings/$section'
-    | '/cron/'
     | '/matters/'
     | '/memory/'
     | '/settings/'
@@ -163,12 +143,10 @@ export interface FileRouteTypes {
     | '/'
     | '/chats/$id'
     | '/chats/new'
-    | '/cron/$id'
     | '/matters/$id'
     | '/memory/$id'
     | '/sessions/$sessionId'
     | '/settings/$section'
-    | '/cron'
     | '/matters'
     | '/memory'
     | '/settings'
@@ -179,12 +157,10 @@ export interface FileRouteTypes {
     | '/_app/'
     | '/_app/chats/$id'
     | '/_app/chats/new'
-    | '/_app/cron/$id'
     | '/_app/matters/$id'
     | '/_app/memory/$id'
     | '/_app/sessions/$sessionId'
     | '/_app/settings/$section'
-    | '/_app/cron/'
     | '/_app/matters/'
     | '/_app/memory/'
     | '/_app/settings/'
@@ -230,20 +206,6 @@ declare module '@tanstack/react-router' {
       path: '/chats/new'
       fullPath: '/chats/new'
       preLoaderRoute: typeof AppChatsNewRouteImport
-      parentRoute: typeof AppRoute
-    }
-    '/_app/cron/': {
-      id: '/_app/cron/'
-      path: '/cron'
-      fullPath: '/cron/'
-      preLoaderRoute: typeof AppCronIndexRouteImport
-      parentRoute: typeof AppRoute
-    }
-    '/_app/cron/$id': {
-      id: '/_app/cron/$id'
-      path: '/cron/$id'
-      fullPath: '/cron/$id'
-      preLoaderRoute: typeof AppCronIdRouteImport
       parentRoute: typeof AppRoute
     }
     '/_app/matters/': {
@@ -302,12 +264,10 @@ interface AppRouteChildren {
   AppIndexRoute: typeof AppIndexRoute
   AppChatsIdRoute: typeof AppChatsIdRoute
   AppChatsNewRoute: typeof AppChatsNewRoute
-  AppCronIdRoute: typeof AppCronIdRoute
   AppMattersIdRoute: typeof AppMattersIdRoute
   AppMemoryIdRoute: typeof AppMemoryIdRoute
   AppSessionsSessionIdRoute: typeof AppSessionsSessionIdRoute
   AppSettingsSectionRoute: typeof AppSettingsSectionRoute
-  AppCronIndexRoute: typeof AppCronIndexRoute
   AppMattersIndexRoute: typeof AppMattersIndexRoute
   AppMemoryIndexRoute: typeof AppMemoryIndexRoute
   AppSettingsIndexRoute: typeof AppSettingsIndexRoute
@@ -317,12 +277,10 @@ const AppRouteChildren: AppRouteChildren = {
   AppIndexRoute: AppIndexRoute,
   AppChatsIdRoute: AppChatsIdRoute,
   AppChatsNewRoute: AppChatsNewRoute,
-  AppCronIdRoute: AppCronIdRoute,
   AppMattersIdRoute: AppMattersIdRoute,
   AppMemoryIdRoute: AppMemoryIdRoute,
   AppSessionsSessionIdRoute: AppSessionsSessionIdRoute,
   AppSettingsSectionRoute: AppSettingsSectionRoute,
-  AppCronIndexRoute: AppCronIndexRoute,
   AppMattersIndexRoute: AppMattersIndexRoute,
   AppMemoryIndexRoute: AppMemoryIndexRoute,
   AppSettingsIndexRoute: AppSettingsIndexRoute,

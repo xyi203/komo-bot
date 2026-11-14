@@ -111,6 +111,7 @@ pub const TABLES: &[TableSpec] = &[
 pub const INDEXES: &[&str] = &[
     r#"CREATE INDEX IF NOT EXISTS "deliveries_state" ON "deliveries" ("state")"#,
     r#"CREATE INDEX IF NOT EXISTS "cron_firings_job" ON "cron_firings" ("job_id", "scheduled_at")"#,
+    r#"CREATE INDEX IF NOT EXISTS "matters_next_run" ON "matters" ("next_run_at")"#,
     r#"CREATE INDEX IF NOT EXISTS "memory_evidence_memory" ON "memory_evidence" ("memory_id")"#,
     r#"CREATE INDEX IF NOT EXISTS "memory_vectors_memory" ON "memory_vectors" ("memory_id", "generation")"#,
 ];

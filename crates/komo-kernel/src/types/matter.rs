@@ -246,6 +246,10 @@ pub struct Matter {
     /// 只给 area：要维持的标准。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub standard: Option<String>,
+    /// 说明：这件事是什么、到点（定时）要做什么的底稿。目标与领域都能写；不进注入行。
+    /// 定时配置不在这里：它是目标上的另一块（`CronJob`，id 同目标 id），改它不升版（见 `CronRepo`）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
     /// 改承诺的那几次操作的用户原话证据，追加不改（§4「谁能改什么」）。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[cfg_attr(feature = "ts", ts(as = "Option<Vec<Evidence>>"))]
@@ -341,6 +345,7 @@ impl NewMatter {
             waiting_for: None,
             due: self.due,
             standard: self.standard,
+            description: None,
             evidence: Vec::new(),
             triggers: Vec::new(),
             created_at: now,
@@ -366,10 +371,16 @@ pub enum MatterVerb {
     /// 挂触发器（§8）：推进类，不要用户原话。
     Link,
     Unlink,
+    /// 设置或修改定时（给出的字段才改）。**不走状态机**：定时是目标上的另一块，不升版。
+    Schedule,
+    /// 去掉定时；历史触发记录保留。
+    Unschedule,
+    /// 立刻触发一次定时（不冒充计划触发）。
+    Run,
 }
 
 impl MatterVerb {
-    pub const ALL: [MatterVerb; 11] = [
+    pub const ALL: [MatterVerb; 14] = [
         MatterVerb::Next,
         MatterVerb::Wait,
         MatterVerb::Resume,
@@ -381,6 +392,9 @@ impl MatterVerb {
         MatterVerb::Edit,
         MatterVerb::Link,
         MatterVerb::Unlink,
+        MatterVerb::Schedule,
+        MatterVerb::Unschedule,
+        MatterVerb::Run,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -396,6 +410,9 @@ impl MatterVerb {
             MatterVerb::Edit => "edit",
             MatterVerb::Link => "link",
             MatterVerb::Unlink => "unlink",
+            MatterVerb::Schedule => "schedule",
+            MatterVerb::Unschedule => "unschedule",
+            MatterVerb::Run => "run",
         }
     }
 
@@ -409,6 +426,15 @@ impl MatterVerb {
                 | MatterVerb::Resume
                 | MatterVerb::Link
                 | MatterVerb::Unlink
+                | MatterVerb::Run
+        )
+    }
+
+    /// 定时三个动词：不经 [`transition`]，由 Gateway 对着定时仓储做。
+    pub fn is_schedule(self) -> bool {
+        matches!(
+            self,
+            MatterVerb::Schedule | MatterVerb::Unschedule | MatterVerb::Run
         )
     }
 }
@@ -456,6 +482,7 @@ pub enum MatterChange {
         title: Option<String>,
         due: Option<Option<Date>>,
         standard: Option<Option<String>>,
+        description: Option<Option<String>>,
     },
     /// 挂一个触发器；已挂着的是空操作。
     Link(MatterTrigger),
@@ -582,10 +609,11 @@ pub fn transition(
             title,
             due,
             standard,
+            description,
         } => {
-            if title.is_none() && due.is_none() && standard.is_none() {
+            if title.is_none() && due.is_none() && standard.is_none() && description.is_none() {
                 return Err(MatterError::Invalid(
-                    "edit 至少要改一样：标题、截止日期或标准".into(),
+                    "edit 至少要改一样：标题、截止日期、标准或说明".into(),
                 ));
             }
             match matter.kind {
@@ -607,6 +635,9 @@ pub fn transition(
             }
             if let Some(standard) = standard {
                 next.standard = standard.clone();
+            }
+            if let Some(description) = description {
+                next.description = description.clone();
             }
         }
         MatterChange::Link(trigger) => {
@@ -713,10 +744,12 @@ mod tests {
             MatterVerb::Edit => MatterChange::Edit {
                 title: Some("改过的标题".into()),
                 due: None,
-                standard: None,
-            },
+                standard: None, description: None },
             MatterVerb::Link => MatterChange::Link(cron("job-1")),
             MatterVerb::Unlink => MatterChange::Unlink(cron("job-1")),
+            MatterVerb::Schedule | MatterVerb::Unschedule | MatterVerb::Run => {
+                unreachable!("定时三个动词不走状态机")
+            }
         }
     }
 
@@ -932,8 +965,7 @@ mod tests {
                 &MatterChange::Edit {
                     title: None,
                     due: Some(None),
-                    standard: None
-                },
+                    standard: None, description: None },
                 T1
             ),
             Err(MatterError::Invalid(_))
@@ -944,8 +976,7 @@ mod tests {
                 &MatterChange::Edit {
                     title: None,
                     due: None,
-                    standard: Some(Some("x".into()))
-                },
+                    standard: Some(Some("x".into())), description: None },
                 T1
             ),
             Err(MatterError::Invalid(_))
@@ -956,8 +987,7 @@ mod tests {
                 &MatterChange::Edit {
                     title: None,
                     due: None,
-                    standard: None
-                },
+                    standard: None, description: None },
                 T1
             ),
             Err(MatterError::Invalid(_))
@@ -968,8 +998,7 @@ mod tests {
             &MatterChange::Edit {
                 title: None,
                 due: Some(None),
-                standard: None,
-            },
+                standard: None, description: None },
             T1,
         )
         .unwrap()
@@ -1023,7 +1052,8 @@ mod tests {
                 MatterVerb::Wait,
                 MatterVerb::Resume,
                 MatterVerb::Link,
-                MatterVerb::Unlink
+                MatterVerb::Unlink,
+                MatterVerb::Run
             ]
         );
         assert!("frobnicate".parse::<MatterVerb>().is_err());

@@ -9,7 +9,7 @@
 
 pub mod attachments;
 pub mod config;
-pub mod cron;
+pub mod schedule;
 pub mod error;
 pub mod idempotency;
 pub mod matters;
@@ -71,7 +71,7 @@ impl Api {
 /// §13.1 的接口表，加上 W3 契约修订里的三个（`/v1/models`、`/v1/config/check`、
 /// `/v1/config/reload`），以及 `/v1/home-session`。
 ///
-/// 会话、run、树、事件、cron、intervention、导出在 [`v2::routes`]（路径与协议类型不变，handler
+/// 会话、run、树、事件、intervention、导出在 [`v2::routes`]（路径与协议类型不变，handler
 /// 读写 `durable.db`）；memories、config、models、mcp、healthz 在这里。
 pub fn router(api: Api) -> Router {
     let auth = crate::auth::AuthState {

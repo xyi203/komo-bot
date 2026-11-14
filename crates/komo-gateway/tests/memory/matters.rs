@@ -302,19 +302,12 @@ async fn a_private_or_off_session_cannot_see_or_change_matters() {
     assert_eq!(body["matters"].as_array().unwrap().len(), 1, "{body}");
 }
 
-/// §8：goal 挂一个真 Cron Job 与一个 monitor，show 里看得到；重复挂不升版；摘掉没挂着的
-/// 报错；done 的回应带着仍挂着的触发器，结案后不能再挂、摘，重开后还在。
+/// §8：goal 挂一个 monitor，show 里看得到；重复挂不升版；摘掉没挂着的报错；done 的回应带着仍挂着
+/// 的触发器，结案后不能再挂、摘，重开后还在。定时不再是挂上去的引用（`docs/redesign.md` P8）：
+/// 挂 `cron` 一律拒绝并说明，老数据里残留的 cron 触发器仍读得出、摘得掉。
 #[tokio::test]
-async fn a_goal_links_a_cron_job_and_a_monitor_and_reminds_on_close() {
+async fn a_goal_links_a_monitor_and_reminds_on_close() {
     let gateway = start(0).await;
-    let job = post(
-        &gateway,
-        "/v1/cron",
-        json!({"name": "approval-watch", "schedule": "0 9 * * *",
-               "timezone": "Asia/Shanghai", "prompt": "看审批到了没"}),
-    )
-    .await;
-    let job_id = job["id"].as_str().unwrap().to_string();
     let goal = post(
         &gateway,
         "/v1/matters",
@@ -324,19 +317,16 @@ async fn a_goal_links_a_cron_job_and_a_monitor_and_reminds_on_close() {
     let id = goal["matter"]["id"].as_str().unwrap().to_string();
     let link = format!("/v1/matters/{id}/link");
 
-    let cron = json!({"kind": "cron", "job": job_id});
     let monitor = json!({"kind": "monitor", "session": "sess-1", "monitor": "3f2a"});
-    let first = post(&gateway, &link, json!({"trigger": cron})).await;
+    let first = post(&gateway, &link, json!({"trigger": monitor})).await;
     assert_eq!(first["matter"]["revision"], 2);
-    let second = post(&gateway, &link, json!({"trigger": monitor})).await;
-    assert_eq!(second["matter"]["revision"], 3);
-    let repeat = post(&gateway, &link, json!({"trigger": cron})).await;
-    assert_eq!(repeat["matter"]["revision"], 3, "重复挂是空操作：{repeat}");
+    let repeat = post(&gateway, &link, json!({"trigger": monitor})).await;
+    assert_eq!(repeat["matter"]["revision"], 2, "重复挂是空操作：{repeat}");
     let (_, shown) = gateway.get_json(&format!("/v1/matters/{id}")).await;
-    assert_eq!(shown["matter"]["triggers"], json!([cron, monitor]));
+    assert_eq!(shown["matter"]["triggers"], json!([monitor]));
     assert!(shown.get("still_linked").is_none(), "{shown}");
 
-    // 没有这个 Job、monitor 写得不像样：400，什么都不改。
+    // 挂 cron：定时是目标自己的配置，不再是引用；monitor 写得不像样：400，什么都不改。
     let (status, body) = gateway
         .post_json(
             &link,
@@ -344,7 +334,7 @@ async fn a_goal_links_a_cron_job_and_a_monitor_and_reminds_on_close() {
         )
         .await;
     assert_eq!(status, 400, "{body}");
-    assert!(body.to_string().contains("no-such-job"), "{body}");
+    assert!(body.to_string().contains("schedule"), "{body}");
     let (status, body) = gateway
         .post_json(
             &link,
@@ -353,28 +343,110 @@ async fn a_goal_links_a_cron_job_and_a_monitor_and_reminds_on_close() {
         .await;
     assert_eq!(status, 400, "{body}");
 
-    let unlinked = post(
-        &gateway,
-        &format!("/v1/matters/{id}/unlink"),
-        json!({"trigger": monitor}),
-    )
-    .await;
-    assert_eq!(unlinked["matter"]["triggers"], json!([cron]));
     let (status, body) = gateway
         .post_json(
             &format!("/v1/matters/{id}/unlink"),
-            json!({"trigger": monitor}),
+            json!({"trigger": {"kind": "monitor", "session": "sess-9", "monitor": "zz"}}),
         )
         .await;
     assert_eq!(status, 400, "没挂着的摘不了：{body}");
 
     let done = post(&gateway, &format!("/v1/matters/{id}/done"), json!({})).await;
-    assert_eq!(done["still_linked"], json!([cron]), "{done}");
-    let (status, body) = gateway.post_json(&link, json!({"trigger": monitor})).await;
+    assert_eq!(done["still_linked"], json!([monitor]), "{done}");
+    let (status, body) = gateway
+        .post_json(
+            &link,
+            json!({"trigger": {"kind": "monitor", "session": "sess-2", "monitor": "aa"}}),
+        )
+        .await;
     assert_eq!(status, 409, "结案的不能再挂：{body}");
     let reopened = post(&gateway, &format!("/v1/matters/{id}/reopen"), json!({})).await;
-    assert_eq!(reopened["matter"]["triggers"], json!([cron]));
+    assert_eq!(reopened["matter"]["triggers"], json!([monitor]));
     assert!(reopened.get("still_linked").is_none(), "{reopened}");
+}
+
+/// 定时是目标的一项配置（P8）：创建时带上、`schedule` 改、`unschedule` 去掉，都**不升目标的版本**；
+/// 清单与详情里带着它；说明（description）能写能改，是目标自己的内容、升版。
+#[tokio::test]
+async fn a_goal_carries_its_schedule_without_bumping_its_revision() {
+    let gateway = start(0).await;
+    let created = post(
+        &gateway,
+        "/v1/matters",
+        json!({"kind": "area", "title": "每天看告警", "description": "看昨晚的告警，挑要处理的",
+               "schedule": {"schedule": "0 9 * * *", "timezone": "Asia/Shanghai"}}),
+    )
+    .await;
+    let id = created["matter"]["id"].as_str().unwrap().to_string();
+    assert_eq!(created["matter"]["revision"], 1);
+    assert_eq!(created["matter"]["description"], "看昨晚的告警，挑要处理的");
+    let job = &created["schedule"]["job"];
+    assert_eq!(job["id"], id.as_str());
+    assert_eq!(job["name"], "每天看告警");
+    assert_eq!(job["version"], 1);
+    assert!(job["next_run_at"].is_string(), "{job}");
+    // 没有写 prompt：到点做的事取目标的说明。
+    assert_eq!(job["prompt"], "看昨晚的告警，挑要处理的");
+
+    // 改定时、暂停：目标的版本不动，定时自己的版本只在改定义时 +1。
+    let edited = post(
+        &gateway,
+        &format!("/v1/matters/{id}/schedule"),
+        json!({"schedule": {"schedule": "0 10 * * *"}}),
+    )
+    .await;
+    assert_eq!(edited["matter"]["revision"], 1, "{edited}");
+    assert_eq!(edited["schedule"]["job"]["version"], 2);
+    let paused = post(
+        &gateway,
+        &format!("/v1/matters/{id}/schedule"),
+        json!({"schedule": {"enabled": false}}),
+    )
+    .await;
+    assert_eq!(paused["matter"]["revision"], 1);
+    assert_eq!(paused["schedule"]["job"]["status"], "paused");
+    assert_eq!(paused["schedule"]["job"]["version"], 2, "暂停不是改定义");
+
+    // 清单与详情里都带着它。
+    let (_, list) = gateway.get_json("/v1/matters").await;
+    assert_eq!(list["schedules"][0]["job"]["id"], id.as_str(), "{list}");
+    let (_, shown) = gateway.get_json(&format!("/v1/matters/{id}")).await;
+    assert_eq!(shown["schedule"]["job"]["status"], "paused");
+
+    // 说明是内容：升版；说明变了，没写 prompt 的定时下一次跟着用新说明。
+    let edit = post(
+        &gateway,
+        &format!("/v1/matters/{id}/edit"),
+        json!({"description": "只看 P1 告警"}),
+    )
+    .await;
+    assert_eq!(edit["matter"]["revision"], 2);
+    assert_eq!(edit["schedule"]["job"]["prompt"], "只看 P1 告警");
+
+    // 去掉：目标还在，定时没了；再去一次报错。
+    let gone = post(
+        &gateway,
+        &format!("/v1/matters/{id}/unschedule"),
+        json!({}),
+    )
+    .await;
+    assert!(gone.get("schedule").is_none(), "{gone}");
+    assert_eq!(gone["matter"]["revision"], 2);
+    let (status, body) = gateway
+        .post_json(&format!("/v1/matters/{id}/unschedule"), json!({}))
+        .await;
+    assert_eq!(status, 400, "{body}");
+
+    // 结案的目标不能再设定时；没有定时的目标 run 不了。
+    let done = post(&gateway, &format!("/v1/matters/{id}/retire"), json!({})).await;
+    assert_eq!(done["matter"]["state"], "retired");
+    let (status, body) = gateway
+        .post_json(
+            &format!("/v1/matters/{id}/schedule"),
+            json!({"schedule": {"schedule": "0 9 * * *"}}),
+        )
+        .await;
+    assert_eq!(status, 409, "{body}");
 }
 
 /// 领域也能挂；link 是推进，Run 里没有用户原话也行。

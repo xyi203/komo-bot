@@ -150,7 +150,7 @@ macOS 应用和手机端，需要一套标准的前端栈，以及一份所有�
 - **类型来源**：记忆、事项、定时与设置的线上类型都由 kernel 的 `ts` feature 生成到 `packages/protocol`（`protocol/ts.rs` 的 `export_all` 又列了几十个类型，连带 `MemoryItem`、`Matter`、`CronJob`、`ConfigModelsResponse` 等的嵌套类型；`CronJob` 里的 `ModelConfig`、记忆提取元数据里的 `EffortSetting` 这类界面不用的深层类型按 `unknown` 导出）。线上 `skip_serializing_if` 为空时不出现的 `Vec` 字段，在 TS 里按可选导出（`ts(as = "Option<Vec<T>>")`），用时要 `?? []`；没有 `skip_serializing_if` 的 `Option` 在线上是 `null`（`since`、`ModelWindow.window`），按 `T | null` 导出。`packages/api/src/types.ts` 里只剩没法生成的 pi 树投影（`SessionTree`、`TreeEntry`）。
 - **偏离与取舍**：见 `web.md` §17。要点：不搬原型"改连的 Gateway"（换 Gateway 就是换地址，Electron 经 `window.komoDesktop.connection.openSettings()`）；页面路由用路径而不是 hash；设置入口 `/settings` 打开弹窗后换回 `/`。
 - **原型删除**：`apps/web`（含 `serve.mjs`）删除；演示与截图工具挪到 `apps/client/scripts/`（`replay-model.mjs` 回放真实会话造演示对话，`shot.mjs` 按真实视口截图）。`AGENTS.md`、`web.md`、`DESIGN.md`、`PRODUCT.md`、`roadmap-muse.md` 里指向原型的说法已改；`komo_bot.md` 里的历史记录（2026-10-30 的实现流水）保持原文。
-- **遗留**：定时的新建 / 修改仍走对话或 `komo cron`；右栏"连接"卡还没接渠道与 MCP 状态；`WireEvent.data` 按 `type` 收窄的类型与错误 `code` 的完整译文表仍是按需补；移动端的会话切换入口、`/pair` 页面的失败重试体验（C0 遗留）；C2 的 `komoDesktop.connection.openSettings` 只有类型声明（`apps/client/src/komo-desktop.d.ts`），壳还没做。
+- **遗留**：定时页已删（定时并进目标，2026-11-14），新建 / 修改走对话或 `komo goal|area schedule`；右栏"连接"卡还没接渠道与 MCP 状态；`WireEvent.data` 按 `type` 收窄的类型与错误 `code` 的完整译文表仍是按需补；移动端的会话切换入口、`/pair` 页面的失败重试体验（C0 遗留）；C2 的 `komoDesktop.connection.openSettings` 只有类型声明（`apps/client/src/komo-desktop.d.ts`），壳还没做。
 
 ### 6.3 C2 实际做了什么（2026-11-02）
 

@@ -185,9 +185,7 @@ async fn prompt_and_command_are_mutually_exclusive() {
     let gw = home.start(FakeLlm::new(vec![])).await;
 
     let (status, body) = gw
-        .post(
-            "/v1/cron",
-            serde_json::json!({
+         .post_cron(serde_json::json!({
                 "name": "both",
                 "schedule": "0 9 * * *",
                 "timezone": "UTC",
@@ -199,9 +197,7 @@ async fn prompt_and_command_are_mutually_exclusive() {
     assert_eq!(status, 400, "{body}");
 
     let (status, body) = gw
-        .post(
-            "/v1/cron",
-            serde_json::json!({
+         .post_cron(serde_json::json!({
                 "name": "neither",
                 "schedule": "0 9 * * *",
                 "timezone": "UTC",

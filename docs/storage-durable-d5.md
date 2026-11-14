@@ -192,7 +192,7 @@
 | 渠道输入 | `dispatcher_v2`：认人不变；主会话按 `kind=main` + agent，群与话题按 `source`；`request_id` = 平台消息键；kind `chat.input`，`data.peer`；同一 peer 主会话忙时 `WhenBusy::Steer`。`channels/*` 收发、渲染、去重不变 |
 | 回复与投递 | `watch.rs` 订阅 hub 投影帧，`RunCompleted` 时取首个输入的 `data.peer` 投回；`deliveries` 在 `aux.db`，先写后发，不变；重启时对未结算且带 peer 的输入重挂看客 |
 | 交回输入的来源对端 | 决定 6 |
-| cron | W3b；`cron_jobs` / `cron_firings` repo 不变（换到 `aux.db`） |
+| cron | W3b；`cron_firings` repo 不变（换到 `aux.db`）；`cron_jobs` 2026-11-14 起退役，定时读写 `matters` 上的列（`docs/redesign.md` P8） |
 | intervention | faulted 任务列表 → `Blocked`、问题 = fault 原因、可答 `abandon`；`WaitReason` 不再产生 |
 | 生命周期 | W4a |
 | memory | 条目 / 证据 / 索引仍在 `aux.db`；提取输入经 `DurableSessionEvents`；注入是系统段 `memory`，uses 记在 `komo.memory` document（2026-10-28 起改为每个 Run 一条 `komo.memory.recall` entry，`docs/memory.md` §9.4）；证据引用仍是 `Seq` / `RunId`（新编码） |

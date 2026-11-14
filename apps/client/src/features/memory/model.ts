@@ -2,10 +2,8 @@ import type { MemoryItem, MemoryScope } from "@komo/protocol";
 import { getLocale } from "@/paraglide/runtime.js";
 import { m } from "@/paraglide/messages.js";
 
-/** 在场光阶：每条记忆按离 prompt 的远近落在四档之一（图例兼筛选）。 */
+/** 在场光阶：每条记忆按离 prompt 的远近落在四档之一（图上点的排位）。 */
 export type Rung = "always" | "relevant" | "paused" | "out";
-/** 筛选：`live` = 在起作用（前两档一起亮）。 */
-export type Bucket = "live" | Rung;
 
 export const RUNGS: { key: Rung; test: (item: MemoryItem) => boolean }[] = [
   { key: "always", test: (x) => x.state === "active" && x.application === "convention" },
@@ -15,9 +13,22 @@ export const RUNGS: { key: Rung; test: (item: MemoryItem) => boolean }[] = [
 ];
 
 export const rungOf = (item: MemoryItem): Rung | undefined => RUNGS.find((r) => r.test(item))?.key;
-export const inBucket = (item: MemoryItem, bucket: Bucket) => (bucket === "live" ? item.state === "active" : rungOf(item) === bucket);
-/** 一条记忆该落在哪个筛选里（生效的都归"在起作用"）。 */
-export const bucketOf = (item: MemoryItem): Bucket => (item.state === "active" ? "live" : (rungOf(item) ?? "live"));
+
+/**
+ * 等你过目：候选且你还没确认。确认过的候选不算——服务端的 `confirm` 只改确认状态、不把候选转成生效
+ * （`docs/memory.md` 附录 C.3.1），那样的条目既不再等你、也还没进召回，归到"暂停中"。
+ */
+export const isPending = (item: MemoryItem) => item.state === "candidate" && item.confirmation !== "user_confirmed";
+
+/** 记忆页的分组（版式见 `docs/web.md` §11）。 */
+export type Group = "pending" | "paused" | "always" | "relevant" | "out";
+export const GROUPS: Group[] = ["pending", "paused", "always", "relevant", "out"];
+export function groupOf(item: MemoryItem): Group {
+  if (isPending(item)) return "pending";
+  if (item.state === "candidate" || item.state === "contested") return "paused";
+  if (item.state === "active") return item.application === "convention" ? "always" : "relevant";
+  return "out";
+}
 
 /** 光点的样子：实心 = 约定，空心环 = 线索，虚线 = 候选，红环 = 有争议，灰点 = 不再带。 */
 export type MoteKind = "full" | "ring" | "alert" | "pale" | "off";
@@ -64,27 +75,25 @@ export function scopesIn(items: MemoryItem[], withPersonal = false): [string, st
   return [...scopes].sort((a, b) => (a[0] === "personal" ? -1 : b[0] === "personal" ? 1 : a[1].localeCompare(b[1])));
 }
 
-/** 列表的行：在起作用的约定在前、再按带上次数；不再带的按最近变动。检索结果保持检索的排序。 */
-export function listRows(all: MemoryItem[], bucket: Bucket, scope: string): MemoryItem[] {
-  const rows = all.filter((x) => inBucket(x, bucket) && (!scope || scopeKey(x.scope) === scope));
-  return rows.sort((a, b) =>
-    bucket === "out"
-      ? Date.parse(b.updated_at) - Date.parse(a.updated_at)
-      : Number(b.application === "convention") - Number(a.application === "convention") || b.usage.count - a.usage.count,
-  );
+const byUsage = (a: MemoryItem, b: MemoryItem) => b.usage.count - a.usage.count || Date.parse(b.updated_at) - Date.parse(a.updated_at);
+const byNewest = (a: MemoryItem, b: MemoryItem) => Date.parse(b.created_at) - Date.parse(a.created_at);
+const byChanged = (a: MemoryItem, b: MemoryItem) => Date.parse(b.updated_at) - Date.parse(a.updated_at);
+const ORDER: Record<Group, (a: MemoryItem, b: MemoryItem) => number> = { pending: byNewest, paused: byChanged, always: byUsage, relevant: byUsage, out: byChanged };
+
+/** 按分组分好的行（可再限一个作用域）：等你过目的新的在前，约定与线索按带上次数，其余按最近变动。 */
+export function groupRows(all: MemoryItem[], scope: string): Record<Group, MemoryItem[]> {
+  const groups: Record<Group, MemoryItem[]> = { pending: [], paused: [], always: [], relevant: [], out: [] };
+  for (const item of all) if (!scope || scopeKey(item.scope) === scope) groups[groupOf(item)].push(item);
+  for (const key of GROUPS) groups[key].sort(ORDER[key]);
+  return groups;
 }
 
-/** 页头那句发现：有争议 > 候选 > 在起作用的里还有几条没过目 / 都确认过。 */
-export function finding(all: MemoryItem[]): string {
-  const contested = all.filter((x) => x.state === "contested").length;
-  const candidate = all.filter((x) => x.state === "candidate").length;
-  const live = all.filter((x) => x.state === "active");
-  const unseen = live.filter((x) => x.confirmation !== "user_confirmed").length;
-  if (contested) return m.memory_finding_contested({ count: contested });
-  if (candidate) return m.memory_finding_candidate({ count: candidate });
-  if (!live.length) return m.memory_finding_none();
-  if (!unseen) return m.memory_finding_confirmed({ count: live.length });
-  return unseen === live.length ? m.memory_finding_all_unseen({ count: live.length }) : m.memory_finding_some_unseen({ live: live.length, unseen });
+/** 页头那句概况：记着几件事，几条等你过目。 */
+export function lead(all: MemoryItem[]): string {
+  const live = all.filter((x) => x.state === "active").length;
+  const pending = all.filter(isPending).length;
+  if (!live && !pending) return m.memory_finding_none();
+  return pending ? m.memory_lead_pending({ live, pending }) : m.memory_lead_clear({ live });
 }
 
 // ---- 日期（Intl，按当前语言）----

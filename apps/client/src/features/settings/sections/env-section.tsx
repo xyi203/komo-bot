@@ -18,7 +18,7 @@ import { useConfigEdit } from "../use-config-edit";
  * 环境变量（docs/web.md §15）：API key 与其他凭证。**值只能写入，任何地方都不显示**：
  * Gateway 的 `GET /v1/config/env` 本来就不带值，输入框都是密码框。
  */
-export function EnvSection() {
+export function EnvSection({ onBack }: { onBack?: () => void }) {
   const env = useConfigEnv();
   const edit = useConfigEdit();
   // 正在改值的变量名 / 正在确认删除的变量名 / 添加表单是否展开
@@ -26,7 +26,17 @@ export function EnvSection() {
   const [confirming, setConfirming] = useState<string | null>(null);
   const [adding, setAdding] = useState(false);
 
-  const head = <SectionHead title={m.settings_sec_env()} description={m.env_desc()} />;
+  const head = (
+    <>
+      {onBack && (
+        <TextButton quiet onClick={onBack} className="mt-4 -mb-1 inline-flex items-center gap-1">
+          <Icon name="left" />
+          {m.settings_sec_about()}
+        </TextButton>
+      )}
+      <SectionHead title={m.settings_sec_env()} description={m.env_desc()} />
+    </>
+  );
   if (env.isError) {
     return (
       <>

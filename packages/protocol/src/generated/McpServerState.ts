@@ -3,4 +3,4 @@
 /**
  * 照 pi 的 `connecting / connected / needs-auth / failed`。
  */
-export type McpServerState = "connecting" | "connected" | "needs_auth" | "failed" | "disconnected";
+export type McpServerState = "connecting" | "connected" | "needs_auth" | "failed" | "disconnected" | "disabled";

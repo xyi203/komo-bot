@@ -2,7 +2,7 @@ import type { MemoryItem } from "@komo/protocol";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { cn } from "@/lib/utils";
 import { m } from "@/paraglide/messages.js";
-import { dayDiff, formatDay, inBucket, moteKind, rungOf, stateName, ymd, type Bucket, type MoteKind } from "./model";
+import { dayDiff, formatDay, moteKind, rungOf, stateName, ymd, type MoteKind } from "./model";
 
 const CELL = 22;
 const RANK = { always: 0, relevant: 1, paused: 2, out: 3 } as const;
@@ -34,22 +34,8 @@ function useWidth() {
 /**
  * 攒下的记忆：横轴是记下的日子（跨度超过 60 天按周并），一天一格，格里一个点是一条记忆。
  * 颜色是在场程度（同光阶），点的面积按带进对话的次数（开方）；格内从左下往上排，在起作用的在下面。
- * 图例就是筛选：选中一档时其余点淡下去。
  */
-export function MemoryChart({
-  items,
-  bucket,
-  searching,
-  selected,
-  onPick,
-}: {
-  items: MemoryItem[];
-  bucket: Bucket;
-  /** 正在看检索结果：所有点都不亮。 */
-  searching: boolean;
-  selected: string | null;
-  onPick: (id: string) => void;
-}) {
+export function MemoryChart({ items, selected, onPick }: { items: MemoryItem[]; selected: string | null; onPick: (id: string) => void }) {
   const [ref, measured] = useWidth();
   const layout = useMemo(() => {
     if (!items.length) return null;
@@ -90,7 +76,6 @@ export function MemoryChart({
             const cx = x0 + (i % per) * CELL + CELL / 2;
             const cy = base - Math.floor(i / per) * CELL - CELL / 2 - 2;
             const r = 3.5 + 5.5 * Math.sqrt(x.usage.count / maxUse);
-            const lit = !searching && inBucket(x, bucket);
             return (
               <circle
                 key={x.id}
@@ -105,7 +90,6 @@ export function MemoryChart({
                 className={cn(
                   "cursor-pointer transition-opacity hover:stroke-text hover:stroke-[1.5] hover:opacity-100",
                   DOT[moteKind(x)],
-                  !lit && "opacity-20",
                   x.id === selected && "stroke-text stroke-2",
                 )}
               >

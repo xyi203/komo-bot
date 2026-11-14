@@ -32,6 +32,8 @@ export const searchMemories = (query: string, limit: number, signal?: AbortSigna
 /** 记忆页的检索：带归档的，结果保持检索的排序，`degraded` 如实给出。 */
 export const findMemories = (query: string, signal?: AbortSignal) =>
   get<MemoryListResponse>("/v1/memories", { query, include_archived: true, limit: 30 }, signal);
+/** 等你过目的：候选状态的记忆（`state=candidate`），最多 100 条。 */
+export const fetchPendingMemories = () => get<MemoryListResponse>("/v1/memories", { state: "candidate", limit: 100 });
 export const fetchMemoryCoverage = () => get<MemoryIndexStatus>("/v1/memory-index");
 
 // 写：都带预期 revision 与请求键 `web:{动作}:{id}:{revision}`；回的是写完的那一条。
@@ -88,4 +90,19 @@ export function useMemoryFind(query: string) {
 /** 向量索引状态（取不到不挡页面）。 */
 export function useMemoryCoverage() {
   return useQuery({ queryKey: keys.memoryIndexStatus, queryFn: fetchMemoryCoverage, retry: false });
+}
+
+/**
+ * 等你过目的记忆：候选且你还没确认（确认过的候选不算：服务端的 `confirm` 只改确认状态，见 `docs/memory.md` 附录 C.3.1）。
+ * 图标栏记忆图标上的点用它；一分钟取一次，键在 `["memories"]` 前缀下，任何记忆写操作之后随其余记忆查询一起重取。
+ */
+export function usePendingMemories() {
+  return useQuery({
+    queryKey: keys.memoriesPending,
+    queryFn: fetchPendingMemories,
+    select: (data) => data.memories.filter((memory) => memory.confirmation !== "user_confirmed"),
+    retry: false,
+    staleTime: 30_000,
+    refetchInterval: 60_000,
+  });
 }

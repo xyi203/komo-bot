@@ -11,6 +11,7 @@ export const keys = {
   models: ["models"] as const,
   memories: ["memories", "list"] as const,
   memoriesAll: ["memories", "list", "all"] as const,
+  memoriesPending: ["memories", "pending"] as const,
   memoryIndexStatus: ["memories", "index-status"] as const,
   interventions: ["interventions"] as const,
   matters: ["matters"] as const,

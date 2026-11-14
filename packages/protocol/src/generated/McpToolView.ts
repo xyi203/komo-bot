@@ -12,4 +12,8 @@ description?: string,
 /**
  * `tool_exposure` 覆盖之后的实际值。
  */
-exposure: McpExposure, outward?: boolean, read_only?: boolean, };
+exposure: McpExposure, 
+/**
+ * 这个工具有没有开着（`disabled_tools` 里没有它）。关着的不进模型的工具表，也调不了。
+ */
+enabled: boolean, outward?: boolean, read_only?: boolean, };

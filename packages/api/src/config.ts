@@ -15,6 +15,7 @@ import type {
   McpServersResponse,
   MemoryIndexStatus,
   RebuildIndexResponse,
+  SkillsResponse,
 } from "@komo/protocol";
 import { useQuery, useQueryClient, type QueryClient } from "@tanstack/react-query";
 import { get, post, request } from "./http";
@@ -29,6 +30,7 @@ export const configKeys = {
   env: ["config", "env"] as const,
   memoryIndex: ["config", "memory-index"] as const,
   mcp: ["config", "mcp"] as const,
+  skills: ["config", "skills"] as const,
 };
 
 // 读
@@ -38,6 +40,7 @@ export const fetchConfigSettings = () => get<ConfigSettingsResponse>("/v1/config
 export const fetchConfigEnv = () => get<ConfigEnvResponse>("/v1/config/env");
 export const fetchMemoryIndexStatus = () => get<MemoryIndexStatus>("/v1/memory-index");
 export const fetchMcp = () => get<McpServersResponse>("/v1/mcp");
+export const fetchSkills = () => get<SkillsResponse>("/v1/skills");
 
 // 写
 export const reloadConfig = () => post<ConfigReloadResponse>("/v1/config/reload");
@@ -51,6 +54,16 @@ export const deleteEnv = (version: string, name: string) =>
 export const rebuildMemoryIndex = () => post<RebuildIndexResponse>("/v1/memory-index/rebuild");
 export const reconnectMcp = (servers: string[] = []) => post<McpReconnectResponse>("/v1/mcp/reconnect", { servers });
 export const disconnectMcp = (servers: string[]) => post<McpReconnectResponse>("/v1/mcp/disconnect", { servers });
+
+/** MCP 整台开关（持久，写 `enabled`）：回应是所有服务器此刻的样子。 */
+export const setMcpServerEnabled = (name: string, enabled: boolean) =>
+  request<McpServersResponse>("PUT", `/v1/mcp/${enc(name)}`, { body: { enabled } });
+/** MCP 逐个工具开关（持久，写 `disabled_tools`，不重连）：回应同上。 */
+export const setMcpToolEnabled = (name: string, tool: string, enabled: boolean) =>
+  request<McpServersResponse>("PUT", `/v1/mcp/${enc(name)}/tools/${enc(tool)}`, { body: { enabled } });
+/** 技能开关（持久）：回应是整张技能表。 */
+export const setSkillEnabled = (name: string, enabled: boolean) =>
+  request<SkillsResponse>("PUT", `/v1/skills/${enc(name)}`, { body: { enabled } });
 
 /** 写完把回应里新的三份视图写回缓存，并让配置检查与 `/v1/models`（输入框下的模型菜单）重读。 */
 export function applyConfigEdit(queryClient: QueryClient, response: ConfigEditResponse) {
@@ -90,7 +103,29 @@ export function useMemoryIndexStatus() {
   return useQuery({ queryKey: configKeys.memoryIndex, queryFn: fetchMemoryIndexStatus, ...fresh });
 }
 export function useMcp() {
-  return useQuery({ queryKey: configKeys.mcp, queryFn: fetchMcp, ...fresh });
+  // 有服务器正在连接（刚打开整台开关、重连）时 2 秒重取一次，连上或失败后自己停
+  return useQuery({
+    queryKey: configKeys.mcp,
+    queryFn: fetchMcp,
+    ...fresh,
+    refetchInterval: (query) => (query.state.data?.servers.some((server) => server.state === "connecting") ? 2000 : false),
+  });
+}
+export function useSkills() {
+  return useQuery({ queryKey: configKeys.skills, queryFn: fetchSkills, ...fresh });
+}
+
+/** 配置检查的提醒条数（图标栏设置图标上的点用）：不像设置里那样每次都重读，几分钟取一次；取不到当没有。 */
+export function useConfigIssueCount(): number {
+  const query = useQuery({
+    queryKey: configKeys.check,
+    queryFn: fetchConfigCheck,
+    select: (data) => data.issues.length,
+    retry: false,
+    staleTime: 60_000,
+    refetchInterval: 300_000,
+  });
+  return query.data ?? 0;
 }
 
 /** Gateway 的 `/healthz`，附上这一圈请求的往返时间（浏览器 → Gateway）。 */

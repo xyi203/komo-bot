@@ -9,6 +9,15 @@ import type { McpTransportKind } from "./McpTransportKind";
  */
 export type McpServerView = { name: string, state: McpServerState, detail?: string, transport: McpTransportKind, oauth?: boolean, description?: string, exposure: McpExposure, 
 /**
- * 最近一次握手列出、按 `tools` 白名单挑过的；没连上过就是空的。
+ * 整台开关（`[mcp.servers.<name>] enabled`，持久）。`false` 时 `state` 是 `disabled`，不连接。
+ */
+enabled: boolean, 
+/**
+ * 它在哪：stdio 只有程序名（basename，不带参数——参数里可能有令牌），http 是 URL（去掉查询串与账号）。设置页「连接」表的说明行。
+ * 凭证不在里面（`env` / `bearer_token_env` 只是变量名，不给）。
+ */
+endpoint?: string, 
+/**
+ * 最近一次握手列出、按 `tools` 白名单挑过的（含关着的）；没连上过就是空的。
  */
 tools: Array<McpToolView>, };

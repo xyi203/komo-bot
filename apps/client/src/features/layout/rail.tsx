@@ -1,4 +1,4 @@
-import { useChats } from "@komo/api";
+import { useChats, useConfigIssueCount, usePendingMemories } from "@komo/api";
 import { Link, useRouterState } from "@tanstack/react-router";
 import type { ComponentProps, ReactNode } from "react";
 import { Icon, type IconName } from "@/components/icon";
@@ -20,6 +20,7 @@ const on = "bg-active text-text [&_svg]:stroke-[1.9]";
 export function Rail() {
   const pathname = useRouterState({ select: (s) => s.location.pathname });
   const waiting = useChats().data?.waitingCount ?? 0;
+  const pending = usePendingMemories().data?.length ?? 0;
   const paletteOpen = usePaletteOpen();
   const settingsOpen = useSettingsState().open;
   return (
@@ -51,7 +52,11 @@ export function Rail() {
           <Icon name="search" />
         </button>
         <RailLink to="/goals" icon="target" label={m.nav_goals()} active={pathname.startsWith("/goals")} />
-        <RailLink to="/memory" icon="leaf" label={m.nav_memory()} active={pathname.startsWith("/memory")} />
+        <RailLink to="/memory" icon="leaf" label={pending > 0 ? m.nav_memory_pending({ count: pending }) : m.nav_memory()} active={pathname.startsWith("/memory")}>
+          {pending > 0 && (
+            <span aria-hidden="true" className="absolute top-2 right-2 size-2 rounded-full bg-wait-dot shadow-[0_0_0_2px_var(--color-ground)]" />
+          )}
+        </RailLink>
       </div>
       <Settings open={settingsOpen} />
     </nav>
@@ -80,8 +85,11 @@ function RailLink({
 }
 
 function Settings({ open }: { open: boolean }) {
-  const problem = useConnection();
-  const label = problem === "down" ? m.conn_down() : problem === "retrying" ? m.conn_retrying() : m.nav_settings();
+  const connection = useConnection();
+  // 连不上与重连中的点 2c 已做；配置检查有提醒时也带一个黄点（连接问题优先，红点盖过黄点）
+  const issues = useConfigIssueCount();
+  const problem = connection ?? (issues > 0 ? "config" : null);
+  const label = problem === "down" ? m.conn_down() : problem === "retrying" ? m.conn_retrying() : problem === "config" ? m.nav_settings_issues({ count: issues }) : m.nav_settings();
   return (
     <button type="button" aria-label={label} title={label} aria-pressed={open} onClick={() => openSettings()} className={cn(button, open && on)}>
       <Icon name="gear" />

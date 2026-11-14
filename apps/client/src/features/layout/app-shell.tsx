@@ -7,7 +7,7 @@ import { ChatColumn } from "@/features/chats/chat-column";
 import { Palette } from "@/features/palette/palette";
 import { togglePalette } from "@/features/palette/store";
 import { SettingsDialog } from "@/features/settings/settings-dialog";
-import { isSettingsSection, openSettings } from "@/features/settings/store";
+import { openSettings, settingsSectionOf } from "@/features/settings/store";
 import { cn } from "@/lib/utils";
 import { isChatPath } from "./paths";
 import { Rail } from "./rail";
@@ -29,7 +29,7 @@ function usePaletteShortcut() {
     const desktop = window.komoDesktop;
     const cancel = desktop?.onCommandPalette?.(togglePalette);
     // 桌面壳的 ⌘, 与菜单栏图标"设置…"：开这里的设置弹窗，不再跳到壳的连接设置页
-    const cancelSettings = desktop?.onOpenSettings?.((section) => openSettings(isSettingsSection(section) ? section : undefined));
+    const cancelSettings = desktop?.onOpenSettings?.((section) => openSettings(settingsSectionOf(section)));
     return () => {
       window.removeEventListener("keydown", onKey);
       window.removeEventListener("komo-desktop:command-palette", togglePalette);

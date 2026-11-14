@@ -162,6 +162,8 @@ pub struct GatewayState {
     pub max_rounds: Option<u32>,
     /// 每轮改了哪些文件（[`super::changes`]）：只活在进程里，不是事实来源。
     pub changes: super::changes::ChangeRecorder,
+    /// 浏览器推送：订阅、VAPID 密钥与发送（`docs/redesign.md` §1.8）。
+    pub push: Arc<crate::push::PushService>,
 }
 
 impl std::fmt::Debug for GatewayState {
@@ -309,6 +311,12 @@ impl GatewayState {
         let max_retries = RetryPolicy::default().max_attempts;
 
         let changes = super::changes::ChangeRecorder::new(home.join("runtime").join("changes"));
+        let push = Arc::new(crate::push::PushService::new(
+            &home,
+            db.clone(),
+            Arc::clone(&config),
+            Arc::clone(&clock),
+        ));
         Ok(Arc::new(GatewayState {
             home,
             shared_home,
@@ -338,6 +346,7 @@ impl GatewayState {
             max_retries,
             max_rounds,
             changes,
+            push,
         }))
     }
 

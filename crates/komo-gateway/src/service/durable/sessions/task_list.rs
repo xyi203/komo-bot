@@ -167,7 +167,7 @@ impl DurableCore {
     /// - 任务会话：`komo.task.goals` 里有，或它的派出方是这个目标的定时会话（定时运行里派出的任务算
     ///   这个目标的活动；只看一层，任务再派任务不追）；
     /// - 其余会话没有键。
-    async fn carries_goal(
+    pub(in crate::service::durable) async fn carries_goal(
         &self,
         record: &SessionRecord,
         goal: &MatterId,

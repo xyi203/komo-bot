@@ -525,8 +525,8 @@ komo 现在有三套"命令"，去掉 TUI 只消掉其中一套：
 
 - **终端里没有对话入口。** 剩下网页（`komo web`）和渠道。SSH 到一台没有浏览器的机器上时只能走渠道，或把网页经隧道转出来
   （`clients.md` 的远程访问还没做，C3）。
-- **首次上手路径变了。** `PRODUCT.md` 原则 2 写的是 init → 配 key → chat；chat 这一步从"终端里直接打字"变成"浏览器里配对
-  后打字"。建议裸 `komo` 改成：确保 Gateway 就绪后做 `komo web` 的事（要配对码、开浏览器），`komo web` 留作别名。
+- **首次上手路径变了。** `PRODUCT.md` 原则 2 写的是 init → 配 key → chat；chat 这一步从"终端里直接打字"变成"浏览器里登录
+  后打字"。建议裸 `komo` 改成：确保 Gateway 就绪后做 `komo web` 的事（开浏览器，登录由网页走 OIDC），`komo web` 留作别名。
 - **手动压缩没有入口。** `/compact` 只在 TUI；在线压缩是自动的（§6），网页要不要补一个按钮单独决定。`/model`、`/effort`
   网页输入框下已有。`!` 直跑 shell 没有替代，也不打算补。
 - 文档里提到 TUI 的地方不少（`komo_bot.md` 44 处、`memory.md` 10 处等），删的时候要一并改，`PRODUCT.md` 的"一个世界，多个
@@ -542,7 +542,7 @@ CLI 子命令各有各的存在理由，"操作者不再坐在终端前"只消�
 
 | 类 | 命令 | 能不能去 |
 |---|---|---|
-| **启动与安装**：网页打开之前、或 Gateway 起不来时要用 | `komo gateway [--foreground\|status\|stop\|restart]`（launchd / systemd 与桌面端都调它）、`komo init`、`komo update`、`komo web`（浏览器的配对码从这来）、`komo doctor`、`komo config check`（配置错到 Gateway 起不来时只有它能说哪里错）、`komo auth codex\|mcp login`、`komo channel login`（微信二维码）、隐藏的 `__codemode-worker` | **去不掉**，除非桌面端接手（见下） |
+| **启动与安装**：网页打开之前、或 Gateway 起不来时要用 | `komo gateway [--foreground\|status\|stop\|restart]`（launchd / systemd 与桌面端都调它）、`komo init`、`komo update`、`komo web`（打开网页地址）、`komo doctor`、`komo config check`（配置错到 Gateway 起不来时只有它能说哪里错）、`komo auth codex\|mcp login`、`komo channel login`（微信二维码）、隐藏的 `__codemode-worker` | **去不掉**，除非桌面端接手（见下） |
 | **Agent 的工具面**：Agent 在 `bash` 里跑，系统提示与工具文档里教的 | `komo memory add/search/confirm/forget`、`komo goal …`、`komo area …`、`komo skills list/inspect/enable/disable`、`komo cron …`、`komo mcp reconnect`、`komo session search/list`、`komo monitor list`、`komo run inspect`、`komo intervention list`（后三条是看门狗提示用的）、`komo gateway restart` | **去不掉**；可以从 `--help` 里藏起来 |
 | **只给终端前的操作者**，网页已有对应 | `komo home`、`komo resume`；`komo session delete/purge`；`komo run cancel`；`komo intervention show/answer`；`komo memory list/show/classify/restore`、`komo memory index status/rebuild`；`komo config reload`；`komo channel list/probe` | **可以去** |
 | 只给操作者，网页**没有**对应 | `komo session export`、`komo memory consolidate`、`komo memory sweep` | 去之前网页要补，或认定不再需要 |
@@ -576,12 +576,11 @@ Cabinet（`../cabinet`）没有 CLI：`pnpm start` 起一个进程，`deploy/ins
 | 启动与安装：`init` | 网页首次配置 | 没有配置时照样启动（现在无 key 也能启动），网页设置已能改模型、配置、环境变量；缺的是"一个 Agent 都没声明"时的引导 |
 | `config check`、`doctor` | 网页设置的配置检查（已有 `GET /v1/config/check`） | 配置错到装不上时保留旧配置继续跑（热重载已如此）；**冷启动时配置就是坏的**要能起到只开设置页的降级状态 |
 | `auth codex login`、`auth mcp login`、`channel login`（微信二维码） | 网页里发起 | 设备码与二维码显示在网页；MCP 的授权码回调现在听 `127.0.0.1` 随机端口，远程部署时要改走 Gateway 自己的回调地址 |
-| `web`（配对码） | 启动日志里印一次性链接（同 DeepSeek Harness 的启动令牌，`clients.md` §7） | cookie 随 Gateway 重启失效这一点要么改成持久，要么留一条重新配对的命令 |
+| `web` | 打开网页地址（2026-11-14 起没有配对码，登录走 OIDC，`docs/redesign.md` P21） | 登录状态已落盘、重启不掉 |
 | `gateway status/stop/restart`、`update` | 交给 launchd / systemd / 容器与发布流程 | 桌面端自动更新；服务器上重新部署二进制 |
 | 第三、四类（操作者用的各种 list / show / export） | 网页 | `session export`、`memory consolidate/sweep` 网页补入口或不要 |
 
-收完之后的 CLI：`komo`（前台起服务，给 launchd / systemd / 容器用）、`komo --version`、隐藏的 `__codemode-worker`；重新配对
-如果不做持久 cookie，再留一条 `komo web`。`crates/komo/src` 的 `commands.rs`、`matters.rs` 与 `komo-client` 的 `render/`、`api.rs`
+收完之后的 CLI：`komo`（前台起服务，给 launchd / systemd / 容器用）、`komo --version`、隐藏的 `__codemode-worker`；`komo web` 只剩打开地址（登录状态已落盘）。`crates/komo/src` 的 `commands.rs`、`matters.rs` 与 `komo-client` 的 `render/`、`api.rs`
 大半可以删，`komo-client` 这个 crate 可能整个不需要。
 
 这一条的来回（都在 2026-11-10）：先提四个按领域分的工具；操作者指出会变复杂，改为不加工具、命令藏出 `--help`；读了 OpenClaw 与
@@ -703,8 +702,7 @@ D3 取代 10-31 的"先统计再定"：操作者直接定了 Router - Worker，�
   整个删掉（先于其余各项做，会话树入口的大半随它一起走），并改裸 `komo` 的含义、清 §13.4 依赖表；D8 的 CLI 收缩同在这一步。完成标准：
   `cargo test --workspace` 通过，`session-tree.md` §4 里对应的测试随功能一起删掉或改写，没有悬空的文档引用。
 - **T3b CLI 收到只剩启动（D8）。** 顺序：先加 `komo` 工具并改系统提示（`SELF_BLOCK`、看门狗提示），
-  旧子命令并存一个版本；再把登录、首次配置、配对搬进网页；最后删命令与 `komo-client`。完成标准：一台只装了二进制的机器上，起服务、打开启动日志里的
-  链接、在网页里配好模型与一个渠道、让 Agent 记一条记忆和一个目标，全程不敲第二条命令。
+  旧子命令并存一个版本；再把登录（OIDC）、首次配置搬进网页；最后删命令与 `komo-client`。完成标准：一台只装了二进制的机器上，起服务、打开网页地址、在网页里配好模型与一个渠道、让 Agent 记一条记忆和一个目标，全程不敲第二条命令。
 - **T4 归属。** 任务带上目标的键（§4.7），目标详情页列出带该键的任务。
 
 ## 8. 未核对

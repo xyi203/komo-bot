@@ -82,6 +82,8 @@ pub fn snapshot_fixture() -> ConfigSnapshot {
             web_dir: None,
             trusted_hosts: vec![],
             oidc: None,
+            web_serve: true,
+            push: Default::default(),
         },
         model_catalog,
         model: main,

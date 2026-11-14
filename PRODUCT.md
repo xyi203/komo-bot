@@ -22,7 +22,7 @@ komo 是一个 Rust 个人 agent 框架：一个二进制提供 Gateway 与 CLI�
 
 ## Operating Context
 
-- 主形态是聊天助理：Web 客户端（`apps/client`，见 `docs/web.md`；终端里敲 `komo` 打开它的配对链接）。终端 TUI 已于 2026-11-12 删除，飞书 / Telegram / 微信渠道已于 2026-11-13 删除。
+- 主形态是聊天助理：Web 客户端（`apps/client`，见 `docs/web.md`；终端里敲 `komo` 打开它的地址，登录走 OIDC）。终端 TUI 已于 2026-11-12 删除，飞书 / Telegram / 微信渠道已于 2026-11-13 删除。
 - gateway 作为常驻进程运行（macOS launchd / Linux systemd 托管），承担定时 Job、monitor、后台任务会话与记忆提取；主动消息经 home chat 送达。
 - 操作者通过 CLI 或 Web 管理记忆、目标与领域、技能、cron、会话与配置，全部走 gateway 的 `/v1/*` HTTP 接口。没有审批与权限策略（2026-10-11 删除）；唯一的例外是触发器起的 Run 调用声明为对外的工具时，停在 confirm 检查点等操作者 approve / reject（`docs/confirm.md`），在 Web 的待处理页或渠道里答。
 - 单机单用户：数据库、配置、凭证都在本地 `~/.komo` 下。

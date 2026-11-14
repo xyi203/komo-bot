@@ -136,7 +136,8 @@ fn check_start_only(snapshot: &ConfigSnapshot, issues: &mut Vec<ConfigIssue>) {
             ));
         }
     }
-    if let Some(dir) = &snapshot.start_only.web_dir
+    if snapshot.start_only.web_serve
+        && let Some(dir) = &snapshot.start_only.web_dir
         && !dir.is_dir()
     {
         // 没有目录只是没有网页，不拦 Gateway 启动。
@@ -146,6 +147,20 @@ fn check_start_only(snapshot: &ConfigSnapshot, issues: &mut Vec<ConfigIssue>) {
         ));
     }
     check_oidc(snapshot, issues);
+    if let Some(subject) = &snapshot.start_only.push.subject
+        && !(subject.starts_with("mailto:") || subject.starts_with("https://"))
+    {
+        issues.push(error(
+            "push.subject",
+            format!("`{subject}` 要写成 mailto:你@example.com 或 https:// 地址（VAPID 的 sub，RFC 8292）"),
+        ));
+    }
+    if !snapshot.start_only.web_serve && snapshot.start_only.web_dir.is_some() {
+        issues.push(warning(
+            "start_only.web_dir",
+            "[web] serve = false：Gateway 不托管网页，[web] dir 不会被用到",
+        ));
+    }
     if !snapshot.start_only.data_dir.is_absolute() {
         issues.push(error(
             "start_only.data_dir",

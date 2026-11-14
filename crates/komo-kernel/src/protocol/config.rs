@@ -83,6 +83,38 @@ pub struct StartOnly {
     /// 网页没法登录，命令行仍用本机令牌（`runtime/gateway.json`）。
     #[serde(default)]
     pub oidc: Option<OidcConfig>,
+    /// `[web] serve`：Gateway 是否托管网页静态文件（默认 `true`）。网页单独发布时关掉：Gateway 只剩
+    /// `/v1/**`、`/auth/**`、`/healthz`，其余路径 404（`docs/redesign.md` §2.9、`docs/deploy.md`）。
+    #[serde(default = "default_true")]
+    pub web_serve: bool,
+    /// `[push]`：浏览器推送（`docs/redesign.md` §1.8）。
+    #[serde(default)]
+    pub push: PushConfig,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// `[push]`：Web Push 的总开关与 VAPID `subject`。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PushConfig {
+    /// 总开关，默认开。关了：接口仍在（网页照常订阅），但服务端什么都不发。
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// VAPID 的 `sub`（RFC 8292 §2.1）：`mailto:` 或 `https:` 地址，推送服务出问题时联系你。
+    /// 省略 = 用 `[auth.oidc] public_url`；两个都没有就不发。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject: Option<String>,
+}
+
+impl Default for PushConfig {
+    fn default() -> Self {
+        PushConfig {
+            enabled: true,
+            subject: None,
+        }
+    }
 }
 
 /// `[auth.oidc]` 的默认客户端密钥变量名。
@@ -840,6 +872,8 @@ mod tests {
                 web_dir: None,
                 trusted_hosts: vec![],
                 oidc: None,
+                web_serve: true,
+                push: PushConfig::default(),
             },
             model_catalog: ModelCatalog::default(),
             model: model("chat-a"),

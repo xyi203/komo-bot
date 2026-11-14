@@ -310,6 +310,7 @@ mod tests {
     fn a_matter_list_is_one_line_per_matter() {
         let response = MatterListResponse {
             schedules: vec![],
+            waiting: Default::default(),
             matters: vec![
                 goal("g-1", MatterState::Active),
                 goal("g-2", MatterState::Waiting),
@@ -326,6 +327,7 @@ mod tests {
         // 截止当天不算超期；结案的不算。
         let on_time = MatterListResponse {
             schedules: vec![],
+            waiting: Default::default(),
             matters: vec![
                 goal("g-1", MatterState::Active),
                 goal("g-3", MatterState::Done),
@@ -336,6 +338,7 @@ mod tests {
         assert_eq!(
             matter_list(&MatterListResponse {
                 schedules: vec![],
+                waiting: Default::default(),
                 matters: vec![],
                 today: date!(2026 - 11 - 01)
             }),

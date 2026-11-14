@@ -88,11 +88,45 @@ pub fn ensure(state: &Arc<GatewayState>, session: &str) {
                     .clone()
                     .unwrap_or_else(|| "（这一轮没有文字回复）".to_owned());
                 title(&state, &session, &run, &text);
+                push_unprompted(&state, &session, &run, body.final_message.as_deref()).await;
             }
         }
         if let Some(state) = weak.upgrade() {
             state.stop_watching(&RunId::from_raw(format!("session-watch:{session}")));
         }
+    });
+}
+
+/// 对话里**不是操作者发起的**一轮（监听事件、任务交回之类触发的 Run）说完了话：推给订阅的设备。
+/// 操作者自己发消息开始的那一轮他正看着，不推；不说话的记号与空回复不推；任务会话、定时会话、存量
+/// 渠道会话不是对话（定时结果与提问走 `say_in`，那边已经推过）。
+async fn push_unprompted(
+    state: &Arc<GatewayState>,
+    session: &str,
+    run: &RunId,
+    reply: Option<&str>,
+) {
+    let Some(text) = reply
+        .map(str::trim)
+        .filter(|text| !text.is_empty() && !is_silent_reply(text))
+    else {
+        return;
+    };
+    let Ok(core) = state.core() else { return };
+    let Ok(record) = core.session(session).await else {
+        return;
+    };
+    if !matches!(record.kind, SessionKind::Main | SessionKind::Normal)
+        || super::super::chats::is_channel_session(&record)
+        || core.run_started_by_operator(run).await
+    {
+        return;
+    }
+    state.push.notify(crate::push::PushMessage {
+        title: "Komo".to_owned(),
+        body: text.to_owned(),
+        url: super::super::chats::say::chat_url(&record),
+        tag: Some(format!("reply:{}", run.as_str())),
     });
 }
 

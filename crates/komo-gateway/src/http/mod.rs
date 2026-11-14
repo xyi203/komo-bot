@@ -17,6 +17,7 @@ pub mod matters;
 pub mod mcp;
 pub mod skills;
 pub mod memories;
+pub mod push;
 pub mod v2;
 
 use std::net::SocketAddr;
@@ -43,6 +44,8 @@ pub struct Api {
     pub web: Arc<WebAuth>,
     /// 登录：OIDC、网页会话、设备令牌（`docs/redesign.md` §2.9）。
     pub auth: Arc<AuthService>,
+    /// 等回调的网页 MCP 登录（`mcp::oauth_start` / `oauth_callback`）。
+    pub mcp_logins: Arc<mcp::McpLogins>,
 }
 
 impl std::fmt::Debug for Api {
@@ -55,11 +58,16 @@ impl Api {
     /// `listen` 是**实际绑定**的地址（端口 0 绑出来的也算），Host 校验放行它。
     pub fn new(state: Arc<GatewayState>, listen: SocketAddr) -> Self {
         let snapshot = state.snapshot();
-        let web_dir = snapshot
-            .start_only
-            .web_dir
-            .clone()
-            .or_else(crate::web::default_web_dir);
+        // `[web] serve = false`：网页单独发布，Gateway 不托管静态文件（fallback 对非 /v1 路径回 404）。
+        let web_dir = if snapshot.start_only.web_serve {
+            snapshot
+                .start_only
+                .web_dir
+                .clone()
+                .or_else(crate::web::default_web_dir)
+        } else {
+            None
+        };
         // 公开地址的主机自动放行：它是操作者在 `[auth.oidc]` 里写的，回调就落在它上面。
         let mut trusted = snapshot.start_only.trusted_hosts.clone();
         if let Some(oidc) = &snapshot.start_only.oidc
@@ -83,6 +91,7 @@ impl Api {
             idempotency: Arc::new(Idempotency::new()),
             web,
             auth,
+            mcp_logins: Arc::new(mcp::McpLogins::default()),
         }
     }
 }
@@ -175,7 +184,14 @@ fn shared_routes() -> Router<Api> {
         .route("/v1/mcp/reconnect", post(mcp::reconnect))
         .route("/v1/mcp/disconnect", post(mcp::disconnect))
         .route("/v1/mcp/{name}", put(mcp::set_server))
+        .route("/v1/mcp/{name}/oauth/start", post(mcp::oauth_start))
+        .route("/v1/mcp/{name}/oauth/callback", get(mcp::oauth_callback))
         .route("/v1/mcp/{name}/tools/{tool}", put(mcp::set_tool))
+        .route("/v1/push/key", get(push::key))
+        .route(
+            "/v1/push/subscriptions",
+            post(push::subscribe).delete(push::unsubscribe),
+        )
         .route("/v1/skills", get(skills::list))
         .route("/v1/skills/{name}", put(skills::set))
 }

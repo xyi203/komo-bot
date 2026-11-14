@@ -31,7 +31,7 @@ pnpm desktop:dev               # macOS Electron 壳（apps/desktop，docs/client
 pnpm desktop:build             # 未签名的 .app（release/mac-arm64/），本机冒烟；pnpm desktop:dist 出 dmg/zip
 
 komo init                      # write a minimal commented config.toml + 0600 .env (never overwrites)
-komo web [--no-open]           # start Gateway if needed → one-time pairing link → browser cookie session (Gateway serves [web] dir); bare `komo` does the same
+komo web [--no-open]           # start Gateway if needed → open its URL; the web client logs in via OIDC → cookie session (Gateway serves [web] dir unless `[web] serve = false`); bare `komo` does the same
 komo gateway [--foreground] | gateway status|stop|restart
 komo config check | config reload
 komo session list|delete|purge|export SESSION_ID [-o FILE]   # export = pi v3 树形 JSONL
@@ -78,7 +78,7 @@ komo-agent     AgentProfile → 能力面选择 · skills 发现与目录 · 编
                值类型（AgentProfile/AgentSurface）留在 kernel。
 komo-gateway   axum routes (`http/v2`) · `service/durable` (DurableCore + hooks; chats/ ·
                sessions/ · submit/ · interventions/ · feed/ · background/) · SSE · auth · lock/discovery ·
-               web (Host guard · pairing → cookie · static shell) · launchd/systemd · web attachment inbox ·
+               web (Host guard · static shell, switchable) · push (Web Push: VAPID + subscriptions) · launchd/systemd · web attachment inbox ·
                intervention rendering · config reload.
 komo-client    HTTP + SSE client · discovery · command output (CLI subcommands).
                Depends on kernel only.

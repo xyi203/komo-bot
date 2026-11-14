@@ -5,6 +5,7 @@ pub mod http;
 pub mod inbox;
 pub mod lock;
 pub mod oidc;
+pub mod push;
 pub mod reload;
 pub mod service;
 pub mod sse;

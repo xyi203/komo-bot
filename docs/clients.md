@@ -87,14 +87,14 @@ macOS 应用和手机端，需要一套标准的前端栈，以及一份所有�
    - **Tailscale**：Gateway 额外监听 tailnet 地址（新增配置项，默认关）。端到端加密，但每台设备都要装 Tailscale。
    - **Cloudflare Tunnel + Access**：Mac 上跑 `cloudflared`，把本机 Gateway 挂到自己的域名下，由 Access 负责登录。
      不用开端口，任何浏览器都能打开；代价是 Cloudflare 终止 TLS，能看到明文。
-   网页由 Gateway 托管，所以经隧道打开时仍然同源，D6 的 cookie 照样能用。
+   网页默认由 Gateway 托管，所以经隧道打开时仍然同源，D6 的 cookie 照样能用。网页单独发布时（`[web] serve = false`）也是同一个域名：Cloudflare 按路径把 `/v1/*`、`/auth/*`、`/healthz` 分给 Gateway，其余给静态网页，仍是同源、**不做 CORS**（配法见 `docs/deploy.md`，未实测）。
 
    经反向代理或隧道访问时，Gateway 看不到浏览器实际用的地址，需要两项配置（同 DeepSeek Harness 的 `--public-url` /
    `--trusted-host`）：`[auth.oidc] public_url` 告诉 Gateway 对外地址（OIDC 回调、cookie 的 `Secure`、`Origin` 核对都看它，它的主机自动进 D6 的 Host 校验；2026-11-14 取代原先设想的 `[gateway] public_url`）；
    `trusted_hosts` 仍可再加别的域名。代理要原样转发 `Host`，不要改写成 `127.0.0.1:7777`（改写了也行：`Origin` 另认 `public_url` 的源）。浏览器那一段
    必须是 HTTPS，否则令牌和 cookie 都是明文；cookie 在 `public_url` 是 https 时加 `Secure`。
 2. **设备令牌**（2026-11-14 已做服务端，§9）：不再用二维码配对。桌面端 / CLI 走「跳系统浏览器登录再跳回」换一个只属于这台设备的长期令牌，可以单独吊销；令牌哈希与设备清单落在 `aux.db` 的 `auth_sessions`（原先「放进 `config.toml` / `.env`」的设想作废）。手机 PWA 直接用网页的 OIDC 登录。
-3. **PWA**：manifest、图标、service worker。推送用 Web Push：Gateway 拿 VAPID 密钥直接推，不需要自建推送服务。
+3. **PWA**：manifest、图标、service worker。推送用 Web Push：Gateway 拿 VAPID 密钥直接推，不需要自建推送服务。**服务端 2026-11-14 已做（未编译、未对真实推送服务实测）**：`GET /v1/push/key`、`POST` / `DELETE /v1/push/subscriptions`，订阅在 `aux.db` 的 `push_subscriptions`，VAPID 密钥在 `runtime/vapid.json`，加密与签名用 `ring` 手写（`docs/komo_bot.md` §13.1「浏览器推送」）；service worker 与订阅界面在网页一侧。推送要求 https。
    iOS 要先"添加到主屏幕"才能收推送（16.4 起支持）。
 4. **原生壳（按需）**：碰到 PWA 的硬限制再做，比如 iOS 推送不够稳，要分享扩展、小组件、快捷指令，或者要读位置、
    健康数据（roadmap-muse P5）。用 Capacitor 套同一份 SPA 产物，令牌存钥匙串，原生能力写成插件。

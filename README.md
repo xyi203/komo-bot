@@ -29,7 +29,7 @@ cargo run -- gateway --foreground
 
 装好之后先 `komo init`：在数据目录（`KOMO_HOME`，默认 `~/.komo`）生成一份带注释的最小
 `config.toml` 和权限 600 的 `.env` 模板，已有 `config.toml` 不会被覆盖。照着改 `base_url` 与
-模型名，在 `.env` 里填 API key，再 `komo config check` 校验，通过后直接 `komo`（等同 `komo web`：确认 Gateway 在跑，打开一次性配对链接，在浏览器里接着聊）。
+模型名，在 `.env` 里填 API key，再 `komo config check` 校验，通过后直接 `komo`（等同 `komo web`：确认 Gateway 在跑，打开网页地址，没登录时由网页走 OIDC 登录，在浏览器里接着聊）。
 
 升级用 `komo update`：它从 GitHub release 下同一套发布包，核对 sha256、解包、试跑
 `--version`，最后才把磁盘上那份换掉（详见 [`docs/komo_bot.md`](docs/komo_bot.md) §13.6）。

@@ -83,6 +83,8 @@ pub fn sample_snapshot() -> ConfigSnapshot {
             web_dir: None,
             trusted_hosts: vec![],
             oidc: None,
+            web_serve: true,
+            push: Default::default(),
         },
         model_catalog: ModelCatalog {
             default: "main".into(),

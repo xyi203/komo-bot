@@ -67,6 +67,13 @@ oauth = true                           # 与 bearer_token_env 只能写一个
   授权码 + PKCE → 回调只听 `127.0.0.1` 的一个随机端口（5 分钟超时，`/callback` 以外的路径回 404）
   → 换 token。`client_id` 与 token 写进 `<数据目录>/mcp/<name>/credentials.json`（临时文件 +
   rename，0600），不进 `.env`。不用重启 Gateway（§2.2）。
+- **网页里登录**（2026-11-14，未对真实授权服务器实测）：Gateway 跑在远程机器上、操作者只用网页时，上面本机随机端口的回调回不来。
+  `POST /v1/mcp/{name}/oauth/start`（登录之后）在 Gateway 里做同一套发现 + 动态注册 + PKCE（`mcp_auth::begin_session`，与命令行共用），
+  回 `{ "authorization_url" }`，浏览器去授权；授权服务器跳回 `<[auth.oidc] public_url>/v1/mcp/{name}/oauth/callback`，
+  Gateway 按 `state` 找回等着的会话（内存、10 分钟、用一次；**必须是发起它的同一条登录状态**，免得别人把他自己的授权回调发给你点）、换 token，
+  写进**同一份**凭证文件，再后台重连这台服务器。要有公开地址（`public_url`），没有就 400；服务器名只认字母、数字、`-`、`_`、`.`。
+  网页的「连接」里「登录」按钮调 start、跳到返回的地址即可；没有公开地址的本机用法仍是 `komo auth mcp login`。
+  授权服务器那边登记的回调是动态注册时带上的 `<public_url>/v1/mcp/{name}/oauth/callback`，无需操作者手填。
 - `komo auth mcp status`：每个 `oauth = true` 的服务器一行——登录与否、过期时间、能否自动刷新；
   不打印 token。
 - Gateway 连接时用这份文件装 rmcp 的 `AuthorizationManager`（`FileCredentialStore`，

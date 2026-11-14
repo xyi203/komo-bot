@@ -135,6 +135,14 @@ mode = "keyword"
 # client_id = "komo"
 # public_url = "https://komo.example.com"      # 回调地址 = <public_url>/auth/callback
 # allowed_subjects = ["<你的 sub>"]            # 或 allowed_emails = ["me@example.com"]；不在名单里一律拒绝
+
+# 网页：默认由 Gateway 托管；网页单独发布（Cloudflare Pages 等）时关掉。
+# [web]
+# serve = false
+# 浏览器推送（要 https）：默认开；subject 省略时用上面的 public_url。
+# [push]
+# enabled = true
+# subject = "mailto:me@example.com"
 "#
     )
 }

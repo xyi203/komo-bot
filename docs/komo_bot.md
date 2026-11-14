@@ -135,7 +135,7 @@ Gateway 对数据目录持有进程锁。多个 CLI 同时启动时，只允许�
    **不认识的键不算错**（2026-09-24）：`config.toml` 里多出来的键——升级后留下的退役键、拼错的键、写到了别的表下面的键（`default_agent` 落进前一个 `[agents.x]` 是最常见的一种）——被忽略，配置照常装上，但每一个都以完整路径（如 `gateway.listen_typo`）作为**警告**出现在 `komo config check`、`komo doctor` 与重载日志里。键认识、值的类型不对仍然是错误。
 2. 校验通过 → 原子替换进程内唯一的 `Arc<ConfigSnapshot>`（arc-swap）。**读配置的地方按用途读当前快照，不缓存**：每个阶段（每次模型请求、每次工具调用）按当前快照解析 Agent / 模型 / effort（§6.2）——所以模型改完，下一次请求用新模型，**已经开始的请求（checkpoint 里冻结的模型与 effort）与进行中的后台记忆任务继续用它们各自开始时抓的快照**（§13.3），不在半路换模型。
 3. 逐段比对新旧快照，只重建变化了的东西：模型 `base_url` / 凭证变了 → 换掉对应 `LlmClient` 实例；向量模型变了 → 走 §9.5 的空间指纹与索引代次流程，不在重载里偷偷重建索引。
-4. 一小组键**只在启动时生效**：数据目录 / `KOMO_HOME`、监听地址与端口、数据库路径、`[web] dir`、`[gateway] trusted_hosts`、`[auth.oidc]`（登录配置在启动时读一次）。这些键改了，重载照常完成其余部分，然后明确报告"以下键需要 `komo gateway restart`"，不静默忽略，也不假装已生效。
+4. 一小组键**只在启动时生效**：数据目录 / `KOMO_HOME`、监听地址与端口、数据库路径、`[web] dir` / `[web] serve`、`[gateway] trusted_hosts`、`[auth.oidc]`（登录配置在启动时读一次）、`[push]`（总开关与 `subject`）。这些键改了，重载照常完成其余部分，然后明确报告"以下键需要 `komo gateway restart`"，不静默忽略，也不假装已生效。
 
 重载事件带新旧快照的差异（键名，不带值，凭证更不带）写进 Gateway 日志；`komo doctor` 显示当前生效配置的加载时间与来源文件 mtime，两者不一致就是"文件改了但没装上"，把上一次校验错误一并印出来。
 
@@ -558,7 +558,7 @@ project_files = false              # 省略 = true
 | 保存位置 | 内容 | 说明 |
 | --- | --- | --- |
 | `<data_dir>/durable.db`（Turso，WAL，一个新文件） | `conversations`、`entries`、`tasks`、`submissions`、`documents`、`sessions`、`durable_meta` | **会话内容、Run / 调用状态、可变状态、生命周期的唯一权威**；一条提交线写，读不经过线 |
-| `<data_dir>/aux.db`（Turso + toasty，同一套模型与 migration） | `cron_jobs`（**已退役**：定时并进了 `matters`，回填之后不再读写）、`cron_firings`（键是目标 id）、`auth_sessions`（登录状态：网页会话与设备令牌，只存令牌的 SHA-256，§13.1「登录」；与 `durable.db` 的对话 `sessions` 无关）、`deliveries`、`memory_items` / `memory_evidence` / `memory_terms` / `memory_vectors` / `memory_index_generations`、幂等键等辅助表 | 与 `durable.db` **分库**：跨库靠预分配 ID 与请求键幂等（cron：先在 `aux.db` 写 firing 行并预分配 Session ID，再一次 engine 提交建会话并受理 `request_id = cron:{job}:{slot}`；投递：先写后发、按逻辑键 `deliver_once`）；"同库同提交"推迟到以后 |
+| `<data_dir>/aux.db`（Turso + toasty，同一套模型与 migration） | `cron_jobs`（**已退役**：定时并进了 `matters`，回填之后不再读写）、`cron_firings`（键是目标 id）、`auth_sessions`（登录状态：网页会话与设备令牌，只存令牌的 SHA-256，§13.1「登录」；与 `durable.db` 的对话 `sessions` 无关）、`push_subscriptions`（浏览器推送订阅：endpoint 唯一，`p256dh` / `auth` 是浏览器的加密密钥，§13.1「浏览器推送」）、`deliveries`、`memory_items` / `memory_evidence` / `memory_terms` / `memory_vectors` / `memory_index_generations`、幂等键等辅助表 | 与 `durable.db` **分库**：跨库靠预分配 ID 与请求键幂等（cron：先在 `aux.db` 写 firing 行并预分配 Session ID，再一次 engine 提交建会话并受理 `request_id = cron:{job}:{slot}`；投递：先写后发、按逻辑键 `deliver_once`）；"同库同提交"推迟到以后 |
 | `sessions/{session_id}/tool-output/{conversation}/{tool_task}/{attempt}/` | `output.json`，以及按需的 `stdout.txt` / `stderr.txt` / `image-<n>.<ext>` / `background.log` | 每次执行的完整工具输出，按尝试独立、完成后不可变；运行时先写 `.partial` |
 | `sessions/{session_id}/artifacts/…` | 工具生成的二进制文件、脚本快照与报告 | 独立产物；正文里以 `artifact://` 给出引用（§4.7） |
 
@@ -978,6 +978,11 @@ CLI 通过 HTTP 发命令，通过 SSE 观察运行。Gateway 内部采用函数
 | POST /v1/mcp/disconnect          | 点名的 MCP 服务器（空 = 全部）手动断开，停到重连为止：后台不再连，调用报"已手动断开"；只在内存里，重启后照常连（`docs/mcp.md` §2.7） |
 | PUT /v1/mcp/{name}               | 整台持久开 / 关（体 `{"enabled": bool}`，写 `[mcp.servers.<name>] enabled`，热重载生效）；回 `McpServersResponse`（`docs/mcp.md` §2.8） |
 | PUT /v1/mcp/{name}/tools/{tool}  | 逐个工具持久开 / 关（写 `disabled_tools`，不重连服务器）；回 `McpServersResponse`（`docs/mcp.md` §2.8） |
+| POST /v1/mcp/{name}/oauth/start  | 网页里登录一台 `oauth = true` 的 MCP 服务器（`docs/mcp.md` §2.1）：在 Gateway 里备好授权会话（动态注册 + PKCE，内存、10 分钟、用一次），回 `{ "authorization_url" }`；没有 `[auth.oidc] public_url`（没有公开地址）400 |
+| GET /v1/mcp/{name}/oauth/callback | 授权服务器跳回 `<public_url>/v1/mcp/{name}/oauth/callback`：按 `state` 对号（必须是发起它的那条登录状态），换 token 写进凭证文件，后台重连这台服务器，回一张 HTML 页 |
+| GET /v1/push/key                 | 浏览器推送：服务端的 VAPID 公钥 `{ "public_key" }`（未压缩 P-256 点的 base64url；密钥对首次需要时生成，落 `runtime/vapid.json`，0600） |
+| POST /v1/push/subscriptions      | 订阅：`{ endpoint, keys: { p256dh, auth }, user_agent? }` → `{ "id" }`；同一 endpoint 再订阅 = 更新；endpoint 必须是 https |
+| DELETE /v1/push/subscriptions    | 取消订阅：`{ endpoint }` → 204（没有这条也 204） |
 | GET /v1/skills                   | skill 列表：名字、说明、来源（配置目录 / komo / 共享）、是否启用、开着却进不了目录行的原因（§5.6） |
 | PUT /v1/skills/{name}            | 开 / 关一个 skill（体 `{"enabled": bool}`，写 `runtime/skills-disabled.json`，与 `komo skills enable|disable` 同一个文件）；关掉的不进目录行、`skill://` 不挂；回 `SkillsResponse` |
 | POST /v1/attachments             | 网页输入框的附件：请求体是原始字节（`?name=` 原文件名），存进 `{workspaces_dir}/inbox/web/`，交回路径、拼进正文的说明，图片另有缩略图地址；上限 20 MB，超了 413 |
@@ -994,7 +999,7 @@ CLI 通过 HTTP 发命令，通过 SSE 观察运行。Gateway 内部采用函数
 
 除最小健康检查、`/auth/*` 与网页静态文件外，所有 `/v1/**` 统一认证（SSE 同），接受三种凭据：`Authorization: Bearer <本机令牌>`（`runtime/gateway.json`，机器上的命令行用，不经 OIDC）、`Authorization: Bearer <设备令牌>`（`komodev_…`）、浏览器的会话 cookie；用 cookie 的**非 GET / HEAD** 请求另外核对 `Origin`（与 `Host` 同源，或等于 `[auth.oidc] public_url` 的源），否则 403。失败一律 401，不区分「没带」与「带错」。
 
-**网页壳与 Host 校验（`docs/clients.md` D5、D6）。** `/v1/*` 与 `/healthz` 之外的路径是网页壳的静态文件：从 `[web] dir` 读（没配就退到 `komo` 二进制旁的 `web/`，发布包与 `install.sh` / `komo update` 装在那里，§13.6），先找文件，没有扩展名的路径回落壳 html（`_shell.html`，客户端路由），带扩展名而找不到的 404；目录不存在不报错，只是没有网页（`komo config check` 给一条警告）。文件不嵌进二进制，Rust 冷构建不依赖 Node。**所有路由**（含静态文件、`/healthz`、`/auth/*`）都先过 Host 校验：只放行回环（`127.0.0.1`、`::1`、`localhost`）、监听地址的主机部分、`[gateway] trusted_hosts`（主机名列表，经反向代理 / 隧道访问时填域名；端口不参与比较）和 `[auth.oidc] public_url` 的主机，其余一律 403——挡 DNS 重绑定，只负责放行、不替代鉴权。`[web] dir` 与 `trusted_hosts` 都是启动期键（§3 第 4 条）。
+**网页壳与 Host 校验（`docs/clients.md` D5、D6）。** `/v1/*` 与 `/healthz` 之外的路径是网页壳的静态文件：从 `[web] dir` 读（没配就退到 `komo` 二进制旁的 `web/`，发布包与 `install.sh` / `komo update` 装在那里，§13.6），先找文件，没有扩展名的路径回落壳 html（`_shell.html`，客户端路由），带扩展名而找不到的 404；目录不存在不报错，只是没有网页（`komo config check` 给一条警告）。文件不嵌进二进制，Rust 冷构建不依赖 Node。**所有路由**（含静态文件、`/healthz`、`/auth/*`）都先过 Host 校验：只放行回环（`127.0.0.1`、`::1`、`localhost`）、监听地址的主机部分、`[gateway] trusted_hosts`（主机名列表，经反向代理 / 隧道访问时填域名；端口不参与比较）和 `[auth.oidc] public_url` 的主机，其余一律 403——挡 DNS 重绑定，只负责放行、不替代鉴权。`[web] dir` 与 `trusted_hosts` 都是启动期键（§3 第 4 条）。**`[web] serve = false`（默认 `true`）**：网页单独发布时关掉静态托管，Gateway 只提供 `/v1/**`、`/auth/**`、`/healthz`，其余路径一律 404（不读 `[web] dir`，也不找二进制旁的 `web/`）；同一域名下由 Cloudflare 按路径把这三类分给 Gateway、其余给静态网页，所以**不做 CORS**（`docs/deploy.md`）。网页启动时读 `GET /healthz` 的 `protocol_version`（kernel 的 `PROTOCOL_VERSION`，**协议类型有不兼容改动时递增**）与 `version` 核对是否与自己配套。
 
 **登录（OIDC，2026-11-14，`docs/redesign.md` §2.9、P21；真实提供方上的流程未实测，见 `docs/clients.md`「操作者怎么实测」）。** komo 是 OIDC 的接入方（授权码 + PKCE S256），身份提供方是操作者自己搭的（Pocket ID；不写死任何提供方，端点全按 `{issuer}/.well-known/openid-configuration` 发现）。配置在 `config.toml` 的 `[auth.oidc]`，客户端密钥放 `.env`：
 
@@ -1013,6 +1018,7 @@ allowed_emails = []                                 # 小写比较；提供方�
 - **ID token 校验**：算法只认 RS256 / ES256 / EdDSA（拒 `none` 与 HS*），验签用工作区已有的 `ring`，JWKS 按 `kid` 取、对不上时（密钥轮换）强制重取一次（间隔至少 60 秒）；再核 `iss`、`aud`（含 `azp`）、`exp` / `nbf`（容 60 秒）、`nonce`，最后核允许名单。token 响应缺邮箱而名单是邮箱时，补问 `userinfo_endpoint`（只认同一个 `sub`）。
 - **防登录 CSRF**：`/auth/login` 种的 `komo_oidc` cookie（HttpOnly、SameSite=Lax、仅 `/auth` 路径、10 分钟）必须与回调的 `state` 一致，state 用一次作废。
 - **设备令牌**：桌面端 / CLI 走「跳系统浏览器登录再跳回」——`GET /auth/device/authorize` → OIDC → 带一次性码 303 回 `redirect_uri` → `POST /auth/device/token` 换令牌。回跳白名单：`komo://auth/callback`（桌面端深链）与本机回环地址的任意端口；其余一律不发码。PKCE 保证码被别人截获也换不出令牌。令牌形如 `komodev_…`，Gateway 只存哈希。
+- **浏览器推送（Web Push，`docs/redesign.md` §1.8）**：`[push] enabled`（默认开）与 `subject`（VAPID `sub`，`mailto:` 或 `https:`；省略用 `[auth.oidc] public_url`，两个都没有就不发）。只推需要操作者看的：停住的运行往对话里问你、定时结果按 `notify` 投进对话（这两处都在 `say_in` 落下之后，判重挡掉的不推）、对话里不是操作者发起的那一轮（监听事件、任务交回触发）说的话；操作者自己发起的那一轮不推。负载 `{ title, body, url, tag? }`，`url` 是站内路径（主对话 `/`，支线 `/chats/<会话 id>`）。发送按 RFC 8291（`aes128gcm`）+ RFC 8292（VAPID，ES256），后台发、失败只记日志；推送服务回 404 / 410 删订阅。推送要求页面是 https。
 - **上游已删**：配对码（`komo web` 的配对链接、`POST /v1/web/pair-code`、`POST /v1/web/session`）整套删除，不留兼容；`state.db` 时代没有落盘的会话，所以存量的内存 cookie 在升级重启时本来就会失效，没有需要迁移的登录状态。
 
 创建会话、提交输入、介入答复、Cron 与 Memory 变更都支持幂等请求键；同一键对应不同内容则拒绝。创建会话的请求键与正文哈希持久保存，同键同内容重发返回原会话，同键不同内容返回 409 `request_key_conflict`，重启后仍有效。
@@ -1266,7 +1272,7 @@ komo-kernel    值类型、`durable/` 模块（entry / conversation / task / sub
 
 komo-store     `durable/`：`Line`（一条提交线，唯一写连接）、Turso `Storage` 实现、新库 DDL 与字节对等测试、
                `blob`（先写文件后提交引用）、`ids`（取号器与高水位）——**裸 `turso`，不经 toasty**；
-               `aux.db` 的 toasty 模型 + `*_TABLE_DDL` + 仓库（cron / 投递 / Memory / 登录状态 `auth_sessions`）、tool_output（输出存储）、
+               `aux.db` 的 toasty 模型 + `*_TABLE_DDL` + 仓库（cron / 投递 / Memory / 登录状态 `auth_sessions` / 推送订阅 `push_subscriptions`）、tool_output（输出存储）、
                session_dir（`SessionPaths` 与落盘小工具）、purge（回收前的引用检查与删目录）。
                唯一依赖 toasty/turso 的 crate。deps: kernel, toasty(turso only), turso, tokio(fs, sync)
 
@@ -1358,7 +1364,7 @@ durable 引擎（约 1.5 万行生产代码）与 harness 是汇聚点，没有�
 | `croner` | `default-features = false`（W2 确认无 chrono 时的时刻表达） | kernel 已有 `time`，不要第二套日期时间库；croner 4 默认特性拉进 chrono + derive_builder / darling / strum |
 | `grep` + `ignore` | `0.4`，`default-features = false`；komo-tools（`rg` 工具），`grep` 另有 komo-llm（上下文超长的报错匹配） | 内嵌 ripgrep 的搜索与遍历，不起子进程：外部 `rg` 要么没装、要么各家版本不同，而遍历规则（隐藏文件、`.gitignore`、覆盖 glob）本来就该用这套实现。默认特性集是空的，写出来是钉住两件事：**不开 `pcre2`**（"正则语法 = Rust regex"是对模型可见的契约）与不引 SIMD 的 `avx-accel`。带进来的 13 个包（`globset`、`walkdir`、`termcolor`、`crossbeam-deque`、`encoding_rs_io`、`memmap2`、`bstr` 等）全是纯 Rust、无 C 工具链，且没有新的重复版本（2026-09-21 对 `cargo tree -d` 核过） |
 | `jiff` | `0.2`，默认特性（系统 tzdb + 系统时区）；komo-runtime、komo-memory、komo-tools、komo-client、与 komo-gateway | runtime：cron 的 `ZoneResolver`（IANA 区名 → 偏移，§10）；memory 与 tools（codemode）：本地日期与时刻。client：CLI 的时刻一律印成本机墙钟 + 偏移（`2026-09-25 14:00:00 +08:00`），偏移按每个时刻各自取，夏令时两侧不同。gateway：目标/领域接口的本地日期；飞书插件：话题上下文里每条消息的 `HH:MM`（§11.3，本机时区）；不用 `time` 的 `local-offset`，它只能取"现在"的偏移，且在多线程进程里拒绝返回。kernel 仍只用 `time` |
-| `ring` | `0.17.14`，`default-features = false, features = ["alloc"]`；仅 komo-gateway | OIDC ID token 的验签（RS256 `RSA_PKCS1_2048_8192_SHA256` / ES256 / EdDSA），`ring::signature` 直接验 JWK 里的公钥，不引 JWT / OIDC 库（`jsonwebtoken`、`openidconnect` 都要另选密码后端或再拉一串依赖）。**已在依赖树里**：rustls 的 ring provider 拉进来的同一个包，Cargo.lock 只在 komo-gateway 的依赖列表里多一行，不新增包也不新增重复版本 |
+| `ring` | `0.17.14`，`default-features = false, features = ["alloc"]`；仅 komo-gateway | **Web Push（2026-11-14）也手写在它上面，不引 web-push crate**：RFC 8291 的 ECDH P-256（`agreement`）、HKDF-SHA256（`hkdf`）、AES-128-GCM（`aead`），RFC 8292 的 ES256 JWT（`ECDSA_P256_SHA256_FIXED_SIGNING`，签名正好是 JWT 要的 r‖s），无新依赖。OIDC ID token 的验签（RS256 `RSA_PKCS1_2048_8192_SHA256` / ES256 / EdDSA），`ring::signature` 直接验 JWK 里的公钥，不引 JWT / OIDC 库（`jsonwebtoken`、`openidconnect` 都要另选密码后端或再拉一串依赖）。**已在依赖树里**：rustls 的 ring provider 拉进来的同一个包，Cargo.lock 只在 komo-gateway 的依赖列表里多一行，不新增包也不新增重复版本 |
 | `base64` | `0.23.1`（工作区那份）；komo-gateway 新增直接依赖 | 解 JWT 的三段与 JWKS 的 `n` / `e` / `x` / `y`（base64url）；不新增包 |
 | `uuid` | 工作区特性加 `v4`（原有 `v7`、`serde`） | `komo-kernel::pkce::random_token` 用 `Uuid::new_v4` 取操作系统随机数拼 32 字节令牌（Gateway 的 `lock::random_token` 早就这么用，只是靠别的 crate 把 `v4` 带进来；kernel 单独编译时要自己声明）。不新增包 |
 | `arc-swap` | 默认；komo-config（`ConfigHolder`）与 komo-runtime（harness 钩子） | §3 热重载的唯一 `Arc<ConfigSnapshot>` 原子替换 |

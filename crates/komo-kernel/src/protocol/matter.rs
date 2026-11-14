@@ -102,6 +102,11 @@ pub struct MatterListResponse {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[cfg_attr(feature = "ts", ts(as = "Option<Vec<MatterSchedule>>"))]
     pub schedules: Vec<MatterSchedule>,
+    /// 此刻在等你的目标：目标 id → 问话所在的对话与介入句柄（形状同目标活动的 `waiting`）。没有在等的
+    /// 目标不出现；整张表为空时省略这个字段。
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    #[cfg_attr(feature = "ts", ts(as = "Option<std::collections::BTreeMap<String, ActivityWaiting>>"))]
+    pub waiting: std::collections::BTreeMap<String, ActivityWaiting>,
     #[serde(with = "iso_date")]
     #[cfg_attr(feature = "ts", ts(type = "string"))]
     pub today: Date,

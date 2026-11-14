@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 
 use komo_kernel::protocol::config::{
     CompactionConfig, ConfigSnapshot, ConsolidateConfig, ExecutionConfig, KeyPath, McpExposure,
-    McpServerConfig, McpTransport, MemoryConfig, OidcConfig, PathsConfig, RetrievalConfig, SourceFile,
+    McpServerConfig, McpTransport, MemoryConfig, OidcConfig, PathsConfig, PushConfig, RetrievalConfig, SourceFile,
     StartOnly, TypesafeConfig, DEFAULT_OIDC_SECRET_ENV,
 };
 use komo_kernel::types::agent::{AgentConfig, AgentProfile, MemoryMode};
@@ -36,6 +36,8 @@ pub(super) struct FileConfig {
     pub gateway: GatewaySection,
     #[serde(default)]
     pub web: WebSection,
+    #[serde(default)]
+    pub push: PushSection,
     #[serde(default)]
     pub auth: AuthSection,
     #[serde(default)]
@@ -135,6 +137,17 @@ impl OidcSection {
 pub(super) struct WebSection {
     /// 静态文件目录；相对路径按 `config.toml` 所在目录算。
     pub dir: Option<PathBuf>,
+    /// Gateway 是否托管网页；省略 = 托管。
+    pub serve: Option<bool>,
+}
+
+/// `[push]`：浏览器推送。
+#[derive(Debug, Default, Deserialize)]
+pub(super) struct PushSection {
+    /// 总开关；省略 = 开。
+    pub enabled: Option<bool>,
+    /// VAPID `sub`（`mailto:` 或 `https:`）；省略 = 用 `[auth.oidc] public_url`。
+    pub subject: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -645,6 +658,15 @@ pub(super) fn assemble(
             .map(|endpoint| endpoint.trim().to_string())
             .filter(|endpoint| !endpoint.is_empty()),
         oidc: file.auth.oidc.map(OidcSection::into_config),
+        web_serve: file.web.serve.unwrap_or(true),
+        push: PushConfig {
+            enabled: file.push.enabled.unwrap_or(true),
+            subject: file
+                .push
+                .subject
+                .map(|subject| subject.trim().to_string())
+                .filter(|subject| !subject.is_empty()),
+        },
     };
 
     let mcp = file

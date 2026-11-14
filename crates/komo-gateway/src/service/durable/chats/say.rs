@@ -18,13 +18,14 @@
 //! [`Said::Duplicate`]。判重靠已提交的 submission，所以重启后补投（介入清单回放、cron 看客重挂）不会重复；
 //! 键换了目标（例如绑定的支线变了）算新的一句。
 
-use komo_kernel::durable::Message;
+use komo_kernel::durable::{Message, SessionKind};
 use komo_runtime::durable::DurableError;
 use komo_runtime::durable::harness::inbox::Admitted;
 use komo_runtime::durable::harness::{SubmissionDraft, WriteDraft};
 use serde_json::{Map, Value, json};
 
 use super::super::DurableCore;
+use crate::push::PushMessage;
 use super::super::sessions::{SessionError, ensure_open};
 
 pub use komo_kernel::durable::legacy_events::MAIN_REPLY_ENTRY;
@@ -91,7 +92,10 @@ impl DurableCore {
         let storage = self.storage.clone();
         let harness = self.harness.clone();
         let id = session.to_owned();
-        self.engine
+        // 提交的闭包会把 `say` 搬走；推送要用的几样先留一份。
+        let announced = (say.source, say.text.clone(), say.key.clone());
+        let said = self
+            .engine
             .commit(move |tx| {
                 Box::pin(async move {
                     // 先读后写：会话行与按键找的已有 submission 都在第一次表写之前读。
@@ -144,6 +148,37 @@ impl DurableCore {
                     Ok(Ok(Said::Posted))
                 })
             })
-            .await?
+            .await??;
+        // 落下的才推：判重挡掉的（重启后补投）不会再响一次。
+        if said == Said::Posted {
+            self.push_say(session, announced).await;
+        }
+        Ok(said)
+    }
+
+    /// 这句话是要操作者看的（停住的提问、定时结果）：往订阅的设备推一条系统通知。后台发，失败不影响投递。
+    async fn push_say(&self, session: &str, (source, text, key): (SaySource, String, String)) {
+        let Some(state) = self.gateway() else { return };
+        let Ok(record) = self.session(session).await else {
+            return;
+        };
+        state.push.notify(PushMessage {
+            title: match source {
+                SaySource::Intervention => "Komo 在等你".to_owned(),
+                SaySource::Cron => "Komo 的定时任务".to_owned(),
+            },
+            body: text,
+            url: chat_url(&record),
+            tag: Some(key),
+        });
+    }
+}
+
+/// 一段对话在网页里的站内路径：主对话 `/`，支线 `/chats/<会话 id>`（`apps/client` 的路由）。
+pub(in crate::service::durable) fn chat_url(record: &komo_kernel::durable::SessionRecord) -> String {
+    if record.kind == SessionKind::Main {
+        "/".to_owned()
+    } else {
+        format!("/chats/{}", record.id)
     }
 }

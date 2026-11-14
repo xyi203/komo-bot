@@ -279,6 +279,35 @@ impl DurableCore {
         Ok(out)
     }
 
+    /// 每个目标此刻是否在等你（`GET /v1/matters` 的 `waiting`）：目标 id → 问话所在的对话与介入句柄。
+    /// 一个会话属于哪个目标的判断同目标活动（`carries_goal`：定时触发的会话、带着目标键的任务）；
+    /// 没有在等的目标不在表里，同一目标有几条留第一条。
+    pub async fn waiting_by_goal(
+        &self,
+        goals: &[komo_kernel::types::matter::Matter],
+    ) -> Result<std::collections::HashMap<String, ActivityWaiting>, SessionError> {
+        let asks = self.pending_asks().await?;
+        let mut out = std::collections::HashMap::new();
+        if asks.is_empty() {
+            return Ok(out);
+        }
+        for (session, waiting) in asks {
+            // 会话读不出来的不标（同 `pending_asks`：这只是个提示）。
+            let Ok(record) = self.session(&session).await else {
+                continue;
+            };
+            for goal in goals {
+                if out.contains_key(goal.id.as_str()) {
+                    continue;
+                }
+                if self.carries_goal(&record, &goal.id).await.unwrap_or(false) {
+                    out.insert(goal.id.as_str().to_owned(), waiting.clone());
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// 指向 `chat` 这段对话、还没答复的介入。
     pub async fn interventions_for_chat(
         &self,

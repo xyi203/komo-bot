@@ -985,7 +985,7 @@ TUI 显示“用了记忆”也不能代替这些验证。
 
 | 条目 | 状态 |
 |---|---|
-| C.3.1 confirm 不改 state | 仍在：`komo-store/src/repos/memory/mod.rs` 的 `confirm` 只写 `confirmation` 与 `updated_at` |
+| C.3.1 confirm 不改 state | **candidate 部分已修（2026-11-14，未编译验证）**：`confirm` 对 candidate 同时置 `state = active`，进召回；**contested 部分仍在**（双方没有记下彼此，要先加字段，见下），confirm 对它仍只写 `confirmation` 与 `updated_at` |
 | C.3.2 candidate 按独立证据晋升 | 未实现：测试 `extracting_the_same_claim_again_never_promotes_a_candidate` 钉的仍是"不晋升" |
 | C.3.3 子进程不带 KOMO_HOME | 已修（2026-10-28）：`BashTool::with_komo_home` 注入 Gateway 的实际数据目录，测试 `the_child_gets_the_gateways_data_dir_as_komo_home` |
 | C.3.4 contested 主动触达 | 未实现 |

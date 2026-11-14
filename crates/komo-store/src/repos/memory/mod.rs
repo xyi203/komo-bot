@@ -200,12 +200,25 @@ impl MemoryRepo for TursoMemoryRepo {
                     let mut row = require_revision(ex, &id, expected_revision).await?;
                     // 操作者确认绑定具体 id / revision；模型返回的 user_confirmed 字段
                     // 没有写入权限（§9.2、§9.6）——它进不到这条路径上来。
-                    row.update()
-                        .confirmation("user_confirmed")
-                        .updated_at(to_ts(at))
-                        .exec(ex)
-                        .await
-                        .map_err(map_toasty)?;
+                    // 候选（模型推断、证据不够硬）被操作者确认就转成生效，才会进召回
+                    // （`is_recallable` 只放行 Active，附录 C.3.1）。contested 不在这里处理：它要同时
+                    // 把对端标成 superseded，而双方没有记下彼此，要先加字段。
+                    if row.state == enum_str(&MemoryState::Candidate) {
+                        row.update()
+                            .confirmation("user_confirmed")
+                            .state(enum_str(&MemoryState::Active))
+                            .updated_at(to_ts(at))
+                            .exec(ex)
+                            .await
+                            .map_err(map_toasty)?;
+                    } else {
+                        row.update()
+                            .confirmation("user_confirmed")
+                            .updated_at(to_ts(at))
+                            .exec(ex)
+                            .await
+                            .map_err(map_toasty)?;
+                    }
                     Ok(load_item(ex, &id).await?.expect("刚刚还在"))
                 }) as BoxFuture<'_, Result<MemoryItem, StoreError>>
             })

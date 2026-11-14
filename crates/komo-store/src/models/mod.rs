@@ -26,6 +26,7 @@ pub mod memory_index_generation;
 pub mod memory_item;
 pub mod memory_terms;
 pub mod memory_vector;
+pub mod push_subscription;
 pub mod session_kind;
 
 pub use auth_session::AuthSessionRow;
@@ -38,6 +39,7 @@ pub use memory_index_generation::MemoryIndexGenerationRow;
 pub use memory_item::MemoryItemRow;
 pub use memory_terms::MemoryTermsRow;
 pub use memory_vector::MemoryVectorRow;
+pub use push_subscription::PushSubscriptionRow;
 pub use session_kind::SessionKind;
 
 /// 一列在 `ALTER TABLE ADD COLUMN` 里的写法，以及补完之后要跑的回填。
@@ -93,7 +95,7 @@ pub struct TableSpec {
     pub columns: &'static [ColumnSpec],
 }
 
-/// `aux.db` 里的全部表，按建表顺序：cron、投递、记忆、事项、登录状态。
+/// `aux.db` 里的全部表，按建表顺序：cron、投递、记忆、事项、登录状态、推送订阅。
 ///
 /// 会话 / run / 工具调用 / 检查点 / 控制 outbox 那几张旧表随旧存储删除（会话与提交在
 /// `durable.db`，`komo-store::durable`）；老用户目录里的 `state.db` 不再被打开。
@@ -108,6 +110,7 @@ pub const TABLES: &[TableSpec] = &[
     memory_index_generation::SPEC,
     matter::SPEC,
     auth_session::SPEC,
+    push_subscription::SPEC,
 ];
 
 /// 索引由 store 自己建（见模块头），新文件与旧文件走同一条路。
@@ -115,6 +118,7 @@ pub const INDEXES: &[&str] = &[
     r#"CREATE INDEX IF NOT EXISTS "deliveries_state" ON "deliveries" ("state")"#,
     r#"CREATE INDEX IF NOT EXISTS "cron_firings_job" ON "cron_firings" ("job_id", "scheduled_at")"#,
     r#"CREATE UNIQUE INDEX IF NOT EXISTS "auth_sessions_token" ON "auth_sessions" ("token_hash")"#,
+    r#"CREATE UNIQUE INDEX IF NOT EXISTS "push_subscriptions_endpoint" ON "push_subscriptions" ("endpoint")"#,
     r#"CREATE INDEX IF NOT EXISTS "matters_next_run" ON "matters" ("next_run_at")"#,
     r#"CREATE INDEX IF NOT EXISTS "memory_evidence_memory" ON "memory_evidence" ("memory_id")"#,
     r#"CREATE INDEX IF NOT EXISTS "memory_vectors_memory" ON "memory_vectors" ("memory_id", "generation")"#,
@@ -133,6 +137,7 @@ pub fn model_set() -> toasty::ModelSet {
         MemoryIndexGenerationRow,
         MatterRow,
         AuthSessionRow,
+        PushSubscriptionRow,
     )
 }
 

@@ -47,9 +47,18 @@ pub async fn list(
         .await
         .map_err(failure)?;
     let schedules = schedule::schedules_of(&api, &matters).await?;
+    // 在等你的目标（P16）：读不出来不拖垮列表，只是这一回不标。
+    let waiting = match api.state.core()?.waiting_by_goal(&matters).await {
+        Ok(waiting) => waiting.into_iter().collect(),
+        Err(error) => {
+            tracing::warn!(%error, "目标列表的「在等你」没算出来");
+            Default::default()
+        }
+    };
     Ok(Json(MatterListResponse {
         matters,
         schedules,
+        waiting,
         today: today(&api),
     }))
 }

@@ -17,6 +17,7 @@ use rmcp::transport::auth::{
     AuthError, AuthorizationManager, AuthorizationRequest, AuthorizationSession, CredentialStore,
     StoredCredentials,
 };
+pub use rmcp::transport::auth::AuthorizationSession as WebAuthorizationSession;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
@@ -121,6 +122,40 @@ pub async fn authorized_manager(
     Ok(manager.initialize_from_store().await?.then_some(manager))
 }
 
+/// 发现授权服务器 → 动态注册 → 备好一次授权会话（含授权地址）。本机命令行（回调听本机随机端口）与
+/// Gateway 的网页登录（回调是 `<public_url>/v1/mcp/<name>/oauth/callback`）共用；之后拿浏览器带回来的
+/// 回调地址调 [`AuthorizationSession::handle_callback_url`] 换 token，token 经 `path` 的凭证文件落盘。
+pub async fn begin_session(
+    url: &str,
+    path: &Path,
+    redirect_uri: &str,
+) -> Result<AuthorizationSession, McpAuthError> {
+    let mut manager = AuthorizationManager::new(url).await?;
+    manager.set_credential_store(FileCredentialStore::new(path));
+    let resolution = manager.resolve_metadata().await?;
+    manager.set_metadata(resolution.metadata);
+    AuthorizationSession::new(
+        manager,
+        AuthorizationRequest::new(redirect_uri).with_client_name("komo"),
+    )
+    .await
+    .map_err(|(_manager, error)| McpAuthError::from(error))
+}
+
+/// 拿浏览器带回来的完整回调地址（含 `code` 与 `state`）换 token，经凭证文件落盘。
+pub async fn complete_session(
+    session: &AuthorizationSession,
+    callback_url: &str,
+) -> Result<(), McpAuthError> {
+    session.handle_callback_url(callback_url).await?;
+    Ok(())
+}
+
+/// 授权地址里的 `state`（CSRF 令牌）：网页登录用它把回调对回等着的那次会话。
+pub fn authorization_state(auth_url: &str) -> Option<String> {
+    query_value(auth_url, "state")
+}
+
 /// `komo auth mcp login <name>`：发现授权服务器 → 动态注册 → 打开浏览器 → 等本机回调 →
 /// 换 token → 落盘。`out` 只打提示，token 只经凭证文件。
 pub async fn login(
@@ -137,16 +172,7 @@ pub async fn login(
         .port();
     let redirect_uri = format!("http://127.0.0.1:{port}/callback");
 
-    let mut manager = AuthorizationManager::new(url).await?;
-    manager.set_credential_store(FileCredentialStore::new(path));
-    let resolution = manager.resolve_metadata().await?;
-    manager.set_metadata(resolution.metadata);
-    let session = AuthorizationSession::new(
-        manager,
-        AuthorizationRequest::new(&redirect_uri).with_client_name("komo"),
-    )
-    .await
-    .map_err(|(_manager, error)| error)?;
+    let session = begin_session(url, path, &redirect_uri).await?;
 
     let auth_url = session.get_authorization_url();
     writeln!(

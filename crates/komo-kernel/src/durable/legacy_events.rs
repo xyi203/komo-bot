@@ -432,6 +432,13 @@ impl Projection {
                     .to_owned(),
             })
         });
+        // 停住的运行投进对话的那句话（`chats::say`，`data.source = "intervention"`）：带上介入的句柄，
+        // 网页在这句话下面放答复按钮。
+        let intervention = data
+            .filter(|data| data.get("source").and_then(Value::as_str) == Some("intervention"))
+            .and_then(|data| data.get("handle"))
+            .and_then(Value::as_str)
+            .map(str::to_owned);
         frame.emit(
             out,
             0,
@@ -440,6 +447,7 @@ impl Projection {
                 text: text.to_owned(),
                 origin,
                 task,
+                intervention,
             }),
         );
     }

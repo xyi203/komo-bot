@@ -113,6 +113,17 @@
   "changes_verb_added": "Created",
   "changes_verb_deleted": "Deleted",
   "changes_verb_edited": "Edited",
+  "chat_name_main": "Komo",
+  "chats_branches": "Side chats",
+  "chats_empty_body": "Side chats are optional. Use one to keep a topic apart from the main chat.",
+  "chats_empty_title": "Start a side chat",
+  "chats_error": "Couldn't load chats: {message}",
+  "chats_main": "Main chat",
+  "chats_new": "New side chat",
+  "chats_no_message": "No messages yet",
+  "chats_running": "Working",
+  "chats_title": "Chats",
+  "chats_waiting": "Waiting for your reply",
   "close": "Close",
   "composer_archived": "This session is archived and read-only",
   "composer_attach": "Add images or files",
@@ -211,11 +222,7 @@
   "config_unit_bytes": "bytes",
   "config_unit_mins": "min",
   "config_unit_secs": "sec",
-  "conn_connecting": "Connecting to Gateway",
   "conn_down": "Cannot reach the Gateway",
-  "conn_label_down": "Gateway not connected",
-  "conn_label_ok": "Gateway connected",
-  "conn_ok": "Gateway {version} · connected",
   "conn_retrying": "Event stream dropped, reconnecting",
   "controls_save": "Save",
   "controls_saving": "Saving",
@@ -304,15 +311,6 @@
   "cron_weekly": "Every {days} at {time}",
   "cron_what": "What it runs",
   "cron_when": "When",
-  "ctx_free": "Free",
-  "ctx_memory": "Memory",
-  "ctx_messages": "Messages",
-  "ctx_project": "Project rules",
-  "ctx_results": "Tool results",
-  "ctx_skills": "Skills list",
-  "ctx_summary": "Compaction summary",
-  "ctx_system": "System prompt",
-  "ctx_tools": "Tool definitions",
   "dismiss": "Dismiss",
   "duration_h_m": "{h}h {m}m",
   "duration_m_s": "{m}m {s}s",
@@ -377,59 +375,7 @@
   "gateway_unreachable": "Unreachable",
   "gateway_version": "Version",
   "gateway_version_value": "{version} · protocol {protocol}",
-  "group_all": "All sessions",
-  "group_archived": "Archived",
-  "group_flat_active": "Sessions",
-  "group_recent": "Recent",
   "home_error": "Could not load the home session: {message}",
-  "inbox_abandon_ask": "This Run stops here and will not continue.",
-  "inbox_abandon_sure": "Yes, stop here",
-  "inbox_answer_error": "Could not answer: {message}",
-  "inbox_answered": "Answered",
-  "inbox_back": "Back to the list",
-  "inbox_detail": "Details",
-  "inbox_empty": "No Runs are stopped right now.",
-  "inbox_explain_blocked": "A file or session it depends on is gone: fix that and let it re-evaluate, or stop here.",
-  "inbox_explain_confirm": "A Run started by a cron job, monitor or background task waits here when it wants to call a tool declared outward (sending a message, filing a ticket) until you run it or not.",
-  "inbox_explain_hint": "These cards only show up here and in komo intervention list.",
-  "inbox_explain_title": "What stops here",
-  "inbox_explain_verify": "The Gateway restarted halfway through a call and nobody knows whether it took effect: check, then tell it “already as intended” or “definitely not performed”.",
-  "inbox_finding": [
-    {
-      "declarations": [
-        "input count",
-        "local countPlural = count: plural"
-      ],
-      "selectors": [
-        "countPlural"
-      ],
-      "match": {
-        "countPlural=one": "{count} item is waiting for your answer; until you answer, its Run stays stopped.",
-        "countPlural=other": "{count} items are waiting for your answer; until you answer, their Runs stay stopped."
-      }
-    }
-  ],
-  "inbox_finding_error": "Could not load the inbox.",
-  "inbox_finding_none": "Nothing is waiting for you.",
-  "inbox_hint": "Your answer applies to this one time only; there is no “always allow”.",
-  "inbox_kind_blocked": "Precondition gone",
-  "inbox_kind_confirm": "Outward tool call",
-  "inbox_kind_verify": "Outcome unclear, needs checking",
-  "inbox_kind_verify_short": "Outcome unclear",
-  "inbox_kv_handle": "Handle",
-  "inbox_kv_session": "Session",
-  "inbox_kv_stopped": "Stopped",
-  "inbox_list": "Inbox list",
-  "inbox_load_error": "Could not load: {message}.",
-  "inbox_none_to_answer": "Nothing to answer.",
-  "inbox_pick": "Pick one to answer it.",
-  "inbox_session_gone": "Session is no longer listed",
-  "inbox_verdict_abandon": "Stop here",
-  "inbox_verdict_approve": "Run it",
-  "inbox_verdict_not_performed": "Not performed, replay it",
-  "inbox_verdict_reject": "Don't run it",
-  "inbox_verdict_resolve": "Handled, re-evaluate",
-  "inbox_verdict_satisfied": "Already as intended, continue",
   "language_en": "English",
   "language_label": "Language",
   "language_zh_cn": "中文",
@@ -629,9 +575,6 @@
   "matter_save": "Save",
   "matter_show_all": "Show all {count}",
   "matter_show_less": "Show less",
-  "matter_state_active": "Active",
-  "matter_state_parked": "Parked",
-  "matter_state_waiting": "Waiting",
   "matter_status_active": "In progress",
   "matter_status_done": "Done",
   "matter_status_dropped": "Dropped",
@@ -990,14 +933,14 @@
   "models_timeout_ph": "Default 120",
   "models_window": "Context window",
   "models_window_ph": "Ask provider",
-  "nav_close": "Close navigation",
+  "nav_chats": "Chats",
+  "nav_chats_waiting": "Chats, {count} waiting for you",
   "nav_cron": "Cron",
-  "nav_inbox": "Inbox",
-  "nav_label": "Navigation and sessions",
+  "nav_goals": "Goals",
+  "nav_label": "Navigation",
   "nav_matters": "Matters",
   "nav_memory": "Memory",
   "nav_new_session": "New chat",
-  "nav_open": "Open navigation",
   "nav_search": "Search",
   "nav_settings": "Settings",
   "pair_failed": "Pairing failed: {message}",
@@ -1034,91 +977,6 @@
   "palette_type_memory": "Memories",
   "palette_type_session": "Sessions",
   "palette_types": "Type",
-  "panel_bg": "In the background",
-  "panel_bg_command": "Background command",
-  "panel_bg_done": "Finished · {when}",
-  "panel_bg_elapsed": "Running for {time}",
-  "panel_bg_ended": "Ended ({reason})",
-  "panel_bg_empty": "Nothing from this conversation has run in the background.",
-  "panel_bg_monitor": "Monitor",
-  "panel_bg_running": [
-    {
-      "declarations": [
-        "input count",
-        "local countPlural = count: plural"
-      ],
-      "selectors": [
-        "countPlural"
-      ],
-      "match": {
-        "countPlural=one": "{count} running",
-        "countPlural=other": "{count} running"
-      }
-    }
-  ],
-  "panel_conn": "Connection",
-  "panel_conn_bad": "Problem",
-  "panel_conn_gateway": "Gateway {version}",
-  "panel_conn_note": "MCP connection status is not wired up here yet.",
-  "panel_conn_ok": "OK",
-  "panel_conn_started": "Started {when}",
-  "panel_conn_telemetry": "Telemetry",
-  "panel_conn_telemetry_error": "Error: {message}",
-  "panel_conn_telemetry_off": "Not configured",
-  "panel_conn_telemetry_ok": "OK, last export {when}",
-  "panel_context": "Context",
-  "panel_context_none": "This conversation has not called the model yet.",
-  "panel_context_note": "The total is the tokens reported by the last request; items are estimated from bytes and scaled to match the total.",
-  "panel_context_of": "{used} / {win}",
-  "panel_context_tree_error": "The session tree could not be loaded, so the breakdown is unavailable.",
-  "panel_context_tree_loading": "Reading the session tree.",
-  "panel_context_used": "{pct} used",
-  "panel_failed": "Could not load: {message}",
-  "panel_loading_session": "Reading this conversation.",
-  "panel_matter_next": "Next: {what}",
-  "panel_matter_standard": "Standard: {what}",
-  "panel_matter_waiting": "Waiting for {what}",
-  "panel_matters": "In progress",
-  "panel_matters_all": "All matters",
-  "panel_matters_empty": "No active goals or areas in care.",
-  "panel_memory": "Memories in use",
-  "panel_memory_all": [
-    {
-      "declarations": [
-        "input count",
-        "local countPlural = count: plural"
-      ],
-      "selectors": [
-        "countPlural"
-      ],
-      "match": {
-        "countPlural=one": "All {count} active memory",
-        "countPlural=other": "All {count} active memories"
-      }
-    }
-  ],
-  "panel_memory_convention": "Convention",
-  "panel_memory_detail": [
-    {
-      "declarations": [
-        "input count",
-        "local countPlural = count: plural"
-      ],
-      "selectors": [
-        "countPlural"
-      ],
-      "match": {
-        "countPlural=one": "{kind} · used {count} time · v{revision}",
-        "countPlural=other": "{kind} · used {count} times · v{revision}"
-      }
-    }
-  ],
-  "panel_memory_empty": "No memories were brought into the latest turn.",
-  "panel_memory_gone": "No longer in the library",
-  "panel_memory_reference": "Reference",
-  "panel_show_less": "Show less",
-  "panel_show_more": "Show more",
-  "panel_title": "This session",
   "recall_brought": "Brought {parts}",
   "recall_conventions": [
     {
@@ -1155,83 +1013,10 @@
   "retry": "Retry",
   "send_failed": "Not sent: {message}",
   "send_sending": "Sending",
-  "session_archive": "Archive",
-  "session_archive_body": "An archived session is read-only: you can't send messages, and anything still running finishes first.",
-  "session_delete": "Delete",
-  "session_delete_body": "Anything still running is stopped first, then this session's content is deleted permanently. This can't be undone.",
-  "session_delete_body_archived": "This session's content is deleted permanently. This can't be undone.",
-  "session_error_create": "Could not create the session: {message}",
-  "session_error_fork": "Could not fork the session: {message}",
-  "session_error_rename": "Could not rename the session: {message}",
-  "session_fork": "Fork",
   "session_kind_main": "Home",
   "session_load_error": "Could not load this session: {message}",
-  "session_menu_more": "More actions for {title}",
-  "session_rename": "Rename",
-  "session_rename_hint": "{title} (click to rename)",
-  "session_rename_label": "Session name",
-  "session_state_running": "Running",
-  "session_state_waiting": "Waiting",
-  "session_tag_archived": "Archived",
-  "session_tag_draft": "Draft",
-  "session_tag_task": "Task",
   "session_untitled": "New session",
-  "sessions_collapse": "Show less",
-  "sessions_error": "Could not load sessions: {message}",
-  "sessions_kids": [
-    {
-      "declarations": [
-        "input count",
-        "local countPlural = count: plural"
-      ],
-      "selectors": [
-        "countPlural"
-      ],
-      "match": {
-        "countPlural=one": "{count} task",
-        "countPlural=other": "{count} tasks"
-      }
-    }
-  ],
-  "sessions_kids_collapse": [
-    {
-      "declarations": [
-        "input count",
-        "local countPlural = count: plural"
-      ],
-      "selectors": [
-        "countPlural"
-      ],
-      "match": {
-        "countPlural=one": "Collapse {count} task",
-        "countPlural=other": "Collapse {count} tasks"
-      }
-    }
-  ],
-  "sessions_kids_expand": [
-    {
-      "declarations": [
-        "input count",
-        "local countPlural = count: plural"
-      ],
-      "selectors": [
-        "countPlural"
-      ],
-      "match": {
-        "countPlural=one": "Expand {count} task",
-        "countPlural=other": "Expand {count} tasks"
-      }
-    }
-  ],
-  "sessions_kids_live": "{count} running",
-  "sessions_load_more": "Load older sessions",
   "sessions_loading": "Loading sessions…",
-  "sessions_loading_more": "Loading…",
-  "sessions_none_active": "No active sessions.",
-  "sessions_none_all": "No sessions yet.",
-  "sessions_none_archived": "No archived sessions.",
-  "sessions_show_all": "Show all {count}",
-  "sessions_title": "Sessions",
   "settings_close": "Close settings",
   "settings_nav": "Settings sections",
   "settings_sec_config": "Configuration",
@@ -1262,9 +1047,6 @@
       }
     }
   ],
-  "tab_changes": "Changes",
-  "tab_chat": "Chat",
-  "tab_trace": "Trace",
   "thread_compacted": "The context was compacted here",
   "thread_empty": "This session hasn't started yet.",
   "thread_empty_hint": "Say the first thing below.",
@@ -1277,10 +1059,6 @@
   "tool_rg": "Search file contents",
   "tool_task": "Create sub-agent",
   "tool_write": "Write",
-  "topbar_fork": "Fork this session",
-  "topbar_panel_close": "Hide side panel",
-  "topbar_panel_open": "Show side panel",
-  "topbar_tabs": "How to view this session",
   "trace_assistant_message": "Assistant message",
   "trace_calls_collapse": "Collapse this step's tool calls",
   "trace_calls_expand": "Expand this step's tool calls",
@@ -1450,20 +1228,6 @@
   "turn_spent_suffix": " after {time}",
   "unauthorized_body": "Run komo web in a terminal; it opens a one-time link that pairs this browser.",
   "unauthorized_title": "This browser is not paired yet",
-  "view_filter": "Filter sessions",
-  "view_filter_active": "Hide archived",
-  "view_filter_all": "All sessions (show archived)",
-  "view_filter_archived": "Archived only",
-  "view_group": "Group by",
-  "view_group_flat": "Single list",
-  "view_group_tree": "Session tree",
-  "view_group_workdir": "Working directory",
-  "view_menu": "Group, sort and filter",
-  "view_sort": "Sort by",
-  "view_sort_created": "Recently created",
-  "view_sort_updated": "Recently updated",
-  "workdir_default": "Default directory",
-  "workdir_new": "New session in {name}",
   "browser_title": "Browser",
   "browser_open": "Open browser",
   "browser_close": "Close browser",
@@ -1497,5 +1261,13 @@
   "conn_testing": "Testing…",
   "conn_save": "Test and save",
   "conn_test": "Test only",
-  "models_preset_change": "Change"
+  "models_preset_change": "Change",
+  "verdict_abandon": "Give up",
+  "verdict_abandon_sure": "Confirm give up",
+  "verdict_approve": "Approve",
+  "verdict_error": "Couldn't send the answer: {message}",
+  "verdict_not_performed": "Not done",
+  "verdict_reject": "Reject",
+  "verdict_resolve": "Fixed it, look again",
+  "verdict_satisfied": "Already done"
 }

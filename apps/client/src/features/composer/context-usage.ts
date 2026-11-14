@@ -2,7 +2,7 @@ import type { SessionTree, TreeEntry, TreeMessage } from "@komo/api";
 import type { ModelMenuEntry } from "@komo/protocol";
 import type { View } from "@/features/conversation/model";
 
-// 上下文构成（docs/web.md §6）。原料来自会话树（GET /v1/sessions/{id}/tree）：沿 leafId 取当前分支，压缩过就只算
+// 上下文构成：输入框的上下文环用它（原来右栏的「上下文」卡随右栏删了，docs/web.md §5）。原料来自会话树（GET /v1/sessions/{id}/tree）：沿 leafId 取当前分支，压缩过就只算
 // 保留下来的部分；系统提示的各段与工具定义取路径上最新的 komo.system；衰减过的工具结果按 context_edit 的替换视图算。
 // 各项按字节 / 4 估（komo 自己的窗口保护也这样估），再按上一次请求实报的 input_tokens 等比校准，
 // 所以合计是实测、各项比例是估算。

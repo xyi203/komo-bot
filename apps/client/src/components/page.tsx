@@ -1,9 +1,8 @@
 import type { ReactNode } from "react";
-import { NavToggle } from "@/features/layout/nav-toggle";
 import { cn } from "@/lib/utils";
 import { m } from "@/paraglide/messages.js";
 
-/** 整页的外框与页头（待处理、事项、记忆、定时共用）：窄屏（≤900）"打开导航"按钮单占一行。 */
+/** 整页的外框与页头（事项、记忆、定时共用）。 */
 export function Page({
   title,
   finding,
@@ -21,9 +20,6 @@ export function Page({
   return (
     <section aria-label={title} className="px-8 pt-7 pb-10 max-[600px]:px-4 max-[600px]:pt-4 max-[600px]:pb-8">
       <header hidden={bare} className="mb-5 grid grid-cols-[minmax(0,1fr)_auto] items-start gap-x-3">
-        <div className="col-span-full -mt-3 -ml-2 empty:hidden">
-          <NavToggle />
-        </div>
         <div className="min-w-0">
           <h1 className="text-page-title font-semibold tracking-tight">{title}</h1>
           {finding && <p className="mt-0.5 text-read text-muted">{finding}</p>}

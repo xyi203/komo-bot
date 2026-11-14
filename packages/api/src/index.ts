@@ -5,15 +5,16 @@ export { keys } from "./keys";
 export { uuid } from "./uuid";
 export { subscribeSession, type StreamState, type SubscribeOptions } from "./sse";
 export {
+  fetchChats,
   fetchHealth,
   fetchSessionPage,
   fetchSessions,
   redeemPairCode,
   SESSION_PAGE,
   sessionUnfinished,
+  useChats,
   useHealth,
   useHomeSession,
-  useInboxCount,
   useInterventions,
   useModels,
   useRunDiff,

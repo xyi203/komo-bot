@@ -4,7 +4,7 @@ import { Icon } from "@/components/icon";
 import { ImageZoom } from "@/components/image-zoom";
 import { Spinner } from "@/components/spinner";
 import type { View } from "@/features/conversation/model";
-import { pctOf, pctText, type ContextView } from "@/features/panel/context-usage";
+import { pctOf, pctText, type ContextView } from "./context-usage";
 import { formatTokens } from "@/lib/format";
 import { showToast } from "@/lib/toast";
 import { cn } from "@/lib/utils";

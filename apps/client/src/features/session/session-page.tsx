@@ -1,330 +1,136 @@
-import { useHomeSession, useMemoryIndex, useModels, useSessionChanges, useSessionEvents, useSessions, useSessionTree } from "@komo/api";
-import type { RunChanges } from "@komo/protocol";
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useChats, useInterventions, useMemoryIndex, useModels, useSessionEvents, useSessions, useSessionTree } from "@komo/api";
+import type { InterventionSummary } from "@komo/protocol";
+import { useEffect, useLayoutEffect, useMemo, useRef } from "react";
 import { IconButton } from "@/components/ui/icon-button";
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { Tooltip } from "@/components/ui/tooltip";
-import { ChangesPage } from "@/features/changes/changes-page";
+import { BrowserPane, desktopBrowser, useBrowserOpen } from "@/features/browser/browser-pane";
+import { contextView } from "@/features/composer/context-usage";
 import { Composer } from "@/features/composer/composer";
 import { useSend } from "@/features/composer/use-send";
-import { ConversationProvider } from "@/features/conversation/context";
+import { ConversationProvider, type ConversationContext } from "@/features/conversation/context";
 import { foldEvents } from "@/features/conversation/model";
 import { Thread } from "@/features/conversation/thread";
-import { NavToggle } from "@/features/layout/nav-toggle";
-import { BrowserPane, desktopBrowser, useBrowserOpen } from "@/features/browser/browser-pane";
-import { PanelShell, usePanel } from "@/features/layout/panel";
-import { contextView } from "@/features/panel/context-usage";
-import { PanelContent } from "@/features/panel/panel-content";
-import { useSessionActions } from "@/features/sessions/actions";
 import { isArchived, isLive } from "@/features/sessions/model";
 import { sessionTitle } from "@/features/sessions/title";
-import { SessionTitle } from "./session-title";
-import { useTraceUi } from "@/features/trace/state";
-import { TraceView } from "@/features/trace/trace-view";
 import { errorText } from "@/lib/errors";
 import { setStreamStatus } from "@/lib/stream-status";
 import { cn } from "@/lib/utils";
 import { m } from "@/paraglide/messages.js";
+import { ChatLayout, SkeletonThread } from "./chat-layout";
 
-type Tab = "chat" | "trace" | "changes";
-
-// 切到改动页的快捷键：⇧⌘D（Windows / Linux 上 Ctrl+Shift+D）
-const isMac = typeof navigator !== "undefined" && /Mac|iPhone|iPad/.test(navigator.platform);
-const CHANGES_SHORTCUT = isMac ? "⇧⌘D" : "Ctrl+Shift+D";
+// 过程面板（步骤、改动、轨迹）下一步接上：在那之前对话里不显示每轮的改动卡片，也没有"查看"按钮。
+const NO_CHANGES: ConversationContext["changes"] = new Map();
+const NO_REVIEW = () => {};
+const NO_INTERVENTIONS: readonly InterventionSummary[] = [];
 
 /**
- * 一个会话的页面（docs/web.md §2–§4）：顶栏（标题、对话 / 轨迹、右上角改动 / 分叉 / 右栏开关），中间是当前标签页，
- * 下面是发送框，右边是右栏。标签页的选择跨会话保留（只在这一层记）；其余状态换会话就清掉（`key`）。
+ * 一段对话的页面（docs/web.md §2–§4）：`/` 是主对话，`/chats/$id` 是支线。顶上居中的头像与名字，中间是按 Run 排下来的正文，
+ * 下面是输入框。换对话就整页重挂（`key`），状态清掉。
  */
-export function SessionPage({ sessionId }: { sessionId: string }) {
-  const [tab, setTab] = useState<Tab>("chat");
-  return <SessionBody key={sessionId} sessionId={sessionId} tab={tab} setTab={setTab} />;
+export function SessionPage({ sessionId, main }: { sessionId: string; main: boolean }) {
+  return <SessionBody key={sessionId} sessionId={sessionId} main={main} />;
 }
 
-function SessionBody({ sessionId, tab, setTab }: { sessionId: string; tab: Tab; setTab: (tab: Tab) => void }) {
+function SessionBody({ sessionId, main }: { sessionId: string; main: boolean }) {
   const sessions = useSessions(true);
-  const home = useHomeSession();
+  const chats = useChats();
   const memories = useMemoryIndex();
+  const pendingInterventions = useInterventions();
   const { events, status, error, delta, stream, reload } = useSessionEvents(sessionId);
   const tree = useSessionTree(sessionId);
   const models = useModels();
-  const changesQuery = useSessionChanges(sessionId);
-  const actions = useSessionActions();
-  const panel = usePanel();
   const browserApi = desktopBrowser();
   const [browserOpen, setBrowserOpen] = useBrowserOpen();
   const showBrowser = !!browserApi && browserOpen;
-  const trace = useTraceUi();
 
   const summary = sessions.data?.find((s) => s.session === sessionId);
   const archived = !!summary && isArchived(summary);
   const view = useMemo(() => (events ? foldEvents(events) : undefined), [events]);
   const { pending, send, retry, stop } = useSend(sessionId, events, view?.runs ?? new Map());
-  // 输入框的上下文环与右栏"上下文"是同一个数
   const context = useMemo(() => contextView(view, tree.data, models.data), [view, tree.data, models.data]);
   const kids = useMemo(() => (sessions.data ?? []).filter((s) => s.kind === "task" && s.home === sessionId && isLive(s)), [sessions.data, sessionId]);
 
-  // 连接状态给侧栏看；标题给浏览器标签
+  const chatRows = chats.data?.chats;
+  const name = main ? m.chat_name_main() : (chatRows?.find((chat) => chat.id === sessionId)?.title || sessionTitle(summary));
+  // 连接状态给图标栏看；名字给浏览器标签
   useEffect(() => {
     setStreamStatus(stream);
     return () => setStreamStatus("idle");
   }, [stream]);
-  const title = sessionTitle(summary);
   useEffect(() => {
-    document.title = `${summary ? title : m.app_name()} · ${m.app_name()}`;
-  }, [summary, title]);
+    document.title = `${name} · ${m.app_name()}`;
+  }, [name]);
 
-  // 每轮改动
-  const changes = useMemo(() => new Map((changesQuery.data?.runs ?? []).map((r): [string, RunChanges] => [r.run, r])), [changesQuery.data]);
-  const turnNumbers = useMemo(() => {
-    const numbers = new Map<string, number>();
-    let n = 0;
-    for (const item of view?.items ?? []) if (item.kind === "turn") numbers.set(item.run, ++n);
-    return numbers;
-  }, [view]);
-  const changeRuns = useMemo(
-    () => [...changes.values()].sort((a, b) => (turnNumbers.get(b.run) ?? 0) - (turnNumbers.get(a.run) ?? 0)),
-    [changes, turnNumbers],
+  // 全部未答复的介入：投进对话的提问按句柄认领自己那条（`ReplyView`）
+  const interventions = pendingInterventions.data?.interventions ?? NO_INTERVENTIONS;
+  const conversation = useMemo<ConversationContext>(
+    () => ({ memories, changes: NO_CHANGES, review: NO_REVIEW, interventions }),
+    [memories, interventions],
   );
-  const changedFiles = useMemo(() => new Set(changeRuns.flatMap((c) => c.files.map((f) => f.path))).size, [changeRuns]);
-  const [openFiles, setOpenFiles] = useState<Record<string, boolean>>({});
-  const [reviewAt, setReviewAt] = useState<string | null>(null);
 
-  const inspect = useCallback(
-    (resultEvent: string) => {
-      setTab("trace");
-      trace.setRange(null);
-      trace.select(resultEvent, true);
-      requestAnimationFrame(() => requestAnimationFrame(() => document.getElementById(`tr-${resultEvent}`)?.scrollIntoView({ block: "center" })));
-    },
-    [setTab, trace],
-  );
-  const review = useCallback(
-    (run: string, index: number) => {
-      setOpenFiles((previous) => ({ ...previous, [`${run}:${index}`]: true }));
-      trace.select(null);
-      setReviewAt(`cg-${run}-${index}`);
-      setTab("changes");
-    },
-    [setTab, trace],
-  );
-  const conversation = useMemo(() => ({ memories, changes, inspect, review }), [memories, changes, inspect, review]);
-
-  // 滚动：对话在底部时跟着长；切回对话落到底；改动页从顶开始
+  // 滚动：对话在底部时跟着长；第一次出内容落到底
   const scroller = useRef<HTMLDivElement>(null);
   const atBottom = useRef(true);
   const opened = useRef(false);
   useLayoutEffect(() => {
     const el = scroller.current;
-    if (!el || tab !== "chat" || !view) return;
+    if (!el || !view) return;
     if (!opened.current || atBottom.current) {
       el.scrollTop = el.scrollHeight;
       opened.current = true;
     }
-  }, [view, delta, pending, tab]);
-  useLayoutEffect(() => {
-    const el = scroller.current;
-    if (!el) return;
-    if (tab === "chat") {
-      el.scrollTop = el.scrollHeight;
-      atBottom.current = true;
-    } else if (tab === "changes") {
-      requestAnimationFrame(() => requestAnimationFrame(() => (el.scrollTop = 0)));
-    }
-  }, [tab]);
-
-  // ⇧⌘D：在改动页和对话之间来回（与右上角改动按钮同一个动作）
-  const toggleChanges = useCallback(() => setTab(tab === "changes" ? "chat" : "changes"), [setTab, tab]);
-  useEffect(() => {
-    const onKey = (event: KeyboardEvent) => {
-      if ((event.metaKey || event.ctrlKey) && event.shiftKey && !event.altKey && !event.repeat && event.key.toLowerCase() === "d") {
-        event.preventDefault();
-        toggleChanges();
-      }
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [toggleChanges]);
+  }, [view, delta, pending]);
 
   const ready = status === "ready" && !archived;
   const busy = (view?.runs.size ?? 0) > 0;
-  const body = (content: React.ReactNode) =>
-    status === "loading" ? (
-      <SkeletonThread />
-    ) : status === "error" ? (
-      <div className="mx-auto mt-12 max-w-130 text-center text-read leading-6">
-        <p className="mb-1.5">{m.session_load_error({ message: errorText(error) })}</p>
-        <button type="button" className="mt-2 cursor-pointer font-medium text-text underline underline-offset-3" onClick={reload}>
-          {m.retry()}
-        </button>
-      </div>
-    ) : (
-      content
-    );
-
   return (
     <ConversationProvider value={conversation}>
-      <Tabs value={tab} onValueChange={(value) => setTab(value as Tab)} className="flex h-full min-h-0 flex-col overflow-hidden">
-        <header className="flex h-12 shrink-0 items-center gap-2 border-b border-border pr-3 pl-5 max-[900px]:pl-2">
-          <NavToggle />
-          <SessionTitle session={summary} fallback={m.app_name()} />
-          <TabsList aria-label={m.topbar_tabs()} className="ml-2 shrink-0 gap-0.5 max-[600px]:ml-0 max-[600px]:gap-0">
-            <Trigger value="chat">{m.tab_chat()}</Trigger>
-            <Trigger value="trace">{m.tab_trace()}</Trigger>
-          </TabsList>
-          {/* 顺序照 Claude Code 桌面版：右栏开关在最前，各面板开关其次，动作（分叉）放最后。 */}
-          <div className="ml-auto flex gap-1">
+      <ChatLayout
+        name={name}
+        scroller={scroller}
+        onScroll={(el) => {
+          atBottom.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+        }}
+        corner={
+          browserApi && (
             <IconButton
-              name="details"
-              label={panel.open ? m.topbar_panel_close() : m.topbar_panel_open()}
-              aria-expanded={panel.open}
-              onClick={panel.toggle}
-              className={cn("max-[600px]:size-11", panel.open && "bg-active text-text")}
+              name="globe"
+              label={showBrowser ? m.browser_close() : m.browser_open()}
+              aria-expanded={showBrowser}
+              onClick={() => setBrowserOpen(!showBrowser)}
+              className={cn("max-[600px]:hidden", showBrowser && "bg-active text-text")}
             />
-            <Tooltip
-              label={
-                <>
-                  {m.tab_changes()}
-                  {changedFiles > 0 && <span className="ml-1.5 text-white/60 tabular-nums">{changedFiles}</span>}
-                </>
-              }
-              shortcut={CHANGES_SHORTCUT}
-            >
-              <IconButton
-                name="diff"
-                label={changedFiles > 0 ? `${m.tab_changes()} ${changedFiles}` : m.tab_changes()}
-                title={undefined}
-                aria-pressed={tab === "changes"}
-                aria-keyshortcuts={isMac ? "Shift+Meta+D" : "Control+Shift+D"}
-                onClick={toggleChanges}
-                className={cn("max-[600px]:size-11", tab === "changes" && "bg-active text-text")}
-              />
-            </Tooltip>
-            {browserApi && (
-              <IconButton
-                name="globe"
-                label={showBrowser ? m.browser_close() : m.browser_open()}
-                aria-expanded={showBrowser}
-                onClick={() => setBrowserOpen(!showBrowser)}
-                className={cn("max-[600px]:hidden", showBrowser && "bg-active text-text")}
-              />
-            )}
-            <IconButton name="branch" label={m.topbar_fork()} onClick={() => void actions.fork(sessionId)} className="max-[600px]:size-11" />
+          )
+        }
+        aside={showBrowser && browserApi ? <BrowserPane api={browserApi} sessionId={sessionId} onClose={() => setBrowserOpen(false)} /> : undefined}
+        composer={
+          <Composer
+            sessionId={sessionId}
+            view={view}
+            context={context}
+            busy={busy}
+            disabled={!ready}
+            archived={archived}
+            onSend={(text, options) => {
+              atBottom.current = true;
+              send(text, options);
+            }}
+            onStop={stop}
+          />
+        }
+      >
+        {status === "loading" ? (
+          <SkeletonThread />
+        ) : status === "error" ? (
+          <div className="mx-auto mt-12 max-w-130 text-center text-read leading-6">
+            <p className="mb-1.5">{m.session_load_error({ message: errorText(error) })}</p>
+            <button type="button" className="mt-2 cursor-pointer font-medium text-text underline underline-offset-3" onClick={reload}>
+              {m.retry()}
+            </button>
           </div>
-        </header>
-        <div
-          className={cn(
-            "grid min-h-0 flex-1",
-            // 浏览器开着：对话与网页对半分，右栏仍贴在最右
-            showBrowser
-              ? panel.docked && panel.open
-                ? "grid-cols-[minmax(0,1fr)_minmax(0,1fr)_336px]"
-                : "grid-cols-[minmax(0,1fr)_minmax(0,1fr)]"
-              : panel.docked && panel.open
-                ? "grid-cols-[minmax(0,1fr)_336px]"
-                : "grid-cols-[minmax(0,1fr)]",
-          )}
-        >
-          <div className="relative flex min-h-0 min-w-0 flex-col">
-            {/* 顶栏下一段白到透明的渐隐：正文滚上去是慢慢淡掉，不在分界线上被切成半行字。 */}
-            <div aria-hidden className="pointer-events-none absolute inset-x-0 top-0 z-10 h-6 bg-linear-to-b from-surface to-transparent max-[600px]:h-4" />
-            <div
-              ref={scroller}
-              onScroll={(event) => {
-                const el = event.currentTarget;
-                atBottom.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
-              }}
-              className="min-h-0 flex-1 overflow-auto px-8 pt-6 pb-6 max-[600px]:px-4 max-[600px]:pt-4 max-[600px]:pb-4"
-            >
-              <TabsContent value="chat" className="mx-auto max-w-180 outline-none">
-                {body(
-                  view && (
-                    <Thread
-                      view={view}
-                      delta={delta}
-                      pending={pending}
-                      kids={kids}
-                      isHome={sessionId === home.data?.session}
-                      onRetry={retry}
-                    />
-                  ),
-                )}
-              </TabsContent>
-              <TabsContent value="trace" className="outline-none">
-                {body(events && view && <TraceView events={events} liveRuns={view.runs} tree={tree.data} memories={memories} ui={trace} />)}
-              </TabsContent>
-              <TabsContent value="changes" className="outline-none">
-                {body(
-                  <ChangesPage
-                    runs={changeRuns}
-                    turnNumbers={turnNumbers}
-                    ui={{
-                      open: openFiles,
-                      toggle: (key, current) => setOpenFiles((previous) => ({ ...previous, [key]: !current })),
-                      reviewAt,
-                      clearReviewAt: () => setReviewAt(null),
-                    }}
-                  />,
-                )}
-              </TabsContent>
-            </div>
-            <Composer
-              sessionId={sessionId}
-              view={view}
-              context={context}
-              busy={busy}
-              disabled={!ready}
-              archived={archived}
-              onSend={(text, options) => {
-                atBottom.current = true;
-                send(text, options);
-              }}
-              onStop={stop}
-            />
-          </div>
-          {showBrowser && browserApi && <BrowserPane api={browserApi} sessionId={sessionId} onClose={() => setBrowserOpen(false)} />}
-          <PanelShell panel={panel}>
-            <PanelContent
-              view={view}
-              viewLoading={status === "loading"}
-              context={context}
-              treeStatus={tree.isError ? "error" : tree.data ? "ready" : "loading"}
-              memories={memories}
-              sessions={sessions.data ?? []}
-              sessionId={sessionId}
-            />
-          </PanelShell>
-        </div>
-      </Tabs>
+        ) : (
+          view && <Thread view={view} delta={delta} pending={pending} kids={kids} isHome={main} onRetry={retry} />
+        )}
+      </ChatLayout>
     </ConversationProvider>
-  );
-}
-
-function Trigger({ value, children }: { value: Tab; children: React.ReactNode }) {
-  return (
-    <TabsTrigger
-      value={value}
-      className="h-7.5 rounded-control px-2.5 text-label text-muted hover:bg-hover-on-white hover:text-text data-[state=active]:bg-active data-[state=active]:font-medium data-[state=active]:text-text max-[600px]:px-1.5"
-    >
-      {children}
-    </TabsTrigger>
-  );
-}
-
-/** 加载：最终布局里放平的灰条，不做微光。 */
-function SkeletonThread() {
-  const bar = (width: string, extra = "") => <span className={`mb-3 block h-3.5 rounded-xs bg-active ${extra}`} style={{ width }} />;
-  return (
-    <div className="mx-auto max-w-180 pt-6">
-      <div className="mb-5 flex justify-end">
-        <span className="block h-10 rounded-[16px] bg-active" style={{ width: "46%" }} />
-      </div>
-      {bar("92%")}
-      {bar("78%")}
-      {bar("40%")}
-      {bar("30%", "mt-4.5")}
-      {bar("88%")}
-      {bar("64%")}
-    </div>
   );
 }

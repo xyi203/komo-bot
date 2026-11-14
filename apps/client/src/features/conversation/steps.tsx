@@ -179,7 +179,7 @@ function CallCard({ call }: { call: Call }) {
           </p>
         )}
       </div>
-      {call.resultEvent && (
+      {inspect && call.resultEvent && (
         <button
           type="button"
           onClick={() => inspect(call.resultEvent!)}

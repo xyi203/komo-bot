@@ -417,6 +417,9 @@ pub struct LineReply {
     /// 这句话来自哪个任务会话；清单与"好，先停了。"不是任务说的，为空。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task: Option<LineReplyTask>,
+    /// 这句话是停住的运行投进对话的提问：那条介入的句柄（`/v1/interventions/{handle}`）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intervention: Option<String>,
 }
 
 /// [`LineReply::task`]：说话的任务会话。

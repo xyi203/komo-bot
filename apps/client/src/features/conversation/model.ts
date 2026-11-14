@@ -49,7 +49,12 @@ export interface Turn {
   reason?: string;
 }
 
-export type Item = Turn | { kind: "user"; id: string; text: string; at: string } | { kind: "note"; id: string };
+export type Item =
+  | Turn
+  | { kind: "user"; id: string; text: string; at: string }
+  /** 投进对话的一句话（`line.reply`，不挂 Run）：停住的运行的提问、定时的结果。 */
+  | { kind: "reply"; id: string; text: string; at: string; intervention?: string }
+  | { kind: "note"; id: string };
 
 export interface View {
   items: Item[];
@@ -111,6 +116,13 @@ function apply(view: View, event: WireEvent): void {
       if (turn && turn.status === "running" && turn.users.length) turn.process.push({ kind: "steer", id: event.event_id, text });
       else if (turn) turn.users.push({ text, at: event.at });
       else view.items.push({ kind: "user", id: event.event_id, text, at: event.at });
+      break;
+    }
+    case "line.reply": {
+      // Router 时代的展示消息，现在是 Komo 往对话里投一句话的载体（docs/redesign.md §2.1）；
+      // 停住的运行的提问带 `intervention`（介入句柄），这句话下面放答复按钮
+      const { text = "", intervention } = payload<{ text: string; intervention?: string }>(event);
+      if (text.trim()) view.items.push({ kind: "reply", id: event.event_id, text, at: event.at, intervention });
       break;
     }
     case "memory.injected": {

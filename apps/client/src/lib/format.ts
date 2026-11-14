@@ -40,6 +40,16 @@ export function formatStamp(iso: string, now = new Date()): string {
   return date.toDateString() === now.toDateString() ? clockFormat(locale).format(date) : dayClockFormat(locale).format(date);
 }
 
+/** 对话列里一行的时间：今天写钟点，更早的只写月日。 */
+export function formatChatTime(iso: string, now = new Date()): string {
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return "";
+  const locale = getLocale();
+  return date.toDateString() === now.toDateString()
+    ? clockFormat(locale).format(date)
+    : new Intl.DateTimeFormat(locale, { month: "numeric", day: "numeric" }).format(date);
+}
+
 export function formatClock(date: Date): string {
   return clockFormat(getLocale()).format(date);
 }

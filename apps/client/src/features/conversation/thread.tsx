@@ -10,6 +10,7 @@ import { cn } from "@/lib/utils";
 import { m } from "@/paraglide/messages.js";
 import type { View } from "./model";
 import { AttachmentList, splitAttachments } from "./attachments";
+import { ReplyView } from "./reply";
 import { TurnView, UserBubble } from "./turn";
 
 export interface PendingSend {
@@ -36,6 +37,7 @@ export function Thread({
   onRetry: (id: string) => void;
 }) {
   const lastTurn = [...view.items].reverse().find((item) => item.kind === "turn");
+  const lastReply = [...view.items].reverse().find((item) => item.kind === "reply");
   const empty = !view.items.length && !pending.length && !view.runs.size;
   const now = useNow(kids.length > 0);
   return (
@@ -49,6 +51,7 @@ export function Thread({
       {view.items.map((item) => {
         if (item.kind === "turn") return <TurnView key={item.id} turn={item} delta={delta} last={item === lastTurn} />;
         if (item.kind === "user") return <UserBubble key={item.id} text={item.text} at={item.at} standalone />;
+        if (item.kind === "reply") return <ReplyView key={item.id} text={item.text} at={item.at} last={item === lastReply} intervention={item.intervention} />;
         return (
           <p key={item.id} className="mb-3.5 text-label text-muted">
             {m.thread_compacted()}

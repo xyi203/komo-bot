@@ -117,12 +117,9 @@
   -webkit-app-region: no-drag;
   app-region: no-drag;
 }
-/* 侧栏顶上的 komo 标记让到红绿灯右边；窄屏没有侧栏时，页头的"打开导航"按钮也让开 */
-[data-desktop="darwin"] .traffic-clear {
-  padding-left: 84px;
-}
-[data-desktop="darwin"] .traffic-clear-toggle {
-  margin-left: 68px;
+/* 图标栏只有 64 宽，红绿灯（压在窗口左上角）盖住它的顶部：komo 标志挪到红绿灯下面 */
+[data-desktop="darwin"] .rail-logo {
+  margin-top: 36px;
 }
 
 /* ---------- 动效与正文 ---------- */

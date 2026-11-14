@@ -1,17 +1,16 @@
-import { isApiError, useSessions } from "@komo/api";
-import { Outlet } from "@tanstack/react-router";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { isApiError, useChats } from "@komo/api";
+import { Outlet, useRouterState } from "@tanstack/react-router";
+import { useEffect } from "react";
 import { Toaster } from "@/components/toaster";
-import { Sheet, SheetContent, SheetDescription, SheetTitle } from "@/components/ui/sheet";
 import { Unauthorized } from "@/components/unauthorized";
+import { ChatColumn } from "@/features/chats/chat-column";
 import { Palette } from "@/features/palette/palette";
 import { togglePalette } from "@/features/palette/store";
 import { SettingsDialog } from "@/features/settings/settings-dialog";
 import { isSettingsSection, openSettings } from "@/features/settings/store";
-import { useMediaQuery } from "@/lib/hooks";
-import { m } from "@/paraglide/messages.js";
-import { Sidebar } from "./sidebar";
-import { SidebarProvider, type SidebarContext } from "./sidebar-context";
+import { cn } from "@/lib/utils";
+import { isChatPath } from "./paths";
+import { Rail } from "./rail";
 
 // C2（Electron 壳）给界面的约定见 `komo-desktop.d.ts`：`window.komoDesktop?.onCommandPalette(fn)` 返回取消函数；也会在 window 上派发
 // DOM 事件 `komo-desktop:command-palette`。没有桌面壳（`komoDesktop` 不存在）时什么也不做。
@@ -41,44 +40,26 @@ function usePaletteShortcut() {
 }
 
 /**
- * 外壳（docs/web.md §2）：1440 宽是 280 的侧栏加主区；≤900 侧栏变左侧抽屉（Radix Dialog，焦点圈在里面、Esc 关）。
- * 主区放当前路由的页面；没配对（401）时整块换成配对提示。
+ * 外壳（docs/web.md §2）：64 的图标栏 + 264 的对话列 + 主区；不在对话页（目标、记忆）时没有对话列。
+ * 主区放当前路由的页面；没配对（401）时整块换成配对提示。≤900 先不处理窄屏（5d 做）：对话列收起，图标栏留着。
  */
 export function AppShell() {
-  const sessions = useSessions(true);
+  const chats = useChats();
+  const chatPage = isChatPath(useRouterState({ select: (s) => s.location.pathname }));
   usePaletteShortcut();
-  const narrow = useMediaQuery("(max-width: 900px)");
-  const [drawer, setDrawer] = useState(false);
-  const closeDrawer = useCallback(() => setDrawer(false), []);
-  const context = useMemo<SidebarContext>(
-    () => ({ narrow, openDrawer: () => setDrawer(true), closeDrawer: narrow ? closeDrawer : undefined }),
-    [narrow, closeDrawer],
-  );
-  const unauthorized = sessions.isError && isApiError(sessions.error) && sessions.error.unauthorized;
-  const sidebarClass = "flex min-h-0 flex-col border-r border-border bg-ground";
+  const unauthorized = chats.isError && isApiError(chats.error) && chats.error.unauthorized;
   return (
-    <SidebarProvider value={context}>
+    <>
       {/* 桌面壳的拖窗口条（只在 macOS 桌面壳里显示，见 styles.css）：要排在最前，后面的按钮才能从拖动区里挖出来 */}
       <div aria-hidden="true" className="titlebar" />
-      <div className="grid h-svh grid-cols-[280px_minmax(0,1fr)] overflow-hidden max-[900px]:grid-cols-1">
-        {narrow ? (
-          <Sheet open={drawer} onOpenChange={setDrawer}>
-            <SheetContent side="left" className={sidebarClass} aria-label={m.nav_label()}>
-              <SheetTitle className="sr-only">{m.nav_label()}</SheetTitle>
-              <SheetDescription className="sr-only">{m.nav_label()}</SheetDescription>
-              <Sidebar />
-            </SheetContent>
-          </Sheet>
-        ) : (
-          <aside aria-label={m.nav_label()} className={sidebarClass}>
-            <Sidebar />
-          </aside>
-        )}
+      <div className={cn("grid h-svh overflow-hidden", chatPage ? "grid-cols-[64px_264px_minmax(0,1fr)] max-[900px]:grid-cols-[64px_minmax(0,1fr)]" : "grid-cols-[64px_minmax(0,1fr)]")}>
+        <Rail />
+        {chatPage && <ChatColumn />}
         <main className="flex min-h-0 min-w-0 flex-col overflow-y-auto bg-surface">{unauthorized ? <Unauthorized /> : <Outlet />}</main>
       </div>
       <Palette />
       <SettingsDialog />
       <Toaster />
-    </SidebarProvider>
+    </>
   );
 }

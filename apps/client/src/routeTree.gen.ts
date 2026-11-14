@@ -12,10 +12,10 @@ import { Route as rootRouteImport } from './routes/__root'
 import { Route as AppRouteImport } from './routes/_app'
 import { Route as PairRouteImport } from './routes/pair'
 import { Route as AppIndexRouteImport } from './routes/_app/index'
+import { Route as AppChatsIdRouteImport } from './routes/_app/chats.$id'
+import { Route as AppChatsNewRouteImport } from './routes/_app/chats.new'
 import { Route as AppCronIndexRouteImport } from './routes/_app/cron/index'
 import { Route as AppCronIdRouteImport } from './routes/_app/cron/$id'
-import { Route as AppInboxIndexRouteImport } from './routes/_app/inbox/index'
-import { Route as AppInboxIdRouteImport } from './routes/_app/inbox/$id'
 import { Route as AppMattersIndexRouteImport } from './routes/_app/matters/index'
 import { Route as AppMattersIdRouteImport } from './routes/_app/matters/$id'
 import { Route as AppMemoryIndexRouteImport } from './routes/_app/memory/index'
@@ -38,6 +38,16 @@ const AppIndexRoute = AppIndexRouteImport.update({
   path: '/',
   getParentRoute: () => AppRoute,
 } as any)
+const AppChatsIdRoute = AppChatsIdRouteImport.update({
+  id: '/chats/$id',
+  path: '/chats/$id',
+  getParentRoute: () => AppRoute,
+} as any)
+const AppChatsNewRoute = AppChatsNewRouteImport.update({
+  id: '/chats/new',
+  path: '/chats/new',
+  getParentRoute: () => AppRoute,
+} as any)
 const AppCronIndexRoute = AppCronIndexRouteImport.update({
   id: '/cron/',
   path: '/cron/',
@@ -46,16 +56,6 @@ const AppCronIndexRoute = AppCronIndexRouteImport.update({
 const AppCronIdRoute = AppCronIdRouteImport.update({
   id: '/cron/$id',
   path: '/cron/$id',
-  getParentRoute: () => AppRoute,
-} as any)
-const AppInboxIndexRoute = AppInboxIndexRouteImport.update({
-  id: '/inbox/',
-  path: '/inbox/',
-  getParentRoute: () => AppRoute,
-} as any)
-const AppInboxIdRoute = AppInboxIdRouteImport.update({
-  id: '/inbox/$id',
-  path: '/inbox/$id',
   getParentRoute: () => AppRoute,
 } as any)
 const AppMattersIndexRoute = AppMattersIndexRouteImport.update({
@@ -97,14 +97,14 @@ const AppSettingsSectionRoute = AppSettingsSectionRouteImport.update({
 export interface FileRoutesByFullPath {
   '/': typeof AppIndexRoute
   '/pair': typeof PairRoute
+  '/chats/$id': typeof AppChatsIdRoute
+  '/chats/new': typeof AppChatsNewRoute
   '/cron/$id': typeof AppCronIdRoute
-  '/inbox/$id': typeof AppInboxIdRoute
   '/matters/$id': typeof AppMattersIdRoute
   '/memory/$id': typeof AppMemoryIdRoute
   '/sessions/$sessionId': typeof AppSessionsSessionIdRoute
   '/settings/$section': typeof AppSettingsSectionRoute
   '/cron/': typeof AppCronIndexRoute
-  '/inbox/': typeof AppInboxIndexRoute
   '/matters/': typeof AppMattersIndexRoute
   '/memory/': typeof AppMemoryIndexRoute
   '/settings/': typeof AppSettingsIndexRoute
@@ -112,14 +112,14 @@ export interface FileRoutesByFullPath {
 export interface FileRoutesByTo {
   '/pair': typeof PairRoute
   '/': typeof AppIndexRoute
+  '/chats/$id': typeof AppChatsIdRoute
+  '/chats/new': typeof AppChatsNewRoute
   '/cron/$id': typeof AppCronIdRoute
-  '/inbox/$id': typeof AppInboxIdRoute
   '/matters/$id': typeof AppMattersIdRoute
   '/memory/$id': typeof AppMemoryIdRoute
   '/sessions/$sessionId': typeof AppSessionsSessionIdRoute
   '/settings/$section': typeof AppSettingsSectionRoute
   '/cron': typeof AppCronIndexRoute
-  '/inbox': typeof AppInboxIndexRoute
   '/matters': typeof AppMattersIndexRoute
   '/memory': typeof AppMemoryIndexRoute
   '/settings': typeof AppSettingsIndexRoute
@@ -129,14 +129,14 @@ export interface FileRoutesById {
   '/_app': typeof AppRouteWithChildren
   '/pair': typeof PairRoute
   '/_app/': typeof AppIndexRoute
+  '/_app/chats/$id': typeof AppChatsIdRoute
+  '/_app/chats/new': typeof AppChatsNewRoute
   '/_app/cron/$id': typeof AppCronIdRoute
-  '/_app/inbox/$id': typeof AppInboxIdRoute
   '/_app/matters/$id': typeof AppMattersIdRoute
   '/_app/memory/$id': typeof AppMemoryIdRoute
   '/_app/sessions/$sessionId': typeof AppSessionsSessionIdRoute
   '/_app/settings/$section': typeof AppSettingsSectionRoute
   '/_app/cron/': typeof AppCronIndexRoute
-  '/_app/inbox/': typeof AppInboxIndexRoute
   '/_app/matters/': typeof AppMattersIndexRoute
   '/_app/memory/': typeof AppMemoryIndexRoute
   '/_app/settings/': typeof AppSettingsIndexRoute
@@ -146,14 +146,14 @@ export interface FileRouteTypes {
   fullPaths:
     | '/'
     | '/pair'
+    | '/chats/$id'
+    | '/chats/new'
     | '/cron/$id'
-    | '/inbox/$id'
     | '/matters/$id'
     | '/memory/$id'
     | '/sessions/$sessionId'
     | '/settings/$section'
     | '/cron/'
-    | '/inbox/'
     | '/matters/'
     | '/memory/'
     | '/settings/'
@@ -161,14 +161,14 @@ export interface FileRouteTypes {
   to:
     | '/pair'
     | '/'
+    | '/chats/$id'
+    | '/chats/new'
     | '/cron/$id'
-    | '/inbox/$id'
     | '/matters/$id'
     | '/memory/$id'
     | '/sessions/$sessionId'
     | '/settings/$section'
     | '/cron'
-    | '/inbox'
     | '/matters'
     | '/memory'
     | '/settings'
@@ -177,14 +177,14 @@ export interface FileRouteTypes {
     | '/_app'
     | '/pair'
     | '/_app/'
+    | '/_app/chats/$id'
+    | '/_app/chats/new'
     | '/_app/cron/$id'
-    | '/_app/inbox/$id'
     | '/_app/matters/$id'
     | '/_app/memory/$id'
     | '/_app/sessions/$sessionId'
     | '/_app/settings/$section'
     | '/_app/cron/'
-    | '/_app/inbox/'
     | '/_app/matters/'
     | '/_app/memory/'
     | '/_app/settings/'
@@ -218,6 +218,20 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AppIndexRouteImport
       parentRoute: typeof AppRoute
     }
+    '/_app/chats/$id': {
+      id: '/_app/chats/$id'
+      path: '/chats/$id'
+      fullPath: '/chats/$id'
+      preLoaderRoute: typeof AppChatsIdRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/_app/chats/new': {
+      id: '/_app/chats/new'
+      path: '/chats/new'
+      fullPath: '/chats/new'
+      preLoaderRoute: typeof AppChatsNewRouteImport
+      parentRoute: typeof AppRoute
+    }
     '/_app/cron/': {
       id: '/_app/cron/'
       path: '/cron'
@@ -230,20 +244,6 @@ declare module '@tanstack/react-router' {
       path: '/cron/$id'
       fullPath: '/cron/$id'
       preLoaderRoute: typeof AppCronIdRouteImport
-      parentRoute: typeof AppRoute
-    }
-    '/_app/inbox/': {
-      id: '/_app/inbox/'
-      path: '/inbox'
-      fullPath: '/inbox/'
-      preLoaderRoute: typeof AppInboxIndexRouteImport
-      parentRoute: typeof AppRoute
-    }
-    '/_app/inbox/$id': {
-      id: '/_app/inbox/$id'
-      path: '/inbox/$id'
-      fullPath: '/inbox/$id'
-      preLoaderRoute: typeof AppInboxIdRouteImport
       parentRoute: typeof AppRoute
     }
     '/_app/matters/': {
@@ -300,14 +300,14 @@ declare module '@tanstack/react-router' {
 
 interface AppRouteChildren {
   AppIndexRoute: typeof AppIndexRoute
+  AppChatsIdRoute: typeof AppChatsIdRoute
+  AppChatsNewRoute: typeof AppChatsNewRoute
   AppCronIdRoute: typeof AppCronIdRoute
-  AppInboxIdRoute: typeof AppInboxIdRoute
   AppMattersIdRoute: typeof AppMattersIdRoute
   AppMemoryIdRoute: typeof AppMemoryIdRoute
   AppSessionsSessionIdRoute: typeof AppSessionsSessionIdRoute
   AppSettingsSectionRoute: typeof AppSettingsSectionRoute
   AppCronIndexRoute: typeof AppCronIndexRoute
-  AppInboxIndexRoute: typeof AppInboxIndexRoute
   AppMattersIndexRoute: typeof AppMattersIndexRoute
   AppMemoryIndexRoute: typeof AppMemoryIndexRoute
   AppSettingsIndexRoute: typeof AppSettingsIndexRoute
@@ -315,14 +315,14 @@ interface AppRouteChildren {
 
 const AppRouteChildren: AppRouteChildren = {
   AppIndexRoute: AppIndexRoute,
+  AppChatsIdRoute: AppChatsIdRoute,
+  AppChatsNewRoute: AppChatsNewRoute,
   AppCronIdRoute: AppCronIdRoute,
-  AppInboxIdRoute: AppInboxIdRoute,
   AppMattersIdRoute: AppMattersIdRoute,
   AppMemoryIdRoute: AppMemoryIdRoute,
   AppSessionsSessionIdRoute: AppSessionsSessionIdRoute,
   AppSettingsSectionRoute: AppSettingsSectionRoute,
   AppCronIndexRoute: AppCronIndexRoute,
-  AppInboxIndexRoute: AppInboxIndexRoute,
   AppMattersIndexRoute: AppMattersIndexRoute,
   AppMemoryIndexRoute: AppMemoryIndexRoute,
   AppSettingsIndexRoute: AppSettingsIndexRoute,

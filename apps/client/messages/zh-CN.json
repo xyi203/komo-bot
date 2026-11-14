@@ -113,6 +113,17 @@
   "changes_verb_added": "已新建",
   "changes_verb_deleted": "已删除",
   "changes_verb_edited": "已编辑",
+  "chat_name_main": "Komo",
+  "chats_branches": "支线对话",
+  "chats_empty_body": "支线对话是可选的，用来把一个话题单独聊。",
+  "chats_empty_title": "开一段支线对话",
+  "chats_error": "对话列表没取到：{message}",
+  "chats_main": "主对话",
+  "chats_new": "新支线对话",
+  "chats_no_message": "还没有消息",
+  "chats_running": "正在做",
+  "chats_title": "对话",
+  "chats_waiting": "在等你回话",
   "close": "关闭",
   "composer_archived": "这段对话已归档，只能查看",
   "composer_attach": "添加图片或文件",
@@ -211,11 +222,7 @@
   "config_unit_bytes": "字节",
   "config_unit_mins": "分钟",
   "config_unit_secs": "秒",
-  "conn_connecting": "正在连接 Gateway",
   "conn_down": "连不上 Gateway",
-  "conn_label_down": "Gateway 未连接",
-  "conn_label_ok": "Gateway 已连接",
-  "conn_ok": "Gateway {version} · 已连接",
   "conn_retrying": "事件流断了，正在重连",
   "controls_save": "保存",
   "controls_saving": "正在保存",
@@ -303,15 +310,6 @@
   "cron_weekly": "每周{days} {time}",
   "cron_what": "跑什么",
   "cron_when": "什么时候",
-  "ctx_free": "空闲",
-  "ctx_memory": "记忆",
-  "ctx_messages": "对话消息",
-  "ctx_project": "项目规范",
-  "ctx_results": "工具结果",
-  "ctx_skills": "Skills 清单",
-  "ctx_summary": "压缩摘要",
-  "ctx_system": "系统提示",
-  "ctx_tools": "工具定义",
   "dismiss": "知道了",
   "duration_h_m": "{h}小时{m}分",
   "duration_m_s": "{m}分{s}秒",
@@ -376,59 +374,7 @@
   "gateway_unreachable": "连不上",
   "gateway_version": "版本",
   "gateway_version_value": "{version} · 协议 {protocol}",
-  "group_all": "全部会话",
-  "group_archived": "已归档",
-  "group_flat_active": "会话",
-  "group_recent": "最近",
   "home_error": "取不到主会话：{message}",
-  "inbox_abandon_ask": "这条 Run 到此为止，取消后不会再继续。",
-  "inbox_abandon_sure": "确定到此为止",
-  "inbox_answer_error": "没答上：{message}",
-  "inbox_answered": "已答复",
-  "inbox_back": "回到列表",
-  "inbox_detail": "详情",
-  "inbox_empty": "现在没有停着的 Run。",
-  "inbox_explain_blocked": "它依赖的文件或会话没了：处理好之后让它重新判断，或到此为止。",
-  "inbox_explain_confirm": "定时任务、monitor 或后台任务起的 Run，要调声明为对外的工具（发消息、提工单）时，等你点执行或不执行。",
-  "inbox_explain_hint": "这些卡只在这里和 komo intervention list 看得到。",
-  "inbox_explain_title": "什么会停在这里",
-  "inbox_explain_verify": "一次调用跑到一半 Gateway 重启了，不知道做没做成：你核对后告诉它“已经是那样了”或“确定没执行”。",
-  "inbox_finding": [
-    {
-      "declarations": [
-        "input count",
-        "local countPlural = count: plural"
-      ],
-      "selectors": [
-        "countPlural"
-      ],
-      "match": {
-        "countPlural=one": "{count} 条在等你答复；不答，那条 Run 就一直停着。",
-        "countPlural=other": "{count} 条在等你答复；不答，那条 Run 就一直停着。"
-      }
-    }
-  ],
-  "inbox_finding_error": "待处理没取到。",
-  "inbox_finding_none": "没有等你答复的事。",
-  "inbox_hint": "答复只对这一次有效，没有“以后都允许”。",
-  "inbox_kind_blocked": "前提没了",
-  "inbox_kind_confirm": "要调对外工具",
-  "inbox_kind_verify": "结果不明，等你核对",
-  "inbox_kind_verify_short": "结果不明",
-  "inbox_kv_handle": "句柄",
-  "inbox_kv_session": "会话",
-  "inbox_kv_stopped": "停下",
-  "inbox_list": "待处理清单",
-  "inbox_load_error": "没取到：{message}。",
-  "inbox_none_to_answer": "没有要答复的。",
-  "inbox_pick": "选一条答复它。",
-  "inbox_session_gone": "会话已不在列表里",
-  "inbox_verdict_abandon": "到此为止",
-  "inbox_verdict_approve": "执行",
-  "inbox_verdict_not_performed": "确定没执行，重放",
-  "inbox_verdict_reject": "不执行",
-  "inbox_verdict_resolve": "处理好了，重新判断",
-  "inbox_verdict_satisfied": "已经是那样了，继续",
   "language_en": "English",
   "language_label": "语言",
   "language_zh_cn": "中文",
@@ -621,9 +567,6 @@
   "matter_save": "保存",
   "matter_show_all": "显示全部 {count} 件",
   "matter_show_less": "收起",
-  "matter_state_active": "进行中",
-  "matter_state_parked": "搁置",
-  "matter_state_waiting": "在等",
   "matter_status_active": "在做",
   "matter_status_done": "完成",
   "matter_status_dropped": "放弃",
@@ -982,14 +925,14 @@
   "models_timeout_ph": "默认 120",
   "models_window": "上下文窗口",
   "models_window_ph": "问 provider",
-  "nav_close": "收起导航",
+  "nav_chats": "对话",
+  "nav_chats_waiting": "对话，{count} 件在等你",
   "nav_cron": "定时",
-  "nav_inbox": "待处理",
-  "nav_label": "导航与会话",
+  "nav_goals": "目标",
+  "nav_label": "导航",
   "nav_matters": "事项",
   "nav_memory": "记忆",
   "nav_new_session": "新对话",
-  "nav_open": "打开导航",
   "nav_search": "搜索",
   "nav_settings": "设置",
   "pair_failed": "配对失败：{message}",
@@ -1026,91 +969,6 @@
   "palette_type_memory": "记忆",
   "palette_type_session": "会话",
   "palette_types": "类型",
-  "panel_bg": "在后台",
-  "panel_bg_command": "转到后台的命令",
-  "panel_bg_done": "已结束 · {when}",
-  "panel_bg_elapsed": "已跑 {time}",
-  "panel_bg_ended": "已结束（{reason}）",
-  "panel_bg_empty": "这段对话没有在后台跑过任务、监听或命令。",
-  "panel_bg_monitor": "监听",
-  "panel_bg_running": [
-    {
-      "declarations": [
-        "input count",
-        "local countPlural = count: plural"
-      ],
-      "selectors": [
-        "countPlural"
-      ],
-      "match": {
-        "countPlural=one": "{count} 个在跑",
-        "countPlural=other": "{count} 个在跑"
-      }
-    }
-  ],
-  "panel_conn": "连接",
-  "panel_conn_bad": "有问题",
-  "panel_conn_gateway": "Gateway {version}",
-  "panel_conn_note": "MCP 的连接状态，这里还没有接上。",
-  "panel_conn_ok": "正常",
-  "panel_conn_started": "启动于 {when}",
-  "panel_conn_telemetry": "遥测",
-  "panel_conn_telemetry_error": "出错：{message}",
-  "panel_conn_telemetry_off": "未配置",
-  "panel_conn_telemetry_ok": "正常，最近一次 {when}",
-  "panel_context": "上下文",
-  "panel_context_none": "这段对话还没有请求过模型。",
-  "panel_context_note": "合计是上一次请求实报的 token；各项按字节估算后按合计校准。",
-  "panel_context_of": "{used} / {win}",
-  "panel_context_tree_error": "会话树没取到，分不出构成。",
-  "panel_context_tree_loading": "正在读会话树。",
-  "panel_context_used": "{pct} 已用",
-  "panel_failed": "没取到：{message}",
-  "panel_loading_session": "正在读这段对话。",
-  "panel_matter_next": "下一步 {what}",
-  "panel_matter_standard": "标准 {what}",
-  "panel_matter_waiting": "在等 {what}",
-  "panel_matters": "在做的事",
-  "panel_matters_all": "全部事项",
-  "panel_matters_empty": "没有进行中的目标或在管的领域。",
-  "panel_memory": "带上的记忆",
-  "panel_memory_all": [
-    {
-      "declarations": [
-        "input count",
-        "local countPlural = count: plural"
-      ],
-      "selectors": [
-        "countPlural"
-      ],
-      "match": {
-        "countPlural=one": "全部 {count} 条生效的记忆",
-        "countPlural=other": "全部 {count} 条生效的记忆"
-      }
-    }
-  ],
-  "panel_memory_convention": "约定",
-  "panel_memory_detail": [
-    {
-      "declarations": [
-        "input count",
-        "local countPlural = count: plural"
-      ],
-      "selectors": [
-        "countPlural"
-      ],
-      "match": {
-        "countPlural=one": "{kind} · 用过 {count} 次 · v{revision}",
-        "countPlural=other": "{kind} · 用过 {count} 次 · v{revision}"
-      }
-    }
-  ],
-  "panel_memory_empty": "最近这一轮没有带上记忆。",
-  "panel_memory_gone": "库里已经没有这条",
-  "panel_memory_reference": "线索",
-  "panel_show_less": "收起",
-  "panel_show_more": "显示更多",
-  "panel_title": "这一段",
   "recall_brought": "带上 {parts}",
   "recall_conventions": [
     {
@@ -1147,83 +1005,10 @@
   "retry": "重试",
   "send_failed": "没发出去：{message}",
   "send_sending": "发送中",
-  "session_archive": "归档",
-  "session_archive_body": "归档后这段对话只能查看，不能再发消息；没跑完的会先跑完。",
-  "session_delete": "删除",
-  "session_delete_body": "没跑完的会先停掉，然后永久删掉这段对话的内容，不能恢复。",
-  "session_delete_body_archived": "永久删掉这段对话的内容，不能恢复。",
-  "session_error_create": "没能新建会话：{message}",
-  "session_error_fork": "没能分叉：{message}",
-  "session_error_rename": "没能改名：{message}",
-  "session_fork": "分叉",
   "session_kind_main": "主会话",
   "session_load_error": "这段对话没取到：{message}",
-  "session_menu_more": "{title} 的更多操作",
-  "session_rename": "重命名",
-  "session_rename_hint": "{title}（点击改名）",
-  "session_rename_label": "会话名称",
-  "session_state_running": "运行中",
-  "session_state_waiting": "等待中",
-  "session_tag_archived": "已归档",
-  "session_tag_draft": "草稿",
-  "session_tag_task": "子任务",
   "session_untitled": "新会话",
-  "sessions_collapse": "收起",
-  "sessions_error": "会话列表没取到：{message}",
-  "sessions_kids": [
-    {
-      "declarations": [
-        "input count",
-        "local countPlural = count: plural"
-      ],
-      "selectors": [
-        "countPlural"
-      ],
-      "match": {
-        "countPlural=one": "{count} 个子任务",
-        "countPlural=other": "{count} 个子任务"
-      }
-    }
-  ],
-  "sessions_kids_collapse": [
-    {
-      "declarations": [
-        "input count",
-        "local countPlural = count: plural"
-      ],
-      "selectors": [
-        "countPlural"
-      ],
-      "match": {
-        "countPlural=one": "收起 {count} 个子任务",
-        "countPlural=other": "收起 {count} 个子任务"
-      }
-    }
-  ],
-  "sessions_kids_expand": [
-    {
-      "declarations": [
-        "input count",
-        "local countPlural = count: plural"
-      ],
-      "selectors": [
-        "countPlural"
-      ],
-      "match": {
-        "countPlural=one": "展开 {count} 个子任务",
-        "countPlural=other": "展开 {count} 个子任务"
-      }
-    }
-  ],
-  "sessions_kids_live": "{count} 个在跑",
-  "sessions_load_more": "加载更早的会话",
   "sessions_loading": "正在加载会话…",
-  "sessions_loading_more": "加载中…",
-  "sessions_none_active": "没有活跃的会话。",
-  "sessions_none_all": "还没有会话。",
-  "sessions_none_archived": "没有已归档的会话。",
-  "sessions_show_all": "显示全部 {count} 个",
-  "sessions_title": "会话",
   "settings_close": "关闭设置",
   "settings_nav": "设置分节",
   "settings_sec_config": "配置",
@@ -1254,9 +1039,6 @@
       }
     }
   ],
-  "tab_changes": "改动",
-  "tab_chat": "对话",
-  "tab_trace": "轨迹",
   "thread_compacted": "上下文在这里压缩过一次",
   "thread_empty": "这段对话还没开始。",
   "thread_empty_hint": "在下面说第一句话。",
@@ -1269,10 +1051,6 @@
   "tool_rg": "搜索文件内容",
   "tool_task": "创建子智能体",
   "tool_write": "写入",
-  "topbar_fork": "分叉这段对话",
-  "topbar_panel_close": "收起右栏",
-  "topbar_panel_open": "展开右栏",
-  "topbar_tabs": "这段对话怎么看",
   "trace_assistant_message": "助手消息",
   "trace_calls_collapse": "收起这一步的工具调用",
   "trace_calls_expand": "展开这一步的工具调用",
@@ -1442,20 +1220,6 @@
   "turn_spent_suffix": "，用时 {time}",
   "unauthorized_body": "在终端运行 komo web，它会打开一个一次性链接完成配对。",
   "unauthorized_title": "这个浏览器还没有配对",
-  "view_filter": "筛选会话",
-  "view_filter_active": "隐藏已归档",
-  "view_filter_all": "全部对话（显示已归档）",
-  "view_filter_archived": "仅显示已归档",
-  "view_group": "分组方式",
-  "view_group_flat": "单列表",
-  "view_group_tree": "按会话树",
-  "view_group_workdir": "按工作目录",
-  "view_menu": "分组、排序与筛选",
-  "view_sort": "排序方式",
-  "view_sort_created": "最近创建",
-  "view_sort_updated": "最近更新",
-  "workdir_default": "默认目录",
-  "workdir_new": "在 {name} 新建会话",
   "browser_title": "浏览器",
   "browser_open": "打开浏览器",
   "browser_close": "关闭浏览器",
@@ -1489,5 +1253,13 @@
   "conn_testing": "测试中…",
   "conn_save": "测试并保存",
   "conn_test": "只测试",
-  "models_preset_change": "换一家"
+  "models_preset_change": "换一家",
+  "verdict_abandon": "放弃",
+  "verdict_abandon_sure": "确定放弃",
+  "verdict_approve": "批准",
+  "verdict_error": "没答上：{message}",
+  "verdict_not_performed": "确实没做",
+  "verdict_reject": "拒绝",
+  "verdict_resolve": "处理好了，重新看",
+  "verdict_satisfied": "已经做了"
 }

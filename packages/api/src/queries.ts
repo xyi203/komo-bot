@@ -1,4 +1,5 @@
 import type {
+  ChatListResponse,
   FileDiff,
   HealthResponse,
   ModelsResponse,
@@ -26,6 +27,8 @@ import { keys } from "./keys";
 import { subscribeSession, type StreamState } from "./sse";
 import type { SessionTree } from "./types";
 
+/** 对话列：主对话 + 支线，每行带最后一句话与是否在等你 / 在跑，另给等你的总数。 */
+export const fetchChats = () => get<ChatListResponse>("/v1/chats");
 export const fetchHealth = () => get<HealthResponse>("/healthz");
 /** 全部会话，一次取完（不带 `limit`）。 */
 export const fetchSessions = (all = false) =>
@@ -73,6 +76,22 @@ export function useSessions(all = false) {
   });
 }
 
+/** 有对话在跑时的重取间隔：别的对话（比如定时触发、主对话派出的）的进展不走当前会话的事件流。 */
+const CHATS_LIVE_POLL_MS = 4000;
+const CHATS_IDLE_POLL_MS = 15_000;
+
+/**
+ * 对话列（`GET /v1/chats`）。当前打开的会话的事件流有变化时由 `useSessionEvents` 让它失效重取；
+ * 别的对话的变化（在等你、在跑）靠轮询：有在跑的 4 秒一次，否则 15 秒。
+ */
+export function useChats() {
+  return useQuery({
+    queryKey: keys.chats,
+    queryFn: fetchChats,
+    refetchInterval: (query) => (query.state.data?.chats.some((chat) => chat.running) ? CHATS_LIVE_POLL_MS : CHATS_IDLE_POLL_MS),
+  });
+}
+
 /** 默认 Agent 的主会话（没有就建）。 */
 export function useHomeSession() {
   return useQuery({ queryKey: keys.home, queryFn: fetchHome, staleTime: Infinity });
@@ -82,14 +101,9 @@ export function useModels() {
   return useQuery({ queryKey: keys.models, queryFn: fetchModels, select: (data: ModelsResponse) => data.models });
 }
 
-/** 待处理清单：不随会话事件流来，半分钟取一次（侧栏的数字与待处理页共用这一份）。 */
+/** 还没答复的介入清单（停住的运行）：不随会话事件流来，半分钟取一次；对话页在最后一句投进来的话下面给答复按钮。 */
 export function useInterventions() {
   return useQuery({ queryKey: keys.interventions, queryFn: fetchInterventions, refetchInterval: 30_000, retry: false });
-}
-
-/** 待处理的条数；取不到就不显示。 */
-export function useInboxCount(): number {
-  return useInterventions().data?.interventions.length ?? 0;
 }
 
 export function useSessionTree(session: string | undefined) {
@@ -139,7 +153,7 @@ function sideRefresher(queryClient: QueryClient) {
   const schedule = () => {
     clearTimeout(timer);
     timer = setTimeout(() => {
-      for (const key of [keys.sessions.all, keys.matters, keys.interventions, keys.memories]) {
+      for (const key of [keys.sessions.all, keys.chats, keys.matters, keys.interventions, keys.memories]) {
         void queryClient.invalidateQueries({ queryKey: key });
       }
     }, 400);
@@ -216,7 +230,8 @@ export function useSessionEvents(session: string) {
             void queryClient.invalidateQueries({ queryKey: keys.session(session).tree });
             if (event.run_id && event.type !== "run.abandoned") void mergeRunChanges(queryClient, session, event.run_id);
           }
-          if (/^(run\.|memory\.)/.test(event.type)) side.schedule();
+          // 对话列的最后一句话与状态：Run 的进展、用户发的话、投进对话的话（`line.reply`）都会改它
+          if (/^(run\.|memory\.|message\.user$|line\.reply$)/.test(event.type)) side.schedule();
         } else if (frame.event === "assistant_delta") {
           const piece = frame.data;
           setDelta((current) =>

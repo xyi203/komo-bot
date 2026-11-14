@@ -2,9 +2,18 @@
 import type { MatterKind } from "./MatterKind";
 import type { RequestKey } from "./RequestKey";
 import type { RunId } from "./RunId";
+import type { ScheduleSpec } from "./ScheduleSpec";
 import type { SessionId } from "./SessionId";
 
 /**
  * `POST /v1/matters`：新建，`active`。`next` / `due` 只给 goal，`standard` 只给 area。
  */
-export type MatterAddRequest = { kind: MatterKind, title: string, next?: string, due?: string, standard?: string, session?: SessionId, run?: RunId, request_key?: RequestKey, };
+export type MatterAddRequest = { kind: MatterKind, title: string, next?: string, due?: string, standard?: string, 
+/**
+ * 说明。
+ */
+description?: string, 
+/**
+ * 同时给它一个定时：要给全（表达式、时区）。
+ */
+schedule?: ScheduleSpec, session?: SessionId, run?: RunId, request_key?: RequestKey, };

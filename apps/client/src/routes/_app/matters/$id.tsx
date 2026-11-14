@@ -1,10 +1,7 @@
-import { createFileRoute } from "@tanstack/react-router";
-import { MattersPage } from "@/features/matters/matters-page";
+import { createFileRoute, redirect } from "@tanstack/react-router";
 
-// 选中的事项放在地址里；⌘K 与右栏跳到这里，同一页内选中这一件。
 export const Route = createFileRoute("/_app/matters/$id")({
-  component: function Page() {
-    const { id } = Route.useParams();
-    return <MattersPage selected={id} />;
+  beforeLoad: ({ params }) => {
+    throw redirect({ to: "/goals/$id", params: { id: params.id }, replace: true });
   },
 });

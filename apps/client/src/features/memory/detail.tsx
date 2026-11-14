@@ -5,7 +5,7 @@ import { useState, type FormEvent, type ReactNode } from "react";
 import { Icon } from "@/components/icon";
 import { Button } from "@/components/ui/button";
 import { IconButton } from "@/components/ui/icon-button";
-import { Kv, SubHeading } from "@/features/matters/parts";
+import { Kv, SubHeading } from "@/features/goals/parts";
 import { sessionTitle } from "@/features/sessions/title";
 import { errorText } from "@/lib/errors";
 import { formatRelative } from "@/lib/format";
@@ -171,7 +171,7 @@ export function MemoryDetail({
       m.memory_kv_belongs(),
       matter ? (
         <>
-          <Link to="/matters/$id" params={{ id: matter.id }} className={link}>
+          <Link to="/goals/$id" params={{ id: matter.id }} className={link}>
             {matter.title}
           </Link>
           {matter.closed_at && <Muted>{m.memory_matter_closed()}</Muted>}

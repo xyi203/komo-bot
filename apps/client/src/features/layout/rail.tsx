@@ -50,8 +50,7 @@ export function Rail() {
         >
           <Icon name="search" />
         </button>
-        {/* 目标页现在还是 /matters，3b 才改成 /goals */}
-        <RailLink to="/matters" icon="target" label={m.nav_goals()} active={pathname.startsWith("/matters")} />
+        <RailLink to="/goals" icon="target" label={m.nav_goals()} active={pathname.startsWith("/goals")} />
         <RailLink to="/memory" icon="leaf" label={m.nav_memory()} active={pathname.startsWith("/memory")} />
       </div>
       <Settings open={settingsOpen} />

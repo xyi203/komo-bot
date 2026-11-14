@@ -30,6 +30,11 @@ due?: string,
  */
 standard?: string, 
 /**
+ * 说明：这件事是什么、到点（定时）要做什么的底稿。目标与领域都能写；不进注入行。
+ * 定时配置不在这里：它是目标上的另一块（`CronJob`，id 同目标 id），改它不升版（见 `CronRepo`）。
+ */
+description?: string, 
+/**
  * 改承诺的那几次操作的用户原话证据，追加不改（§4「谁能改什么」）。
  */
 evidence?: Array<Evidence>, 

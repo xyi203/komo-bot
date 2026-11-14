@@ -114,6 +114,12 @@ const PATHS = {
   "key": (
     <><circle cx="8" cy="15" r="4"/><path d="m10.8 12.2 8.7-8.7M17 6l3 3M14.5 8.5l2 2"/></>
   ),
+  "flag": (
+    <><path d="M5 21V4M5 4h11l-2 4 2 4H5"/></>
+  ),
+  "loop": (
+    <><path d="M4.8 10.8a6.6 6.6 0 0 1 6.6-6h5.4M16.8 4.8l-2.4-2.4M16.8 4.8l-2.4 2.4M19.2 13.2a6.6 6.6 0 0 1-6.6 6H7.2M7.2 19.2l2.4 2.4M7.2 19.2l2.4-2.4"/></>
+  ),
   "more": (
     <><circle cx="5" cy="12" r="1.3" fill="currentColor"/><circle cx="12" cy="12" r="1.3" fill="currentColor"/><circle cx="19" cy="12" r="1.3" fill="currentColor"/></>
   ),

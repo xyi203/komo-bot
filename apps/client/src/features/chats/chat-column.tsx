@@ -79,7 +79,15 @@ function ChatItem({ chat, current }: { chat: ChatRow; current: boolean }) {
   const status = chat.waiting ? m.chats_waiting() : chat.running ? m.chats_running() : "";
   const body = (
     <>
-      <span className="truncate font-medium">{title}</span>
+      <span className="truncate font-medium">
+        {chat.goal && (
+          <span title={m.chats_goal({ title: chat.goal.title })} className="mr-1 inline-grid align-[-2px] text-faint">
+            <Icon name="flag" className="size-3.25" />
+            <span className="sr-only">{m.chats_goal({ title: chat.goal.title })}</span>
+          </span>
+        )}
+        {title}
+      </span>
       <span className="text-right text-small text-faint tabular-nums">{chat.lastMessage ? formatChatTime(chat.lastMessageAt) : ""}</span>
       <span className="truncate text-small leading-[18px] text-faint">{chat.lastMessage || m.chats_no_message()}</span>
       <span className="flex justify-end" title={status || undefined}>

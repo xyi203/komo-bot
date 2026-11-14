@@ -1,10 +1,8 @@
 import type { ComponentProps, ReactNode } from "react";
 import { Icon } from "@/components/icon";
-import { IconButton } from "@/components/ui/icon-button";
 import { cn } from "@/lib/utils";
-import { m } from "@/paraglide/messages.js";
 
-// 事项、记忆、定时三页共用的小部件（原型的 `.pill`、`.kv`、`.notice`、`.text-btn`、`.sub-h`、`.detail-top`、表单控件）。
+// 目标、记忆两页共用的小部件（原型的 `.pill`、`.kv`、`.notice`、`.text-btn`、`.sub-h`、`.detail-top`、表单控件）。
 // 版式照 Claude 桌面的设置页：一节一个标题，下面一行一项，行与行之间只有一条细线，不再叠表头线、节线与灰底井。
 
 /** 列表：行间一条细线，首行上、末行下都不画。 */
@@ -40,32 +38,6 @@ export function Pill({ tone, children, className }: { tone?: "wait" | "bad" | "o
     >
       {children}
     </span>
-  );
-}
-
-/** 详情卡顶部：窄屏左边是返回，右边的药丸靠右，`onClose`（宽屏定时详情）给个关闭叉。 */
-export function DetailTop({
-  label,
-  pill,
-  compact,
-  onBack,
-  onClose,
-}: {
-  label: ReactNode;
-  pill?: ReactNode;
-  compact?: boolean;
-  onBack?: () => void;
-  onClose?: () => void;
-}) {
-  return (
-    <div className="flex min-h-7 items-center gap-2">
-      {compact && onBack && <IconButton name="left" label={m.matter_back()} onClick={onBack} className="-ml-2" />}
-      <span className="font-medium">{label}</span>
-      <span className="ml-auto flex items-center gap-2">
-        {pill}
-        {onClose && <IconButton name="x" label={m.close()} onClick={onClose} className="-my-1 -mr-2" />}
-      </span>
-    </div>
   );
 }
 
@@ -143,6 +115,9 @@ export const Label = ({ children, htmlFor }: { children: ReactNode; htmlFor?: st
 const control =
   "w-full rounded-control bg-surface px-3 text-text shadow-ring-control placeholder:text-faint focus:shadow-[0_0_0_1px_var(--color-text)] focus:outline-0";
 export const Input = ({ className, ...props }: ComponentProps<"input">) => <input className={cn("h-9", control, className)} {...props} />;
+export const Textarea = ({ className, ...props }: ComponentProps<"textarea">) => (
+  <textarea className={cn("min-h-20 resize-y py-2 leading-5", control, className)} {...props} />
+);
 export const Select = ({ className, ...props }: ComponentProps<"select">) => (
   <select className={cn("h-9 cursor-pointer px-2", control, className)} {...props} />
 );
@@ -154,5 +129,32 @@ export function Radio({ children, ...props }: { children: ReactNode } & Omit<Com
       <input type="radio" className="m-0 accent-primary" {...props} />
       {children}
     </label>
+  );
+}
+
+/** 详情页的一节：节标题（带计数）、右边一个可选的小动作，下面是内容。 */
+export function Section({ title, count, action, children }: { title: ReactNode; count?: number; action?: ReactNode; children: ReactNode }) {
+  return (
+    <section className="mt-9">
+      <div className="flex items-baseline gap-3 pb-1">
+        <SectionTitle count={count}>{title}</SectionTitle>
+        {action && <span className="ml-auto">{action}</span>}
+      </div>
+      {children}
+    </section>
+  );
+}
+
+/** 详情页里一行（链接 / 按钮 / 静态）的版式：左边 20 宽的图标，中间标题与说明，右边一小段文字。 */
+export const itemClass = cn(rowClass, "grid w-full grid-cols-[20px_minmax(0,1fr)_auto] items-start gap-x-3 text-left text-text no-underline");
+
+export function ItemBody({ icon, title, desc, end }: { icon: ReactNode; title: ReactNode; desc?: ReactNode; end?: ReactNode }) {
+  return (
+    <>
+      <span className="mt-0.5 grid size-5 place-items-center text-faint">{icon}</span>
+      <span className="flex min-w-0 flex-wrap items-center gap-x-2 leading-5.5 [overflow-wrap:anywhere]">{title}</span>
+      <span className="flex items-center gap-1 text-label leading-5.5 text-muted">{end}</span>
+      {desc && <span className="col-start-2 col-end-4 mt-0.5 text-small leading-4.5 text-muted [overflow-wrap:anywhere]">{desc}</span>}
+    </>
   );
 }

@@ -6,6 +6,7 @@ import { Icon, type IconName } from "@/components/icon";
 import { formatChatTime } from "@/lib/format";
 import { cn } from "@/lib/utils";
 import { m } from "@/paraglide/messages.js";
+import { firstLine } from "@/features/goals/model";
 import { closePalette, usePaletteOpen } from "./store";
 
 /** 没输入时列最近的几段对话。 */
@@ -112,9 +113,9 @@ function PaletteBody() {
           key: `g:${x.id}`,
           icon: "target",
           title: x.title,
-          detail: x.next ?? x.standard ?? "",
+          detail: firstLine(x.description) || (x.next ?? x.standard ?? ""),
           stamp: "",
-          run: () => void navigate({ to: "/matters/$id", params: { id: x.id } }),
+          run: () => void navigate({ to: "/goals/$id", params: { id: x.id } }),
         }),
       );
     return [

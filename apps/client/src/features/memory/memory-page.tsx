@@ -5,7 +5,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { Icon } from "@/components/icon";
 import { BlockError, DetailCard, EmptyFrame, Page, PageBody, SkeletonRows } from "@/components/page";
 import { Button } from "@/components/ui/button";
-import { columnLabelClass, listClass, rowClass, rowOnClass, SectionTitle } from "@/features/matters/parts";
+import { columnLabelClass, listClass, rowClass, rowOnClass, SectionTitle } from "@/features/goals/parts";
 import { errorText } from "@/lib/errors";
 import { formatNumber, formatRelative } from "@/lib/format";
 import { showToast } from "@/lib/toast";

@@ -15,6 +15,9 @@ export const keys = {
   interventions: ["interventions"] as const,
   matters: ["matters"] as const,
   mattersAll: ["matters", "all"] as const,
+  // 都在 `matters` 前缀下：目标有任何改动，失效一次 `keys.matters` 就连详情与运行历史一起重取
+  matter: (id: string) => ["matters", "detail", id] as const,
+  matterRuns: (id: string) => ["matters", "runs", id] as const,
   monitors: ["monitors"] as const,
   monitorsAll: ["monitors", "all"] as const,
   sessionSearch: (query: string, limit: number) => ["session-search", query, limit] as const,

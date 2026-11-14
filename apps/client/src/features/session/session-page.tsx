@@ -1,8 +1,9 @@
 import { useChats, useInterventions, useMemoryIndex, useModels, useSessionChanges, useSessionEvents, useSessions, useSessionTree } from "@komo/api";
 import type { InterventionSummary, RunChanges } from "@komo/protocol";
-import { useRouterState } from "@tanstack/react-router";
+import { Link, useRouterState } from "@tanstack/react-router";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { ChatMenu } from "@/features/chats/chat-menu";
+import { Icon } from "@/components/icon";
 import { IconButton } from "@/components/ui/icon-button";
 import { BrowserPane, desktopBrowser, useBrowserOpen } from "@/features/browser/browser-pane";
 import { contextView } from "@/features/composer/context-usage";
@@ -53,6 +54,7 @@ function SessionBody({ sessionId, main }: { sessionId: string; main: boolean }) 
   const kids = useMemo(() => (sessions.data ?? []).filter((s) => s.kind === "task" && s.home === sessionId && isLive(s)), [sessions.data, sessionId]);
 
   const chatRows = chats.data?.chats;
+  const goal = main ? undefined : chatRows?.find((chat) => chat.id === sessionId)?.goal;
   const name = main ? m.chat_name_main() : (chatRows?.find((chat) => chat.id === sessionId)?.title || sessionTitle(summary));
   // 连接状态给图标栏看；名字给浏览器标签
   useEffect(() => {
@@ -123,6 +125,17 @@ function SessionBody({ sessionId, main }: { sessionId: string; main: boolean }) 
         }}
         corner={
           <>
+            {goal && (
+              <Link
+                to="/goals/$id"
+                params={{ id: goal.id }}
+                title={m.chats_goal({ title: goal.title })}
+                className="inline-flex h-8 max-w-60 items-center gap-1.5 rounded-full bg-surface pr-3 pl-2.5 text-label text-muted no-underline shadow-[0_0_0_1px_rgb(0_0_0/0.1)] transition-colors hover:bg-hover-on-white hover:text-text max-[600px]:max-w-32"
+              >
+                <Icon name="flag" className="size-3.5" />
+                <span className="truncate">{goal.title}</span>
+              </Link>
+            )}
             {browserApi && (
               <IconButton
                 name="globe"

@@ -44,6 +44,8 @@ export const get = <T>(path: string, query?: Record<string, string | number | bo
 export const post = <T>(path: string, body?: unknown, signal?: AbortSignal) =>
   request<T>("POST", path, { body: body ?? {}, signal });
 
+export const del = <T>(path: string, signal?: AbortSignal) => request<T>("DELETE", path, { signal });
+
 function withQuery(path: string, query?: Record<string, string | number | boolean | undefined>): string {
   if (!query) return path;
   const params = new URLSearchParams();

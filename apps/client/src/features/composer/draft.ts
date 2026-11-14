@@ -62,6 +62,13 @@ export function useDraftedSessions(): ReadonlySet<string> {
   );
 }
 
+/** 往某个会话的输入框预填一句话（目标页「和 Komo 聊这件事」）：写进同一个键，输入框挂上来时读到；框里已经有没发的字就不覆盖。 */
+export function presetDraft(session: string, text: string) {
+  if (readStored<string>(keyOf(session), (raw) => (typeof raw === "string" ? raw : undefined), "")) return;
+  writeStored(keyOf(session), JSON.stringify(text));
+  mark(withText, session, true);
+}
+
 /** 某个会话的文字草稿：初值从 localStorage 读，每次改动写回。 */
 export function useDraftText(session: string) {
   const [text, setText] = useState(() => readStored<string>(keyOf(session), (raw) => (typeof raw === "string" ? raw : undefined), ""));

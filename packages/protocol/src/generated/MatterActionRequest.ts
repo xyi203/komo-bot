@@ -3,6 +3,7 @@ import type { MatterKind } from "./MatterKind";
 import type { MatterTrigger } from "./MatterTrigger";
 import type { RequestKey } from "./RequestKey";
 import type { RunId } from "./RunId";
+import type { ScheduleSpec } from "./ScheduleSpec";
 import type { SessionId } from "./SessionId";
 
 /**
@@ -14,7 +15,9 @@ import type { SessionId } from "./SessionId";
  * | `wait` | `waiting_for`（必填） |
  * | `resume` | `next`（可选） |
  * | `link` / `unlink` | `trigger`（必填：Cron Job 或 monitor） |
- * | `edit` | `title` / `due` / `clear_due`（goal）/ `standard`（area；空 = 清空），至少一样 |
+ * | `edit` | `title` / `due` / `clear_due`（goal）/ `standard`（area；空 = 清空）/ `description`（空 = 清空），至少一样 |
+ * | `schedule` | `schedule`（[`ScheduleSpec`]，给出的字段才改；还没有定时时要给全） |
+ * | `unschedule` / `run` | 无 |
  * | 其余 | 无 |
  */
 export type MatterActionRequest = { 
@@ -27,6 +30,14 @@ kind?: MatterKind, title?: string, next?: string, waiting_for?: string, due?: st
  * `--no-due`。
  */
 clear_due?: boolean, standard?: string, 
+/**
+ * 说明；空串清空。
+ */
+description?: string, 
+/**
+ * `schedule` 动词的内容。
+ */
+schedule?: ScheduleSpec, 
 /**
  * `link` / `unlink` 要挂 / 摘的触发器。
  */

@@ -542,7 +542,7 @@
   "mcp_exposure_direct": "直接给模型",
   "mcp_exposure_hidden": "不挂",
   "mcp_load_error": "MCP 没取到：{message}。",
-  "mcp_needs_auth_hint": "在终端跑 {command}，登录完下一次调用自动连上。",
+  "mcp_needs_auth_hint": "点“登录”在浏览器里授权，完成后自动连上；也可以在终端跑 {command}。",
   "mcp_no_tools": "这台服务器没有列出工具。",
   "mcp_none": "没有配 MCP 服务器。",
   "mcp_old_gateway": "在跑的 Gateway 还没有服务器列表的接口；装上新版后这里列出每台服务器和它的工具。",
@@ -1160,7 +1160,6 @@
   "push_failed": "没能完成：{message}",
   "push_incomplete": "浏览器给出的订阅信息不完整",
   "nav_back_chats": "返回对话列表",
-  "nav_back": "返回",
   "login_title": "登录 Komo",
   "login_body": "用你的账号登录后继续。",
   "login_button": "登录",
@@ -1187,5 +1186,9 @@
   "devices_revoke_current_confirm": "确认退出",
   "devices_revoke_current_hint": "这是你正在用的登录，吊销就是退出登录。",
   "protocol_mismatch": "网页与服务端版本不一致，请刷新或升级。",
-  "protocol_refresh": "刷新"
+  "protocol_refresh": "刷新",
+  "mcp_login": "登录",
+  "mcp_login_waiting": "已在新窗口打开授权页，完成后这里会自动更新状态。",
+  "mcp_login_blocked": "浏览器拦了新窗口，点这里打开授权页",
+  "mcp_login_failed": "登录没发起：{message}"
 }

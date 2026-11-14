@@ -550,7 +550,7 @@
   "mcp_exposure_direct": "Direct to model",
   "mcp_exposure_hidden": "Hidden",
   "mcp_load_error": "Couldn't load MCP servers: {message}.",
-  "mcp_needs_auth_hint": "Run {command} in a terminal; once signed in, the next call connects automatically.",
+  "mcp_needs_auth_hint": "Click “Sign in” to authorize in your browser, and it connects automatically afterwards; or run {command} in a terminal.",
   "mcp_no_tools": "This server lists no tools.",
   "mcp_none": "No MCP servers configured.",
   "mcp_old_gateway": "The running Gateway has no server list endpoint yet; after updating, each server and its tools are listed here.",
@@ -1168,7 +1168,6 @@
   "push_failed": "Couldn't finish: {message}",
   "push_incomplete": "The browser returned an incomplete subscription",
   "nav_back_chats": "Back to chats",
-  "nav_back": "Back",
   "login_title": "Sign in to Komo",
   "login_body": "Sign in with your account to continue.",
   "login_button": "Sign in",
@@ -1195,5 +1194,9 @@
   "devices_revoke_current_confirm": "Confirm sign out",
   "devices_revoke_current_hint": "This is the sign-in you're using; revoking it signs you out.",
   "protocol_mismatch": "The web app and the server are on different versions. Refresh or upgrade.",
-  "protocol_refresh": "Refresh"
+  "protocol_refresh": "Refresh",
+  "mcp_login": "Sign in",
+  "mcp_login_waiting": "The authorization page opened in a new window; this updates automatically once you finish.",
+  "mcp_login_blocked": "The browser blocked the new window; click here to open the authorization page",
+  "mcp_login_failed": "Could not start sign-in: {message}"
 }

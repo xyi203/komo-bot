@@ -53,6 +53,8 @@ export const deleteEnv = (version: string, name: string) =>
   request<ConfigEditResponse>("DELETE", `/v1/config/env/${enc(name)}`, { body: { version } });
 export const rebuildMemoryIndex = () => post<RebuildIndexResponse>("/v1/memory-index/rebuild");
 export const reconnectMcp = (servers: string[] = []) => post<McpReconnectResponse>("/v1/mcp/reconnect", { servers });
+/** 网页里的 MCP 登录（OAuth）：回授权地址，浏览器去那里授权，Gateway 收回调后后台重连。没配 public_url 时 400。 */
+export const startMcpOauth = (name: string) => post<{ authorization_url: string }>(`/v1/mcp/${enc(name)}/oauth/start`);
 export const disconnectMcp = (servers: string[]) => post<McpReconnectResponse>("/v1/mcp/disconnect", { servers });
 
 /** MCP 整台开关（持久，写 `enabled`）：回应是所有服务器此刻的样子。 */
@@ -102,13 +104,14 @@ export function useConfigEnv() {
 export function useMemoryIndexStatus() {
   return useQuery({ queryKey: configKeys.memoryIndex, queryFn: fetchMemoryIndexStatus, ...fresh });
 }
-export function useMcp() {
-  // 有服务器正在连接（刚打开整台开关、重连）时 2 秒重取一次，连上或失败后自己停
+export function useMcp(options: { poll?: boolean } = {}) {
+  // 有服务器正在连接（刚打开整台开关、重连）时 2 秒重取一次，连上或失败后自己停；
+  // poll：点了登录之后在浏览器里授权，回调落到 Gateway 才会变状态，调用方要求先一直取着
   return useQuery({
     queryKey: configKeys.mcp,
     queryFn: fetchMcp,
     ...fresh,
-    refetchInterval: (query) => (query.state.data?.servers.some((server) => server.state === "connecting") ? 2000 : false),
+    refetchInterval: (query) => (options.poll || query.state.data?.servers.some((server) => server.state === "connecting") ? 2000 : false),
   });
 }
 export function useSkills() {

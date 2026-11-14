@@ -11,9 +11,9 @@
 import { Route as rootRouteImport } from './routes/__root'
 import { Route as AppRouteImport } from './routes/_app'
 import { Route as AppIndexRouteImport } from './routes/_app/index'
+import { Route as AppChatsIndexRouteImport } from './routes/_app/chats.index'
 import { Route as AppChatsIdRouteImport } from './routes/_app/chats.$id'
 import { Route as AppChatsNewRouteImport } from './routes/_app/chats.new'
-import { Route as AppChatsIndexRouteImport } from './routes/_app/chats.index'
 import { Route as AppGoalsIndexRouteImport } from './routes/_app/goals/index'
 import { Route as AppGoalsIdRouteImport } from './routes/_app/goals/$id'
 import { Route as AppMattersIndexRouteImport } from './routes/_app/matters/index'
@@ -33,6 +33,11 @@ const AppIndexRoute = AppIndexRouteImport.update({
   path: '/',
   getParentRoute: () => AppRoute,
 } as any)
+const AppChatsIndexRoute = AppChatsIndexRouteImport.update({
+  id: '/chats/',
+  path: '/chats/',
+  getParentRoute: () => AppRoute,
+} as any)
 const AppChatsIdRoute = AppChatsIdRouteImport.update({
   id: '/chats/$id',
   path: '/chats/$id',
@@ -41,11 +46,6 @@ const AppChatsIdRoute = AppChatsIdRouteImport.update({
 const AppChatsNewRoute = AppChatsNewRouteImport.update({
   id: '/chats/new',
   path: '/chats/new',
-  getParentRoute: () => AppRoute,
-} as any)
-const AppChatsIndexRoute = AppChatsIndexRouteImport.update({
-  id: '/chats/',
-  path: '/chats/',
   getParentRoute: () => AppRoute,
 } as any)
 const AppGoalsIndexRoute = AppGoalsIndexRouteImport.update({
@@ -210,6 +210,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AppIndexRouteImport
       parentRoute: typeof AppRoute
     }
+    '/_app/chats/': {
+      id: '/_app/chats/'
+      path: '/chats'
+      fullPath: '/chats/'
+      preLoaderRoute: typeof AppChatsIndexRouteImport
+      parentRoute: typeof AppRoute
+    }
     '/_app/chats/$id': {
       id: '/_app/chats/$id'
       path: '/chats/$id'
@@ -222,13 +229,6 @@ declare module '@tanstack/react-router' {
       path: '/chats/new'
       fullPath: '/chats/new'
       preLoaderRoute: typeof AppChatsNewRouteImport
-      parentRoute: typeof AppRoute
-    }
-    '/_app/chats/': {
-      id: '/_app/chats/'
-      path: '/chats'
-      fullPath: '/chats/'
-      preLoaderRoute: typeof AppChatsIndexRouteImport
       parentRoute: typeof AppRoute
     }
     '/_app/goals/': {

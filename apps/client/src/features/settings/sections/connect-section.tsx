@@ -1,7 +1,7 @@
-import { configKeys, isApiError, reconnectMcp, setMcpServerEnabled, setMcpToolEnabled, setSkillEnabled, useMcp, useSkills } from "@komo/api";
+import { configKeys, isApiError, reconnectMcp, setMcpServerEnabled, setMcpToolEnabled, setSkillEnabled, startMcpOauth, useMcp, useSkills } from "@komo/api";
 import type { McpServersResponse, McpServerView, SkillsResponse, SkillView } from "@komo/protocol";
 import { useQueryClient } from "@tanstack/react-query";
-import { useState, type ReactNode } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 import { Icon } from "@/components/icon";
 import { BlockError, SkeletonRows } from "@/components/page";
 import { Spinner } from "@/components/spinner";
@@ -70,8 +70,14 @@ export function ConnectSection() {
   );
 }
 
+// 授权会话在 Gateway 里最多挂 10 分钟（LOGIN_TTL），网页的轮询也到此为止
+const LOGIN_WATCH_MS = 10 * 60_000;
+
 function ToolsTable() {
-  const mcp = useMcp();
+  // 点了「登录」的服务器与点时的状态：授权在别的窗口里完成，回调落到 Gateway 后状态才变，所以先一直 2 秒取一次
+  const [login, setLogin] = useState<{ name: string; from: McpServerView["state"] } | null>(null);
+  const [loginLink, setLoginLink] = useState<{ name: string; url: string } | null>(null);
+  const mcp = useMcp({ poll: login !== null });
   const queryClient = useQueryClient();
   const [open, setOpen] = useState<string | null>(null);
   // 正在写的开关（`服务器` 或 `服务器/工具`）与各自的失败原因
@@ -100,6 +106,34 @@ function ToolsTable() {
       setFailure({ key: names[0] ?? "*", text: m.mcp_reconnect_failed({ message: errorText(error) }) });
     }
     setReconnecting("");
+  };
+
+  const watched = login ? mcp.data?.servers.find((s) => s.name === login.name) : undefined;
+  const loginDone = login !== null && (!watched || watched.state !== login.from);
+  useEffect(() => {
+    if (!login) return;
+    if (loginDone) {
+      setLogin(null);
+      setLoginLink(null);
+      return;
+    }
+    const timer = setTimeout(() => setLogin(null), LOGIN_WATCH_MS);
+    return () => clearTimeout(timer);
+  }, [login, loginDone]);
+  const startLogin = async (server: McpServerView) => {
+    setFailure(null);
+    setLoginLink(null);
+    try {
+      const { authorization_url } = await startMcpOauth(server.name);
+      // 新标签打开；桌面壳里 window.open 会交给系统浏览器。被拦了就把地址摆出来让人自己点
+      if (!window.open(authorization_url, "_blank", "noopener,noreferrer") && !window.komoDesktop) {
+        setLoginLink({ name: server.name, url: authorization_url });
+      }
+      setLogin({ name: server.name, from: server.state });
+    } catch (error) {
+      // 没配 public_url 等：Gateway 的原话
+      setFailure({ key: server.name, text: m.mcp_login_failed({ message: errorText(error) }) });
+    }
   };
 
   // 404 = 在跑的 Gateway 早于 GET /v1/mcp：说清楚，别只甩一个状态码
@@ -138,11 +172,14 @@ function ToolsTable() {
             open={open === server.name}
             busy={busy}
             reconnecting={reconnecting === server.name}
+            loggingIn={login?.name === server.name}
+            loginLink={loginLink?.name === server.name ? loginLink.url : null}
             failure={failure?.key.split("/")[0] === server.name ? failure : null}
             onOpen={() => setOpen(open === server.name ? null : server.name)}
             onServer={(next) => void toggle(server.name, () => setMcpServerEnabled(server.name, next))}
             onTool={(tool, next) => void toggle(`${server.name}/${tool}`, () => setMcpToolEnabled(server.name, tool, next))}
             onReconnect={() => void reconnect([server.name])}
+            onLogin={() => void startLogin(server)}
           />
         ))}
       </div>
@@ -162,21 +199,27 @@ function ServerRows({
   open,
   busy,
   reconnecting,
+  loggingIn,
+  loginLink,
   failure,
   onOpen,
   onServer,
   onTool,
   onReconnect,
+  onLogin,
 }: {
   server: McpServerView;
   open: boolean;
   busy: string;
   reconnecting: boolean;
+  loggingIn: boolean;
+  loginLink: string | null;
   failure: { key: string; text: string } | null;
   onOpen: () => void;
   onServer: (next: boolean) => void;
   onTool: (tool: string, next: boolean) => void;
   onReconnect: () => void;
+  onLogin: () => void;
 }) {
   const tools = server.tools ?? [];
   const enabledTools = tools.filter((tool) => tool.enabled).length;
@@ -237,6 +280,14 @@ function ServerRows({
           ) : server.detail ? (
             <Hint bad>{server.detail}</Hint>
           ) : null}
+          {loggingIn && <Hint>{m.mcp_login_waiting()}</Hint>}
+          {loginLink && (
+            <Hint>
+              <a href={loginLink} target="_blank" rel="noopener noreferrer" className="text-primary underline">
+                {m.mcp_login_blocked()}
+              </a>
+            </Hint>
+          )}
           {server.state === "disconnected" && <Hint>{m.mcp_disconnected_hint()}</Hint>}
           {tools.length ? (
             <ul className="mt-1">
@@ -260,7 +311,12 @@ function ServerRows({
             <p className="mt-1 text-label text-muted">{server.state === "connected" ? m.mcp_no_tools() : m.mcp_tools_after_connect()}</p>
           )}
           {server.enabled && (
-            <div className="mt-2 flex justify-end">
+            <div className="mt-2 flex justify-end gap-2">
+              {server.oauth && (server.state === "needs_auth" || server.state === "failed") && (
+                <Button size="sm" variant={server.state === "needs_auth" ? "primary" : "default"} disabled={loggingIn} onClick={onLogin}>
+                  {m.mcp_login()}
+                </Button>
+              )}
               <Button size="sm" disabled={reconnecting} onClick={onReconnect}>
                 {reconnecting ? m.mcp_reconnecting() : server.state === "disconnected" ? m.mcp_connect() : m.mcp_reconnect()}
               </Button>

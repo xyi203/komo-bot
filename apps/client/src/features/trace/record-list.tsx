@@ -43,14 +43,17 @@ export function RecordList({
   model,
   hits,
   ui,
+  compact = false,
 }: {
   trace: Trace;
   model: Overview;
   hits: Set<string> | null;
   ui: TraceUi;
+  /** 窄的容器（过程面板）：token 三列一直收起，只留时间。 */
+  compact?: boolean;
 }) {
   const { range } = ui;
-  const narrow = ui.selected !== null;
+  const narrow = compact || ui.selected !== null;
   const inRange = range
     ? new Set(model.spans.filter((s) => s.row && s.end >= range[0] && s.start <= range[1]).map((s) => s.row!.id))
     : null;
@@ -94,6 +97,7 @@ function TurnHeader({ n, trace, ui, narrow }: { n: number; trace: Trace; ui: Tra
     : "";
   return (
     <div
+      id={`trturn-${n}`}
       className={cn(
         COLS,
         narrow && COLS_NARROW,

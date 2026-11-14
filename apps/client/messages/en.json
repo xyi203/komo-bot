@@ -132,46 +132,15 @@
   "composer_attach_remove": "Remove {name}",
   "composer_attach_uploading": "Uploading {name}",
   "composer_attach_wait": "Attachments are still uploading — send once they're done",
-  "composer_cache": "cache hit {pct}%",
+  "composer_ctx_hint": "Context {pct} used",
   "composer_effort": "Effort",
   "composer_label": "Message komo",
+  "composer_menu": "More",
   "composer_model": "Model",
   "composer_ring": "Context {pct} ({used} / {win})",
   "composer_ring_none": "This conversation has not called the model yet",
-  "composer_running": "Running · {time}",
   "composer_send": "Send",
-  "composer_steps": [
-    {
-      "declarations": [
-        "input count",
-        "local countPlural = count: plural"
-      ],
-      "selectors": [
-        "countPlural"
-      ],
-      "match": {
-        "countPlural=one": "{count} step",
-        "countPlural=other": "{count} steps"
-      }
-    }
-  ],
   "composer_stop": "Stop this turn",
-  "composer_tokens": "{tokens} tok",
-  "composer_turns": [
-    {
-      "declarations": [
-        "input count",
-        "local countPlural = count: plural"
-      ],
-      "selectors": [
-        "countPlural"
-      ],
-      "match": {
-        "countPlural=one": "{count} turn",
-        "countPlural=other": "{count} turns"
-      }
-    }
-  ],
   "config_call_timeout": "Tool call timeout",
   "config_call_timeout_desc": "How long a single tool call may run.",
   "config_check_error": "Couldn't run the config check: {message}.",
@@ -948,35 +917,26 @@
   "pair_missing_code": "This link has no pairing code.",
   "pair_title": "Pair this browser",
   "pair_working": "Pairing…",
-  "palette_close": "Close search",
   "palette_empty_blank": "Nothing here yet.",
-  "palette_empty_memory_hint": "Type a keyword to search memories.",
-  "palette_empty_none": "Nothing found.",
-  "palette_key_close": "Close",
-  "palette_key_open": "Open",
-  "palette_key_select": "Select",
-  "palette_key_type": "Type",
-  "palette_meta_archived": "Archived",
-  "palette_meta_area": "Area",
-  "palette_meta_goal": "Goal",
-  "palette_meta_task": "Task",
-  "palette_placeholder": "Search sessions, matters, memories, schedules",
+  "palette_empty_none": "No results for \"{query}\"",
+  "palette_placeholder": "Search chats and goals",
   "palette_results": "Results",
   "palette_searching": "Searching…",
-  "palette_searching_memory": "Searching memories…",
-  "palette_sec_action": "Actions",
-  "palette_sec_cron": "Schedules",
-  "palette_sec_matter": "Matters",
-  "palette_sec_memory": "Memories",
+  "palette_sec_chats": "Chats",
+  "palette_sec_goals": "Goals",
   "palette_sec_recent": "Recent",
-  "palette_sec_session": "Sessions",
   "palette_title": "Search",
-  "palette_type_all": "All",
-  "palette_type_cron": "Schedules",
-  "palette_type_matter": "Matters",
-  "palette_type_memory": "Memories",
-  "palette_type_session": "Sessions",
-  "palette_types": "Type",
+  "proc_close": "Close process",
+  "proc_empty_steps": "Nothing to show for this turn.",
+  "proc_kids": "Background tasks",
+  "proc_meta": "{time} · {steps} tool calls",
+  "proc_next": "Next turn",
+  "proc_prev": "Previous turn",
+  "proc_tab_changes": "Changes",
+  "proc_tab_steps": "Steps",
+  "proc_tab_trace": "Trace",
+  "proc_title": "Process",
+  "proc_turn_of": "Turn {n} of {total}",
   "recall_brought": "Brought {parts}",
   "recall_conventions": [
     {
@@ -1010,6 +970,22 @@
     }
   ],
   "recall_separator": ", ",
+  "reply_memories": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
+      "match": {
+        "countPlural=one": "Used {count} memory",
+        "countPlural=other": "Used {count} memories"
+      }
+    }
+  ],
+  "reply_view_process": "View process",
   "retry": "Retry",
   "send_failed": "Not sent: {message}",
   "send_sending": "Sending",
@@ -1218,14 +1194,10 @@
   "trace_waiting_model": "Waiting for the model",
   "trace_where_start": "Session start",
   "trace_where_step": "Turn {n} · step {step}",
-  "turn_cancelled": "Stopped after {time}",
   "turn_cancelled_note": "Task stopped",
-  "turn_done": "Done in {time}",
-  "turn_failed": "Failed",
   "turn_failed_note": "This turn failed: {reason}",
   "turn_no_reason": "No reason given",
-  "turn_running": "Running, {time} so far",
-  "turn_spent_suffix": " after {time}",
+  "typing_label": "Typing",
   "unauthorized_body": "Run komo web in a terminal; it opens a one-time link that pairs this browser.",
   "unauthorized_title": "This browser is not paired yet",
   "browser_title": "Browser",

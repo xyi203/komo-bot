@@ -1,25 +1,24 @@
-import { useChats, useInterventions, useMemoryIndex, useModels, useSessionEvents, useSessions, useSessionTree } from "@komo/api";
-import type { InterventionSummary } from "@komo/protocol";
-import { useEffect, useLayoutEffect, useMemo, useRef } from "react";
+import { useChats, useInterventions, useMemoryIndex, useModels, useSessionChanges, useSessionEvents, useSessions, useSessionTree } from "@komo/api";
+import type { InterventionSummary, RunChanges } from "@komo/protocol";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { IconButton } from "@/components/ui/icon-button";
 import { BrowserPane, desktopBrowser, useBrowserOpen } from "@/features/browser/browser-pane";
 import { contextView } from "@/features/composer/context-usage";
 import { Composer } from "@/features/composer/composer";
 import { useSend } from "@/features/composer/use-send";
-import { ConversationProvider, type ConversationContext } from "@/features/conversation/context";
+import { ConversationProvider, type ConversationContext, type ProcessTab } from "@/features/conversation/context";
 import { foldEvents } from "@/features/conversation/model";
 import { Thread } from "@/features/conversation/thread";
+import { ProcessPanel } from "@/features/process/process-panel";
 import { isArchived, isLive } from "@/features/sessions/model";
 import { sessionTitle } from "@/features/sessions/title";
+import { useTraceUi } from "@/features/trace/state";
 import { errorText } from "@/lib/errors";
 import { setStreamStatus } from "@/lib/stream-status";
 import { cn } from "@/lib/utils";
 import { m } from "@/paraglide/messages.js";
 import { ChatLayout, SkeletonThread } from "./chat-layout";
 
-// 过程面板（步骤、改动、轨迹）下一步接上：在那之前对话里不显示每轮的改动卡片，也没有"查看"按钮。
-const NO_CHANGES: ConversationContext["changes"] = new Map();
-const NO_REVIEW = () => {};
 const NO_INTERVENTIONS: readonly InterventionSummary[] = [];
 
 /**
@@ -38,6 +37,8 @@ function SessionBody({ sessionId, main }: { sessionId: string; main: boolean }) 
   const { events, status, error, delta, stream, reload } = useSessionEvents(sessionId);
   const tree = useSessionTree(sessionId);
   const models = useModels();
+  const changesQuery = useSessionChanges(sessionId);
+  const trace = useTraceUi();
   const browserApi = desktopBrowser();
   const [browserOpen, setBrowserOpen] = useBrowserOpen();
   const showBrowser = !!browserApi && browserOpen;
@@ -60,11 +61,35 @@ function SessionBody({ sessionId, main }: { sessionId: string; main: boolean }) 
     document.title = `${name} · ${m.app_name()}`;
   }, [name]);
 
+  // 过程面板：开着、看哪一轮、哪个标签。换对话整页重挂，状态跟着清掉
+  const [panel, setPanel] = useState<{ run: string; tab: ProcessTab } | null>(null);
+  const changes = useMemo(() => new Map((changesQuery.data?.runs ?? []).map((r): [string, RunChanges] => [r.run, r])), [changesQuery.data]);
+  const [openFiles, setOpenFiles] = useState<Record<string, boolean>>({});
+  const [reviewAt, setReviewAt] = useState<string | null>(null);
+  const openProcess = useCallback((run: string, tab: ProcessTab = "steps") => setPanel({ run, tab }), []);
+  const inspect = useCallback(
+    (resultEvent: string) => {
+      setPanel((prev) => prev && { ...prev, tab: "trace" });
+      trace.setRange(null);
+      trace.select(resultEvent, true);
+      requestAnimationFrame(() => requestAnimationFrame(() => document.getElementById(`tr-${resultEvent}`)?.scrollIntoView({ block: "center" })));
+    },
+    [trace],
+  );
+  const review = useCallback(
+    (run: string, index: number) => {
+      setOpenFiles((previous) => ({ ...previous, [`${run}:${index}`]: true }));
+      setReviewAt(`cg-${run}-${index}`);
+      setPanel({ run, tab: "changes" });
+    },
+    [],
+  );
+
   // 全部未答复的介入：投进对话的提问按句柄认领自己那条（`ReplyView`）
   const interventions = pendingInterventions.data?.interventions ?? NO_INTERVENTIONS;
   const conversation = useMemo<ConversationContext>(
-    () => ({ memories, changes: NO_CHANGES, review: NO_REVIEW, interventions }),
-    [memories, interventions],
+    () => ({ memories, changes, processRun: panel?.run ?? null, openProcess, inspect, review, interventions }),
+    [memories, changes, panel?.run, openProcess, inspect, review, interventions],
   );
 
   // 滚动：对话在底部时跟着长；第一次出内容落到底
@@ -81,7 +106,9 @@ function SessionBody({ sessionId, main }: { sessionId: string; main: boolean }) 
   }, [view, delta, pending]);
 
   const ready = status === "ready" && !archived;
-  const busy = (view?.runs.size ?? 0) > 0;
+  // 「正在输入」只给真在跑的 Run；停住等你答复的（`waiting`）由投进对话的提问和对话列的黄点表示
+  const busy = [...(view?.runs.values() ?? [])].some((run) => !run.waiting);
+  const closePanel = () => setPanel(null);
   return (
     <ConversationProvider value={conversation}>
       <ChatLayout
@@ -102,19 +129,42 @@ function SessionBody({ sessionId, main }: { sessionId: string; main: boolean }) 
           )
         }
         aside={showBrowser && browserApi ? <BrowserPane api={browserApi} sessionId={sessionId} onClose={() => setBrowserOpen(false)} /> : undefined}
+        panel={
+          panel && view && events ? (
+            <ProcessPanel
+              view={view}
+              events={events}
+              tree={tree.data}
+              memories={memories}
+              run={panel.run}
+              tab={panel.tab}
+              changes={changes}
+              changesUi={{
+                open: openFiles,
+                toggle: (key, current) => setOpenFiles((previous) => ({ ...previous, [key]: !current })),
+                reviewAt,
+                clearReviewAt: () => setReviewAt(null),
+              }}
+              trace={trace}
+              kids={kids}
+              delta={!!delta}
+              onTab={(tab) => setPanel({ ...panel, tab })}
+              onRun={(run) => setPanel({ ...panel, run })}
+              onClose={closePanel}
+            />
+          ) : undefined
+        }
         composer={
           <Composer
             sessionId={sessionId}
-            view={view}
+            main={main}
             context={context}
-            busy={busy}
             disabled={!ready}
             archived={archived}
             onSend={(text, options) => {
               atBottom.current = true;
               send(text, options);
             }}
-            onStop={stop}
           />
         }
       >
@@ -128,7 +178,7 @@ function SessionBody({ sessionId, main }: { sessionId: string; main: boolean }) 
             </button>
           </div>
         ) : (
-          view && <Thread view={view} delta={delta} pending={pending} kids={kids} isHome={main} onRetry={retry} />
+          view && <Thread view={view} delta={delta} pending={pending} kids={kids} isHome={main} busy={busy} onStop={stop} onRetry={retry} />
         )}
       </ChatLayout>
     </ConversationProvider>

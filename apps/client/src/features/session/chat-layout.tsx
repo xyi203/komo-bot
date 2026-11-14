@@ -1,4 +1,5 @@
 import type { ReactNode, RefObject } from "react";
+import { cn } from "@/lib/utils";
 
 /**
  * 对话页的外框：顶上居中的头像（Komo 标志）与名字，正文区，下面的输入框；`aside` 是桌面壳的内置浏览器（有才出现）。
@@ -9,6 +10,7 @@ export function ChatLayout({
   scroller,
   onScroll,
   aside,
+  panel,
   corner,
   composer,
   children,
@@ -17,13 +19,26 @@ export function ChatLayout({
   scroller?: RefObject<HTMLDivElement | null>;
   onScroll?: (el: HTMLDivElement) => void;
   aside?: ReactNode;
+  /** 过程面板（有才出现）：宽 380 占一列；≤1180 时面板自己浮在上面，不占列。 */
+  panel?: ReactNode;
   /** 右上角的小按钮（桌面壳的浏览器开关）。 */
   corner?: ReactNode;
   composer: ReactNode;
   children: ReactNode;
 }) {
   return (
-    <div className={aside ? "grid h-full min-h-0 grid-cols-[minmax(0,1fr)_minmax(0,1fr)] overflow-hidden" : "grid h-full min-h-0 grid-cols-[minmax(0,1fr)] overflow-hidden"}>
+    <div
+      className={cn(
+        "grid h-full min-h-0 overflow-hidden",
+        aside
+          ? panel
+            ? "grid-cols-[minmax(0,1fr)_minmax(0,1fr)_380px] max-[1180px]:grid-cols-[minmax(0,1fr)_minmax(0,1fr)]"
+            : "grid-cols-[minmax(0,1fr)_minmax(0,1fr)]"
+          : panel
+            ? "grid-cols-[minmax(0,1fr)_380px] max-[1180px]:grid-cols-[minmax(0,1fr)]"
+            : "grid-cols-[minmax(0,1fr)]",
+      )}
+    >
       <div className="relative flex min-h-0 min-w-0 flex-col">
         <div aria-hidden="true" className="pointer-events-none absolute inset-x-0 top-0 z-10 h-18 bg-linear-to-b from-surface from-30% to-transparent" />
         <header className="pointer-events-none absolute top-2.5 left-1/2 z-20 flex max-w-[60%] -translate-x-1/2 flex-col items-center gap-0.5">
@@ -47,6 +62,7 @@ export function ChatLayout({
         {composer}
       </div>
       {aside}
+      {panel}
     </div>
   );
 }

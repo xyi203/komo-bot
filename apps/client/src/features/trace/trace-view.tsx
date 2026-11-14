@@ -21,18 +21,31 @@ export function TraceView({
   tree,
   memories,
   ui,
+  focusRun,
+  compact = false,
 }: {
   events: readonly WireEvent[];
   liveRuns: ReadonlyMap<string, unknown>;
   tree: SessionTree | undefined;
   memories: ReadonlyMap<string, MemoryBrief>;
   ui: TraceUi;
+  /** 过程面板里开着时：滚到这一轮的轮头。 */
+  focusRun?: string;
+  /** 窄的容器（过程面板，380 宽）：单列，详情挪到记录表上面成一块，不吸顶也不从底下升起。 */
+  compact?: boolean;
 }) {
   const now = useNow(liveRuns.size > 0);
   const trace = useMemo(() => traceOf(events, liveRuns, tree, memories), [events, liveRuns, tree, memories]);
   const overview = useMemo(() => traceSpans(trace, ui.byDuration, now), [trace, ui.byDuration, now]);
   const hits = useMemo(() => searchHits(trace, ui.query), [trace, ui.query]);
   const picked = trace.rows.find((r) => r.id === ui.selected);
+
+  const focusN = focusRun ? trace.runs.get(focusRun)?.n : undefined;
+  useEffect(() => {
+    if (!focusN) return;
+    const frame = requestAnimationFrame(() => document.getElementById(`trturn-${focusN}`)?.scrollIntoView({ block: "start" }));
+    return () => cancelAnimationFrame(frame);
+  }, [focusN]);
 
   // Esc：先清掉概览上的区间，再关详情
   const { range, selected, setRange, select } = ui;
@@ -57,7 +70,7 @@ export function TraceView({
 
   return (
     <div className="pt-1">
-      <div className="mb-1.5 flex items-center gap-3 max-[600px]:flex-wrap">
+      <div className={cn("mb-1.5 flex items-center gap-3 max-[600px]:flex-wrap", compact && "flex-wrap gap-y-1.5")}>
         <div role="toolbar" aria-label={m.trace_toolbar()} className="flex gap-0.5">
           <ToolButton
             icon="clock"
@@ -84,7 +97,7 @@ export function TraceView({
             {m.trace_toolbar_calls()}
           </ToolButton>
         </div>
-        <label className="ml-auto flex h-7.5 w-55 items-center gap-1.5 rounded-control px-2.5 text-faint shadow-ring-control focus-within:shadow-[0_0_0_1px_var(--color-muted)] max-[600px]:w-full">
+        <label className={cn("ml-auto flex h-7.5 w-55 items-center gap-1.5 rounded-control px-2.5 text-faint shadow-ring-control focus-within:shadow-[0_0_0_1px_var(--color-muted)] max-[600px]:w-full", compact && "ml-0 w-full")}>
           <Icon name="search" className="size-3.5" />
           <span className="sr-only">{m.trace_search_label()}</span>
           <input
@@ -106,9 +119,19 @@ export function TraceView({
         onSelect={pick}
         onRange={ui.setRange}
       />
-      <div className={cn("grid items-start gap-4 pl-5.5 max-[600px]:pl-4.5", picked ? "grid-cols-[minmax(0,1fr)_minmax(320px,400px)] max-[900px]:grid-cols-1" : "grid-cols-1")}>
-        <RecordList trace={trace} model={overview} hits={hits} ui={ui} />
-        {picked && (
+      <div
+        className={cn(
+          "grid items-start gap-4 pl-5.5 max-[600px]:pl-4.5",
+          compact ? "grid-cols-1" : picked ? "grid-cols-[minmax(0,1fr)_minmax(320px,400px)] max-[900px]:grid-cols-1" : "grid-cols-1",
+        )}
+      >
+        {compact && picked && (
+          <aside aria-label={m.trace_detail_aside()} className="-ml-5.5 flex max-h-[60vh] flex-col overflow-hidden rounded-card bg-surface shadow-lift max-[600px]:-ml-4.5">
+            <TraceDetail key={picked.id} row={picked} trace={trace} ui={ui} />
+          </aside>
+        )}
+        <RecordList trace={trace} model={overview} hits={hits} ui={ui} compact={compact} />
+        {!compact && picked && (
           <aside
             aria-label={m.trace_detail_aside()}
             className="sticky top-2 mt-2 flex max-h-[calc(100vh-220px)] flex-col overflow-hidden rounded-card bg-surface shadow-lift max-[900px]:fixed max-[900px]:inset-x-0 max-[900px]:top-auto max-[900px]:bottom-0 max-[900px]:z-20 max-[900px]:mt-0 max-[900px]:max-h-[70vh] max-[900px]:rounded-b-none max-[900px]:rounded-t-[16px] max-[900px]:shadow-[0_0_0_1px_rgb(0_0_0/0.12),0_-8px_24px_rgb(0_0_0/0.12)]"

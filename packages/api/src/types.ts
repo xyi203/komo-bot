@@ -27,3 +27,14 @@ export interface SessionTree {
   entries: TreeEntry[];
   leafId: string | null;
 }
+
+/** `GET /v1/session-search` 的一个命中会话（kernel 的 `SessionSearchHit`，还没生成 TS 类型；字段按搜索弹窗用到的写）。 */
+export interface SessionSearchHit {
+  session: string;
+  title: string;
+  /** `main` / `normal` / `task`。 */
+  kind: string;
+  matched_at: string;
+  /** 最近几条命中的片段（`用户：…` / `助手：…`），新的在前。 */
+  snippets: string[];
+}

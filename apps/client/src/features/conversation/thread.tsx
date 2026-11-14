@@ -20,13 +20,18 @@ export interface PendingSend {
   error?: string;
 }
 
-/** 对话标签页：按轮排下来，末尾是还没确认收到的待发气泡和这段对话派出、还在跑的任务会话。 */
+/**
+ * 对话正文：按轮排下来，末尾是还没确认收到的待发气泡、"正在输入"（有 Run 在跑时，带停止）和这段对话派出、还在跑的任务会话。
+ * 回复下的悬停工具最后一条常显（没有 Run 在跑时）。
+ */
 export function Thread({
   view,
   delta,
   pending,
   kids,
   isHome,
+  busy,
+  onStop,
   onRetry,
 }: {
   view: View;
@@ -34,10 +39,14 @@ export function Thread({
   pending: readonly PendingSend[];
   kids: readonly SessionSummary[];
   isHome: boolean;
+  /** 这段对话此刻有 Run 在跑：末尾画"正在输入"。 */
+  busy: boolean;
+  /** 取消当前的 Run；不给就没有停止按钮。 */
+  onStop?: () => void;
   onRetry: (id: string) => void;
 }) {
-  const lastTurn = [...view.items].reverse().find((item) => item.kind === "turn");
-  const lastReply = [...view.items].reverse().find((item) => item.kind === "reply");
+  // 最后一条 Komo 的话（一轮的回复或投进来的话）：它下面的工具常显
+  const lastSpoken = [...view.items].reverse().find((item) => (item.kind === "turn" && item.answer) || item.kind === "reply");
   const empty = !view.items.length && !pending.length && !view.runs.size;
   const now = useNow(kids.length > 0);
   return (
@@ -49,9 +58,9 @@ export function Thread({
         </div>
       )}
       {view.items.map((item) => {
-        if (item.kind === "turn") return <TurnView key={item.id} turn={item} delta={delta} last={item === lastTurn} />;
+        if (item.kind === "turn") return <TurnView key={item.id} turn={item} delta={delta} always={item === lastSpoken && !busy} />;
         if (item.kind === "user") return <UserBubble key={item.id} text={item.text} at={item.at} standalone />;
-        if (item.kind === "reply") return <ReplyView key={item.id} text={item.text} at={item.at} last={item === lastReply} intervention={item.intervention} />;
+        if (item.kind === "reply") return <ReplyView key={item.id} text={item.text} always={item === lastSpoken && !busy} intervention={item.intervention} />;
         return (
           <p key={item.id} className="mb-3.5 text-label text-muted">
             {m.thread_compacted()}
@@ -85,6 +94,7 @@ export function Thread({
           </div>
         );
       })}
+      {busy && <Typing onStop={onStop} />}
       {kids.map((kid) => (
         <Link
           key={kid.session}
@@ -99,5 +109,29 @@ export function Thread({
         </Link>
       ))}
     </>
+  );
+}
+
+/** "正在输入"：三点动画，旁边一个小的停止按钮（取消当前的 Run）。 */
+function Typing({ onStop }: { onStop?: () => void }) {
+  return (
+    <div role="status" aria-label={m.typing_label()} className="mb-5 flex items-center gap-3 py-2.5">
+      <span aria-hidden="true" className="flex gap-1">
+        {[0, 1, 2].map((i) => (
+          <i key={i} className="size-1.5 animate-breathe rounded-full bg-control" style={{ animationDelay: `${i * 0.2}s` }} />
+        ))}
+      </span>
+      {onStop && (
+        <button
+          type="button"
+          aria-label={m.composer_stop()}
+          title={m.composer_stop()}
+          onClick={onStop}
+          className="grid size-6 cursor-pointer place-items-center rounded-full text-muted shadow-ring transition-colors hover:bg-hover-on-white hover:text-text"
+        >
+          <Icon name="stop" solid className="size-2.5" />
+        </button>
+      )}
+    </div>
   );
 }

@@ -3,7 +3,16 @@ import { useLayoutEffect, useRef, useState, type ClipboardEvent, type DragEvent,
 import { Icon } from "@/components/icon";
 import { ImageZoom } from "@/components/image-zoom";
 import { Spinner } from "@/components/spinner";
-import type { View } from "@/features/conversation/model";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuRadioGroup,
+  DropdownMenuRadioItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import { pctOf, pctText, type ContextView } from "./context-usage";
 import { formatTokens } from "@/lib/format";
 import { showToast } from "@/lib/toast";
@@ -17,30 +26,30 @@ import type { SendOptions } from "./use-send";
 // 模型与 effort 的选择在会话之间保留（原型里它们是页面上唯一的两个 <select>，换会话不重置），刷新后回到默认。
 let chosen: { model: string | null; effort: string } = { model: null, effort: "" };
 
+/** 上下文占用到这个比例（%）就在输入框旁出小提示。 */
+const CONTEXT_WARN = 80;
+
 /**
- * 输入框（docs/web.md §5）：加号（选图片或文件）、一行文字、发送；会话有 Run 在跑且输入为空时发送键变停止，输入了文字则是插话。
- * 图片与文件也可以直接粘贴或拖进来：先传给 Gateway，发送时把每个附件的那行说明拼在文字前面（附件不进消息结构）。
- * 框下：左边用量行（轮数、步数、tok、缓存命中；跑着时是计时），右边模型、effort 与上下文环。
- * 没发出去的文字和附件按会话留着（`draft.ts`、`use-attachments.ts`）：切页、换会话再回来不丢。
+ * 输入框（docs/web.md §5）：加号、一行文字、发送，别的都收进加号菜单（docs/redesign.md P15）。
+ * 支线对话的加号是一个菜单：添加附件、模型、effort、上下文占用；主对话的加号就是添加附件（只有这一项，不开菜单）。
+ * 上下文占用到 80% 时输入框旁出一个小提示。图片与文件也可以直接粘贴或拖进来：先传给 Gateway，发送时把每个附件的那行说明拼在文字前面。
+ * 有 Run 在跑时发送就是插话；停止在对话末尾的"正在输入"旁。没发出去的文字和附件按会话留着（`draft.ts`、`use-attachments.ts`）。
  */
 export function Composer({
   sessionId,
-  view,
+  main,
   context,
-  busy,
   disabled,
   archived,
   onSend,
-  onStop,
 }: {
   sessionId: string;
-  view: View | undefined;
+  /** 主对话：加号只有添加附件，模型不在这里选（去设置改默认模型）。 */
+  main: boolean;
   context: ContextView;
-  busy: boolean;
   disabled: boolean;
   archived: boolean;
   onSend: (text: string, options: SendOptions) => void;
-  onStop: () => void;
 }) {
   const [text, setText] = useDraftText(sessionId);
   const area = useRef<HTMLTextAreaElement>(null);
@@ -55,12 +64,12 @@ export function Composer({
   }, []);
   const models = useModels().data;
   const [pick, setPick] = useState(chosen);
-  const showStop = busy && !text.trim() && drafts.length === 0;
 
   const defaultModel = models?.find((x) => x.default) ?? models?.[0];
   const current = models?.find((x) => x.id === (pick.model ?? defaultModel?.id)) ?? defaultModel;
   const efforts = current?.efforts ?? [];
   const effort = efforts.includes(pick.effort) ? pick.effort : "";
+  const warn = context.measured && context.win > 0 && pctOf(context.total, context.win) >= CONTEXT_WARN;
   const choose = (next: typeof chosen) => {
     chosen = next;
     setPick(next);
@@ -73,7 +82,7 @@ export function Composer({
     if (drafts.some((d) => d.state === "failed")) return showToast(m.composer_attach_blocked());
     // 说明在前、用户的话在后
     const body = [...drafts.map((d) => d.note ?? ""), text.trim() ? text : ""].filter(Boolean).join("\n");
-    onSend(body, {
+    onSend(body, main ? {} : {
       // 选的就是默认模型时不带 model，让 Gateway 用当前快照的主模型
       ...(current && current.id !== defaultModel?.id ? { model: current.id } : {}),
       ...(effort ? { effort } : {}),
@@ -125,16 +134,63 @@ export function Composer({
               event.target.value = "";
             }}
           />
-          <button
-            type="button"
-            aria-label={m.composer_attach()}
-            title={m.composer_attach()}
-            disabled={disabled}
-            onClick={() => picker.current?.click()}
-            className="grid size-8 shrink-0 cursor-pointer place-items-center rounded-full text-text transition-colors hover:bg-hover-on-white disabled:cursor-not-allowed disabled:opacity-35 max-[600px]:m-1.5"
-          >
-            <Icon name="plus" />
-          </button>
+          {main ? (
+            <button
+              type="button"
+              aria-label={m.composer_attach()}
+              title={m.composer_attach()}
+              disabled={disabled}
+              onClick={() => picker.current?.click()}
+              className={plusClass}
+            >
+              <Icon name="plus" />
+            </button>
+          ) : (
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <button type="button" aria-label={m.composer_menu()} title={m.composer_menu()} disabled={disabled} className={plusClass}>
+                  <Icon name="plus" />
+                </button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="start" side="top" sideOffset={8}>
+                <DropdownMenuItem onSelect={() => picker.current?.click()}>
+                  <Icon name="file" className="size-4 text-muted" />
+                  {m.composer_attach()}
+                </DropdownMenuItem>
+                {models && models.length > 0 && (
+                  <>
+                    <DropdownMenuSeparator />
+                    <DropdownMenuLabel>{m.composer_model()}</DropdownMenuLabel>
+                    <DropdownMenuRadioGroup value={current?.id ?? ""} onValueChange={(id) => choose({ model: id, effort: "" })}>
+                      {models.map((model) => (
+                        <DropdownMenuRadioItem key={model.id} value={model.id}>
+                          <span className="truncate">{modelLabel(model.name || model.id)}</span>
+                        </DropdownMenuRadioItem>
+                      ))}
+                    </DropdownMenuRadioGroup>
+                    {efforts.length > 0 && (
+                      <>
+                        <DropdownMenuLabel>{m.composer_effort()}</DropdownMenuLabel>
+                        <DropdownMenuRadioGroup value={effort} onValueChange={(value) => choose({ ...pick, effort: value })}>
+                          <DropdownMenuRadioItem value="">{m.effort_default()}</DropdownMenuRadioItem>
+                          {efforts.map((value) => (
+                            <DropdownMenuRadioItem key={value} value={value}>
+                              {effortLabel(value)}
+                            </DropdownMenuRadioItem>
+                          ))}
+                        </DropdownMenuRadioGroup>
+                      </>
+                    )}
+                  </>
+                )}
+                <DropdownMenuSeparator />
+                <div className="flex items-center gap-2 px-2.5 py-1.5 text-label text-muted">
+                  <ContextRing context={context} />
+                  <span className="min-w-0 truncate tabular-nums">{ringLabel(context)}</span>
+                </div>
+              </DropdownMenuContent>
+            </DropdownMenu>
+          )}
           <label className="sr-only" htmlFor="composer-input">
             {m.composer_label()}
           </label>
@@ -154,65 +210,26 @@ export function Composer({
             onPaste={onPaste}
             className="max-h-60 min-h-8 min-w-0 flex-1 resize-none bg-transparent px-1 py-1.5 text-read leading-5 text-text outline-none placeholder:text-faint max-[600px]:min-h-11 max-[600px]:py-3"
           />
-          {showStop ? (
-            <button
-              type="button"
-              aria-label={m.composer_stop()}
-              title={m.composer_stop()}
-              onClick={onStop}
-              className="grid size-8 shrink-0 cursor-pointer place-items-center rounded-full bg-primary text-white transition-[transform,opacity] hover:opacity-90 active:scale-95 max-[600px]:m-1.5"
-            >
-              <Icon name="stop" solid />
-            </button>
-          ) : (
-            <button
-              type="submit"
-              aria-label={m.composer_send()}
-              title={m.composer_send()}
-              disabled={disabled}
-              className={cn(
-                "grid size-8 shrink-0 cursor-pointer place-items-center rounded-full bg-primary text-white transition-[transform,opacity] hover:opacity-90 active:scale-95 max-[600px]:m-1.5",
-                disabled && "cursor-not-allowed opacity-35",
-              )}
-            >
-              <Icon name="up" />
-            </button>
+          {warn && (
+            <span role="img" aria-label={ringLabel(context)} title={ringLabel(context)} className="flex h-8 shrink-0 items-center gap-1.5 text-small text-accent tabular-nums">
+              <ContextRing context={context} />
+              {m.composer_ctx_hint({ pct: pctText(context.total, context.win) })}
+            </span>
           )}
+          <button
+            type="submit"
+            aria-label={m.composer_send()}
+            title={m.composer_send()}
+            disabled={disabled}
+            className={cn(
+              "grid size-8 shrink-0 cursor-pointer place-items-center rounded-full bg-primary text-white transition-[transform,opacity] hover:opacity-90 active:scale-95 max-[600px]:m-1.5",
+              disabled && "cursor-not-allowed opacity-35",
+            )}
+          >
+            <Icon name="up" />
+          </button>
         </div>
       </form>
-      <div className="mx-auto mt-1 flex h-7 max-w-180 items-center gap-2 px-2 text-label text-muted max-[600px]:justify-end">
-        <UsageLine view={view} />
-        {models && models.length > 0 && (
-          <>
-            <select
-              aria-label={m.composer_model()}
-              value={current?.id ?? ""}
-              onChange={(event) => choose({ model: event.target.value, effort: "" })}
-              className={cn(pickClass, "ml-auto text-text max-[600px]:ml-0")}
-            >
-              {models.map((model) => (
-                <option key={model.id} value={model.id}>
-                  {modelLabel(model.name || model.id)}
-                </option>
-              ))}
-            </select>
-            <select
-              aria-label={m.composer_effort()}
-              value={effort}
-              onChange={(event) => choose({ ...pick, effort: event.target.value })}
-              className={cn(pickClass, "-ml-1")}
-            >
-              <option value="">{m.effort_default()}</option>
-              {efforts.map((value) => (
-                <option key={value} value={value}>
-                  {effortLabel(value)}
-                </option>
-              ))}
-            </select>
-          </>
-        )}
-        <ContextRing context={context} className={cn(!(models && models.length > 0) && "ml-auto")} />
-      </div>
     </div>
   );
 }
@@ -264,50 +281,26 @@ function DraftList({ drafts, onRemove }: { drafts: readonly Draft[]; onRemove: (
   );
 }
 
-const pickClass =
-  "h-6 min-w-0 max-w-40 cursor-pointer truncate rounded-sm border-0 bg-transparent px-1 text-label hover:bg-hover-on-white max-[600px]:max-w-32";
+const plusClass =
+  "grid size-8 shrink-0 cursor-pointer place-items-center rounded-full text-text transition-colors hover:bg-hover-on-white disabled:cursor-not-allowed disabled:opacity-35 max-[600px]:m-1.5";
 
-/**
- * 左边的用量行："N 轮 M 步 · 4.4M tok · 缓存命中 95%"（从 `message.assistant` 的用量累加）。
- * 跑着时也是这一行：转圈与计时只在这一轮的抬头（turn.tsx），这里不再重复一份。
- */
-function UsageLine({ view }: { view: View | undefined }) {
-  const turns = view?.turns.size ?? 0;
-  if (!view || !turns) return <span className="max-[600px]:hidden" />;
-  const { stats } = view;
-  const hit = stats.input ? Math.round((stats.cache / stats.input) * 100) : null;
-  return (
-    <span className="inline-flex min-w-0 items-center gap-1 overflow-hidden whitespace-nowrap tabular-nums max-[600px]:hidden">
-      {m.composer_turns({ count: turns })} {m.composer_steps({ count: stats.steps })}
-      <Sep />
-      {m.composer_tokens({ tokens: formatTokens(stats.input + stats.output) })}
-      {hit != null && (
-        <>
-          <Sep />
-          {m.composer_cache({ pct: hit })}
-        </>
-      )}
-    </span>
-  );
+/** 上下文占用的一句话：`上下文 12%（24k / 200k）`；还没请求过模型时写明。 */
+function ringLabel({ total, win, measured }: ContextView): string {
+  const used = measured ? total : 0;
+  return used ? m.composer_ring({ pct: win ? pctText(used, win) : "—", used: formatTokens(used), win: win ? formatTokens(win) : "?" }) : m.composer_ring_none();
 }
 
-const Sep = () => <span className="mx-1.5 text-faint">·</span>;
-
-/** 上下文环：上一次请求的 input_tokens ÷ 模型窗口，与右栏"上下文"同一个数。 */
-function ContextRing({ context, className }: { context: ContextView; className?: string }) {
+/** 上下文环：上一次请求的 input_tokens ÷ 模型窗口。 */
+function ContextRing({ context }: { context: ContextView }) {
   const { total, win, measured } = context;
   const used = measured ? total : 0;
   const pct = win && used ? Math.min(100, pctOf(used, win)) : 0;
   const r = 6;
   const len = 2 * Math.PI * r;
-  const label = used ? m.composer_ring({ pct: win ? pctText(used, win) : "—", used: formatTokens(used), win: win ? formatTokens(win) : "?" }) : m.composer_ring_none();
   return (
-    <span role="img" aria-label={label} title={label} className={cn("inline-flex items-center gap-1.25 tabular-nums", className)}>
-      <svg viewBox="0 0 16 16" aria-hidden="true" className="size-4 -rotate-90 fill-none [&_circle]:stroke-[2.2]">
-        <circle cx="8" cy="8" r={r} className="stroke-active" />
-        <circle cx="8" cy="8" r={r} strokeLinecap="round" className="stroke-accent" strokeDasharray={`${(len * pct) / 100} ${len}`} />
-      </svg>
-      <span>{used ? (win ? pctText(used, win) : "—") : "—"}</span>
-    </span>
+    <svg viewBox="0 0 16 16" aria-hidden="true" className="size-4 shrink-0 -rotate-90 fill-none [&_circle]:stroke-[2.2]">
+      <circle cx="8" cy="8" r={r} className="stroke-active" />
+      <circle cx="8" cy="8" r={r} strokeLinecap="round" className="stroke-accent" strokeDasharray={`${(len * pct) / 100} ${len}`} />
+    </svg>
   );
 }

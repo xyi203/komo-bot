@@ -69,8 +69,8 @@ function groupTitle(seg: Extract<Segment, { kind: "steps" }>, live: boolean) {
 }
 
 /** 过程组：组头是类别图标加活动摘要，悬停或展开时图标换成箭头；默认收起，展开后限高自己滚。 */
-export function StepsFold({ seg, live }: { seg: Extract<Segment, { kind: "steps" }>; live: boolean }) {
-  const [open, setOpen] = useState(false);
+export function StepsFold({ seg, live, defaultOpen = false }: { seg: Extract<Segment, { kind: "steps" }>; live: boolean; defaultOpen?: boolean }) {
+  const [open, setOpen] = useState(defaultOpen);
   const failed = seg.steps.filter((x) => x.kind === "call" && callBad(x.call)).length;
   const title = groupTitle(seg, live);
   return (
@@ -179,7 +179,7 @@ function CallCard({ call }: { call: Call }) {
           </p>
         )}
       </div>
-      {inspect && call.resultEvent && (
+      {call.resultEvent && (
         <button
           type="button"
           onClick={() => inspect(call.resultEvent!)}

@@ -132,46 +132,15 @@
   "composer_attach_remove": "移除 {name}",
   "composer_attach_uploading": "{name} 正在上传",
   "composer_attach_wait": "附件还在上传，传完再发",
-  "composer_cache": "缓存命中 {pct}%",
+  "composer_ctx_hint": "上下文已用 {pct}",
   "composer_effort": "推理强度",
   "composer_label": "发给 komo",
+  "composer_menu": "更多",
   "composer_model": "模型",
   "composer_ring": "上下文 {pct}（{used} / {win}）",
   "composer_ring_none": "这段对话还没有请求过模型",
-  "composer_running": "正在跑 · {time}",
   "composer_send": "发送",
-  "composer_steps": [
-    {
-      "declarations": [
-        "input count",
-        "local countPlural = count: plural"
-      ],
-      "selectors": [
-        "countPlural"
-      ],
-      "match": {
-        "countPlural=one": "{count} 步",
-        "countPlural=other": "{count} 步"
-      }
-    }
-  ],
   "composer_stop": "停止这一轮",
-  "composer_tokens": "{tokens} tok",
-  "composer_turns": [
-    {
-      "declarations": [
-        "input count",
-        "local countPlural = count: plural"
-      ],
-      "selectors": [
-        "countPlural"
-      ],
-      "match": {
-        "countPlural=one": "{count} 轮",
-        "countPlural=other": "{count} 轮"
-      }
-    }
-  ],
   "config_call_timeout": "工具调用时限",
   "config_call_timeout_desc": "一次工具调用最长跑多久。",
   "config_check_error": "配置检查没取到：{message}。",
@@ -940,35 +909,26 @@
   "pair_missing_code": "这个链接里没有配对码。",
   "pair_title": "配对浏览器",
   "pair_working": "正在配对…",
-  "palette_close": "关闭搜索",
   "palette_empty_blank": "这里还没有东西。",
-  "palette_empty_memory_hint": "输入关键词检索记忆。",
-  "palette_empty_none": "没有找到。",
-  "palette_key_close": "关闭",
-  "palette_key_open": "打开",
-  "palette_key_select": "选择",
-  "palette_key_type": "换类型",
-  "palette_meta_archived": "已归档",
-  "palette_meta_area": "领域",
-  "palette_meta_goal": "目标",
-  "palette_meta_task": "子任务",
-  "palette_placeholder": "搜索会话、事项、记忆、定时",
+  "palette_empty_none": "没有找到「{query}」",
+  "palette_placeholder": "搜索对话、目标",
   "palette_results": "结果",
   "palette_searching": "正在检索……",
-  "palette_searching_memory": "正在检索记忆……",
-  "palette_sec_action": "动作",
-  "palette_sec_cron": "定时",
-  "palette_sec_matter": "事项",
-  "palette_sec_memory": "记忆",
+  "palette_sec_chats": "对话",
+  "palette_sec_goals": "目标",
   "palette_sec_recent": "最近",
-  "palette_sec_session": "会话",
   "palette_title": "搜索",
-  "palette_type_all": "全部",
-  "palette_type_cron": "定时",
-  "palette_type_matter": "事项",
-  "palette_type_memory": "记忆",
-  "palette_type_session": "会话",
-  "palette_types": "类型",
+  "proc_close": "关闭过程",
+  "proc_empty_steps": "这一轮没有过程可看。",
+  "proc_kids": "后台任务",
+  "proc_meta": "用时 {time} · 调用 {steps} 次",
+  "proc_next": "下一轮",
+  "proc_prev": "上一轮",
+  "proc_tab_changes": "改动",
+  "proc_tab_steps": "步骤",
+  "proc_tab_trace": "轨迹",
+  "proc_title": "过程",
+  "proc_turn_of": "第 {n} 轮 / 共 {total} 轮",
   "recall_brought": "带上 {parts}",
   "recall_conventions": [
     {
@@ -1002,6 +962,22 @@
     }
   ],
   "recall_separator": "、",
+  "reply_memories": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
+      "match": {
+        "countPlural=one": "用上了 {count} 条记忆",
+        "countPlural=other": "用上了 {count} 条记忆"
+      }
+    }
+  ],
+  "reply_view_process": "看过程",
   "retry": "重试",
   "send_failed": "没发出去：{message}",
   "send_sending": "发送中",
@@ -1210,14 +1186,10 @@
   "trace_waiting_model": "等模型回话",
   "trace_where_start": "会话开始",
   "trace_where_step": "第 {n} 轮 · 第 {step} 步",
-  "turn_cancelled": "已停止，用时 {time}",
   "turn_cancelled_note": "任务已停止",
-  "turn_done": "已完成，用时 {time}",
-  "turn_failed": "处理失败",
   "turn_failed_note": "本轮运行失败：{reason}",
   "turn_no_reason": "没有给出原因",
-  "turn_running": "进行中，用时 {time}",
-  "turn_spent_suffix": "，用时 {time}",
+  "typing_label": "正在输入",
   "unauthorized_body": "在终端运行 komo web，它会打开一个一次性链接完成配对。",
   "unauthorized_title": "这个浏览器还没有配对",
   "browser_title": "浏览器",

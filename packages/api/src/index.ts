@@ -20,6 +20,7 @@ export {
   useRunDiff,
   useSessionChanges,
   useSessionEvents,
+  useSessionSearch,
   useSessions,
   useSessionTree,
   type Delta,
@@ -30,6 +31,7 @@ export type {
   SessionTree,
   TreeEntry,
   TreeMessage,
+  SessionSearchHit,
 } from "./types";
 export * from "./config";
 export * from "./cron";

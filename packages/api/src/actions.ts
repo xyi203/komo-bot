@@ -20,7 +20,7 @@ import type {
   UploadAttachmentResponse,
 } from "@komo/protocol";
 import { get, post, request } from "./http";
-import type { SessionTree } from "./types";
+import type { SessionSearchHit, SessionTree } from "./types";
 
 // 读
 export const fetchHome = () => get<SessionSummary>("/v1/home-session");
@@ -31,6 +31,9 @@ export const fetchEventPage = (session: string, from: number, signal?: AbortSign
 export const fetchTree = (session: string) => get<SessionTree>(`/v1/sessions/${enc(session)}/tree`);
 export const fetchSessionChanges = (session: string) => get<SessionChanges>(`/v1/sessions/${enc(session)}/changes`);
 export const fetchRunChanges = (run: string) => get<RunChanges>(`/v1/runs/${enc(run)}/changes`);
+/** 跨会话找回（标题与正文）：空白分开的几个词要在同一条消息里都出现。 */
+export const searchSessions = (q: string, limit: number, signal?: AbortSignal) =>
+  get<{ hits: SessionSearchHit[] }>("/v1/session-search", { q, limit }, signal);
 export const fetchRunDiff = (run: string, index: number) => get<FileDiff>(`/v1/runs/${enc(run)}/changes/${index}`);
 
 // 写

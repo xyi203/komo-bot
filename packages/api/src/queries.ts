@@ -20,6 +20,7 @@ import {
   fetchRunChanges,
   fetchRunDiff,
   fetchSessionChanges,
+  searchSessions,
   fetchTree,
 } from "./actions";
 import { get, post } from "./http";
@@ -95,6 +96,18 @@ export function useChats() {
 /** 默认 Agent 的主会话（没有就建）。 */
 export function useHomeSession() {
   return useQuery({ queryKey: keys.home, queryFn: fetchHome, staleTime: Infinity });
+}
+
+/** 搜索弹窗的对话检索：关键词非空才查，结果按关键词缓存。 */
+export function useSessionSearch(query: string, limit: number) {
+  return useQuery({
+    queryKey: keys.sessionSearch(query, limit),
+    queryFn: ({ signal }) => searchSessions(query, limit, signal),
+    select: (data) => data.hits,
+    enabled: query !== "",
+    retry: false,
+    staleTime: 30_000,
+  });
 }
 
 export function useModels() {

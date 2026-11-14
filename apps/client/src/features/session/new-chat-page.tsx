@@ -72,17 +72,15 @@ export function NewChatPage() {
       composer={
         <Composer
           sessionId={DRAFT_KEY}
-          view={undefined}
+          main={false}
           context={context}
-          busy={false}
           disabled={pending.some((p) => p.state === "sending")}
           archived={false}
           onSend={send}
-          onStop={() => {}}
         />
       }
     >
-      <Thread view={EMPTY} delta={null} pending={pending} kids={NO_RUNS} isHome={false} onRetry={(id) => void run(id)} />
+      <Thread view={EMPTY} delta={null} pending={pending} kids={NO_RUNS} isHome={false} busy={false} onRetry={(id) => void run(id)} />
     </ChatLayout>
   );
 }

@@ -49,15 +49,15 @@
 - [x] 对话列：主对话固定在上，支线在下，在等你的排前；每行标题、最后一句、时间、黄点 / 橙点（2b-1，`GET /v1/chats`）
 - [x] 新支线对话：加号新建，第一句话成为标题（2b-1：`/chats/new` 不预先建会话，发第一句时 `POST /v1/sessions` 再提交）
 - [x] 顶部居中的头像与名字；去掉顶栏的标题、对话 / 轨迹切换、改动按钮、分叉、右栏开关（2b-1；改动与轨迹的入口随之暂无，2b-2 的过程面板接回）
-- [ ] 回复下的悬停工具：复制（图标）、看过程、用上了 N 条记忆
-- [ ] 「正在输入」指示，取代轮次抬头与过程组
-- [ ] 输入框只留附件、文字、发送。支线对话的加号菜单里放模型、effort 与上下文占用（P15）；主对话的加号菜单只有附件。原型里还没画这个菜单
-- [ ] 过程面板：步骤、改动、轨迹三个标签；改动的文件对比与轨迹沿用现有实现（`features/changes`、`features/trace`），要嵌进面板
-- [x] 删：`features/sessions/`（列表、视图菜单、会话菜单、分组排序筛选）、`features/panel/`（右栏各段）、`features/session/session-title.tsx`、`features/inbox/`（2b-1；`features/sessions/` 里留了 `title.ts`、`model.ts`、`actions.ts` 三个小文件，⌘K 弹窗与记忆 / 事项 / 定时页还在引用，随 2b-2 / 3b 去掉；`context-usage.ts` 移到 `features/composer/`）
+- [x] 回复下的悬停工具：复制（图标）、看过程、用上了 N 条记忆（2b-2；投进对话的话只有复制）
+- [x] 「正在输入」指示，取代轮次抬头与过程组（2b-2；旁边带停止按钮）
+- [x] 输入框只留附件、文字、发送。支线对话的加号菜单里放模型、effort 与上下文占用（P15）；主对话的加号菜单只有附件（2b-2；主对话的加号直接开选文件框，不弹菜单；上下文到 80% 在输入框旁出小提示）
+- [x] 过程面板：步骤、改动、轨迹三个标签；改动的文件对比与轨迹沿用现有实现（`features/changes`、`features/trace`），嵌进面板（2b-2，`features/process/`；改动卡片与调用的"查看"也接回了）
+- [x] 删：`features/sessions/`（列表、视图菜单、会话菜单、分组排序筛选）、`features/panel/`（右栏各段）、`features/session/session-title.tsx`、`features/inbox/`（2b-1；`features/sessions/` 里留了 `title.ts`、`model.ts`、`actions.ts` 三个小文件，`context-usage.ts` 移到 `features/composer/`；2b-2 删了 `actions.ts`，`model.ts` 只留 `isArchived` / `isLive`（对话页用），`title.ts` 还被记忆 / 事项 / 定时页与对话页引用，随 3b 去掉）
 
 ### 1.3 搜索
 
-- [ ] `features/palette/` 改成原型的样式：没输入列最近对话；输入后分「对话」「目标」两组；去掉类型标签排与快捷键说明行
+- [x] `features/palette/` 改成原型的样式：没输入列最近对话；输入后分「对话」「目标」两组；去掉类型标签排与快捷键说明行（2b-2；对话走 `GET /v1/session-search`，目标在前端按标题过滤）
 - [ ] 记忆要不要进搜索结果：待定
 
 ### 1.4 目标

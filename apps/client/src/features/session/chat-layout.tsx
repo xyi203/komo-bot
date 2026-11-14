@@ -1,5 +1,7 @@
 import type { ReactNode, RefObject } from "react";
+import { useConnection } from "@/lib/connection";
 import { cn } from "@/lib/utils";
+import { m } from "@/paraglide/messages.js";
 
 /**
  * 对话页的外框：顶上居中的头像（Komo 标志）与名字，正文区，下面的输入框；`aside` 是桌面壳的内置浏览器（有才出现）。
@@ -59,6 +61,7 @@ export function ChatLayout({
         >
           <div className="mx-auto max-w-180">{children}</div>
         </div>
+        <ConnectionNotice />
         {composer}
       </div>
       {aside}
@@ -82,5 +85,17 @@ export function SkeletonThread() {
       {bar("88%")}
       {bar("64%")}
     </div>
+  );
+}
+
+/** 输入框上方的一行连接提示：连不上或事件流断了才出现，连上后自己消失；不挡输入，发送失败有各自的重试。 */
+function ConnectionNotice() {
+  const problem = useConnection();
+  if (!problem) return null;
+  return (
+    <p role="status" className="shrink-0 px-8 pb-2 text-center text-label text-muted max-[600px]:px-3">
+      <span aria-hidden="true" className={cn("mr-2 inline-block size-1.5 rounded-full align-middle", problem === "down" ? "bg-negative" : "bg-wait-dot")} />
+      {problem === "down" ? m.conn_notice_down() : m.conn_retrying()}
+    </p>
   );
 }

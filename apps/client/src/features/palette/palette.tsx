@@ -146,7 +146,14 @@ function PaletteBody() {
     }
   };
 
-  const emptyText = waiting && !flat.length ? m.palette_searching() : q ? m.palette_empty_none({ query: q }) : m.palette_empty_blank();
+  const emptyText =
+    waiting && !flat.length
+      ? m.palette_searching()
+      : q
+        ? search.isError && searchDone
+          ? m.palette_error()
+          : m.palette_empty_none({ query: q })
+        : m.palette_empty_blank();
   let n = 0;
   return (
     <>

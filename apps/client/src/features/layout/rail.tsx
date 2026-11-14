@@ -1,10 +1,10 @@
-import { useChats, useHealth } from "@komo/api";
+import { useChats } from "@komo/api";
 import { Link, useRouterState } from "@tanstack/react-router";
 import type { ComponentProps, ReactNode } from "react";
 import { Icon, type IconName } from "@/components/icon";
 import { openPalette, usePaletteOpen } from "@/features/palette/store";
 import { openSettings, useSettingsState } from "@/features/settings/store";
-import { useStreamStatus } from "@/lib/stream-status";
+import { useConnection } from "@/lib/connection";
 import { cn } from "@/lib/utils";
 import { m } from "@/paraglide/messages.js";
 import { isChatPath } from "./paths";
@@ -81,9 +81,7 @@ function RailLink({
 }
 
 function Settings({ open }: { open: boolean }) {
-  const health = useHealth();
-  const stream = useStreamStatus();
-  const problem = health.isError ? "down" : stream === "reconnecting" ? "retrying" : null;
+  const problem = useConnection();
   const label = problem === "down" ? m.conn_down() : problem === "retrying" ? m.conn_retrying() : m.nav_settings();
   return (
     <button type="button" aria-label={label} title={label} aria-pressed={open} onClick={() => openSettings()} className={cn(button, open && on)}>

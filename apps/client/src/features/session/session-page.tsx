@@ -1,6 +1,8 @@
 import { useChats, useInterventions, useMemoryIndex, useModels, useSessionChanges, useSessionEvents, useSessions, useSessionTree } from "@komo/api";
 import type { InterventionSummary, RunChanges } from "@komo/protocol";
+import { useRouterState } from "@tanstack/react-router";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { ChatMenu } from "@/features/chats/chat-menu";
 import { IconButton } from "@/components/ui/icon-button";
 import { BrowserPane, desktopBrowser, useBrowserOpen } from "@/features/browser/browser-pane";
 import { contextView } from "@/features/composer/context-usage";
@@ -105,7 +107,9 @@ function SessionBody({ sessionId, main }: { sessionId: string; main: boolean }) 
     }
   }, [view, delta, pending]);
 
-  const ready = status === "ready" && !archived;
+  // 正在换页（比如点了对话列的加号，新页面的代码还在加载）时旧输入框立刻不再收话：否则这时敲的字会发进这段对话
+  const navigating = useRouterState({ select: (state) => state.status === "pending" });
+  const ready = status === "ready" && !archived && !navigating;
   // 「正在输入」只给真在跑的 Run；停住等你答复的（`waiting`）由投进对话的提问和对话列的黄点表示
   const busy = [...(view?.runs.values() ?? [])].some((run) => !run.waiting);
   const closePanel = () => setPanel(null);
@@ -118,15 +122,18 @@ function SessionBody({ sessionId, main }: { sessionId: string; main: boolean }) 
           atBottom.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
         }}
         corner={
-          browserApi && (
-            <IconButton
-              name="globe"
-              label={showBrowser ? m.browser_close() : m.browser_open()}
-              aria-expanded={showBrowser}
-              onClick={() => setBrowserOpen(!showBrowser)}
-              className={cn("max-[600px]:hidden", showBrowser && "bg-active text-text")}
-            />
-          )
+          <>
+            {browserApi && (
+              <IconButton
+                name="globe"
+                label={showBrowser ? m.browser_close() : m.browser_open()}
+                aria-expanded={showBrowser}
+                onClick={() => setBrowserOpen(!showBrowser)}
+                className={cn("max-[600px]:hidden", showBrowser && "bg-active text-text")}
+              />
+            )}
+            {!main && !archived && <ChatMenu id={sessionId} title={name} current className="size-8" />}
+          </>
         }
         aside={showBrowser && browserApi ? <BrowserPane api={browserApi} sessionId={sessionId} onClose={() => setBrowserOpen(false)} /> : undefined}
         panel={

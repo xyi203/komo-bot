@@ -49,7 +49,13 @@ export type SessionPages = InfiniteData<SessionListResponse, string | undefined>
 export const redeemPairCode = (code: string) => post<Record<string, never>>("/v1/web/session", { code } satisfies PairRequest);
 
 export function useHealth() {
-  return useQuery({ queryKey: keys.health, queryFn: fetchHealth, retry: false });
+  // 连不上时 5 秒探一次：连接提示（设置图标上的点、对话页输入框上的一行字）要在 Gateway 回来后自己消失
+  return useQuery({
+    queryKey: keys.health,
+    queryFn: fetchHealth,
+    retry: false,
+    refetchInterval: (query) => (query.state.status === "error" ? 5000 : false),
+  });
 }
 
 /** 这个会话有没有没跑完的 Run（排队、在跑或停在等待上）。 */

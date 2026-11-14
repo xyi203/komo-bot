@@ -54,7 +54,7 @@ export function Thread({
       {empty && (
         <div className="mx-auto mt-[30vh] max-w-130 text-center text-read leading-6">
           <p className="mb-1.5">{isHome ? m.thread_empty_home() : m.thread_empty()}</p>
-          <p className="mb-1.5 text-muted">{m.thread_empty_hint()}</p>
+          <p className="mb-1.5 text-muted">{isHome ? m.thread_empty_hint_home() : m.thread_empty_hint()}</p>
         </div>
       )}
       {view.items.map((item) => {

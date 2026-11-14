@@ -55,6 +55,10 @@
 - [x] 过程面板：步骤、改动、轨迹三个标签；改动的文件对比与轨迹沿用现有实现（`features/changes`、`features/trace`），嵌进面板（2b-2，`features/process/`；改动卡片与调用的"查看"也接回了）
 - [x] 删：`features/sessions/`（列表、视图菜单、会话菜单、分组排序筛选）、`features/panel/`（右栏各段）、`features/session/session-title.tsx`、`features/inbox/`（2b-1；`features/sessions/` 里留了 `title.ts`、`model.ts`、`actions.ts` 三个小文件，`context-usage.ts` 移到 `features/composer/`；2b-2 删了 `actions.ts`，`model.ts` 只留 `isArchived` / `isLive`（对话页用），`title.ts` 还被记忆 / 事项 / 定时页与对话页引用，随 3b 去掉）
 
+- [x] 支线的改名与归档：对话列行悬停的「…」菜单与支线页右上角的同一个菜单，改名调 `POST /v1/sessions/{id}/name`，归档调 `POST /v1/sessions/{id}/delete`（软删除，先确认；归档当前这段回 `/`）（2c，`features/chats/chat-menu.tsx`）
+- [x] 空状态与连接 / 出错提示：主对话、支线、无支线、搜索无结果各有一句话；连不上或事件流断开时输入框上方一行提示（2c，见 `docs/web.md` §7）
+- [x] 已知竞态：点加号后立刻打字回车会落进旧对话——路由切换 `pending` 期间旧输入框置灰（2c；比取消懒加载更通用，换任何页都生效）
+
 ### 1.3 搜索
 
 - [x] `features/palette/` 改成原型的样式：没输入列最近对话；输入后分「对话」「目标」两组；去掉类型标签排与快捷键说明行（2b-2；对话走 `GET /v1/session-search`，目标在前端按标题过滤）
@@ -90,7 +94,7 @@
 
 - [x] 待处理页去掉后停住的运行在哪答复：已定（P14），在它所在的对话里用一句话问，你直接回。原型里对外动作的确认已是这样，「结果不明 / 前提没了」两类照同一个办法（2b-1 已接：投进来的话下面按 `verdicts` 给答复按钮）
 - [ ] 窄屏与手机：原型只做了最粗的收起
-- [ ] 英文文案：原型只有中文
+- [x] 英文文案：原型只有中文（2c：`messages/en.json` 里重设计新增与改过的键按英文习惯重写，不逐字直译，中文口吻一并理顺；删了确认没人用的 `gateway_change`、`matter_col_matter`）
 - [ ] `claude/komo-web-redesign-61bc08` 分支上未合并的视觉重做，与这次改动撞在外壳和对话页，要先定基线
 
 ### 1.8 手机（建议：同一套网页做成 PWA，暂不做原生应用）

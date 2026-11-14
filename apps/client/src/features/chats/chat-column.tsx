@@ -5,6 +5,7 @@ import { Icon } from "@/components/icon";
 import { errorText } from "@/lib/errors";
 import { formatChatTime } from "@/lib/format";
 import { cn } from "@/lib/utils";
+import { ChatMenu } from "./chat-menu";
 import { chatKeyOf } from "@/features/layout/paths";
 import { m } from "@/paraglide/messages.js";
 
@@ -33,9 +34,9 @@ export function ChatColumn() {
         </Link>
       </header>
       <div className="min-h-0 flex-1 overflow-y-auto px-2 pb-3">
-        {chats.isPending ? (
+        {!chats.data && chats.isPending ? (
           <Skeleton />
-        ) : chats.isError ? (
+        ) : !chats.data ? (
           <div className="mx-3 my-7 text-center text-label text-faint">
             <p className="mb-2">{m.chats_error({ message: errorText(chats.error) })}</p>
             <button type="button" className="cursor-pointer font-medium text-text underline underline-offset-3" onClick={() => void chats.refetch()}>
@@ -91,14 +92,26 @@ function ChatItem({ chat, current }: { chat: ChatRow; current: boolean }) {
     </>
   );
   const className = cn(row, current && "bg-active");
-  return chat.main ? (
-    <Link to="/" aria-current={current ? "page" : undefined} className={className}>
-      {body}
-    </Link>
-  ) : (
-    <Link to="/chats/$id" params={{ id: chat.id }} aria-current={current ? "page" : undefined} className={className}>
-      {body}
-    </Link>
+  if (chat.main) {
+    return (
+      <Link to="/" aria-current={current ? "page" : undefined} className={className}>
+        {body}
+      </Link>
+    );
+  }
+  // 「…」菜单不能放进链接里：悬停、键盘聚焦或菜单开着时盖在时间的位置
+  return (
+    <div className="group/row relative">
+      <Link to="/chats/$id" params={{ id: chat.id }} aria-current={current ? "page" : undefined} className={cn(className, "group-has-[:focus-visible]/row:[&>span:nth-child(2)]:invisible group-has-[[data-state=open]]/row:[&>span:nth-child(2)]:invisible [@media(hover:hover)]:group-hover/row:[&>span:nth-child(2)]:invisible")}>
+        {body}
+      </Link>
+      <ChatMenu
+        id={chat.id}
+        title={title}
+        current={current}
+        className="absolute top-1 right-1.5 [@media(hover:hover)]:opacity-0 [@media(hover:hover)]:group-hover/row:opacity-100 [@media(hover:hover)]:group-has-[:focus-visible]/row:opacity-100 [@media(hover:hover)]:data-[state=open]:opacity-100"
+      />
+    </div>
   );
 }
 

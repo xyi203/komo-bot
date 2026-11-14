@@ -3,7 +3,6 @@ import type {
   FileDiff,
   HealthResponse,
   ModelsResponse,
-  PairRequest,
   RunChanges,
   SessionChanges,
   SessionListResponse,
@@ -23,7 +22,7 @@ import {
   searchSessions,
   fetchTree,
 } from "./actions";
-import { get, post } from "./http";
+import { get } from "./http";
 import { keys } from "./keys";
 import { subscribeSession, type StreamState } from "./sse";
 import type { SessionTree } from "./types";
@@ -44,9 +43,6 @@ export const fetchSessionPage = (all = false, cursor?: string, limit = SESSION_P
 
 /** 会话列表缓存的形状（按页）。 */
 export type SessionPages = InfiniteData<SessionListResponse, string | undefined>;
-
-/** 配对码换会话 cookie（`Set-Cookie` 由浏览器收下，响应体为空对象）。 */
-export const redeemPairCode = (code: string) => post<Record<string, never>>("/v1/web/session", { code } satisfies PairRequest);
 
 export function useHealth() {
   // 连不上时 5 秒探一次：连接提示（设置图标上的点、对话页输入框上的一行字）要在 Gateway 回来后自己消失

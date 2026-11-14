@@ -1,8 +1,6 @@
-import { isApiError, useChats } from "@komo/api";
 import { Outlet, useRouterState } from "@tanstack/react-router";
 import { useEffect } from "react";
 import { Toaster } from "@/components/toaster";
-import { Unauthorized } from "@/components/unauthorized";
 import { ChatColumn } from "@/features/chats/chat-column";
 import { Palette } from "@/features/palette/palette";
 import { togglePalette } from "@/features/palette/store";
@@ -45,27 +43,25 @@ function usePaletteShortcut() {
 
 /**
  * 外壳（docs/web.md §2）：64 的图标栏 + 264 的对话列 + 主区；不在对话页（目标、记忆）时没有对话列。
- * 主区放当前路由的页面；没配对（401）时整块换成配对提示。
+ * 主区放当前路由的页面（没登录时根路由的 `AuthGate` 已经换成登录页，走不到这里）。
  * 窄屏（≤900，docs/web.md「手机与 PWA」）一次只显示一栏：`/chats` 是铺满的对话列表，其余是主区；
  * 图标栏换成底部标签栏（对话页与详情页不画，让出整屏）。外壳按可见区域（visualViewport）定高，软键盘弹出时输入框不被遮。
  */
 export function AppShell() {
-  const chats = useChats();
   const pathname = useRouterState({ select: (s) => s.location.pathname });
   const chatPage = isChatPath(pathname);
   usePaletteShortcut();
   useServiceWorker();
   const narrow = useNarrow();
   useViewportVars(narrow);
-  const unauthorized = chats.isError && isApiError(chats.error) && chats.error.unauthorized;
-  const page = unauthorized ? <Unauthorized /> : <Outlet />;
+  const page = <Outlet />;
   return (
     <>
       {/* 桌面壳的拖窗口条（只在 macOS 桌面壳里显示，见 styles.css）：要排在最前，后面的按钮才能从拖动区里挖出来 */}
       <div aria-hidden="true" className="titlebar" />
       {narrow ? (
         <div className="fixed inset-x-0 top-[var(--app-top,0px)] flex h-[var(--app-height,100dvh)] flex-col overflow-hidden bg-surface pr-[env(safe-area-inset-right)] pl-[env(safe-area-inset-left)]">
-          {isChatListPath(pathname) && !unauthorized ? (
+          {isChatListPath(pathname) ? (
             <ChatColumn full />
           ) : (
             <main className="flex min-h-0 min-w-0 flex-1 flex-col overflow-y-auto overscroll-contain bg-surface">{page}</main>

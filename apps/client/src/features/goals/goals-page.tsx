@@ -73,7 +73,11 @@ export function GoalsPage() {
   const bound = useMemo(() => new Map((chats ?? []).flatMap((chat): [string, ChatRow][] => (chat.goal ? [[chat.goal.id, chat]] : []))), [chats]);
   const tracked = useMemo(() => matters.filter(isTracked).sort(trackedOrder(today)), [matters, today]);
   const rest = useMemo(() => matters.filter((x) => !isTracked(x)).sort((a, b) => (b.closed_at ?? b.updated_at).localeCompare(a.closed_at ?? a.updated_at)), [matters]);
-  const asking = tracked.filter((x) => bound.get(x.id)?.waiting).length;
+  // 「在等你」：优先用服务端在目标列表里给的 `waiting`（形状待与服务端核对，见 packages/protocol/src/matters-waiting.ts），
+  // 没有这个字段（旧 Gateway）才回落到从对话列的行上反查——那一份只对绑了支线的目标成立。
+  const serverWaiting = query.data?.waiting;
+  const isAsking = (id: string) => (serverWaiting ? id in serverWaiting : !!bound.get(id)?.waiting);
+  const asking = tracked.filter((x) => isAsking(x.id)).length;
   const ready = query.isSuccess;
 
   const draft = () => {
@@ -121,7 +125,7 @@ export function GoalsPage() {
               {tracked.length ? (
                 <ul className={listClass}>
                   {tracked.map((matter) => (
-                    <Row key={matter.id} matter={matter} today={today} schedule={schedules.get(matter.id)} chat={bound.get(matter.id)} />
+                    <Row key={matter.id} matter={matter} today={today} schedule={schedules.get(matter.id)} chat={bound.get(matter.id)} asking={isAsking(matter.id)} />
                   ))}
                 </ul>
               ) : (
@@ -134,7 +138,7 @@ export function GoalsPage() {
                 {rest.length ? (
                   <ul className={listClass}>
                     {rest.map((matter) => (
-                      <Row key={matter.id} matter={matter} today={today} schedule={schedules.get(matter.id)} chat={bound.get(matter.id)} />
+                      <Row key={matter.id} matter={matter} today={today} schedule={schedules.get(matter.id)} chat={bound.get(matter.id)} asking={isAsking(matter.id)} />
                     ))}
                   </ul>
                 ) : (
@@ -156,7 +160,7 @@ export function GoalsPage() {
   );
 }
 
-function Row({ matter, today, schedule, chat }: { matter: Matter; today: string | undefined; schedule: MatterSchedule | undefined; chat: ChatRow | undefined }) {
+function Row({ matter, today, schedule, chat, asking }: { matter: Matter; today: string | undefined; schedule: MatterSchedule | undefined; chat: ChatRow | undefined; asking: boolean }) {
   const tracked = isTracked(matter);
   const sub = goalSub(matter);
   // 右边一小段：有定时是节奏与下一次，否则是截止；不再追踪的只写状态
@@ -181,7 +185,7 @@ function Row({ matter, today, schedule, chat }: { matter: Matter; today: string 
               <span className="sr-only">{m.goal_bound({ title: chat.title || m.session_untitled() })}</span>
             </span>
           )}
-          {chat?.waiting && <Pill tone="wait">{m.goal_asking()}</Pill>}
+          {asking && <Pill tone="wait">{m.goal_asking()}</Pill>}
           {!tracked && <Pill tone="off">{statusLabel(matter.state)}</Pill>}
         </span>
         {sub && <span className="line-clamp-2 text-small text-muted [overflow-wrap:anywhere]">{sub}</span>}

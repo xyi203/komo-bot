@@ -18,7 +18,7 @@ export class ApiError extends Error {
     this.keys = body.error.keys ?? [];
   }
 
-  /** 没带凭据或凭据失效（浏览器该重新 `komo web` 配对）。 */
+  /** 没带凭据或凭据失效（网页该回到登录页）。 */
   get unauthorized(): boolean {
     return this.code === "unauthorized";
   }

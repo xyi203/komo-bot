@@ -1,6 +1,6 @@
 # Web 客户端
 
-> 状态：现行规格。新版（C1 完成，2026-11-03），代码在 `apps/client/`（TanStack Start SPA 模式），接真实 Gateway、无样例数据。W0 原型（`apps/web`、`serve.mjs`）已删除。2026-11-14 起外壳、路由、对话页顶部按 `docs/redesign.md` §1.1、§1.2 重做（2b-1：图标栏 + 对话列、`/` 是主对话、支线 `/chats/$id`），旧的会话列表、右栏、待处理页已删，下面 §2–§6、§14 已按新样子写；2b-2（2026-11-14）又换了 §4 的正文渲染（悬停工具、「正在输入」、右侧的过程面板）、§5 的输入框（加号菜单）与 ⌘K 搜索弹窗；4b、4c（2026-11-14）重做了 §11 记忆页与 §15 设置弹窗（四节），图标栏的记忆图标、设置图标带提示点。本文是界面行为的规格：每一节标出新版代码的位置；原型有、新版有意不搬或改了的，写在 §17。与 `docs/komo_bot.md` 冲突处以设计文档为准。
+> 状态：现行规格。新版（C1 完成，2026-11-03），代码在 `apps/client/`（TanStack Start SPA 模式），接真实 Gateway、无样例数据。W0 原型（`apps/web`、`serve.mjs`）已删除。2026-11-14（5e）加了网页登录（§19）。2026-11-14 起外壳、路由、对话页顶部按 `docs/redesign.md` §1.1、§1.2 重做（2b-1：图标栏 + 对话列、`/` 是主对话、支线 `/chats/$id`），旧的会话列表、右栏、待处理页已删，下面 §2–§6、§14 已按新样子写；2b-2（2026-11-14）又换了 §4 的正文渲染（悬停工具、「正在输入」、右侧的过程面板）、§5 的输入框（加号菜单）与 ⌘K 搜索弹窗；4b、4c（2026-11-14）重做了 §11 记忆页与 §15 设置弹窗（四节），图标栏的记忆图标、设置图标带提示点。本文是界面行为的规格：每一节标出新版代码的位置；原型有、新版有意不搬或改了的，写在 §17。与 `docs/komo_bot.md` 冲突处以设计文档为准。
 
 ## 1. 定位
 
@@ -8,7 +8,7 @@
 
 TUI 与聊天渠道之外的第三个入口，给电脑上的长会话用，之后扩展到 macOS 与手机（`docs/clients.md`）。它是 Gateway 的 HTTP 客户端，不持有状态：会话正文是事件流的 fold，刷新即重建。
 
-运行：生产里网页由 Gateway 同源托管（`komo web` 配对换 cookie 后打开 Gateway 的地址），所以浏览器里换 Gateway 就是换地址，界面里没有"改连接"。开发：`KOMO_HOME=<数据目录> pnpm --filter @komo/client dev`，`apps/client/vite-gateway-proxy.ts` 把 `/v1/*`、`/healthz` 转给本机 Gateway 并在服务端带令牌（每次请求现读 `runtime/gateway.json`），不需要配对。界面文案走 Paraglide（中文 / 英文），语言偏好只存在本机（`docs/clients.md` D9）。
+运行：生产里网页由 Gateway 同源托管（`komo web` 只打开 Gateway 的地址，网页自己走 OIDC 登录换 cookie，§19），所以浏览器里换 Gateway 就是换地址，界面里没有"改连接"。开发：`KOMO_HOME=<数据目录> pnpm --filter @komo/client dev`，`apps/client/vite-gateway-proxy.ts` 把 `/v1/*`、`/healthz` 转给本机 Gateway 并在服务端带令牌（每次请求现读 `runtime/gateway.json`），不需要登录（`/auth/me` 也经代理，带令牌回 `credential: local`）。界面文案走 Paraglide（中文 / 英文），语言偏好只存在本机（`docs/clients.md` D9）。
 
 ## 2. 布局
 
@@ -154,7 +154,7 @@ TUI 与聊天渠道之外的第三个入口，给电脑上的长会话用，之�
 
 做原型时发现、正式版之前要补的：
 
-1. （已解决，C0）没有托管静态文件的路由：Gateway 现在同源托管网页，浏览器用配对换来的 cookie 鉴权（`docs/clients.md` D5、D6）。
+1. （已解决，C0）没有托管静态文件的路由：Gateway 现在同源托管网页，浏览器用 OIDC 登录换来的 cookie 鉴权（`docs/clients.md` D5、D6、§9）。
 2. 会话列表不带运行状态：要知道哪个任务在跑，得逐个 `GET /v1/sessions/{id}` 看 `unfinished`。（新主页的对话列用 `GET /v1/chats`，每行带 `running`，见下方第 10 条。）
 3. 会话的 `updated_at` 不随最后一条消息更新，列表的时间与"最近更新"排序因此不准。（会话记录已补 `last_message_at`，`GET /v1/chats` 按它排序；`/v1/sessions` 的 `updated_at` 没改。）
 4. 上下文构成要前端拉整棵会话树来估；应由 Gateway 在 `prepare` 组请求时记下各段 token 数直接返回，口径与窗口保护一致。
@@ -242,11 +242,11 @@ TUI 与聊天渠道之外的第三个入口，给电脑上的长会话用，之�
   - **工具**（`GET /v1/mcp`，不等握手、不重连；有服务器在"连接中"时 2 秒重取一次）：一张表，一台 MCP 服务器一行——名字（等宽）、下面灰字它在哪（`endpoint`：本机进程是程序名，远程是去掉查询串与账号的 URL）与"N 个工具 / 开着 a / b 个工具"、类型（本机进程 / 远程，走 OAuth 的带标签）、状态（已连上 / 连接中 / 要登录 / 连不上 / 已断开 / 已关闭）、最右一个**整台开关**（`PUT /v1/mcp/{name}`，持久写 `enabled`；关 = 断开并撤掉工具，重启后仍关着；开 = 后台连）。点名字展开（行尾小箭头）：服务器说明、要登录的写出 `komo auth mcp login <名字>`、连不上的写出原因，然后列它的工具——原名、一行说明，"直接给模型 / 不挂"（与服务器默认不同才标）、对外、只读标签，右边**逐个开关**（`PUT /v1/mcp/{name}/tools/{tool}`，持久写 `disabled_tools`，不重连；**整台关着时置灰**）；底下"重连"只重连这一台（`POST /v1/mcp/reconnect`，状态是"已断开"时叫"连接"）；表下面"重连全部"。两种开关写的回应都是所有服务器此刻的样子，直接写回缓存；失败写在那一行 / 那个工具下面，原话来自 Gateway。关着的服务器若还留着最近一次握手的工具列表，也能展开看（开关置灰），否则不给展开。**不再有"断开连接"按钮**（原型只有重连；接口还在）。增删改服务器仍在配置文件里（`docs/redesign.md` §2.3：网页添加 MCP 待定）。在跑的 Gateway 没有这个接口（404）时说明要装新版。
   - **技能**（`GET /v1/skills`）：一张表，一个技能一行——名字（等宽，悬停看路径）、两行以内的说明、来源（Komo / 共享 / 配置的目录）、开关（`PUT /v1/skills/{name}`，回应是整张表）；开着但没进目录行的（平台或工具不满足、缺 description）在说明下面用琥珀色写出原因（`unavailable`）。空状态、加载条、出错重试都在页内。
 - **关于**：Gateway 地址与连接状态、版本、启动时间、配置检查、环境变量入口。
-  - **Gateway 地址**：浏览器里是一个输入框（预填 `location.origin`）加"连接"，下面写"已连上 · 往返 N ms"或"连不上"。改了地址点连接：先用 `no-cors` 探一下新地址的 `/healthz` 通不通，通就整页跳到新地址（网页由 Gateway 同源托管，"连到另一台"就是打开另一台的网页，那边自己的登录与会话照旧；`docs/redesign.md` §2.3），不通就留在原地写"连不上这个地址，仍连着原来的 Gateway"；地址不是 http(s) 写"这不是一个有效的地址"；填的和现在一样什么也不做。Electron 里这一行是桌面壳的连接设置（本机 / 远程、令牌、请求头，`desktop-connection.tsx`，沿用壳里的存储，改完壳整页重载）。
+  - **Gateway 地址**：浏览器里是一个输入框（预填 `location.origin`）加"连接"，下面写"已连上 · 往返 N ms"或"连不上"。改了地址点连接：先用 `no-cors` 探一下新地址的 `/healthz` 通不通，通就整页跳到新地址（网页由 Gateway 同源托管，"连到另一台"就是打开另一台的网页，那边自己的登录与会话照旧；`docs/redesign.md` §2.3），不通就留在原地写"连不上这个地址，仍连着原来的 Gateway"；地址不是 http(s) 写"这不是一个有效的地址"；填的和现在一样什么也不做。Electron 里这一行显示桌面壳当前连的地址与状态，右边一个「打开连接设置」（`komoDesktop.connection.openSettings()`，离开 SPA 去壳自带的连接设置页：地址、额外请求头、登录；`desktop-connection.tsx`）。
   - **版本**（版本与协议号）与**启动时间**（`GET /healthz`）；实例、数据目录、遥测不在界面里。
   - **配置检查**：通过或几条提醒（每条带键与原话）、生效配置的装载时间（文件之后改过标"还没装上"）、"重新加载"（`POST /v1/config/reload`）与"重新检查"。
   - **环境变量**：一行"N 个，M 个缺值"加"管理"；点"管理"这一节整块换成环境变量视图（左上角返回"关于"）：一张列表，变量名、已设置 / 是空的 / 缺、谁在用，行尾"改值"与删除（二次确认，还在用的由 Gateway 拒绝并说出引用方），值只能写入、任何地方都不显示；"添加变量"展开一叠"名字 / 值"对（值是密码框，把整段 `.env` 粘进名字框会按行拆开），底部取消 / 保存，一次 `PUT /v1/config/env` 写完。
-  - 账号与登录状态等登录做完再放进来（`docs/redesign.md` §2.9，P21）。
+  - **账号**与**已登录的设备**（`sections/account-section.tsx`）：见 §19。
 
 ## 16. 每轮改了哪些文件（Gateway 端）
 
@@ -346,3 +346,27 @@ C1 的原则是行为以本文为准、只搬不改、只修 bug；下面是有�
 3. 设置（底部标签栏最右）→ 通用 → 通知，打开开关，在系统弹窗里允许。
 4. 让 Komo 找你一次（让目标的定时跑一次、或在对话里让它稍后问你一句），退到后台或锁屏；收到系统通知，点开应落在对应的对话（`/chats/<id>` 或主对话）。
 5. 关掉开关，再触发一次：不应再收到。
+
+## 19. 登录
+
+> 5e（2026-11-14）网页侧，**没编译、没在浏览器里点过**（全部步骤做完后统一做）。服务端接口见 `docs/clients.md` §9、`docs/redesign.md` §2.9（P19–P21）。代码：`features/auth/{auth-gate,protocol-banner}.tsx`、`routes/__root.tsx`（守卫与提示条挂在根上）、`router.tsx`（注册 401 的处理）、`features/settings/sections/{account-section,desktop-connection}.tsx`；接口在 `packages/api/src/{auth,unauthorized,http,sse}.ts`，类型在 `packages/protocol/src/{auth,version,matters-waiting}.ts`（手写，不在 `generated/`）。`/auth/*` 是 Gateway 的路径，网页路由不占用；配对码的残留（`/pair` 页、`routes/pair.tsx`、`redeemPairCode`、未配对提示组件与文案）已删。
+
+**登录状态**。根路由的 `AuthGate` 在启动时取 `GET /auth/me`（`staleTime: Infinity`，只在登录失效或登录 / 退出后变）：
+
+| 情形 | 显示 |
+|---|---|
+| `authenticated: true`（含 `credential: local` 的本机令牌，如 `pnpm dev` 的代理；桌面端的设备令牌） | 正常进入 |
+| 未登录、`oidc_configured: true`（浏览器） | 登录页：居中的标志、一句说明、一个「登录」按钮，点了才 `location.assign('/auth/login?next=' + 当前路径与查询串)`；**不自动跳转**，登录失败时才不会来回循环。窄屏居中、左右留 24 |
+| 未登录、`oidc_configured: false` | 「这台 Komo 还没有配置登录」的说明页：写出要配 `[auth.oidc]`、指向部署文档（`docs/clients.md` §9），带「重新检查」 |
+| 未登录、桌面壳里（`window.komoDesktop` 存在） | 网页不显示自己的登录页，只一句「请在桌面端登录」加「打开连接设置」（`komoDesktop.connection.openSettings()`，没有就只有文字）。桌面壳的请求带设备令牌，正常是 `authenticated: true`、`credential: "device"`，走不到这里；令牌失效时桌面端自己会回它的连接设置页 |
+| `/auth/me` 取不到（连不上、旧 Gateway 没有这个接口） | 照常进入，由各页自己的「连不上」提示说话 |
+
+**401**。`request`（`packages/api/src/http.ts`）收到任何 `/v1/**` 的 401，调 `notifyUnauthorized()`；`router.tsx` 注册的处理函数（`markSignedOut`）把 `/auth/me` 的缓存就地标成未登录（守卫立刻换成登录页）并作废它取真实状态。已经是未登录不再动。SSE（`sse.ts`）断开后、重连前先取一次 `/auth/me`：未登录就通知并停止重连，`/auth/me` 本身连不上（Gateway 在重启）按没失效处理，照常退避重连。「连不上」提示（`lib/connection.ts`）不把 401 当成连不上。
+
+**设置 → 关于**。「账号」一行：显示 email（没有就 subject），本机令牌显示「本机访问」；「退出登录」在浏览器里 `POST /auth/logout` 后回登录页，桌面壳里调 `komoDesktop.connection.signOut()`（吊销设备令牌并回壳的连接设置页；`POST /auth/logout` 只认 cookie，桌面壳里不能用）。「已登录的设备」：`GET /v1/auth/sessions` 的列表，每行名称（label）、类型（网页 / 设备）、上次使用（相对时间）、当前这条标「当前」，右边「吊销」（`DELETE /v1/auth/sessions/{id}`，成功后重取列表）；吊销**当前这条**等于退出登录，点一下先变成「确认退出 / 取消」，确认后走与「退出登录」同一条路。取不到清单（旧 Gateway）整块不画。
+
+**协议版本核对**。`packages/protocol/src/version.ts` 的 `EXPECTED_PROTOCOL_VERSION`（与 kernel 的 `PROTOCOL_VERSION` 保持一致，改一边要改另一边）与 `/healthz` 的 `protocol_version` 比较（按文本，数字或字符串都行）；不一致时顶部固定一条不能关的提示「网页与服务端版本不一致，请刷新或升级」加「刷新」，不阻断使用。服务端没给这个字段时不提示。提示条是固定在窗口顶上的一条，会盖住顶上约 32 像素的内容（包括桌面壳的拖窗口条），因为外壳按整屏定高、没有给它留位置。
+
+**目标列表的「在等你」**。优先用 `GET /v1/matters` 响应里的 `waiting`（暂定形状 `{ [目标id]: { chat, handle } }`，类型 `MatterListWithWaiting`，**形状待与服务端核对**）：响应带了这个字段（哪怕是空对象）就以它为准，没带才回落到 3b 的做法，从 `GET /v1/chats` 的行上反查（只对绑了支线的目标成立）。用在目标页的「在等你」药丸与页头那句话（`features/goals/goals-page.tsx`）。
+
+**没验证**：整套登录没有对真实的 Pocket ID 走过；登录页、关于里的账号与设备、401 回登录页、SSE 重连前的核对都没在浏览器里点过；桌面壳里的行为照 `apps/desktop/src/shared/api.ts` 的接口写，没在壳里跑过。iOS 上「添加到主屏幕」的应用与 Safari 登录状态分开，是否顺畅未验证。

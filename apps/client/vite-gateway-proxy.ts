@@ -1,6 +1,6 @@
-// 开发时把 `/v1/*` 与 `/healthz` 转给本机 Gateway，并在服务端带上令牌（原型 `serve.mjs` 的做法，已随原型删除）：
+// 开发时把 `/v1/*`、`/healthz` 与 `/auth/me`（网页启动时问登录状态，带令牌回 `credential: local`）转给本机 Gateway，并在服务端带上令牌（原型 `serve.mjs` 的做法，已随原型删除）：
 // 令牌每次请求现读 `$KOMO_HOME/runtime/gateway.json`（Gateway 重启后会换），从不发给浏览器，
-// 所以 `pnpm dev` 不需要配对。生产里由 Gateway 自己托管网页，走 cookie（docs/clients.md D6）。
+// 所以 `pnpm dev` 不需要登录。生产里由 Gateway 自己托管网页，走 cookie（docs/clients.md D6）。
 import { readFile } from "node:fs/promises";
 import http from "node:http";
 import { homedir } from "node:os";
@@ -16,7 +16,7 @@ export function komoGatewayProxy(): Plugin {
     configureServer(server) {
       server.middlewares.use((req, res, next) => {
         const url = req.url ?? "";
-        if (!url.startsWith("/v1/") && url !== "/healthz") return next();
+        if (!url.startsWith("/v1/") && url !== "/healthz" && url !== "/auth/me") return next();
         void forward(req, res);
       });
     },

@@ -2,6 +2,8 @@ import type { QueryClient } from "@tanstack/react-query";
 import { QueryClientProvider } from "@tanstack/react-query";
 import { HeadContent, Outlet, Scripts, createRootRouteWithContext } from "@tanstack/react-router";
 import type { ReactNode } from "react";
+import { AuthGate } from "@/features/auth/auth-gate";
+import { ProtocolBanner } from "@/features/auth/protocol-banner";
 import { LocaleProvider } from "@/lib/i18n";
 import appCss from "@/styles.css?url";
 
@@ -56,7 +58,10 @@ function RootComponent() {
   return (
     <QueryClientProvider client={queryClient}>
       <LocaleProvider>
-        <Outlet />
+        <ProtocolBanner />
+        <AuthGate>
+          <Outlet />
+        </AuthGate>
       </LocaleProvider>
     </QueryClientProvider>
   );

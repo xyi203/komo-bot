@@ -11,12 +11,12 @@ import { CardRow, FormError, KState, KeyValues, Panel, Pill, SettingsCard, TextI
 import { editErrorText } from "../use-config-edit";
 import { withCode } from "../rich";
 import { SectionHead } from "../section-head";
+import { AccountRow, DevicesRow } from "./account-section";
 import { DesktopConnectionRow, desktopConnection } from "./desktop-connection";
 import { EnvSection } from "./env-section";
 
 /**
- * 关于：Gateway 地址与连接状态、版本与启动时间、配置检查、环境变量入口。
- * 账号与登录状态在登录接上之后放这里（docs/redesign.md §2.9）。
+ * 关于：Gateway 地址与连接状态、账号与退出、已登录的设备、版本与启动时间、配置检查、环境变量入口。
  * 点"环境变量"的"管理"，这一节整块换成环境变量视图，左上角返回。
  */
 export function AboutSection() {
@@ -26,6 +26,8 @@ export function AboutSection() {
     <>
       <SectionHead title={m.settings_sec_about()} />
       <GatewayRows />
+      <AccountRow />
+      <DevicesRow />
       <ConfigCheckRow />
       <EnvRow onManage={() => setView("env")} />
     </>

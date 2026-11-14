@@ -1,4 +1,6 @@
 import type { SseFrame } from "@komo/protocol";
+import { fetchAuthMe } from "./auth";
+import { notifyUnauthorized } from "./unauthorized";
 
 export type StreamState = "connecting" | "open" | "reconnecting";
 
@@ -56,8 +58,23 @@ export function subscribeSession(session: string, options: SubscribeOptions): ()
       es.close();
       if (stopped) return;
       options.onState?.("reconnecting");
-      timer = setTimeout(open, delay);
+      const wait = delay;
       delay = Math.min(delay * 2, RETRY_MAX_MS);
+      // 重连前先问一下还登着没有：登录失效了（401 在 EventSource 里看不到状态码）就别再重连，
+      // 通知应用回登录页；`/auth/me` 本身连不上（Gateway 在重启）按没失效处理，照常退避重连。
+      void fetchAuthMe().then(
+        (me) => {
+          if (stopped) return;
+          if (!me.authenticated) {
+            notifyUnauthorized();
+            return;
+          }
+          timer = setTimeout(open, wait);
+        },
+        () => {
+          if (!stopped) timer = setTimeout(open, wait);
+        },
+      );
     };
   };
 

@@ -7,13 +7,16 @@ interface KomoDesktop {
   /** ⌘, 或菜单栏图标的"设置…"：打开设置弹窗，section 是要停的那一节。返回取消订阅的函数。 */
   onOpenSettings?: (listener: (section?: string) => void) => () => void;
   connection?: {
-    /** 打开桌面壳的"连接的 Gateway"设置（本机 / 远程）。连不上时的提示页还在用；设置弹窗里直接用下面几项。 */
-    openSettings(): void;
+    /** 跳到壳自带的连接设置页（离开 SPA）：地址、额外请求头、登录。未登录时网页只提示一句，登录在那里做。 */
+    openSettings(): Promise<void> | void;
     get?(): Promise<KomoConnectionInfo>;
-    test?(input: KomoRemoteInput): Promise<KomoTestResult>;
-    /** 测通才保存；成功后主进程整页重载，收不到结果。 */
-    saveRemote?(input: KomoRemoteInput): Promise<{ ok: boolean; error?: string; test?: KomoTestResult }>;
-    useLocal?(): Promise<{ ok: boolean; error?: string }>;
+    /** 只测不登录。 */
+    test?(input: KomoSignInInput): Promise<KomoTestResult>;
+    signIn?(input: KomoSignInInput): Promise<{ ok: boolean; error?: string; test?: KomoTestResult }>;
+    cancelSignIn?(): Promise<void>;
+    /** 吊销设备令牌、清本地登录状态并回到连接设置页（桌面壳里退出走它，不走 `POST /auth/logout`：那条只认 cookie）。 */
+    signOut?(): Promise<{ ok: boolean; revoked: boolean; warning?: string }>;
+    retry?(): Promise<void>;
   };
   /** 右栏浏览器（apps/desktop/src/main/browser.ts）：网页是一块盖在占位框上的原生视图，界面只画地址栏与按钮。 */
   browser?: {
@@ -29,24 +32,29 @@ interface KomoDesktop {
 }
 
 interface KomoConnectionInfo {
-  mode: "local" | "remote";
-  status: string;
+  /** `signed-out`：还没登录或登录失效，桌面端停在连接设置页。 */
+  status: "connecting" | "ok" | "signed-out" | "unreachable" | "mismatch" | "error";
   baseUrl?: string;
   message?: string;
-  /** 令牌与请求头的值永远不给，只有名字。 */
+  /** 已填的地址与额外请求头的名字；请求头的值永远不给。 */
   remote?: { url: string; headerNames: string[] };
+  /** 已登录的账号；令牌不给界面。 */
+  account?: { subject: string; email?: string };
+  /** 系统浏览器里的登录还在等。 */
+  signingIn?: boolean;
+  /** 最近一次登录 / 退出 / 登录失效的结果。 */
+  notice?: { text: string; error: boolean };
 }
 
-interface KomoRemoteInput {
+interface KomoSignInInput {
   url: string;
-  token: string;
   /** 每行 `Name: value`。 */
   headers: string;
 }
 
 interface KomoTestResult {
   ok: boolean;
-  steps: { name: string; ok: boolean; message: string }[];
+  steps: { name: "health" | "protocol" | "oidc" | "auth" | "sse"; ok: boolean; message: string }[];
 }
 
 interface KomoBrowserState {

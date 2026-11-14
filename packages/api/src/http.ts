@@ -1,5 +1,6 @@
 import type { ErrorBody } from "@komo/protocol";
 import { ApiError, fallbackBody } from "./errors";
+import { notifyUnauthorized } from "./unauthorized";
 
 /**
  * 同源相对路径的 fetch 封装：`/v1/*` 由 Gateway 托管，cookie 自动带（鉴权见 docs/clients.md D6），
@@ -34,7 +35,11 @@ export async function request<T>(
     throw new ApiError(0, fallbackBody(error instanceof Error ? error.message : String(error)));
   }
   const text = await response.text();
-  if (!response.ok) throw new ApiError(response.status, parseErrorBody(text, response));
+  if (!response.ok) {
+    // `/v1/**` 回 401：登录失效，让应用回到登录页（而不是当成「连不上」）。`/auth/*` 的 401 不算。
+    if (response.status === 401 && path.startsWith("/v1/")) notifyUnauthorized();
+    throw new ApiError(response.status, parseErrorBody(text, response));
+  }
   return (text ? JSON.parse(text) : undefined) as T;
 }
 

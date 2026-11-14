@@ -1,4 +1,6 @@
 export * from "./actions";
+export * from "./auth";
+export { notifyUnauthorized, setUnauthorizedHandler } from "./unauthorized";
 export { ApiError, isApiError } from "./errors";
 export { del, get, post, request } from "./http";
 export { keys } from "./keys";
@@ -9,7 +11,6 @@ export {
   fetchHealth,
   fetchSessionPage,
   fetchSessions,
-  redeemPairCode,
   SESSION_PAGE,
   sessionUnfinished,
   useChats,

@@ -6,6 +6,8 @@
  */
 export const keys = {
   health: ["health"] as const,
+  authMe: ["auth", "me"] as const,
+  authSessions: ["auth", "sessions"] as const,
   home: ["home-session"] as const,
   chats: ["chats"] as const,
   models: ["models"] as const,

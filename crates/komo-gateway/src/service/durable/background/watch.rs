@@ -318,3 +318,185 @@ pub async fn replay_recent(state: &Arc<GatewayState>) {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    //! 首轮跑完起标题的规则（真 Gateway、脚本化模型）。模型替身默认不起标题，这里用
+    //! `auto_title(true)` 打开；起标题的那次调用是脚本里紧跟在首轮回复之后的一段。
+
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use komo_kernel::durable::SessionRecord;
+    use komo_kernel::protocol::http::SessionSummary;
+    use serde_json::json;
+
+    use super::*;
+    use crate::service::test_support::harness::{
+        FakeLlm, GatewayBuilder, Home, TestGateway, home_config, text_round,
+    };
+
+    /// 没有该发生的事时留给"它不该发生"的那一小段时间。
+    const GRACE: Duration = Duration::from_millis(500);
+
+    async fn record(state: &Arc<GatewayState>, session: &str) -> SessionRecord {
+        state
+            .core()
+            .expect("Durable 核心")
+            .session(session)
+            .await
+            .expect("会话")
+    }
+
+    async fn wait_title(state: &Arc<GatewayState>, session: &str, want: &str) {
+        for _ in 0..400 {
+            let row = record(state, session).await;
+            if row.title.as_deref() == Some(want) && !row.title_provisional {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let row = record(state, session).await;
+        panic!(
+            "等了 20 秒标题也没有换成「{want}」：{:?} provisional={}",
+            row.title, row.title_provisional
+        );
+    }
+
+    /// 网页开一条支线会话（`POST /v1/sessions`）。
+    async fn side_session(gw: &TestGateway, body: serde_json::Value) -> String {
+        let (code, body) = gw.post("/v1/sessions", body).await;
+        assert_eq!(code, 200, "{body}");
+        serde_json::from_str::<SessionSummary>(&body)
+            .expect("会话摘要")
+            .session
+            .to_string()
+    }
+
+    async fn gateway(llm: &Arc<FakeLlm>) -> TestGateway {
+        GatewayBuilder::new(&home_config())
+            .fake_llm(Arc::clone(llm))
+            .auto_title(true)
+            .start()
+            .await
+    }
+
+    #[tokio::test]
+    async fn a_side_session_gets_a_model_title_after_its_first_run() {
+        let llm = FakeLlm::new(vec![
+            vec![text_round(1, "已经修好了")],
+            vec![text_round(1, "标题：《排查 shell 报错》。")],
+        ]);
+        let gw = gateway(&llm).await;
+        let session = side_session(&gw, json!({})).await;
+
+        let receipt = gw
+            .say_in(
+                &SessionId::from_raw(&session),
+                "帮我看看这个报错",
+                "k1",
+                false,
+            )
+            .await;
+        gw.wait_run(&receipt.run).await;
+
+        wait_title(gw.state(), &session, "排查 shell 报错").await;
+        assert_eq!(llm.turns(), 2, "一次主回复、一次起标题");
+    }
+
+    #[tokio::test]
+    async fn a_session_with_a_real_title_keeps_it() {
+        let llm = FakeLlm::always(vec![text_round(1, "好的")]);
+        let gw = gateway(&llm).await;
+        let session = side_session(&gw, json!({ "title": "我自己起的名字" })).await;
+
+        let receipt = gw
+            .say_in(
+                &SessionId::from_raw(&session),
+                "帮我看看这个报错",
+                "k1",
+                false,
+            )
+            .await;
+        gw.wait_run(&receipt.run).await;
+        tokio::time::sleep(GRACE).await;
+
+        let row = record(gw.state(), &session).await;
+        assert_eq!(row.title.as_deref(), Some("我自己起的名字"));
+        assert!(!row.title_provisional);
+        assert_eq!(llm.turns(), 1, "只有主回复，没有起标题那一次");
+    }
+
+    #[tokio::test]
+    async fn the_title_is_set_once_and_later_runs_leave_it_alone() {
+        let llm = FakeLlm::new(vec![
+            vec![text_round(1, "第一轮回复")],
+            vec![text_round(1, "头一个标题")],
+            vec![text_round(1, "第二轮回复")],
+        ]);
+        let gw = gateway(&llm).await;
+        let session = side_session(&gw, json!({})).await;
+        let id = SessionId::from_raw(&session);
+
+        let first = gw.say_in(&id, "第一件事", "k1", false).await;
+        gw.wait_run(&first.run).await;
+        wait_title(gw.state(), &session, "头一个标题").await;
+
+        let second = gw.say_in(&id, "第二件事", "k2", false).await;
+        gw.wait_run(&second.run).await;
+        tokio::time::sleep(GRACE).await;
+
+        let row = record(gw.state(), &session).await;
+        assert_eq!(row.title.as_deref(), Some("头一个标题"));
+        assert_eq!(llm.turns(), 3, "两次主回复加一次起标题，第二轮不再起");
+    }
+
+    #[tokio::test]
+    async fn the_main_conversation_is_never_titled() {
+        let llm = FakeLlm::always(vec![text_round(1, "好的")]);
+        let gw = gateway(&llm).await;
+        let main = gw.home_session().await;
+        let before = record(gw.state(), main.as_str()).await;
+        assert_eq!(before.kind, SessionKind::Main);
+
+        let receipt = gw.say_in(&main, "随便聊聊", "k1", false).await;
+        gw.wait_run(&receipt.run).await;
+        tokio::time::sleep(GRACE).await;
+
+        let row = record(gw.state(), main.as_str()).await;
+        assert_ne!(row.title.as_deref(), Some("好的"));
+        assert!(row.title_provisional, "主对话的临时标题不会被换成正式的");
+        assert_eq!(llm.turns(), 1, "只有主回复，没有起标题那一次");
+    }
+
+    #[tokio::test]
+    async fn a_run_settled_before_a_restart_is_titled_once_after_it() {
+        let home = Home::with_config(&home_config());
+
+        // 上一代进程：标题没开，首轮结算了、标题还是临时的首行。
+        let first = FakeLlm::finisher("已经修好了");
+        let gw = home.start(Arc::clone(&first)).await;
+        let (code, body) = gw.post("/v1/sessions", json!({})).await;
+        assert_eq!(code, 200, "{body}");
+        let session = serde_json::from_str::<SessionSummary>(&body)
+            .expect("会话摘要")
+            .session;
+        let receipt = gw.submit(&session, "k1", "帮我看看这个报错").await;
+        gw.wait_terminal(&receipt.run).await;
+        let before = record(gw.state(), session.as_str()).await;
+        assert_eq!(before.title.as_deref(), Some("帮我看看这个报错"));
+        assert!(before.title_provisional);
+        gw.stop().await;
+
+        // 下一代：重启补起（`replay_recent`），只起一次。
+        home.auto_title(true);
+        let second = FakeLlm::new(vec![vec![text_round(1, "排查报错")]]);
+        let gw = home.start(Arc::clone(&second)).await;
+        wait_title(gw.state(), session.as_str(), "排查报错").await;
+
+        replay_recent(gw.state()).await;
+        tokio::time::sleep(GRACE).await;
+        assert_eq!(second.turns(), 1, "补起一次，再回放也不重复");
+        gw.stop().await;
+    }
+}

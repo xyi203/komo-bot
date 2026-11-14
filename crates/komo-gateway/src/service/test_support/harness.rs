@@ -537,6 +537,7 @@ pub struct GatewayBuilder {
     home: Option<PathBuf>,
     tools: Vec<Arc<dyn Tool>>,
     stream: Option<Arc<dyn ModelStream>>,
+    auto_title: bool,
 }
 
 impl GatewayBuilder {
@@ -549,7 +550,15 @@ impl GatewayBuilder {
             home: None,
             tools: Vec::new(),
             stream: None,
+            auto_title: false,
         }
+    }
+
+    /// 打开"首轮跑完给会话起标题"（注入模型时默认关着：那次多出来的请求会吃掉脚本里下一段）。
+    /// 打开之后，起标题的那次调用是脚本里**紧跟在首轮回复之后**的一段。
+    pub fn auto_title(mut self, on: bool) -> Self {
+        self.auto_title = on;
+        self
     }
 
     /// 注入无状态的模型后端（harness 的主模型）。
@@ -605,6 +614,7 @@ impl GatewayBuilder {
         };
         write_home(&home, &self.config, &self.env);
         super::install_test_tools(&home, self.tools);
+        super::enable_auto_title(&home, self.auto_title);
 
         let running = start(ServiceOptions {
             home: Some(home.clone()),
@@ -892,6 +902,11 @@ impl Home {
         let dir = tempfile::tempdir().expect("临时数据目录");
         write_home(dir.path(), config, DEFAULT_ENV);
         Home { dir }
+    }
+
+    /// 之后在这个数据目录起的 Gateway 是否自动起会话标题（见 [`GatewayBuilder::auto_title`]）。
+    pub fn auto_title(&self, on: bool) {
+        super::enable_auto_title(self.dir.path(), on);
     }
 
     /// 之后每次在这个数据目录起 Gateway 都多挂这几个测试工具（[`super::Gate`]）。

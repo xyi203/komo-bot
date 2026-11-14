@@ -293,6 +293,31 @@ pub fn install_test_tools(
     table.push((home.to_path_buf(), tools));
 }
 
+/// 注入了模型替身的 Gateway 默认不起会话标题（多出来的那次请求会吃掉脚本里下一段）；
+/// 测起标题本身的测试按数据目录打开它。装配时查一次，**没开过就是 false**，生产路径不受影响。
+fn auto_title_homes() -> &'static std::sync::Mutex<Vec<std::path::PathBuf>> {
+    static HOMES: std::sync::OnceLock<std::sync::Mutex<Vec<std::path::PathBuf>>> =
+        std::sync::OnceLock::new();
+    HOMES.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
+
+/// 下一次在 `home` 起 Gateway 时打开 / 关闭自动起标题。
+pub fn enable_auto_title(home: &std::path::Path, on: bool) {
+    let mut homes = auto_title_homes().lock().expect("起标题开关表");
+    homes.retain(|path| path != home);
+    if on {
+        homes.push(home.to_path_buf());
+    }
+}
+
+pub(crate) fn auto_title_enabled(home: &std::path::Path) -> bool {
+    auto_title_homes()
+        .lock()
+        .expect("起标题开关表")
+        .iter()
+        .any(|path| path == home)
+}
+
 /// 装配时的那一次查表。**没装过就是空的**。
 pub(crate) fn test_tools(
     home: &std::path::Path,

@@ -266,7 +266,13 @@ impl GatewayState {
         }
 
         // 注入了模型后端（测试）就不起标题：多出来的那次请求会吃掉脚本里下一段的答复。
-        let auto_title = llm.is_none();
+        // 测的就是起标题的测试按数据目录单独打开（`test_support::enable_auto_title`）；
+        // 测试支撑只在 test / `test-support` 下编译，生产里这一项恒为 false。
+        #[cfg(any(test, feature = "test-support"))]
+        let titles_under_test = super::test_support::auto_title_enabled(&home);
+        #[cfg(not(any(test, feature = "test-support")))]
+        let titles_under_test = false;
+        let auto_title = llm.is_none() || titles_under_test;
         let probe_windows = llm.is_none();
         let llm = Arc::new(SwappableLlm::new(match llm {
             Some(client) => client,

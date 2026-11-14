@@ -6,10 +6,19 @@
  */
 export type ConnectionStatus = "connecting" | "ok" | "signed-out" | "unreachable" | "mismatch" | "error";
 
+/**
+ * local：连这台机器上的 Gateway，用发现文件里的本机令牌，不登录（没在跑就拉起）；
+ * remote：连远程 Gateway，走 OIDC 换设备令牌。
+ */
+export type ConnectionMode = "local" | "remote";
+
 export interface ConnectionInfo {
+  mode: ConnectionMode;
   status: ConnectionStatus;
-  /** 当前 Gateway 的地址（已登录时才有，不含令牌）。 */
+  /** 当前 Gateway 的地址（本机是发现文件里的地址，远程已登录时才有；不含令牌）。 */
   baseUrl?: string;
+  /** 本机数据目录（`KOMO_HOME`，默认 `~/.komo`）。 */
+  local?: { home: string };
   /** 给人看的说明：为什么停在这里、下一步做什么。 */
   message?: string;
   gateway?: { version: string; protocolVersion: number; instanceId: string };
@@ -113,6 +122,8 @@ export interface KomoDesktopApi {
   readonly protocolVersion: number;
   connection: {
     get(): Promise<ConnectionInfo>;
+    /** 切换本机 / 远程。远程的地址与登录状态切走时保留；切完重新探测并整页重载（远程没登录则停在连接设置页）。 */
+    setMode(mode: ConnectionMode): Promise<void>;
     /** 只测不登录：HTTP、协议版本、这台 Gateway 配没配登录（已登录时还测令牌与 SSE）。 */
     test(input: SignInInput): Promise<TestResult>;
     /** 测通后在系统浏览器里打开登录页；完成登录后系统会唤回桌面端（komo://auth/callback），主进程整页重载。 */

@@ -7,6 +7,7 @@ import type { KomoDesktopApi } from "../shared/api";
 
 const channels: typeof ChannelNames = {
   connectionGet: "komo:connection:get",
+  connectionSetMode: "komo:connection:set-mode",
   connectionTest: "komo:connection:test",
   connectionSignIn: "komo:connection:sign-in",
   connectionCancelSignIn: "komo:connection:cancel-sign-in",
@@ -49,6 +50,7 @@ const api: KomoDesktopApi = {
   protocolVersion: Number(arg("komo-protocol-version")),
   connection: {
     get: () => ipcRenderer.invoke(channels.connectionGet),
+    setMode: (mode) => ipcRenderer.invoke(channels.connectionSetMode, mode),
     test: (input) => ipcRenderer.invoke(channels.connectionTest, input),
     signIn: (input) => ipcRenderer.invoke(channels.connectionSignIn, input),
     cancelSignIn: () => ipcRenderer.invoke(channels.connectionCancelSignIn),

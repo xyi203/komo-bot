@@ -10,6 +10,8 @@ interface KomoDesktop {
     /** 跳到壳自带的连接设置页（离开 SPA）：地址、额外请求头、登录。未登录时网页只提示一句，登录在那里做。 */
     openSettings(): Promise<void> | void;
     get?(): Promise<KomoConnectionInfo>;
+    /** 切换本机 / 远程（远程的地址与登录切走时保留）；切完壳会重新探测并整页重载。 */
+    setMode?(mode: "local" | "remote"): Promise<void>;
     /** 只测不登录。 */
     test?(input: KomoSignInInput): Promise<KomoTestResult>;
     signIn?(input: KomoSignInInput): Promise<{ ok: boolean; error?: string; test?: KomoTestResult }>;
@@ -32,6 +34,10 @@ interface KomoDesktop {
 }
 
 interface KomoConnectionInfo {
+  /** 本机：用发现文件里的本机令牌连这台电脑上的 Gateway，不登录；远程：OIDC 设备登录。老版本的壳没有这一项（只有远程）。 */
+  mode?: "local" | "remote";
+  /** 本机数据目录（`KOMO_HOME`）。 */
+  local?: { home: string };
   /** `signed-out`：还没登录或登录失效，桌面端停在连接设置页。 */
   status: "connecting" | "ok" | "signed-out" | "unreachable" | "mismatch" | "error";
   baseUrl?: string;

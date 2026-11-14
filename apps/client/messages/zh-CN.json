@@ -1167,7 +1167,7 @@
   "login_unconfigured_body": "在 Gateway 的 config.toml 里配置 [auth.oidc]（身份提供方地址、客户端 ID、允许登录的账号），重新加载配置后回到这里重新检查。步骤见部署文档（docs/clients.md §9）。",
   "login_recheck": "重新检查",
   "login_desktop_title": "请在桌面端登录",
-  "login_desktop_body": "桌面端的登录在连接设置里完成：填好 Komo 的地址，用系统浏览器登录。",
+  "login_desktop_body": "在连接设置里选「本机」直接连这台电脑上的 Komo；连远程则填好地址，用系统浏览器登录。",
   "desktop_open_connection": "打开连接设置",
   "account_title": "账号",
   "account_local": "本机访问",

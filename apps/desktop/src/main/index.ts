@@ -1,6 +1,6 @@
 import { Menu, app, ipcMain, type IpcMainInvokeEvent, type MenuItemConstructorOptions } from "electron";
 import { channels } from "./channels";
-import type { BrowserAction, BrowserRect, NotifyInput, SignInInput, WindowAction } from "../shared/api";
+import type { BrowserAction, BrowserRect, ConnectionMode, NotifyInput, SignInInput, WindowAction } from "../shared/api";
 import { BrowserPane } from "./browser";
 import { ConnectionManager } from "./connection";
 import { parseCallback } from "./auth";
@@ -102,6 +102,11 @@ function registerIpc() {
     };
 
   ipcMain.handle(channels.connectionGet, guard(() => connection.info()));
+  ipcMain.handle(channels.connectionSetMode, guard((mode: ConnectionMode) => {
+    connection.setMode(mode);
+    // 重新探测：本机会拉起 Gateway 进 SPA；远程没登录就回到连接设置页。
+    setImmediate(() => void connectAndShow());
+  }));
   ipcMain.handle(channels.connectionTest, guard(async (input: SignInInput) => {
     try {
       return await connection.test(input);
@@ -114,6 +119,7 @@ function registerIpc() {
   ipcMain.handle(channels.connectionSignOut, guard(async () => {
     const result = await connection.signOut();
     system.reset();
+    // 本机模式下退的是保存着的远程登录（连接设置页上点的）：本机连接不受影响，仍回设置页显示结果。
     setImmediate(() => windows.loadPage("settings"));
     return result;
   }));
@@ -211,6 +217,11 @@ void app.whenReady().then(async () => {
   connection.on("signedOut", () => {
     system.reset();
     windows.loadPage("settings");
+  });
+  // 本机令牌被拒且发现文件里已经是最新的：停在提示页，由「重试」重新探测。
+  connection.on("lost", () => {
+    system.reset();
+    windows.loadPage("error");
   });
   registerIpc();
   buildMenu();

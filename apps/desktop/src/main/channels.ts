@@ -3,6 +3,7 @@
 /** IPC 通道名。 */
 export const channels = {
   connectionGet: "komo:connection:get",
+  connectionSetMode: "komo:connection:set-mode",
   connectionTest: "komo:connection:test",
   connectionSignIn: "komo:connection:sign-in",
   connectionCancelSignIn: "komo:connection:cancel-sign-in",

@@ -40,9 +40,15 @@ function renderStarting(info: ConnectionInfo) {
   clear();
   root.append(
     el("div", { class: "spinner" }),
-    el("h1", {}, t("正在连接 Gateway…", "Connecting to the Gateway…")),
-    el("p", { class: "muted" }, info.message ?? info.remote?.url ?? ""),
+    el("h1", {}, info.mode === "local" ? t("正在连接本机 Gateway…", "Connecting to the local Gateway…") : t("正在连接 Gateway…", "Connecting to the Gateway…")),
+    el("p", { class: "muted" }, info.message ?? (info.mode === "local" ? info.local?.home : info.remote?.url) ?? ""),
   );
+}
+
+/** 当前连的是哪里：本机写数据目录与地址，远程写地址。 */
+function where(info: ConnectionInfo): string {
+  if (info.mode === "local") return [t("本机", "Local"), info.local?.home, info.baseUrl].filter(Boolean).join(" · ");
+  return info.remote?.url ?? "";
 }
 
 function renderProblem(info: ConnectionInfo) {
@@ -54,7 +60,7 @@ function renderProblem(info: ConnectionInfo) {
         : t("App 版本比 Gateway 旧", "This app is older than the Gateway")
       : t("连不上 Gateway", "Can't reach the Gateway");
   root.append(el("h1", {}, title), el("p", {}, info.message ?? ""));
-  if (info.remote?.url) root.append(el("p", { class: "muted" }, info.remote.url));
+  if (where(info)) root.append(el("p", { class: "muted" }, where(info)));
   if (info.status === "mismatch" || info.gateway) {
     root.append(
       el(
@@ -73,8 +79,60 @@ function renderProblem(info: ConnectionInfo) {
   root.append(actions);
 }
 
+/** 本机 / 远程的分段控件。切换由主进程保存并重新探测，窗口随后整页换掉。 */
+function modeField(info: ConnectionInfo) {
+  const group = el("div", { class: "mode", role: "radiogroup" });
+  const options: Array<["local" | "remote", string]> = [
+    ["local", t("本机", "This Mac")],
+    ["remote", t("远程", "Remote")],
+  ];
+  for (const [value, label] of options) {
+    const input = el("input", { type: "radio", name: "mode", value, checked: info.mode === value });
+    input.addEventListener("change", () => {
+      if (!input.checked) return;
+      for (const item of group.querySelectorAll("input")) item.disabled = true;
+      void api.connection.setMode(value);
+    });
+    group.append(el("label", {}, input, label));
+  }
+  return el("div", { class: "field" }, el("span", {}, t("连接方式", "Connect to")), group);
+}
+
 function renderSettings(info: ConnectionInfo) {
   clear();
+  root.append(el("h1", {}, t("连接设置", "Connection settings")), modeField(info));
+  if (info.mode === "local") return renderLocalSettings(info);
+  renderRemoteSettings(info);
+}
+
+function renderLocalSettings(info: ConnectionInfo) {
+  root.append(
+    el(
+      "p",
+      { class: "muted hint" },
+      t(
+        `连这台电脑上的 komo（数据目录 ${info.local?.home ?? "~/.komo"}），用本机令牌，不用登录；Gateway 没在跑会自动启动。`,
+        `Uses komo on this computer (data directory ${info.local?.home ?? "~/.komo"}) with its local token, no sign-in. Starts the Gateway if it isn't running.`,
+      ),
+    ),
+  );
+  if (info.status === "ok" && info.baseUrl) {
+    root.append(el("p", { class: "good" }, `${t("已连接", "Connected")}: ${info.baseUrl}`));
+  } else if (info.message && info.status !== "connecting") {
+    root.append(el("p", { class: "bad" }, info.message));
+  }
+  if (info.notice) root.append(el("p", { class: info.notice.error ? "bad" : "good" }, info.notice.text));
+  const actions = el("div", { class: "row" }, button(t("连接", "Connect"), () => void api.connection.retry(), true));
+  // 切到本机不会退掉远程登录：告诉人它还在，要清就在这里退。
+  if (info.account) {
+    const who = info.account.email ?? info.account.subject;
+    root.append(el("p", { class: "muted hint" }, t(`远程登录仍保留：${who} · ${info.remote?.url ?? ""}（切到「远程」即可用）。`, `Remote sign-in kept: ${who} · ${info.remote?.url ?? ""} (switch to Remote to use it).`)));
+    actions.append(button(t("退出远程登录", "Sign out of remote"), () => void api.connection.signOut()));
+  }
+  root.append(actions);
+}
+
+function renderRemoteSettings(info: ConnectionInfo) {
   const url = el("input", { type: "text", placeholder: "https://komo.example.com", value: info.remote?.url ?? "", spellcheck: false });
   const names = info.remote?.headerNames ?? [];
   const headers = el("textarea", {
@@ -125,7 +183,6 @@ function renderSettings(info: ConnectionInfo) {
     renderSettings(await api.connection.get());
   }), true);
 
-  root.append(el("h1", {}, t("连接设置", "Connection settings")));
   if (info.account) {
     const who = info.account.email ?? info.account.subject;
     root.append(

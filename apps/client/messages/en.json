@@ -1175,7 +1175,7 @@
   "login_unconfigured_body": "Configure [auth.oidc] in the Gateway's config.toml (provider URL, client ID, allowed accounts), reload the config, then check again here. See the deployment guide (docs/clients.md §9).",
   "login_recheck": "Check again",
   "login_desktop_title": "Sign in on the desktop app",
-  "login_desktop_body": "Sign-in happens in the desktop app's connection settings: enter Komo's address and sign in with the system browser.",
+  "login_desktop_body": "In the desktop app's connection settings, choose This Mac to use Komo on this computer, or enter a remote address and sign in with the system browser.",
   "desktop_open_connection": "Open connection settings",
   "account_title": "Account",
   "account_local": "Local access",

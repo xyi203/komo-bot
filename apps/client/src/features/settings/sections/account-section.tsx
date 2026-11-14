@@ -9,7 +9,7 @@ import { m } from "@/paraglide/messages.js";
 import { CardRow, FormError, Pill, SettingsCard } from "../controls";
 import { DesktopSignOut, desktopConnection } from "./desktop-connection";
 
-/** 关于里的「账号」：当前账号与退出登录。本机令牌（`pnpm dev` 的代理、命令行）没有账号，写「本机访问」。 */
+/** 关于里的「账号」：当前账号与退出登录。本机令牌（`pnpm dev` 的代理、命令行、桌面端的本机连接）没有账号，写「本机访问」。 */
 export function AccountRow() {
   const me = useAuthMe().data;
   const queryClient = useQueryClient();
@@ -37,7 +37,8 @@ export function AccountRow() {
         title={m.account_title()}
         desc={me.credential === "local" ? m.account_local() : (name ?? m.account_unknown())}
         control={
-          desktop ? (
+          // 桌面壳的本机连接用的是本机令牌（credential = local），没有登录可退
+          desktop && me.credential === "device" ? (
             <DesktopSignOut api={desktop} />
           ) : web ? (
             <Button size="sm" disabled={busy} onClick={() => void signOut()}>

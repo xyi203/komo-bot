@@ -1,6 +1,6 @@
 // app:// 协议：同一个来源 `app://komo` 下既是静态文件（SPA 产物、壳自带的提示页），也是 Gateway 的反向代理。
-//   /v1/*、/healthz、/auth/me → 转给当前 Gateway，加设备令牌与额外请求头（渲染进程看不到令牌，也不需要 CORS）；
-//                       Gateway 回 401 就清本地登录并回到登录界面。其余 /auth/*（登录、回调、令牌）只由主进程自己调，不转发
+//   /v1/*、/healthz、/auth/me → 转给当前 Gateway，加令牌（本机令牌或设备令牌）与额外请求头（渲染进程看不到令牌，也不需要 CORS）；
+//                       Gateway 回 401：本机先换发现文件里的新令牌重发一次，远程清本地登录并回到登录界面。其余 /auth/*（登录、回调、令牌）只由主进程自己调，不转发
 //   /_desktop/*       → dist/pages（连接设置、版本不一致提示页）
 //   其他              → SPA 产物目录；无扩展名回落 `_shell.html`（客户端路由）
 import { protocol } from "electron";
@@ -9,7 +9,7 @@ import { readFile } from "node:fs/promises";
 import path from "node:path";
 import type { ConnectionManager } from "./connection";
 import { clientRoot, pagesRoot } from "./paths";
-import { errorMessage } from "./upstream";
+import { errorMessage, type Target } from "./upstream";
 
 export const APP_ORIGIN = "app://komo";
 
@@ -134,27 +134,46 @@ async function forward(request: Request, url: URL, connection: ConnectionManager
   const body = method === "GET" || method === "HEAD" ? undefined : await request.arrayBuffer();
   const wantsStream = (request.headers.get("accept") ?? "").includes("text/event-stream");
 
-  const target = connection.targetSync();
-  if (!target) return jsonError(401, "还没有登录 Gateway，请在连接设置里登录", "unauthorized");
-  const headers = new Headers();
-  for (const [name, value] of request.headers) if (!DROP_REQUEST.has(name.toLowerCase())) headers.set(name, value);
-  // 额外请求头与 Authorization 来自主进程，覆盖渲染进程发来的同名头。
-  for (const [name, value] of Object.entries(target.headers)) headers.set(name, value);
-  // 事件流不要压缩：中间层对压缩流的缓冲会让事件迟到。
-  if (wantsStream) headers.set("accept-encoding", "identity");
+  const first = connection.targetSync();
+  if (!first) {
+    return connection.mode === "local"
+      ? jsonError(502, "本机 Gateway 没在跑（没有发现文件），请在连接提示页里重试")
+      : jsonError(401, "还没有登录 Gateway，请在连接设置里登录", "unauthorized");
+  }
+  const headersFor = (target: Target) => {
+    const headers = new Headers();
+    for (const [name, value] of request.headers) if (!DROP_REQUEST.has(name.toLowerCase())) headers.set(name, value);
+    // 额外请求头与 Authorization 来自主进程，覆盖渲染进程发来的同名头。
+    for (const [name, value] of Object.entries(target.headers)) headers.set(name, value);
+    // 事件流不要压缩：中间层对压缩流的缓冲会让事件迟到。
+    if (wantsStream) headers.set("accept-encoding", "identity");
+    return headers;
+  };
 
   // 渲染进程取消（EventSource.close、页面跳走）时，上游连接跟着断。
   const controller = new AbortController();
   request.signal.addEventListener("abort", () => controller.abort(), { once: true });
-  try {
-    const upstream = await fetch(`${target.base}${url.pathname}${url.search}`, {
+  const send = (target: Target) =>
+    fetch(`${target.base}${url.pathname}${url.search}`, {
       method,
-      headers,
+      headers: headersFor(target),
       body,
       redirect: "manual",
       signal: controller.signal,
     });
-    // 令牌失效：清本地登录，主进程会把窗口带回登录界面。响应照常交给界面（它马上会被整页换掉）。
+  try {
+    let target = first;
+    let upstream = await send(target);
+    if (upstream.status === 401 && connection.mode === "local") {
+      // 本机 Gateway 刚重启过：发现文件里已经是新令牌就换上再发一次（请求体已经读进内存，可以重放）。
+      const fresh = connection.targetSync();
+      if (fresh && (fresh.base !== target.base || fresh.headers.authorization !== target.headers.authorization)) {
+        void upstream.body?.cancel();
+        target = fresh;
+        upstream = await send(target);
+      }
+    }
+    // 令牌失效：远程清本地登录、回登录界面；本机停在提示页。响应照常交给界面（它马上会被整页换掉）。
     if (upstream.status === 401) connection.handleUnauthorized(target);
     return relay(upstream, controller);
   } catch (error) {

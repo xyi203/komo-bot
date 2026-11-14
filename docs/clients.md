@@ -30,7 +30,7 @@ macOS 应用和手机端，需要一套标准的前端栈，以及一份所有�
 | D4 | 仓库结构 | 仓库根加 pnpm workspace：`apps/client`（Start SPA）、`apps/desktop`（Electron）、`packages/protocol`（生成的类型）、`packages/api`（HTTP + SSE 客户端与 Query hooks）；以后加 `apps/mobile` | 界面、协议、各端的壳各管一摊。原型 `apps/web` 留到新版对齐后再删（C1 已删） |
 | D5 | 网页由谁提供 | Gateway 同源提供 SPA 产物：`/v1/*` 是 API，其余路径先找静态文件，找不到回落 `_shell.html`（已拍板，同 Hermes） | 去掉 `serve.mjs`；浏览器、PWA、手机都只认 Gateway 一个地址（web.md §9 第 1 条）。网页跟 Gateway 一起发布，协议不会错位；同源时 cookie 鉴权可用。不放到 Cloudflare Worker：浏览器反正要连到 Gateway，放在 Worker 上只多一处部署，还会跨域、版本错位 |
 | D6 | 浏览器怎么鉴权 | **（2026-11-14 改写，原配对码方案已删，P21）** OIDC 登录换 cookie：网页没登录时跳 `/auth/login`，Gateway 走 OIDC 授权码 + PKCE 到操作者自建的身份提供方，回调里核对允许名单后种 `komo_session`（`HttpOnly; SameSite=Lax`，公开地址是 https 时带 `Secure`），会话落 `aux.db`、重启不掉；`auth` 层认本机令牌 / 设备令牌（Bearer）与这个 cookie；会改东西的 cookie 请求另外核对 `Origin`（同 `Host` 或等于 `public_url` 的源）。**Host 校验**不变：只接受回环地址、监听地址、`[gateway] trusted_hosts` 与 `public_url` 的主机，其余一律 403（同 DeepSeek Harness）。细节见 §9 | `EventSource` 带不了请求头，cookie 能带；`HttpOnly` 让 JS 拿不到；自己不存密码、不做登录失败限制，那是身份提供方的事。Host 校验挡的是 DNS 重绑定：恶意网页把自己的域名改解析到 `127.0.0.1`，就能以"同源"身份读 Gateway 的响应。不需要鉴权的路由（静态文件、`/healthz`、`/auth/*`）照样暴露，所以 `/auth/*` 里不放任何不经校验就能用的东西。校验只负责放行，鉴权仍靠令牌和 cookie |
-| D7 | macOS | **Electron**（已拍板），用 electron-builder 打包和自动更新；只连远程 Gateway（点「登录」跳系统浏览器走 OIDC，换设备令牌，§4、§9），不再有本机模式（2026-11-14，P20） | 跟网页同一套代码。见 §4 |
+| D7 | macOS | **Electron**（已拍板），用 electron-builder 打包和自动更新；两种连接（2026-11-15）：**本机**（默认，读 `runtime/gateway.json` 的本机令牌，不登录，没在跑就拉起）与**远程**（点「登录」跳系统浏览器走 OIDC，换设备令牌，§4、§9）。2026-11-14 曾按 P20 删掉本机模式，因本机使用离不开 OIDC 配置而加回 | 跟网页同一套代码。见 §4 |
 | D8 | 手机 | 先做 PWA；PWA 不够用时再用 Capacitor 套壳 | 见 §5 |
 | D9 | 多语言 | 新版从第一行界面代码起就走文案表，先做 `zh-CN` 与 `en`；文案表用 Paraglide JS（编译期生成带类型的消息函数）。语言偏好**只存在各端**（已拍板）：浏览器与 PWA 存 `localStorage`，Electron 存在自己的设置里，Capacitor 存在 App 偏好里；没选过就跟系统语言（`zh*` 用中文，其余用英文） | 原型里几百处写死的中文不再搬第二次：C1 迁移一节就抽一节的文案。消息函数带类型，漏翻、键名写错在编译期报错，没用到的文案不进产物。偏好不进 Gateway：语言是看界面的人的事，同一个 Gateway 可以有人用中文、有人用英文；代价是换设备要重选一次 |
 
@@ -60,7 +60,9 @@ macOS 应用和手机端，需要一套标准的前端栈，以及一份所有�
 ## 4. macOS：Electron
 
 - **加载**：用自定义协议 `app://` 加载打进包里的 SPA 产物，不用 `file://`。打开即用，不依赖 Gateway 先起来。
-- **连接**（2026-11-14 改，P19–P21：komo 只跑在远程机器上，桌面端只剩「连远程」一种，本机模式——读 `runtime/gateway.json`、拉起本机 Gateway——已删）：
+- **连接**两种，连接设置页顶上的「连接方式」切换（2026-11-15 加回本机；2026-11-14 曾按 P19–P21 只留远程）：
+  - **本机**（默认；没有 `connection.json`、或旧文件里没地址时都是本机）：主进程读 `$KOMO_HOME/runtime/gateway.json`（默认 `~/.komo`）拿地址与本机令牌，转发时带 `Authorization: Bearer <本机令牌>`，与机器上的命令行同一条凭据（`Credential::Local`），不经 OIDC——能读这个 0600 文件的人本来就能用 komo。令牌只在主进程内存里，不进 `connection.json`。发现文件按 mtime 与大小缓存，每次转发前 stat 一次：Gateway 重启换了令牌或端口，下一条请求就用新的；正在途中的请求拿到 401 时，若发现文件里已是新令牌就换上重发一次（请求体已在内存，可重放）。仍然 401 就停在「连不上」提示页，不清任何东西。Gateway 没在跑（没有发现文件或 `/healthz` 不通）就拉起：找 `komo`（`KOMO_BIN` → PATH → `~/.local/bin` → `/opt/homebrew/bin` → `/usr/local/bin`），默认数据目录跑 `komo gateway`（装 / 起系统服务），非默认 `KOMO_HOME` 跑分离的 `komo gateway --foreground`；最多等 30 秒就绪。
+  - **远程**：下面几条。切到本机时远程的地址、额外请求头与登录原样保留，切回去不用重新登录；在远程那边完成一次登录会把连接方式切到远程。
   - 连接设置只填 Gateway 地址（https；回环地址允许 http，开发时连 `http://127.0.0.1:端口` 当作普通远程地址、走同样的登录），可选再加几个额外请求头，给挡在前面的访问代理用（比如 Cloudflare Access 的 service token）。不再手填令牌。
   - **登录**：点「登录」→ 主进程先测 `/healthz`、协议版本与 `GET /auth/me`（`oidc_configured` 为假就报「这台 Gateway 没有配置登录」，不开浏览器）→ 生成 `code_verifier` / S256 `code_challenge` / `state`（只在内存，5 分钟有效）→ `shell.openExternal(<gateway>/auth/device/authorize?…&redirect_uri=komo://auth/callback&name=…)` → 系统浏览器完成 OIDC → Gateway 303 到 `komo://auth/callback?code&state` → 系统唤回桌面端（macOS `open-url`；Windows / Linux 为 `second-instance` 的 argv，冷启动则在本进程的 argv）→ 校验 state 与有效期 → `POST /auth/device/token {code, code_verifier, redirect_uri}` → 设备令牌。state 不符、过期、没有进行中的登录、换令牌失败都在连接设置页给出原因。
   - **令牌存放**：地址、`session_id`、`subject` / `email` 明文放 `userData/connection.json`（0600）；令牌与额外请求头用 `safeStorage` 加密后放同一文件。加密不可用（含 Linux 退到 `basic_text`）时**拒绝登录**，不退化成明文；这个检查在打开浏览器之前，免得换到令牌才发现存不了。
@@ -158,7 +160,7 @@ macOS 应用和手机端，需要一套标准的前端栈，以及一份所有�
 |---|---|---|
 | 加载 | 特权协议 `app://komo`（standard/secure/stream），`src/main/protocol.ts`：无扩展名回落 `_shell.html`，目录穿越拒绝；开发读 `apps/client/dist/client`，打包读 `Resources/client`（`KOMO_DESKTOP_CLIENT_DIR` 可覆盖）；壳 html 的 CSP 按内联脚本内容算 sha256（不开 `unsafe-inline` 脚本） | 完成，冒烟通过 |
 | 转发 | `/v1/*`、`/healthz`、`/auth/me` 由协议处理器转给当前 Gateway，加设备令牌与额外请求头；响应以流转发，渲染进程取消读取时上游随之断开；3xx（访问代理要登录）转成 502 的 `ErrorBody`；401 清本地登录（2026-11-14） | 转发的旧版完成并冒烟过（SSE 24 帧）；带设备令牌与 401 处理是 5b 改的，**未编译、未实测**。断开传播只按代码路径写，没有单独测 |
-| ~~本机连接~~ | **已删（2026-11-14，5b）**：读发现文件、拉起本机 Gateway、`KOMO_BIN` 查找都不在了；开发时连 `http://127.0.0.1:端口` 当普通远程地址 | 代码已删，**未编译** |
+| 本机连接 | `src/main/local.ts`（发现文件缓存、找 `komo`、拉起 Gateway）、`connection.ts` 的 `connectLocal` 与本机 401、`protocol.ts` 的换令牌重发一次；`connection.json` 多一个 `mode`（`local` / `remote`），没有 `mode` 的旧文件有地址就按远程读（已登录的人升级后不被切走）。2026-11-14 删过，2026-11-15 加回 | 2026-11-15 冒烟：空 userData 起来直接进 SPA，`/auth/me` 回 `credential: "local"`、`/v1/sessions` 200（本机 Gateway 没配 OIDC）；本机与远程来回切（含在设置页点单选）都对，`connection.json` 只记 `mode`。**未实测**：Gateway 没在跑时的拉起、Gateway 重启后换令牌 |
 | 登录 | 见 §4「连接」：`src/main/auth.ts`（PKCE、state、换令牌、吊销）、`connection.ts`（登录状态机、401 / 退出）、`store.ts`（`safeStorage` 加密存 `connection.json`；旧版 `{mode, remote}` 文件只沿用地址与额外请求头，旧令牌作废）、`pages/page.ts`（连接设置页：地址 + 额外请求头 + 登录 / 退出） | 2026-11-14（5b）写完，**未编译、未实测**（§9.1 第 5 步是实测清单） |
 | 切换连接 | 登录成功后主进程让窗口整页重载到 `app://komo/`（清 Query 缓存与前端状态），托盘通知基线同时作废 | 完成（代码路径），未端到端实测 |
 | 版本 | 构建时 `scripts/build-info.mjs` 从 `crates/komo-kernel/src/protocol/mod.rs` 的 `PROTOCOL_VERSION` 与根 `Cargo.toml` 读出，写进 `dist/build-info.json`（读不到就构建失败）；连接时与 `/healthz` 比，不一致停在提示页并说明哪边旧、怎么更新；`version` 不同而协议相同照常用 | 完成；提示页文案与布局做了，**不一致的真实场景没造出来**（只有一个 Gateway 版本） |
@@ -183,14 +185,14 @@ macOS 应用和手机端，需要一套标准的前端栈，以及一份所有�
 **界面接口约定**（C1 已接 ⌘K 事件与设置里的连接按钮）（类型在 `apps/desktop/src/shared/api.ts`，界面里按 `window.komoDesktop?` 判断是否在 Electron 里；浏览器里没有这个对象）
 
 - `window.komoDesktop`：`apiVersion: 1`、`platform`、`appVersion`、`protocolVersion`；
-  `connection.get()`（`ConnectionInfo`，不含令牌；`status` 多了 `signed-out`，没有 `mode` 了；`account` 是已登录账号，`signingIn` 表示在等浏览器，`notice` 是最近一次登录 / 退出 / 失效的说明）、`connection.test({url, headers})`、`connection.signIn({url, headers})`（只负责打开系统浏览器，结果靠整页重载通知）、`connection.cancelSignIn()`、`connection.signOut()`（成功后主进程回到连接设置页）、`connection.retry()`、`connection.openSettings()`；
+  `connection.get()`（`ConnectionInfo`，不含令牌；`mode` 是 `local` / `remote`，本机时 `local.home` 是数据目录；`status` 多了 `signed-out`（只在远程出现）；`account` 是已登录账号，`signingIn` 表示在等浏览器，`notice` 是最近一次登录 / 退出 / 失效的说明）、`connection.test({url, headers})`、`connection.signIn({url, headers})`（只负责打开系统浏览器，结果靠整页重载通知）、`connection.cancelSignIn()`、`connection.setMode("local" | "remote")`（保存后重新探测并换页）、`connection.signOut()`（退的是远程登录；成功后主进程回到连接设置页）、`connection.retry()`、`connection.openSettings()`；
   `notify({ title, body?, session? })`；`window.do("minimize" | "toggle-maximize" | "toggle-fullscreen" | "close")`；
   `onCommandPalette(handler)` 与 `onOpenSession(handler)`，都返回取消订阅函数。
 - **⌘K**：全局快捷键触发后，主进程在窗口加载完的 SPA 上发事件。界面二选一：`window.komoDesktop.onCommandPalette(() => openPalette())`，或监听 DOM 事件 `komo-desktop:command-palette`（无 detail）。
 - **打开会话**：`onOpenSession(id => router.navigate(...))`。**登记过才会收到**；没登记时主进程退回整页跳转到 `app://komo/sessions/<id>`（现有 C0 路由），所以不接也能用，只是会整页重载。
 - **连接设置入口**：连接设置页是壳自带的 `app://komo/_desktop/page.html?kind=settings`（菜单 ⌘, 与托盘也能进）。界面的设置页放个按钮调 `komoDesktop.connection.openSettings()` 即可（要显示账号、做退出按钮可用 `connection.get()` 的 `account` 与 `connection.signOut()`），别再自己做一份登录表单；令牌不进 SPA。
 - **版本不一致/连不上**：主进程在进入 SPA 之前就拦在 `_desktop/page.html?kind=mismatch|error`，SPA 不需要处理；SPA 里 Gateway 掉线后的错误提示照常走 `ErrorBody`（转发失败会得到 502 + `error.code = "internal"`）。设置页可以用 `connection.get()` 显示两边版本。
-- 请求照旧用同源相对路径 `/v1/*`；Electron 里不走 cookie，带的是设备令牌（§9）。`GET /auth/me` 也转发（带令牌，所以回 `credential: "device"`），网页的账号区块在桌面壳里可以照常用；网页的「退出」在桌面壳里要调 `komoDesktop.connection.signOut()`，不要 `POST /auth/logout`（那条只认 cookie 会话）。
+- 请求照旧用同源相对路径 `/v1/*`；Electron 里不走 cookie，带的是本机令牌或设备令牌（§9）。`GET /auth/me` 也转发（带令牌，所以回 `credential: "local"` 或 `"device"`；本机时账号区块写「本机访问」、不显示退出），网页的账号区块在桌面壳里可以照常用；网页的「退出」在桌面壳里要调 `komoDesktop.connection.signOut()`，不要 `POST /auth/logout`（那条只认 cookie 会话）。
 - 开发：`pnpm desktop:dev` 用的是 SPA 的构建产物，没有热更新；改界面仍用 `pnpm dev` 在浏览器里调。
 
 ## 7. 参考：Hermes Agent 与 DeepSeek Harness
@@ -248,7 +250,7 @@ komo 照搬的：Host 校验（D6）、`public_url` / `trusted_hosts`（§5）�
           客户端 ──POST /auth/device/token {code, code_verifier, redirect_uri}──▶ 设备令牌（Bearer）
 ```
 
-**凭据与权限**：所有 `/v1/**` 接受本机令牌、设备令牌或登录 cookie；`/healthz`、`/auth/*` 不要求登录。本机令牌（`runtime/gateway.json`）只给机器上的命令行，不经 OIDC——身份提供方挂了，登到机器上处理。没配 `[auth.oidc]` 时网页与设备都登不了（`GET /auth/me` 报 `oidc_configured: false`，`komo config check` 有警告）。
+**凭据与权限**：所有 `/v1/**` 接受本机令牌、设备令牌或登录 cookie；`/healthz`、`/auth/*` 不要求登录。本机令牌（`runtime/gateway.json`）给机器上的命令行与桌面端的本机连接，不经 OIDC——身份提供方挂了，登到机器上处理。没配 `[auth.oidc]` 时网页与设备都登不了（`GET /auth/me` 报 `oidc_configured: false`，`komo config check` 有警告）。
 
 **设备登录的回跳白名单**（`GET /auth/device/authorize` 的 `redirect_uri`）：`komo://auth/callback`（桌面端深链；注意这与现有的 `komo://session/<id>` 是另一种形状，桌面端要加一条处理）与本机回环地址的任意端口（`http://127.0.0.1:端口/…`、`localhost`、`[::1]`）。不在白名单里的地址 Gateway 页面报错，不跳转、不发码。
 
@@ -296,7 +298,7 @@ allowed_subjects = ["<你的 sub>"]      # 或 allowed_emails = ["me@example.com
 
 **5. 桌面端**（2026-11-14 5b 写完，**未编译、未实测**；要用打包产物验：`pnpm desktop:build` 出 `.app`，装到「应用程序」再开。`pnpm desktop:dev` 没注册 `komo://`，收不到回跳）
 
-1. 用一个全新的 userData 起（`KOMO_DESKTOP_USER_DATA=/tmp/komo-desktop-x` 或直接用 .app）：窗口应停在「连接设置」，没有「本机」选项。
+1. 用一个全新的 userData 起（`KOMO_DESKTOP_USER_DATA=/tmp/komo-desktop-x` 或直接用 .app）：默认是「本机」，直接进主界面；在连接设置里切到「远程」，窗口停在远程的连接设置。
 2. 填 `https://komo.example.com` → 「只测试」：应看到 health、协议版本一致、「Gateway 已配置登录，可以登录」。填一台没配 `[auth.oidc]` 的 Gateway（含 `http://127.0.0.1:端口`）：应提示「这台 Gateway 没有配置登录」，且不会打开浏览器。填非回环的 `http://…`：应直接报必须用 https。
 3. 点「登录」：系统浏览器打开 `…/auth/device/authorize?…`，页面上等待态；在 Pocket ID 登完，浏览器 303 到 `komo://auth/callback?code=…&state=…`，**需确认**：macOS 上 Safari / Chrome 是否弹「要打开 komo 吗」、是否放行；桌面端被唤到前台、进入主界面；`connection.json` 里没有令牌明文（`secret` 是 base64 密文）；服务端 `GET /v1/auth/sessions` 多一条 `kind: "device"`、名字是「komo 桌面端 @ <主机名>」。
 4. **失败路径**：点「登录」后等 5 分钟不操作 → 设置页显示「登录超时」；点「登录」后手动打开 `komo://auth/callback?code=x&state=y`（`open 'komo://…'`）→ 「state 对不上」，原登录仍可完成；没点「登录」就打开 `komo://auth/callback?code=x&state=y` → 「没有正在进行的登录」；把 `code` 改坏或回跳两次 → 「Gateway 拒绝了授权码」。

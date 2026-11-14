@@ -15,11 +15,15 @@ export interface StoredLogin {
   email?: string;
 }
 
+/** 本机：读 `$KOMO_HOME/runtime/gateway.json` 的本机令牌，不登录；远程：地址 + OIDC 设备令牌。 */
+export type StoredMode = "local" | "remote";
+
 /**
- * `userData/connection.json`：Gateway 地址与登录状态。`secret` 是 safeStorage 加密后的 Secrets（base64）；
- * 有 `login` 才算登录过，没有就是"只填了地址"。
+ * `userData/connection.json`：连接方式、远程 Gateway 地址与登录状态。`secret` 是 safeStorage 加密后的 Secrets（base64）；
+ * 有 `login` 才算登录过，没有就是"只填了地址"。本机模式下远程那几项照样保留，切回远程不用重填、不用重新登录。
  */
 export interface StoredConnection {
+  mode: StoredMode;
   url?: string;
   secret?: string;
   login?: StoredLogin;
@@ -29,21 +33,25 @@ const file = () => path.join(app.getPath("userData"), "connection.json");
 
 export function loadStored(): StoredConnection {
   try {
-    const parsed = JSON.parse(readFileSync(file(), "utf8")) as StoredConnection & { remote?: { url?: string; secret?: string } };
+    const parsed = JSON.parse(readFileSync(file(), "utf8")) as Partial<StoredConnection> & { remote?: { url?: string; secret?: string } };
     // 旧版（手填令牌）写的是 { mode, remote: { url, secret } }：地址与额外请求头沿用，令牌不再认——没有 login 就得重新登录。
-    const url = parsed.url ?? parsed.remote?.url;
-    if (typeof url !== "string" || !url) return {};
+    const raw = parsed.url ?? parsed.remote?.url;
+    const url = typeof raw === "string" && raw ? raw : undefined;
+    // 没写 mode 的文件来自只有远程的那一版：有地址就还是远程（已登录的人升级后不被切走），否则默认本机。
+    const mode: StoredMode = parsed.mode === "local" || parsed.mode === "remote" ? parsed.mode : url ? "remote" : "local";
+    if (!url) return { mode };
     const secret = parsed.secret ?? parsed.remote?.secret;
     const login = parsed.login;
     const valid = login && typeof login.sessionId === "string" && typeof login.subject === "string";
     return {
+      mode,
       url,
       ...(typeof secret === "string" && secret ? { secret } : {}),
       ...(valid ? { login: { sessionId: login.sessionId, subject: login.subject, ...(login.email ? { email: login.email } : {}) } } : {}),
     };
   } catch {
-    // 没有文件或读不出来：当作从没配过。
-    return {};
+    // 没有文件或读不出来：当作从没配过，默认连本机。
+    return { mode: "local" };
   }
 }
 
@@ -69,12 +77,17 @@ function write(value: StoredConnection) {
  * 保存地址（与登录状态）。令牌或额外请求头要落盘时，加密不可用就抛，不退化成明文；
  * 只有地址（没有令牌、没有请求头）不需要加密。
  */
-export function saveStored(url: string, secrets: Secrets, login?: StoredLogin) {
+export function saveStored(mode: StoredMode, url: string, secrets: Secrets, login?: StoredLogin) {
   const needsSecret = Boolean(secrets.token) || Object.keys(secrets.headers).length > 0;
-  if (!needsSecret) return write({ url });
+  if (!needsSecret) return write({ mode, url });
   if (!canEncrypt()) throw new Error("系统钥匙串不可用（safeStorage），无法安全保存登录令牌");
   const secret = safeStorage.encryptString(JSON.stringify(secrets)).toString("base64");
-  write({ url, secret, ...(login ? { login } : {}) });
+  write({ mode, url, secret, ...(login ? { login } : {}) });
+}
+
+/** 只改连接方式，远程的地址、密文与登录状态原样留着（不解密、不重新加密）。 */
+export function saveMode(mode: StoredMode) {
+  write({ ...loadStored(), mode });
 }
 
 /** 写不进去时的兜底：直接删文件，免得留着一个已经作废的令牌。 */

@@ -1,6 +1,12 @@
 import { app } from "electron";
 import { readFileSync } from "node:fs";
+import { homedir } from "node:os";
 import path from "node:path";
+
+/** 本机数据目录：`KOMO_HOME`，默认 `~/.komo`（与 komo 命令一致）。从 Finder 启动的 App 通常没有 `KOMO_HOME`。 */
+export const komoHome = () => process.env.KOMO_HOME || path.join(homedir(), ".komo");
+
+export const defaultHome = () => path.join(homedir(), ".komo");
 
 /** SPA 产物目录。打包后在 Resources/client；开发时指向 apps/client/dist/client（先 pnpm build）。 */
 export function clientRoot(): string {

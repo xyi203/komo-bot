@@ -166,6 +166,9 @@ mod tests {
     /// flush 之后失败被记进状态，而且只在第一次是"边沿"。
     #[tokio::test(flavor = "multi_thread")]
     async fn an_unreachable_endpoint_never_blocks_the_emitter() {
+        // 导出器建 HTTP 客户端要 rustls 的加密实现：生产里 `main` 启动时装（`install_default`），
+        // 测试里自己装，不能指望同一个测试程序里别的测试先装过（单跑这一个会失败）。
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let endpoint = "http://127.0.0.1:9";
         let status = Arc::new(TelemetryStatus::new(Some(endpoint.into())));
         let started = Instant::now();

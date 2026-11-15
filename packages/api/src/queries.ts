@@ -50,6 +50,8 @@ export function useHealth() {
     queryKey: keys.health,
     queryFn: fetchHealth,
     retry: false,
+    // 好几处同时订阅（协议提示、图标栏、输入框），不设的话每挂一处就重取一次
+    staleTime: 30_000,
     refetchInterval: (query) => (query.state.status === "error" ? 5000 : false),
   });
 }
@@ -95,9 +97,16 @@ export function useChats() {
   });
 }
 
+const homeQuery = { queryKey: keys.home, queryFn: fetchHome, staleTime: Infinity };
+
 /** 默认 Agent 的主会话（没有就建）。 */
 export function useHomeSession() {
-  return useQuery({ queryKey: keys.home, queryFn: fetchHome, staleTime: Infinity });
+  return useQuery(homeQuery);
+}
+
+/** 启动时与 `/auth/me` 同时取主会话：登录守卫一放行，主对话就能直接发它的请求，少等一个来回。 */
+export function prefetchHomeSession(queryClient: QueryClient) {
+  void queryClient.prefetchQuery(homeQuery);
 }
 
 /** 搜索弹窗的对话检索：关键词非空才查，结果按关键词缓存。 */
@@ -121,11 +130,11 @@ export function useInterventions() {
   return useQuery({ queryKey: keys.interventions, queryFn: fetchInterventions, refetchInterval: 30_000, retry: false });
 }
 
-export function useSessionTree(session: string | undefined) {
+export function useSessionTree(session: string | undefined, enabled = true) {
   return useQuery({
     queryKey: keys.session(session ?? "").tree,
     queryFn: () => fetchTree(session!),
-    enabled: !!session,
+    enabled: !!session && enabled,
     retry: false,
   });
 }

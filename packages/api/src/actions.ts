@@ -27,7 +27,7 @@ export const fetchHome = () => get<SessionSummary>("/v1/home-session");
 export const fetchModels = () => get<ModelsResponse>("/v1/models");
 export const fetchInterventions = () => get<InterventionListResponse>("/v1/interventions");
 export const fetchEventPage = (session: string, from: number, signal?: AbortSignal) =>
-  get<EventPage>(`/v1/sessions/${enc(session)}/events`, { from, limit: 500 }, signal);
+  get<EventPage>(`/v1/sessions/${enc(session)}/events`, { from, limit: 500, lean: true }, signal);
 export const fetchTree = (session: string) => get<SessionTree>(`/v1/sessions/${enc(session)}/tree`);
 export const fetchSessionChanges = (session: string) => get<SessionChanges>(`/v1/sessions/${enc(session)}/changes`);
 export const fetchRunChanges = (run: string) => get<RunChanges>(`/v1/runs/${enc(run)}/changes`);

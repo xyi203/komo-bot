@@ -11,6 +11,7 @@ export {
   fetchHealth,
   fetchSessionPage,
   fetchSessions,
+  prefetchHomeSession,
   SESSION_PAGE,
   sessionUnfinished,
   useChats,

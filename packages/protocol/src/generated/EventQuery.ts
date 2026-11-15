@@ -5,4 +5,9 @@ export type EventQuery = {
 /**
  * 从哪个游标读起（不含）。
  */
-from: Seq, limit?: number | null, };
+from: Seq, limit?: number | null, 
+/**
+ * 只对 JSON 分页生效：`tool.result` 不带 `body`（`preview` 还在），`message.assistant` 的
+ * `provider_blocks` 只留推理块。给只画对话的客户端省流量；不带就是完整事件。
+ */
+lean?: boolean | null, };

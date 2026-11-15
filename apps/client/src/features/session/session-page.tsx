@@ -38,7 +38,6 @@ function SessionBody({ sessionId, main }: { sessionId: string; main: boolean }) 
   const memories = useMemoryIndex();
   const pendingInterventions = useInterventions();
   const { events, status, error, delta, stream, reload } = useSessionEvents(sessionId);
-  const tree = useSessionTree(sessionId);
   const models = useModels();
   const changesQuery = useSessionChanges(sessionId);
   const trace = useTraceUi();
@@ -50,7 +49,6 @@ function SessionBody({ sessionId, main }: { sessionId: string; main: boolean }) 
   const archived = !!summary && isArchived(summary);
   const view = useMemo(() => (events ? foldEvents(events) : undefined), [events]);
   const { pending, send, retry, stop } = useSend(sessionId, events, view?.runs ?? new Map());
-  const context = useMemo(() => contextView(view, tree.data, models.data), [view, tree.data, models.data]);
   const kids = useMemo(() => (sessions.data ?? []).filter((s) => s.kind === "task" && s.home === sessionId && isLive(s)), [sessions.data, sessionId]);
 
   const chatRows = chats.data?.chats;
@@ -67,6 +65,9 @@ function SessionBody({ sessionId, main }: { sessionId: string; main: boolean }) 
 
   // 过程面板：开着、看哪一轮、哪个标签。换对话整页重挂，状态跟着清掉
   const [panel, setPanel] = useState<{ run: string; tab: ProcessTab } | null>(null);
+  // 会话树很大，首屏不取：过程面板的系统提示要它；上下文占用只在还没有实报用量时拿它估算
+  const tree = useSessionTree(sessionId, !!panel || (!!view && !view.usage));
+  const context = useMemo(() => contextView(view, tree.data, models.data), [view, tree.data, models.data]);
   const changes = useMemo(() => new Map((changesQuery.data?.runs ?? []).map((r): [string, RunChanges] => [r.run, r])), [changesQuery.data]);
   const [openFiles, setOpenFiles] = useState<Record<string, boolean>>({});
   const [reviewAt, setReviewAt] = useState<string | null>(null);

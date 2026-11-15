@@ -2,7 +2,8 @@
 //!
 //! 路径、`Accept` 分派、游标写法（`?from=` 与 `Last-Event-ID`，头优先）沿用冻结的协议：
 //!
-//! - 非 `text/event-stream`：一页 JSON（[`EventPage`]），`seq > from` 的前 `limit` 条；
+//! - 非 `text/event-stream`：一页 JSON（[`EventPage`]），`seq > from` 的前 `limit` 条；`?lean=true` 时去掉
+//!   只画对话的客户端不读的大字段（[`lean`]）；
 //! - `text/event-stream`：**先订阅 hub 再补读**，补读之后接直播。补读先看 feed 在内存里留的最近事件，
 //!   覆盖不到才读存储（投影与 feed 同一个纯函数，见 [`feed::backfill_recent`]），直播来自 [`feed`] 推进
 //!   hub 的帧。两段重叠的部分靠 seq 去重
@@ -28,9 +29,11 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use futures_util::stream::{self, Stream, StreamExt};
 use komo_kernel::durable::Storage;
+use komo_kernel::events::{Event, EventPayload};
 use komo_kernel::protocol::http::{ErrorCode, EventPage, EventQuery};
 use komo_kernel::protocol::sse::{SseEvent, SseFrame};
 use komo_kernel::types::ids::{Seq, SessionId};
+use serde_json::Value;
 
 use crate::http::Api;
 use crate::http::error::{ApiFailure, ApiResult};
@@ -70,11 +73,31 @@ async fn nested_frames(storage: &dyn Storage, session: &str, last: Seq) -> Vec<S
         .collect()
 }
 
-fn frame_of(event: komo_kernel::events::Event) -> SseFrame {
+fn frame_of(event: Event) -> SseFrame {
     SseFrame {
         id: event.seq,
         session: event.session.clone(),
         event: SseEvent::Event(Box::new(event)),
+    }
+}
+
+/// `?lean=true` 的一条事件：`tool.result` 去掉 `body`（完整的模型视图，一条最多 30 KiB；1 KiB 的
+/// `preview` 留着），`message.assistant` 的 `provider_blocks` 只留推理块（其余与 `text` /
+/// `tool_calls` 重复）。
+fn lean(event: &mut Event) {
+    match &mut event.payload {
+        EventPayload::ToolResult(result) => result.body = None,
+        EventPayload::MessageAssistant(message) => {
+            if let Some(Value::Array(blocks)) = &mut message.provider_blocks {
+                blocks.retain(|block| {
+                    matches!(
+                        block.get("type").and_then(Value::as_str),
+                        Some("reasoning" | "thinking")
+                    )
+                });
+            }
+        }
+        _ => {}
     }
 }
 
@@ -108,6 +131,9 @@ async fn stream(
             .map_err(failure)?;
         let more = events.len() > limit;
         events.truncate(limit);
+        if query.lean == Some(true) {
+            events.iter_mut().for_each(lean);
+        }
         let next = events.last().map_or(from, |event| event.seq);
         return Ok(Json(EventPage {
             session: SessionId::from_raw(id),
@@ -215,4 +241,53 @@ fn frames(
             }
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn event(kind: &str, data: &str) -> Event {
+        Event::from_line(&format!(
+            r#"{{"v":1,"seq":1,"event_id":"evt-1","session_id":"sess-1","run_id":"run-1","at":"2026-09-15T08:00:02Z","type":"{kind}","data":{data}}}"#
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn lean_drops_the_tool_result_body_and_keeps_the_preview() {
+        let mut event = event(
+            "tool.result",
+            r#"{"body":{"status":"completed","result":null,"preview":"全文"},"call_id":"call-7","attempt_id":"attempt-1","status":"completed","output_ref":{"path":"tool-output/run-1/call-7/attempt-1/output.json","size":12,"hash":"deadbeef"},"preview":"预览"}"#,
+        );
+        lean(&mut event);
+        let EventPayload::ToolResult(result) = &event.payload else {
+            panic!()
+        };
+        assert!(result.body.is_none());
+        assert_eq!(result.preview.as_deref(), Some("预览"));
+    }
+
+    #[test]
+    fn lean_keeps_only_the_reasoning_blocks_of_an_assistant_message() {
+        let mut event = event(
+            "message.assistant",
+            r#"{"round":3,"text":"答","provider_blocks":[{"type":"reasoning","summary":[{"text":"想"}]},{"type":"message","content":[{"text":"答"}]},{"type":"thinking","thinking":"想"},{"type":"function_call","arguments":"{}"}]}"#,
+        );
+        lean(&mut event);
+        let EventPayload::MessageAssistant(message) = &event.payload else {
+            panic!()
+        };
+        let kinds: Vec<_> = message
+            .provider_blocks
+            .as_ref()
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|block| block["type"].as_str().unwrap())
+            .collect();
+        assert_eq!(kinds, ["reasoning", "thinking"]);
+        assert_eq!(message.text.as_deref(), Some("答"));
+    }
 }

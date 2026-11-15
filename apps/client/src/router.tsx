@@ -1,4 +1,4 @@
-import { markSignedOut, setUnauthorizedHandler } from "@komo/api";
+import { markSignedOut, prefetchHomeSession, setUnauthorizedHandler } from "@komo/api";
 import { QueryClient } from "@tanstack/react-query";
 import { createRouter } from "@tanstack/react-router";
 import { routeTree } from "./routeTree.gen";
@@ -10,6 +10,7 @@ export function getRouter() {
   });
   // 任何 `/v1/**` 回 401（或 SSE 重连前发现登录失效）：守卫换成登录页。
   setUnauthorizedHandler(() => markSignedOut(queryClient));
+  if (typeof window !== "undefined") prefetchHomeSession(queryClient);
   return createRouter({
     routeTree,
     context: { queryClient },

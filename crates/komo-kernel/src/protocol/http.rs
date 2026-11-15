@@ -704,6 +704,10 @@ pub struct EventQuery {
     pub from: Seq,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<u32>,
+    /// 只对 JSON 分页生效：`tool.result` 不带 `body`（`preview` 还在），`message.assistant` 的
+    /// `provider_blocks` 只留推理块。给只画对话的客户端省流量；不带就是完整事件。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lean: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

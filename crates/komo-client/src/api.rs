@@ -379,6 +379,9 @@ impl KomoClient {
         if let Some(limit) = query.limit {
             params.push(("limit", limit.to_string()));
         }
+        if let Some(lean) = query.lean {
+            params.push(("lean", lean.to_string()));
+        }
         self.get_with(&format!("/v1/sessions/{session}/events"), &params)
             .await
     }
@@ -1171,6 +1174,7 @@ mod wire_tests {
                 &EventQuery {
                     from: Seq(7),
                     limit: Some(500),
+                    lean: None,
                 },
             )
             .await

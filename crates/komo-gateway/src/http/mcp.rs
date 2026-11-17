@@ -4,10 +4,9 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use axum::Extension;
 use axum::Json;
-use axum::extract::{Path, Query, State};
-use axum::http::{HeaderValue, StatusCode, header};
+use axum::extract::{OriginalUri, Path, Query, State};
+use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
 use komo_kernel::protocol::config::McpTransport;
 use komo_kernel::protocol::http::{
@@ -15,7 +14,6 @@ use komo_kernel::protocol::http::{
 };
 use komo_tools::mcp_auth::{self, WebAuthorizationSession};
 
-use crate::auth::Credential;
 use serde::{Deserialize, Serialize};
 use time::{Duration, OffsetDateTime};
 
@@ -122,7 +120,14 @@ pub async fn set_tool(
 // 走不通。网页的做法：`POST /v1/mcp/{name}/oauth/start` 在 Gateway 里备好授权会话（动态注册 + PKCE），
 // 返回授权地址；浏览器去授权；授权服务器跳回 `<public_url>/v1/mcp/{name}/oauth/callback`，Gateway 换 token、
 // 落进与命令行相同的凭证文件（`<数据目录>/mcp/<name>/credentials.json`），再后台重连这台服务器。
-// 两个路由都在登录之后；会话只在内存里（10 分钟、用一次），按授权地址里的 `state` 对号。
+// 会话只在内存里（10 分钟、用一次），按授权地址里的 `state` 对号。
+//
+// 发起要登录；回调是公开路由，在处理函数里自己认人：桌面端用设备令牌发起、再打开系统浏览器，回调落在
+// 浏览器里，带的是网页会话（或者还没登录），与发起时不是同一条凭据。所以回调只要求「是这台 Gateway 的
+// 登录用户」——任一条凭据都行，没登录先跳 `/auth/login?next=` 登录再回来（state 这时还没取走）。
+// 这一步仍挡得住授权地址泄露：拿到地址的人能在授权服务器上用他的账号授权，但他的浏览器过不了这里的
+// 登录，换不成 token。凭证是整台 Gateway 共用的，绑「发起的那条凭据」挡不住任何登录用户自己完成回调，
+// 反而把跨端交接挡死了。
 
 /// 一次等回调的授权会话最多挂多久。
 const LOGIN_TTL: Duration = Duration::minutes(10);
@@ -131,9 +136,6 @@ const MAX_PENDING: usize = 16;
 
 struct PendingLogin {
     server: String,
-    /// 发起它的那条登录状态（网页会话 / 设备令牌的 id；本机令牌是 `None`）。回调必须来自同一条：
-    /// 否则别人可以把他自己的授权回调发给你点，把你的 MCP 绑到他的账号上。
-    owner: Option<String>,
     session: Arc<WebAuthorizationSession>,
     expires: OffsetDateTime,
 }
@@ -172,13 +174,11 @@ impl McpLogins {
         &self,
         state: &str,
         server: &str,
-        owner: Option<&str>,
         now: OffsetDateTime,
     ) -> Option<Arc<WebAuthorizationSession>> {
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
         let login = pending.remove(state)?;
-        (login.server == server && login.owner.as_deref() == owner && login.expires > now)
-            .then_some(login.session)
+        (login.server == server && login.expires > now).then_some(login.session)
     }
 }
 
@@ -200,7 +200,6 @@ fn path_safe(name: &str) -> bool {
 /// （`[auth.oidc] public_url`），没有就 400——没有公开地址的本机用法继续用 `komo auth mcp login`。
 pub async fn oauth_start(
     State(api): State<Api>,
-    Extension(credential): Extension<Credential>,
     Path(name): Path<String>,
 ) -> ApiResult<Json<McpOauthStartResponse>> {
     let snapshot = api.state.snapshot();
@@ -245,7 +244,6 @@ pub async fn oauth_start(
         state,
         PendingLogin {
             server: name,
-            owner: credential.session_id().map(str::to_owned),
             session: Arc::new(session),
             expires: now + LOGIN_TTL,
         },
@@ -263,14 +261,23 @@ pub struct OauthCallbackQuery {
     error_description: Option<String>,
 }
 
-/// `GET /v1/mcp/{name}/oauth/callback`：授权服务器跳回来的地方（浏览器顶层导航，带登录 cookie）。回一张
-/// 简单的 HTML 页，成功后后台重连这台服务器。
+/// `GET /v1/mcp/{name}/oauth/callback`：授权服务器跳回来的地方（浏览器顶层导航）。公开路由，自己认人
+/// （见本节开头）：没登录跳去登录、登录完回到这里；认出来了再按 `state` 取会话。回一张简单的 HTML 页，
+/// 成功后后台重连这台服务器。
 pub async fn oauth_callback(
     State(api): State<Api>,
-    Extension(credential): Extension<Credential>,
     Path(name): Path<String>,
     Query(query): Query<OauthCallbackQuery>,
+    OriginalUri(uri): OriginalUri,
+    method: Method,
+    headers: HeaderMap,
 ) -> Response {
+    match api.auth.authenticate(&headers, &method).await {
+        Ok(Some(_)) => {}
+        // 登录完回到同一个回调地址；state 还在等着，没被取走。
+        Ok(None) => return login_first(&uri),
+        Err(failure) => return failure.into_response(),
+    }
     if let Some(error) = &query.error {
         let detail = query.error_description.clone().unwrap_or_default();
         return result_page(
@@ -286,14 +293,11 @@ pub async fn oauth_callback(
             "回调缺少 code 或 state",
         );
     };
-    let Some(session) =
-        api.mcp_logins
-            .take(state, &name, credential.session_id(), api.state.clock.now())
-    else {
+    let Some(session) = api.mcp_logins.take(state, &name, api.state.clock.now()) else {
         return result_page(
             StatusCode::BAD_REQUEST,
             "授权已失效",
-            "这次授权过期了、已经用过，或不是在这台 Gateway 上、用这个登录状态发起的；回到 Komo 重新点「登录」",
+            "这次授权过期了、已经用过，或不是在这台 Gateway 上发起的；回到 Komo 重新点「登录」",
         );
     };
     // 用会话自己记的回调地址拼出完整的回跳地址（授权服务器带回来的参数照原样放进去）。
@@ -323,6 +327,29 @@ pub async fn oauth_callback(
         }
     });
     result_page(StatusCode::OK, "授权完成", "可以关掉这个页面，回到 Komo。")
+}
+
+/// 没登录的回调：303 去 `/auth/login?next=<这个回调的路径与参数>`，登录完浏览器带着 cookie 回来。
+fn login_first(uri: &Uri) -> Response {
+    let next = uri
+        .path_and_query()
+        .map(|path| path.as_str())
+        .unwrap_or_else(|| uri.path());
+    let location = reqwest::Url::parse_with_params("http://komo/auth/login", [("next", next)])
+        .map(|url| format!("/auth/login?{}", url.query().unwrap_or_default()));
+    let Ok(Ok(value)) = location.map(|location| HeaderValue::from_str(&location)) else {
+        return result_page(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "授权没有完成",
+            "登录跳转地址不合法",
+        );
+    };
+    let mut response = StatusCode::SEE_OTHER.into_response();
+    response.headers_mut().insert(header::LOCATION, value);
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
 }
 
 /// 只有标题与一句话的 HTML 页（内容转义）。

@@ -9,7 +9,7 @@ use time::OffsetDateTime;
 use crate::traits::*;
 use crate::types::ids::*;
 
-use crate::cron::{CronFiring, CronJob, JobStatus};
+use crate::cron::{CronFiring, CronJob, JobStatus, ScheduleSeen};
 
 /// 内存里的 [`CronRepo`]。`claim_firing` 的唯一键是真的。
 #[derive(Debug, Clone, Default)]
@@ -71,6 +71,27 @@ impl CronRepo for MemCronRepo {
         job.status = status;
         job.last_error = last_error;
         Ok(())
+    }
+
+    async fn advance_from(
+        &self,
+        id: &CronJobId,
+        seen: ScheduleSeen,
+        next_run_at: Option<OffsetDateTime>,
+        status: JobStatus,
+        last_error: Option<String>,
+    ) -> Result<bool, RepoError> {
+        let mut state = self.state.lock().expect("cron");
+        let job = state.jobs.get_mut(id).ok_or_else(|| RepoError::NotFound {
+            what: format!("cron job {id}"),
+        })?;
+        if job.seen() != seen {
+            return Ok(false);
+        }
+        job.next_run_at = next_run_at;
+        job.status = status;
+        job.last_error = last_error;
+        Ok(true)
     }
 
     async fn remove(&self, id: &CronJobId) -> Result<bool, RepoError> {

@@ -15,7 +15,9 @@
 use async_trait::async_trait;
 use time::OffsetDateTime;
 
-use crate::cron::{CronFiring, CronJob, JobStatus, ZoneError, ZoneResolution};
+use crate::cron::{
+    CronFiring, CronJob, FiringStatus, JobStatus, ScheduleSeen, ZoneError, ZoneResolution,
+};
 use crate::types::ids::{CronJobId, MatterId, MemoryId};
 use crate::types::matter::{Matter, MatterKind};
 use crate::types::memory::{MemoryItem, RecallQuery, RecallResult};
@@ -229,6 +231,21 @@ pub trait CronRepo: Send + Sync {
         last_error: Option<String>,
     ) -> Result<(), RepoError>;
 
+    /// 调度器推进槽位：同 [`CronRepo::advance`]，但只在库里的调度状态仍是 `seen`（触发前读到的
+    /// 版本、启停、下一个槽位）时才写，写了答 `true`。
+    ///
+    /// 触发会等目标跑完（命令型 Job 等命令结束），这段时间里操作者可能暂停、改时间或改定义；
+    /// 那些修改接口已经答了成功，拿触发前的快照写回会把它们悄悄撤掉（`docs/redesign.md` P8）。
+    /// 对不上就不写，答 `false`：操作者那次写入时已经按自己的状态算好了下一个槽位。
+    async fn advance_from(
+        &self,
+        id: &CronJobId,
+        seen: ScheduleSeen,
+        next_run_at: Option<OffsetDateTime>,
+        status: JobStatus,
+        last_error: Option<String>,
+    ) -> Result<bool, RepoError>;
+
     /// 去掉目标的定时（目标本身与触发历史保留）；本来就没有定时答 `false`。
     async fn remove(&self, id: &CronJobId) -> Result<bool, RepoError>;
 
@@ -250,6 +267,19 @@ pub trait CronRepo: Send + Sync {
     async fn update_firing(&self, firing: CronFiring) -> Result<bool, RepoError>;
 
     async fn firings(&self, id: &CronJobId, limit: u32) -> Result<Vec<CronFiring>, RepoError>;
+
+    /// 还没结束的触发记录（`queued` / `waiting`），不限条数。
+    ///
+    /// 重叠判定用它，不能用"最近 N 条"：上一次卡住时，每一槽的 `skipped` 也占一条历史，
+    /// 攒够 N 条就把那次真正没跑完的挤出窗口，判成"没有未结束的"而重复触发。
+    async fn unfinished_firings(&self, id: &CronJobId) -> Result<Vec<CronFiring>, RepoError> {
+        Ok(self
+            .firings(id, u32::MAX)
+            .await?
+            .into_iter()
+            .filter(|firing| matches!(firing.status, FiringStatus::Queued | FiringStatus::Waiting))
+            .collect())
+    }
 
     /// 一页触发记录（新的在前）：只要计划时间**早于** `before` 的（不给 = 从最新的起），至多 `limit` 条。
     /// 运行历史的分页用它；游标就是上一页最后一条的 `scheduled_at`（同一目标的计划时间唯一）。

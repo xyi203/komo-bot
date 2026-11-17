@@ -1,6 +1,7 @@
 //! 网页里完成 MCP 的 OAuth（`POST /v1/mcp/{name}/oauth/start` → 浏览器授权 → `GET …/oauth/callback`）：
-//! 发起的 400 / 404 分支、state 单次使用、回调必须来自发起它的那条登录状态、错误页转义、成功后凭证落盘并
-//! 重连。授权服务器是 `oauth_server.py`（带动态注册与换 token）。
+//! 发起的 400 / 404 分支、state 单次使用、回调要求登录但不要求是发起的那条凭据（桌面端发起、浏览器收尾）、
+//! 没登录先去登录且不烧掉 state、错误页转义、成功后凭证落盘并重连。授权服务器是 `oauth_server.py`（带动态
+//! 注册与换 token）。
 
 use komo_gateway::service::test_support::harness::{FakeLlm, Gw, Home, config_toml};
 use komo_kernel::types::digest::ContentHash;
@@ -129,7 +130,7 @@ async fn starting_a_web_login_refuses_what_cannot_work() {
 }
 
 #[tokio::test]
-async fn a_web_login_completes_once_for_the_login_that_started_it() {
+async fn a_web_login_started_on_one_device_completes_in_another_logged_in_browser() {
     let server = OAuthServer::start("tok-web");
     let extra = format!("{}\n{}", oidc_block(), secure_block(server.port));
     let home = Home::with_config(&config_toml(&extra));
@@ -183,16 +184,15 @@ async fn a_web_login_completes_once_for_the_login_that_started_it() {
     assert_eq!(status, 400);
     assert!(page.contains("授权已失效"), "{page}");
     assert!(!credentials.exists());
-    // 别人（bob）拿到了 alice 的 state 也不行——而且这一次尝试不会烧掉 alice 的会话？
-    // 会：`take` 先取走再核对，宁可让 alice 重新发起，也不给别人第二次试探的机会。
+    // 换成别的服务器名也不行：state 被取走作废，要重新发起。
     let (status, _) = callback_as(
         &gw,
-        Some(&bob),
-        "secure",
+        Some(&alice),
+        "other",
         &[("code", "c"), ("state", &state)],
     )
     .await;
-    assert_eq!(status, 400, "别的登录状态");
+    assert_eq!(status, 400, "别的服务器名");
     let (status, _) = callback_as(
         &gw,
         Some(&alice),
@@ -203,12 +203,42 @@ async fn a_web_login_completes_once_for_the_login_that_started_it() {
     assert_eq!(status, 400, "state 已经被取走作废");
     assert!(!credentials.exists());
 
-    // 重新发起 → 正确的人用正确的 state 完成：凭证落盘，服务器随后连上；同一个 state 不能再用。
+    // 重新发起（alice = 桌面端的设备令牌）。浏览器还没登录：先跳去登录，回来的地址就是这个回调，
+    // 而且 state 不被烧掉——拿到授权地址的外人也就卡在这一步。
     let (_, started) = start_as(&gw, Some(&alice), "secure").await;
     let state = param(started["authorization_url"].as_str().unwrap(), "state");
+    let anonymous = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap()
+        .get(
+            reqwest::Url::parse_with_params(
+                &format!("{}/v1/mcp/secure/oauth/callback", gw.base_url()),
+                &[("code", "the-code"), ("state", state.as_str())],
+            )
+            .unwrap(),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(anonymous.status().as_u16(), 303);
+    let location = anonymous.headers()["location"]
+        .to_str()
+        .unwrap()
+        .to_string();
+    let next = param(&format!("http://komo{location}"), "next");
+    assert!(location.starts_with("/auth/login?"), "{location}");
+    assert!(
+        next.starts_with("/v1/mcp/secure/oauth/callback?") && next.contains(&state),
+        "{next}"
+    );
+    assert!(!credentials.exists());
+
+    // 登录后的浏览器（bob = 另一条凭据）带同一个 state 完成：凭证落盘，服务器随后连上；同一个 state
+    // 不能再用。
     let (status, page) = callback_as(
         &gw,
-        Some(&alice),
+        Some(&bob),
         "secure",
         &[("code", "the-code"), ("state", &state)],
     )

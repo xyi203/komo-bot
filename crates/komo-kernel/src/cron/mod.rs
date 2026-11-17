@@ -494,7 +494,26 @@ pub struct CronJob {
     pub last_error: Option<String>,
 }
 
+/// 调度器读到 Job 那一刻的调度状态，[`CronRepo::advance_from`](crate::traits::CronRepo::advance_from)
+/// 拿它判断触发期间有没有人改过。版本管定义（改时间、改内容），启停与下一个槽位管只走
+/// `advance` 不升版本的那些修改（暂停 / 恢复）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScheduleSeen {
+    pub version: u64,
+    pub status: JobStatus,
+    pub next_run_at: Option<OffsetDateTime>,
+}
+
 impl CronJob {
+    /// 此刻的调度状态，见 [`ScheduleSeen`]。
+    pub fn seen(&self) -> ScheduleSeen {
+        ScheduleSeen {
+            version: self.version,
+            status: self.status,
+            next_run_at: self.next_run_at,
+        }
+    }
+
     /// 在 `now` 这一刻该不该触发。
     pub fn is_due(&self, now: OffsetDateTime) -> bool {
         self.status == JobStatus::Active && self.next_run_at.is_some_and(|slot| slot <= now)

@@ -276,3 +276,60 @@ async fn firing_twice_with_the_same_session_returns_the_same_run() {
     assert_eq!(first.run, second.run);
     gw.stop().await;
 }
+
+/// Job 声明的 `skills`：触发时 SKILL.md 正文预载进首轮输入，排在提示词前面（§5.6）。
+#[tokio::test]
+async fn a_firing_preloads_the_skills_its_job_names() {
+    let home = Home::new();
+    let skill = home.path().join("skills").join("digest").join("SKILL.md");
+    std::fs::create_dir_all(skill.parent().unwrap()).unwrap();
+    std::fs::write(
+        &skill,
+        "---\nname: digest\ndescription: 怎么整理动态\n---\n# 整理步骤\n只列三条，每条带链接。\n",
+    )
+    .unwrap();
+    let gw = home
+        .start(FakeLlm::always(vec![text_round(1, "整理好了")]))
+        .await;
+    let mut body = daily();
+    body["skills"] = serde_json::json!(["digest"]);
+    let job = gw.add_job(body).await;
+    gw.make_due(&job.id).await;
+    let fired = gw.tick().await.fired[0].clone();
+    gw.wait_state(&fired.run, |s| s.is_terminal(), "终态").await;
+
+    let (code, text) = gw
+        .get(&format!("/v1/sessions/{}/tree", fired.session))
+        .await;
+    assert_eq!(code, 200, "{text}");
+    let body_at = text.find("只列三条，每条带链接。").expect("正文预载了");
+    let prompt_at = text.find("整理今天的技术动态").expect("提示词还在");
+    assert!(body_at < prompt_at, "正文在提示词前面：{text}");
+    gw.stop().await;
+}
+
+/// 写了却找不到的 skill：这一槽记成 `error`、说出名字，不悄悄不带。
+#[tokio::test]
+async fn a_missing_preloaded_skill_fails_the_firing_by_name() {
+    let home = Home::new();
+    let gw = home.start(FakeLlm::always(vec![text_round(1, "好")])).await;
+    let mut body = daily();
+    body["skills"] = serde_json::json!(["nowhere"]);
+    let job = gw.add_job(body).await;
+    gw.make_due(&job.id).await;
+    let tick = gw.tick().await;
+    assert!(tick.fired.is_empty(), "{tick:?}");
+
+    let firings = gw.firings(&job.id).await;
+    assert_eq!(firings.len(), 1);
+    assert_eq!(firings[0].status, FiringStatus::Error);
+    assert!(
+        firings[0]
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("nowhere"),
+        "{firings:?}"
+    );
+    gw.stop().await;
+}

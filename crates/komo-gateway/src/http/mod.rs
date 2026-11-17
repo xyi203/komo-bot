@@ -112,7 +112,9 @@ pub fn router(api: Api) -> Router {
         .route("/auth/logout", post(auth::logout))
         .route("/auth/me", get(auth::me))
         .route("/auth/device/authorize", get(auth::device_authorize))
-        .route("/auth/device/token", post(auth::device_token));
+        .route("/auth/device/token", post(auth::device_token))
+        // MCP 授权回调自己认人（没登录跳去登录再回来），发起它的凭据与回调的浏览器常常不是同一条。
+        .route("/v1/mcp/{name}/oauth/callback", get(mcp::oauth_callback));
     let guarded = shared_routes()
         .merge(v2::routes())
         .route("/v1/auth/sessions", get(auth::sessions))
@@ -185,7 +187,6 @@ fn shared_routes() -> Router<Api> {
         .route("/v1/mcp/disconnect", post(mcp::disconnect))
         .route("/v1/mcp/{name}", put(mcp::set_server))
         .route("/v1/mcp/{name}/oauth/start", post(mcp::oauth_start))
-        .route("/v1/mcp/{name}/oauth/callback", get(mcp::oauth_callback))
         .route("/v1/mcp/{name}/tools/{tool}", put(mcp::set_tool))
         .route("/v1/push/key", get(push::key))
         .route(

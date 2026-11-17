@@ -18,7 +18,8 @@
 
 use async_trait::async_trait;
 use komo_kernel::cron::{
-    CronFiring, CronJob, FiringStatus, JobStatus, NotifyPolicy, OverlapPolicy, Trigger,
+    CronFiring, CronJob, FiringStatus, JobStatus, NotifyPolicy, OverlapPolicy, ScheduleSeen,
+    Trigger,
 };
 use komo_kernel::traits::{CronRepo, RepoError, StoreError};
 use komo_kernel::types::digest::ContentHash;
@@ -242,6 +243,50 @@ impl CronRepo for TursoCronRepo {
                         .await
                         .map_err(map_toasty)
                 }) as BoxFuture<'_, Result<(), StoreError>>
+            })
+            .await
+            .map_err(RepoError::from)
+    }
+
+    async fn advance_from(
+        &self,
+        id: &CronJobId,
+        seen: ScheduleSeen,
+        next_run_at: Option<OffsetDateTime>,
+        status: JobStatus,
+        last_error: Option<String>,
+    ) -> Result<bool, RepoError> {
+        let id = id.to_string();
+        self.db
+            .with_write_retry(move |ex| {
+                let (id, last_error) = (id.clone(), last_error.clone());
+                Box::pin(async move {
+                    let Some(mut row) = MatterRow::filter_by_id(&id)
+                        .first()
+                        .exec(ex)
+                        .await
+                        .map_err(map_toasty)?
+                    else {
+                        return Err(not_a_goal(&id));
+                    };
+                    let Some(stored) = job_from_row(&row)? else {
+                        return Err(StoreError::NotFound {
+                            what: format!("目标 {id} 的定时"),
+                        });
+                    };
+                    // 核对与写在同一个事务里：触发期间被暂停 / 改时间 / 改定义的，留着别人的写入。
+                    if stored.seen() != seen {
+                        return Ok(false);
+                    }
+                    row.update()
+                        .next_run_at(to_ts_opt(next_run_at))
+                        .schedule_status(status.as_str())
+                        .last_error(last_error)
+                        .exec(ex)
+                        .await
+                        .map_err(map_toasty)?;
+                    Ok(true)
+                }) as BoxFuture<'_, Result<bool, StoreError>>
             })
             .await
             .map_err(RepoError::from)
@@ -763,6 +808,68 @@ mod tests {
                 Err(RepoError::NotFound { .. })
             ));
         }
+    }
+
+    /// 调度器的推进只在库里还是它读到的那份时才写：期间被暂停（不升版本）或改了定义（升版本）都不覆盖。
+    #[tokio::test]
+    async fn advance_from_leaves_a_schedule_changed_since_it_was_read() {
+        let (repo, _db, _dir) = repo_with(&["g-1"]).await;
+        let id = CronJobId::from_raw("g-1");
+        let read = repo.put(job("g-1")).await.unwrap();
+        let later = Some(NOW + time::Duration::days(1));
+
+        // 期间暂停了：不写。
+        repo.advance(&id, read.next_run_at, JobStatus::Paused, None)
+            .await
+            .unwrap();
+        assert!(
+            !repo
+                .advance_from(&id, read.seen(), later, JobStatus::Active, None)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            repo.get(&id).await.unwrap().unwrap().status,
+            JobStatus::Paused
+        );
+
+        // 期间改了定义（版本 +1）：也不写。
+        let edited = repo.put(read.clone()).await.unwrap();
+        assert!(
+            !repo
+                .advance_from(&id, read.seen(), later, JobStatus::Active, None)
+                .await
+                .unwrap()
+        );
+
+        // 没人动过：照写。
+        assert!(
+            repo.advance_from(&id, edited.seen(), later, JobStatus::Active, None)
+                .await
+                .unwrap()
+        );
+        assert_eq!(repo.get(&id).await.unwrap().unwrap().next_run_at, later);
+    }
+
+    /// 重叠判定要的未结束记录不受历史条数限制：一条 `queued` 后面攒了很多 `skipped` 也找得到。
+    #[tokio::test]
+    async fn unfinished_firings_are_found_behind_any_number_of_skips() {
+        let (repo, _db, _dir) = repo_with(&["g-1"]).await;
+        let stored = repo.put(job("g-1")).await.unwrap();
+        let id = stored.id.clone();
+        assert!(repo.claim_firing(firing(&id, NOW)).await.unwrap());
+        for minute in 1..=60 {
+            let at = NOW + time::Duration::minutes(minute);
+            assert!(
+                repo.claim_firing(CronFiring::skipped(&stored, at, "overlap"))
+                    .await
+                    .unwrap()
+            );
+        }
+
+        let unfinished = repo.unfinished_firings(&id).await.unwrap();
+        assert_eq!(unfinished.len(), 1);
+        assert_eq!(unfinished[0].scheduled_at, NOW);
     }
 
     /// 验收：`claim_firing` 的唯一键是 `job + scheduled_at`，重复就是 `false`。

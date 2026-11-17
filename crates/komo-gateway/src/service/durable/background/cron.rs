@@ -111,6 +111,40 @@ fn new_session(config: &ConfigSnapshot, spec: &FireSpec) -> Result<NewSession, C
     Ok(new)
 }
 
+/// 提示词型 Job 的首轮输入：声明了 `skills` 的，把那几份 SKILL.md 正文放在提示词前面
+/// （`docs/komo_bot.md` §5.6「触发时把这些 SKILL.md 正文预载进首轮上下文」）。
+///
+/// 找不到或停用了的报错，这一槽记成 `error`：配置写了却悄悄不带，跑出来的结果跟预期不一样还看不出
+/// 原因。停用按"不可被调用"算（`skill://` 也读不到它）。
+fn with_skills(state: &GatewayState, job: &CronJob) -> Result<String, CronError> {
+    if job.skills.is_empty() {
+        return Ok(job.prompt.clone());
+    }
+    let registry = state.skills.read().expect("skills 注册表");
+    let mut text =
+        String::from("这个定时任务预载了下面的 skill（SKILL.md 正文），做事时照它们来：\n");
+    for name in &job.skills {
+        if registry.is_disabled(name) {
+            return Err(CronError::Target(format!(
+                "预载的 skill `{name}` 已停用：在设置里启用，或从这个定时里去掉"
+            )));
+        }
+        let Some(doc) = registry.inspect(name) else {
+            return Err(CronError::Target(format!(
+                "找不到预载的 skill `{name}`（skills 目录里没有这个名字）"
+            )));
+        };
+        text.push_str(&format!(
+            "\n<skill name=\"{name}\" path=\"{}\">\n{}\n</skill>\n",
+            doc.skill.path.display(),
+            doc.body.trim_end()
+        ));
+    }
+    text.push_str("\n---\n\n");
+    text.push_str(&job.prompt);
+    Ok(text)
+}
+
 /// 触发放置成的输入 entry：`cron.input`，`data {job, slot}`（手动 run 没有 slot，带 `manual`）。
 fn input_data(spec: &FireSpec, hash: &str) -> Value {
     let slot = spec
@@ -163,11 +197,15 @@ impl DurableCronTarget {
         new: NewSession,
         spec: &FireSpec,
     ) -> Result<FiredRef, CronError> {
-        let text = spec.job.prompt.clone();
+        let text = with_skills(&self.state, &spec.job)?;
         let hash = ContentHash::of_str(&text).to_string();
+        let mut data = input_data(spec, &hash);
+        if !spec.job.skills.is_empty() {
+            data["skills"] = json!(spec.job.skills);
+        }
         let draft = SubmissionDraft::Input {
             content: Content::Text(text),
-            entry: Some(InputEntry::new(CRON_INPUT, Some(input_data(spec, &hash)))),
+            entry: Some(InputEntry::new(CRON_INPUT, Some(data))),
             when_busy: WhenBusy::FollowUp,
             request_id: Some(spec.request_key.to_string()),
             internal: false,
@@ -291,10 +329,7 @@ impl CronTarget for DurableCronTarget {
         job: &CronJobId,
     ) -> Result<bool, CronError> {
         let core = self.core()?;
-        for firing in jobs.firings(job, 50).await? {
-            if !matches!(firing.status, FiringStatus::Queued | FiringStatus::Waiting) {
-                continue;
-            }
+        for firing in jobs.unfinished_firings(job).await? {
             let Some(run) = &firing.run else {
                 return Ok(true);
             };

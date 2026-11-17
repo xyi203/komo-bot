@@ -423,7 +423,11 @@ impl CronScheduler {
     ///
     /// 一次性触发在这里**完成**（§10：`@at` 是一次性，claim 时完成）；算不出下一槽的
     /// Job 把原因写进 `last_error` 并留在清单里——安静地再也不响是最糟的结果。
+    ///
+    /// 写回走 [`CronRepo::advance_from`]：`job` 是这一拍开头读到的快照，触发期间（命令型 Job
+    /// 要等命令跑完）操作者暂停或改了时间，库里已经是新的状态，不能拿旧快照盖回去。
     async fn advance(&self, job: &mut CronJob, now: OffsetDateTime) -> Result<(), CronError> {
+        let seen = job.seen();
         if matches!(job.trigger, Trigger::At { .. }) {
             job.status = JobStatus::Done;
             job.next_run_at = None;
@@ -431,9 +435,19 @@ impl CronScheduler {
             // `CronJob::advance` 已经把 next_run_at 清空、把原因写进 last_error 了。
             tracing::warn!(job = %job.id, error = %error, "算不出下一个槽位");
         }
-        self.jobs
-            .advance(&job.id, job.next_run_at, job.status, job.last_error.clone())
+        let written = self
+            .jobs
+            .advance_from(
+                &job.id,
+                seen,
+                job.next_run_at,
+                job.status,
+                job.last_error.clone(),
+            )
             .await?;
+        if !written {
+            tracing::info!(job = %job.id, "触发期间定时被改过，保留改后的状态，不推进");
+        }
         Ok(())
     }
 }
@@ -951,5 +965,82 @@ mod tests {
         // 交给目标的是 Job 自己的那份配置，不是主模型的。
         let fired = h.target.fired.lock().unwrap();
         assert_eq!(fired[0].model.model, "job-model");
+    }
+
+    /// 触发期间改定时的目标：模拟命令型 Job 正在跑命令时，操作者在网页上暂停或改了时间。
+    struct EditingTarget {
+        jobs: Arc<MemCronRepo>,
+        reschedule_to: Option<OffsetDateTime>,
+    }
+
+    #[async_trait]
+    impl CronTarget for EditingTarget {
+        async fn fire(&self, spec: FireSpec) -> Result<FiredRef, CronError> {
+            let mut job = self.jobs.get(&spec.job.id).await.unwrap().unwrap();
+            match self.reschedule_to {
+                // 改时间是改定义：走 `put`，版本 +1。
+                Some(at) => {
+                    job.next_run_at = Some(at);
+                    self.jobs.put(job).await.unwrap();
+                }
+                // 暂停只走 `advance`，版本不动（`http/schedule.rs` 的 `store_job`）。
+                None => self
+                    .jobs
+                    .advance(&job.id, job.next_run_at, JobStatus::Paused, None)
+                    .await
+                    .unwrap(),
+            }
+            Ok(FiredRef {
+                run: RunId::from_raw("run-1"),
+                deduplicated: false,
+            })
+        }
+
+        async fn has_unfinished(
+            &self,
+            _jobs: &dyn CronRepo,
+            _job: &CronJobId,
+        ) -> Result<bool, CronError> {
+            Ok(false)
+        }
+    }
+
+    async fn fire_while_editing(reschedule_to: Option<OffsetDateTime>) -> CronJob {
+        let jobs = Arc::new(MemCronRepo::new());
+        jobs.put(job("job-1", Some(NOW - time::Duration::minutes(1))))
+            .await
+            .unwrap();
+        let scheduler = CronScheduler::new(
+            Arc::clone(&jobs) as Arc<dyn CronRepo>,
+            Arc::new(EditingTarget {
+                jobs: Arc::clone(&jobs),
+                reschedule_to,
+            }) as Arc<dyn CronTarget>,
+            Arc::new(TestClock::at(NOW)),
+            Arc::new(JiffZoneResolver::new()),
+            model(),
+        );
+        let tick = scheduler.tick().await.unwrap();
+        assert_eq!(tick.fired.len(), 1, "{tick:?}");
+        jobs.get(&CronJobId::from_raw("job-1"))
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    /// 触发期间暂停：接口已经答了成功，触发结束不能把它改回 `Active`。
+    #[tokio::test]
+    async fn pausing_while_a_firing_runs_stays_paused() {
+        let stored = fire_while_editing(None).await;
+        assert_eq!(stored.status, JobStatus::Paused);
+    }
+
+    /// 触发期间改了时间：留着新的下一个槽位，不被触发前的快照推进覆盖。
+    #[tokio::test]
+    async fn rescheduling_while_a_firing_runs_keeps_the_new_slot() {
+        let new_slot = NOW + time::Duration::hours(5);
+        let stored = fire_while_editing(Some(new_slot)).await;
+        assert_eq!(stored.next_run_at, Some(new_slot));
+        assert_eq!(stored.status, JobStatus::Active);
     }
 }

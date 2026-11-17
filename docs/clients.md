@@ -250,7 +250,7 @@ komo 照搬的：Host 校验（D6）、`public_url` / `trusted_hosts`（§5）�
           客户端 ──POST /auth/device/token {code, code_verifier, redirect_uri}──▶ 设备令牌（Bearer）
 ```
 
-**凭据与权限**：所有 `/v1/**` 接受本机令牌、设备令牌或登录 cookie；`/healthz`、`/auth/*` 不要求登录。本机令牌（`runtime/gateway.json`）给机器上的命令行与桌面端的本机连接，不经 OIDC——身份提供方挂了，登到机器上处理。没配 `[auth.oidc]` 时网页与设备都登不了（`GET /auth/me` 报 `oidc_configured: false`，`komo config check` 有警告）。
+**凭据与权限**：所有 `/v1/**` 接受本机令牌、设备令牌或登录 cookie；`/healthz`、`/auth/*` 不要求登录。本机令牌（`runtime/gateway.json`）给机器上的命令行与桌面端的本机连接，不经 OIDC——身份提供方挂了，登到机器上处理。没配 `[auth.oidc]` 时设备登不了，网页只能在跑 Gateway 的机器上用 `komo web` 进：它用本机令牌换一条一次性登录链接（`POST /v1/auth/local-link` → `/auth/local?code=…`，两分钟、用一次）打开，浏览器拿到的是普通的网页会话（账号记为 `local`，2026-11-17）；直接打开地址会看到说明页（`GET /auth/me` 报 `oidc_configured: false`，`komo config check` 有警告）。
 
 **设备登录的回跳白名单**（`GET /auth/device/authorize` 的 `redirect_uri`）：`komo://auth/callback`（桌面端深链；注意这与现有的 `komo://session/<id>` 是另一种形状，桌面端要加一条处理）与本机回环地址的任意端口（`http://127.0.0.1:端口/…`、`localhost`、`[::1]`）。不在白名单里的地址 Gateway 页面报错，不跳转、不发码。
 

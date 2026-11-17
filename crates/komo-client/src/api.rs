@@ -277,6 +277,15 @@ impl KomoClient {
         serde_json::from_str(&body).map_err(|e| ClientError::Decode(format!("{e}（{body}）")))
     }
 
+    // ---- /v1/auth ----
+
+    /// `komo web`：本机令牌换一条一次性的网页登录链接（`docs/clients.md` §9）。只有本机令牌换得到，
+    /// 连的是远程 Gateway（设备令牌）时是 403。
+    pub async fn local_link(&self) -> ClientResult<LocalLinkResponse> {
+        self.post("/v1/auth/local-link", &serde_json::json!({}))
+            .await
+    }
+
     // ---- /v1/sessions ----
 
     pub async fn create_session(

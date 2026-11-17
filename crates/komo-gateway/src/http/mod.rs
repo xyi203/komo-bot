@@ -113,10 +113,12 @@ pub fn router(api: Api) -> Router {
         .route("/auth/me", get(auth::me))
         .route("/auth/device/authorize", get(auth::device_authorize))
         .route("/auth/device/token", post(auth::device_token))
+        .route("/auth/local", get(auth::local_login))
         // MCP 授权回调自己认人（没登录跳去登录再回来），发起它的凭据与回调的浏览器常常不是同一条。
         .route("/v1/mcp/{name}/oauth/callback", get(mcp::oauth_callback));
     let guarded = shared_routes()
         .merge(v2::routes())
+        .route("/v1/auth/local-link", post(auth::local_link))
         .route("/v1/auth/sessions", get(auth::sessions))
         .route("/v1/auth/sessions/{id}", delete(auth::revoke))
         .layer(axum::middleware::from_fn_with_state(

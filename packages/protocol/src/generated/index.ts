@@ -68,6 +68,7 @@ export type { InterventionVerdict } from "./InterventionVerdict";
 export type { IssueSeverity } from "./IssueSeverity";
 export type { JobStatus } from "./JobStatus";
 export type { KeyPath } from "./KeyPath";
+export type { LocalLinkResponse } from "./LocalLinkResponse";
 export type { ManualCronRunResponse } from "./ManualCronRunResponse";
 export type { Matter } from "./Matter";
 export type { MatterActionRequest } from "./MatterActionRequest";

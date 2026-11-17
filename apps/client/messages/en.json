@@ -1172,7 +1172,7 @@
   "login_body": "Sign in with your account to continue.",
   "login_button": "Sign in",
   "login_unconfigured_title": "Sign-in isn't set up on this Komo",
-  "login_unconfigured_body": "Configure [auth.oidc] in the Gateway's config.toml (provider URL, client ID, allowed accounts), reload the config, then check again here. See the deployment guide (docs/clients.md §9).",
+  "login_unconfigured_body": "Using Komo on this machine only? Run komo web on the machine running the Gateway; it opens a signed-in page. To sign in from other devices, configure [auth.oidc] in the Gateway's config.toml (provider URL, client ID, allowed accounts), restart the Gateway, then check again here. See the deployment guide (docs/clients.md §9).",
   "login_recheck": "Check again",
   "login_desktop_title": "Sign in on the desktop app",
   "login_desktop_body": "In the desktop app's connection settings, choose This Mac to use Komo on this computer, or enter a remote address and sign in with the system browser.",

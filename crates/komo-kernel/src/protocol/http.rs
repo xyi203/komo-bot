@@ -11,6 +11,7 @@
 //! |---|---|---|
 //! | `GET /auth/me` | — | [`AuthMeResponse`] |
 //! | `POST /auth/device/token` | [`DeviceTokenRequest`] | [`DeviceTokenResponse`] |
+//! | `POST /v1/auth/local-link` | — | [`LocalLinkResponse`] |
 //! | `GET /v1/auth/sessions` | — | [`AuthSessionsResponse`] |
 //! | `DELETE /v1/auth/sessions/{id}` | — | [`AuthRevokeResponse`] |
 //! | `POST /v1/sessions` | [`CreateSessionRequest`] | [`SessionSummary`] |
@@ -258,6 +259,15 @@ pub struct DeviceTokenResponse {
     pub subject: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub email: Option<String>,
+}
+
+/// `POST /v1/auth/local-link` 的响应（只认本机令牌）：浏览器打开 `path`（相对 Gateway 根地址）就种上
+/// 网页会话。给 `komo web` 用：没配 `[auth.oidc]` 的本机也能用网页。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct LocalLinkResponse {
+    /// `/auth/local?code=…`：一次性，两分钟内有效。
+    pub path: String,
 }
 
 // ---- /v1/sessions ----

@@ -29,9 +29,8 @@ enum Command {
     /// （`docs/codemode.md` §3）。不给人用，不进 `--help`。
     #[command(name = "__codemode-worker", hide = true)]
     CodemodeWorker,
-    /// 在浏览器里打开网页版：打开 Gateway 的地址，没登录时网页会跳去 OIDC 登录（`docs/redesign.md` §2.9）。
-    ///
-    /// 不再有配对码。Gateway 没配 `[auth.oidc]` 时网页登不了（`komo config check` 会提示）。
+    /// 在浏览器里打开网页版：连本机 Gateway 时打开一条已登录的一次性链接（两分钟内有效，不需要
+    /// `[auth.oidc]`）；连远程 Gateway 时打开它的地址，没登录时网页会跳去 OIDC 登录（`docs/clients.md` §9）。
     Web {
         /// 只打印链接，不打开浏览器。
         #[arg(long)]
@@ -500,17 +499,31 @@ fn command_of(cli: Cli) -> Command {
     cli.command.unwrap_or(Command::Web { no_open: false })
 }
 
-/// `komo web`：确保 Gateway 就绪，打开它的地址（登录由网页走 OIDC）。
+/// `komo web`：确保 Gateway 就绪，打开它的网页。
+///
+/// 拿着本机令牌就换一条一次性登录链接打开，浏览器直接是登录状态；换不到（连的是远程 Gateway、
+/// 或者 Gateway 是还没有这个接口的旧版本）就只打开地址，登录由网页走 OIDC。
 async fn web(home: &Path, no_open: bool) -> Result<Option<String>, String> {
     init_tracing(None, None);
     let client = connect::connect_or_start(home).await?;
-    let url = client.base_url();
+    let base = client.base_url();
+    let (url, note) = match client.local_link().await {
+        Ok(link) => (
+            format!("{}{}", base.trim_end_matches('/'), link.path),
+            "（一次性登录链接，两分钟内有效；浏览器会记住登录 30 天）",
+        ),
+        Err(error) => {
+            tracing::debug!(%error, "换不到本机登录链接，只打开地址");
+            (
+                base,
+                "（没登录时网页会跳去身份提供方；机器上没有浏览器就从自己的电脑打开 Gateway 的公开地址）",
+            )
+        }
+    };
     if !no_open && !commands::open_in_browser(&url) {
         eprintln!("没能自动打开浏览器，请手动打开下面的链接。");
     }
-    Ok(Some(format!(
-        "{url}\n（没登录时网页会跳去身份提供方；机器上没有浏览器就从自己的电脑打开 Gateway 的公开地址）"
-    )))
+    Ok(Some(format!("{url}\n{note}")))
 }
 
 /// 跑一条命令。`Ok(None)` = 这条命令自己管输出（前台 Gateway）。
@@ -952,52 +965,71 @@ mod tests {
         }
     }
 
-    /// `komo web` 连上发现文件指的 Gateway，印出它的地址（没有配对码了）。
+    /// `komo web` 连上发现文件指的 Gateway：换得到本机登录链接就印链接，换不到（远程 / 旧版本）就印地址。
     #[tokio::test]
-    async fn web_prints_the_gateway_address_from_the_discovery_file() {
-        use axum::routing::get;
+    async fn web_opens_a_local_login_link_or_falls_back_to_the_address() {
+        use axum::routing::{get, post};
         use axum::{Json, Router};
         use komo_kernel::protocol::PROTOCOL_VERSION;
-        use komo_kernel::protocol::http::HealthResponse;
+        use komo_kernel::protocol::http::{HealthResponse, LocalLinkResponse};
 
         let _ = rustls::crypto::ring::default_provider().install_default();
-        let dir = tempfile::tempdir().expect("临时数据目录");
-        let data_dir = dir.path().to_string_lossy().to_string();
-        let health = HealthResponse {
-            instance_id: "inst-1".into(),
-            version: "test".into(),
-            protocol_version: PROTOCOL_VERSION,
-            started_at: time::OffsetDateTime::now_utc(),
-            data_dir,
-            telemetry: Default::default(),
-        };
-        let app = Router::new().route("/healthz", get(move || async move { Json(health) }));
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("绑定 loopback");
-        let base_url = format!("http://{}", listener.local_addr().expect("本地地址"));
-        let server = tokio::spawn(async move {
-            let _ = axum::serve(listener, app).await;
-        });
-        std::fs::create_dir_all(dir.path().join("runtime")).expect("runtime 目录");
-        std::fs::write(
-            dir.path().join("runtime/gateway.json"),
-            serde_json::json!({
-                "instance_id": "inst-1",
-                "base_url": base_url,
-                "protocol_version": PROTOCOL_VERSION,
-            })
-            .to_string(),
-        )
-        .expect("写发现文件");
 
-        let out = web(dir.path(), true)
-            .await
-            .expect("komo web")
-            .expect("有输出");
-        server.abort();
+        async fn run(with_link: bool) -> (String, String) {
+            let dir = tempfile::tempdir().expect("临时数据目录");
+            let health = HealthResponse {
+                instance_id: "inst-1".into(),
+                version: "test".into(),
+                protocol_version: PROTOCOL_VERSION,
+                started_at: time::OffsetDateTime::now_utc(),
+                data_dir: dir.path().to_string_lossy().to_string(),
+                telemetry: Default::default(),
+            };
+            let mut app = Router::new().route("/healthz", get(move || async move { Json(health) }));
+            if with_link {
+                app = app.route(
+                    "/v1/auth/local-link",
+                    post(|| async {
+                        Json(LocalLinkResponse {
+                            path: "/auth/local?code=abc".into(),
+                        })
+                    }),
+                );
+            }
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("绑定 loopback");
+            let base_url = format!("http://{}", listener.local_addr().expect("本地地址"));
+            let server = tokio::spawn(async move {
+                let _ = axum::serve(listener, app).await;
+            });
+            std::fs::create_dir_all(dir.path().join("runtime")).expect("runtime 目录");
+            std::fs::write(
+                dir.path().join("runtime/gateway.json"),
+                serde_json::json!({
+                    "instance_id": "inst-1",
+                    "base_url": base_url,
+                    "protocol_version": PROTOCOL_VERSION,
+                    "token": "local-token",
+                })
+                .to_string(),
+            )
+            .expect("写发现文件");
+            let out = web(dir.path(), true)
+                .await
+                .expect("komo web")
+                .expect("有输出");
+            server.abort();
+            (base_url, out)
+        }
+
+        let (base_url, out) = run(true).await;
+        assert!(
+            out.starts_with(&format!("{base_url}/auth/local?code=abc\n")),
+            "{out}"
+        );
+        let (base_url, out) = run(false).await;
         assert!(out.starts_with(&format!("{base_url}\n")), "{out}");
-        assert!(!out.contains("/pair"), "{out}");
     }
 
     /// 指标事件（`komo::metrics`，DEBUG）不进文本日志：哪怕 `KOMO_LOG=debug`。

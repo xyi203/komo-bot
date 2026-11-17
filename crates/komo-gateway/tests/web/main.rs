@@ -245,3 +245,104 @@ async fn with_serve_off_only_the_api_answers() {
         .expect("请求");
     assert_eq!(sessions.status(), 200);
 }
+
+/// 没配 `[auth.oidc]` 的本机（`docs/clients.md` §9）：本机令牌换一次性链接，浏览器打开就登录；
+/// 链接只能用一次；设备 / 网页凭据换不到链接，没凭据更换不到。
+#[tokio::test]
+async fn the_local_token_mints_a_one_time_link_that_signs_a_browser_in() {
+    let (gateway, _web) = start("").await;
+    let base = gateway.base_url();
+    let mint = || async {
+        let response = client()
+            .post(format!("{base}/v1/auth/local-link"))
+            .bearer_auth(gateway.token())
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .expect("请求");
+        assert_eq!(response.status(), 200);
+        let body: serde_json::Value = response.json().await.unwrap();
+        body["path"].as_str().unwrap().to_string()
+    };
+
+    let path = mint().await;
+    assert!(path.starts_with("/auth/local?code="), "{path}");
+    let opened = client()
+        .get(format!("{base}{path}"))
+        .send()
+        .await
+        .expect("请求");
+    assert_eq!(opened.status(), 303);
+    assert_eq!(opened.headers()["location"], "/");
+    let cookie = opened
+        .headers()
+        .get_all("set-cookie")
+        .iter()
+        .map(|value| value.to_str().unwrap().to_string())
+        .find(|value| value.starts_with("komo_session=") && !value.contains("Max-Age=0"))
+        .expect("会话 cookie");
+    let cookie = cookie.split(';').next().unwrap().to_string();
+
+    let me: serde_json::Value = client()
+        .get(format!("{base}/auth/me"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .expect("请求")
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(me["authenticated"], true, "{me}");
+    assert_eq!(me["oidc_configured"], false, "{me}");
+    assert_eq!(me["credential"], "web", "{me}");
+    assert_eq!(me["subject"], "local", "{me}");
+    let sessions = client()
+        .get(format!("{base}/v1/sessions"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .expect("请求");
+    assert_eq!(sessions.status(), 200);
+
+    // 同一条链接再开一次：作废了，不再发 cookie。
+    let again = client()
+        .get(format!("{base}{path}"))
+        .send()
+        .await
+        .expect("请求");
+    assert_eq!(again.status(), 401);
+    assert!(again.headers().get("set-cookie").is_none());
+    let bogus = client()
+        .get(format!("{base}/auth/local?code=nope"))
+        .send()
+        .await
+        .expect("请求");
+    assert_eq!(bogus.status(), 401);
+
+    // `next` 只认站内路径。
+    let path = mint().await;
+    let next = client()
+        .get(format!("{base}{path}&next=/sessions/s-1"))
+        .send()
+        .await
+        .expect("请求");
+    assert_eq!(next.headers()["location"], "/sessions/s-1");
+
+    // 网页会话不能再铸链接（同源写请求也不行）；没凭据是 401。
+    let by_cookie = client()
+        .post(format!("{base}/v1/auth/local-link"))
+        .header("cookie", &cookie)
+        .header("origin", base)
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .expect("请求");
+    assert_eq!(by_cookie.status(), 403);
+    let bare = client()
+        .post(format!("{base}/v1/auth/local-link"))
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .expect("请求");
+    assert_eq!(bare.status(), 401);
+}

@@ -8,6 +8,8 @@
 //! | `GET /auth/me` | 不要 | 当前登录状态（永远 200），网页据此决定要不要跳登录 |
 //! | `GET /auth/device/authorize` | 不要 | 桌面端 / CLI 发起设备登录（浏览器里打开），完成后带一次性码跳回 |
 //! | `POST /auth/device/token` | 不要（码即凭据） | 一次性码 + PKCE verifier 换长期设备令牌 |
+//! | `POST /v1/auth/local-link` | 本机令牌 | 发一条一次性的本机登录链接（`komo web` 用） |
+//! | `GET /auth/local?code=…[&next=/路径]` | 不要（码即凭据） | 核销链接、种会话 cookie、跳回网页 |
 //! | `GET /v1/auth/sessions` | 要 | 登录状态清单（网页会话与设备令牌） |
 //! | `DELETE /v1/auth/sessions/{id}` | 要 | 吊销一条 |
 //!
@@ -20,12 +22,12 @@ use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use komo_kernel::protocol::http::{
     AuthMeResponse, AuthRevokeResponse, AuthSessionsResponse, DeviceTokenRequest,
-    DeviceTokenResponse, ErrorCode,
+    DeviceTokenResponse, ErrorCode, LocalLinkResponse,
 };
 use serde::Deserialize;
 
 use crate::auth::{
-    AuthError, Credential, DeviceRequest, LOGIN_COOKIE, Purpose, redirect_allowed,
+    AuthError, Credential, DeviceRequest, LOCAL_SUBJECT, LOGIN_COOKIE, Purpose, redirect_allowed,
     redirect_with_code, safe_next,
 };
 use crate::http::Api;
@@ -270,6 +272,64 @@ pub async fn device_token(
     .into_response();
     no_store(&mut response);
     Ok(response)
+}
+
+/// `POST /v1/auth/local-link`：只认本机令牌。设备令牌与网页会话不能再铸一条网页会话出来——
+/// 否则远程的设备凭据就能绕过 OIDC 名单，给任意浏览器开会话。
+pub async fn local_link(
+    State(api): State<Api>,
+    axum::Extension(credential): axum::Extension<Credential>,
+) -> ApiResult<Response> {
+    if credential != Credential::Local {
+        return Err(ApiFailure::new(
+            ErrorCode::Denied,
+            "本机登录链接只发给本机令牌（runtime/gateway.json）",
+        ));
+    }
+    let code = api.auth.issue_local_link();
+    let mut response = Json(LocalLinkResponse {
+        path: format!("/auth/local?code={code}"),
+    })
+    .into_response();
+    no_store(&mut response);
+    Ok(response)
+}
+
+#[derive(Debug, Deserialize)]
+pub struct LocalQuery {
+    code: Option<String>,
+    next: Option<String>,
+}
+
+/// `GET /auth/local?code=…`：浏览器打开 `komo web` 给的链接，换一个网页会话。
+pub async fn local_login(
+    State(api): State<Api>,
+    headers: HeaderMap,
+    Query(query): Query<LocalQuery>,
+) -> Response {
+    let redeemed = query
+        .code
+        .as_deref()
+        .is_some_and(|code| api.auth.redeem_local_link(code));
+    if !redeemed {
+        return page(
+            StatusCode::UNAUTHORIZED,
+            "登录链接无效",
+            "这条链接已经用过或过期了（两分钟内有效）。在跑 Gateway 的机器上重新运行 komo web。",
+        );
+    }
+    let user_agent = headers
+        .get(header::USER_AGENT)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    match api.auth.issue_web(LOCAL_SUBJECT, None, user_agent).await {
+        Ok(token) => {
+            let mut response = redirect(&safe_next(query.next.as_deref()));
+            append_cookie(&mut response, &api.auth.session_cookie(&token));
+            response
+        }
+        Err(error) => error_page(&error),
+    }
 }
 
 /// `GET /v1/auth/sessions`

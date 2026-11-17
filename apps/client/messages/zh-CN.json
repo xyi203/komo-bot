@@ -1164,7 +1164,7 @@
   "login_body": "用你的账号登录后继续。",
   "login_button": "登录",
   "login_unconfigured_title": "这台 Komo 还没有配置登录",
-  "login_unconfigured_body": "在 Gateway 的 config.toml 里配置 [auth.oidc]（身份提供方地址、客户端 ID、允许登录的账号），重新加载配置后回到这里重新检查。步骤见部署文档（docs/clients.md §9）。",
+  "login_unconfigured_body": "只在这台机器上用：在跑 Gateway 的机器上运行 komo web，会打开一个已登录的页面。要从别的设备访问：在 Gateway 的 config.toml 里配置 [auth.oidc]（身份提供方地址、客户端 ID、允许登录的账号），重启 Gateway 后回到这里重新检查。步骤见部署文档（docs/clients.md §9）。",
   "login_recheck": "重新检查",
   "login_desktop_title": "请在桌面端登录",
   "login_desktop_body": "在连接设置里选「本机」直接连这台电脑上的 Komo；连远程则填好地址，用系统浏览器登录。",

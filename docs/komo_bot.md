@@ -18,7 +18,7 @@ v0.8 相对 v0.7 的变化：状态数据库改为 Turso + toasty（§8.2；2026
 | -------- | ------------------------------------------------------------------------------------------------ |
 | 部署     | Fedora Server 与 macOS 均可独立运行，每个实例保存自己的数据                                      |
 | 进程入口 | 单个可执行程序 `komo`，包含 CLI 客户端和 Gateway                                            |
-| 聊天     | 网页（`komo` / `komo web` 打开 Gateway 的地址，登录走 OIDC，§13.1）；Gateway 未运行时自动启动。聊天渠道已删除（§11） |
+| 聊天     | 网页（`komo` / `komo web` 打开 Gateway 的网页：本机用一次性登录链接，远程走 OIDC，§13.1）；Gateway 未运行时自动启动。聊天渠道已删除（§11） |
 | 执行方式 | LLM 原生 tool call，由 Rust 校验和执行；没有 Policy 与审批（§7）                                 |
 | 基础工具 | 严格保留 `read`、`write`、`edit`、`bash`、`codemode`（外加只读的 `rg`，§4）                      |
 | 能力扩展 | 可复用能力写成 Skill（`SKILL.md` + 脚本），由 `bash` 运行；没有 toolbox（2026-10-15 删除，§5.3）   |
@@ -81,7 +81,7 @@ Gateway 持有模型连接、数据库与提交线、工具环境和运行状态
 | 命令                                         | 行为                                                                        |
 | -------------------------------------------- | --------------------------------------------------------------------------- |
 | `komo`                                       | 确保本机 Gateway 就绪，再做 `komo web` 做的事（2026-11-12 起；此前是进 TUI 聊天，TUI 与 `komo resume` / `komo home` 已删除） |
-| `komo web [--no-open]`                       | 在浏览器里打开网页版（`docs/clients.md`）：打印并打开 Gateway 的地址，登录由网页走 OIDC（没登录时跳去身份提供方，§13.1「登录」）。**没有配对码了**（2026-11-14 删除，`docs/redesign.md` P21）。`--no-open` 只打印链接。需要 Gateway 在跑（同 `komo`，没起就拉起）；有 `komo login` 存下的远程登录时连那台远程的 |
+| `komo web [--no-open]`                       | 在浏览器里打开网页版（`docs/clients.md`）：连本机 Gateway 时用本机令牌换一条一次性登录链接（`POST /v1/auth/local-link`，两分钟、用一次），打印并打开它，浏览器直接是登录状态，不需要 `[auth.oidc]`（2026-11-17）；连远程 Gateway（或换不到链接的旧版本）时打印并打开地址，登录由网页走 OIDC（§13.1「登录」）。**没有配对码了**（2026-11-14 删除，`docs/redesign.md` P21）。`--no-open` 只打印链接。需要 Gateway 在跑（同 `komo`，没起就拉起）；有 `komo login` 存下的远程登录时连那台远程的 |
 | `komo login URL [--name N] [--no-open]`      | 登录**远程** Gateway（2026-11-14）：本机起一个只听 `127.0.0.1` 的临时端口，带 PKCE challenge 与回环回跳地址在浏览器里打开 `URL/auth/device/authorize`，走完 OIDC 后 Gateway 带一次性码跳回本机端口，命令用码 + verifier 换长期设备令牌，存进数据目录的 `remote.json`（0600）。之后的操作命令连这台远程 Gateway。机器上连本机 Gateway 不需要登录（本机令牌 `runtime/gateway.json`） |
 | `komo logout`                                | 吊销服务端的设备令牌（尽力而为）并删掉 `remote.json`，命令回到连本机 |
 | `komo session list [--all] [--limit N] [--cursor C]` | 查看会话列表和状态（最新创建的在前）；`--all` 才列出已逻辑删除的会话（§8.10）。一页 50 条，还有更多时末尾印出接着列的 `--cursor`；`--limit 0` 一次列完 |
@@ -120,7 +120,7 @@ Gateway 持有模型连接、数据库与提交线、工具环境和运行状态
 2. 检查 Gateway 健康状态与实例身份，不能只凭 PID 或端口判断。
 3. 本机实例未运行时，请求系统服务管理器启动。
 4. 等待服务就绪，超时则返回具体诊断信息。
-5. 做 `komo web` 的事：打印并打开 Gateway 的地址；对话在浏览器里发生（登录走 OIDC，§13.1）。
+5. 做 `komo web` 的事：打印并打开 Gateway 的网页（本机是一次性登录链接，§13.1）；对话在浏览器里发生。
 
 Gateway 获得数据目录进程锁并完成存储校验后，引擎自动恢复未完成的任务；不必等用户打开 CLI 或发送 resume。恢复与新请求共用调度器，恢复本身不等待全部旧任务完成才提供服务。恢复就是 §8.4 的那张表加 §8.9 的 blob 引用检查：`running` 一律回 `pending`，从 checkpoint 所在阶段接着跑（上一代不是干净关闭时记一次崩溃，连续 5 次就停住等人，§8.4）；被引用的 blob 读不到的工具任务写成 faulted，在下一次调度之前判定完（§8.7）。
 
@@ -994,6 +994,8 @@ CLI 通过 HTTP 发命令，通过 SSE 观察运行。Gateway 内部采用函数
 | GET /auth/me                     | 不要登录，永远 200：`AuthMeResponse`（`authenticated`、`oidc_configured`、`credential` = `web` / `device` / `local`、`subject`、`email`、`session_id`）。网页据此决定要不要跳 `/auth/login` |
 | GET /auth/device/authorize       | 不要登录。桌面端 / CLI 在系统浏览器里打开：`code_challenge`（S256）、`redirect_uri`（只认 `komo://auth/callback` 与本机回环 `http://127.0.0.1:端口/…`、`localhost`、`[::1]`）、可选 `state`、`name`。浏览器已登录就直接发码，否则走一遍 OIDC；最后 303 到 `redirect_uri?code=…&state=…`（码两分钟、用一次） |
 | POST /auth/device/token          | 不要登录（一次性码即凭据）。`DeviceTokenRequest {code, code_verifier, redirect_uri}` → `DeviceTokenResponse {token, token_type: "Bearer", session_id, subject, email}`；令牌只出现这一次，库里只存哈希 |
+| POST /v1/auth/local-link         | **只认本机令牌**（设备令牌、网页会话 403）。→ `LocalLinkResponse {path: "/auth/local?code=…"}`，码两分钟、用一次，只在内存里。给 `komo web` 用 |
+| GET /auth/local?code=…[&next=/路径] | 不要登录（码即凭据）。核销码，建一条网页会话（账号记为 `local`）并种 `komo_session`，303 跳回 `next`（只认站内路径）；码不对 / 用过 / 过期回 401 页 |
 | GET /v1/auth/sessions            | 没过期的登录状态（网页会话与设备令牌）：`AuthSessionsResponse`，每条 `id` / `kind` / `label` / `subject` / `email` / `created_at` / `last_used_at` / `expires_at`（设备令牌为 null）/ `current`（设置页「通用」或「关于」的设备清单） |
 | DELETE /v1/auth/sessions/{id}    | 吊销一条（`AuthRevokeResponse`），该 cookie / 令牌立刻失效；id 不存在 404 |
 
@@ -1013,12 +1015,13 @@ allowed_subjects = ["<sub>"]                        # 与 allowed_emails 至少�
 allowed_emails = []                                 # 小写比较；提供方明说 email_verified=false 的不算
 ```
 
-- **没配 `[auth.oidc]`**：配置照常装上，Gateway 起来 warn 一句、`komo config check` 给 `auth.oidc` 一条警告「未配置登录」；网页登不了（`/auth/login` 回 404 页，`/auth/me` 报 `oidc_configured: false`），设备登录也发不了；机器上的命令行与本机开发（`pnpm dev` 的代理自己带本机令牌）照常用本机令牌。配了但填错（issuer 不是 https、没有名单 …）是配置错误，不装上。
+- **没配 `[auth.oidc]`**：配置照常装上，Gateway 起来 warn 一句、`komo config check` 给 `auth.oidc` 一条警告「未配置登录」；网页只能经 `komo web` 的本机登录链接进（`/auth/login` 回 404 页，`/auth/me` 报 `oidc_configured: false`，网页的说明页会提示运行 `komo web`），设备登录发不了；机器上的命令行与本机开发（`pnpm dev` 的代理自己带本机令牌）照常用本机令牌。配了但填错（issuer 不是 https、没有名单 …）是配置错误，不装上。
 - **登录状态落盘**：`aux.db` 的 `auth_sessions`（网页会话 `web`、设备令牌 `device`），**只存令牌的 SHA-256**，重启后仍有效；网页会话 30 天滑动续期（距上次记录超 10 分钟才写库，并重发 cookie），设备令牌不过期、可列出可吊销（`GET /v1/auth/sessions`、`DELETE /v1/auth/sessions/{id}`）。登录过程的临时状态（state / nonce / verifier、设备登录的一次性码）只在内存里，重启丢了重新登录即可。
 - **ID token 校验**：算法只认 RS256 / ES256 / EdDSA（拒 `none` 与 HS*），验签用工作区已有的 `ring`，JWKS 按 `kid` 取、对不上时（密钥轮换）强制重取一次（间隔至少 60 秒）；再核 `iss`、`aud`（含 `azp`）、`exp` / `nbf`（容 60 秒）、`nonce`，最后核允许名单。token 响应缺邮箱而名单是邮箱时，补问 `userinfo_endpoint`（只认同一个 `sub`）。
 - **防登录 CSRF**：`/auth/login` 种的 `komo_oidc` cookie（HttpOnly、SameSite=Lax、仅 `/auth` 路径、10 分钟）必须与回调的 `state` 一致，state 用一次作废。
 - **设备令牌**：桌面端 / CLI 走「跳系统浏览器登录再跳回」——`GET /auth/device/authorize` → OIDC → 带一次性码 303 回 `redirect_uri` → `POST /auth/device/token` 换令牌。回跳白名单：`komo://auth/callback`（桌面端深链）与本机回环地址的任意端口；其余一律不发码。PKCE 保证码被别人截获也换不出令牌。令牌形如 `komodev_…`，Gateway 只存哈希。
 - **浏览器推送（Web Push，`docs/redesign.md` §1.8）**：`[push] enabled`（默认开）与 `subject`（VAPID `sub`，`mailto:` 或 `https:`；省略用 `[auth.oidc] public_url`，两个都没有就不发）。只推需要操作者看的：停住的运行往对话里问你、定时结果按 `notify` 投进对话（这两处都在 `say_in` 落下之后，判重挡掉的不推）、对话里不是操作者发起的那一轮（监听事件、任务交回触发）说的话；操作者自己发起的那一轮不推。负载 `{ title, body, url, tag? }`，`url` 是站内路径（主对话 `/`，支线 `/chats/<会话 id>`）。发送按 RFC 8291（`aes128gcm`）+ RFC 8292（VAPID，ES256），后台发、失败只记日志；推送服务回 404 / 410 删订阅。推送要求页面是 https。
+- **本机登录链接（2026-11-17）**：只在这台机器上用时不必搭身份提供方——`komo web` 拿本机令牌换一次性链接，浏览器打开就有网页会话（30 天滑动，与 OIDC 签发的同一种，可在设备清单里吊销）。**不按「请求来自回环地址」放行**：Cloudflare 隧道 / 反向代理转进来的请求也来自回环地址；凭据是本机令牌（`runtime/gateway.json`，0600），拿得到它就是人在这台机器上。与删掉的配对码的区别：没有页面、没有人工抄码，链接由命令行直接打开。
 - **上游已删**：配对码（`komo web` 的配对链接、`POST /v1/web/pair-code`、`POST /v1/web/session`）整套删除，不留兼容；`state.db` 时代没有落盘的会话，所以存量的内存 cookie 在升级重启时本来就会失效，没有需要迁移的登录状态。
 
 创建会话、提交输入、介入答复、Cron 与 Memory 变更都支持幂等请求键；同一键对应不同内容则拒绝。创建会话的请求键与正文哈希持久保存，同键同内容重发返回原会话，同键不同内容返回 409 `request_key_conflict`，重启后仍有效。

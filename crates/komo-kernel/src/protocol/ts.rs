@@ -27,7 +27,7 @@ use super::{
     DefaultModelRequest, DeleteSessionRequest, DeviceTokenRequest, DeviceTokenResponse,
     EmbeddingUpsertRequest, EnabledRequest, EnvSetRequest, ErrorBody, EventPage, EventQuery,
     FileDiff, ForkSessionResponse, HealthResponse, InterventionAnswerRequest,
-    InterventionAnswerResponse, InterventionListResponse, ManualCronRunResponse,
+    InterventionAnswerResponse, InterventionListResponse, LocalLinkResponse, ManualCronRunResponse,
     MatterActionRequest, MatterAddRequest, MatterChatResponse, MatterDetail, MatterListResponse,
     MatterRunsResponse, McpReconnectRequest, McpReconnectResponse, McpServersResponse,
     MemoryAddRequest, MemoryAddResponse, MemoryClassifyRequest, MemoryDetail, MemoryIndexStatus,
@@ -76,6 +76,7 @@ pub fn export_all(dir: &Path) -> Result<(), String> {
     each(AuthRevokeResponse::export_all(&cfg))?;
     each(DeviceTokenRequest::export_all(&cfg))?;
     each(DeviceTokenResponse::export_all(&cfg))?;
+    each(LocalLinkResponse::export_all(&cfg))?;
     each(WireEvent::export_all(&cfg))?;
     // C1：会话列表与菜单、对话、改动页用到的。
     each(CreateSessionRequest::export_all(&cfg))?;

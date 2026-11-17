@@ -10,6 +10,11 @@
 //!   OIDC 登录成功后签发。带 cookie 的**非 GET / HEAD** 请求另外核对 `Origin`（同 `Host` 或等于公开
 //!   地址的源），否则 403。
 //!
+//! 网页会话还有一条不经 OIDC 的来路：**本机令牌换一次性链接**（`POST /v1/auth/local-link` →
+//! 浏览器打开 `/auth/local?code=…`），给 `komo web` 用，没配 `[auth.oidc]` 的本机也能用网页。
+//! 不按「请求来自回环地址」放行：隧道 / 反向代理转进来的请求也是回环地址，靠的是拿得到本机令牌
+//! （`runtime/gateway.json`，0600）＝人在这台机器上。
+//!
 //! 设备令牌与会话 cookie 都落在 `aux.db` 的 `auth_sessions`，**只存令牌的 SHA-256**，重启后仍有效；
 //! 网页会话 30 天滑动续期（用一次、距上次记录超过 10 分钟就续，并重发 cookie 把浏览器那一侧也续上）。
 //! 登录过程中的临时状态（`state` / `nonce` / PKCE verifier、设备登录的一次性授权码）只在内存里，
@@ -52,8 +57,10 @@ pub const WEB_TTL: Duration = Duration::days(30);
 const TOUCH_AFTER: Duration = Duration::minutes(10);
 /// 一次登录从跳出去到回调最多多久。
 const LOGIN_TTL: Duration = Duration::minutes(10);
-/// 设备登录的一次性授权码多久失效。
+/// 设备登录的一次性授权码、本机登录链接多久失效。
 const CODE_TTL: Duration = Duration::minutes(2);
+/// 本机登录链接换出来的网页会话记在哪个账号下（`/v1/auth/sessions` 里显示）。
+pub const LOCAL_SUBJECT: &str = "local";
 /// 内存里同时挂着的待完成登录 / 授权码上限：满了先丢最早的。
 const MAX_PENDING: usize = 256;
 
@@ -181,6 +188,8 @@ pub struct AuthService {
     oidc: Option<OidcClient>,
     pending: Mutex<HashMap<String, PendingLogin>>,
     codes: Mutex<HashMap<String, DeviceCode>>,
+    /// 本机登录链接里的一次性码 → 到期时间。
+    local_links: Mutex<HashMap<String, OffsetDateTime>>,
 }
 
 impl std::fmt::Debug for AuthService {
@@ -212,6 +221,7 @@ impl AuthService {
             oidc,
             pending: Mutex::new(HashMap::new()),
             codes: Mutex::new(HashMap::new()),
+            local_links: Mutex::new(HashMap::new()),
         }
     }
 
@@ -482,6 +492,29 @@ impl AuthService {
                 .await?;
         }
         Ok(())
+    }
+
+    // ------------------------------------------------------------ 本机登录链接
+
+    /// 给持本机令牌的调用方发一个一次性码（两分钟、用一次），浏览器拿它换网页会话。
+    pub fn issue_local_link(&self) -> String {
+        let now = self.now();
+        let code = random_token();
+        insert_bounded(
+            &self.local_links,
+            code.clone(),
+            now + CODE_TTL,
+            now,
+            |expires| *expires,
+        );
+        code
+    }
+
+    /// 核销本机登录链接的码：**先取走**，不管成不成，一个码只能用一次。
+    pub fn redeem_local_link(&self, code: &str) -> bool {
+        let now = self.now();
+        let expires = self.local_links.lock().expect("内存表").remove(code);
+        expires.is_some_and(|expires| expires > now)
     }
 
     // ------------------------------------------------------------ 设备登录
@@ -1061,6 +1094,19 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+    }
+
+    #[tokio::test]
+    async fn a_local_link_is_single_use_and_short_lived() {
+        let f = fixture("local-token").await;
+        let code = f.auth.issue_local_link();
+        assert!(f.auth.redeem_local_link(&code));
+        assert!(!f.auth.redeem_local_link(&code), "用过一次就作废");
+        assert!(!f.auth.redeem_local_link("not-issued"));
+
+        let late = f.auth.issue_local_link();
+        f.clock.advance(Duration::minutes(3));
+        assert!(!f.auth.redeem_local_link(&late), "过期");
     }
 
     async fn redeem_device(f: &Fixture) -> (String, AuthSessionRecord) {

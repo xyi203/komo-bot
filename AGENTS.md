@@ -78,7 +78,8 @@ komo-agent     AgentProfile → 能力面选择 · skills 发现与目录 · 编
                值类型（AgentProfile/AgentSurface）留在 kernel。
 komo-gateway   axum routes (`http/v2`) · `service/durable` (DurableCore + hooks; chats/ ·
                sessions/ · submit/ · interventions/ · feed/ · background/) · SSE · auth · lock/discovery ·
-               web (Host guard · static shell, switchable) · push (Web Push: VAPID + subscriptions) · launchd/systemd · web attachment inbox ·
+               web (Host guard · static shell, switchable) · push (Web Push: VAPID + subscriptions) ·
+               telegram (fallback entry: operator-only long poll, text in/out, notices) · launchd/systemd · web attachment inbox ·
                intervention rendering · config reload.
 komo-client    HTTP + SSE client · discovery · command output (CLI subcommands).
                Depends on kernel only.

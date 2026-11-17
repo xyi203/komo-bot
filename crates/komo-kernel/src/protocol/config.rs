@@ -90,6 +90,24 @@ pub struct StartOnly {
     /// `[push]`：浏览器推送（`docs/redesign.md` §1.8）。
     #[serde(default)]
     pub push: PushConfig,
+    /// `[telegram]`：网页进不去时的备用入口（`docs/telegram.md`）。`None` = 没配。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub telegram: Option<TelegramConfig>,
+}
+
+/// `.env` 里放 Telegram bot token 的默认变量名。
+pub const DEFAULT_TELEGRAM_TOKEN_ENV: &str = "KOMO_TELEGRAM_BOT_TOKEN";
+
+/// `[telegram]`：一个 bot、一个操作者（`docs/telegram.md`）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TelegramConfig {
+    /// 操作者的 Telegram 用户 id：只认这个人的私聊，别人发来的一律不理。
+    pub operator: i64,
+    /// `.env` 里放 bot token 的变量名（默认 [`DEFAULT_TELEGRAM_TOKEN_ENV`]）。
+    pub token_env: String,
+    /// Bot API 端点；`None` = 官方 `https://api.telegram.org`。自建代理或测试时改。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -870,6 +888,7 @@ mod tests {
                 oidc: None,
                 web_serve: true,
                 push: PushConfig::default(),
+                telegram: None,
             },
             model_catalog: ModelCatalog::default(),
             model: model("chat-a"),

@@ -963,3 +963,47 @@ fn a_main_model_alias_that_does_not_exist_refuses_the_load() {
         "{error}"
     );
 }
+
+/// `[telegram]`（`docs/telegram.md`）：有这一节就开，token 变量名有默认值、端点去掉尾部斜杠；
+/// operator 不是正整数、端点不是 http(s) 地址都拒绝加载并点名键。
+#[test]
+fn the_telegram_fallback_is_read_and_its_operator_and_endpoint_are_checked() {
+    let fixture = Fixture::valid();
+    let loaded = load_config(&fixture.options()).unwrap();
+    assert_eq!(loaded.snapshot.start_only.telegram, None);
+
+    let mut text = Fixture::config_text("chat-a", "medium");
+    text.push_str("\n[telegram]\noperator = 4242\nendpoint = \"https://tg.example.com/\"\n");
+    write(&fixture.sources().config, &text);
+    let loaded = load_config(&fixture.options()).unwrap();
+    let telegram = loaded
+        .snapshot
+        .start_only
+        .telegram
+        .clone()
+        .expect("配了就有");
+    assert_eq!(telegram.operator, 4242);
+    assert_eq!(
+        telegram.token_env,
+        komo_kernel::protocol::config::DEFAULT_TELEGRAM_TOKEN_ENV
+    );
+    assert_eq!(telegram.endpoint.as_deref(), Some("https://tg.example.com"));
+
+    for (section, key) in [
+        ("[telegram]\noperator = 0\n", "telegram.operator"),
+        (
+            "[telegram]\noperator = 1\nendpoint = \"tg.example.com\"\n",
+            "telegram.endpoint",
+        ),
+    ] {
+        let mut text = Fixture::config_text("chat-a", "medium");
+        text.push_str(&format!("\n{section}"));
+        write(&fixture.sources().config, &text);
+        let error = load_config(&fixture.options()).unwrap_err();
+        assert!(
+            error.issues().iter().any(|issue| issue.key.as_str() == key),
+            "{key}：{:?}",
+            error.issues()
+        );
+    }
+}

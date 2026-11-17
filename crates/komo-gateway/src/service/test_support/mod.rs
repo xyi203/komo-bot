@@ -85,6 +85,7 @@ pub fn sample_snapshot() -> ConfigSnapshot {
             oidc: None,
             web_serve: true,
             push: Default::default(),
+            telegram: None,
         },
         model_catalog: ModelCatalog {
             default: "main".into(),

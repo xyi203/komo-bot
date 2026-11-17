@@ -122,7 +122,7 @@ async fn push_unprompted(
     {
         return;
     }
-    state.push.notify(crate::push::PushMessage {
+    state.notify_operator(crate::push::PushMessage {
         title: "Komo".to_owned(),
         body: text.to_owned(),
         url: super::super::chats::say::chat_url(&record),
@@ -140,7 +140,10 @@ fn title(state: &Arc<GatewayState>, session: &str, run: &RunId, reply: &str) {
 // ------------------------------------------------------------------ 重启之后
 
 /// 一条已结算的输入 submission 的回答正文（只有正常完成的才有）。
-async fn completed_text(core: &DurableCore, record: &SubmissionRecord) -> Option<String> {
+pub(crate) async fn completed_text(
+    core: &DurableCore,
+    record: &SubmissionRecord,
+) -> Option<String> {
     let SubmissionKind::Input {
         state: InputState::Done { answer, .. },
     } = &record.kind

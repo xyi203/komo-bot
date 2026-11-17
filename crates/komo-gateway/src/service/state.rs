@@ -164,6 +164,23 @@ pub struct GatewayState {
     pub changes: super::changes::ChangeRecorder,
     /// 浏览器推送：订阅、VAPID 密钥与发送（`docs/redesign.md` §1.8）。
     pub push: Arc<crate::push::PushService>,
+    /// Telegram 备用入口（`docs/telegram.md`）；没配就是一个什么都不做的空壳。
+    pub telegram: Arc<crate::telegram::Telegram>,
+}
+
+impl GatewayState {
+    /// 要操作者知道的一句话：推给订阅了的浏览器，配了 Telegram 也发一份（`docs/telegram.md`）。
+    /// 网页进不去时浏览器推送点开也没用，Telegram 那份带着全文。
+    pub fn notify_operator(&self, message: crate::push::PushMessage) {
+        let public_url = self
+            .snapshot()
+            .start_only
+            .oidc
+            .as_ref()
+            .map(|oidc| oidc.public_url.clone());
+        self.telegram.notify(&message, public_url.as_deref());
+        self.push.notify(message);
+    }
 }
 
 impl std::fmt::Debug for GatewayState {
@@ -317,6 +334,7 @@ impl GatewayState {
             Arc::clone(&config),
             Arc::clone(&clock),
         ));
+        let telegram = Arc::new(crate::telegram::Telegram::from_config(&config));
         Ok(Arc::new(GatewayState {
             home,
             shared_home,
@@ -347,6 +365,7 @@ impl GatewayState {
             max_rounds,
             changes,
             push,
+            telegram,
         }))
     }
 

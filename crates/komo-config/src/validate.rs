@@ -147,6 +147,7 @@ fn check_start_only(snapshot: &ConfigSnapshot, issues: &mut Vec<ConfigIssue>) {
         ));
     }
     check_oidc(snapshot, issues);
+    check_telegram(snapshot, issues);
     if let Some(subject) = &snapshot.start_only.push.subject
         && !(subject.starts_with("mailto:") || subject.starts_with("https://"))
     {
@@ -175,6 +176,27 @@ fn check_start_only(snapshot: &ConfigSnapshot, issues: &mut Vec<ConfigIssue>) {
 /// `[auth.oidc]`：能不能登录。没配这一段不是错误（命令行仍用本机令牌），只是网页登不了；
 /// 那条提示在 Gateway 的 `config check` 里补（它知道有没有配，这里没配就什么都不说，
 /// 免得每份不登录的配置都带一条警告）。
+fn check_telegram(snapshot: &ConfigSnapshot, issues: &mut Vec<ConfigIssue>) {
+    let Some(telegram) = &snapshot.start_only.telegram else {
+        return;
+    };
+    if telegram.operator <= 0 {
+        issues.push(error(
+            "telegram.operator",
+            "operator 要写你自己的 Telegram 用户 id（正整数，给 @userinfobot 发条消息就能看到）",
+        ));
+    }
+    if let Some(endpoint) = &telegram.endpoint
+        && !reqwest::Url::parse(endpoint)
+            .is_ok_and(|url| matches!(url.scheme(), "http" | "https") && url.host().is_some())
+    {
+        issues.push(error(
+            "telegram.endpoint",
+            format!("`{endpoint}` 要是 http(s) 地址，如 https://api.telegram.org"),
+        ));
+    }
+}
+
 fn check_oidc(snapshot: &ConfigSnapshot, issues: &mut Vec<ConfigIssue>) {
     let Some(oidc) = &snapshot.start_only.oidc else {
         return;

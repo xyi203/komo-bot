@@ -9,6 +9,7 @@ pub mod push;
 pub mod reload;
 pub mod service;
 pub mod sse;
+pub mod telegram;
 pub mod telemetry;
 pub mod web;
 

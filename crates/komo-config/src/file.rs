@@ -8,9 +8,10 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use komo_kernel::protocol::config::{
-    CompactionConfig, ConfigSnapshot, ConsolidateConfig, DEFAULT_OIDC_SECRET_ENV, ExecutionConfig,
-    KeyPath, McpExposure, McpServerConfig, McpTransport, MemoryConfig, OidcConfig, PathsConfig,
-    PushConfig, RetrievalConfig, SourceFile, StartOnly, TypesafeConfig,
+    CompactionConfig, ConfigSnapshot, ConsolidateConfig, DEFAULT_OIDC_SECRET_ENV,
+    DEFAULT_TELEGRAM_TOKEN_ENV, ExecutionConfig, KeyPath, McpExposure, McpServerConfig,
+    McpTransport, MemoryConfig, OidcConfig, PathsConfig, PushConfig, RetrievalConfig, SourceFile,
+    StartOnly, TelegramConfig, TypesafeConfig,
 };
 use komo_kernel::types::agent::{AgentConfig, AgentProfile, MemoryMode};
 use komo_kernel::types::memory::{MemoryScopeParseError, RetrievalMode};
@@ -38,6 +39,7 @@ pub(super) struct FileConfig {
     pub web: WebSection,
     #[serde(default)]
     pub push: PushSection,
+    pub telegram: Option<TelegramSection>,
     #[serde(default)]
     pub auth: AuthSection,
     #[serde(default)]
@@ -148,6 +150,34 @@ pub(super) struct PushSection {
     pub enabled: Option<bool>,
     /// VAPID `sub`（`mailto:` 或 `https:`）；省略 = 用 `[auth.oidc] public_url`。
     pub subject: Option<String>,
+}
+
+/// `[telegram]`：备用入口（`docs/telegram.md`）。有这一节就开。
+#[derive(Debug, Deserialize)]
+pub(super) struct TelegramSection {
+    /// 操作者的 Telegram 用户 id。必填：没有它谁的消息都不该收。
+    pub operator: i64,
+    /// `.env` 里放 bot token 的变量名；省略 = `KOMO_TELEGRAM_BOT_TOKEN`。
+    pub token_env: Option<String>,
+    /// Bot API 端点；省略 = 官方。
+    pub endpoint: Option<String>,
+}
+
+impl TelegramSection {
+    fn into_config(self) -> TelegramConfig {
+        TelegramConfig {
+            operator: self.operator,
+            token_env: self
+                .token_env
+                .map(|name| name.trim().to_string())
+                .filter(|name| !name.is_empty())
+                .unwrap_or_else(|| DEFAULT_TELEGRAM_TOKEN_ENV.to_string()),
+            endpoint: self
+                .endpoint
+                .map(|endpoint| endpoint.trim().trim_end_matches('/').to_string())
+                .filter(|endpoint| !endpoint.is_empty()),
+        }
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -667,6 +697,7 @@ pub(super) fn assemble(
                 .map(|subject| subject.trim().to_string())
                 .filter(|subject| !subject.is_empty()),
         },
+        telegram: file.telegram.map(TelegramSection::into_config),
     };
 
     let mcp = file

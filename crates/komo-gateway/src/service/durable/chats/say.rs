@@ -162,7 +162,7 @@ impl DurableCore {
         let Ok(record) = self.session(session).await else {
             return;
         };
-        state.push.notify(PushMessage {
+        state.notify_operator(PushMessage {
             title: match source {
                 SaySource::Intervention => "Komo 在等你".to_owned(),
                 SaySource::Cron => "Komo 的定时任务".to_owned(),

@@ -679,6 +679,7 @@ mod tests {
             arm_scores: vec![],
             dropped_by_threshold: None,
             reused_pin: false,
+            shadow: None,
         };
         let EventPayload::MemoryInjected(body) = &mut event.payload else {
             unreachable!()

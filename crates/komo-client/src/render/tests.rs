@@ -445,6 +445,7 @@ fn inspected_detail() -> RunDetail {
         arm_scores: vec![],
         dropped_by_threshold: None,
         reused_pin: false,
+        shadow: None,
     });
     detail
 }

@@ -30,6 +30,7 @@ mod extract;
 mod index;
 pub mod matter;
 mod offline;
+pub mod provider;
 mod rerank;
 mod stale;
 mod sweep;
@@ -53,7 +54,7 @@ use komo_kernel::types::ids::{MatterId, MemoryId, RunId, Seq, SessionId};
 use komo_kernel::types::matter::{Matter, MatterState, MatterUse};
 use komo_kernel::types::memory::{
     Injection, MemoryItem, MemoryScope, MemoryState, MemoryWork, RecallDiagnostics, RecallQuery,
-    RecallResult, RetrievalMode, clue_is_pushed, scope_allowed,
+    RecallResult, RetrievalMode, ShadowHit, ShadowRecall, clue_is_pushed, scope_allowed,
 };
 use komo_kernel::types::model::{EmbeddingSpace, InputKind, ModelConfig, Vector};
 use komo_kernel::types::turn::{LlmError, MemoryUse};
@@ -412,6 +413,8 @@ pub struct MemoryManager {
     /// 判断后端。与向量后端同一个形状（可以后装）：配置热重载时换成新的那一份，运行中的
     /// 查询下一次就读到新的。
     reranker: RwLock<Option<Reranker>>,
+    /// 外部记忆提供方（附录 G）。启动时按 `[memory.hindsight]` 装上，没配就是 `None`。
+    provider: RwLock<Option<provider::Installed>>,
     /// 配了 `memory.embedding` alias 吗。**与"后端在不在手上"是两件事**：配了但探测还没
     /// 落定（或探测失败）时，§9.4 的规则是"hybrid 退化成关键词、vector-only 报不可用"，
     /// 不是"配置错误"。
@@ -461,6 +464,21 @@ struct Live {
     llm: Arc<dyn LlmClient>,
 }
 
+/// 外部提供方交回的条目包成的检索结果：没有两臂分数与融合计数，那些是内置检索的事。
+fn plain_result(items: Vec<MemoryItem>, mode: RetrievalMode) -> RecallResult {
+    RecallResult {
+        items,
+        mode,
+        degraded: false,
+        degraded_reason: None,
+        vector_coverage: None,
+        candidates_before_fusion: None,
+        candidates_after_fusion: None,
+        arm_scores: Vec::new(),
+        dropped_by_threshold: None,
+    }
+}
+
 /// 一次后台处理最多领几个会话（每个会话一批，§9.10）。
 pub const WORK_BATCH: usize = 8;
 
@@ -469,6 +487,15 @@ fn extract_idle(config: &MemoryConfig) -> time::Duration {
 }
 
 /// 索引构建失败后第一次重试等多久；之后每次翻倍，封顶 [`INDEX_RETRY_MAX`]（§9.5）。
+/// 召回在每个 Run 的第一次模型请求之前同步跑，两处网络调用各给一个时限（§9.4「召回的时限」）：超了按
+/// "这一刻不通"降级——查询向量超时，hybrid 只走关键词；重排超时，保持融合顺序。模型配置里的整体超时
+/// （默认 120 秒）是给生成用的，一个卡住的 embedding / 判断端点不该让每一轮都先干等两分钟。
+const QUERY_EMBED_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+const RERANK_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+/// 外部提供方的召回与证据交付（附录 G）：与查询向量同一个理由，召回卡住不该拖住这一轮。
+const PROVIDER_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+const INGEST_DEADLINE: std::time::Duration = std::time::Duration::from_secs(15);
+
 const INDEX_RETRY_FIRST: time::Duration = time::Duration::seconds(30);
 const INDEX_RETRY_MAX: time::Duration = time::Duration::minutes(30);
 
@@ -508,6 +535,7 @@ impl MemoryManager {
             catalog: parts.catalog,
             embeddings: RwLock::new(parts.embeddings),
             reranker: RwLock::new(parts.reranker),
+            provider: RwLock::new(None),
             configured,
             events: parts.events,
             work: parts.work,
@@ -617,6 +645,41 @@ impl MemoryManager {
         *self.reranker.write().expect("判断后端槽") = reranker;
     }
 
+    /// 装上（或撤掉）外部记忆提供方（附录 G）。
+    pub fn install_provider(&self, installed: Option<provider::Installed>) {
+        *self.provider.write().expect("提供方槽") = installed;
+    }
+
+    fn provider(&self) -> Option<provider::Installed> {
+        self.provider.read().expect("提供方槽").clone()
+    }
+
+    /// 外部提供方召回一次，有时限（同查询向量，§9.4「召回的时限」）。交回结果与耗时。
+    async fn external_recall(
+        &self,
+        installed: &provider::Installed,
+        text: &str,
+        scopes: &[MemoryScope],
+        limit: u32,
+    ) -> (
+        Result<Vec<provider::ProviderHit>, provider::ProviderError>,
+        u64,
+    ) {
+        let started = std::time::Instant::now();
+        let outcome = tokio::time::timeout(
+            PROVIDER_DEADLINE,
+            installed.provider.recall(text, scopes, limit),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            Err(provider::ProviderError(format!(
+                "{} 秒内没回来",
+                PROVIDER_DEADLINE.as_secs()
+            )))
+        });
+        (outcome, started.elapsed().as_millis() as u64)
+    }
+
     /// 这一次查询要不要重排、用哪个后端。**两个条件都要**：开关开着，而且后端在手上。
     fn reranker(&self) -> Option<Reranker> {
         if !self.retrieval().rerank {
@@ -658,7 +721,17 @@ impl MemoryManager {
         }
         if query.mode != RetrievalMode::Keyword {
             match self.vector_backend() {
-                Some(client) => match self.embed_query(client.as_ref(), &query.text).await {
+                Some(client) => match tokio::time::timeout(
+                    QUERY_EMBED_DEADLINE,
+                    self.embed_query(client.as_ref(), &query.text),
+                )
+                .await
+                .unwrap_or_else(|_| {
+                    Err(EmbedError::Unavailable(format!(
+                        "查询向量 {} 秒内没回来",
+                        QUERY_EMBED_DEADLINE.as_secs()
+                    )))
+                }) {
                     Ok(Some(vector)) => query.query_vector = Some(vector),
                     Ok(None) => {
                         // 空查询文本没有向量可言；这不是故障，交给关键词臂（它也会返回空）。
@@ -711,14 +784,22 @@ impl MemoryManager {
         }
 
         if let (Some(_), Some(reranker)) = (shortlist, reranker) {
-            match rerank::order(
-                reranker.backend.as_ref(),
-                &reranker.model,
-                &query.text,
-                &result.items,
+            let ordered = tokio::time::timeout(
+                RERANK_DEADLINE,
+                rerank::order(
+                    reranker.backend.as_ref(),
+                    &reranker.model,
+                    &query.text,
+                    &result.items,
+                ),
             )
             .await
-            {
+            .unwrap_or_else(|_| {
+                Err(komo_kernel::types::systemone::SystemOneError::Transport(
+                    format!("重排判断 {} 秒内没回来", RERANK_DEADLINE.as_secs()),
+                ))
+            });
+            match ordered {
                 Ok(Some(order)) => {
                     result.items = rerank::apply_order(result.items, &order);
                     tracing::debug!(candidates = order.len(), "记忆短名单按判断重排过（§9.4）");
@@ -890,7 +971,70 @@ impl MemoryManager {
                 (query.top_k + conventions.len() as u32).min(query.candidate_limit)
             };
             diagnostics.mode = Some(query.mode);
-            match self.search(query).await {
+            // 外部提供方（附录 G）：影子模式与内置检索并发跑、只记录；主用模式取代线索召回，召回失败退回内置。
+            let installed = self.provider();
+            let primary = installed
+                .as_ref()
+                .filter(|installed| installed.mode == provider::ProviderMode::Primary);
+            let external = async {
+                match &installed {
+                    Some(installed) => Some(
+                        self.external_recall(installed, text, scopes, query.top_k)
+                            .await,
+                    ),
+                    None => None,
+                }
+            };
+            let builtin = async {
+                match primary {
+                    Some(_) => None,
+                    None => Some(self.search(query.clone()).await),
+                }
+            };
+            let (external, mut builtin) = tokio::join!(external, builtin);
+            if let (Some(installed), Some((outcome, elapsed_ms))) = (&installed, external) {
+                let name = installed.provider.name().to_string();
+                match (primary.is_some(), outcome) {
+                    (true, Ok(hits)) => {
+                        builtin = Some(Ok(plain_result(
+                            hits.into_iter()
+                                .map(|hit| provider::external_item(&name, hit, now))
+                                .collect(),
+                            query.mode,
+                        )));
+                    }
+                    (true, Err(error)) => {
+                        tracing::warn!(%error, provider = %name, "外部提供方召回失败，这一次退回内置检索");
+                        diagnostics.degraded = true;
+                        diagnostics.degraded_reason =
+                            Some(format!("{name} 召回失败，退回内置：{error}"));
+                        builtin = Some(self.search(query.clone()).await);
+                    }
+                    (false, outcome) => {
+                        let (hits, error) = match outcome {
+                            Ok(hits) => (hits, None),
+                            Err(error) => (Vec::new(), Some(error.to_string())),
+                        };
+                        diagnostics.shadow = Some(ShadowRecall {
+                            provider: name,
+                            hits: hits
+                                .into_iter()
+                                .take(retrieval.top_k as usize)
+                                .map(|hit| ShadowHit {
+                                    id: hit.id,
+                                    text: hit.text,
+                                    score: hit.score,
+                                })
+                                .collect(),
+                            error,
+                            elapsed_ms,
+                        });
+                    }
+                }
+            }
+            let searched = builtin.unwrap_or_else(|| Ok(plain_result(Vec::new(), query.mode)));
+            let degraded_before = diagnostics.degraded_reason.take();
+            match searched {
                 Ok(result) => {
                     if result.degraded {
                         tracing::info!(
@@ -899,8 +1043,8 @@ impl MemoryManager {
                         );
                     }
                     diagnostics.mode = Some(result.mode);
-                    diagnostics.degraded = result.degraded;
-                    diagnostics.degraded_reason = result.degraded_reason;
+                    diagnostics.degraded = result.degraded || degraded_before.is_some();
+                    diagnostics.degraded_reason = degraded_before.or(result.degraded_reason);
                     diagnostics.candidates_before_fusion = result.candidates_before_fusion;
                     diagnostics.candidates_after_fusion = result.candidates_after_fusion;
                     diagnostics.arm_scores = result.arm_scores;
@@ -1032,9 +1176,20 @@ impl MemoryManager {
     }
 
     /// 重新核对一批记忆引用的**当前**状态（§9.7）。过期、遗忘、改了版本的都掉出去。
+    ///
+    /// 外部提供方的条目（附录 G）问提供方现状：删了、作废了、正文改了都掉出去；问不通也掉出去——核对不了的
+    /// 不留在模型眼前，与内置条目"读不出来先不沿用"同一条规矩。
     pub async fn revalidate(&self, uses: &[MemoryUse], now: OffsetDateTime) -> Vec<MemoryItem> {
         let mut alive = Vec::new();
+        let installed = self.provider();
+        let mut external: Vec<&MemoryUse> = Vec::new();
         for use_ in uses {
+            if let Some(installed) = &installed
+                && provider::external_id(installed.provider.name(), &use_.memory).is_some()
+            {
+                external.push(use_);
+                continue;
+            }
             match self.repo.get(&use_.memory).await {
                 Ok(Some(item)) => {
                     if item.revision != use_.revision {
@@ -1049,6 +1204,30 @@ impl MemoryManager {
                 }
                 Ok(None) => {}
                 Err(error) => tracing::debug!(%error, memory = %use_.memory, "核对不了，先不沿用"),
+            }
+        }
+        if let (Some(installed), false) = (installed, external.is_empty()) {
+            let name = installed.provider.name().to_string();
+            let ids: Vec<String> = external
+                .iter()
+                .filter_map(|use_| provider::external_id(&name, &use_.memory).map(str::to_owned))
+                .collect();
+            match tokio::time::timeout(PROVIDER_DEADLINE, installed.provider.current(&ids)).await {
+                Ok(Ok(hits)) => {
+                    for hit in hits {
+                        let item = provider::external_item(&name, hit, now);
+                        if external
+                            .iter()
+                            .any(|use_| use_.memory == item.id && use_.revision == item.revision)
+                        {
+                            alive.push(item);
+                        }
+                    }
+                }
+                Ok(Err(error)) => {
+                    tracing::debug!(%error, provider = %name, "外部条目核对不了，先不沿用")
+                }
+                Err(_) => tracing::debug!(provider = %name, "外部条目核对超时，先不沿用"),
             }
         }
         alive
@@ -1172,6 +1351,35 @@ impl MemoryManager {
         );
     }
 
+    /// 一段提取窗口交给外部提供方。失败只记日志：外部是附加的一份，不影响内置提取与游标。
+    async fn ingest_external(
+        &self,
+        session: &SessionId,
+        transcript: &extract::Transcript,
+        confined: Option<&MemoryScope>,
+    ) {
+        let Some(installed) = self.provider() else {
+            return;
+        };
+        let batch = provider::EvidenceBatch {
+            key: format!("{session}:{}", transcript.run),
+            session,
+            scope: confined.cloned().unwrap_or(MemoryScope::Personal),
+            text: &transcript.rendered,
+            at: self.clock.now(),
+        };
+        let name = installed.provider.name().to_string();
+        match tokio::time::timeout(INGEST_DEADLINE, installed.provider.ingest(&batch)).await {
+            Ok(Ok(())) => {
+                tracing::debug!(provider = %name, key = %batch.key, "证据交给了外部提供方")
+            }
+            Ok(Err(error)) => {
+                tracing::warn!(%error, provider = %name, key = %batch.key, "证据没交给外部提供方")
+            }
+            Err(_) => tracing::warn!(provider = %name, key = %batch.key, "交证据给外部提供方超时"),
+        }
+    }
+
     async fn skip(
         &self,
         item: &MemoryWorkItem,
@@ -1286,6 +1494,10 @@ impl MemoryManager {
                 if !transcript.has_new_evidence() {
                     skipped = Some("没有新的用户陈述或工具结果");
                 } else {
+                    // 同一份窗口交给外部提供方（附录 G），先于内置提取：内置失败放回 pending 时，下次按同一个
+                    // 键再交一次，提供方覆盖而不是多存一份。
+                    self.ingest_external(&batch.session, &transcript, confined.as_ref())
+                        .await;
                     let consolidator = consolidate::Consolidator::new(self);
                     // 提取前整批召回一次，编号后随提取调用一起交给模型（§9.10）。
                     let scopes: Vec<MemoryScope> = confined.iter().cloned().collect();

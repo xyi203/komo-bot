@@ -148,6 +148,7 @@ fn check_start_only(snapshot: &ConfigSnapshot, issues: &mut Vec<ConfigIssue>) {
     }
     check_oidc(snapshot, issues);
     check_telegram(snapshot, issues);
+    check_hindsight(snapshot, issues);
     if let Some(subject) = &snapshot.start_only.push.subject
         && !(subject.starts_with("mailto:") || subject.starts_with("https://"))
     {
@@ -176,6 +177,34 @@ fn check_start_only(snapshot: &ConfigSnapshot, issues: &mut Vec<ConfigIssue>) {
 /// `[auth.oidc]`：能不能登录。没配这一段不是错误（命令行仍用本机令牌），只是网页登不了；
 /// 那条提示在 Gateway 的 `config check` 里补（它知道有没有配，这里没配就什么都不说，
 /// 免得每份不登录的配置都带一条警告）。
+fn check_hindsight(snapshot: &ConfigSnapshot, issues: &mut Vec<ConfigIssue>) {
+    let Some(hindsight) = &snapshot.start_only.hindsight else {
+        return;
+    };
+    if !reqwest::Url::parse(&hindsight.url)
+        .is_ok_and(|url| matches!(url.scheme(), "http" | "https") && url.host().is_some())
+    {
+        issues.push(error(
+            "memory.hindsight.url",
+            format!(
+                "`{}` 要是 http(s) 地址，如 http://localhost:8888",
+                hindsight.url
+            ),
+        ));
+    }
+    // bank 名进 URL 路径。
+    if !hindsight
+        .bank
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':'))
+    {
+        issues.push(error(
+            "memory.hindsight.bank",
+            format!("`{}` 只能用字母、数字与 - _ . :", hindsight.bank),
+        ));
+    }
+}
+
 fn check_telegram(snapshot: &ConfigSnapshot, issues: &mut Vec<ConfigIssue>) {
     let Some(telegram) = &snapshot.start_only.telegram else {
         return;

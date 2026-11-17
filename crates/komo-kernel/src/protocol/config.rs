@@ -93,6 +93,30 @@ pub struct StartOnly {
     /// `[telegram]`：网页进不去时的备用入口（`docs/telegram.md`）。`None` = 没配。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub telegram: Option<TelegramConfig>,
+    /// `[memory.hindsight]`：外部记忆提供方（`docs/memory.md` 附录 G）。`None` = 只用内置记忆。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hindsight: Option<HindsightConfig>,
+}
+
+/// `[memory.hindsight]`：接一个自建的 Hindsight 服务（vectorize-io/hindsight）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HindsightConfig {
+    /// 服务地址，如 `http://localhost:8888`。
+    pub url: String,
+    /// 记忆库（bank）名；不存在时第一次写入前建。
+    pub bank: String,
+    pub mode: ProviderMode,
+}
+
+/// 外部提供方怎么用（`docs/memory.md` 附录 G）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderMode {
+    /// 两边都召回、都写入，只注入内置的；外部那份记进召回记录供对比。默认。
+    #[default]
+    Shadow,
+    /// 线索召回改用外部的；约定、事项、手动记的仍走内置。
+    Primary,
 }
 
 /// `.env` 里放 Telegram bot token 的默认变量名。
@@ -889,6 +913,7 @@ mod tests {
                 web_serve: true,
                 push: PushConfig::default(),
                 telegram: None,
+                hindsight: None,
             },
             model_catalog: ModelCatalog::default(),
             model: model("chat-a"),

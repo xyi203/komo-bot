@@ -23,6 +23,7 @@
 | 附录 D | 记忆效果基线：注入有没有用、该召回的召回了没有 | 2026-10-19 回溯评估 |
 | 附录 E | Claude Code 的记忆机制（官方文档核对） | 2026-10-26 调研 |
 | 附录 F | 长期约定与历史线索的使用模型 | 2026-10-28 提案；已并入 §9.2–§9.8 正文，已实现（§9.4 验收记录） |
+| 附录 G | 记忆提供方接缝（对照 OpenClaw / Hermes 的记忆插件） | 2026-11-17 操作者同意做 P0 + P1，已实现（G.6）；P2 待影子数据；「召回的时限」已并入 §9.4 |
 
 ## 9.1 两类内容，分别保存
 
@@ -277,6 +278,12 @@ MemoryManager 对 AgentRuntime 提供三个主要入口：recall、process_compl
 **`[memory]` 热重载**（2026-10-14）：`enabled`、`model`（连同它指向的 `model.*` / 凭证）与 `retrieval` 改了就换进 `MemoryManager`，下一次提取 / 召回用新的；此前这几项在构造时定死，重载报告却说"变了"。`memory.embedding` 不在其中——换它是换向量空间（§9.5）。
 
 **附录 F 的实现与验收（2026-10-28）。** 类型与存储：`MemoryItem.application` / `applies_when`，aux.db `memory_items` 追加 `application`、`applies_when` 两列（旧行读成 NULL）；`RetrievalConfig.min_similarity` / `min_keyword_score`（默认 0，热重载）。实现处的几个定法：门槛在 RRF 之后、重排与 `top_k` 之前删人，名次按两臂完整名单融合；一臂没跑只看另一臂，门槛 0 = 该臂名单里的条目都算过；邻居检索（提取前召回、离线整理）不受门槛约束。新增测试：store `an_item_that_clears_either_arms_threshold_stays_and_the_rest_are_dropped`、`the_keyword_score_is_normalised_so_one_word_stays_below_one`、`zero_thresholds_keep_everything_the_arms_returned`、`when_the_vector_arm_did_not_run_only_the_keyword_threshold_counts`、`the_content_hash_covers_the_index_input_and_matches_the_old_one_without_a_condition`、`the_condition_is_searchable_and_both_columns_round_trip`、`the_same_content_with_another_condition_is_found_separately`、`the_application_columns_are_added_to_an_existing_memory_items_table`；agent `conventions_and_clues_render_in_two_groups`、`the_header_no_longer_tells_the_model_to_ask_before_using_unconfirmed_memories`、`both_groups_share_one_budget`；runtime `a_well_formed_convention_keeps_its_application_and_condition`、`a_convention_whose_basis_is_not_in_a_user_event_becomes_a_reference`、`a_convention_claim_without_a_preference_user_statement_and_condition_becomes_a_reference`、`an_extracted_convention_lands_with_its_condition`、`a_reference_cannot_supersede_a_convention_it_only_contests_it`、`the_same_words_with_another_condition_are_a_separate_memory`、`extraction_does_not_fold_a_convention_into_a_hand_added_reference`、`add_defaults_to_reference_and_refuses_a_malformed_convention`、`adding_the_same_words_with_a_new_application_bumps_the_revision`、`classify_writes_a_new_revision_and_keeps_evidence_and_confirmation`、`classify_refuses_a_convention_without_a_condition_or_for_a_fact`、离线 `members_with_a_different_condition_or_application_are_never_merged`、`members_with_the_same_usage_still_merge`、`a_reference_cannot_supersede_a_convention`、`the_consolidation_prompt_version_is_v2`。`cargo fmt --check` 通过；`cargo test --workspace`：2385 通过、0 失败、12 忽略（含 hooks `memory_section_is_pinned_until_the_next_head`、`recall::the_memory_block_survives_a_restart_within_one_segment`、`a_forgotten_memory_never_comes_back_into_a_turn`）；开发过程中 `tool_output::an_interrupted_attempts_partial_output_is_reported_and_then_published_with_it` 在并发负载下偶发失败一次，单跑两次均通过，与本改动无关。增量 `cargo build --timings`：7.09 秒，报告 `target/cargo-timings/cargo-timing-20261028T090408704Z-f55de822e3512fa2.html`。未装二进制、未重启 Gateway、未改写真实记忆；`classify` 路由与 CLI 只有 runtime 层测试，没有 HTTP 端到端用例。
+
+**召回的时限（2026-11-17，已实现）。** 召回在每个 Run 的第一次模型请求之前同步跑，里面有两处网络调用：查询向量与可选的重排判断。
+两者各有时限，超了按"这一刻不通"处理，走上面已有的降级：查询向量 5 秒没回来，hybrid 只走关键词并明示 `degraded`（vector-only 照旧报不可用）；
+重排判断 10 秒没回来，保持融合顺序，候选一条不丢。模型配置里的整体超时（默认 120 秒）是给生成用的，不该让一个卡住的端点把每一轮都先拖两分钟。
+常量在 `komo-memory/src/lib.rs`（`QUERY_EMBED_DEADLINE` / `RERANK_DEADLINE`）；测试 `a_hanging_vector_endpoint_degrades_hybrid_at_the_deadline`、
+`a_hanging_judgement_keeps_the_fusion_order_at_the_deadline`。
 
 ## 9.5 向量索引与模型切换
 
@@ -1511,3 +1518,91 @@ Rust 回归使用 `cargo test --workspace`，格式使用 `cargo fmt --check`；
 | durable.db 架构与工具执行机制 | 否 | 沿用既有权威存储与执行路径 |
 | 发布工单平台接口 | 否 | 仅影响 Agent 选择默认值，不修改外部平台契约 |
 | 记忆采集授权、外发端点与 Skills 发布 | 否 | 不因本方案自动扩大范围 |
+
+## 附录 G：记忆提供方接缝（2026-11-17）
+
+> 状态：P0 + P1 已实现（2026-11-17 操作者同意，落地记录见 G.6）；P2（要不要切）等影子数据。目的是让记忆后端可以换（比如 Hindsight），对照的是 OpenClaw（本地克隆 `aa508b062`，2026-11-10）与
+> Hermes Agent（`8ad89d45ac`，2026-11-09）的记忆插件。不引入插件框架：`docs/agent.md` §19 不做 hook 注册表与动态服务容器，
+> 这里只是一个 `dyn` 接缝，与 `Arc<dyn Storage>` 同类。
+
+### G.1 两家的做法
+
+| | OpenClaw | Hermes |
+|---|---|---|
+| 选择 | `plugins.slots.memory` 独占槽：不写 = 内置 memory-core，`"none"` = 关，其余固定某个插件 | `memory.provider`，至多一个外部提供方，与内置 MEMORY.md / USER.md 并存 |
+| 接口 | `MemoryProviderHandle`：`search / get / health / candidates / refresh / close`，命中带 `{providerId, id, revision}`，调用方带权限与受众 | `MemoryProvider` 基类：`prefetch`（同步等，8 秒）、`sync_turn`（后台队列）、`on_pre_compress`、`on_session_end`、工具 |
+| 注入 | 通用 `before_prompt_build` hook，各插件各加各的 | 核心统一包一层"不是用户输入"的标记，附在本轮用户消息上并原样回放 |
+| 写入 | `agent_end` 给整个消息数组，插件自己做游标与去重 | 核心每轮交给提供方，提取在提供方 |
+| 毛病 | 两套契约并存、注册按字段合并、多个插件重复注入 | 内置 / 提供方 / 镜像三处存同一条事实，删除不同步；超时不取消；可选方法靠查签名 |
+
+### G.2 komo 取什么
+
+- **独占的一个提供方**：`[memory] provider = "builtin"`（默认）。外部提供方同时只开一个，不与内置并存写入（避开 Hermes 的三处重复）。
+- **注入归核心**：每个 Run 一条 `komo.memory.recall`、失效时 `komo.memory.revoke` 改写、段内按 `id@revision` 去重、预算、宿主标记、
+  提取窗口看不到注入正文——这些比两家都严，不交给提供方。
+- **写入由核心编排**：会话空闲后按游标交一批证据（只有用户陈述与工具结果，注入、助手摘要、cron / 任务会话的不算），提供方负责提取与存。
+- **时限与降级**：召回有时限（已做，§9.4），提供方出错或超时落一条不进上下文的召回记录。
+
+### G.3 接缝要切在哪（读代码得出的难点）
+
+Gateway 对记忆的调用约 20 个方法，但能换后端的只有热路径上的三件：召回（`recall_for_run`）、已注入条目的失效核对（`revalidate`）、
+提取（`process_pending`）。确认、分类、遗忘与恢复、整理、索引、事项归档这些是内置存储的管理操作，留在 `MemoryManager` 上，
+外部提供方按能力声明不支持，界面相应隐藏。
+
+难点在召回：今天 `recall_for_run` 交回的 `Injection` 是**渲染好的整块**——事项组、约定组（不过门槛、单独预算）、按门槛与 `top_k`
+选出的记忆、各组 token 预算，全在 `komo-memory` 的 `prepare_with` 里拼好。事项是 komo 的目标，约定是内置记忆的概念，外部后端都没有。
+所以接缝不能是"把 `recall_for_run` 原样变成 trait 方法"（那样外部后端得自己产出 komo 格式的整块、还会丢掉事项组），而要先把
+`prepare_with` 拆成两层：
+
+```text
+提供方：recall(query, scopes, shown) -> Vec<Recalled { ref: id@revision, text, kind, application, score }>
+        validate(shown refs) -> 仍有效的 refs
+        ingest(evidence batch) -> 报告（幂等，按批次键）
+核心：  事项组 + 约定组（内置才有）+ 提供方的条目 → 门槛、top_k、预算、渲染成召回块
+```
+
+### G.4 分步
+
+1. **P0**：拆 `prepare_with` 的选取与渲染；定义 `MemoryProvider`（上面三个方法 + `capabilities` + `health`），内置实现就是现在的检索与提取；
+   `hooks/recall.rs` 与 `background/memory.rs` 改走接缝。行为不变，现有召回与提取测试全过即验收。
+2. **P1**：Hindsight 适配器（retain / recall、`state = invalidated` 对应失效），先跑影子模式：两边都召回，只注入内置的，记下对比，按附录 D 的方法评估。
+3. **P2**：看数据决定切不切。外部后端没有候选、约定、确认，切过去这些能力会变弱，所以影子对比是前提。
+
+### G.5 待定
+
+- P0 的拆分值不值得在没有第二个实现之前做：只有 P1 确定要做时才做 P0，否则接缝只有一个实现，是为假设的需求加抽象。
+- 外部提供方的条目要不要进约定组（Hindsight 有 directive，概念上接近 convention）。
+
+### G.6 落地记录（2026-11-17，P0 + P1）
+
+读代码后接缝比 G.3 设想的更窄：`prepare_with` 里依赖后端的只有 `search` 与 `revalidate`，二者都按内核类型
+`MemoryItem` 交回；约定组、事项组、分层、`top_k`、预算、渲染都在它们之后。所以没有拆渲染，外部提供方交回
+`ProviderHit`，核心包成一条只读线索（`provider::external_item`）走原来的路。
+
+- **接缝**（`komo-memory/src/provider.rs`）：`MemoryProvider { name, recall(text, scopes, limit), current(ids), ingest(batch) }`。
+  外部条目的 id 是 `<name>:<它的 id>`，`application = reference`、`provenance = model_inference`、没有归属，`revision` 取正文哈希——
+  提供方改了正文，旧注入按"版本变了"失效。
+- **召回**：影子模式与内置检索并发跑，外部那份（至多 `top_k` 条、有无报错、耗时）记进召回诊断 `shadow`，**不注入**；
+  主用模式由外部取代线索召回，外部失败或超时（5 秒）退回内置检索并在诊断里说明。约定组、事项组两种模式都来自内置。
+- **核对**：已注入的外部条目问提供方现状，删了、作废了、正文改了、问不通都掉出去（走原来的 `komo.memory.revoke` 改写）。
+- **证据**：会话空闲后，同一份提取窗口（`Transcript.rendered`，核心已按 §9.3 挑过：cron、任务会话、`memory = off` 的不在内）
+  先交给提供方再做内置提取；幂等键 `<会话>:<窗口最后一个 Run>`，内置提取失败重领时覆盖而不是多存。两种模式内置提取都照跑。
+- **Hindsight 适配器**（`komo-gateway/src/hindsight.rs`）：召回 `POST …/memories/recall`、现状 `GET …/memories/{id}`
+  （`state = invalidated` 或 404 算没了）、写入 `POST …/memories`（`document_id` = 幂等键，`async = true`），bank 不在先 `PUT` 建。
+  作用域打成标签 `scope:<作用域>`；共享召回（放行列表为空）只查 `scope:personal`。
+- **配置**（启动时读，改了要重启）：
+
+  ```toml
+  [memory.hindsight]
+  url = "http://localhost:8888"
+  # bank = "komo"       # 默认
+  # mode = "shadow"     # 默认；"primary" = 线索改用 Hindsight
+  ```
+- **看对比**：每个 Run 的召回诊断（`GET /v1/runs/{id}` 的 `recall.shadow`）里有 Hindsight 那份；按附录 D 的方法与注入的那份比
+  "该召回的召回了没有"。
+- **测试**：`komo-memory` 里用假提供方测影子不注入、主用替换与退回、外部条目核对、证据交付（cron 不交）；
+  `komo-gateway` 的 `hindsight::tests` 用假服务测请求与解析，`against_a_real_server`（`--ignored`，要
+  `KOMO_TEST_HINDSIGHT_URL`）对本机 Hindsight 1.2.1 跑通过一次；`komo-config` 测配置读取与校验。
+- **已知限制**：交给 Hindsight 的窗口里也有助手的话，它会从中提取（内置提取不认助手的话为证据）；主用模式下
+  `[memory.retrieval] push_unattached = false` 会把外部线索全部滤掉（它们没有归属）。
+

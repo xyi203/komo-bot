@@ -553,6 +553,34 @@ pub struct RecallDiagnostics {
     /// 这一块是沿用这一段之前钉下的那一块，没有重新召回。
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub reused_pin: bool,
+    /// 外部提供方影子模式下它这一次召回了什么（`docs/memory.md` 附录 G）：只记录、不注入，事后按附录 D
+    /// 的方法与注入的那一份比。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shadow: Option<ShadowRecall>,
+}
+
+/// 影子召回的记录：外部提供方对同一句查询给了什么。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ShadowRecall {
+    /// 提供方名（`hindsight`）。
+    pub provider: String,
+    /// 按它自己的排序，至多 `top_k` 条。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hits: Vec<ShadowHit>,
+    /// 没召回成（超时、连不上）的原因。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    pub elapsed_ms: u64,
+}
+
+/// 影子召回的一条。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ShadowHit {
+    /// 提供方自己的 id。
+    pub id: String,
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub score: Option<f64>,
 }
 
 /// Run 的记忆处理进度（`runs.memory_work`，§9.3）。

@@ -295,6 +295,14 @@ impl GatewayState {
         if injected_embeddings.is_none() {
             spawn_embedding_probe(Arc::clone(&memories), Arc::clone(&config));
         }
+        // 外部记忆提供方（`docs/memory.md` 附录 G）：启动时按 `[memory.hindsight]` 装上，改了要重启。
+        if let Some(hindsight) = &snapshot.start_only.hindsight {
+            memories.install_provider(Some(komo_memory::provider::Installed {
+                provider: Arc::new(crate::hindsight::Hindsight::new(hindsight)),
+                mode: hindsight.mode,
+            }));
+            tracing::info!(url = %hindsight.url, bank = %hindsight.bank, mode = ?hindsight.mode, "记忆接了 Hindsight");
+        }
 
         // 注入了模型后端（测试）就不起标题：多出来的那次请求会吃掉脚本里下一段的答复。
         // 测的就是起标题的测试按数据目录单独打开（`test_support::enable_auto_title`）；

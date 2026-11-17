@@ -59,6 +59,8 @@ impl Clock for FixedClock {
 struct ConceptEmbeddings {
     space: EmbeddingSpace,
     down: Mutex<bool>,
+    /// 一直不回（测召回的时限）。
+    hang: Mutex<bool>,
     /// 每一维一组同义词。
     concepts: Vec<Vec<&'static str>>,
     /// 被要求嵌过几次。**"这一段有没有重新召回"的观察口**（§9.4：同一段里逐字复用，
@@ -89,6 +91,7 @@ impl ConceptEmbeddings {
                 effort: None,
             },
             down: Mutex::new(false),
+            hang: Mutex::new(false),
             concepts,
             calls: std::sync::atomic::AtomicUsize::new(0),
         })
@@ -96,6 +99,10 @@ impl ConceptEmbeddings {
 
     fn set_down(&self, down: bool) {
         *self.down.lock().expect("向量替身") = down;
+    }
+
+    fn set_hang(&self, hang: bool) {
+        *self.hang.lock().expect("向量替身") = hang;
     }
 }
 
@@ -107,6 +114,10 @@ impl EmbeddingClient for ConceptEmbeddings {
 
     async fn embed(&self, _kind: InputKind, texts: &[String]) -> Result<Vec<Vector>, EmbedError> {
         self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let hang = *self.hang.lock().expect("向量替身");
+        if hang {
+            std::future::pending::<()>().await;
+        }
         if *self.down.lock().expect("向量替身") {
             return Err(EmbedError::Unavailable("测试里把端点关掉了".into()));
         }
@@ -2642,6 +2653,8 @@ struct ScriptedJudge {
     pick: Option<&'static str>,
     /// 让它失败（测降级）。
     fail: Option<&'static str>,
+    /// 一直不回（测召回的时限）。
+    hang: bool,
     seen: Mutex<Vec<komo_kernel::types::systemone::SystemOneRequest>>,
 }
 
@@ -2654,6 +2667,7 @@ impl ScriptedJudge {
                 .collect(),
             pick: None,
             fail: None,
+            hang: false,
             seen: Mutex::new(Vec::new()),
         })
     }
@@ -2673,6 +2687,9 @@ impl komo_kernel::traits::SystemOne for ScriptedJudge {
         komo_kernel::types::systemone::SystemOneError,
     > {
         self.seen.lock().expect("判断替身").push(request);
+        if self.hang {
+            std::future::pending::<()>().await;
+        }
         if let Some(message) = self.fail {
             return Err(komo_kernel::types::systemone::SystemOneError::Transport(
                 message.to_string(),
@@ -2700,6 +2717,66 @@ impl komo_kernel::traits::SystemOne for ScriptedJudge {
             usage: Default::default(),
         })
     }
+}
+
+/// 召回的时限（§9.4）：查询向量一直不回，hybrid 到点按关键词给结果并明示降级，不干等端点。
+#[tokio::test(start_paused = true)]
+async fn a_hanging_vector_endpoint_degrades_hybrid_at_the_deadline() {
+    let harness = HarnessBuilder::new()
+        .config(memory_config(true, RetrievalMode::Hybrid))
+        .embeddings()
+        .build()
+        .await;
+    harness
+        .repo
+        .put(memory("m-1", "客厅空调设 26 度"), None)
+        .await
+        .unwrap();
+    harness.embeddings.set_hang(true);
+
+    let started = tokio::time::Instant::now();
+    let hybrid = harness
+        .manager
+        .search(harness.manager.query("空调", None))
+        .await
+        .expect("hybrid 不该整个失败");
+    assert!(started.elapsed() >= QUERY_EMBED_DEADLINE, "等到时限才放弃");
+    assert!(hybrid.degraded, "要明示降级");
+    assert!(!hybrid.items.is_empty(), "关键词臂照常给结果");
+}
+
+/// 重排判断一直不回：到点保持融合顺序，候选一条不丢。
+#[tokio::test(start_paused = true)]
+async fn a_hanging_judgement_keeps_the_fusion_order_at_the_deadline() {
+    let judge = Arc::new(ScriptedJudge {
+        hang: true,
+        ..Arc::into_inner(ScriptedJudge::new(&[
+            ("m-1", 0.1),
+            ("m-3", 0.9),
+            ("none", 0.0),
+        ]))
+        .expect("刚造出来只有一个引用")
+    });
+    let harness = HarnessBuilder::new()
+        .config(retrieval_with_rerank(1, 3))
+        .reranker(Reranker {
+            backend: Arc::clone(&judge) as Arc<dyn komo_kernel::traits::SystemOne>,
+            model: "jev-test".into(),
+        })
+        .build()
+        .await;
+    for (id, text) in [("m-1", "空调设 26 度"), ("m-3", "空调滤网三个月换一次")] {
+        harness.repo.put(memory(id, text), None).await.unwrap();
+    }
+
+    let result = harness
+        .manager
+        .search(harness.manager.query("空调", None))
+        .await
+        .expect("查得动");
+    assert_eq!(judge.seen().len(), 1, "问过一次");
+    assert_eq!(result.items.len(), 1, "top_k 是 1");
+    assert_eq!(result.items[0].id.as_str(), "m-1", "没等到判断，按融合顺序");
 }
 
 /// 判断能把融合排在后头的条目抬进 `top_k`——这正是重排存在的理由。
@@ -4027,4 +4104,258 @@ async fn classify_refuses_a_convention_without_a_condition_or_for_a_fact() {
     // 没条件也没改动：库里还是原样。
     let still = harness.repo.get(&pref.id).await.unwrap().unwrap();
     assert_eq!(still.revision, pref.revision);
+}
+
+// =========================================================== 外部提供方（附录 G）
+
+/// 假的外部提供方：召回交回固定几条（或失败），`current` 按它手上的正文答，`ingest` 记下来。
+struct FakeProvider {
+    hits: Vec<(&'static str, &'static str)>,
+    fail: bool,
+    /// `current` 时各 id 现在的正文；不在表里 = 已删除。
+    now_texts: Mutex<BTreeMap<String, String>>,
+    ingested: Mutex<Vec<(String, MemoryScope, String)>>,
+}
+
+impl FakeProvider {
+    fn new(hits: Vec<(&'static str, &'static str)>) -> Arc<Self> {
+        Arc::new(FakeProvider {
+            now_texts: Mutex::new(
+                hits.iter()
+                    .map(|(id, text)| ((*id).to_string(), (*text).to_string()))
+                    .collect(),
+            ),
+            hits,
+            fail: false,
+            ingested: Mutex::new(Vec::new()),
+        })
+    }
+
+    fn failing() -> Arc<Self> {
+        Arc::new(FakeProvider {
+            fail: true,
+            ..Arc::into_inner(FakeProvider::new(Vec::new())).expect("唯一引用")
+        })
+    }
+
+    fn hit(id: &str, text: &str) -> crate::provider::ProviderHit {
+        crate::provider::ProviderHit {
+            id: id.into(),
+            text: text.into(),
+            scope: MemoryScope::Personal,
+            score: Some(0.9),
+        }
+    }
+}
+
+#[async_trait]
+impl crate::provider::MemoryProvider for FakeProvider {
+    fn name(&self) -> &str {
+        "fake"
+    }
+
+    async fn recall(
+        &self,
+        _text: &str,
+        _scopes: &[MemoryScope],
+        limit: u32,
+    ) -> Result<Vec<crate::provider::ProviderHit>, crate::provider::ProviderError> {
+        if self.fail {
+            return Err(crate::provider::ProviderError("连不上".into()));
+        }
+        Ok(self
+            .hits
+            .iter()
+            .take(limit as usize)
+            .map(|(id, text)| FakeProvider::hit(id, text))
+            .collect())
+    }
+
+    async fn current(
+        &self,
+        ids: &[String],
+    ) -> Result<Vec<crate::provider::ProviderHit>, crate::provider::ProviderError> {
+        let texts = self.now_texts.lock().expect("假提供方");
+        Ok(ids
+            .iter()
+            .filter_map(|id| texts.get(id).map(|text| FakeProvider::hit(id, text)))
+            .collect())
+    }
+
+    async fn ingest(
+        &self,
+        batch: &crate::provider::EvidenceBatch<'_>,
+    ) -> Result<(), crate::provider::ProviderError> {
+        self.ingested.lock().expect("假提供方").push((
+            batch.key.clone(),
+            batch.scope.clone(),
+            batch.text.to_string(),
+        ));
+        Ok(())
+    }
+}
+
+fn install(harness: &Harness, provider: &Arc<FakeProvider>, mode: crate::provider::ProviderMode) {
+    harness
+        .manager
+        .install_provider(Some(crate::provider::Installed {
+            provider: Arc::clone(provider) as Arc<dyn crate::provider::MemoryProvider>,
+            mode,
+        }));
+}
+
+/// 影子模式：注入的只有内置那份，外部的召回记进诊断供对比。
+#[tokio::test]
+async fn a_shadow_provider_is_recorded_but_never_injected() {
+    let harness = HarnessBuilder::new().build().await;
+    harness
+        .repo
+        .put(memory("m-1", "客厅空调设 26 度"), None)
+        .await
+        .unwrap();
+    let provider = FakeProvider::new(vec![("x-1", "卧室空调设 27 度")]);
+    install(&harness, &provider, crate::provider::ProviderMode::Shadow);
+
+    let injection = harness
+        .manager
+        .recall_for_run(&RunId::from_raw("run-1"), "空调", &[], &[], None)
+        .await;
+    let ids: Vec<&str> = injection.uses.iter().map(|u| u.memory.as_str()).collect();
+    assert_eq!(ids, vec!["m-1"]);
+    let text = injection.text.clone().unwrap_or_default();
+    assert!(!text.contains("卧室"), "{text}");
+    let shadow = injection
+        .diagnostics
+        .and_then(|diagnostics| diagnostics.shadow)
+        .expect("影子召回记下来了");
+    assert_eq!(shadow.provider, "fake");
+    assert_eq!(shadow.hits.len(), 1);
+    assert_eq!(shadow.hits[0].text, "卧室空调设 27 度");
+    assert_eq!(shadow.error, None);
+}
+
+/// 主用模式：线索换成外部的（id 带前缀、只读线索）；外部不通退回内置，并说明降级。
+#[tokio::test]
+async fn a_primary_provider_replaces_clue_recall_and_falls_back_when_down() {
+    let harness = HarnessBuilder::new().build().await;
+    harness
+        .repo
+        .put(memory("m-1", "客厅空调设 26 度"), None)
+        .await
+        .unwrap();
+    let provider = FakeProvider::new(vec![("x-1", "卧室空调设 27 度")]);
+    install(&harness, &provider, crate::provider::ProviderMode::Primary);
+
+    let injection = harness
+        .manager
+        .recall_for_run(&RunId::from_raw("run-1"), "空调", &[], &[], None)
+        .await;
+    let ids: Vec<&str> = injection.uses.iter().map(|u| u.memory.as_str()).collect();
+    assert_eq!(ids, vec!["fake:x-1"]);
+    assert!(
+        injection
+            .text
+            .unwrap_or_default()
+            .contains("卧室空调设 27 度")
+    );
+
+    install(
+        &harness,
+        &FakeProvider::failing(),
+        crate::provider::ProviderMode::Primary,
+    );
+    let injection = harness
+        .manager
+        .recall_for_run(&RunId::from_raw("run-2"), "空调", &[], &[], None)
+        .await;
+    let ids: Vec<&str> = injection.uses.iter().map(|u| u.memory.as_str()).collect();
+    assert_eq!(ids, vec!["m-1"], "退回内置检索");
+    let diagnostics = injection.diagnostics.expect("有诊断");
+    assert!(diagnostics.degraded);
+    assert!(
+        diagnostics
+            .degraded_reason
+            .unwrap_or_default()
+            .contains("fake 召回失败"),
+    );
+}
+
+/// 已注入的外部条目按提供方现状核对：正文改了、删了都掉出去，没变的留下。
+#[tokio::test]
+async fn external_uses_are_revalidated_against_the_provider() {
+    let harness = HarnessBuilder::new().build().await;
+    let provider = FakeProvider::new(vec![("x-1", "卧室空调设 27 度"), ("x-2", "滤网三个月换")]);
+    install(&harness, &provider, crate::provider::ProviderMode::Primary);
+    let injection = harness
+        .manager
+        .recall_for_run(&RunId::from_raw("run-1"), "空调", &[], &[], None)
+        .await;
+    assert_eq!(injection.uses.len(), 2);
+
+    {
+        let mut texts = provider.now_texts.lock().unwrap();
+        texts.insert("x-1".into(), "卧室空调设 25 度".into());
+        texts.remove("x-2");
+    }
+    assert!(
+        harness
+            .manager
+            .revalidate(&injection.uses, NOW)
+            .await
+            .is_empty(),
+        "改了正文的按版本变了失效，删了的失效"
+    );
+
+    provider
+        .now_texts
+        .lock()
+        .unwrap()
+        .insert("x-1".into(), "卧室空调设 27 度".into());
+    let alive = harness.manager.revalidate(&injection.uses, NOW).await;
+    let ids: Vec<&str> = alive.iter().map(|item| item.id.as_str()).collect();
+    assert_eq!(ids, vec!["fake:x-1"]);
+}
+
+/// 提取窗口同时交给外部提供方：键是会话 + 窗口最后一个 Run，正文就是那份窗口。Cron 的 Run 不交。
+#[tokio::test]
+async fn the_extraction_window_is_handed_to_the_provider_but_not_for_cron_runs() {
+    let harness = HarnessBuilder::new()
+        .work(vec![
+            work_item(RunState::Completed, interactive()),
+            MemoryWorkItem {
+                run: RunId::from_raw("run-cron"),
+                session: SessionId::from_raw("sess-cron"),
+                ..work_item(
+                    RunState::Completed,
+                    PlanSource::Cron {
+                        job: komo_kernel::types::ids::CronJobId::from_raw("job-1"),
+                        job_version: 1,
+                    },
+                )
+            },
+        ])
+        .build()
+        .await;
+    harness.ledger.seed(
+        &SessionId::from_raw("sess-1"),
+        vec![user_event(
+            1,
+            &RunId::from_raw("run-1"),
+            "以后发布工单都选 saas",
+        )],
+    );
+    harness.ledger.seed(
+        &SessionId::from_raw("sess-cron"),
+        vec![user_event(1, &RunId::from_raw("run-cron"), "巡检一下")],
+    );
+    let provider = FakeProvider::new(Vec::new());
+    install(&harness, &provider, crate::provider::ProviderMode::Shadow);
+
+    let _ = harness.manager.process_pending(4).await;
+    let ingested = provider.ingested.lock().unwrap().clone();
+    assert_eq!(ingested.len(), 1, "{ingested:?}");
+    let (key, scope, text) = &ingested[0];
+    assert_eq!(key, "sess-1:run-1");
+    assert_eq!(scope, &MemoryScope::Personal);
+    assert!(text.contains("以后发布工单都选 saas"), "{text}");
 }

@@ -85,6 +85,7 @@ pub fn snapshot_fixture() -> ConfigSnapshot {
             web_serve: true,
             push: Default::default(),
             telegram: None,
+            hindsight: None,
         },
         model_catalog,
         model: main,

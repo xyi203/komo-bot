@@ -1007,3 +1007,52 @@ fn the_telegram_fallback_is_read_and_its_operator_and_endpoint_are_checked() {
         );
     }
 }
+
+/// `[memory.hindsight]`（`docs/memory.md` 附录 G）：bank 默认 `komo`、模式默认影子，地址去掉尾部斜杠；
+/// 地址不是 http(s)、bank 带进不了 URL 路径的字符都拒绝加载并点名键。
+#[test]
+fn the_hindsight_provider_is_read_with_defaults_and_checked() {
+    use komo_kernel::protocol::config::ProviderMode;
+
+    let fixture = Fixture::valid();
+    let with = |section: &str| {
+        // 夹具里已经有 `[memory]`：子表单独追加即可。
+        let mut text = Fixture::config_text("chat-a", "medium");
+        text.push_str(&format!("\n[memory.hindsight]\n{section}"));
+        write(&fixture.sources().config, &text);
+        load_config(&fixture.options())
+    };
+
+    let loaded = with("url = \"http://localhost:8888/\"\n").unwrap();
+    let hindsight = loaded
+        .snapshot
+        .start_only
+        .hindsight
+        .clone()
+        .expect("配了就有");
+    assert_eq!(hindsight.url, "http://localhost:8888");
+    assert_eq!(hindsight.bank, "komo");
+    assert_eq!(hindsight.mode, ProviderMode::Shadow);
+
+    let loaded = with("url = \"http://h:8888\"\nbank = \"me\"\nmode = \"primary\"\n").unwrap();
+    let hindsight = loaded.snapshot.start_only.hindsight.clone().unwrap();
+    assert_eq!(
+        (hindsight.bank.as_str(), hindsight.mode),
+        ("me", ProviderMode::Primary)
+    );
+
+    for (section, key) in [
+        ("url = \"localhost:8888\"\n", "memory.hindsight.url"),
+        (
+            "url = \"http://h\"\nbank = \"a/b\"\n",
+            "memory.hindsight.bank",
+        ),
+    ] {
+        let error = with(section).unwrap_err();
+        assert!(
+            error.issues().iter().any(|issue| issue.key.as_str() == key),
+            "{key}：{:?}",
+            error.issues()
+        );
+    }
+}

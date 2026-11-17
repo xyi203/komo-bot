@@ -67,7 +67,8 @@ komo-tools     tools/{read,write,edit,rg,bash,task,monitor,…} · tool catalog
                (`executor::ToolExecutor`) · codemode (Monty worker) · MCP client + login ·
                child-process registry. Depends on kernel + llm + config; no store, no
                durable engine (the harness drives tool tasks).
-komo-memory    MemoryManager (§9) · matters (goals / areas). Depends on kernel + store + llm;
+komo-memory    MemoryManager (§9) · matters (goals / areas) · `provider` seam for an external
+               memory backend (docs/memory.md appendix G). Depends on kernel + store + llm;
                the two Durable seams live in runtime `durable::memory`.
 komo-runtime   `durable/`: Task engine + harness (generation / tool / inbox /
                compaction / orchestration / codemode / landing, the agent loop organised
@@ -79,7 +80,8 @@ komo-agent     AgentProfile → 能力面选择 · skills 发现与目录 · 编
 komo-gateway   axum routes (`http/v2`) · `service/durable` (DurableCore + hooks; chats/ ·
                sessions/ · submit/ · interventions/ · feed/ · background/) · SSE · auth · lock/discovery ·
                web (Host guard · static shell, switchable) · push (Web Push: VAPID + subscriptions) ·
-               telegram (fallback entry: operator-only long poll, text in/out, notices) · launchd/systemd · web attachment inbox ·
+               telegram (fallback entry: operator-only long poll, text in/out, notices) ·
+               hindsight (external memory provider adapter, appendix G) · launchd/systemd · web attachment inbox ·
                intervention rendering · config reload.
 komo-client    HTTP + SSE client · discovery · command output (CLI subcommands).
                Depends on kernel only.

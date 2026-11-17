@@ -1,6 +1,7 @@
 //! Gateway：HTTP/SSE 接口、进程锁与发现文件（docs/komo_bot.md §13.1、§13.4）。
 
 pub mod auth;
+pub mod hindsight;
 pub mod http;
 pub mod inbox;
 pub mod lock;

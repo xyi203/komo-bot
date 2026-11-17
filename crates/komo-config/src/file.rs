@@ -9,9 +9,9 @@ use std::path::{Path, PathBuf};
 
 use komo_kernel::protocol::config::{
     CompactionConfig, ConfigSnapshot, ConsolidateConfig, DEFAULT_OIDC_SECRET_ENV,
-    DEFAULT_TELEGRAM_TOKEN_ENV, ExecutionConfig, KeyPath, McpExposure, McpServerConfig,
-    McpTransport, MemoryConfig, OidcConfig, PathsConfig, PushConfig, RetrievalConfig, SourceFile,
-    StartOnly, TelegramConfig, TypesafeConfig,
+    DEFAULT_TELEGRAM_TOKEN_ENV, ExecutionConfig, HindsightConfig, KeyPath, McpExposure,
+    McpServerConfig, McpTransport, MemoryConfig, OidcConfig, PathsConfig, ProviderMode, PushConfig,
+    RetrievalConfig, SourceFile, StartOnly, TelegramConfig, TypesafeConfig,
 };
 use komo_kernel::types::agent::{AgentConfig, AgentProfile, MemoryMode};
 use komo_kernel::types::memory::{MemoryScopeParseError, RetrievalMode};
@@ -253,6 +253,33 @@ pub(super) struct MemorySection {
     /// 会话空闲多久后提取：`"10m"`、`"90s"`、`"2h"`（§9.10）。
     pub extract_idle: Option<String>,
     pub max_observations: Option<usize>,
+    /// 外部提供方（附录 G）。改了要重启。
+    pub hindsight: Option<HindsightSection>,
+}
+
+/// `[memory.hindsight]`。
+#[derive(Debug, Deserialize)]
+pub(super) struct HindsightSection {
+    pub url: String,
+    /// 省略 = `komo`。
+    pub bank: Option<String>,
+    /// `shadow`（默认）或 `primary`。
+    #[serde(default)]
+    pub mode: ProviderMode,
+}
+
+impl HindsightSection {
+    fn into_config(self) -> HindsightConfig {
+        HindsightConfig {
+            url: self.url.trim().trim_end_matches('/').to_string(),
+            bank: self
+                .bank
+                .map(|bank| bank.trim().to_string())
+                .filter(|bank| !bank.is_empty())
+                .unwrap_or_else(|| "komo".to_string()),
+            mode: self.mode,
+        }
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -698,6 +725,7 @@ pub(super) fn assemble(
                 .filter(|subject| !subject.is_empty()),
         },
         telegram: file.telegram.map(TelegramSection::into_config),
+        hindsight: file.memory.hindsight.map(HindsightSection::into_config),
     };
 
     let mcp = file

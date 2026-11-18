@@ -8,10 +8,11 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use komo_kernel::protocol::config::{
-    CompactionConfig, ConfigSnapshot, ConsolidateConfig, DEFAULT_OIDC_SECRET_ENV,
-    DEFAULT_TELEGRAM_TOKEN_ENV, ExecutionConfig, HindsightConfig, KeyPath, McpExposure,
-    McpServerConfig, McpTransport, MemoryConfig, OidcConfig, PathsConfig, ProviderMode, PushConfig,
-    RetrievalConfig, SourceFile, StartOnly, TelegramConfig, TypesafeConfig,
+    CompactionConfig, ConfigSnapshot, ConsolidateConfig, DEFAULT_HINDSIGHT_MIN_RERANKER,
+    DEFAULT_OIDC_SECRET_ENV, DEFAULT_TELEGRAM_TOKEN_ENV, ExecutionConfig,
+    HINDSIGHT_MIN_RERANKER_ENV, HindsightConfig, KeyPath, McpExposure, McpServerConfig,
+    McpTransport, MemoryConfig, OidcConfig, PathsConfig, ProviderMode, PushConfig, RetrievalConfig,
+    SourceFile, StartOnly, TelegramConfig, TypesafeConfig,
 };
 use komo_kernel::types::agent::{AgentConfig, AgentProfile, MemoryMode};
 use komo_kernel::types::memory::{MemoryScopeParseError, RetrievalMode};
@@ -269,7 +270,12 @@ pub(super) struct HindsightSection {
 }
 
 impl HindsightSection {
-    fn into_config(self) -> HindsightConfig {
+    /// 重排下限从 `.env` 读；写了但不是数记成 NaN，交给校验报错（不悄悄换成默认）。
+    fn into_config(self, secrets: &Secrets) -> HindsightConfig {
+        let min_reranker = secrets
+            .get(HINDSIGHT_MIN_RERANKER_ENV)
+            .map(|raw| raw.trim().parse::<f64>().unwrap_or(f64::NAN))
+            .unwrap_or(DEFAULT_HINDSIGHT_MIN_RERANKER);
         HindsightConfig {
             url: self.url.trim().trim_end_matches('/').to_string(),
             bank: self
@@ -278,6 +284,7 @@ impl HindsightSection {
                 .filter(|bank| !bank.is_empty())
                 .unwrap_or_else(|| "komo".to_string()),
             mode: self.mode,
+            min_reranker,
         }
     }
 }
@@ -725,7 +732,10 @@ pub(super) fn assemble(
                 .filter(|subject| !subject.is_empty()),
         },
         telegram: file.telegram.map(TelegramSection::into_config),
-        hindsight: file.memory.hindsight.map(HindsightSection::into_config),
+        hindsight: file
+            .memory
+            .hindsight
+            .map(|section| section.into_config(secrets)),
     };
 
     let mcp = file

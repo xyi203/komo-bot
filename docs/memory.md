@@ -1606,3 +1606,18 @@ Gateway 对记忆的调用约 20 个方法，但能换后端的只有热路径�
 - **已知限制**：交给 Hindsight 的窗口里也有助手的话，它会从中提取（内置提取不认助手的话为证据）；主用模式下
   `[memory.retrieval] push_unattached = false` 会把外部线索全部滤掉（它们没有归属）。
 
+### G.7 召回的重排下限（2026-11-18）
+
+不设下限时 Hindsight 总把 token 预算填满：bank 里根本没有的问题（"上周三吃了什么"）也回二三十条，注入的全是杂讯。
+它的召回结果带 `scores.reranker`（本地 cross-encoder，归一化 0–1），实测（komo bank，263 条）相关查询头部 0.94–1.0、
+无关查询最高 0.053，分得很开。召回请求因此带 `min_scores.reranker`，低于它的 Hindsight 直接不返回；它对每条结果都
+成立（`semantic` / `keyword` 两个下限只管各自那一臂，挡不住别的臂捞上来的，不用）。
+
+- **配置**：`.env` 的 `KOMO_HINDSIGHT_MIN_RERANKER`（0–1，默认 0.3；进程环境按 §3 的规则覆盖），装进
+  `HindsightConfig.min_reranker`；不是 0–1 的数校验报错、拒绝加载，不悄悄换默认。随 `[memory.hindsight]` 启动时读，改了要重启。
+- **效果**（按 komo 的实际请求，0.3）：无关查询 0 条；"homelab 上跑了哪些服务" 39 → 15 条、头部不变；"komo 记忆怎么设计" 30 → 30。
+- **重复**不在 komo 里处理：同一事实的 world 与 observation 两份，由 bank 配置 `recall_prefer_observations = true`
+  在 Hindsight 侧去掉（`PATCH …/banks/komo/config`）。
+- **测试**：`komo-config` `the_hindsight_rerank_floor_comes_from_the_env_file`；`komo-gateway`
+  `recall_maps_scopes_to_tags_and_reads_scores_and_scopes_back` 断言请求带上配置的下限。
+

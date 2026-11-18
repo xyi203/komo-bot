@@ -63,7 +63,7 @@ impl fmt::Display for KeyPath {
 ///
 /// MCP 服务器不在这里：增删改热重载时就连上 / 断开（`docs/mcp.md` §2.2），见
 /// [`ConfigSnapshot::mcp`]。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StartOnly {
     /// 数据目录 / `KOMO_HOME`。
     pub data_dir: PathBuf,
@@ -98,14 +98,28 @@ pub struct StartOnly {
     pub hindsight: Option<HindsightConfig>,
 }
 
+/// `.env` 里放 Hindsight 召回重排分数下限的变量名。
+pub const HINDSIGHT_MIN_RERANKER_ENV: &str = "KOMO_HINDSIGHT_MIN_RERANKER";
+/// 没设时的下限。不设下限时它总把预算填满，无关问题也回二三十条；实测（本地 cross-encoder）
+/// 相关查询头部 ≥ 0.94、无关查询最高 ≤ 0.06。
+pub const DEFAULT_HINDSIGHT_MIN_RERANKER: f64 = 0.3;
+
 /// `[memory.hindsight]`：接一个自建的 Hindsight 服务（vectorize-io/hindsight）。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HindsightConfig {
     /// 服务地址，如 `http://localhost:8888`。
     pub url: String,
     /// 记忆库（bank）名；不存在时第一次写入前建。
     pub bank: String,
     pub mode: ProviderMode,
+    /// 召回结果的重排分数（归一化 0–1）下限，低于它的不返回；来自 `.env` 的
+    /// [`HINDSIGHT_MIN_RERANKER_ENV`]。
+    #[serde(default = "default_hindsight_min_reranker")]
+    pub min_reranker: f64,
+}
+
+fn default_hindsight_min_reranker() -> f64 {
+    DEFAULT_HINDSIGHT_MIN_RERANKER
 }
 
 /// 外部提供方怎么用（`docs/memory.md` 附录 G）。

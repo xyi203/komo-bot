@@ -8,7 +8,7 @@
 //! （装填时空值不入表），所以校验函数拿不到、也不需要凭证的值。
 
 use komo_kernel::protocol::config::{
-    ConfigIssue, ConfigSnapshot, IssueSeverity, KeyPath, glob_matches,
+    ConfigIssue, ConfigSnapshot, HINDSIGHT_MIN_RERANKER_ENV, IssueSeverity, KeyPath, glob_matches,
 };
 use komo_kernel::types::agent::MemoryMode;
 use komo_kernel::types::memory::{MemoryScope, RetrievalMode};
@@ -201,6 +201,12 @@ fn check_hindsight(snapshot: &ConfigSnapshot, issues: &mut Vec<ConfigIssue>) {
         issues.push(error(
             "memory.hindsight.bank",
             format!("`{}` 只能用字母、数字与 - _ . :", hindsight.bank),
+        ));
+    }
+    if !(0.0..=1.0).contains(&hindsight.min_reranker) {
+        issues.push(error(
+            HINDSIGHT_MIN_RERANKER_ENV,
+            ".env 里的这个值要是 0–1 的数（召回重排分数下限，如 0.3）",
         ));
     }
 }

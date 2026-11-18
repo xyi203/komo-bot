@@ -34,6 +34,8 @@ pub struct Hindsight {
     base: String,
     bank: String,
     bank_ready: OnceCell<()>,
+    /// 召回的重排分数下限（`HindsightConfig::min_reranker`）。
+    min_reranker: f64,
 }
 
 impl std::fmt::Debug for Hindsight {
@@ -55,6 +57,7 @@ impl Hindsight {
             ),
             bank: config.bank.clone(),
             bank_ready: OnceCell::new(),
+            min_reranker: config.min_reranker,
         }
     }
 
@@ -180,6 +183,7 @@ impl MemoryProvider for Hindsight {
                         "max_tokens": RECALL_TOKENS,
                         "tags": recall_tags(scopes),
                         "tags_match": "any",
+                        "min_scores": { "reranker": self.min_reranker },
                     })),
             )
             .await?;
@@ -276,6 +280,7 @@ mod tests {
             url,
             bank: "komo".into(),
             mode: ProviderMode::Shadow,
+            min_reranker: 0.4,
         });
         (fake, hindsight)
     }
@@ -343,6 +348,11 @@ mod tests {
         );
         assert_eq!(seen[1].1["tags"], json!(["scope:agent:helper"]));
         assert_eq!(seen[1].1["tags_match"], "any");
+        assert_eq!(
+            seen[1].1["min_scores"]["reranker"],
+            json!(0.4),
+            "重排下限取自配置"
+        );
     }
 
     #[tokio::test]
@@ -396,6 +406,7 @@ mod tests {
             url: url.clone(),
             bank: bank.clone(),
             mode: ProviderMode::Shadow,
+            min_reranker: 0.0,
         });
         let session = SessionId::from_raw("sess-live");
         hindsight

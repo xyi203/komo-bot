@@ -1056,3 +1056,50 @@ fn the_hindsight_provider_is_read_with_defaults_and_checked() {
         );
     }
 }
+
+/// 召回的重排分数下限从 `.env` 的 `KOMO_HINDSIGHT_MIN_RERANKER` 读：没写用默认，写了用它；
+/// 不是 0–1 的数拒绝加载并点名这个变量，不悄悄换成默认。
+#[test]
+fn the_hindsight_rerank_floor_comes_from_the_env_file() {
+    use komo_kernel::protocol::config::{
+        DEFAULT_HINDSIGHT_MIN_RERANKER, HINDSIGHT_MIN_RERANKER_ENV,
+    };
+
+    let fixture = Fixture::valid();
+    let mut text = Fixture::config_text("chat-a", "medium");
+    text.push_str("\n[memory.hindsight]\nurl = \"http://h:8888\"\n");
+    write(&fixture.sources().config, &text);
+    let with_env = |extra: &str| {
+        write(
+            &fixture.sources().env,
+            &format!("{}{extra}", Fixture::env_text()),
+        );
+        load_config(&fixture.options())
+    };
+    let floor = |loaded: Loaded| {
+        loaded
+            .snapshot
+            .start_only
+            .hindsight
+            .clone()
+            .unwrap()
+            .min_reranker
+    };
+
+    assert_eq!(floor(with_env("").unwrap()), DEFAULT_HINDSIGHT_MIN_RERANKER);
+    assert_eq!(
+        floor(with_env(&format!("{HINDSIGHT_MIN_RERANKER_ENV}=0.5\n")).unwrap()),
+        0.5
+    );
+    for bad in ["abc", "1.5", "-0.1"] {
+        let error = with_env(&format!("{HINDSIGHT_MIN_RERANKER_ENV}={bad}\n")).unwrap_err();
+        assert!(
+            error
+                .issues()
+                .iter()
+                .any(|issue| issue.key.as_str() == HINDSIGHT_MIN_RERANKER_ENV),
+            "{bad}：{:?}",
+            error.issues()
+        );
+    }
+}

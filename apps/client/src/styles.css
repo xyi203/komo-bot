@@ -302,6 +302,11 @@
   }
 }
 
+/* 正在流进来的思考框：限高、顶上渐隐（文字往上滚出去的那一截淡掉） */
+.thinking-box {
+  mask-image: linear-gradient(to bottom, transparent 0, black 1.75rem);
+}
+
 /* 进行中的那句话：一道浅光从左扫到右（文字本身是 muted 色，光是 text 色） */
 .text-shimmer {
   background: linear-gradient(90deg, var(--color-muted) 0%, var(--color-muted) 40%, var(--color-text) 50%, var(--color-muted) 60%, var(--color-muted) 100%);

@@ -284,7 +284,10 @@ async fn assistant_delta_is_the_suffix_of_the_throttled_partial() {
     })
     .await;
     for frame in &frames {
-        if let SseEvent::AssistantDelta { run, round, text } = &frame.event {
+        if let SseEvent::AssistantDelta {
+            run, round, text, ..
+        } = &frame.event
+        {
             deltas.push((run.clone(), *round, text.clone()));
         }
     }
@@ -299,6 +302,88 @@ async fn assistant_delta_is_the_suffix_of_the_throttled_partial() {
             (run, 2, "第二轮".to_owned()),
         ],
         "后缀、前缀对不上从头发、不重复、下一轮 round + 1"
+    );
+    shutdown.cancel();
+}
+
+/// 思考也按增量推：先只有思考（正文还空）就发 `thinking`，之后正文开始长时只发正文的增量；
+/// 两者都没变就不发。
+#[tokio::test]
+async fn thinking_streams_as_its_own_increment_before_the_reply() {
+    let (gateway, shutdown) = gateway(FakeLlm::finisher("好")).await;
+    let id = new_session(&gateway).await;
+    let core = gateway.state().core().unwrap();
+    let conversation = core.session(&id).await.unwrap().root_conversation;
+    let mut rx = gateway
+        .state()
+        .hub
+        .subscribe(&SessionId::from_raw(id.clone()));
+    let with_thinking = |thinking: &str, text: &str| {
+        let mut content = vec![ContentBlock::Thinking {
+            thinking: thinking.into(),
+            extra: Default::default(),
+        }];
+        if !text.is_empty() {
+            content.push(ContentBlock::text(text));
+        }
+        serde_json::to_value(AssistantMessage {
+            content,
+            stop_reason: StopReason::Stop,
+            timestamp: 0,
+            extra: Default::default(),
+        })
+        .unwrap()
+    };
+
+    let mut frames = Vec::new();
+    let steps = [
+        ("先看", ""),
+        ("先看一下", ""),
+        ("先看一下", "好"),
+        ("先看一下", "好的"),
+    ];
+    for (step, (thinking, text)) in steps.into_iter().enumerate() {
+        write_live(
+            &gateway,
+            conversation,
+            Some(with_thinking(thinking, text)),
+            0,
+        )
+        .await;
+        gather(&mut rx, &mut frames, "增量", |frames| {
+            frames
+                .iter()
+                .filter(|frame| matches!(frame.event, SseEvent::AssistantDelta { .. }))
+                .count()
+                > step
+        })
+        .await;
+    }
+    write_live(
+        &gateway,
+        conversation,
+        Some(with_thinking("先看一下", "好的")),
+        0,
+    )
+    .await;
+    let deltas: Vec<(String, String)> = frames
+        .iter()
+        .filter_map(|frame| match &frame.event {
+            SseEvent::AssistantDelta { text, thinking, .. } => {
+                Some((text.clone(), thinking.clone()))
+            }
+            _ => None,
+        })
+        .collect();
+    let pair = |text: &str, thinking: &str| (text.to_owned(), thinking.to_owned());
+    assert_eq!(
+        deltas,
+        [
+            pair("", "先看"),
+            pair("", "一下"),
+            pair("好", ""),
+            pair("的", "")
+        ],
     );
     shutdown.cancel();
 }

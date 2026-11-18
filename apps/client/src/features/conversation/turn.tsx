@@ -42,18 +42,19 @@ export function TurnView({ turn, delta, always }: { turn: Turn; delta: Delta | n
   // 有过程可看（思考、调用、召回……）才有"看过程"；只有一句回复的一轮没有
   const hasProcess = turn.process.length > 0 || !!changesOfRun?.files.length;
   const showTools = !live && (!!turn.answer || hasProcess);
-  const streaming = live && !turn.answer && !!delta?.text && delta.run === turn.run;
+  const mine = live && !turn.answer && delta?.run === turn.run ? delta : null;
+  const streaming = !!mine?.text;
 
   return (
     <section className="group/msg mb-5">
       {turn.users.map((u, i) => (
         <UserBubble key={i} text={u.text} at={u.at} />
       ))}
-      <InlineProcess turn={turn} streaming={streaming} />
+      <InlineProcess turn={turn} streaming={streaming} thinking={mine?.thinking} />
       {turn.answer ? (
         <Markdown text={turn.answer.text} className="mt-4" />
       ) : (
-        streaming && <Markdown text={delta?.text ?? ""} className="streaming mt-4" />
+        streaming && <Markdown text={mine?.text ?? ""} className="streaming mt-4" />
       )}
       {live && <LiveMark />}
       {card}

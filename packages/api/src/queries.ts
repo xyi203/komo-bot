@@ -167,12 +167,14 @@ export function useRunDiff(run: string, index: number, enabled: boolean) {
 }
 
 /**
- * 旧版的"打字机"提示：同一轮 `(run, round)` 的 `assistant_delta` 拼起来，正式回复一到就丢掉。
+ * 流式中的这一轮：同一轮 `(run, round)` 的 `assistant_delta` 拼起来，正式回复（`message.assistant`）一到就丢掉。
+ * `text` 是回复正文，`thinking` 是同一轮的思考（推理摘要），两者各自边收边长。
  */
 export interface Delta {
   run: string;
   round: number;
   text: string;
+  thinking: string;
 }
 
 const TERMINAL = /^run\.(completed|failed|cancelled|abandoned)$/;
@@ -264,10 +266,11 @@ export function useSessionEvents(session: string) {
           if (/^(run\.|memory\.|message\.user$|line\.reply$)/.test(event.type)) side.schedule();
         } else if (frame.event === "assistant_delta") {
           const piece = frame.data;
+          const thinking = piece.thinking ?? "";
           setDelta((current) =>
             current && current.run === piece.run && current.round === piece.round
-              ? { ...current, text: current.text + piece.text }
-              : { ...piece },
+              ? { ...current, text: current.text + piece.text, thinking: current.thinking + thinking }
+              : { run: piece.run, round: piece.round, text: piece.text, thinking },
           );
         }
       },

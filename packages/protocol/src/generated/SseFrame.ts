@@ -12,4 +12,4 @@ export type SseFrame = {
 /**
  * SSE 的 `id:`。
  */
-id: Seq, session: SessionId, } & ({ "event": "event", "data": import('./WireEvent').WireEvent } | { "event": "assistant_delta", "data": { run: RunId, round: number, text: string, } } | { "event": "run_status", "data": { run: RunId, state: RunState, } } | { "event": "nested_calls", "data": { run: RunId, call: ToolCallId, calls: Array<unknown>, } } | { "event": "heartbeat" });
+id: Seq, session: SessionId, } & ({ "event": "event", "data": import('./WireEvent').WireEvent } | { "event": "assistant_delta", "data": { run: RunId, round: number, text: string, thinking?: string, } } | { "event": "run_status", "data": { run: RunId, state: RunState, } } | { "event": "nested_calls", "data": { run: RunId, call: ToolCallId, calls: Array<unknown>, } } | { "event": "heartbeat" });

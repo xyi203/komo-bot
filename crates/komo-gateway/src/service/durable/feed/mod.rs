@@ -383,7 +383,8 @@ struct Feed {
     documents: HashMap<DocumentId, Option<ConversationId>>,
     sessions: HashMap<String, SessionFeed>,
     /// 每个 conversation 上次发出的部分回复文字。
-    partials: HashMap<ConversationId, String>,
+    /// 每个 conversation 上次发出的部分回复（正文、思考），下一帧只发增量。
+    partials: HashMap<ConversationId, Partial>,
     /// 每个 conversation 里还在跑的 codemode 子调用（成员缓存与上次推出去的快照）。
     nested: HashMap<ConversationId, LiveNested>,
     /// 见过的最大记录 ID（见模块文档）。
@@ -684,12 +685,25 @@ impl Feed {
             self.partials.remove(&conversation);
             return;
         };
-        let last = self.partials.get(&conversation).map_or("", String::as_str);
-        let Some(delta) = delta_of(last, &partial.text) else {
+        // 换了 run 或换了一轮：从头算，不拿上一轮的文字当前缀。
+        let last = self
+            .partials
+            .get(&conversation)
+            .filter(|last| last.run == partial.run && last.round == partial.round);
+        let text = delta_of(last.map_or("", |last| last.text.as_str()), &partial.text);
+        let thinking = delta_of(
+            last.map_or("", |last| last.thinking.as_str()),
+            &partial.thinking,
+        );
+        if text.is_none() && thinking.is_none() {
             return;
-        };
-        let delta = delta.to_owned();
-        self.partials.insert(conversation, partial.text);
+        }
+        let (text, thinking) = (
+            text.unwrap_or_default().to_owned(),
+            thinking.unwrap_or_default().to_owned(),
+        );
+        let (run, round) = (partial.run.clone(), partial.round);
+        self.partials.insert(conversation, partial);
         let Some((session, id)) = self.frame_target(conversation).await else {
             return;
         };
@@ -697,9 +711,10 @@ impl Feed {
             id,
             session: SessionId::from_raw(session),
             event: SseEvent::AssistantDelta {
-                run: partial.run,
-                round: partial.round,
-                text: delta,
+                run,
+                round,
+                text,
+                thinking,
             },
         });
     }
@@ -771,9 +786,11 @@ struct Partial {
     /// 旧事件里的轮次：这条 run 已经完成的轮数 + 1（与 `MessageAssistant.round` 同一个数）。
     round: u32,
     text: String,
+    /// 推理（思考）块拼起来的文字：provider 的推理摘要或 thinking 块，流式时边收边长。
+    thinking: String,
 }
 
-/// 从 `komo.live` 整值里取出部分回复的文字；没有 run、没有部分回复或还没有文字就是 `None`。
+/// 从 `komo.live` 整值里取出部分回复的正文与思考；没有 run、没有部分回复、或两者都还是空就是 `None`。
 fn partial_of(value: &Value) -> Option<Partial> {
     let live = LiveState::deserialize(value).ok()?;
     let run = live.run?;
@@ -788,13 +805,25 @@ fn partial_of(value: &Value) -> Option<Partial> {
             _ => None,
         })
         .collect();
-    if text.is_empty() {
+    let thinking = message
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Thinking { thinking, .. } if !thinking.trim().is_empty() => {
+                Some(thinking.as_str())
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    if text.is_empty() && thinking.is_empty() {
         return None;
     }
     Some(Partial {
         run: run_id(first),
         round: run.rounds + 1,
         text,
+        thinking,
     })
 }
 

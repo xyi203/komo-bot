@@ -40,10 +40,16 @@ pub enum SseEvent {
     ///
     /// 所以它是纯粹的界面提示：TUI 拿它做打字机效果，丢了不影响任何东西，一轮结束时
     /// `message.assistant` 会把完整回复正式送到。
+    ///
+    /// `text` 是回复正文的增量，`thinking` 是同一轮推理（思考）的增量（provider 给的推理摘要或
+    /// thinking 块拼起来的文字）；一帧里两者可能只有一个非空。旧客户端不认 `thinking` 就当没有。
     AssistantDelta {
         run: RunId,
         round: u32,
         text: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        #[cfg_attr(feature = "ts", ts(as = "Option<String>", optional))]
+        thinking: String,
     },
     /// Run 的状态变了。派生自事件，给不想自己 fold 的客户端。
     RunStatus { run: RunId, state: RunState },
@@ -103,6 +109,7 @@ mod tests {
                 run: RunId::from_raw("run-1"),
                 round: 1,
                 text: "我算".into(),
+                thinking: String::new(),
             },
         };
         let text = serde_json::to_string(&frame).unwrap();

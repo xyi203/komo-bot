@@ -16,7 +16,8 @@ patterns.
 cargo build                    # cold build budget ≤ 60s (§13.4)
 cargo test --workspace         # ALWAYS --workspace; ~10 min cold — from komo's
                                # bash tool pass timeout_secs ≥ 900
-scripts/install-local.sh       # release build → ~/.local/bin/komo (atomic) → gateway restart;
+scripts/install-local.sh       # release build → ~/.local/bin/komo (atomic) + web shell → ~/.local/bin/web → gateway restart;
+                               # --web-only rebuilds/swaps just the web (no restart needed), --no-web skips it;
                                # worktrees share the main checkout's target/
 
 cargo fmt --check

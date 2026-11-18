@@ -41,6 +41,8 @@ export function Composer({
   context,
   disabled,
   archived,
+  busy = false,
+  onStop,
   onSend,
 }: {
   sessionId: string;
@@ -49,6 +51,9 @@ export function Composer({
   context: ContextView;
   disabled: boolean;
   archived: boolean;
+  /** 这段对话有 Run 在跑：框里没东西时发送键换成停止（有字照样发，算插话）。 */
+  busy?: boolean;
+  onStop?: () => void;
   onSend: (text: string, options: SendOptions) => void;
 }) {
   const [text, setText] = useDraftText(sessionId);
@@ -216,18 +221,30 @@ export function Composer({
               {m.composer_ctx_hint({ pct: pctText(context.total, context.win) })}
             </span>
           )}
-          <button
-            type="submit"
-            aria-label={m.composer_send()}
-            title={m.composer_send()}
-            disabled={disabled}
-            className={cn(
-              "relative grid size-8 shrink-0 cursor-pointer place-items-center rounded-full bg-primary text-white transition-[transform,opacity] hover:opacity-90 active:scale-95 max-[600px]:m-1.5 narrow:after:absolute narrow:after:-inset-1.5",
-              disabled && "cursor-not-allowed opacity-35",
-            )}
-          >
-            <Icon name="up" />
-          </button>
+          {busy && onStop && !text.trim() && drafts.length === 0 ? (
+            <button
+              type="button"
+              aria-label={m.composer_stop()}
+              title={m.composer_stop()}
+              onClick={onStop}
+              className="relative grid size-8 shrink-0 cursor-pointer place-items-center rounded-full bg-primary text-white transition-[transform,opacity] hover:opacity-90 active:scale-95 max-[600px]:m-1.5 narrow:after:absolute narrow:after:-inset-1.5"
+            >
+              <span aria-hidden="true" className="size-2.5 rounded-[2px] bg-current" />
+            </button>
+          ) : (
+            <button
+              type="submit"
+              aria-label={m.composer_send()}
+              title={m.composer_send()}
+              disabled={disabled}
+              className={cn(
+                "relative grid size-8 shrink-0 cursor-pointer place-items-center rounded-full bg-primary text-white transition-[transform,opacity] hover:opacity-90 active:scale-95 max-[600px]:m-1.5 narrow:after:absolute narrow:after:-inset-1.5",
+                disabled && "cursor-not-allowed opacity-35",
+              )}
+            >
+              <Icon name="up" />
+            </button>
+          )}
         </div>
       </form>
     </div>

@@ -209,6 +209,8 @@ function SessionBody({ sessionId, main }: { sessionId: string; main: boolean }) 
             context={context}
             disabled={!ready}
             archived={archived}
+            busy={busy}
+            onStop={stop}
             onSend={(text, options) => {
               atBottom.current = true;
               send(text, options);
@@ -226,7 +228,7 @@ function SessionBody({ sessionId, main }: { sessionId: string; main: boolean }) 
             </button>
           </div>
         ) : (
-          view && <Thread view={view} delta={delta} pending={pending} kids={kids} isHome={main} busy={busy} onStop={stop} onRetry={retry} />
+          view && <Thread view={view} delta={delta} pending={pending} kids={kids} isHome={main} busy={busy} onRetry={retry} />
         )}
       </ChatLayout>
     </ConversationProvider>

@@ -56,11 +56,11 @@ TUI 与聊天渠道之外的第三个入口，给电脑上的长会话用，之�
 
 ## 4. 对话
 
-> 新版：`apps/client/src/features/conversation/`（`model.ts` 事件 fold、`process.ts` 过程分组、`turn.tsx` 一轮、`tools.tsx` 回复下的悬停工具、`recall.tsx` 带上的记忆、`steps.tsx` 过程行、`thread.tsx` 正文与「正在输入」、`reply.tsx` 投进来的话与答复按钮）、`features/process/process-panel.tsx`（过程面板）、`features/trace/`（轨迹）、`features/changes/`（改动卡片与对比）；数据 hook 在 `packages/api/src/queries.ts` 的 `useSessionEvents`、`useSessionChanges`；对话页 `features/session/session-page.tsx`。
+> 新版：`apps/client/src/features/conversation/`（`model.ts` 事件 fold、`process.ts` 过程分组、`turn.tsx` 一轮、`tools.tsx` 回复下的悬停工具、`recall.tsx` 带上的记忆、`steps.tsx` 过程行、`inline-process.tsx` 回复里的过程与在跑时的标志、`thread.tsx` 正文、`reply.tsx` 投进来的话与答复按钮）、`features/process/process-panel.tsx`（过程面板）、`features/trace/`（轨迹）、`features/changes/`（改动卡片与对比）；数据 hook 在 `packages/api/src/queries.ts` 的 `useSessionEvents`、`useSessionChanges`；对话页 `features/session/session-page.tsx`。
 
 **对话页**：顶上居中一个圆形头像（Komo 标志）与下面的名字（主对话"Komo"，支线是它的标题），浮在正文上面、不占高度，正文顶上留出位置并叠一段白到透明的渐隐；没有顶栏，也就没有标题编辑、对话 / 轨迹切换、改动按钮、分叉、右栏开关。桌面壳里内置浏览器的开关是右上角的一个小图标按钮。正文只有话：用户的话与 Komo 的回复，过程不在正文里。
 
-**回复下的悬停工具**（2b-2，P1，`tools.tsx`）：每条 Komo 回复（一轮的最终回答、投进对话的话）下面一行小工具，平时隐藏，悬停或键盘聚焦这条回复时出现（没有悬停的设备一直显示），最后一条回复常显（对话里有 Run 在跑时它也收起，免得和"正在输入"挤在一起）：
+**回复下的悬停工具**（2b-2，P1，`tools.tsx`）：每条 Komo 回复（一轮的最终回答、投进对话的话）下面一行小工具，平时隐藏，悬停或键盘聚焦这条回复时出现（没有悬停的设备一直显示），最后一条回复常显（对话里有 Run 在跑时它也收起）：
 - 复制（图标按钮，复制回复正文）。
 - 「看过程」：打开右侧的过程面板（见下）并定位到这一轮。一轮没有过程（只有一句回复，没有思考、调用、召回，也没有改动）时不显示；投进对话的话没有这一项。
 - 「用上了 N 条记忆」：N 是这一轮最近一次 `memory.injected` 带上的条数，N = 0 不显示；点它在这一行下面展开那几条（约定实心点、参考空心圈，内容取自记忆索引），再点收起。过程面板的"步骤"里也有一行同样的召回。
@@ -69,7 +69,7 @@ TUI 与聊天渠道之外的第三个入口，给电脑上的长会话用，之�
 - 流式：`assistant_delta` 拼到这一轮的回答位置，`message.assistant` 到了再替换成正式回复。
 - 这一轮写了文件时，回复下面仍有一张改动卡片（只改一个文件写"已编辑 文件名 +a −d"，多个先列 4 行，见下"改动"），点一行打开过程面板的"改动"标签并展开这个文件。
 
-**「正在输入」**（2b-2，`thread.tsx` 的 `Typing`）：这段对话有 Run 在跑（`view.runs` 非空，含停住等答复的）时，消息末尾是三个呼吸的点，旁边一个小的停止按钮，取消当前的 Run（`use-send.ts` 的 `stop`，`POST /v1/runs/{id}/cancel`，有几条跑着取消几条）。它取代了原来的轮次抬头（"已完成，用时 …"）和对话里展开的过程组。
+**回复里的过程与在跑时的样子**（2026-11-18 改，照 Claude Desktop；`inline-process.tsx`、`turn.tsx`）：一轮的思考与工具调用按时间顺序排在回复上方，相邻的并成一组、一组一行（`StepsFold`，默认收起，点开看每一步），中间说的话穿插在组之间；召回在回复下的「用上了 N 条记忆」里，插话是上面的用户气泡，不在这里重复。在跑时：最后一组的标题写此刻在做什么（「正在运行命令 · 命令」「正在思考 · 最近一段思考」），文字带扫光（`.text-shimmer`），细节换了就淡入一次；还没有过程、或刚说完一句中间的话时补一行「正在思考」（排队时「排队中」）；回复末尾是 Komo 轨道（大圆不动、两个小圆绕着转，`.live-orbit`）。停止在输入框：有 Run 在跑且框里没东西时，发送键换成停止（`use-send.ts` 的 `stop`，`POST /v1/runs/{id}/cancel`，有几条跑着取消几条）；框里有字照样发送，算插话。取代了 2b-2 的「正在输入」（末尾三个呼吸的点加小停止按钮，过程只在右侧面板）。
 
 **过程面板**（2b-2，P5，`features/process/process-panel.tsx`，原型 `.proc`）：从回复的「看过程」打开，在对话右侧滑出，宽 380；打开时主区让出位置（`chat-layout.tsx` 的网格多一列），窗口 ≤ 1180 时浮在对话上面。状态（开不开、看哪一轮、哪个标签、改动页展开了哪些文件、轨迹的选中与筛选）都在 `session-page.tsx` 这一层，换对话整页重挂就清掉。
 - 标题栏：「过程」、上一轮 / 下一轮与"第 N 轮 / 共 M 轮"（只有一轮时不显示切换）、关闭。没有 Esc 关闭（轨迹详情自己占着 Esc）。

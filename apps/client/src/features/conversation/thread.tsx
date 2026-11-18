@@ -1,6 +1,7 @@
 import type { Delta } from "@komo/api";
 import { Spinner } from "@/components/spinner";
 import { Icon } from "@/components/icon";
+import { LiveMark } from "./inline-process";
 import { useNow } from "@/lib/hooks";
 import { formatElapsed } from "@/lib/format";
 import { sessionTitle } from "@/features/sessions/title";
@@ -8,7 +9,7 @@ import type { SessionSummary } from "@komo/protocol";
 import { Link } from "@tanstack/react-router";
 import { cn } from "@/lib/utils";
 import { m } from "@/paraglide/messages.js";
-import type { View } from "./model";
+import type { Turn, View } from "./model";
 import { AttachmentList, splitAttachments } from "./attachments";
 import { ReplyView } from "./reply";
 import { TurnView, UserBubble } from "./turn";
@@ -21,7 +22,8 @@ export interface PendingSend {
 }
 
 /**
- * 对话正文：按轮排下来，末尾是还没确认收到的待发气泡、"正在输入"（有 Run 在跑时，带停止）和这段对话派出、还在跑的任务会话。
+ * 对话正文：按轮排下来，末尾是还没确认收到的待发气泡和这段对话派出、还在跑的任务会话。在跑的那一轮自己画过程与
+ * Komo 标志（`turn.tsx`）；有 Run 在跑却还没折出那一轮时，末尾先放一个标志。
  * 回复下的悬停工具最后一条常显（没有 Run 在跑时）。
  */
 export function Thread({
@@ -31,7 +33,6 @@ export function Thread({
   kids,
   isHome,
   busy,
-  onStop,
   onRetry,
 }: {
   view: View;
@@ -39,16 +40,15 @@ export function Thread({
   pending: readonly PendingSend[];
   kids: readonly SessionSummary[];
   isHome: boolean;
-  /** 这段对话此刻有 Run 在跑：末尾画"正在输入"。 */
+  /** 这段对话此刻有 Run 在跑。停止在输入框（发送键在跑时变成停止）。 */
   busy: boolean;
-  /** 取消当前的 Run；不给就没有停止按钮。 */
-  onStop?: () => void;
   onRetry: (id: string) => void;
 }) {
   // 最后一条 Komo 的话（一轮的回复或投进来的话）：它下面的工具常显
   const lastSpoken = [...view.items].reverse().find((item) => (item.kind === "turn" && item.answer) || item.kind === "reply");
   const empty = !view.items.length && !pending.length && !view.runs.size;
   const now = useNow(kids.length > 0);
+  const liveTurn = [...view.items].reverse().find((item): item is Turn => item.kind === "turn" && (item.status === "running" || item.status === "queued"));
   return (
     <>
       {empty && (
@@ -94,7 +94,7 @@ export function Thread({
           </div>
         );
       })}
-      {busy && <Typing onStop={onStop} />}
+      {busy && !liveTurn && <LiveMark />}
       {kids.map((kid) => (
         <Link
           key={kid.session}
@@ -109,29 +109,5 @@ export function Thread({
         </Link>
       ))}
     </>
-  );
-}
-
-/** "正在输入"：三点动画，旁边一个小的停止按钮（取消当前的 Run）。 */
-function Typing({ onStop }: { onStop?: () => void }) {
-  return (
-    <div role="status" aria-label={m.typing_label()} className="mb-5 flex items-center gap-3 py-2.5">
-      <span aria-hidden="true" className="flex gap-1">
-        {[0, 1, 2].map((i) => (
-          <i key={i} className="size-1.5 animate-breathe rounded-full bg-control" style={{ animationDelay: `${i * 0.2}s` }} />
-        ))}
-      </span>
-      {onStop && (
-        <button
-          type="button"
-          aria-label={m.composer_stop()}
-          title={m.composer_stop()}
-          onClick={onStop}
-          className="grid size-6 cursor-pointer place-items-center rounded-full text-muted shadow-ring transition-colors hover:bg-hover-on-white hover:text-text"
-        >
-          <Icon name="stop" solid className="size-2.5" />
-        </button>
-      )}
-    </div>
   );
 }

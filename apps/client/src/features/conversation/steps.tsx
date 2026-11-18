@@ -56,7 +56,7 @@ const TOOL_TITLE: Record<string, () => string> = {
 };
 
 /** 组标题的文字：结束的按类别次数降序取前三（两类用"并"连、三类用逗号、多于三类末尾加"等"），在跑的写当前在跑的那一类。 */
-function groupTitle(seg: Extract<Segment, { kind: "steps" }>, live: boolean) {
+export function groupTitle(seg: Extract<Segment, { kind: "steps" }>, live: boolean) {
   const summary = groupSummary(seg, live);
   if (live) return { text: LIVE[summary.categories[0]!](), detail: summary.detail, icon: summary.icon };
   const [a, b, c] = summary.categories.map((cat) => DONE[cat]);
@@ -85,14 +85,15 @@ export function StepsFold({ seg, live, defaultOpen = false }: { seg: Extract<Seg
           <Icon name={CATEGORY_ICON[title.icon]} />
         </span>
         <Icon name={open ? "chev-up" : "down"} className="hidden group-hover/head:block group-focus-visible/head:block group-aria-expanded/head:block" />
-        <span className={cn("min-w-0 truncate", live && "text-muted")}>
-          {title.text}
-          {title.detail && <span className="text-faint"> · {title.detail}</span>}
+        <span className="min-w-0 truncate">
+          <span className={cn(live && "text-shimmer")}>{title.text}</span>
+          {/* 细节换了（换了一个调用、来了新的思考）就淡入一次 */}
+          {title.detail && <span key={title.detail} className={cn("text-faint", live && "process-in inline-block")}> · {title.detail}</span>}
         </span>
         {failed > 0 && <span className="text-negative">· {m.steps_failed({ count: failed })}</span>}
       </button>
       {open && (
-        <div className="mt-2 grid max-h-[min(400px,50vh)] grid-cols-[minmax(0,1fr)] gap-1 overflow-auto pl-6">
+        <div className="process-in mt-2 grid max-h-[min(400px,50vh)] grid-cols-[minmax(0,1fr)] gap-1 overflow-auto pl-6">
           {seg.steps.map((step) => (
             <StepRow key={step.id} step={step} />
           ))}

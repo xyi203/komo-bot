@@ -41,11 +41,13 @@ export const createSession = (body: CreateSessionRequest) => post<SessionSummary
 export const forkSession = (session: string) => post<ForkSessionResponse>(`/v1/sessions/${enc(session)}/fork`);
 export const renameSession = (session: string, name: string) =>
   post<unknown>(`/v1/sessions/${enc(session)}/name`, { name } satisfies NameSessionRequest);
-/** 归档：`/delete`（逻辑删除，内容还在）。`now` 立刻取消没跑完的 Run。 */
+/** 归档：`/delete`（逻辑删除，内容还在，能恢复）。`now` 立刻取消没跑完的 Run。 */
 export const archiveSession = (session: string, body: DeleteSessionRequest = {}) =>
   post<SessionLifecycleResponse>(`/v1/sessions/${enc(session)}/delete`, body);
 /** 永久删内容。Gateway 只认已归档的会话。 */
 export const purgeSession = (session: string) => post<PurgeSessionResponse>(`/v1/sessions/${enc(session)}/purge`);
+/** 恢复归档了的会话（`deleted` / `closing` → `active`）；已永久删除的 409。 */
+export const restoreSession = (session: string) => post<SessionLifecycleResponse>(`/v1/sessions/${enc(session)}/restore`);
 export const submitRun = (session: string, body: SubmitRunRequest) =>
   post<SubmitRunResponse>(`/v1/sessions/${enc(session)}/runs`, body);
 /** 存一个附件（粘贴、拖入或选的图片与文件），回执里的 `note` 拼在正文前面一起提交（Gateway 不认识附件）。 */

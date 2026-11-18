@@ -7,6 +7,7 @@ export { keys } from "./keys";
 export { uuid } from "./uuid";
 export { subscribeSession, type StreamState, type SubscribeOptions } from "./sse";
 export {
+  fetchArchivedChats,
   fetchChats,
   fetchHealth,
   fetchSessionPage,
@@ -14,6 +15,7 @@ export {
   prefetchHomeSession,
   SESSION_PAGE,
   sessionUnfinished,
+  useArchivedChats,
   useChats,
   useHealth,
   useHomeSession,

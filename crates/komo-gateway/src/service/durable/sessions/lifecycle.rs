@@ -9,6 +9,8 @@
 //!   任务一起停），等被标记的任务终结，之后进 `deleted`。abort 的 run 收尾时仍会放置收尾那一刻才到的内部输入、
 //!   起后继 run，所以"撤回 → abort → 看还剩什么"循环到什么都不剩（有上限，剩下的由后台补做接着收）。
 //!   `now = false`：撤回排队的，其余让在跑的 run 跑完，空了才 `deleted`（后台补做按判定推进，不是时钟）。
+//! - **restore**（网页的「恢复」）：`deleted` / `closing` 回到 `active`。逻辑删除就是网页上的「归档」：
+//!   内容不动，所以能原样回来；删除时停掉的监听、撤回的排队输入、取消的 Run 不会跟着回来。`purged` 回不来。
 //! - **purge**：要求已 `deleted`（旧 komo 会自动先删；新存储不——purge 是破坏性的，不替人做上一步）。
 //!   先算阻挡项（未结束的工作 + `aux.db` 里的记忆证据 / 投递 / cron 触发），有就 409 并列出；没有就**一次
 //!   提交**里 `PurgeConversations` + 退役 `komo.interventions.ack` + 墓碑 `purged`，**提交之后**才删
@@ -356,6 +358,24 @@ impl DurableCore {
             changed_at: record.changed_at,
             cancelled: unfinished,
         })
+    }
+
+    /// 恢复一段逻辑删除（归档）了的会话：`deleted` / `closing` → `active`。已经 `active` 是幂等的；
+    /// `purged` 内容没了，409。
+    pub async fn restore_session(&self, id: &str) -> Result<SessionRecord, SessionError> {
+        let (record, _) = self
+            .advance(
+                id,
+                &[SessionLifecycle::Deleted, SessionLifecycle::Closing],
+                SessionLifecycle::Active,
+            )
+            .await?;
+        if record.lifecycle == SessionLifecycle::Purged {
+            return Err(SessionError::Conflict(format!(
+                "会话 {id} 已经永久删除，恢复不了"
+            )));
+        }
+        Ok(record)
     }
 
     /// 把停在 `closing` 的会话推进到 `deleted`：撤回新到的排队输入，工作都做完了就推进。返回推进了几个。

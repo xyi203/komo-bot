@@ -43,6 +43,7 @@ pub fn routes() -> Router<Api> {
         .route("/v1/sessions/{id}/runs", post(submit))
         .route("/v1/sessions/{id}/delete", post(delete))
         .route("/v1/sessions/{id}/purge", post(purge))
+        .route("/v1/sessions/{id}/restore", post(restore))
 }
 
 /// query 里那个开关开着吗。`?all`、`?all=1`、`?all=true`、`?all=yes` 都算开（
@@ -159,8 +160,23 @@ async fn create(
 }
 
 /// `GET /v1/chats`：新主页的对话列（`docs/redesign.md` §2.1）。主对话没有就建，同 `/v1/home-session`。
-async fn chats(State(api): State<Api>) -> ApiResult<Json<ChatListResponse>> {
-    Ok(Json(api.state.core()?.chats().await?))
+#[derive(Debug, Default, serde::Deserialize)]
+pub(crate) struct ChatsQuery {
+    /// `true` = 已归档的支线（逻辑删除了、可恢复的），见 `DurableCore::archived_chats`。
+    #[serde(default)]
+    archived: bool,
+}
+
+async fn chats(
+    State(api): State<Api>,
+    Query(query): Query<ChatsQuery>,
+) -> ApiResult<Json<ChatListResponse>> {
+    let core = api.state.core()?;
+    Ok(Json(if query.archived {
+        core.archived_chats().await?
+    } else {
+        core.chats().await?
+    }))
 }
 
 /// `GET /v1/home-session`：默认 Agent 的主会话（没有就建）。
@@ -322,6 +338,21 @@ async fn delete(
     api.idempotency
         .remember(request.request_key.as_ref(), &hash, &response);
     Ok(Json(response))
+}
+
+/// `POST /v1/sessions/{id}/restore`：把归档（逻辑删除）了的会话恢复成活着的。已经活着的原样返回；
+/// 已永久删除的 409。
+async fn restore(
+    State(api): State<Api>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<SessionLifecycleResponse>> {
+    let record = api.state.core()?.restore_session(&id).await?;
+    Ok(Json(SessionLifecycleResponse {
+        session: SessionId::from_raw(id),
+        state: crate::service::durable::sessions::state_of(record.lifecycle),
+        changed_at: crate::service::durable::sessions::time_of(record.changed_at),
+        cancelled: Vec::new(),
+    }))
 }
 
 /// `POST /v1/sessions/{id}/purge`（§8.10 第 3 条）：要求已 `deleted`；有没做完的工作（或记忆证据、

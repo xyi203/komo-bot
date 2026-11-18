@@ -1,6 +1,7 @@
 import type { ChatRow } from "@komo/protocol";
-import { useChats } from "@komo/api";
+import { useArchivedChats, useChats } from "@komo/api";
 import { Link, useRouterState } from "@tanstack/react-router";
+import { useState } from "react";
 import { Icon } from "@/components/icon";
 import { errorText } from "@/lib/errors";
 import { formatChatTime } from "@/lib/format";
@@ -15,12 +16,19 @@ const row = "grid w-full cursor-pointer grid-cols-[minmax(0,1fr)_auto] items-cen
  * 对话列（264 宽，只在对话页出现）：顶上"对话"与新对话的加号；主对话固定最上，下面是支线（在等你的在前，顺序由 `GET /v1/chats` 给）。
  * 一行：标题、最后一句话、时间；在等你的带黄圈，在跑的带橙点。
  * 窄屏上它不常驻：只在 `/chats` 以 `full`（铺满一屏）出现，点一行进对话页。
+ * 底部「已归档」默认收起，展开才取 `GET /v1/chats?archived=true`；打开的是一段已归档的对话时自动展开，好看到它在哪。
  */
 export function ChatColumn({ full }: { full?: boolean }) {
   const chats = useChats();
   const current = chatKeyOf(useRouterState({ select: (s) => s.location.pathname }));
   const main = chats.data?.chats.find((chat) => chat.main);
   const branches = chats.data?.chats.filter((chat) => !chat.main) ?? [];
+  const [archivedOpen, setArchivedOpen] = useState(false);
+  // 打开的支线不在对话列里（多半是已归档的）：也去取已归档，好把它展开出来
+  const openElsewhere = !!chats.data && !!current && current !== "main" && current !== "new" && !chats.data.chats.some((chat) => chat.id === current);
+  const archived = useArchivedChats(archivedOpen || openElsewhere);
+  const archivedRows = archived.data?.chats ?? [];
+  const showArchived = archivedOpen || archivedRows.some((chat) => chat.id === current);
   return (
     <aside aria-label={m.chats_title()} className={cn("flex min-h-0 flex-col border-r border-border bg-ground", full ? "min-w-0 flex-1 border-r-0" : "narrow:hidden")}>
       <header className="flex h-14 shrink-0 items-center pr-2 pl-4 text-section-title font-semibold">
@@ -68,6 +76,23 @@ export function ChatColumn({ full }: { full?: boolean }) {
                 </Link>
               </div>
             )}
+            <button
+              type="button"
+              aria-expanded={showArchived}
+              onClick={() => setArchivedOpen(!showArchived)}
+              className="mx-1 mt-3 mb-1 flex cursor-pointer items-center gap-1 rounded-control px-1.5 py-1 text-small text-faint transition-colors hover:text-text"
+            >
+              <Icon name="right" className={cn("size-3 transition-transform", showArchived && "rotate-90")} />
+              {m.chats_archived()}
+            </button>
+            {showArchived &&
+              (archived.isPending ? (
+                <Skeleton />
+              ) : archivedRows.length === 0 ? (
+                <p className="mx-2.5 my-2 text-small text-faint">{archived.isError ? m.chats_error({ message: errorText(archived.error) }) : m.chats_archived_empty()}</p>
+              ) : (
+                archivedRows.map((chat) => <ChatItem key={chat.id} chat={chat} current={current === chat.id} archived />)
+              ))}
           </>
         )}
       </div>
@@ -75,7 +100,7 @@ export function ChatColumn({ full }: { full?: boolean }) {
   );
 }
 
-function ChatItem({ chat, current }: { chat: ChatRow; current: boolean }) {
+function ChatItem({ chat, current, archived = false }: { chat: ChatRow; current: boolean; archived?: boolean }) {
   const title = chat.main ? m.chats_main() : chat.title || m.session_untitled();
   const status = chat.waiting ? m.chats_waiting() : chat.running ? m.chats_running() : "";
   const body = (
@@ -118,6 +143,7 @@ function ChatItem({ chat, current }: { chat: ChatRow; current: boolean }) {
         id={chat.id}
         title={title}
         current={current}
+        archived={archived}
         className="absolute top-1 right-1.5 [@media(hover:hover)]:opacity-0 [@media(hover:hover)]:group-hover/row:opacity-100 [@media(hover:hover)]:group-has-[:focus-visible]/row:opacity-100 [@media(hover:hover)]:data-[state=open]:opacity-100"
       />
     </div>

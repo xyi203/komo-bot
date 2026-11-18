@@ -1,9 +1,11 @@
-import { useChats, useInterventions, useMemoryIndex, useModels, useSessionChanges, useSessionEvents, useSessions, useSessionTree } from "@komo/api";
+import { keys, restoreSession, useArchivedChats, useChats, useInterventions, useMemoryIndex, useModels, useSessionChanges, useSessionEvents, useSessions, useSessionTree } from "@komo/api";
 import type { InterventionSummary, RunChanges } from "@komo/protocol";
+import { useQueryClient } from "@tanstack/react-query";
 import { Link, useRouterState } from "@tanstack/react-router";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { ChatMenu } from "@/features/chats/chat-menu";
 import { Icon } from "@/components/icon";
+import { Button } from "@/components/ui/button";
 import { IconButton } from "@/components/ui/icon-button";
 import { BrowserPane, desktopBrowser, useBrowserOpen } from "@/features/browser/browser-pane";
 import { contextView } from "@/features/composer/context-usage";
@@ -46,14 +48,33 @@ function SessionBody({ sessionId, main }: { sessionId: string; main: boolean }) 
   const showBrowser = !!browserApi && browserOpen;
 
   const summary = sessions.data?.find((s) => s.session === sessionId);
-  const archived = !!summary && isArchived(summary);
+  // 会话列表是分页的，归档的那段未必在已取的页里：不在对话列里的支线再对一下已归档列表
+  const chatRows = chats.data?.chats;
+  const inChats = !!chatRows?.some((chat) => chat.id === sessionId);
+  const archivedChats = useArchivedChats(!main && !!chatRows && !inChats);
+  const archivedRow = archivedChats.data?.chats.find((chat) => chat.id === sessionId);
+  const archived = (!!summary && isArchived(summary)) || !!archivedRow;
+  const queryClient = useQueryClient();
+  const [restoring, setRestoring] = useState(false);
+  const restore = async () => {
+    setRestoring(true);
+    try {
+      await restoreSession(sessionId);
+    } finally {
+      // `keys.chats` 是前缀：对话列与已归档一起重取
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: keys.chats }),
+        queryClient.invalidateQueries({ queryKey: keys.sessions.all }),
+      ]);
+      setRestoring(false);
+    }
+  };
   const view = useMemo(() => (events ? foldEvents(events) : undefined), [events]);
   const { pending, send, retry, stop } = useSend(sessionId, events, view?.runs ?? new Map());
   const kids = useMemo(() => (sessions.data ?? []).filter((s) => s.kind === "task" && s.home === sessionId && isLive(s)), [sessions.data, sessionId]);
 
-  const chatRows = chats.data?.chats;
   const goal = main ? undefined : chatRows?.find((chat) => chat.id === sessionId)?.goal;
-  const name = main ? m.chat_name_main() : (chatRows?.find((chat) => chat.id === sessionId)?.title || sessionTitle(summary));
+  const name = main ? m.chat_name_main() : (chatRows?.find((chat) => chat.id === sessionId)?.title || archivedRow?.title || sessionTitle(summary));
   // 连接状态给图标栏看；名字给浏览器标签
   useEffect(() => {
     setStreamStatus(stream);
@@ -146,7 +167,13 @@ function SessionBody({ sessionId, main }: { sessionId: string; main: boolean }) 
                 className={cn("max-[600px]:hidden", showBrowser && "bg-active text-text")}
               />
             )}
-            {!main && !archived && <ChatMenu id={sessionId} title={name} current className="size-8" />}
+            {!main && archived && (
+              <Button type="button" disabled={restoring} onClick={() => void restore()}>
+                <Icon name="reload" className="size-4" />
+                {m.chat_restore()}
+              </Button>
+            )}
+            {!main && <ChatMenu id={sessionId} title={name} current archived={archived} className="size-8" />}
           </>
         }
         aside={showBrowser && browserApi ? <BrowserPane api={browserApi} sessionId={sessionId} onClose={() => setBrowserOpen(false)} /> : undefined}

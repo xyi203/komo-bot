@@ -11,6 +11,8 @@
 //!   不核对目标是否结案（结案的目标，旗仍在）。已归档的支线本来就不在列表里，绑定自然看不到。
 //! - 支线对话取活着的 `kind = normal` 会话、排除 `source` 以 `chat:` 开头的存量渠道 / 群会话；
 //!   最多给 [`MAX_SIDE_CHATS`] 段（等你的在前，所以不会被截掉）。
+//! - **已归档**（`GET /v1/chats?archived=true`，[`DurableCore::archived_chats`]）：归档就是逻辑删除
+//!   （`deleted` / 还在收尾的 `closing`），内容都在、可恢复；按归档时刻倒序，不带主对话，`waitingCount` 恒为 0。
 
 use std::collections::HashMap;
 
@@ -163,25 +165,12 @@ impl DurableCore {
         {
             let count = waiting.get(&record.id).copied().unwrap_or(0);
             waiting_count += count;
-            let live = Harness::live(&*self.storage, record.current_branch).await?;
-            chats.push(ChatRow {
-                id: SessionId::from_raw(record.id.clone()),
-                main: is_main,
-                title: match (&record.title, is_main) {
-                    (Some(title), _) if !title.trim().is_empty() => title.clone(),
-                    (_, true) => "主对话".to_owned(),
-                    (_, false) => "新对话".to_owned(),
-                },
-                last_message: self.last_words(record).await?,
-                last_message_at: time_of(record.last_message_ms()),
-                waiting: count > 0,
-                running: live.run.is_some(),
-                goal: if is_main {
-                    None
-                } else {
-                    goals.remove(&record.id)
-                },
-            });
+            let goal = if is_main {
+                None
+            } else {
+                goals.remove(&record.id)
+            };
+            chats.push(self.chat_row(record, is_main, count > 0, goal).await?);
         }
         Ok(ChatListResponse {
             chats,
@@ -189,10 +178,59 @@ impl DurableCore {
         })
     }
 
+    /// 已归档的支线对话（逻辑删除了、内容还在的），最近归档的在前，最多 [`MAX_SIDE_CHATS`] 段。
+    pub async fn archived_chats(&self) -> Result<ChatListResponse, SessionError> {
+        let mut archived = self
+            .side_chats_in(&[SessionLifecycle::Deleted, SessionLifecycle::Closing])
+            .await?;
+        archived.sort_by(|a, b| b.changed_at.cmp(&a.changed_at).then(b.id.cmp(&a.id)));
+        archived.truncate(MAX_SIDE_CHATS);
+        let mut chats = Vec::with_capacity(archived.len());
+        for record in &archived {
+            chats.push(self.chat_row(record, false, false, None).await?);
+        }
+        Ok(ChatListResponse {
+            chats,
+            waiting_count: 0,
+        })
+    }
+
+    async fn chat_row(
+        &self,
+        record: &SessionRecord,
+        is_main: bool,
+        waiting: bool,
+        goal: Option<komo_kernel::protocol::http::ChatGoal>,
+    ) -> Result<ChatRow, SessionError> {
+        let live = Harness::live(&*self.storage, record.current_branch).await?;
+        Ok(ChatRow {
+            id: SessionId::from_raw(record.id.clone()),
+            main: is_main,
+            title: match (&record.title, is_main) {
+                (Some(title), _) if !title.trim().is_empty() => title.clone(),
+                (_, true) => "主对话".to_owned(),
+                (_, false) => "新对话".to_owned(),
+            },
+            last_message: self.last_words(record).await?,
+            last_message_at: time_of(record.last_message_ms()),
+            waiting,
+            running: live.run.is_some(),
+            goal,
+        })
+    }
+
     /// 活着的支线对话（`kind = normal`，排除渠道 / 群的存量会话），次序不定。
     async fn side_chats(&self) -> Result<Vec<SessionRecord>, SessionError> {
+        self.side_chats_in(&[SessionLifecycle::Active]).await
+    }
+
+    /// 生命周期在 `lifecycles` 里的支线对话，次序不定。
+    async fn side_chats_in(
+        &self,
+        lifecycles: &[SessionLifecycle],
+    ) -> Result<Vec<SessionRecord>, SessionError> {
         let query = SessionQuery {
-            lifecycle: Some(SessionLifecycle::Active),
+            lifecycles: lifecycles.to_vec(),
             kind: Some(SessionKind::Normal),
             order: Some(ScanOrder::Descending),
             ..SessionQuery::default()

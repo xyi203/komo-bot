@@ -53,6 +53,12 @@ async fn says(core: &DurableCore, session: &str) -> Vec<Value> {
         .collect()
 }
 
+async fn archived(gw: &Gw) -> ChatListResponse {
+    let (code, body) = gw.get("/v1/chats?archived=true").await;
+    assert_eq!(code, 200, "{body}");
+    serde_json::from_str(&body).expect("已归档列表")
+}
+
 async fn chats(gw: &Gw) -> ChatListResponse {
     let (code, body) = gw.get("/v1/chats").await;
     assert_eq!(code, 200, "{body}");
@@ -186,6 +192,67 @@ async fn the_chat_list_puts_main_first_then_waiting_then_newest_with_its_fields(
 }
 
 /// 长话截断成一行；对话正在跑的那一行 `running`。
+/// 归档（逻辑删除）与删除（purge）是两件事：归档的支线离开对话列、进「已归档」，内容还在、能恢复回来；
+/// 删除是归档之后再 purge，之后哪个列表都没有，也恢复不了。
+#[tokio::test]
+async fn an_archived_chat_can_be_restored_and_only_a_deleted_one_is_gone_for_good() {
+    let home = Home::new();
+    let gw = home.start(FakeLlm::finisher("好")).await;
+    let kept = side_chat(&gw, "a", "要归档的那段").await;
+    let gone = side_chat(&gw, "b", "要删掉的那段").await;
+    let ids = |list: &ChatListResponse| list.chats.iter().map(|c| c.id.clone()).collect::<Vec<_>>();
+
+    for session in [&kept, &gone] {
+        let (code, body) = gw
+            .post(
+                &format!("/v1/sessions/{session}/delete"),
+                json!({ "now": true }),
+            )
+            .await;
+        assert_eq!(code, 200, "{body}");
+    }
+    assert!(!ids(&chats(&gw).await).contains(&kept));
+    let list = archived(&gw).await;
+    assert_eq!(list.waiting_count, 0);
+    assert!(
+        list.chats.iter().all(|chat| !chat.main),
+        "已归档里没有主对话"
+    );
+    let row = list
+        .chats
+        .iter()
+        .find(|c| c.id == kept)
+        .expect("归档的在已归档里");
+    assert_eq!(row.title, "要归档的那段");
+    assert_eq!(row.last_message, "好", "内容还在");
+
+    // 恢复：回到对话列，能接着说话；再恢复一次是幂等的。
+    for _ in 0..2 {
+        let (code, body) = gw
+            .post(&format!("/v1/sessions/{kept}/restore"), json!({}))
+            .await;
+        assert_eq!(code, 200, "{body}");
+        assert!(body.contains("\"active\""), "{body}");
+    }
+    assert!(ids(&chats(&gw).await).contains(&kept));
+    assert!(!ids(&archived(&gw).await).contains(&kept));
+    let run = gw.submit(&kept, "a-2", "接着说").await.run;
+    gw.wait_terminal(&run).await;
+
+    // 删除：purge 之后哪儿都没有，也恢复不了。
+    let (code, body) = gw
+        .post(&format!("/v1/sessions/{gone}/purge"), json!({}))
+        .await;
+    assert_eq!(code, 200, "{body}");
+    assert!(!ids(&chats(&gw).await).contains(&gone));
+    assert!(!ids(&archived(&gw).await).contains(&gone));
+    let (code, body) = gw
+        .post(&format!("/v1/sessions/{gone}/restore"), json!({}))
+        .await;
+    assert_eq!(code, 409, "{body}");
+    gw.stop().await;
+}
+
 #[tokio::test]
 async fn a_long_last_line_is_cut_and_a_chat_with_a_live_run_is_running() {
     let gate = Gate::new();

@@ -29,6 +29,7 @@ import type { SessionTree } from "./types";
 
 /** 对话列：主对话 + 支线，每行带最后一句话与是否在等你 / 在跑，另给等你的总数。 */
 export const fetchChats = () => get<ChatListResponse>("/v1/chats");
+export const fetchArchivedChats = () => get<ChatListResponse>("/v1/chats?archived=true");
 export const fetchHealth = () => get<HealthResponse>("/healthz");
 /** 全部会话，一次取完（不带 `limit`）。 */
 export const fetchSessions = (all = false) =>
@@ -95,6 +96,11 @@ export function useChats() {
     queryFn: fetchChats,
     refetchInterval: (query) => (query.state.data?.chats.some((chat) => chat.running) ? CHATS_LIVE_POLL_MS : CHATS_IDLE_POLL_MS),
   });
+}
+
+/** 已归档的支线（`GET /v1/chats?archived=true`）：只在对话列展开「已归档」时取，不轮询。 */
+export function useArchivedChats(enabled: boolean) {
+  return useQuery({ queryKey: keys.archivedChats, queryFn: fetchArchivedChats, enabled });
 }
 
 const homeQuery = { queryKey: keys.home, queryFn: fetchHome, staleTime: Infinity };

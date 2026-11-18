@@ -933,6 +933,7 @@ CLI 通过 HTTP 发命令，通过 SSE 观察运行。Gateway 内部采用函数
 | POST /v1/sessions/{id}/runs      | 提交新输入；会话不在 `active` 时 409 并说清是 `closing` / `deleted` / `purged` |
 | POST /v1/sessions/{id}/delete    | 逻辑删除：进 `closing`（`{"now":true}` 立刻 abort 未完成的 run（各留一条明确的取消）并进 `deleted`）。**不碰内容**（§8.10） |
 | POST /v1/sessions/{id}/purge     | 回收内容进 `purged`；引用检查不过则 409 并列出要先处置什么（§8.10） |
+| POST /v1/sessions/{id}/restore   | 逻辑删除（网页上叫「归档」）的会话回到 `active`：`deleted` / `closing` → `active`，`SessionLifecycleResponse`；已经活着的原样返回，`purged` 409。删除时停掉的监听、撤回的输入、取消的 Run 不会回来（2026-11-18） |
 | POST /v1/reconcile               | 立刻跑一次 blob 引用检查（§8.9）；幂等，返回 `checked` / `blocked` / `closed` / `purged` |
 | GET /v1/runs/{id}                | 执行详情                                       |
 | POST /v1/runs/{id}/cancel        | 取消                                           |

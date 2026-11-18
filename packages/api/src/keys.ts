@@ -10,6 +10,8 @@ export const keys = {
   authSessions: ["auth", "sessions"] as const,
   home: ["home-session"] as const,
   chats: ["chats"] as const,
+  // 在 `chats` 前缀下：归档、恢复、删除后失效 `keys.chats` 一次，两个列表一起重取
+  archivedChats: ["chats", "archived"] as const,
   models: ["models"] as const,
   memories: ["memories", "list"] as const,
   memoriesAll: ["memories", "list", "all"] as const,

@@ -6,11 +6,13 @@ import { cn } from "@/lib/utils";
 import { m } from "@/paraglide/messages.js";
 
 /**
- * 对话页的外框：顶上居中的名字，正文区，下面的输入框；`aside` 是桌面壳的内置浏览器（有才出现）。
+ * 对话页的外框：左上角的名字，正文区，下面的输入框；`aside` 是桌面壳的内置浏览器（有才出现）。
+ * 名字照 Claude 桌面端放左上角、不加框，`title` 给了就用它代替纯文字（对话页是带下拉箭头的对话菜单）。
  * 名字浮在正文上面（不占高度），与右上角的按钮同高对齐；正文顶上留出它的位置，再叠一段白到透明的渐隐，滚上去的字不会在名字后面被切成半行。
  */
 export function ChatLayout({
   name,
+  title,
   scroller,
   onScroll,
   aside,
@@ -20,6 +22,8 @@ export function ChatLayout({
   children,
 }: {
   name: string;
+  /** 代替纯文字名字的可点标题（对话菜单的触发器）。 */
+  title?: ReactNode;
   scroller?: RefObject<HTMLDivElement | null>;
   onScroll?: (el: HTMLDivElement) => void;
   aside?: ReactNode;
@@ -54,8 +58,8 @@ export function ChatLayout({
         >
           <Icon name="left" className="size-5" />
         </Link>
-        <header className="pointer-events-none absolute top-3 left-1/2 z-20 flex h-8 max-w-[60%] -translate-x-1/2 items-center narrow:top-2.5">
-          <h1 className="max-w-full truncate rounded-[10px] bg-surface px-2.5 py-px text-small font-medium shadow-[0_0_0_1px_rgb(0_0_0/0.06)]">{name}</h1>
+        <header className="absolute top-3 left-4 z-20 flex h-8 max-w-[60%] items-center narrow:top-2.5 narrow:left-12">
+          <h1 className={cn("max-w-full min-w-0 text-body font-medium", title ? "flex" : "truncate px-2")}>{title ?? name}</h1>
         </header>
         {corner && <div className="absolute top-3 right-4 z-20 flex gap-1 narrow:top-2.5 narrow:right-2">{corner}</div>}
         <div

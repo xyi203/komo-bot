@@ -27,12 +27,15 @@ export function ChatMenu({
   title,
   current,
   archived = false,
+  asTitle = false,
   className,
 }: {
   id: string;
   title: string;
   current: boolean;
   archived?: boolean;
+  /** 对话页左上角：触发器就是标题本身，后面跟一个下拉箭头（照 Claude 桌面端），菜单向右展开。 */
+  asTitle?: boolean;
   className?: string;
 }) {
   const [dialog, setDialog] = useState<"rename" | "archive" | "delete" | null>(null);
@@ -48,19 +51,33 @@ export function ChatMenu({
     <>
       <DropdownMenu>
         <DropdownMenuTrigger asChild>
-          <button
-            type="button"
-            aria-label={m.chat_menu()}
-            title={m.chat_menu()}
-            className={cn(
-              "grid size-7 cursor-pointer place-items-center rounded-control narrow:size-11 text-muted transition-colors hover:bg-hover-on-white hover:text-text data-[state=open]:bg-hover-on-white data-[state=open]:text-text",
-              className,
-            )}
-          >
-            <Icon name="more" />
-          </button>
+          {asTitle ? (
+            <button
+              type="button"
+              title={m.chat_menu()}
+              className={cn(
+                "inline-flex h-8 max-w-full min-w-0 cursor-pointer items-center gap-1 rounded-control px-2 text-text transition-colors hover:bg-hover-on-white data-[state=open]:bg-hover-on-white",
+                className,
+              )}
+            >
+              <span className="truncate">{title}</span>
+              <Icon name="down" className="size-4 shrink-0 text-muted" />
+            </button>
+          ) : (
+            <button
+              type="button"
+              aria-label={m.chat_menu()}
+              title={m.chat_menu()}
+              className={cn(
+                "grid size-7 cursor-pointer place-items-center rounded-control narrow:size-11 text-muted transition-colors hover:bg-hover-on-white hover:text-text data-[state=open]:bg-hover-on-white data-[state=open]:text-text",
+                className,
+              )}
+            >
+              <Icon name="more" />
+            </button>
+          )}
         </DropdownMenuTrigger>
-        <DropdownMenuContent align="end" size="compact">
+        <DropdownMenuContent align={asTitle ? "start" : "end"} size="compact">
           {archived ? (
             <DropdownMenuItem size="compact" onSelect={() => void restore()}>
               <Icon name="reload" className="size-4 text-muted" />

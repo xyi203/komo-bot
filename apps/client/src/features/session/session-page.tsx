@@ -141,6 +141,7 @@ function SessionBody({ sessionId, main }: { sessionId: string; main: boolean }) 
     <ConversationProvider value={conversation}>
       <ChatLayout
         name={name}
+        title={!main ? <ChatMenu id={sessionId} title={name} current archived={archived} asTitle /> : undefined}
         scroller={scroller}
         onScroll={(el) => {
           atBottom.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
@@ -173,7 +174,6 @@ function SessionBody({ sessionId, main }: { sessionId: string; main: boolean }) 
                 {m.chat_restore()}
               </Button>
             )}
-            {!main && <ChatMenu id={sessionId} title={name} current archived={archived} className="size-8" />}
           </>
         }
         aside={showBrowser && browserApi ? <BrowserPane api={browserApi} sessionId={sessionId} onClose={() => setBrowserOpen(false)} /> : undefined}

@@ -130,6 +130,7 @@ pub(super) async fn entries(
         matters: injection.matter_uses,
         recall: injection.diagnostics,
         at: request.now,
+        external: injection.external,
     };
     let mut draft = EntryDraft::new(MEMORY_RECALL_ENTRY_KIND)
         .with_data(serde_json::to_value(&data).expect("RecallData 可序列化"));

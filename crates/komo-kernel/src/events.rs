@@ -562,6 +562,9 @@ pub struct MemoryInjected {
     /// 召回诊断；旧行没有。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recall: Option<crate::types::memory::RecallDiagnostics>,
+    /// `uses` 里外部提供方条目注入时的正文（附录 G）；旧行与只有内置条目时没有。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub external: Vec<crate::types::memory::ExternalText>,
 }
 
 /// 截至 `upto`（含）最近的一条 `memory.injected`：一个 Run 系统提示里带的那一块。

@@ -841,6 +841,8 @@
       }
     }
   ],
+  "recall_external_untracked": "{id} (from {provider}; text not recorded)",
+  "recall_from": "from {provider}",
   "recall_missing": "{id} (no longer in the store)",
   "recall_references": [
     {

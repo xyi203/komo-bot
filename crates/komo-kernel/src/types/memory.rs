@@ -606,6 +606,17 @@ pub struct Injection {
     /// 召回诊断。**不参与相等**：同一块沿用时它变（`reused_pin`），不该被当成换了一块。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub diagnostics: Option<RecallDiagnostics>,
+    /// `uses` 里外部提供方那几条注入时的正文（附录 G）。**不参与相等**：它与 `text` 同出一源。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub external: Vec<ExternalText>,
+}
+
+/// 外部提供方的一条注入时的正文（`docs/memory.md` 附录 G）。内置条目能在记忆库里按 id 查到正文，外部的不在库里，
+/// 不在注入时记下来，界面上就只剩一个 id；提供方之后删了、改了，也仍显示当时注入的那句。只供展示，不参与核对。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExternalText {
+    pub memory: MemoryId,
+    pub text: String,
 }
 
 impl PartialEq for Injection {

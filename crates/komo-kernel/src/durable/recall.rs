@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use super::ids::SubmissionId;
 use super::records::EntryRecord;
 use crate::types::matter::MatterUse;
-use crate::types::memory::RecallDiagnostics;
+use crate::types::memory::{ExternalText, RecallDiagnostics};
 use crate::types::turn::MemoryUse;
 
 /// 召回块 entry 的 `kind`。
@@ -37,6 +37,10 @@ pub struct RecallData {
     /// 召回时刻（毫秒）。
     #[serde(default)]
     pub at: i64,
+    /// `uses` 里外部提供方条目注入时的正文（`docs/memory.md` 附录 G）：它们不在记忆库里，界面靠这份显示。
+    /// 旧 entry 没有这一项，读作空。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub external: Vec<ExternalText>,
 }
 
 impl RecallData {
@@ -53,7 +57,7 @@ impl RecallData {
 mod tests {
     use super::*;
 
-    /// 加事项组之前落下的召回记录没有 `matters`：读作空，写回时也不多出这一项。
+    /// 加事项组、外部正文之前落下的召回记录没有 `matters` / `external`：读作空，写回时也不多出这两项。
     #[test]
     fn an_old_recall_entry_without_matters_still_parses() {
         let data: RecallData = serde_json::from_value(serde_json::json!({
@@ -63,11 +67,18 @@ mod tests {
         }))
         .unwrap();
         assert!(data.matters.is_empty());
+        assert!(data.external.is_empty());
         assert_eq!(data.uses.len(), 1);
         assert!(
             serde_json::to_value(&data)
                 .unwrap()
                 .get("matters")
+                .is_none()
+        );
+        assert!(
+            serde_json::to_value(&data)
+                .unwrap()
+                .get("external")
                 .is_none()
         );
     }

@@ -327,6 +327,7 @@ fn test_render(
         uses,
         matter_uses: Vec::new(),
         diagnostics: None,
+        external: Vec::new(),
     }
 }
 
@@ -4234,7 +4235,8 @@ async fn a_shadow_provider_is_recorded_but_never_injected() {
     assert_eq!(shadow.error, None);
 }
 
-/// 主用模式：线索换成外部的（id 带前缀、只读线索）；外部不通退回内置，并说明降级。
+/// 主用模式：线索换成外部的（id 带前缀、只读线索），注入时的正文随注入记下（外部条目不在记忆库里，界面
+/// 靠它显示）；外部不通退回内置，并说明降级，内置条目不另记正文。
 #[tokio::test]
 async fn a_primary_provider_replaces_clue_recall_and_falls_back_when_down() {
     let harness = HarnessBuilder::new().build().await;
@@ -4258,6 +4260,13 @@ async fn a_primary_provider_replaces_clue_recall_and_falls_back_when_down() {
             .unwrap_or_default()
             .contains("卧室空调设 27 度")
     );
+    assert_eq!(
+        injection.external,
+        vec![komo_kernel::types::memory::ExternalText {
+            memory: komo_kernel::types::ids::MemoryId::from_raw("fake:x-1"),
+            text: "卧室空调设 27 度".into(),
+        }]
+    );
 
     install(
         &harness,
@@ -4270,6 +4279,7 @@ async fn a_primary_provider_replaces_clue_recall_and_falls_back_when_down() {
         .await;
     let ids: Vec<&str> = injection.uses.iter().map(|u| u.memory.as_str()).collect();
     assert_eq!(ids, vec!["m-1"], "退回内置检索");
+    assert!(injection.external.is_empty(), "内置条目在库里查得到");
     let diagnostics = injection.diagnostics.expect("有诊断");
     assert!(diagnostics.degraded);
     assert!(

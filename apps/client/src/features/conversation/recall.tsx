@@ -3,7 +3,7 @@ import { Icon } from "@/components/icon";
 import { cn } from "@/lib/utils";
 import { m } from "@/paraglide/messages.js";
 import { useConversation } from "./context";
-import type { MemoryUse } from "./events";
+import { externalProvider, type MemoryUse } from "./events";
 
 type Memories = ReturnType<typeof useConversation>["memories"];
 
@@ -36,11 +36,26 @@ export function RecallList({ uses }: { uses: MemoryUse[] }) {
         return (
           <div key={use.memory} className="grid grid-cols-[10px_minmax(0,1fr)] gap-2 py-1 pl-3.5 text-body">
             <span className="mt-[7px]">{mote(memory?.application === "convention")}</span>
-            <span>{memory ? memory.content : <span className="text-muted">{m.recall_missing({ id: use.memory })}</span>}</span>
+            <span>{memory ? memory.content : <Unlisted use={use} />}</span>
           </div>
         );
       })}
     </div>
+  );
+}
+
+/**
+ * 记忆库里查不到的一条。外部提供方的条目本来就不在库里：有注入时记下的正文就显示它并标出来源，旧记录没有正文
+ * 只能给 id；内置条目查不到才是真被删了。
+ */
+function Unlisted({ use }: { use: MemoryUse }) {
+  const provider = externalProvider(use.memory);
+  if (!provider) return <span className="text-muted">{m.recall_missing({ id: use.memory })}</span>;
+  if (use.text === undefined) return <span className="text-muted">{m.recall_external_untracked({ id: use.memory, provider })}</span>;
+  return (
+    <>
+      {use.text} <span className="text-small text-faint">· {m.recall_from({ provider })}</span>
+    </>
   );
 }
 

@@ -751,6 +751,7 @@ mod tests {
                 text_ref: None,
                 uses: Vec::new(),
                 recall: None,
+                external: Vec::new(),
             }),
         )
     }

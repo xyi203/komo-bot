@@ -833,6 +833,8 @@
       }
     }
   ],
+  "recall_external_untracked": "{id}（来自 {provider}，当时没记下正文）",
+  "recall_from": "来自 {provider}",
   "recall_missing": "{id}（库里已经没有这条）",
   "recall_references": [
     {

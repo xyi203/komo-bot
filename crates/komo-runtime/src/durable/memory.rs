@@ -125,6 +125,7 @@ pub fn inject_memory_events(events: &mut Vec<Event>, doc: &MemoryDoc) {
             text_ref: None,
             uses: doc.uses.clone(),
             recall: doc.recall.clone(),
+            external: Vec::new(),
         }),
     };
     events.insert(position + 1, injected);

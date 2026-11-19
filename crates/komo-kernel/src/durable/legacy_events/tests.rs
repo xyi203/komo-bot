@@ -555,6 +555,43 @@ fn a_memory_recall_block_is_an_injection_on_its_run_not_a_user_message() {
     assert!(body.text.is_none());
 }
 
+/// 外部提供方的条目不在记忆库里（`docs/memory.md` 附录 G），召回块记下的注入时正文随 `memory.injected`
+/// 一起出去，界面靠它显示；提供方之后删了它、旧块被改写，显示的仍是当时注入的那句。
+#[test]
+fn a_recall_block_carries_external_texts_onto_its_injection() {
+    use crate::durable::recall::{MEMORY_RECALL_ENTRY_KIND, MEMORY_REVOKE_ENTRY_KIND};
+
+    let entries = vec![
+        user(2, "空调怎么设"),
+        entry(3, MEMORY_RECALL_ENTRY_KIND)
+            .with_model(vec![Message::user(
+                "[已知记忆]\n- 卧室空调设 27 度 〔· hindsight:x-1@9〕",
+                3000,
+            )])
+            .with_data(json!({
+                "submission": 1,
+                "uses": [{"memory": "hindsight:x-1", "revision": 9}],
+                "at": 3,
+                "external": [{"memory": "hindsight:x-1", "text": "卧室空调设 27 度"}],
+            })),
+        entry(4, MEMORY_REVOKE_ENTRY_KIND).with_edits(vec![ContextEdit::omit(eid(3))]),
+        assistant(5, "好", &[]),
+        settled(6, 1, Some(5)),
+    ];
+    let subs = vec![input_sub(1, done(2, 5))];
+    let events = legacy_events(SESSION, &entries, &subs);
+    let body = events
+        .iter()
+        .find_map(|event| match &event.payload {
+            EventPayload::MemoryInjected(body) => Some(body),
+            _ => None,
+        })
+        .expect("有注入");
+    assert_eq!(body.external.len(), 1);
+    assert_eq!(body.external[0].memory.as_str(), "hindsight:x-1");
+    assert_eq!(body.external[0].text, "卧室空调设 27 度");
+}
+
 #[test]
 fn context_changes_and_plain_user_messages_have_their_own_frames() {
     let entries = vec![

@@ -31,6 +31,25 @@ export interface MemoryUse {
   /** `convention`（约定）或 `reference`（线索）。 */
   application?: string;
   revision?: number;
+  /** 外部提供方条目注入时的正文（记忆库里没有它，见 {@link injectedUses}）。 */
+  text?: string;
+}
+
+/** 外部提供方条目的 id 带 `<提供方>:` 前缀（`hindsight:…`，docs/memory.md 附录 G）；内置条目没有冒号。 */
+export function externalProvider(id: string): string | null {
+  const at = id.indexOf(":");
+  return at > 0 ? id.slice(0, at) : null;
+}
+
+/**
+ * `memory.injected` 带上的条目。外部条目不在记忆库里，正文在同一事件的 `external` 里（注入时记下的那句），
+ * 并进对应的 use；旧事件没有 `external`。
+ */
+export function injectedUses(event: WireEvent): MemoryUse[] {
+  const { uses = [], external = [] } = payload<{ uses: MemoryUse[]; external: { memory: string; text: string }[] }>(event);
+  if (!external.length) return uses;
+  const texts = new Map(external.map((x) => [x.memory, x.text]));
+  return uses.map((use) => (texts.has(use.memory) ? { ...use, text: texts.get(use.memory) } : use));
 }
 
 export interface RunPayload {

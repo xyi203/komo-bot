@@ -1,5 +1,6 @@
 import type { WireEvent } from "@komo/protocol";
 import {
+  injectedUses,
   payload,
   thinkingOf,
   type AssistantPayload,
@@ -126,7 +127,7 @@ function apply(view: View, event: WireEvent): void {
       break;
     }
     case "memory.injected": {
-      const uses = payload<{ uses: MemoryUse[] }>(event).uses ?? [];
+      const uses = injectedUses(event);
       view.recall = uses;
       if (turn && uses.length) {
         turn.recall = uses;

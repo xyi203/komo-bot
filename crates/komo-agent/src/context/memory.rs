@@ -177,6 +177,8 @@ pub fn render_block(
             matters_over_budget: (matters_over > 0).then_some(matters_over as u32),
             ..RecallDiagnostics::default()
         }),
+        // 渲染不认外部提供方，由 komo-memory 在召回收尾补上。
+        external: Vec::new(),
     }
 }
 

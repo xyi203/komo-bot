@@ -2,7 +2,7 @@ import type { WireEvent } from "@komo/protocol";
 import type { MemoryBrief, SessionTree } from "@komo/api";
 import { formatList } from "@/lib/format";
 import { m } from "@/paraglide/messages.js";
-import { payload, thinkingOf, type AssistantPayload, type MemoryUse, type RunPayload, type ToolResultPayload } from "../conversation/events";
+import { injectedUses, payload, thinkingOf, type AssistantPayload, type RunPayload, type ToolResultPayload } from "../conversation/events";
 
 // 轨迹：同一份事件加上树上的 `komo.system` 摊平成记录，照 DeepSeek Harness 的 Trajectory。
 // 记录是：系统（初始系统提示词、之后的更新）、用户、上下文（召回、压缩、失败）、思考、助手（只调用工具时写"（仅工具调用）"）、
@@ -228,14 +228,14 @@ export function traceOf(
         last.set(run, e.at);
         break;
       case "memory.injected": {
-        const uses = payload<{ uses: MemoryUse[] }>(e).uses ?? [];
+        const uses = injectedUses(e);
         if (uses.length) {
           rows.push({
             kind: "ctx",
             id: e.event_id,
             n,
             at: e.at,
-            text: m.trace_recall({ count: uses.length, list: uses.map((u) => memories.get(u.memory)?.content ?? u.memory).join("；") }),
+            text: m.trace_recall({ count: uses.length, list: uses.map((u) => memories.get(u.memory)?.content ?? u.text ?? u.memory).join("；") }),
           });
         }
         break;

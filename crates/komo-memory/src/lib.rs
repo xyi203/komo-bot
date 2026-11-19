@@ -53,8 +53,9 @@ use komo_kernel::types::agent::MemoryMode;
 use komo_kernel::types::ids::{MatterId, MemoryId, RunId, Seq, SessionId};
 use komo_kernel::types::matter::{Matter, MatterState, MatterUse};
 use komo_kernel::types::memory::{
-    Injection, MemoryItem, MemoryScope, MemoryState, MemoryWork, RecallDiagnostics, RecallQuery,
-    RecallResult, RetrievalMode, ShadowHit, ShadowRecall, clue_is_pushed, scope_allowed,
+    ExternalText, Injection, MemoryItem, MemoryScope, MemoryState, MemoryWork, RecallDiagnostics,
+    RecallQuery, RecallResult, RetrievalMode, ShadowHit, ShadowRecall, clue_is_pushed,
+    scope_allowed,
 };
 use komo_kernel::types::model::{EmbeddingSpace, InputKind, ModelConfig, Vector};
 use komo_kernel::types::turn::{LlmError, MemoryUse};
@@ -1137,8 +1138,25 @@ impl MemoryManager {
             diagnostics.conventions_over_budget = Some(over_budget as u32);
         }
         injection.diagnostics = Some(diagnostics);
+        injection.external = self.external_texts(&injection.uses, &items);
         self.record_usage(&injection, now).await;
         injection
+    }
+
+    /// 注入的条目里外部提供方那几条的正文（附录 G）：它们不在记忆库里，界面只能靠注入时记下的这份显示。
+    fn external_texts(&self, uses: &[MemoryUse], items: &[MemoryItem]) -> Vec<ExternalText> {
+        let Some(installed) = self.provider() else {
+            return Vec::new();
+        };
+        let name = installed.provider.name();
+        uses.iter()
+            .filter(|use_| provider::external_id(name, &use_.memory).is_some())
+            .filter_map(|use_| items.iter().find(|item| item.id == use_.memory))
+            .map(|item| ExternalText {
+                memory: item.id.clone(),
+                text: item.content.clone(),
+            })
+            .collect()
     }
 
     /// 这一次放行作用域里全部 active + convention 的条目（未过期、按创建先后）。读不出来就当

@@ -1621,3 +1621,18 @@ Gateway 对记忆的调用约 20 个方法，但能换后端的只有热路径�
 - **测试**：`komo-config` `the_hindsight_rerank_floor_comes_from_the_env_file`；`komo-gateway`
   `recall_maps_scopes_to_tags_and_reads_scores_and_scopes_back` 断言请求带上配置的下限。
 
+
+### G.8 外部条目在界面上的正文（2026-11-19）
+
+主用模式下注入的是外部条目（`hindsight:<id>`），界面的"用上了 N 条记忆"、过程面板的召回与轨迹按 id 去记忆索引里找正文，
+外部条目本来就不在库里，于是一律显示成"库里已经没有这条"。
+
+- **记下注入时的正文**：`Injection.external`（`ExternalText { memory, text }`）由 `komo-memory` 在召回收尾按提供方前缀
+  从这次的条目里挑出，随召回记录 `RecallData.external` 落进 `komo.memory.recall` entry，投影进 `memory.injected` 的 `external`。
+  只供展示：不参与 `Injection` 的相等、不参与核对与改写；提供方之后删了、改了那条，界面仍显示当时注入的那句。
+  旧记录与只有内置条目时没有这一项（`skip_serializing_if`，读作空）。
+- **界面**（`apps/client`）：`injectedUses` 把正文并进对应的 use。记忆索引里查不到时，外部条目有正文就显示正文并标
+  "来自 <提供方>"，没有正文（本次之前的旧记录）显示 id 与"当时没记下正文"；内置条目查不到才是"库里已经没有这条"。
+- **测试**：`komo-memory` `a_primary_provider_replaces_clue_recall_and_falls_back_when_down`（主用时记下正文、退回内置时不记）；
+  `komo-kernel` `a_recall_block_carries_external_texts_onto_its_injection`（旧块被改写后投影仍带正文）、
+  `an_old_recall_entry_without_matters_still_parses`（旧 entry 读作空、写回不多出这一项）。

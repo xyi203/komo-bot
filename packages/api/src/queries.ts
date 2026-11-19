@@ -245,9 +245,19 @@ export function useSessionEvents(session: string) {
     const key = keys.session(session).events;
     const side = sideRefresher(queryClient);
     const next = queryClient.getQueryData<{ next: number }>(key)?.next ?? 0;
+    // 断开过又连上：可能是 Gateway 重启了。改动记录只活在 Gateway 进程里，重启前那几轮的卡片已经给不出对比，
+    // 重取一次摘要，Gateway 不记得的轮次卡片就自己消失（只是网络抖了一下也重取，代价是一个请求）。
+    let dropped = false;
     const stop = subscribeSession(session, {
       from: next,
-      onState: setStream,
+      onState: (state) => {
+        setStream(state);
+        if (state === "reconnecting") dropped = true;
+        else if (state === "open" && dropped) {
+          dropped = false;
+          void queryClient.invalidateQueries({ queryKey: keys.session(session).changes });
+        }
+      },
       onFrame: (frame) => {
         if (frame.event === "event") {
           const event = frame.data;

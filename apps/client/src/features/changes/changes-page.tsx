@@ -1,4 +1,4 @@
-import { useRunDiff } from "@komo/api";
+import { ApiError, useRunDiff } from "@komo/api";
 import type { ChangedFile, RunChanges } from "@komo/protocol";
 import { useIsFetching } from "@tanstack/react-query";
 import { useEffect } from "react";
@@ -114,6 +114,8 @@ function Diff({ run, index }: { run: string; index: number }) {
   const diff = useRunDiff(run, index, true);
   const note = "m-0 border-t border-rule px-3 py-2.5 text-small text-muted";
   if (diff.isPending) return <p className={note}>{m.changes_diff_loading()}</p>;
+  // 404 是 Gateway 重启过、记录清掉了：意料之中，不当错误画红
+  if (diff.isError && diff.error instanceof ApiError && diff.error.status === 404) return <p className={note}>{m.changes_diff_gone()}</p>;
   if (diff.isError) return <p className={cn(note, "text-negative")}>{m.changes_diff_error({ message: errorText(diff.error) })}</p>;
   const data = diff.data;
   if (data.status !== "text") {

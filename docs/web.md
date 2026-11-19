@@ -58,7 +58,7 @@ TUI 与聊天渠道之外的第三个入口，给电脑上的长会话用，之�
 
 > 新版：`apps/client/src/features/conversation/`（`model.ts` 事件 fold、`process.ts` 过程分组、`turn.tsx` 一轮、`tools.tsx` 回复下的悬停工具、`recall.tsx` 带上的记忆、`steps.tsx` 过程行、`inline-process.tsx` 回复里的过程与在跑时的标志、`thread.tsx` 正文、`reply.tsx` 投进来的话与答复按钮）、`features/process/process-panel.tsx`（过程面板）、`features/trace/`（轨迹）、`features/changes/`（改动卡片与对比）；数据 hook 在 `packages/api/src/queries.ts` 的 `useSessionEvents`、`useSessionChanges`；对话页 `features/session/session-page.tsx`。
 
-**对话页**：顶上居中一个圆形头像（Komo 标志）与下面的名字（主对话"Komo"，支线是它的标题），浮在正文上面、不占高度，正文顶上留出位置并叠一段白到透明的渐隐；没有顶栏，也就没有标题编辑、对话 / 轨迹切换、改动按钮、分叉、右栏开关。桌面壳里内置浏览器的开关是右上角的一个小图标按钮。正文只有话：用户的话与 Komo 的回复，过程不在正文里。
+**对话页**：顶上居中是名字（主对话"Komo"，支线是它的标题；2026-11-19 去掉了上面的圆形 Komo 头像），与右上角按钮同高，浮在正文上面、不占高度，正文顶上留出位置并叠一段白到透明的渐隐；没有顶栏，也就没有标题编辑、对话 / 轨迹切换、改动按钮、分叉、右栏开关。桌面壳里内置浏览器的开关是右上角的一个小图标按钮。正文只有话：用户的话与 Komo 的回复，过程不在正文里。
 
 **回复下的悬停工具**（2b-2，P1，`tools.tsx`）：每条 Komo 回复（一轮的最终回答、投进对话的话）下面一行小工具，平时隐藏，悬停或键盘聚焦这条回复时出现（没有悬停的设备一直显示），最后一条回复常显（对话里有 Run 在跑时它也收起）：
 - 复制（图标按钮，复制回复正文）。

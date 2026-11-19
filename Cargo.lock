@@ -2269,7 +2269,7 @@ dependencies = [
 
 [[package]]
 name = "komo"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "async-trait",
  "axum",
@@ -2301,7 +2301,7 @@ dependencies = [
 
 [[package]]
 name = "komo-agent"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "komo-kernel",
  "serde_json",
@@ -2311,7 +2311,7 @@ dependencies = [
 
 [[package]]
 name = "komo-client"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "async-trait",
  "bytes",
@@ -2331,7 +2331,7 @@ dependencies = [
 
 [[package]]
 name = "komo-config"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "arc-swap",
  "dotenvy",
@@ -2351,7 +2351,7 @@ dependencies = [
 
 [[package]]
 name = "komo-gateway"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -2387,7 +2387,7 @@ dependencies = [
 
 [[package]]
 name = "komo-kernel"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "async-trait",
  "croner",
@@ -2402,7 +2402,7 @@ dependencies = [
 
 [[package]]
 name = "komo-llm"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -2423,7 +2423,7 @@ dependencies = [
 
 [[package]]
 name = "komo-memory"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "async-trait",
  "jiff",
@@ -2442,7 +2442,7 @@ dependencies = [
 
 [[package]]
 name = "komo-runtime"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -2467,7 +2467,7 @@ dependencies = [
 
 [[package]]
 name = "komo-store"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "async-trait",
  "komo-kernel",
@@ -2485,7 +2485,7 @@ dependencies = [
 
 [[package]]
 name = "komo-tools"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "async-trait",
  "base64 0.23.1",

@@ -69,6 +69,10 @@ pub struct RunControl {
     /// 连续被截断（带工具调用）的回复数；一轮正常的工具调用就清零。放在这里是为了重启不重置。
     #[serde(default)]
     pub truncations: u32,
+    /// 这一串续写里被输出上限截断、已经落账的纯文字回复，按先后。最终回答收尾时把它们的正文
+    /// 接在前面（渠道投递、任务交回只读回答那一条 entry）；中间有一轮工具调用就清空。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub continued: Vec<EntryId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

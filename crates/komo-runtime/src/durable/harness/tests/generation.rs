@@ -7,6 +7,7 @@ use std::time::Duration;
 use komo_kernel::durable::{
     InputState, Message, StopReason, SubmissionKind, TaskOutcome, TaskState,
 };
+use komo_kernel::types::turn::LlmError;
 use serde_json::json;
 use tokio::sync::Notify;
 
@@ -314,16 +315,59 @@ async fn a_retry_prepares_again_so_a_new_model_applies_from_the_next_attempt() {
     engine.close().await.unwrap();
 }
 
-/// §6 / `AgentLoop`："模型回复被截断，调用参数未收齐——不按半轮调用执行"。截断的一轮不执行任何
-/// 调用，也不进之后的上下文。
+fn truncated_text(text: &str) -> Step {
+    let mut message = text_reply(text);
+    message.stop_reason = StopReason::Length;
+    Step::Reply(message)
+}
+
+/// §6：有字的回复被输出上限截断不让 run 失败——这一段照常落账，补一条 `komo.continue`（"接着写"），
+/// 下一轮从断开处接着写；最终回答的 `data.text` 是接起来的整段（渠道投递、任务交回读它）。
 #[tokio::test(start_paused = true)]
-async fn a_truncated_reply_fails_the_run_without_running_its_calls() {
+async fn a_truncated_answer_is_continued_and_the_answer_is_stitched_whole() {
+    let world = World::new();
+    world.script.push(truncated_text("第一段，写到一半"));
+    world.script.reply("接着写完。");
+    let engine = world.open().await;
+    let id = world.submit(&engine, "写一份长报告").await;
+    let settled = world.harness.wait(&engine, id).await.unwrap();
+
+    assert!(matches!(input_state(&settled), InputState::Done { .. }));
+    let requests = world.script.requests();
+    assert_eq!(requests.len(), 2);
+    let second = outline(&requests[1]);
+    assert_eq!(second[second.len() - 2], "assistant: 第一段，写到一半");
+    assert!(
+        second
+            .last()
+            .unwrap()
+            .starts_with("user: （这条是 komo 自动发的"),
+        "{second:?}"
+    );
+    assert_eq!(world.entries_of("komo.continue").await.len(), 1);
+    let assistants = world.entries_of("komo.assistant").await;
+    assert_eq!(assistants.len(), 2);
+    assert_eq!(assistant_stop(&assistants[0]), StopReason::Length);
+    let data = assistants[1]
+        .data
+        .as_ref()
+        .expect("续写收尾的回答带整段正文");
+    assert_eq!(data["text"], "第一段，写到一半接着写完。");
+    assert_eq!(data["continued"], json!([assistants[0].id]));
+    assert!(world.live().await.run.is_none());
+    engine.close().await.unwrap();
+}
+
+/// 续写有上限：连续 3 次之后再截断，按"模型回复被截断"失败；截断回复里的
+/// 调用从不执行。
+#[tokio::test(start_paused = true)]
+async fn a_truncated_answer_fails_the_run_after_three_continuations() {
     let world = World::new();
     let read = Arc::new(TestTool::reader("read", &world.log));
     world.tools(vec![read.clone()]);
-    let mut truncated = text_reply("a long ans");
-    truncated.stop_reason = StopReason::Length;
-    world.script.push(Step::Reply(truncated));
+    for n in 0..4 {
+        world.script.push(truncated_text(&format!("段{n}")));
+    }
     let engine = world.open().await;
     let id = world.submit(&engine, "hi").await;
     let settled = world.harness.wait(&engine, id).await.unwrap();
@@ -331,19 +375,152 @@ async fn a_truncated_reply_fails_the_run_without_running_its_calls() {
     let (reason, detail) = unanswered(&settled);
     assert_eq!(reason, "model_error");
     assert!(detail.unwrap().contains("模型回复被截断"));
+    assert_eq!(world.script.request_count(), 4);
     assert_eq!(read.runs(), 0);
-    assert!(world.tasks("komo.tool").await.is_empty());
+    let assistants = world.entries_of("komo.assistant").await;
+    assert_eq!(assistants.len(), 4);
+    assert_eq!(assistant_stop(&assistants[2]), StopReason::Length);
+    assert_eq!(assistant_stop(&assistants[3]), StopReason::Error);
+    engine.close().await.unwrap();
+}
+
+/// 只有思考、一个字没写就被截断：续写没有可接的，照旧失败，这一条不进之后的上下文。
+#[tokio::test(start_paused = true)]
+async fn a_truncated_reply_without_text_fails_the_run() {
+    let world = World::new();
+    let mut truncated = text_reply("");
+    truncated.content.clear();
+    truncated.stop_reason = StopReason::Length;
+    world.script.push(Step::Reply(truncated));
+    let engine = world.open().await;
+    let id = world.submit(&engine, "hi").await;
+    let settled = world.harness.wait(&engine, id).await.unwrap();
+
+    let (reason, _) = unanswered(&settled);
+    assert_eq!(reason, "model_error");
     let assistants = world.entries_of("komo.assistant").await;
     assert_eq!(assistants.len(), 1);
     assert_eq!(assistant_stop(&assistants[0]), StopReason::Error);
-    assert!(
+    assert!(world.entries_of("komo.continue").await.is_empty());
+    engine.close().await.unwrap();
+}
+
+/// 同一个调用原样连发 6 次：第 7 次请求末尾多一句 `komo.nudge` 提醒；只提醒、不停 run。
+#[tokio::test(start_paused = true)]
+async fn identical_calls_in_a_row_get_one_nudge_and_the_run_goes_on() {
+    let world = World::new();
+    let read = Arc::new(TestTool::reader("read", &world.log));
+    world.tools(vec![read.clone()]);
+    for n in 0..6 {
         world
-            .messages()
-            .await
-            .iter()
-            .all(|m| !matches!(m, Message::Assistant(_))),
-        "the truncated reply never reaches a later request"
+            .script
+            .calls(&[(&format!("c{n}"), "read", json!({"path": "a"}))]);
+    }
+    world.script.reply("换个办法");
+    let engine = world.open().await;
+    let id = world.submit(&engine, "看看 a").await;
+    let settled = world.harness.wait(&engine, id).await.unwrap();
+
+    assert!(matches!(input_state(&settled), InputState::Done { .. }));
+    assert_eq!(read.runs(), 6);
+    let requests = world.script.requests();
+    assert_eq!(requests.len(), 7);
+    for request in &requests[..6] {
+        assert!(!last_user_text(request).contains("完全相同的参数"));
+    }
+    let last = outline(&requests[6]);
+    assert!(
+        last.last()
+            .unwrap()
+            .contains("连续 6 次用完全相同的参数调用 `read`"),
+        "{last:?}"
     );
+    let nudges = world.entries_of("komo.nudge").await;
+    assert_eq!(nudges.len(), 1);
+    assert_eq!(nudges[0].data.as_ref().unwrap()["count"], 6);
+    engine.close().await.unwrap();
+}
+
+/// 参数不同的连续调用不算打转。
+#[tokio::test(start_paused = true)]
+async fn different_arguments_are_not_a_streak() {
+    let world = World::new();
+    let read = Arc::new(TestTool::reader("read", &world.log));
+    world.tools(vec![read.clone()]);
+    for n in 0..7 {
+        world
+            .script
+            .calls(&[(&format!("c{n}"), "read", json!({"path": format!("f{n}")}))]);
+    }
+    world.script.reply("读完了");
+    let engine = world.open().await;
+    let id = world.submit(&engine, "都读一遍").await;
+    world.harness.wait(&engine, id).await.unwrap();
+
+    assert!(world.entries_of("komo.nudge").await.is_empty());
+    engine.close().await.unwrap();
+}
+
+/// 429 带了 Retry-After：退避至少等服务端要的那么久（这里 30 s，比指数退避的 2 s 长）。
+#[tokio::test(start_paused = true)]
+async fn a_throttled_request_waits_for_retry_after() {
+    let world = World::new();
+    world.script.push(Step::Error(LlmError::Throttled {
+        message: "slow down".into(),
+        retry_after_ms: Some(30_000),
+    }));
+    world.script.push(Step::Error(LlmError::Throttled {
+        message: "slow down".into(),
+        retry_after_ms: None,
+    }));
+    world.script.reply("ok");
+    let engine = world.open().await;
+    let id = world.submit(&engine, "hi").await;
+    world.harness.wait(&engine, id).await.unwrap();
+
+    let times = world.script.request_times();
+    assert_eq!(times.len(), 3);
+    assert_eq!(times[1] - times[0], 30_000, "Retry-After wins over 2 s");
+    assert_eq!(
+        times[2] - times[1],
+        4_000,
+        "no Retry-After: the exponential backoff as before"
+    );
+    engine.close().await.unwrap();
+}
+
+/// 一轮里的只读调用一组至多 10 个同时在飞，多出来的等前一组收尾。
+#[tokio::test(start_paused = true)]
+async fn at_most_ten_read_only_calls_run_at_once() {
+    let world = World::new();
+    let gate = Arc::new(Notify::new());
+    let read = Arc::new(TestTool::reader("read", &world.log).with_gate(&gate));
+    world.tools(vec![read.clone()]);
+    let calls: Vec<(String, serde_json::Value)> = (0..12)
+        .map(|n| (format!("c{n}"), json!({"path": format!("f{n}")})))
+        .collect();
+    let calls: Vec<(&str, &str, serde_json::Value)> = calls
+        .iter()
+        .map(|(id, args)| (id.as_str(), "read", args.clone()))
+        .collect();
+    world.script.calls(&calls);
+    world.script.reply("读完了");
+    let engine = world.open().await;
+    let id = world.submit(&engine, "都读一遍").await;
+    world.until_log("start read #10").await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(read.runs(), 10, "the eleventh waits for the first group");
+    let wait = world.harness.wait(&engine, id);
+    tokio::pin!(wait);
+    let settled = loop {
+        gate.notify_one();
+        tokio::select! {
+            settled = &mut wait => break settled.unwrap(),
+            _ = tokio::time::sleep(Duration::from_millis(5)) => {}
+        }
+    };
+    assert!(matches!(input_state(&settled), InputState::Done { .. }));
+    assert_eq!(read.runs(), 12);
     engine.close().await.unwrap();
 }
 

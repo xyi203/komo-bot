@@ -675,6 +675,7 @@ pub async fn start_run(
         tokens: 0,
         started_at: tx.now(),
         truncations: 0,
+        continued: Vec::new(),
     });
     Ok(task)
 }

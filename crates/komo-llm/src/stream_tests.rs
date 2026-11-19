@@ -1234,6 +1234,40 @@ async fn a_throttled_stream_builds_one_snapshot_per_interval_and_the_same_final_
     }
 }
 
+/// 429 带着响应头里的 Retry-After 报上去（三家协议同一条路），loop 的退避据此至少等这么久。
+#[tokio::test]
+async fn a_429_carries_retry_after() {
+    for p in ALL {
+        let config = p.config(None);
+        let messages = vec![Message::user("hi", 0)];
+        let mut reply = Reply::json(429, r#"{"error":{"message":"slow down"}}"#);
+        reply.retry_after_ms = Some(7_000);
+        let transport = ScriptedTransport::new(vec![reply]);
+        let stream = factory(&transport)
+            .build_stream(&config, ModelRole::Main)
+            .unwrap();
+        let error = stream
+            .stream(&ModelRequest::new(&config, &messages), &mut |_| {})
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                LlmError::Throttled {
+                    retry_after_ms: Some(7_000),
+                    ..
+                }
+            ),
+            "{p:?}: {error:?}"
+        );
+        assert_eq!(crate::retry_after_ms(&error), Some(7_000));
+        assert_eq!(
+            crate::retry_cause(&error),
+            Some(crate::RetryCause::RateLimited)
+        );
+    }
+}
+
 #[tokio::test]
 async fn failures_keep_their_classification() {
     for p in ALL {

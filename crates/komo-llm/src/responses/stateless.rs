@@ -183,6 +183,7 @@ impl OpenAiResponsesLlm {
     ) -> Result<AssistantMessage, LlmError> {
         let response = self.transport.post(http).await.map_err(transport_error)?;
         let status = response.status;
+        let retry_after_ms = response.retry_after_ms;
         if !(200..300).contains(&status) {
             let mut body = response.body;
             let mut bytes = Vec::new();
@@ -208,10 +209,11 @@ impl OpenAiResponsesLlm {
                 String::from_utf8_lossy(&bytes).into_owned()
             };
             // §13.3：模型 400 不触发静默删参重试。
-            return Err(LlmError::Rejected {
+            return Err(crate::http_error(
                 status,
-                message: wire::error_message(status, &text),
-            });
+                wire::error_message(status, &text),
+                retry_after_ms,
+            ));
         }
 
         let mut stream = response.body;

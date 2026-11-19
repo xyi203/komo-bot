@@ -110,7 +110,27 @@ impl HttpRequest {
 /// 响应：状态码 + 还没读的正文流。
 pub struct HttpResponse {
     pub status: u16,
+    /// 响应头里的 `retry-after-ms` / `retry-after`（秒数形式；HTTP 日期形式不认）折成毫秒。
+    pub retry_after_ms: Option<u64>,
     pub body: BoxStream<'static, Result<Vec<u8>, TransportError>>,
+}
+
+/// 从响应头读服务端要求的最短等待：`retry-after-ms`（OpenAI / Azure）优先，其次
+/// `retry-after` 的秒数。HTTP 日期形式不认（要多一个依赖，各家模型 API 都给秒数）。
+pub fn retry_after_ms(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+    let read = |name: &str| {
+        headers
+            .get(name)?
+            .to_str()
+            .ok()?
+            .trim()
+            .parse::<f64>()
+            .ok()
+            .filter(|value| value.is_finite() && *value >= 0.0)
+    };
+    read("retry-after-ms")
+        .map(|ms| ms.ceil() as u64)
+        .or_else(|| read("retry-after").map(|secs| (secs * 1000.0).ceil() as u64))
 }
 
 impl fmt::Debug for HttpResponse {
@@ -197,6 +217,7 @@ async fn send(
         .map_err(|_| TransportError::Timeout)?
         .map_err(map_reqwest)?;
     let status = response.status().as_u16();
+    let retry_after_ms = retry_after_ms(response.headers());
     let timeout = request.timeout;
     let stream = response.bytes_stream();
     let body =
@@ -230,7 +251,11 @@ async fn send(
             }
         })
         .boxed();
-    Ok(HttpResponse { status, body })
+    Ok(HttpResponse {
+        status,
+        retry_after_ms,
+        body,
+    })
 }
 
 fn map_reqwest(error: reqwest::Error) -> TransportError {
@@ -332,6 +357,8 @@ pub(crate) mod testing {
     #[derive(Debug, Clone)]
     pub struct Reply {
         pub status: u16,
+        /// 响应头里的 Retry-After（毫秒）；脚本里要测限流退避时才给。
+        pub retry_after_ms: Option<u64>,
         /// 按到达顺序切好的字节段——半帧、跨帧的拼接都靠它模拟。
         pub chunks: Vec<Vec<u8>>,
     }
@@ -341,6 +368,7 @@ pub(crate) mod testing {
         pub fn raw(status: u16, frames: &[String]) -> Self {
             Reply {
                 status,
+                retry_after_ms: None,
                 chunks: frames.iter().map(|f| f.as_bytes().to_vec()).collect(),
             }
         }
@@ -348,6 +376,7 @@ pub(crate) mod testing {
         pub fn json(status: u16, body: &str) -> Self {
             Reply {
                 status,
+                retry_after_ms: None,
                 chunks: vec![body.as_bytes().to_vec()],
             }
         }
@@ -407,10 +436,12 @@ pub(crate) mod testing {
             state.seen.push(request);
             let reply = state.replies.get(index).cloned().unwrap_or(Reply {
                 status: 500,
+                retry_after_ms: None,
                 chunks: vec!["脚本演完了".as_bytes().to_vec()],
             });
             Ok(HttpResponse {
                 status: reply.status,
+                retry_after_ms: reply.retry_after_ms,
                 body: stream::iter(reply.chunks.into_iter().map(Ok)).boxed(),
             })
         }
@@ -473,5 +504,21 @@ mod tests {
 
         assert_eq!(transport.bodies().len(), 2);
         assert_eq!(transport.bodies()[1]["n"], serde_json::json!(2));
+    }
+    #[test]
+    fn retry_after_reads_milliseconds_first_then_seconds() {
+        use reqwest::header::{HeaderMap, HeaderValue};
+        let mut headers = HeaderMap::new();
+        assert_eq!(retry_after_ms(&headers), None);
+        headers.insert("retry-after", HeaderValue::from_static("12"));
+        assert_eq!(retry_after_ms(&headers), Some(12_000));
+        headers.insert("retry-after-ms", HeaderValue::from_static("1500"));
+        assert_eq!(retry_after_ms(&headers), Some(1_500), "the ms header wins");
+        let mut dated = HeaderMap::new();
+        dated.insert(
+            "retry-after",
+            HeaderValue::from_static("Wed, 21 Oct 2015 07:28:00 GMT"),
+        );
+        assert_eq!(retry_after_ms(&dated), None, "HTTP dates are not read");
     }
 }

@@ -66,6 +66,9 @@ use crate::durable::runtime::TaskRuntime;
 use crate::durable::tx::{DraftHead, EntryDraft, Ownership, TaskOptions, Tx};
 use komo_llm::{ModelRequest, RequestOptions, retry_cause};
 
+/// 退化的摘要最多要几次（含第一次）：再短就按失败收场，不吃满整个重试预算。
+const SHORT_SUMMARY_ATTEMPTS: u32 = 3;
+
 /// 为什么压。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -118,6 +121,12 @@ pub struct SummaryRequest {
     pub model: ModelConfig,
     pub system: String,
     pub instructions: String,
+    /// 压缩钩子给的 `SummaryPrompt::footer`：钉在 checkpoint 里，重启后落下的摘要 entry 不变。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub footer: Option<String>,
+    /// 压缩钩子给的 `SummaryPrompt::min_chars`（0 = 不设闸）。
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub min_chars: usize,
     pub retry: RetryPolicy,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_key: Option<String>,
@@ -159,6 +168,10 @@ fn input_of(task: &RunningTask) -> Result<Input, TaskError> {
 }
 
 /// 摘要请求允许的输出上限：`reserve` 的八成（pi 的 `0.8 * reserveTokens`）。
+fn is_zero(value: &usize) -> bool {
+    *value == 0
+}
+
 fn max_summary_tokens(setup: &CompactionSetup) -> u32 {
     (setup.settings.economics.window_reserve_tokens as f64 * 0.8) as u32
 }
@@ -222,6 +235,8 @@ impl CompactionTask {
             model: setup.model.clone(),
             system: setup.prompt.system.clone(),
             instructions: setup.prompt.instructions.clone(),
+            footer: setup.prompt.footer.clone(),
+            min_chars: setup.prompt.min_chars,
             retry: setup.retry,
             cache_key: setup.cache_key.clone(),
             max_tokens: Some(max_summary_tokens(&setup)),
@@ -301,7 +316,27 @@ impl CompactionTask {
         };
         match result {
             Ok(message) => match summary_text(&message) {
-                Some(summary) => self.place(rt, input, request, summary).await,
+                // 摘要短得不像话（退化的回复）：按临时失败退避再要，最多要 [`SHORT_SUMMARY_ATTEMPTS`] 次。
+                // 能进压缩的那一段至少有 `memo_tokens` 那么长，正常摘要远不止这几个字。
+                Some(summary) if summary.chars().count() < request.min_chars => {
+                    let text = format!(
+                        "Summarization produced a degenerate summary ({} chars)",
+                        summary.chars().count()
+                    );
+                    if request.attempt < SHORT_SUMMARY_ATTEMPTS
+                        && request.retry.allows_another(request.attempt)
+                    {
+                        return self.back_off(rt, request, text).await;
+                    }
+                    self.fail(rt, input.reason, "model_error", text).await
+                }
+                Some(summary) => {
+                    let summary = match &request.footer {
+                        Some(footer) => format!("{summary}\n\n{footer}"),
+                        None => summary,
+                    };
+                    self.place(rt, input, request, summary).await
+                }
                 None => {
                     let text = summary_failure(&message);
                     self.fail(rt, input.reason, "model_error", text).await

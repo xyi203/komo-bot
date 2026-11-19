@@ -929,6 +929,7 @@ struct HookState {
     compaction_enabled: bool,
     /// 先放过这么多次 `compaction()`，再失败一次。
     compaction_failure: Option<(usize, HookError)>,
+    summary_prompt: Option<SummaryPrompt>,
     /// `komo.task` 里的 alias → 模型配置（gateway 的 `setup` 按名字解析的替身）。
     aliases: std::collections::HashMap<String, ModelConfig>,
     storage: Option<Arc<dyn Storage>>,
@@ -975,6 +976,7 @@ impl TestHooks {
                 compaction: None,
                 compaction_enabled: false,
                 compaction_failure: None,
+                summary_prompt: None,
                 aliases: std::collections::HashMap::new(),
                 storage: None,
                 setups: Vec::new(),
@@ -1034,6 +1036,11 @@ impl TestHooks {
         let mut state = self.state.lock().unwrap();
         state.compaction_enabled = enabled;
         state.compaction = Some(settings);
+    }
+
+    /// 摘要提示（没调就是 `SummaryPrompt::default()`：没有尾注、不设最短字数）。
+    pub fn set_summary_prompt(&self, prompt: SummaryPrompt) {
+        self.state.lock().unwrap().summary_prompt = Some(prompt);
     }
 
     /// 工具结果的投影设置（衰减策略在里面）。
@@ -1128,7 +1135,7 @@ impl AgentHooks for TestHooks {
             enabled: state.compaction_enabled,
             settings: state.compaction.clone().unwrap_or_default(),
             model: setup.model,
-            prompt: SummaryPrompt::default(),
+            prompt: state.summary_prompt.clone().unwrap_or_default(),
             retry: setup.budget.retry,
             cache_key: setup.cache_key,
         })

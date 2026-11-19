@@ -160,6 +160,12 @@ pub struct SeqRange {
 pub enum LlmError {
     #[error("请求被拒绝（{status}）：{message}")]
     Rejected { status: u16, message: String },
+    /// 429，带服务端给的 `Retry-After`（毫秒，没给就是 `None`）：退避至少等这么久。
+    #[error("请求被限流（429）：{message}")]
+    Throttled {
+        message: String,
+        retry_after_ms: Option<u64>,
+    },
     #[error("超时")]
     Timeout,
     #[error("收到数据后超时")]

@@ -159,6 +159,17 @@ pub(crate) async fn completed_text(
 
 async fn answer_text(core: &DurableCore, entry: EntryId) -> Option<String> {
     let stored = core.storage.entry(entry).await.ok()??;
+    // 续写收尾的回答：整段正文在 `data.text`（被输出上限截断的几段 + 最后一段）。
+    if let Some(text) = stored
+        .entry
+        .data
+        .as_ref()
+        .and_then(|data| data.get("text"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|text| !text.trim().is_empty())
+    {
+        return Some(text.to_owned());
+    }
     let text = stored
         .entry
         .model

@@ -128,6 +128,7 @@ pub fn retry_cause(error: &LlmError) -> Option<RetryCause> {
             408 | 409 | 425 => Some(RetryCause::Transport),
             _ => None,
         },
+        LlmError::Throttled { .. } => Some(RetryCause::RateLimited),
         LlmError::Timeout | LlmError::TimeoutAfterData => Some(RetryCause::Transport),
         // 「回复未收齐」——包括流断在终止帧之前。
         LlmError::Incomplete => Some(RetryCause::Transport),
@@ -135,6 +136,26 @@ pub fn retry_cause(error: &LlmError) -> Option<RetryCause> {
         LlmError::UnsupportedEffort { .. } => None,
         // §8.5：结果与用量都未知时保留未知标记，不能当成零，也不能自动再来一次。
         LlmError::Unknown(_) => None,
+    }
+}
+
+/// 服务端要求至少等多久再发（只有 429 带，见 [`LlmError::Throttled`]）。
+pub fn retry_after_ms(error: &LlmError) -> Option<u64> {
+    match error {
+        LlmError::Throttled { retry_after_ms, .. } => *retry_after_ms,
+        _ => None,
+    }
+}
+
+/// 模型接口回了非 2xx：429 带上 `Retry-After` 成 [`LlmError::Throttled`]，其余照旧
+/// [`LlmError::Rejected`]。
+pub(crate) fn http_error(status: u16, message: String, retry_after_ms: Option<u64>) -> LlmError {
+    match status {
+        429 => LlmError::Throttled {
+            message,
+            retry_after_ms,
+        },
+        _ => LlmError::Rejected { status, message },
     }
 }
 
@@ -212,7 +233,8 @@ pub fn is_context_overflow(error: &LlmError) -> bool {
     use grep::matcher::Matcher as _;
     static OVERFLOW: OnceLock<grep::regex::RegexMatcher> = OnceLock::new();
     static NON_OVERFLOW: OnceLock<grep::regex::RegexMatcher> = OnceLock::new();
-    let LlmError::Rejected { message, .. } = error else {
+    // 429 一般是限流，但也有代理把超长报成 429：正文照样过一遍两张表（限流措辞先被排除）。
+    let (LlmError::Rejected { message, .. } | LlmError::Throttled { message, .. }) = error else {
         return false;
     };
     let matches =

@@ -318,6 +318,68 @@ async fn a_retryable_summary_error_backs_off_and_resends_the_same_request() {
     engine.close().await.unwrap();
 }
 
+/// 摘要短于 `min_chars` 当退化的回复：退避再要一次；够长的那份落下，后面接上 `footer`。
+#[tokio::test(start_paused = true)]
+async fn a_degenerate_summary_is_asked_again_and_the_footer_follows_the_summary() {
+    let world = World::new();
+    readers(&world, 2000);
+    windowed(&world, 1100);
+    world.hooks.set_compaction(true, settings(1, 100, 50));
+    world.hooks.set_summary_prompt(SummaryPrompt {
+        footer: Some("（原文在会话记录里）".into()),
+        min_chars: 10,
+        ..SummaryPrompt::default()
+    });
+    world.script.push(call(&world, "c1", "read"));
+    world.script.push(call(&world, "c2", "rg"));
+    world.script.push_summary(Step::Reply(text_reply("短")));
+    world
+        .script
+        .push_summary(Step::Reply(text_reply("读过 a 与 b，正在收尾。")));
+    world.script.push(say(&world, "done"));
+    let engine = world.open().await;
+    let id = world.submit(&engine, "go").await;
+    world.harness.wait(&engine, id).await.unwrap();
+
+    assert_eq!(world.script.summary_requests().len(), 2);
+    let entries = world.entries_of(COMPACTION_ENTRY_KIND).await;
+    assert_eq!(entries.len(), 1);
+    let text = text_of(&entries[0].model.as_ref().unwrap()[0]);
+    assert!(
+        text.contains("读过 a 与 b，正在收尾。\n\n（原文在会话记录里）"),
+        "{text}"
+    );
+    engine.close().await.unwrap();
+}
+
+/// 退化的摘要不吃满整个重试预算：第三次还短就按失败收场。
+#[tokio::test(start_paused = true)]
+async fn a_summary_that_stays_degenerate_fails_after_three_attempts() {
+    let world = World::new();
+    readers(&world, 2000);
+    windowed(&world, 1100);
+    world.hooks.set_compaction(true, settings(1, 100, 50));
+    world.hooks.set_summary_prompt(SummaryPrompt {
+        min_chars: 10,
+        ..SummaryPrompt::default()
+    });
+    world.script.push(call(&world, "c1", "read"));
+    world.script.push(call(&world, "c2", "rg"));
+    for _ in 0..3 {
+        world.script.push_summary(Step::Reply(text_reply("短")));
+    }
+    world.script.push(say(&world, "done"));
+    let engine = world.open().await;
+    let id = world.submit(&engine, "go").await;
+    world.harness.wait(&engine, id).await.unwrap();
+
+    assert_eq!(world.script.summary_requests().len(), 3);
+    assert!(world.entries_of(COMPACTION_ENTRY_KIND).await.is_empty());
+    let compaction = world.tasks(COMPACTION_KIND).await.pop().unwrap();
+    assert!(matches!(outcome(&compaction), TaskOutcome::Failed { .. }));
+    engine.close().await.unwrap();
+}
+
 // ------------------------------------------------------------------ 后台压缩
 
 /// pi §8.3：到了后台阈值，同一次提交里建一个 conversation 所有的后台压缩，不等它——这一轮

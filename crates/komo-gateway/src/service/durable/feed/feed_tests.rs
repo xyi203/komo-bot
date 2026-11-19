@@ -228,6 +228,7 @@ async fn write_live(
                         tokens: 0,
                         started_at: 0,
                         truncations: 0,
+                        continued: Vec::new(),
                     }),
                     generation: Some(GenerationLive {
                         attempt: 1,

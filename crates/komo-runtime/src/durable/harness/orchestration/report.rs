@@ -107,6 +107,15 @@ fn facts(run: &live::RunControl, now: i64, continued: bool) -> String {
 }
 
 fn answer_text(entry: &EntryRecord) -> String {
+    // 续写收尾的回答：整段正文在 `data.text`（前面被截断的几段 + 这一段，`generation::answer`）。
+    if let Some(text) = entry
+        .data
+        .as_ref()
+        .and_then(|data| data.get("text"))
+        .and_then(serde_json::Value::as_str)
+    {
+        return text.to_owned();
+    }
     entry
         .model
         .iter()

@@ -19,6 +19,7 @@
 
 use std::sync::Arc;
 
+use komo_agent::context::compaction::SUMMARY_FOOTER;
 use komo_gateway::service::test_support::harness::{
     FakeLlm, Home, call_round, config_toml, text_round,
 };
@@ -106,7 +107,7 @@ async fn window_protection_compacts_and_the_run_goes_on_with_task_summary_tail()
         std::fs::write(home.workspace().join(format!("big{n}.txt")), lines).expect("写文件");
     }
     let read = |n: u32| serde_json::json!({ "path": format!("big{n}.txt") });
-    let summary = "摘要：读过 big1–big4，内容是编号行。";
+    let summary = "摘要：\n1. 任务与意图：把五个大文件读一遍，最后跑一条命令。\n2. 用户说过的话：「把五个大文件读一遍，最后跑一条命令」。\n3. 关键事实：big1–big4 已读，内容是编号行（形如 1-0000 xxx），每个文件 600 行。\n4. 改动与产出：无。\n5. 错误与修复：无。\n6. 已完成与验证：big1–big4 读完，行号连续。\n7. 待办：读 big5，然后跑那条命令。\n8. 当前进行到哪：正在读 big5。\n9. 下一步：读完 big5 后跑命令。";
     let mut first = Vec::new();
     for n in 1..=READS {
         first.push(call_round(n, &format!("pc-r{n}"), "read", read(n)));
@@ -159,6 +160,7 @@ async fn window_protection_compacts_and_the_run_goes_on_with_task_summary_tail()
         panic!("{recorded:?}");
     };
     assert_eq!(decision.reason, CompactionReason::WindowProtection);
+    let summary = &format!("{summary}\n\n{SUMMARY_FOOTER}");
     assert_eq!(written, summary);
     let rounds: Vec<_> = events
         .iter()
@@ -272,7 +274,10 @@ async fn run_into_overflow(
             call_round(2, "pc-r2", "read", read(2)),
             too_long(),
         ],
-        vec![text_round(1, "摘要：读过 big1，内容是编号行。")],
+        vec![text_round(
+            1,
+            "摘要：\n1. 任务与意图：把两个大文件读一遍。\n2. 用户说过的话：「把两个大文件读一遍」。\n3. 关键事实：big1 已读，内容是编号行（形如 1-0000 xxx），共 600 行。\n4. 改动与产出：无。\n5. 错误与修复：上下文超长，强制压缩了一次。\n6. 已完成与验证：big1 读完，行号连续。\n7. 待办：读 big2。\n8. 当前进行到哪：正在读 big2。\n9. 下一步：读完 big2 后收尾，向用户报告。",
+        )],
         after_summary,
     ]);
     let gateway = home.start(Arc::clone(&llm)).await;

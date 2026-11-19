@@ -90,6 +90,21 @@ const MAX_TRUNCATIONS: u32 = 2;
 /// 截断的回复里每个调用的错误结果：模型看到的文字。
 const TRUNCATED_CALL: &str = "这次回复超出了输出上限被截断，调用参数未收齐，没有执行。请重新发出这个调用；内容很长时拆成几次。";
 
+/// 服务端 `Retry-After` 最多照着等多久（10 分钟）。
+const MAX_RETRY_AFTER_MS: u64 = 600_000;
+
+/// 纯文字回复连续被截断几次之内接着写；再截断就按 [`TRUNCATED`] 失败。长报告、大段代码一次
+/// 写不完是输出上限的事，压缩救不回来，续写救得回来。
+const MAX_CONTINUATIONS: u32 = 3;
+
+/// 续写时补给模型的那句话（`komo.continue` entry 的 user 消息）。
+const CONTINUE_PROMPT: &str = "（这条是 komo 自动发的，不是用户说的。）你上一条回复超出了单次输出上限，在中途被截断了。\
+从断开的地方直接接着写：不要重复已经写过的内容，不要加开场白；剩下的内容还很长就写得紧凑些。";
+
+/// 同一个调用（名字与参数都一样）连续出现这么多次，补一句提醒；之后每多这么多次再提醒一次。
+/// 只提醒、不停：总轮数不设上限（§6），停一条 Run 靠取消。
+const NUDGE_AFTER_IDENTICAL_CALLS: usize = 6;
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Limits {
@@ -321,6 +336,18 @@ impl GenerationTask {
             .map_err(|error| TaskError::new(error.to_string()))?;
         let revises = added.iter().any(|draft| !draft.edits.is_empty());
         drafts.extend(added);
+        // 同一个调用原样连发了一串：补一句提醒（只追加，不改前缀）。提醒本身是 user 消息，会
+        // 截断这一串，所以重试再进 `prepare` 不会重复补。
+        if let Some((count, tool)) = identical_streak(&view.messages)
+            && count >= NUDGE_AFTER_IDENTICAL_CALLS
+        {
+            let now = rt.now()?;
+            drafts.push(
+                EntryDraft::new(entries::NUDGE)
+                    .with_model(vec![Message::user(nudge_text(count, &tool), now)])
+                    .with_data(json!({ "count": count, "tool": tool })),
+            );
+        }
 
         // 压缩判断（spec §8.3 / §8.7）：这个生成还没等过压缩才判。
         let mut revised_from = revises
@@ -665,7 +692,11 @@ impl GenerationTask {
                         .retry_truncated_calls(rt, request, message, calls)
                         .await;
                 }
-                // 不带调用的截断：这一条不进之后的上下文，任务失败。
+                // 有字的截断：落账、补一句"接着写"，交给下一个生成（次数用完在里面按失败收场）。
+                if answer_said(&message) {
+                    return self.continue_truncated_answer(rt, request, message).await;
+                }
+                // 只有思考、没有字的截断：这一条不进之后的上下文，任务失败。
                 let mut message = message;
                 message.stop_reason = StopReason::Error;
                 message
@@ -756,7 +787,103 @@ impl GenerationTask {
                     run.rounds += 1;
                     run.tokens += spent;
                     run.truncations += 1;
+                    run.continued.clear();
                     // 同正常工具轮：回复已落账、调用不执行，token 超了就以 `budget` 收场。
+                    if let Some(limit) = max_tokens
+                        && run.tokens > limit
+                    {
+                        let text = format!("超过 token 预算（{limit}）");
+                        report::end_run_abnormal(
+                            tx,
+                            &this,
+                            conversation,
+                            &mut live,
+                            task.id(),
+                            &unanswered("budget", Some(&text)),
+                            boundary,
+                        )
+                        .await?;
+                        live::store(tx, conversation, &live).await?;
+                        return Ok(Some(failed(text, "budget", None)));
+                    }
+                }
+                live.generation = None;
+                hand_to_next_generation(
+                    tx,
+                    &this,
+                    conversation,
+                    &mut live,
+                    task.id(),
+                    &mut boundary,
+                )
+                .await?;
+                live::store(tx, conversation, &live).await?;
+                Ok(Some(completed(json!({ "entryId": entry.id }))))
+            })
+        })
+        .await?;
+        Ok(())
+    }
+
+    /// 有字的回复被输出上限截断：这条 assistant entry 照常落账（进之后的上下文），后面补一条
+    /// `komo.continue`（"接着写"），同一次提交里交给下一个生成。连续 [`MAX_CONTINUATIONS`] 次之后
+    /// 再截断就失败。截断的几段记在 `RunControl::continued`，最终回答收尾时接成整段正文
+    /// （[`GenerationTask::answer`]）。
+    async fn continue_truncated_answer(
+        &self,
+        rt: &TaskRuntime,
+        request: &RequestCheckpoint,
+        message: AssistantMessage,
+    ) -> Result<(), TaskError> {
+        let conversation = rt.conversation();
+        let spent = spent(&usage_of(&message));
+        let max_tokens = request.limits.max_tokens;
+        let this = self.clone();
+        let modes = self.modes();
+        rt.commit(move |tx, task| {
+            Box::pin(async move {
+                // 表读先于第一次表写。
+                let mut boundary = inbox::prepare_boundary(tx, conversation, modes).await?;
+                let mut live = live::load(tx, conversation).await?;
+                let given_up = live.run.as_ref().is_some_and(|run| {
+                    run.task == task.id() && run.truncations >= MAX_CONTINUATIONS
+                });
+                if given_up {
+                    let mut message = message;
+                    message.stop_reason = StopReason::Error;
+                    message
+                        .extra
+                        .insert("errorMessage".into(), json!(TRUNCATED));
+                    append_assistant(tx, conversation, message).await?;
+                    report::end_run_abnormal(
+                        tx,
+                        &this,
+                        conversation,
+                        &mut live,
+                        task.id(),
+                        &unanswered("model_error", Some(TRUNCATED)),
+                        boundary,
+                    )
+                    .await?;
+                    live::store(tx, conversation, &live).await?;
+                    return Ok(Some(failed(TRUNCATED.to_owned(), "model_error", None)));
+                }
+                let entry = append_assistant(tx, conversation, message).await?;
+                let now = tx.now();
+                tx.append_entry(
+                    conversation,
+                    EntryDraft::new(entries::CONTINUE)
+                        .with_model(vec![Message::user(CONTINUE_PROMPT, now)])
+                        .with_data(json!({ "after": entry.id })),
+                )
+                .await?;
+                if let Some(run) = live.run.as_mut()
+                    && run.task == task.id()
+                {
+                    run.rounds += 1;
+                    run.tokens += spent;
+                    run.truncations += 1;
+                    run.continued.push(entry.id);
                     if let Some(limit) = max_tokens
                         && run.tokens > limit
                     {
@@ -831,7 +958,13 @@ impl GenerationTask {
             let conversation = rt.conversation();
             let attempt = request.attempt;
             let compacted = request.compacted;
-            let until = rt.now()? + request.limits.retry.delay_ms(attempt) as i64;
+            // 429 带了 Retry-After 就至少等它要的那么久（封顶 [`MAX_RETRY_AFTER_MS`]，免得一个
+            // 离谱的值把 run 挂上几个小时）；没带照指数退避。
+            let wait = komo_llm::retry_after_ms(&error)
+                .map(|ms| ms.min(MAX_RETRY_AFTER_MS))
+                .unwrap_or(0)
+                .max(request.limits.retry.delay_ms(attempt));
+            let until = rt.now()? + wait as i64;
             tracing::warn!(attempt, until, %error, "模型请求失败，持久化退避后再试");
             return rt
                 .commit(move |tx, _| {
@@ -955,7 +1088,27 @@ impl GenerationTask {
                     true => session_of(tx, conversation).await?,
                     false => None,
                 };
-                let entry = append_assistant(tx, conversation, message).await?;
+                // 续写收尾：前面被截断的几段（表读，先于第一次表写）接上这一段，整段正文记进回答
+                // entry 的 `data.text`——渠道投递、任务交回只读回答这一条 entry。
+                let continued = live
+                    .run
+                    .as_ref()
+                    .filter(|run| run.task == task.id())
+                    .map(|run| run.continued.clone())
+                    .unwrap_or_default();
+                let mut whole = String::new();
+                for id in &continued {
+                    if let Some(part) = tx.entry(*id).await? {
+                        whole.push_str(&entry_text(&part));
+                    }
+                }
+                let entry = if continued.is_empty() {
+                    append_assistant(tx, conversation, message).await?
+                } else {
+                    whole.push_str(&message_text(&message));
+                    let data = json!({ "continued": continued, "text": whole });
+                    entries::append_assistant_with_data(tx, conversation, message, data).await?
+                };
                 if let Some(mut record) = session {
                     record.last_message_at = now;
                     tx.put_session(record);
@@ -1015,6 +1168,7 @@ impl GenerationTask {
                     run.rounds += 1;
                     run.tokens += spent;
                     run.truncations = 0;
+                    run.continued.clear();
                     if let Some(limit) = max_tokens
                         && run.tokens > limit
                     {
@@ -1253,6 +1407,78 @@ fn answer_said(message: &AssistantMessage) -> bool {
         .any(|block| matches!(block, ContentBlock::Text { text, .. } if !text.trim().is_empty()))
 }
 
+/// 上下文末尾连续几个一模一样的调用（名字与参数都相同），和那个工具名。从后往前数：工具结果与
+/// system 消息跳过；一条没有调用的 assistant 回复、或任何别的消息（用户输入、插话、提醒本身）
+/// 都截断这一串。
+fn identical_streak(messages: &[Message]) -> Option<(usize, String)> {
+    let mut first: Option<(&str, &serde_json::Value)> = None;
+    let mut count = 0;
+    for message in messages.iter().rev() {
+        let assistant = match message {
+            Message::ToolResult(_) | Message::System(_) => continue,
+            Message::Assistant(assistant) => assistant,
+            _ => break,
+        };
+        let mut calls = assistant
+            .content
+            .iter()
+            .rev()
+            .filter_map(|block| match block {
+                ContentBlock::ToolCall {
+                    name, arguments, ..
+                } => Some((name.as_str(), arguments)),
+                _ => None,
+            })
+            .peekable();
+        if calls.peek().is_none() {
+            break;
+        }
+        for call in calls {
+            match first {
+                None => first = Some(call),
+                Some(seen) if seen == call => {}
+                Some((name, _)) => return Some((count, name.to_owned())),
+            }
+            count += 1;
+        }
+    }
+    first.map(|(name, _)| (count, name.to_owned()))
+}
+
+/// 连发提醒的正文。
+fn nudge_text(count: usize, tool: &str) -> String {
+    format!(
+        "（这条是 komo 自动发的，不是用户说的。）你已经连续 {count} 次用完全相同的参数调用 `{tool}`，\
+         再发一次结果也不会变。如果是在等某件事发生，改用 `monitor` 挂监听；否则换个办法，\
+         或者停下来说明卡在哪里、需要什么。"
+    )
+}
+
+/// 一条 assistant 消息的正文（文字块直接相连：续写是从断开处接着写的）。
+fn message_text(message: &AssistantMessage) -> String {
+    message
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Text { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// 一条 assistant entry 的正文（[`message_text`]）；不是 assistant entry 就是空的。
+fn entry_text(entry: &EntryRecord) -> String {
+    entry
+        .model
+        .iter()
+        .flatten()
+        .find_map(|message| match message {
+            Message::Assistant(message) => Some(message_text(message)),
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
 /// conversation 所在的 Session 行（还没有行的测试 conversation 是 `None`）。
 async fn session_of(
     tx: &mut crate::durable::tx::Tx,
@@ -1284,8 +1510,13 @@ fn pending_of(message: Option<&AssistantMessage>, pending: &[String]) -> Vec<(St
         .collect()
 }
 
-/// 下一组有几个调用：第一个是只读的，就连同后面连续的只读调用一起（同时在飞）；否则它自成
-/// 一组。只读与否看工具名与这个调用的参数（`komo` 一个工具里既有读也有写）。
+/// 一组只读调用最多同时在飞几个；再多的排进下一组（模型一轮发几十个 `read` / `rg` 时
+/// 不一下子全压上去）。
+const MAX_PARALLEL_CALLS: usize = 10;
+
+/// 下一组有几个调用：第一个是只读的，就连同后面连续的只读调用一起（同时在飞，至多
+/// [`MAX_PARALLEL_CALLS`] 个）；否则它自成一组。只读与否看工具名与这个调用的参数（`komo`
+/// 一个工具里既有读也有写）。
 fn group_len(
     tools: &ToolSet,
     calls: &[(String, String)],
@@ -1312,7 +1543,11 @@ fn group_len(
     if !parallel(first) {
         return 1;
     }
-    calls.iter().take_while(|call| parallel(call)).count()
+    calls
+        .iter()
+        .take_while(|call| parallel(call))
+        .take(MAX_PARALLEL_CALLS)
+        .count()
 }
 
 /// 建一组工具任务，由生成任务拥有；返回任务 ID，按调用顺序。

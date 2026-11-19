@@ -35,6 +35,11 @@ pub const ASSISTANT: &str = "komo.assistant";
 pub const TOOL_RESULT: &str = "komo.tool-result";
 pub const RESET: &str = "komo.reset";
 pub const SETTLED: &str = "komo.settled";
+/// 纯文字回复被输出上限截断之后，生成自己补的"接着写"（user 消息）。占 `komo.` 前缀：消息列表与
+/// 会话树都不把它当成用户说的话。
+pub const CONTINUE: &str = "komo.continue";
+/// 同一组调用连续原样重发时，生成补的一句提醒（user 消息），`data.count` = 提醒时连续了几次。
+pub const NUDGE: &str = "komo.nudge";
 pub use komo_kernel::durable::context::SYSTEM_ENTRY_KIND as SYSTEM;
 
 /// 输入放置成的 entry：`entry` 给了的 kind 与 data，或 `komo.user`；`model` 是 `content`
@@ -84,6 +89,22 @@ pub async fn append_assistant(
     tx.append_entry(
         conversation,
         EntryDraft::new(ASSISTANT).with_model(vec![Message::Assistant(message)]),
+    )
+    .await
+}
+
+/// 同 [`append_assistant`]，另带 `data`（续写收尾的最终回答带上整段正文）。
+pub async fn append_assistant_with_data(
+    tx: &mut Tx,
+    conversation: ConversationId,
+    message: AssistantMessage,
+    data: serde_json::Value,
+) -> Result<EntryRecord, DurableError> {
+    tx.append_entry(
+        conversation,
+        EntryDraft::new(ASSISTANT)
+            .with_model(vec![Message::Assistant(message)])
+            .with_data(data),
     )
     .await
 }

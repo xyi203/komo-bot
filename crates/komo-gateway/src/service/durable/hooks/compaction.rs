@@ -2,10 +2,11 @@
 //!
 //! - 开关与阈值每次读**当前**快照（热重载）；`[compaction] background_tokens` 是新存储 harness
 //!   才有的后台阈值（0 = 不启用）。
-//! - 摘要提示用 komo-agent 的 [`SUMMARY_INSTRUCTIONS`]（旧在线压缩的同一份）。
+//! - 摘要提示用 komo-agent 的 [`SUMMARY_INSTRUCTIONS`]（旧在线压缩的同一份），摘要后面接
+//!   [`SUMMARY_FOOTER`]（原文去哪找回），短于 [`SUMMARY_MIN_CHARS`] 的摘要当退化回复再要。
 //! - 摘要用这一轮的模型（同旧实现：压缩请求与它压的那条会话同一个模型与缓存键）。
 
-use komo_agent::context::compaction::SUMMARY_INSTRUCTIONS;
+use komo_agent::context::compaction::{SUMMARY_FOOTER, SUMMARY_INSTRUCTIONS, SUMMARY_MIN_CHARS};
 use komo_kernel::protocol::config::ConfigSnapshot;
 use komo_runtime::durable::harness::{CompactionSettings, CompactionSetup, SummaryPrompt};
 
@@ -24,6 +25,8 @@ pub(super) fn build(config: &ConfigSnapshot, resolved: &Resolved) -> CompactionS
         prompt: SummaryPrompt {
             system: SUMMARY_INSTRUCTIONS.to_owned(),
             instructions: SUMMARY_REQUEST.to_owned(),
+            footer: Some(SUMMARY_FOOTER.to_owned()),
+            min_chars: SUMMARY_MIN_CHARS,
         },
         retry: resolved.budget.retry,
         cache_key: Some(resolved.cache_key.clone()),

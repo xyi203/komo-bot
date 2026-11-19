@@ -50,6 +50,12 @@ impl Default for CompactionSettings {
 pub struct SummaryPrompt {
     pub system: String,
     pub instructions: String,
+    /// 接在摘要正文后面的一段固定说明（比如"压缩前的原文去哪找回"）；摘要模型不写它。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub footer: Option<String>,
+    /// 摘要少于这么多字就当退化的回复，退避再要（0 = 不设这道闸）。
+    #[serde(default)]
+    pub min_chars: usize,
 }
 
 const SUMMARIZATION_SYSTEM_PROMPT: &str = "You are a context summarization assistant. Your task is to read a conversation between a user and an AI assistant, then produce a structured summary following the exact format specified.\n\nDo NOT continue the conversation. Do NOT respond to any questions in the conversation. ONLY output the structured summary.";
@@ -62,6 +68,8 @@ impl Default for SummaryPrompt {
         Self {
             system: SUMMARIZATION_SYSTEM_PROMPT.to_owned(),
             instructions: SUMMARIZATION_PROMPT.to_owned(),
+            footer: None,
+            min_chars: 0,
         }
     }
 }

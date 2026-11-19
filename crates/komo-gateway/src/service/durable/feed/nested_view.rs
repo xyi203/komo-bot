@@ -258,6 +258,7 @@ mod tests {
                 tokens: 0,
                 started_at: 0,
                 truncations: 0,
+                continued: Vec::new(),
             }),
             tools: Some(vec![slot("m1", "codemode", 9, SlotStatus::Running)]),
             nested_tools: Some(nested),

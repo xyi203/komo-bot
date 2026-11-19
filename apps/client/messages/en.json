@@ -1209,5 +1209,12 @@
   "mcp_login": "Sign in",
   "mcp_login_waiting": "The authorization page opened in a new window; this updates automatically once you finish.",
   "mcp_login_blocked": "The browser blocked the new window; click here to open the authorization page",
-  "mcp_login_failed": "Could not start sign-in: {message}"
+  "mcp_login_failed": "Could not start sign-in: {message}",
+  "memory_provider_error": "Couldn't reach {provider}: {message}",
+  "memory_provider_kind_experience": "Experience",
+  "memory_provider_kind_observation": "Observation",
+  "memory_provider_kind_world": "Fact",
+  "memory_provider_none": "Nothing stored here yet",
+  "memory_provider_primary": "Read-only · in use: relevant clues are recalled from here",
+  "memory_provider_shadow": "Read-only · shadow mode: recorded for comparison, not brought into chats"
 }

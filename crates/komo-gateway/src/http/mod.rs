@@ -145,6 +145,7 @@ fn shared_routes() -> Router<Api> {
         .route("/v1/memories/{id}/restore", post(memories::restore))
         .route("/v1/memory-sweep", post(memories::sweep))
         .route("/v1/memory-consolidate", post(memories::consolidate))
+        .route("/v1/memory-provider", get(memories::provider))
         .route("/v1/memory-index", get(memories::index))
         .route("/v1/memory-index/rebuild", post(memories::rebuild))
         .route("/v1/matters", get(matters::list).post(matters::add))

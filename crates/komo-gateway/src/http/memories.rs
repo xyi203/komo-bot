@@ -17,10 +17,12 @@ use komo_kernel::protocol::http::{
     ConsolidateGroupStatus, ConsolidateOutcome, MemoryAddRequest, MemoryAddResponse,
     MemoryClassifyRequest, MemoryConsolidateRequest, MemoryConsolidateResponse, MemoryDetail,
     MemoryIndexStatus, MemoryListQuery, MemoryListResponse, MemoryRevisionRequest,
-    MemorySweepRequest, MemorySweepResponse, RebuildIndexRequest, RebuildIndexResponse,
+    MemorySweepRequest, MemorySweepResponse, ProviderMemory, ProviderMemoryList,
+    ProviderMemoryQuery, RebuildIndexRequest, RebuildIndexResponse,
 };
 use komo_kernel::types::ids::{MemoryId, SessionId};
 use komo_kernel::types::memory::{MemoryScope, MemoryState, scope_allowed};
+use komo_memory::provider::ProviderMode;
 use komo_memory::{BelongsChange, MemoryError};
 
 use super::Api;
@@ -107,6 +109,54 @@ pub async fn list(
         mode: Some(result.mode),
         arm_scores: result.arm_scores,
     }))
+}
+
+/// 外部提供方清单一页默认几条、最多几条。
+const PROVIDER_PAGE: u32 = 50;
+const PROVIDER_PAGE_MAX: u32 = 200;
+
+/// `GET /v1/memory-provider`：外部记忆提供方存着的条目（`docs/memory.md` 附录 G.9），记忆页只读展示。没装提供方
+/// 回一个空的；提供方问不通也是 200，原因写在 `error`，不拖累内置记忆那几组。
+pub async fn provider(
+    State(api): State<Api>,
+    Query(query): Query<ProviderMemoryQuery>,
+) -> ApiResult<Json<ProviderMemoryList>> {
+    let limit = query.limit.unwrap_or(PROVIDER_PAGE).min(PROVIDER_PAGE_MAX);
+    let Some(listing) = api
+        .state
+        .memories
+        .provider_list(
+            query.query.as_deref().unwrap_or_default(),
+            limit,
+            query.offset.unwrap_or(0),
+        )
+        .await
+    else {
+        return Ok(Json(ProviderMemoryList::default()));
+    };
+    let mut out = ProviderMemoryList {
+        provider: Some(listing.provider),
+        primary: listing.mode == ProviderMode::Primary,
+        ..ProviderMemoryList::default()
+    };
+    match listing.page {
+        Ok(page) => {
+            out.total = page.total;
+            out.items = page
+                .items
+                .into_iter()
+                .map(|item| ProviderMemory {
+                    id: item.id,
+                    text: item.text,
+                    kind: item.kind,
+                    scope: item.scope,
+                    at: item.at,
+                })
+                .collect();
+        }
+        Err(error) => out.error = Some(error.to_string()),
+    }
+    Ok(Json(out))
 }
 
 /// 这个会话的 Profile 放行哪些记忆作用域：与自动召回同一处判断（`recall_scopes`）。

@@ -1201,5 +1201,12 @@
   "mcp_login": "登录",
   "mcp_login_waiting": "已在新窗口打开授权页，完成后这里会自动更新状态。",
   "mcp_login_blocked": "浏览器拦了新窗口，点这里打开授权页",
-  "mcp_login_failed": "登录没发起：{message}"
+  "mcp_login_failed": "登录没发起：{message}",
+  "memory_provider_error": "{provider} 连不上：{message}",
+  "memory_provider_kind_experience": "经历",
+  "memory_provider_kind_observation": "观察",
+  "memory_provider_kind_world": "事实",
+  "memory_provider_none": "这里还没有条目",
+  "memory_provider_primary": "只读 · 主用：相关线索从这里召回",
+  "memory_provider_shadow": "只读 · 影子模式：只记录对比，不带进对话"
 }

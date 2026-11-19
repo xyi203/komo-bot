@@ -4194,6 +4194,37 @@ impl crate::provider::MemoryProvider for FakeProvider {
         ));
         Ok(())
     }
+
+    async fn list(
+        &self,
+        query: &str,
+        limit: u32,
+        offset: u32,
+    ) -> Result<crate::provider::ProviderPage, crate::provider::ProviderError> {
+        if self.fail {
+            return Err(crate::provider::ProviderError("连不上".into()));
+        }
+        let texts = self.now_texts.lock().expect("假提供方");
+        let matched: Vec<_> = texts
+            .iter()
+            .filter(|(_, text)| text.contains(query))
+            .collect();
+        Ok(crate::provider::ProviderPage {
+            total: matched.len() as u64,
+            items: matched
+                .into_iter()
+                .skip(offset as usize)
+                .take(limit as usize)
+                .map(|(id, text)| crate::provider::ProviderListed {
+                    id: id.clone(),
+                    text: text.clone(),
+                    kind: None,
+                    scope: MemoryScope::Personal,
+                    at: None,
+                })
+                .collect(),
+        })
+    }
 }
 
 fn install(harness: &Harness, provider: &Arc<FakeProvider>, mode: crate::provider::ProviderMode) {
@@ -4203,6 +4234,39 @@ fn install(harness: &Harness, provider: &Arc<FakeProvider>, mode: crate::provide
             provider: Arc::clone(provider) as Arc<dyn crate::provider::MemoryProvider>,
             mode,
         }));
+}
+
+/// 记忆页看外部提供方存了什么（附录 G.9）：没装是 `None`；装了交回名字、用法与一页；问不通如实交回错误，不算这次调用失败。
+#[tokio::test]
+async fn provider_list_pages_through_the_installed_provider() {
+    let harness = HarnessBuilder::new().build().await;
+    assert!(harness.manager.provider_list("", 10, 0).await.is_none());
+
+    let provider = FakeProvider::new(vec![
+        ("x-1", "卧室空调设 27 度"),
+        ("x-2", "客厅空调设 26 度"),
+        ("x-3", "滤网三个月换"),
+    ]);
+    install(&harness, &provider, crate::provider::ProviderMode::Shadow);
+    let listing = harness
+        .manager
+        .provider_list("空调", 1, 1)
+        .await
+        .expect("装了提供方");
+    assert_eq!(listing.provider, "fake");
+    assert_eq!(listing.mode, crate::provider::ProviderMode::Shadow);
+    let page = listing.page.expect("问得通");
+    assert_eq!(page.total, 2);
+    let ids: Vec<&str> = page.items.iter().map(|item| item.id.as_str()).collect();
+    assert_eq!(ids, vec!["x-2"]);
+
+    install(
+        &harness,
+        &FakeProvider::failing(),
+        crate::provider::ProviderMode::Primary,
+    );
+    let listing = harness.manager.provider_list("", 10, 0).await.unwrap();
+    assert!(listing.page.is_err());
 }
 
 /// 影子模式：注入的只有内置那份，外部的召回记进诊断供对比。

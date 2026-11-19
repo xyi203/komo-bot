@@ -1,5 +1,5 @@
-import { memoryVerb, useHomeSession, useMemoriesAll, useMemoryCoverage, useMemoryFind, useSessions } from "@komo/api";
-import type { MemoryItem, SessionSummary } from "@komo/protocol";
+import { memoryVerb, useHomeSession, useMemoriesAll, useMemoryCoverage, useMemoryFind, useProviderMemories, useSessions } from "@komo/api";
+import type { MemoryItem, ProviderMemory, SessionSummary } from "@komo/protocol";
 import { useNavigate } from "@tanstack/react-router";
 import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { Icon } from "@/components/icon";
@@ -38,7 +38,8 @@ const scroller = () => document.querySelector("main");
 
 /**
  * 记忆页（docs/web.md §11，docs/redesign.md §1.5）：一句概况、攒下的记忆图，下面分组——等你过目（记住 / 不用记）、
- * 暂停中、每次都带、相关才带、不再带（收起），最后"记一条"去对话里说。搜索与作用域筛选还在，检索时列表换成命中的几条。
+ * 暂停中、每次都带、相关才带、不再带（收起），装了外部提供方时再加它只读的一组，最后"记一条"去对话里说。
+ * 搜索与作用域筛选还在，检索时列表换成命中的几条（外部那组按正文筛，不受作用域筛选影响）。
  * 点一条进它的详情页（不论窗口宽窄），左上角返回，列表回到原来的滚动位置；选中的 id 在地址里（`/memory/$id`）。
  */
 export function MemoryPage({ selected }: { selected: string | null }) {
@@ -273,6 +274,8 @@ export function MemoryPage({ selected }: { selected: string | null }) {
         </>
       )}
 
+      {ready && !query.isError && <ProviderSection query={debounced} />}
+
       {ready && !query.isError && (
         <section className="mt-10">
           <h2 className="m-0 mb-1 text-section-title font-semibold">{m.memory_tell_title()}</h2>
@@ -297,6 +300,83 @@ export function MemoryPage({ selected }: { selected: string | null }) {
             : ""}
       </p>
     </Page>
+  );
+}
+
+/** Hindsight 的分类名；不认得的原样给。 */
+const providerKinds: Record<string, () => string> = {
+  world: m.memory_provider_kind_world,
+  experience: m.memory_provider_kind_experience,
+  observation: m.memory_provider_kind_observation,
+};
+
+/**
+ * 外部记忆提供方（docs/memory.md 附录 G.9）存着的条目：只读一组，没有确认、遗忘这些动作（要改去提供方那边）。
+ * 主用时它的条目就是"相关才带"的线索（空心环），影子模式只记录对比、不进对话（灰点）。没装提供方整组不出现；
+ * 问不通只在这一组里说，不影响上面内置的几组。
+ */
+function ProviderSection({ query }: { query: string }) {
+  const list = useProviderMemories(query);
+  const first = list.data?.pages[0];
+  if (!first?.provider) return null;
+  const items = list.data?.pages.flatMap((page) => page.items) ?? [];
+  const name = first.provider.charAt(0).toUpperCase() + first.provider.slice(1);
+  return (
+    <section>
+      <GroupLabel tone="plain" count={first.error ? undefined : formatNumber(first.total)} sub={first.primary ? m.memory_provider_primary() : m.memory_provider_shadow()}>
+        {name}
+      </GroupLabel>
+      {first.error ? (
+        <BlockError message={m.memory_provider_error({ provider: name, message: first.error })} onRetry={() => void list.refetch()} />
+      ) : items.length ? (
+        <ul className={listClass}>
+          {items.map((item) => (
+            <ProviderRow key={item.id} item={item} live={first.primary} />
+          ))}
+          {list.hasNextPage && (
+            <li className="py-2">
+              <button
+                type="button"
+                disabled={list.isFetchingNextPage}
+                onClick={() => void list.fetchNextPage()}
+                className="cursor-pointer text-label text-muted hover:text-text disabled:cursor-progress"
+              >
+                {m.memory_show_rest({ count: first.total - items.length })}
+              </button>
+            </li>
+          )}
+        </ul>
+      ) : (
+        <EmptyFrame>{query ? m.memory_none_search() : m.memory_provider_none()}</EmptyFrame>
+      )}
+    </section>
+  );
+}
+
+/** 外部的一条：光点 | 正文与一行灰字（分类、发生时间、非个人的作用域）。不能点。 */
+function ProviderRow({ item, live }: { item: ProviderMemory; live: boolean }) {
+  const sub = [
+    item.kind ? (providerKinds[item.kind]?.() ?? item.kind) : null,
+    item.at ? formatRelative(item.at) : null,
+    scopeName(item.scope) === m.memory_scope_personal() ? null : scopeName(item.scope),
+  ].filter((x): x is string => !!x);
+  return (
+    <li className={cn(rowClass, "grid grid-cols-[16px_minmax(0,1fr)] items-start gap-x-3")}>
+      <MemoryMote kind={live ? "ring" : "off"} className="mt-2 justify-self-center" />
+      <div className="flex min-w-0 flex-col gap-0.5">
+        <span className="leading-6 [overflow-wrap:anywhere]">{item.text}</span>
+        {sub.length > 0 && (
+          <span className="text-small leading-4.5 text-muted">
+            {sub.map((part, i) => (
+              <span key={i}>
+                {i > 0 && <span className="mx-1.5 text-faint">·</span>}
+                {part}
+              </span>
+            ))}
+          </span>
+        )}
+      </div>
+    </li>
   );
 }
 

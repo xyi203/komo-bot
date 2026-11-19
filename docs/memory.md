@@ -1636,3 +1636,20 @@ Gateway 对记忆的调用约 20 个方法，但能换后端的只有热路径�
 - **测试**：`komo-memory` `a_primary_provider_replaces_clue_recall_and_falls_back_when_down`（主用时记下正文、退回内置时不记）；
   `komo-kernel` `a_recall_block_carries_external_texts_onto_its_injection`（旧块被改写后投影仍带正文）、
   `an_old_recall_entry_without_matters_still_parses`（旧 entry 读作空、写回不多出这一项）。
+
+### G.9 记忆页列出外部提供方的条目（2026-11-19）
+
+记忆页只列内置记忆库，装了 Hindsight 也看不到它存了什么。补一个只读的清单，不把它并进内置的分组：两边的状态与操作
+完全不同（确认、分类、遗忘只对内置有意义，见本附录开头），混在一张表里会让人以为外部条目也能这样处理。
+
+- **接缝**：`MemoryProvider::list(query, limit, offset) -> ProviderPage { items, total }`，条目是 `ProviderListed`
+  （id、正文、提供方自己的分类、作用域、发生时刻）。不分作用域——看的是操作者，与内置清单一样列全部。
+  `MemoryManager::provider_list` 交回提供方名、用法与这一页；没装是 `None`，问不通如实放在结果里。
+- **Hindsight**：`GET …/memories/list?state=valid&limit&offset[&q]`，读 `items[]` 的 `fact_type`、`date`（RFC 3339，读不出来
+  留空）、`scope:` 标签与 `total`。`q` 是它的正文子串筛选，自己说明扫全 bank，只给人翻看用。workspace 的 `reqwest`
+  没开 `query` 特性，地址用 `Url::parse_with_params` 拼，不加依赖特性。
+- **Gateway**：`GET /v1/memory-provider?query&limit&offset`（默认 50 条、最多 200）→ `ProviderMemoryList { provider, primary,
+  items, total, error }`。没装提供方回空的（`provider` 缺省）；问不通也是 200，原因在 `error`，记忆页其余部分照常。
+- **界面**：记忆页最下面一组，见 `docs/web.md` §11「外部提供方一组」。
+- **测试**：`komo-gateway` `list_asks_for_valid_facts_and_reads_kind_time_and_scope`（参数、分类、时间、作用域、空查询不带 `q`）；
+  `komo-memory` `provider_list_pages_through_the_installed_provider`（没装、分页与筛选、问不通）。

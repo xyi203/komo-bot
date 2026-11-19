@@ -655,6 +655,23 @@ impl MemoryManager {
         self.provider.read().expect("提供方槽").clone()
     }
 
+    /// 外部提供方存着的条目，一页（记忆页只读展示，附录 G.9）；没装提供方是 `None`。问不通不算这个接口的错，
+    /// 如实放进 [`provider::Listing::page`]，界面照常出内置的那几组。
+    pub async fn provider_list(
+        &self,
+        query: &str,
+        limit: u32,
+        offset: u32,
+    ) -> Option<provider::Listing> {
+        let installed = self.provider()?;
+        let page = installed.provider.list(query, limit, offset).await;
+        Some(provider::Listing {
+            provider: installed.provider.name().to_string(),
+            mode: installed.mode,
+            page,
+        })
+    }
+
     /// 外部提供方召回一次，有时限（同查询向量，§9.4「召回的时限」）。交回结果与耗时。
     async fn external_recall(
         &self,

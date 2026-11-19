@@ -1,9 +1,11 @@
 //! Hindsight（vectorize-io/hindsight，自建服务）作为外部记忆提供方（`docs/memory.md` 附录 G）。
 //!
-//! 用到它的三个接口（按 1.2.1 的 HTTP API，本机实测过形状）：
+//! 用到它的四个接口（按 1.2.1 的 HTTP API，本机实测过形状）：
 //!
 //! - 召回 `POST /v1/default/banks/{bank}/memories/recall`：`results[]` 里有 `id / text / tags / scores.final`；
 //! - 现状 `GET …/memories/{id}`：`state = invalidated` 是作废，404 是删了；
+//! - 清单 `GET …/memories/list?state=valid&limit&offset&q`：`items[]`（多带 `fact_type / date`）与 `total`，记忆页只读展示；
+//!   `q` 是正文子串筛选，它自己说是扫全 bank 的，只给人翻看用；
 //! - 写入 `POST …/memories`：交一段窗口正文，`document_id` 是幂等键（同一个键再交是覆盖），`async = true`
 //!   让它排队提取、立刻返回。bank 不存在时先 `PUT …/banks/{bank}` 建一个（建过的再 PUT 只是更新名字）。
 //!
@@ -17,9 +19,12 @@ use std::time::Duration;
 use async_trait::async_trait;
 use komo_kernel::protocol::config::HindsightConfig;
 use komo_kernel::types::memory::MemoryScope;
-use komo_memory::provider::{EvidenceBatch, MemoryProvider, ProviderError, ProviderHit};
+use komo_memory::provider::{
+    EvidenceBatch, MemoryProvider, ProviderError, ProviderHit, ProviderListed, ProviderPage,
+};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use tokio::sync::OnceCell;
 
@@ -120,6 +125,12 @@ struct Fact {
     /// 只有 `GET memory` 带：`valid` / `invalidated`。
     #[serde(default)]
     state: Option<String>,
+    /// 清单带：`world` / `experience` / `observation`。
+    #[serde(default)]
+    fact_type: Option<String>,
+    /// 清单带：它记下的事发生的时刻（RFC 3339）。
+    #[serde(default)]
+    date: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -129,19 +140,35 @@ struct Scores {
 }
 
 impl Fact {
-    fn into_hit(self) -> ProviderHit {
-        let scope = self
-            .tags
+    /// 写入时打的作用域标签；没有或读不出来按 Personal。
+    fn scope(&self) -> MemoryScope {
+        self.tags
             .iter()
             .flatten()
             .find_map(|tag| tag.strip_prefix("scope:"))
             .and_then(|raw| MemoryScope::from_str(raw).ok())
-            .unwrap_or(MemoryScope::Personal);
+            .unwrap_or(MemoryScope::Personal)
+    }
+
+    fn into_hit(self) -> ProviderHit {
         ProviderHit {
+            scope: self.scope(),
             id: self.id,
             text: self.text,
-            scope,
             score: self.scores.and_then(|scores| scores.total),
+        }
+    }
+
+    fn into_listed(self) -> ProviderListed {
+        ProviderListed {
+            scope: self.scope(),
+            at: self
+                .date
+                .as_deref()
+                .and_then(|date| OffsetDateTime::parse(date, &Rfc3339).ok()),
+            id: self.id,
+            text: self.text,
+            kind: self.fact_type,
         }
     }
 }
@@ -241,6 +268,37 @@ impl MemoryProvider for Hindsight {
             .await?;
         Self::json(response).await.map(|_| ())
     }
+
+    async fn list(
+        &self,
+        query: &str,
+        limit: u32,
+        offset: u32,
+    ) -> Result<ProviderPage, ProviderError> {
+        #[derive(Deserialize)]
+        struct Listed {
+            items: Vec<Fact>,
+            #[serde(default)]
+            total: u64,
+        }
+        let mut params = vec![
+            ("state", "valid".to_string()),
+            ("limit", limit.to_string()),
+            ("offset", offset.to_string()),
+        ];
+        if !query.trim().is_empty() {
+            params.push(("q", query.trim().to_string()));
+        }
+        let url = reqwest::Url::parse_with_params(&format!("{}/memories/list", self.base), &params)
+            .map_err(|error| ProviderError(format!("hindsight 地址拼不成：{error}")))?;
+        let response = self.send(self.http.get(url)).await?;
+        let listed: Listed = serde_json::from_value(Self::json(response).await?)
+            .map_err(|error| ProviderError(format!("hindsight 清单解析不了：{error}")))?;
+        Ok(ProviderPage {
+            items: listed.items.into_iter().map(Fact::into_listed).collect(),
+            total: listed.total,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -249,7 +307,7 @@ mod tests {
 
     use axum::Json;
     use axum::Router;
-    use axum::extract::{Path, State};
+    use axum::extract::{Path, Query, State};
     use axum::http::StatusCode;
     use axum::routing::{get, post, put};
     use komo_kernel::protocol::config::ProviderMode;
@@ -271,6 +329,7 @@ mod tests {
             .route(base, put(bank))
             .route(&format!("{base}/memories"), post(retain))
             .route(&format!("{base}/memories/recall"), post(recall))
+            .route(&format!("{base}/memories/list"), get(list))
             .route(&format!("{base}/memories/{{id}}"), get(memory))
             .with_state(fake.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -303,6 +362,22 @@ mod tests {
             { "id": "b", "text": "私有的", "tags": ["scope:agent:helper"] },
             { "id": "c", "text": "第三条" },
         ]}))
+    }
+
+    async fn list(
+        State(fake): State<Fake>,
+        Query(params): Query<std::collections::HashMap<String, String>>,
+    ) -> Json<Value> {
+        fake.seen
+            .lock()
+            .unwrap()
+            .push(("list".into(), json!(params)));
+        Json(json!({ "items": [
+            { "id": "a", "text": "发布工单 Platform 选 saas", "fact_type": "world",
+              "date": "2026-11-18T08:08:00.030000+00:00", "tags": ["scope:personal"], "state": "valid" },
+            { "id": "b", "text": "助手的私事", "fact_type": "observation", "date": "不是时间",
+              "tags": ["scope:agent:helper"] },
+        ], "total": 42, "limit": 2, "offset": 10 }))
     }
 
     async fn memory(Path(id): Path<String>) -> (StatusCode, Json<Value>) {
@@ -390,6 +465,33 @@ mod tests {
         assert_eq!(item["tags"], json!(["scope:personal"]));
         assert_eq!(item["content"], "[用户] 以后都选 saas");
         assert_eq!(seen[1].1["async"], true);
+    }
+
+    #[tokio::test]
+    async fn list_asks_for_valid_facts_and_reads_kind_time_and_scope() {
+        let (fake, hindsight) = start().await;
+        let page = hindsight.list(" saas ", 2, 10).await.unwrap();
+        assert_eq!(page.total, 42, "总数是全部符合的，不只这一页");
+        assert_eq!(page.items.len(), 2);
+        assert_eq!(page.items[0].kind.as_deref(), Some("world"));
+        assert_eq!(
+            page.items[0].at.map(|at| at.unix_timestamp()),
+            Some(1_794_989_280)
+        );
+        assert_eq!(page.items[1].at, None, "读不出来的时间不编");
+        assert_eq!(
+            page.items[1].scope,
+            MemoryScope::Agent {
+                agent_id: "helper".into()
+            }
+        );
+        hindsight.list("  ", 50, 0).await.unwrap();
+        let seen = fake.seen.lock().unwrap().clone();
+        assert_eq!(
+            seen[0].1,
+            json!({ "state": "valid", "limit": "2", "offset": "10", "q": "saas" })
+        );
+        assert!(seen[1].1.get("q").is_none(), "空查询不带 q");
     }
 
     /// 对一台真的 Hindsight 走一遍：`KOMO_TEST_HINDSIGHT_URL=http://localhost:8888 cargo test -p komo-gateway

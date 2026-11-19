@@ -1204,6 +1204,61 @@ pub struct MemoryListResponse {
     pub arm_scores: Vec<ArmScore>,
 }
 
+/// `GET /v1/memory-provider`：外部记忆提供方存着的条目，一页（`docs/memory.md` 附录 G.9）。只读。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(optional_fields))]
+pub struct ProviderMemoryQuery {
+    /// 按正文筛（提供方自己的子串匹配，不是召回）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offset: Option<u32>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(optional_fields))]
+pub struct ProviderMemoryList {
+    /// 装的是哪家（`hindsight`）；没装外部提供方是 `None`，其余字段都空。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    /// 主用模式：线索召回用的就是它；否则是影子模式，只记录不注入。
+    #[serde(default)]
+    pub primary: bool,
+    #[serde(default)]
+    pub items: Vec<ProviderMemory>,
+    /// 符合条件的总数（不只这一页）。
+    #[serde(default)]
+    pub total: u64,
+    /// 问不通的原因。不当作这次请求失败：内置记忆照常列。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// 外部提供方的一条。id 是它自己的（不带 `<提供方>:` 前缀）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(optional_fields))]
+pub struct ProviderMemory {
+    pub id: String,
+    pub text: String,
+    /// 提供方自己的分类（Hindsight：`world` / `experience` / `observation`）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    pub scope: MemoryScope,
+    /// 记下的事发生的时刻。
+    #[serde(
+        default,
+        with = "time::serde::rfc3339::option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[cfg_attr(feature = "ts", ts(type = "string"))]
+    pub at: Option<OffsetDateTime>,
+}
+
 /// confirm / forget 都携带预期 revision；重复请求幂等（§9.6）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]

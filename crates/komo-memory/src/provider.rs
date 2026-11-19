@@ -5,7 +5,8 @@
 //! 核心把它包成一条只读的线索（[`external_item`]）走同一条路。证据也是核心挑好的：会话空闲后同一份提取窗口
 //! （只有不是 cron / 任务会话 / `memory = off` 的 Run），注入的记忆正文本来就不在里面。
 //!
-//! 确认、分类、遗忘、整理、索引这些管理操作只对内置存储有意义，不在这里。
+//! 确认、分类、遗忘、整理、索引这些管理操作只对内置存储有意义，不在这里；记忆页要看它存了什么，只有一个只读的
+//! [`MemoryProvider::list`]。
 
 use async_trait::async_trait;
 use komo_kernel::types::ids::{MemoryId, SessionId};
@@ -27,6 +28,34 @@ pub struct ProviderHit {
     /// 它写入时归在哪个作用域；读不出来按 [`MemoryScope::Personal`]。
     pub scope: MemoryScope,
     pub score: Option<f64>,
+}
+
+/// 清单里的一条（记忆页只读展示，附录 G.9）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProviderListed {
+    pub id: String,
+    pub text: String,
+    /// 提供方自己的分类（Hindsight 的 `world` / `experience` / `observation`），原样给界面。
+    pub kind: Option<String>,
+    pub scope: MemoryScope,
+    /// 它记下的事发生在什么时候；读不出来是 `None`。
+    pub at: Option<OffsetDateTime>,
+}
+
+/// 清单的一页。
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct ProviderPage {
+    pub items: Vec<ProviderListed>,
+    /// 符合条件的总数（不只这一页）。
+    pub total: u64,
+}
+
+/// [`crate::MemoryManager::provider_list`] 的结果：装的是哪家、怎么用，以及这一页（问不通如实给出）。
+#[derive(Debug, Clone)]
+pub struct Listing {
+    pub provider: String,
+    pub mode: ProviderMode,
+    pub page: Result<ProviderPage, ProviderError>,
 }
 
 /// 交给提供方的一批证据：一个会话空闲后的一段提取窗口。
@@ -66,6 +95,14 @@ pub trait MemoryProvider: Send + Sync {
 
     /// 交一批证据，由提供方自己提取与存。
     async fn ingest(&self, batch: &EvidenceBatch<'_>) -> Result<(), ProviderError>;
+
+    /// 它现在存着的有效条目，一页（记忆页只读展示）。`query` 非空时按正文筛；不分作用域——看的是操作者。
+    async fn list(
+        &self,
+        query: &str,
+        limit: u32,
+        offset: u32,
+    ) -> Result<ProviderPage, ProviderError>;
 }
 
 /// 装上的提供方与它的用法。

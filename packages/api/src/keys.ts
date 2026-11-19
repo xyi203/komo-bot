@@ -27,6 +27,7 @@ export const keys = {
   monitorsAll: ["monitors", "all"] as const,
   sessionSearch: (query: string, limit: number) => ["session-search", query, limit] as const,
   memoryFind: (query: string) => ["memories", "find", query] as const,
+  memoryProvider: (query: string) => ["memories", "provider", query] as const,
   memorySearch: (query: string, limit: number) => ["memories", "search", query, limit] as const,
   sessions: {
     all: ["sessions"] as const,

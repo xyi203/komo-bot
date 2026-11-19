@@ -7,8 +7,9 @@ import type {
   MemoryItem,
   MemoryListResponse,
   MemoryRevisionRequest,
+  ProviderMemoryList,
 } from "@komo/protocol";
-import { useQuery } from "@tanstack/react-query";
+import { useInfiniteQuery, useQuery } from "@tanstack/react-query";
 import { useMemo } from "react";
 import { get, post } from "./http";
 import { keys } from "./keys";
@@ -35,6 +36,9 @@ export const findMemories = (query: string, signal?: AbortSignal) =>
 /** 等你过目的：候选状态的记忆（`state=candidate`），最多 100 条。 */
 export const fetchPendingMemories = () => get<MemoryListResponse>("/v1/memories", { state: "candidate", limit: 100 });
 export const fetchMemoryCoverage = () => get<MemoryIndexStatus>("/v1/memory-index");
+/** 外部记忆提供方（Hindsight）存着的条目，一页；没装提供方时 `provider` 为空。只读。 */
+export const fetchProviderMemories = (query: string, offset: number, limit: number, signal?: AbortSignal) =>
+  get<ProviderMemoryList>("/v1/memory-provider", { ...(query ? { query } : {}), offset, limit }, signal);
 
 // 写：都带预期 revision 与请求键 `web:{动作}:{id}:{revision}`；回的是写完的那一条。
 export type MemoryVerb = "confirm" | "forget" | "restore";
@@ -104,5 +108,22 @@ export function usePendingMemories() {
     retry: false,
     staleTime: 30_000,
     refetchInterval: 60_000,
+  });
+}
+
+const PROVIDER_PAGE = 50;
+
+/** 记忆页的外部提供方一组：一页 50 条，点"显示更多"取下一页；关键词变了从头取。 */
+export function useProviderMemories(query: string) {
+  return useInfiniteQuery({
+    queryKey: keys.memoryProvider(query),
+    queryFn: ({ pageParam, signal }) => fetchProviderMemories(query, pageParam, PROVIDER_PAGE, signal),
+    initialPageParam: 0,
+    getNextPageParam: (last, pages) => {
+      const loaded = pages.reduce((sum, page) => sum + page.items.length, 0);
+      return !last.error && last.items.length > 0 && loaded < last.total ? loaded : undefined;
+    },
+    retry: false,
+    staleTime: 30_000,
   });
 }

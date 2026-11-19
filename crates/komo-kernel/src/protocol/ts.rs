@@ -32,10 +32,11 @@ use super::{
     MatterRunsResponse, McpReconnectRequest, McpReconnectResponse, McpServersResponse,
     MemoryAddRequest, MemoryAddResponse, MemoryClassifyRequest, MemoryDetail, MemoryIndexStatus,
     MemoryListResponse, MemoryRevisionRequest, ModelUpsertRequest, ModelsResponse,
-    MonitorListResponse, NameSessionRequest, ProviderModelsRequest, ProviderModelsResponse,
-    ProviderUpsertRequest, PurgeBlocked, PurgeSessionResponse, RebuildIndexResponse,
-    SessionChanges, SessionLifecycleResponse, SessionListResponse, SettingRequest, SkillsResponse,
-    SseFrame, SubmitRunRequest, SubmitRunResponse, TaskListResponse, UploadAttachmentResponse,
+    MonitorListResponse, NameSessionRequest, ProviderMemoryList, ProviderMemoryQuery,
+    ProviderModelsRequest, ProviderModelsResponse, ProviderUpsertRequest, PurgeBlocked,
+    PurgeSessionResponse, RebuildIndexResponse, SessionChanges, SessionLifecycleResponse,
+    SessionListResponse, SettingRequest, SkillsResponse, SseFrame, SubmitRunRequest,
+    SubmitRunResponse, TaskListResponse, UploadAttachmentResponse,
 };
 
 /// `GET /v1/sessions/{id}/events` 与 SSE `event` 帧里一条事件的线上信封（[`crate::events::Event`] 的 JSON）。
@@ -99,6 +100,8 @@ pub fn export_all(dir: &Path) -> Result<(), String> {
     each(InterventionAnswerResponse::export_all(&cfg))?;
     // C1 C 段：记忆、事项、定时、设置。
     each(MemoryListResponse::export_all(&cfg))?;
+    each(ProviderMemoryList::export_all(&cfg))?;
+    each(ProviderMemoryQuery::export_all(&cfg))?;
     each(MemoryDetail::export_all(&cfg))?;
     each(MemoryAddRequest::export_all(&cfg))?;
     each(MemoryAddResponse::export_all(&cfg))?;

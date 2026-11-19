@@ -24,7 +24,7 @@ export function Rail() {
   const paletteOpen = usePaletteOpen();
   const settingsOpen = useSettingsState().open;
   return (
-    <nav aria-label={m.nav_label()} className="flex min-h-0 flex-col items-center gap-1.5 border-r border-border bg-ground py-3">
+    <nav aria-label={m.nav_label()} className="rail flex min-h-0 flex-col items-center gap-1.5 border-r border-border bg-ground py-3">
       <svg viewBox="0 0 28 28" aria-hidden="true" className="rail-logo size-6.5 shrink-0">
         <circle cx="11" cy="12" r="8" className="fill-accent" />
         <circle cx="20.5" cy="18.5" r="4.5" className="fill-accent" fillOpacity="0.55" />

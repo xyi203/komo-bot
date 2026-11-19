@@ -31,7 +31,7 @@ export function ChatColumn({ full }: { full?: boolean }) {
   const showArchived = archivedOpen || archivedRows.some((chat) => chat.id === current);
   return (
     <aside aria-label={m.chats_title()} className={cn("flex min-h-0 flex-col border-r border-border bg-ground", full ? "min-w-0 flex-1 border-r-0" : "narrow:hidden")}>
-      <header className="flex h-14 shrink-0 items-center pr-2 pl-4 text-section-title font-semibold">
+      <header className="chats-header flex h-14 shrink-0 items-center pr-2 pl-4 text-section-title font-semibold">
         {m.chats_title()}
         <Link
           to="/chats/new"

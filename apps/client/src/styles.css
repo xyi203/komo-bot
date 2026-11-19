@@ -124,9 +124,19 @@
   -webkit-app-region: no-drag;
   app-region: no-drag;
 }
-/* 图标栏只有 64 宽，红绿灯（压在窗口左上角）盖住它的顶部：komo 标志挪到红绿灯下面 */
-[data-desktop="darwin"] .rail-logo {
+/* 红绿灯从 x=18 排到 80 左右，比 64 宽的图标栏宽，压在图标栏和对话列的顶部。顶上 48px 当一条空着的标题栏带：
+   komo 标志与对话列的「对话」标题都挪到红绿灯下面（一样下移 36px，两者仍对齐）；图标栏的分隔线从这条带下面才开始画，
+   不然它正好从绿灯中间穿过去。 */
+[data-desktop="darwin"] :is(.rail-logo, .chats-header) {
   margin-top: 36px;
+}
+[data-desktop="darwin"] .rail {
+  border-right-color: transparent;
+  background-image: linear-gradient(var(--color-border), var(--color-border));
+  background-size: 1px calc(100% - 48px);
+  background-position: right bottom;
+  background-origin: border-box;
+  background-repeat: no-repeat;
 }
 
 /* ---------- 动效与正文 ---------- */

@@ -1,0 +1,14 @@
+.git
+target
+**/node_modules
+**/dist
+apps/desktop/release
+.env
+.env.local
+.komo
+.claude
+.codegraph
+.scratch
+.idea
+logs
+*.db

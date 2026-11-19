@@ -87,15 +87,20 @@ function LiveRow({ label }: { label: string }) {
   );
 }
 
-/** 一轮在跑时回复末尾的 Komo 轨道：大圆不动，两个小圆绕着它转（`styles.css` 的 `.live-orbit`）。 */
+/** 一轮在跑时回复末尾的 Komo 轨道：logo 的大中小三个圆有远近地一起绕中心转（`styles.css` 的 `.live-orbit`）。
+ *  每个圆外面那层 `<i>` 管左右与前后遮挡，里面的 `<span>` 管远近，两层动画才能各走各的节奏。 */
 export function LiveMark() {
   return (
     <span role="img" aria-label={m.typing_label()} className="live-orbit mt-3 block">
-      <b />
-      <span>
-        <i />
-        <i />
-      </span>
+      <i>
+        <span />
+      </i>
+      <i>
+        <span />
+      </i>
+      <i>
+        <span />
+      </i>
     </span>
   );
 }

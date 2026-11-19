@@ -249,45 +249,143 @@
   animation: var(--animate-caret);
 }
 
-/* 一轮在跑时回复末尾的 Komo 轨道（`inline-process.tsx` 的 LiveMark）：大圆不动，两个小圆绕着它转 */
+/* 一轮在跑时回复末尾的 Komo 轨道（`inline-process.tsx` 的 LiveMark）：logo 的大中小三个圆在一条斜着看的圆轨道上
+   一起绕中心转，各错开三分之一圈。转到前面变大变实、偏下，转到后面变小变淡、偏上并被前面的圆挡住，靠这点远近感
+   显得是在立体地绕。一圈拆成三个动画：水平位置、远近（大小 / 透明度 / 高低）各一个 ease-in-out 往返，相差四分之一圈，
+   合起来近似匀速绕圆；z-index 按深度分档跳，决定谁挡谁。整组再沿视线方向（z 轴）一呼一吸地靠近、退远。
+   节奏取人静息时的呼吸：每分钟约 15 次，一次 4s，绕一圈也是一次呼吸。reduced-motion 下动画全关，三个圆停在侧栏 logo 的摆法。 */
 .live-orbit {
+  --breath: 4s;
+  --orbit: var(--breath);
+  /* easeInOutSine：往返动画用它才接近正弦，绕起来不顿 */
+  --orbit-ease: cubic-bezier(0.37, 0, 0.63, 1);
   position: relative;
   width: 24px;
   height: 24px;
+  animation: live-orbit-near var(--breath) var(--orbit-ease) infinite;
 }
-.live-orbit > b {
+.live-orbit > i {
   position: absolute;
-  inset: 6px;
-  border-radius: 9999px;
-  background: var(--color-accent);
+  left: 50%;
+  top: 50%;
+  animation:
+    live-orbit-x calc(var(--orbit) / 2) var(--orbit-ease) infinite alternate,
+    live-orbit-z var(--orbit) step-end infinite;
 }
-.live-orbit > span {
-  position: absolute;
-  inset: 0;
-  animation: live-orbit 1.6s linear infinite;
-}
-.live-orbit i {
+.live-orbit > i > span {
   position: absolute;
   border-radius: 9999px;
   background: var(--color-accent);
+  /* 三个圆同色，叠在一起会糊成一团；描一圈对话底色把前面那个从后面的切出来 */
+  box-shadow: 0 0 0 1.5px var(--color-surface);
+  animation: live-orbit-depth calc(var(--orbit) / 2) var(--orbit-ease) calc(var(--orbit) / -4) infinite alternate;
 }
-.live-orbit i:nth-child(1) {
-  width: 6px;
-  height: 6px;
-  left: 18px;
-  top: 9px;
-  opacity: 0.6;
+/* 大、中、小：尺寸与深浅照 logo；静止位置也照 logo，错开的相位是 0、⅓、⅔ 圈 */
+.live-orbit > i:nth-of-type(1) {
+  translate: -2.5px -1.5px;
+  z-index: 3;
 }
-.live-orbit i:nth-child(2) {
+.live-orbit > i:nth-of-type(1) > span {
+  width: 12px;
+  height: 12px;
+  margin: -6px;
+}
+.live-orbit > i:nth-of-type(2) {
+  translate: 5.5px 4px;
+  z-index: 4;
+  opacity: 0.7;
+  animation-delay: calc(var(--orbit) / -3);
+}
+.live-orbit > i:nth-of-type(2) > span {
+  width: 7px;
+  height: 7px;
+  margin: -3.5px;
+  animation-delay: calc(var(--orbit) * -7 / 12);
+}
+.live-orbit > i:nth-of-type(3) {
+  translate: 5px -6px;
+  z-index: 2;
+  opacity: 0.5;
+  animation-delay: calc(var(--orbit) * -2 / 3);
+}
+.live-orbit > i:nth-of-type(3) > span {
   width: 4px;
   height: 4px;
-  left: 2px;
-  top: 2px;
-  opacity: 0.35;
+  margin: -2px;
+  animation-delay: calc(var(--orbit) * -11 / 12);
 }
-@keyframes live-orbit {
+/* z 轴：吸气时整组靠近、整体变大（轨道和圆一起放大），呼气时退远变小；吸比呼短，4 : 6 */
+@keyframes live-orbit-near {
+  0%,
+  100% {
+    scale: 0.82;
+  }
+  40% {
+    scale: 1.08;
+  }
+}
+/* 左右：右端略高，轨道是斜的 */
+@keyframes live-orbit-x {
+  from {
+    translate: -7px 2px;
+  }
   to {
-    transform: rotate(360deg);
+    translate: 7px -2px;
+  }
+}
+/* 远近：远处偏上、小、淡；近处偏下、大、实 */
+@keyframes live-orbit-depth {
+  from {
+    translate: 0 -4px;
+    scale: 0.65;
+    opacity: 0.5;
+  }
+  to {
+    translate: 0 4px;
+    scale: 1.1;
+    opacity: 1;
+  }
+}
+/* 前后：每 1/12 圈按那一段的深度（sin）取一档，越靠前越高。从左往右走的半圈在前面，往回走的半圈在后面 */
+@keyframes live-orbit-z {
+  0% {
+    z-index: 6;
+  }
+  8.333% {
+    z-index: 8;
+  }
+  16.667% {
+    z-index: 9;
+  }
+  25% {
+    z-index: 9;
+  }
+  33.333% {
+    z-index: 8;
+  }
+  41.667% {
+    z-index: 6;
+  }
+  50% {
+    z-index: 4;
+  }
+  58.333% {
+    z-index: 2;
+  }
+  66.667% {
+    z-index: 1;
+  }
+  75% {
+    z-index: 1;
+  }
+  83.333% {
+    z-index: 2;
+  }
+  91.667% {
+    z-index: 4;
+  }
+  100% {
+    z-index: 4;
   }
 }
 

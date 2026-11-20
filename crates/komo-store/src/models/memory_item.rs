@@ -66,11 +66,11 @@ pub const SPEC: TableSpec = TableSpec {
     columns: COLUMNS,
 };
 
-pub const DDL: &str = r#"CREATE TABLE "memory_items" ("id" TEXT NOT NULL, "revision" BIGINT NOT NULL, "content" TEXT NOT NULL, "content_hash" TEXT NOT NULL, "kind" TEXT NOT NULL, "scope_kind" TEXT NOT NULL, "scope" TEXT NOT NULL, "provenance" TEXT NOT NULL, "confirmation" TEXT NOT NULL, "state" TEXT NOT NULL, "observed_at" BIGINT NOT NULL, "valid_until" BIGINT NOT NULL, "created_at" BIGINT NOT NULL, "updated_at" BIGINT NOT NULL, "extraction" TEXT NOT NULL, "usage_count" BIGINT NOT NULL, "last_used_at" BIGINT NOT NULL, "supersedes" TEXT, "superseded_by" TEXT, "consolidated_at" BIGINT, "adopted_count" BIGINT, "last_adopted_at" BIGINT, "application" TEXT, "applies_when" TEXT, "belongs_to" TEXT, PRIMARY KEY ("id"))"#;
+pub const DDL: &str = r#"CREATE TABLE "memory_items" ("id" TEXT NOT NULL, "revision" INTEGER NOT NULL, "content" TEXT NOT NULL, "content_hash" TEXT NOT NULL, "kind" TEXT NOT NULL, "scope_kind" TEXT NOT NULL, "scope" TEXT NOT NULL, "provenance" TEXT NOT NULL, "confirmation" TEXT NOT NULL, "state" TEXT NOT NULL, "observed_at" INTEGER NOT NULL, "valid_until" INTEGER NOT NULL, "created_at" INTEGER NOT NULL, "updated_at" INTEGER NOT NULL, "extraction" TEXT NOT NULL, "usage_count" INTEGER NOT NULL, "last_used_at" INTEGER NOT NULL, "supersedes" TEXT, "superseded_by" TEXT, "consolidated_at" INTEGER, "adopted_count" INTEGER, "last_adopted_at" INTEGER, "application" TEXT, "applies_when" TEXT, "belongs_to" TEXT, PRIMARY KEY ("id"))"#;
 
 pub const COLUMNS: &[ColumnSpec] = &[
     ColumnSpec::new("id", "TEXT NOT NULL DEFAULT ''"),
-    ColumnSpec::new("revision", "BIGINT NOT NULL DEFAULT 1"),
+    ColumnSpec::new("revision", "INTEGER NOT NULL DEFAULT 1"),
     ColumnSpec::new("content", "TEXT NOT NULL DEFAULT ''"),
     ColumnSpec::new("content_hash", "TEXT NOT NULL DEFAULT ''"),
     ColumnSpec::new("kind", "TEXT NOT NULL DEFAULT 'fact'"),
@@ -79,18 +79,18 @@ pub const COLUMNS: &[ColumnSpec] = &[
     ColumnSpec::new("provenance", "TEXT NOT NULL DEFAULT 'model_inference'"),
     ColumnSpec::new("confirmation", "TEXT NOT NULL DEFAULT 'unconfirmed'"),
     ColumnSpec::new("state", "TEXT NOT NULL DEFAULT 'candidate'"),
-    ColumnSpec::new("observed_at", "BIGINT NOT NULL DEFAULT 0"),
-    ColumnSpec::new("valid_until", "BIGINT NOT NULL DEFAULT 0"),
-    ColumnSpec::new("created_at", "BIGINT NOT NULL DEFAULT 0"),
-    ColumnSpec::new("updated_at", "BIGINT NOT NULL DEFAULT 0"),
+    ColumnSpec::new("observed_at", "INTEGER NOT NULL DEFAULT 0"),
+    ColumnSpec::new("valid_until", "INTEGER NOT NULL DEFAULT 0"),
+    ColumnSpec::new("created_at", "INTEGER NOT NULL DEFAULT 0"),
+    ColumnSpec::new("updated_at", "INTEGER NOT NULL DEFAULT 0"),
     ColumnSpec::new("extraction", "TEXT NOT NULL DEFAULT '{}'"),
-    ColumnSpec::new("usage_count", "BIGINT NOT NULL DEFAULT 0"),
-    ColumnSpec::new("last_used_at", "BIGINT NOT NULL DEFAULT 0"),
+    ColumnSpec::new("usage_count", "INTEGER NOT NULL DEFAULT 0"),
+    ColumnSpec::new("last_used_at", "INTEGER NOT NULL DEFAULT 0"),
     ColumnSpec::new("supersedes", "TEXT"),
     ColumnSpec::new("superseded_by", "TEXT"),
-    ColumnSpec::new("consolidated_at", "BIGINT"),
-    ColumnSpec::new("adopted_count", "BIGINT"),
-    ColumnSpec::new("last_adopted_at", "BIGINT"),
+    ColumnSpec::new("consolidated_at", "INTEGER"),
+    ColumnSpec::new("adopted_count", "INTEGER"),
+    ColumnSpec::new("last_adopted_at", "INTEGER"),
     ColumnSpec::new("application", "TEXT"),
     ColumnSpec::new("applies_when", "TEXT"),
     ColumnSpec::new("belongs_to", "TEXT"),

@@ -1154,7 +1154,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("aux.db");
 
-        let legacy = crate::models::memory_item::DDL.replace(r#""consolidated_at" BIGINT, "#, "");
+        let legacy = crate::models::memory_item::DDL.replace(r#""consolidated_at" INTEGER, "#, "");
         assert!(!legacy.contains("consolidated_at"), "旧形状里不该有这一列");
         plain_build_old(&path, Some(("memory_items", legacy))).await;
 
@@ -1175,8 +1175,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("aux.db");
 
-        let legacy = crate::models::memory_item::DDL
-            .replace(r#""adopted_count" BIGINT, "last_adopted_at" BIGINT, "#, "");
+        let legacy = crate::models::memory_item::DDL.replace(
+            r#""adopted_count" INTEGER, "last_adopted_at" INTEGER, "#,
+            "",
+        );
         assert!(!legacy.contains("adopted"), "旧形状里不该有这两列");
         plain_build_old(&path, Some(("memory_items", legacy))).await;
 

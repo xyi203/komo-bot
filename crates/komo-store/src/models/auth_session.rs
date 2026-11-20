@@ -32,7 +32,7 @@ pub const SPEC: TableSpec = TableSpec {
     columns: COLUMNS,
 };
 
-pub const DDL: &str = r#"CREATE TABLE "auth_sessions" ("id" TEXT NOT NULL, "kind" TEXT NOT NULL, "token_hash" TEXT NOT NULL, "subject" TEXT NOT NULL, "email" TEXT, "label" TEXT NOT NULL, "created_at" BIGINT NOT NULL, "last_used_at" BIGINT NOT NULL, "expires_at" BIGINT NOT NULL, PRIMARY KEY ("id"))"#;
+pub const DDL: &str = r#"CREATE TABLE "auth_sessions" ("id" TEXT NOT NULL, "kind" TEXT NOT NULL, "token_hash" TEXT NOT NULL, "subject" TEXT NOT NULL, "email" TEXT, "label" TEXT NOT NULL, "created_at" INTEGER NOT NULL, "last_used_at" INTEGER NOT NULL, "expires_at" INTEGER NOT NULL, PRIMARY KEY ("id"))"#;
 
 pub const COLUMNS: &[ColumnSpec] = &[
     ColumnSpec::new("id", "TEXT NOT NULL DEFAULT ''"),
@@ -41,7 +41,7 @@ pub const COLUMNS: &[ColumnSpec] = &[
     ColumnSpec::new("subject", "TEXT NOT NULL DEFAULT ''"),
     ColumnSpec::new("email", "TEXT"),
     ColumnSpec::new("label", "TEXT NOT NULL DEFAULT ''"),
-    ColumnSpec::new("created_at", "BIGINT NOT NULL DEFAULT 0"),
-    ColumnSpec::new("last_used_at", "BIGINT NOT NULL DEFAULT 0"),
-    ColumnSpec::new("expires_at", "BIGINT NOT NULL DEFAULT 0"),
+    ColumnSpec::new("created_at", "INTEGER NOT NULL DEFAULT 0"),
+    ColumnSpec::new("last_used_at", "INTEGER NOT NULL DEFAULT 0"),
+    ColumnSpec::new("expires_at", "INTEGER NOT NULL DEFAULT 0"),
 ];

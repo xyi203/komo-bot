@@ -32,17 +32,17 @@ pub const SPEC: TableSpec = TableSpec {
     columns: COLUMNS,
 };
 
-pub const DDL: &str = r#"CREATE TABLE "cron_firings" ("id" TEXT NOT NULL, "job_id" TEXT NOT NULL, "job_version" BIGINT NOT NULL, "scheduled_at" BIGINT NOT NULL, "prompt" TEXT NOT NULL, "session_id" TEXT, "run_id" TEXT, "status" TEXT NOT NULL, "error" TEXT, "created_at" BIGINT NOT NULL, PRIMARY KEY ("id"))"#;
+pub const DDL: &str = r#"CREATE TABLE "cron_firings" ("id" TEXT NOT NULL, "job_id" TEXT NOT NULL, "job_version" INTEGER NOT NULL, "scheduled_at" INTEGER NOT NULL, "prompt" TEXT NOT NULL, "session_id" TEXT, "run_id" TEXT, "status" TEXT NOT NULL, "error" TEXT, "created_at" INTEGER NOT NULL, PRIMARY KEY ("id"))"#;
 
 pub const COLUMNS: &[ColumnSpec] = &[
     ColumnSpec::new("id", "TEXT NOT NULL DEFAULT ''"),
     ColumnSpec::new("job_id", "TEXT NOT NULL DEFAULT ''"),
-    ColumnSpec::new("job_version", "BIGINT NOT NULL DEFAULT 0"),
-    ColumnSpec::new("scheduled_at", "BIGINT NOT NULL DEFAULT 0"),
+    ColumnSpec::new("job_version", "INTEGER NOT NULL DEFAULT 0"),
+    ColumnSpec::new("scheduled_at", "INTEGER NOT NULL DEFAULT 0"),
     ColumnSpec::new("prompt", "TEXT NOT NULL DEFAULT ''"),
     ColumnSpec::new("session_id", "TEXT"),
     ColumnSpec::new("run_id", "TEXT"),
     ColumnSpec::new("status", "TEXT NOT NULL DEFAULT 'queued'"),
     ColumnSpec::new("error", "TEXT"),
-    ColumnSpec::new("created_at", "BIGINT NOT NULL DEFAULT 0"),
+    ColumnSpec::new("created_at", "INTEGER NOT NULL DEFAULT 0"),
 ];

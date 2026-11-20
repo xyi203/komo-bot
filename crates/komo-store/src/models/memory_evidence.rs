@@ -29,15 +29,15 @@ pub const SPEC: TableSpec = TableSpec {
     columns: COLUMNS,
 };
 
-pub const DDL: &str = r#"CREATE TABLE "memory_evidence" ("id" TEXT NOT NULL, "memory_id" TEXT NOT NULL, "revision" BIGINT NOT NULL, "ordinal" BIGINT NOT NULL, "reference" TEXT NOT NULL, "provenance" TEXT NOT NULL, "observed_at" BIGINT NOT NULL, "extracted_from_run" TEXT, PRIMARY KEY ("id"))"#;
+pub const DDL: &str = r#"CREATE TABLE "memory_evidence" ("id" TEXT NOT NULL, "memory_id" TEXT NOT NULL, "revision" INTEGER NOT NULL, "ordinal" INTEGER NOT NULL, "reference" TEXT NOT NULL, "provenance" TEXT NOT NULL, "observed_at" INTEGER NOT NULL, "extracted_from_run" TEXT, PRIMARY KEY ("id"))"#;
 
 pub const COLUMNS: &[ColumnSpec] = &[
     ColumnSpec::new("id", "TEXT NOT NULL DEFAULT ''"),
     ColumnSpec::new("memory_id", "TEXT NOT NULL DEFAULT ''"),
-    ColumnSpec::new("revision", "BIGINT NOT NULL DEFAULT 0"),
-    ColumnSpec::new("ordinal", "BIGINT NOT NULL DEFAULT 0"),
+    ColumnSpec::new("revision", "INTEGER NOT NULL DEFAULT 0"),
+    ColumnSpec::new("ordinal", "INTEGER NOT NULL DEFAULT 0"),
     ColumnSpec::new("reference", "TEXT NOT NULL DEFAULT '{}'"),
     ColumnSpec::new("provenance", "TEXT NOT NULL DEFAULT 'model_inference'"),
-    ColumnSpec::new("observed_at", "BIGINT NOT NULL DEFAULT 0"),
+    ColumnSpec::new("observed_at", "INTEGER NOT NULL DEFAULT 0"),
     ColumnSpec::new("extracted_from_run", "TEXT"),
 ];

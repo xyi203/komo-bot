@@ -26,12 +26,12 @@ pub const SPEC: TableSpec = TableSpec {
     columns: COLUMNS,
 };
 
-pub const DDL: &str = r#"CREATE TABLE "memory_terms" ("id" TEXT NOT NULL, "memory_id" TEXT NOT NULL, "revision" BIGINT NOT NULL, "terms" TEXT NOT NULL, "term_count" BIGINT NOT NULL, PRIMARY KEY ("id"))"#;
+pub const DDL: &str = r#"CREATE TABLE "memory_terms" ("id" TEXT NOT NULL, "memory_id" TEXT NOT NULL, "revision" INTEGER NOT NULL, "terms" TEXT NOT NULL, "term_count" INTEGER NOT NULL, PRIMARY KEY ("id"))"#;
 
 pub const COLUMNS: &[ColumnSpec] = &[
     ColumnSpec::new("id", "TEXT NOT NULL DEFAULT ''"),
     ColumnSpec::new("memory_id", "TEXT NOT NULL DEFAULT ''"),
-    ColumnSpec::new("revision", "BIGINT NOT NULL DEFAULT 0"),
+    ColumnSpec::new("revision", "INTEGER NOT NULL DEFAULT 0"),
     ColumnSpec::new("terms", "TEXT NOT NULL DEFAULT ''"),
-    ColumnSpec::new("term_count", "BIGINT NOT NULL DEFAULT 0"),
+    ColumnSpec::new("term_count", "INTEGER NOT NULL DEFAULT 0"),
 ];

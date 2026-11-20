@@ -28,15 +28,15 @@ pub const SPEC: TableSpec = TableSpec {
     columns: COLUMNS,
 };
 
-pub const DDL: &str = r#"CREATE TABLE "memory_vectors" ("id" TEXT NOT NULL, "memory_id" TEXT NOT NULL, "revision" BIGINT NOT NULL, "content_hash" TEXT NOT NULL, "generation" TEXT NOT NULL, "dimensions" BIGINT NOT NULL, "vector" BLOB NOT NULL, "created_at" BIGINT NOT NULL, PRIMARY KEY ("id"))"#;
+pub const DDL: &str = r#"CREATE TABLE "memory_vectors" ("id" TEXT NOT NULL, "memory_id" TEXT NOT NULL, "revision" INTEGER NOT NULL, "content_hash" TEXT NOT NULL, "generation" TEXT NOT NULL, "dimensions" INTEGER NOT NULL, "vector" BLOB NOT NULL, "created_at" INTEGER NOT NULL, PRIMARY KEY ("id"))"#;
 
 pub const COLUMNS: &[ColumnSpec] = &[
     ColumnSpec::new("id", "TEXT NOT NULL DEFAULT ''"),
     ColumnSpec::new("memory_id", "TEXT NOT NULL DEFAULT ''"),
-    ColumnSpec::new("revision", "BIGINT NOT NULL DEFAULT 0"),
+    ColumnSpec::new("revision", "INTEGER NOT NULL DEFAULT 0"),
     ColumnSpec::new("content_hash", "TEXT NOT NULL DEFAULT ''"),
     ColumnSpec::new("generation", "TEXT NOT NULL DEFAULT ''"),
-    ColumnSpec::new("dimensions", "BIGINT NOT NULL DEFAULT 0"),
+    ColumnSpec::new("dimensions", "INTEGER NOT NULL DEFAULT 0"),
     ColumnSpec::new("vector", "BLOB NOT NULL DEFAULT x''"),
-    ColumnSpec::new("created_at", "BIGINT NOT NULL DEFAULT 0"),
+    ColumnSpec::new("created_at", "INTEGER NOT NULL DEFAULT 0"),
 ];

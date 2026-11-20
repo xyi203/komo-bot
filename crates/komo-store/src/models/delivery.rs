@@ -41,7 +41,7 @@ pub const SPEC: TableSpec = TableSpec {
     columns: COLUMNS,
 };
 
-pub const DDL: &str = r#"CREATE TABLE "deliveries" ("id" TEXT NOT NULL, "platform" TEXT NOT NULL, "chat_id" TEXT NOT NULL, "is_home" BOOLEAN NOT NULL, "outbound" TEXT NOT NULL, "approval_id" TEXT, "notification_key" TEXT, "state" TEXT NOT NULL, "attempts" BIGINT NOT NULL, "last_error" TEXT, "created_at" BIGINT NOT NULL, "updated_at" BIGINT NOT NULL, "thread" TEXT, PRIMARY KEY ("id"))"#;
+pub const DDL: &str = r#"CREATE TABLE "deliveries" ("id" TEXT NOT NULL, "platform" TEXT NOT NULL, "chat_id" TEXT NOT NULL, "is_home" BOOLEAN NOT NULL, "outbound" TEXT NOT NULL, "approval_id" TEXT, "notification_key" TEXT, "state" TEXT NOT NULL, "attempts" INTEGER NOT NULL, "last_error" TEXT, "created_at" INTEGER NOT NULL, "updated_at" INTEGER NOT NULL, "thread" TEXT, PRIMARY KEY ("id"))"#;
 
 pub const COLUMNS: &[ColumnSpec] = &[
     ColumnSpec::new("id", "TEXT NOT NULL DEFAULT ''"),
@@ -52,9 +52,9 @@ pub const COLUMNS: &[ColumnSpec] = &[
     ColumnSpec::new("approval_id", "TEXT"),
     ColumnSpec::new("notification_key", "TEXT"),
     ColumnSpec::new("state", "TEXT NOT NULL DEFAULT 'pending'"),
-    ColumnSpec::new("attempts", "BIGINT NOT NULL DEFAULT 0"),
+    ColumnSpec::new("attempts", "INTEGER NOT NULL DEFAULT 0"),
     ColumnSpec::new("last_error", "TEXT"),
-    ColumnSpec::new("created_at", "BIGINT NOT NULL DEFAULT 0"),
-    ColumnSpec::new("updated_at", "BIGINT NOT NULL DEFAULT 0"),
+    ColumnSpec::new("created_at", "INTEGER NOT NULL DEFAULT 0"),
+    ColumnSpec::new("updated_at", "INTEGER NOT NULL DEFAULT 0"),
     ColumnSpec::new("thread", "TEXT"),
 ];

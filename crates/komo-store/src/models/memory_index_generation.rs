@@ -34,18 +34,18 @@ pub const SPEC: TableSpec = TableSpec {
     columns: COLUMNS,
 };
 
-pub const DDL: &str = r#"CREATE TABLE "memory_index_generations" ("id" TEXT NOT NULL, "space" TEXT, "fingerprint" TEXT NOT NULL, "state" TEXT NOT NULL, "dimensions" BIGINT NOT NULL, "indexed" BIGINT NOT NULL, "total" BIGINT NOT NULL, "errors" TEXT NOT NULL, "active" BOOLEAN NOT NULL, "created_at" BIGINT NOT NULL, "activated_at" BIGINT NOT NULL, PRIMARY KEY ("id"))"#;
+pub const DDL: &str = r#"CREATE TABLE "memory_index_generations" ("id" TEXT NOT NULL, "space" TEXT, "fingerprint" TEXT NOT NULL, "state" TEXT NOT NULL, "dimensions" INTEGER NOT NULL, "indexed" INTEGER NOT NULL, "total" INTEGER NOT NULL, "errors" TEXT NOT NULL, "active" BOOLEAN NOT NULL, "created_at" INTEGER NOT NULL, "activated_at" INTEGER NOT NULL, PRIMARY KEY ("id"))"#;
 
 pub const COLUMNS: &[ColumnSpec] = &[
     ColumnSpec::new("id", "TEXT NOT NULL DEFAULT ''"),
     ColumnSpec::new("space", "TEXT"),
     ColumnSpec::new("fingerprint", "TEXT NOT NULL DEFAULT ''"),
     ColumnSpec::new("state", "TEXT NOT NULL DEFAULT 'unconfigured'"),
-    ColumnSpec::new("dimensions", "BIGINT NOT NULL DEFAULT 0"),
-    ColumnSpec::new("indexed", "BIGINT NOT NULL DEFAULT 0"),
-    ColumnSpec::new("total", "BIGINT NOT NULL DEFAULT 0"),
+    ColumnSpec::new("dimensions", "INTEGER NOT NULL DEFAULT 0"),
+    ColumnSpec::new("indexed", "INTEGER NOT NULL DEFAULT 0"),
+    ColumnSpec::new("total", "INTEGER NOT NULL DEFAULT 0"),
     ColumnSpec::new("errors", "TEXT NOT NULL DEFAULT '[]'"),
     ColumnSpec::new("active", "BOOLEAN NOT NULL DEFAULT 0"),
-    ColumnSpec::new("created_at", "BIGINT NOT NULL DEFAULT 0"),
-    ColumnSpec::new("activated_at", "BIGINT NOT NULL DEFAULT 0"),
+    ColumnSpec::new("created_at", "INTEGER NOT NULL DEFAULT 0"),
+    ColumnSpec::new("activated_at", "INTEGER NOT NULL DEFAULT 0"),
 ];

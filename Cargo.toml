@@ -38,13 +38,17 @@ komo-gateway = { path = "crates/komo-gateway", default-features = false }
 komo-client = { path = "crates/komo-client" }
 
 # §13.4：去掉 `sqlite` 特性拉进来的 rusqlite / libsqlite3-sys。
-toasty = { version = "0.11.0", default-features = false, features = ["turso"] }
-# §13.4：与 toasty-driver-turso 同 major（0.11 依赖 turso ^0.7），工作区唯一；升到 0.8 会链进两份 turso、C 符号重名。
+# 暂钉 toasty main 的 c6532549（2026-11-18，CI 全绿）：crates.io 上的 0.11.0 依赖 turso ^0.7，
+# main 已升到 ^0.8，但 0.12 的发版 PR（tokio-rs/toasty#1263）一直没合。0.12 发版后换回 crates.io。
+# toasty 与 toasty-driver-turso 必须钉同一个 rev，否则会链进两份 toasty-core / turso。
+toasty = { git = "https://github.com/tokio-rs/toasty", rev = "c6532549afb0ed1ab6791daed10258f473a81022", default-features = false, features = ["turso"] }
+# §13.4：与 toasty-driver-turso 同 major（上面那个 rev 依赖 turso ^0.8），工作区唯一；两个 major 并存会链进两份 turso、C 符号重名。
 # spikes/store.md：关掉 turso 默认特性 `fts`（MVCC 下本来就被拒绝），tantivy / zstd-sys / lz4 与
-# 一条 C 工具链随之消失，少 62 个编译单元；toasty-driver-turso 0.11 上游已对 turso 关默认特性，不再 vendor。
-turso = { version = "0.7.2", default-features = false, features = ["mimalloc"] }
+# 一条 C 工具链随之消失，少 62 个编译单元；toasty-driver-turso 上游已对 turso 关默认特性，不再 vendor。
+# mimalloc 由这里显式打开：上游 #1234 起驱动不再替用户选分配器。
+turso = { version = "0.8.3", default-features = false, features = ["mimalloc"] }
 # toasty 0.10 起不再导出驱动类型（`Turso::file(..).concurrent_writes()` 只在驱动里），store 直接依赖它。
-toasty-driver-turso = { version = "0.11.0", default-features = false }
+toasty-driver-turso = { git = "https://github.com/tokio-rs/toasty", rev = "c6532549afb0ed1ab6791daed10258f473a81022", default-features = false }
 
 # §13.4：`rustls` 特性 = `__rustls-aws-lc-rs`；`no-provider` 后由 komo 在 main 里
 # 安装 ring provider，且必须在飞书 ws 线程启动之前。

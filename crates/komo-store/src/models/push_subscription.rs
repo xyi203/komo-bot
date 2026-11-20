@@ -25,7 +25,7 @@ pub const SPEC: TableSpec = TableSpec {
     columns: COLUMNS,
 };
 
-pub const DDL: &str = r#"CREATE TABLE "push_subscriptions" ("id" TEXT NOT NULL, "endpoint" TEXT NOT NULL, "p256dh" TEXT NOT NULL, "auth" TEXT NOT NULL, "user_agent" TEXT, "created_at" BIGINT NOT NULL, "updated_at" BIGINT NOT NULL, PRIMARY KEY ("id"))"#;
+pub const DDL: &str = r#"CREATE TABLE "push_subscriptions" ("id" TEXT NOT NULL, "endpoint" TEXT NOT NULL, "p256dh" TEXT NOT NULL, "auth" TEXT NOT NULL, "user_agent" TEXT, "created_at" INTEGER NOT NULL, "updated_at" INTEGER NOT NULL, PRIMARY KEY ("id"))"#;
 
 pub const COLUMNS: &[ColumnSpec] = &[
     ColumnSpec::new("id", "TEXT NOT NULL DEFAULT ''"),
@@ -33,6 +33,6 @@ pub const COLUMNS: &[ColumnSpec] = &[
     ColumnSpec::new("p256dh", "TEXT NOT NULL DEFAULT ''"),
     ColumnSpec::new("auth", "TEXT NOT NULL DEFAULT ''"),
     ColumnSpec::new("user_agent", "TEXT"),
-    ColumnSpec::new("created_at", "BIGINT NOT NULL DEFAULT 0"),
-    ColumnSpec::new("updated_at", "BIGINT NOT NULL DEFAULT 0"),
+    ColumnSpec::new("created_at", "INTEGER NOT NULL DEFAULT 0"),
+    ColumnSpec::new("updated_at", "INTEGER NOT NULL DEFAULT 0"),
 ];

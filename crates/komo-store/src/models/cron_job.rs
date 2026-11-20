@@ -50,12 +50,12 @@ pub const SPEC: TableSpec = TableSpec {
     columns: COLUMNS,
 };
 
-pub const DDL: &str = r#"CREATE TABLE "cron_jobs" ("id" TEXT NOT NULL, "name" TEXT NOT NULL, "version" BIGINT NOT NULL, "trigger" TEXT NOT NULL, "prompt" TEXT NOT NULL, "command" TEXT, "workdir" TEXT, "status" TEXT NOT NULL, "overlap" TEXT NOT NULL, "model" TEXT, "effort" TEXT, "skills" TEXT NOT NULL, "max_rounds" BIGINT NOT NULL, "notify" TEXT NOT NULL, "next_run_at" BIGINT NOT NULL, "last_error" TEXT, "created_at" BIGINT NOT NULL, "updated_at" BIGINT NOT NULL, PRIMARY KEY ("id"))"#;
+pub const DDL: &str = r#"CREATE TABLE "cron_jobs" ("id" TEXT NOT NULL, "name" TEXT NOT NULL, "version" INTEGER NOT NULL, "trigger" TEXT NOT NULL, "prompt" TEXT NOT NULL, "command" TEXT, "workdir" TEXT, "status" TEXT NOT NULL, "overlap" TEXT NOT NULL, "model" TEXT, "effort" TEXT, "skills" TEXT NOT NULL, "max_rounds" INTEGER NOT NULL, "notify" TEXT NOT NULL, "next_run_at" INTEGER NOT NULL, "last_error" TEXT, "created_at" INTEGER NOT NULL, "updated_at" INTEGER NOT NULL, PRIMARY KEY ("id"))"#;
 
 pub const COLUMNS: &[ColumnSpec] = &[
     ColumnSpec::new("id", "TEXT NOT NULL DEFAULT ''"),
     ColumnSpec::new("name", "TEXT NOT NULL DEFAULT ''"),
-    ColumnSpec::new("version", "BIGINT NOT NULL DEFAULT 1"),
+    ColumnSpec::new("version", "INTEGER NOT NULL DEFAULT 1"),
     ColumnSpec::new("trigger", "TEXT NOT NULL DEFAULT '{}'"),
     ColumnSpec::new("prompt", "TEXT NOT NULL DEFAULT ''"),
     ColumnSpec::new("command", "TEXT"),
@@ -65,10 +65,10 @@ pub const COLUMNS: &[ColumnSpec] = &[
     ColumnSpec::new("model", "TEXT"),
     ColumnSpec::new("effort", "TEXT"),
     ColumnSpec::new("skills", "TEXT NOT NULL DEFAULT '[]'"),
-    ColumnSpec::new("max_rounds", "BIGINT NOT NULL DEFAULT 0"),
+    ColumnSpec::new("max_rounds", "INTEGER NOT NULL DEFAULT 0"),
     ColumnSpec::new("notify", "TEXT NOT NULL DEFAULT 'always'"),
-    ColumnSpec::new("next_run_at", "BIGINT NOT NULL DEFAULT 0"),
+    ColumnSpec::new("next_run_at", "INTEGER NOT NULL DEFAULT 0"),
     ColumnSpec::new("last_error", "TEXT"),
-    ColumnSpec::new("created_at", "BIGINT NOT NULL DEFAULT 0"),
-    ColumnSpec::new("updated_at", "BIGINT NOT NULL DEFAULT 0"),
+    ColumnSpec::new("created_at", "INTEGER NOT NULL DEFAULT 0"),
+    ColumnSpec::new("updated_at", "INTEGER NOT NULL DEFAULT 0"),
 ];

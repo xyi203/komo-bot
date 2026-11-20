@@ -1355,8 +1355,8 @@ durable 引擎（约 1.5 万行生产代码）与 harness 是汇聚点，没有�
 
 | 依赖 | 配置 | 理由 |
 |---|---|---|
-| `toasty` | `default-features = false, features = ["turso"]` | 去掉 `sqlite` 特性拉进来的 rusqlite / libsqlite3-sys |
-| `turso` | 与 `toasty-driver-turso` 同 major，工作区唯一 | mimalloc 全局分配器只能有一个 |
+| `toasty` / `toasty-driver-turso` | `default-features = false`（toasty 另开 `features = ["turso"]`）；2026-11-20 起两者钉同一个 git rev（tokio-rs/toasty `c6532549`），等 0.12 发到 crates.io 再换回版本号 | 去掉 `sqlite` 特性拉进来的 rusqlite / libsqlite3-sys；钉 git 是因为 crates.io 的 0.11 依赖 turso ^0.7，main 已到 ^0.8。该 rev 起 SQLite 方言的整数列一律写 `INTEGER`（上游 #1339），`aux.db` 的 `*_TABLE_DDL` 常量随之从 `BIGINT` 改为 `INTEGER`；老库里记录的 `BIGINT` 不用迁移（同为 INTEGER 亲和性，补列只按列名比对） |
+| `turso` | `0.8.3`，`default-features = false, features = ["mimalloc"]`；与 `toasty-driver-turso` 同 major，工作区唯一 | mimalloc 全局分配器只能有一个；上游 #1234 起驱动不再替用户开 `mimalloc`，由工作区显式打开 |
 | `reqwest` | `default-features = false, features = ["rustls-no-provider", "json", "stream", "charset", "form"]` | `rustls` 特性 = `__rustls-aws-lc-rs`；`no-provider` 后由 komo 在 `main` 里 `rustls::crypto::ring::default_provider().install_default()`，且必须在飞书 ws 线程启动之前。`form` 是 ChatGPT OAuth 的 token 端点要的 `application/x-www-form-urlencoded`（§13.3），只多拉 `serde_urlencoded` 一个纯 Rust 包 |
 | `rustls` | `default-features = false, features = ["ring"]` | 同上 |
 | `base64` | `0.22`；komo-llm（JWT）与 komo-tools（图片、codemode 的字节） | ChatGPT OAuth 的 access_token / id_token 是 JWT：只 base64url 解 payload，不验签（§13.3）。0.22.1 已经是依赖树里被拉得最多的一份（reqwest 等间接拉入），钉住它不再添一份重复版本；reqwest 自己另拉一份 0.23.1，是既有的重复，与本次改动无关 |

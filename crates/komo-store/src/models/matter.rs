@@ -55,11 +55,11 @@ pub const SPEC: TableSpec = TableSpec {
     columns: COLUMNS,
 };
 
-pub const DDL: &str = r#"CREATE TABLE "matters" ("id" TEXT NOT NULL, "revision" BIGINT NOT NULL, "kind" TEXT NOT NULL, "title" TEXT NOT NULL, "state" TEXT NOT NULL, "next" TEXT, "waiting_for" TEXT, "due" TEXT, "standard" TEXT, "evidence" TEXT NOT NULL, "created_at" BIGINT NOT NULL, "updated_at" BIGINT NOT NULL, "closed_at" BIGINT NOT NULL, "triggers" TEXT NOT NULL, "description" TEXT, "schedule" TEXT, "schedule_status" TEXT NOT NULL, "next_run_at" BIGINT NOT NULL, "last_error" TEXT, "migrated_from" TEXT, "chat_session" TEXT, PRIMARY KEY ("id"))"#;
+pub const DDL: &str = r#"CREATE TABLE "matters" ("id" TEXT NOT NULL, "revision" INTEGER NOT NULL, "kind" TEXT NOT NULL, "title" TEXT NOT NULL, "state" TEXT NOT NULL, "next" TEXT, "waiting_for" TEXT, "due" TEXT, "standard" TEXT, "evidence" TEXT NOT NULL, "created_at" INTEGER NOT NULL, "updated_at" INTEGER NOT NULL, "closed_at" INTEGER NOT NULL, "triggers" TEXT NOT NULL, "description" TEXT, "schedule" TEXT, "schedule_status" TEXT NOT NULL, "next_run_at" INTEGER NOT NULL, "last_error" TEXT, "migrated_from" TEXT, "chat_session" TEXT, PRIMARY KEY ("id"))"#;
 
 pub const COLUMNS: &[ColumnSpec] = &[
     ColumnSpec::new("id", "TEXT NOT NULL DEFAULT ''"),
-    ColumnSpec::new("revision", "BIGINT NOT NULL DEFAULT 1"),
+    ColumnSpec::new("revision", "INTEGER NOT NULL DEFAULT 1"),
     ColumnSpec::new("kind", "TEXT NOT NULL DEFAULT 'goal'"),
     ColumnSpec::new("title", "TEXT NOT NULL DEFAULT ''"),
     ColumnSpec::new("state", "TEXT NOT NULL DEFAULT 'active'"),
@@ -68,14 +68,14 @@ pub const COLUMNS: &[ColumnSpec] = &[
     ColumnSpec::new("due", "TEXT"),
     ColumnSpec::new("standard", "TEXT"),
     ColumnSpec::new("evidence", "TEXT NOT NULL DEFAULT '[]'"),
-    ColumnSpec::new("created_at", "BIGINT NOT NULL DEFAULT 0"),
-    ColumnSpec::new("updated_at", "BIGINT NOT NULL DEFAULT 0"),
-    ColumnSpec::new("closed_at", "BIGINT NOT NULL DEFAULT 0"),
+    ColumnSpec::new("created_at", "INTEGER NOT NULL DEFAULT 0"),
+    ColumnSpec::new("updated_at", "INTEGER NOT NULL DEFAULT 0"),
+    ColumnSpec::new("closed_at", "INTEGER NOT NULL DEFAULT 0"),
     ColumnSpec::new("triggers", "TEXT NOT NULL DEFAULT '[]'"),
     ColumnSpec::new("description", "TEXT"),
     ColumnSpec::new("schedule", "TEXT"),
     ColumnSpec::new("schedule_status", "TEXT NOT NULL DEFAULT 'active'"),
-    ColumnSpec::new("next_run_at", "BIGINT NOT NULL DEFAULT 0"),
+    ColumnSpec::new("next_run_at", "INTEGER NOT NULL DEFAULT 0"),
     ColumnSpec::new("last_error", "TEXT"),
     ColumnSpec::new("migrated_from", "TEXT"),
     ColumnSpec::new("chat_session", "TEXT"),

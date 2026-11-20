@@ -81,8 +81,8 @@
 
 use std::collections::{HashMap, HashSet};
 
+use jiff::Timestamp;
 use serde_json::Value;
-use time::OffsetDateTime;
 
 use super::compaction::{COMPACTION_ENTRY_KIND, DECAY_ENTRY_KIND, SUMMARY_PREFIX, SUMMARY_SUFFIX};
 use super::ids::{ConversationId, EntityId, EntryId, SubmissionId};
@@ -843,7 +843,7 @@ impl Projection {
 struct Frame {
     session: SessionId,
     record: u64,
-    ts: OffsetDateTime,
+    ts: Timestamp,
 }
 
 impl Frame {
@@ -851,8 +851,8 @@ impl Frame {
         Self {
             session: projection.session.clone(),
             record,
-            ts: OffsetDateTime::from_unix_timestamp_nanos(i128::from(millis) * 1_000_000)
-                .unwrap_or(OffsetDateTime::UNIX_EPOCH),
+            ts: Timestamp::from_nanosecond(i128::from(millis) * 1_000_000)
+                .unwrap_or(Timestamp::UNIX_EPOCH),
         }
     }
 

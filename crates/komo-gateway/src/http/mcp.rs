@@ -14,8 +14,8 @@ use komo_kernel::protocol::http::{
 };
 use komo_tools::mcp_auth::{self, WebAuthorizationSession};
 
+use jiff::{SignedDuration, Timestamp};
 use serde::{Deserialize, Serialize};
-use time::{Duration, OffsetDateTime};
 
 use super::Api;
 use super::config::write_config;
@@ -130,14 +130,14 @@ pub async fn set_tool(
 // 反而把跨端交接挡死了。
 
 /// 一次等回调的授权会话最多挂多久。
-const LOGIN_TTL: Duration = Duration::minutes(10);
+const LOGIN_TTL: SignedDuration = SignedDuration::from_mins(10);
 /// 同时挂着的上限：满了先丢最早的。
 const MAX_PENDING: usize = 16;
 
 struct PendingLogin {
     server: String,
     session: Arc<WebAuthorizationSession>,
-    expires: OffsetDateTime,
+    expires: Timestamp,
 }
 
 /// 等回调的 MCP 登录（`state` → 会话）。
@@ -153,7 +153,7 @@ impl std::fmt::Debug for McpLogins {
 }
 
 impl McpLogins {
-    fn insert(&self, state: String, login: PendingLogin, now: OffsetDateTime) {
+    fn insert(&self, state: String, login: PendingLogin, now: Timestamp) {
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
         pending.retain(|_, login| login.expires > now);
         while pending.len() >= MAX_PENDING {
@@ -174,7 +174,7 @@ impl McpLogins {
         &self,
         state: &str,
         server: &str,
-        now: OffsetDateTime,
+        now: Timestamp,
     ) -> Option<Arc<WebAuthorizationSession>> {
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
         let login = pending.remove(state)?;

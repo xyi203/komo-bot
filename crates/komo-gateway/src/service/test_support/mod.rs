@@ -127,7 +127,7 @@ pub fn sample_snapshot() -> ConfigSnapshot {
             workspaces_dir: "/tmp/komo/workspaces".into(),
         },
         credentials: Default::default(),
-        loaded_at: time::macros::datetime!(2026-09-16 08:00:00 UTC),
+        loaded_at: "2026-09-16T08:00:00Z".parse::<jiff::Timestamp>().unwrap(),
         sources: vec![],
     }
 }

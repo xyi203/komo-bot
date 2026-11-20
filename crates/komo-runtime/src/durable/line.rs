@@ -92,7 +92,7 @@ impl Line {
 
     /// 时钟，毫秒（unix）。
     pub fn now_ms(&self) -> i64 {
-        (self.shared.clock.now().unix_timestamp_nanos() / 1_000_000) as i64
+        (self.shared.clock.now().as_nanosecond() / 1_000_000) as i64
     }
 
     /// 线已关闭或失败时的错误。

@@ -7,6 +7,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use jiff::Timestamp;
 use komo_kernel::protocol::config::{
     CompactionConfig, ConfigSnapshot, ConsolidateConfig, DEFAULT_HINDSIGHT_MIN_RERANKER,
     DEFAULT_OIDC_SECRET_ENV, DEFAULT_TELEGRAM_TOKEN_ENV, ExecutionConfig,
@@ -20,7 +21,6 @@ use komo_kernel::types::model::{
     CatalogModel, Effort, EmbeddingConfig, ModelCatalog, ModelConfig, ModelType,
 };
 use serde::Deserialize;
-use time::OffsetDateTime;
 
 use super::error::ConfigError;
 use komo_llm::Secrets;
@@ -613,7 +613,8 @@ impl Sources {
                 let mtime = std::fs::metadata(path).ok()?.modified().ok()?;
                 Some(SourceFile {
                     path: path.to_path_buf(),
-                    mtime: OffsetDateTime::from(mtime),
+                    // jiff 只表示 -9999..=9999 年；越界的 mtime 只可能是坏时钟，按纪元算，文件照样列出。
+                    mtime: Timestamp::try_from(mtime).unwrap_or(Timestamp::UNIX_EPOCH),
                 })
             })
             .collect()
@@ -679,7 +680,7 @@ pub(super) fn assemble(
     home: &Path,
     sources: &Sources,
     secrets: &Secrets,
-    now: OffsetDateTime,
+    now: Timestamp,
 ) -> Result<ConfigSnapshot, ConfigError> {
     let base = sources
         .config

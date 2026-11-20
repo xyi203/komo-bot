@@ -46,8 +46,8 @@
 //! `confirm` 与 `forget` 都返回**整条**记忆而不是一个 `{ok:true}`：它们带着预期
 //! revision 来，回去的那条才说得清现在是第几版（§9.6 的幂等就是靠这个比出来的）。
 
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
-use time::OffsetDateTime;
 
 #[path = "session.rs"]
 pub mod session;
@@ -128,8 +128,7 @@ pub struct HealthResponse {
     pub version: String,
     pub protocol_version: u32,
     #[cfg_attr(feature = "ts", ts(type = "string"))]
-    #[serde(with = "time::serde::rfc3339")]
-    pub started_at: OffsetDateTime,
+    pub started_at: Timestamp,
     pub data_dir: String,
     /// 遥测导出状态（docs/observability.md §4）；`komo doctor` 显示。
     #[serde(default)]
@@ -142,11 +141,11 @@ pub struct HealthResponse {
 pub struct TelemetryHealth {
     pub endpoint: Option<String>,
     #[cfg_attr(feature = "ts", ts(type = "string | null"))]
-    #[serde(default, with = "time::serde::rfc3339::option")]
-    pub last_ok_at: Option<OffsetDateTime>,
+    #[serde(default)]
+    pub last_ok_at: Option<Timestamp>,
     #[cfg_attr(feature = "ts", ts(type = "string | null"))]
-    #[serde(default, with = "time::serde::rfc3339::option")]
-    pub last_error_at: Option<OffsetDateTime>,
+    #[serde(default)]
+    pub last_error_at: Option<Timestamp>,
     pub last_error: Option<String>,
 }
 
@@ -206,15 +205,13 @@ pub struct AuthSessionView {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub email: Option<String>,
     #[cfg_attr(feature = "ts", ts(type = "string"))]
-    #[serde(with = "time::serde::rfc3339")]
-    pub created_at: OffsetDateTime,
+    pub created_at: Timestamp,
     #[cfg_attr(feature = "ts", ts(type = "string"))]
-    #[serde(with = "time::serde::rfc3339")]
-    pub last_used_at: OffsetDateTime,
+    pub last_used_at: Timestamp,
     /// 设备令牌不过期（`None`）；网页会话滑动续期。
     #[cfg_attr(feature = "ts", ts(type = "string | null"))]
-    #[serde(default, with = "time::serde::rfc3339::option")]
-    pub expires_at: Option<OffsetDateTime>,
+    #[serde(default)]
+    pub expires_at: Option<Timestamp>,
     /// 就是发这次请求的那一条。
     pub current: bool,
 }
@@ -305,11 +302,9 @@ pub struct SessionSummary {
     pub current_wait: Option<WaitReason>,
     pub applied_seq: Seq,
     #[cfg_attr(feature = "ts", ts(type = "string"))]
-    #[serde(with = "time::serde::rfc3339")]
-    pub created_at: OffsetDateTime,
+    pub created_at: Timestamp,
     #[cfg_attr(feature = "ts", ts(type = "string"))]
-    #[serde(with = "time::serde::rfc3339")]
-    pub updated_at: OffsetDateTime,
+    pub updated_at: Timestamp,
     /// 会话用途：`main` / `normal` / `task`（`docs/background-tasks.md`）。
     /// 老客户端读到的是默认的 `"normal"`（这个字段之前不存在）。值镜像
     /// `komo_store::models::SessionKind::as_str()` 的那几个词——kernel 不依赖 store，这里
@@ -378,8 +373,7 @@ pub struct ChatRow {
     pub last_message: String,
     /// 最后一句话的时刻；旧会话回落到最近一次改动、再回落到创建时刻。
     #[cfg_attr(feature = "ts", ts(type = "string"))]
-    #[serde(with = "time::serde::rfc3339")]
-    pub last_message_at: OffsetDateTime,
+    pub last_message_at: Timestamp,
     /// 有指向这段对话、还没答复的介入（停住的运行在等你）。
     pub waiting: bool,
     /// 这段对话此刻有一条 Run 在跑。
@@ -498,16 +492,11 @@ pub struct TaskSummary {
     pub dispatched_by: Option<SessionId>,
     /// 会话的创建时刻。
     #[cfg_attr(feature = "ts", ts(type = "string"))]
-    #[serde(with = "time::serde::rfc3339")]
-    pub started_at: OffsetDateTime,
+    pub started_at: Timestamp,
     /// 最近一次交回的时刻；没交回过（含没有派出方的会话）缺省。
     #[cfg_attr(feature = "ts", ts(type = "string"))]
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        with = "time::serde::rfc3339::option"
-    )]
-    pub ended_at: Option<OffsetDateTime>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended_at: Option<Timestamp>,
     /// 工具轮数：在跑时是当前 Run 的，否则是最近一次交回的（旧数据缺省）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rounds: Option<u32>,
@@ -546,8 +535,7 @@ pub struct SessionSearchHit {
     /// `main` / `normal` / `task`。
     pub kind: String,
     /// 最近一条命中的消息的时刻。
-    #[serde(with = "time::serde::rfc3339")]
-    pub matched_at: OffsetDateTime,
+    pub matched_at: Timestamp,
     /// 任务会话的短号（`#12`）与派它的会话。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task: Option<String>,
@@ -591,12 +579,10 @@ pub struct MonitorSummary {
     /// 结束的原因（`exit` / `timeout` / `stopped` ……），只有 `ended` 有。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
-    #[serde(with = "time::serde::rfc3339")]
     #[cfg_attr(feature = "ts", ts(type = "string"))]
-    pub started_at: OffsetDateTime,
-    #[serde(with = "time::serde::rfc3339")]
+    pub started_at: Timestamp,
     #[cfg_attr(feature = "ts", ts(type = "string"))]
-    pub deadline: OffsetDateTime,
+    pub deadline: Timestamp,
     /// 脚本的开头一段。
     pub command: String,
     /// 是转到后台的 `bash` 命令（不是 `monitor` 工具挂的监听）；旧 Gateway 不给，读成 `false`。
@@ -644,8 +630,7 @@ pub struct SessionLifecycleResponse {
     pub session: SessionId,
     pub state: SessionState,
     #[cfg_attr(feature = "ts", ts(type = "string"))]
-    #[serde(with = "time::serde::rfc3339")]
-    pub changed_at: OffsetDateTime,
+    pub changed_at: Timestamp,
     /// `now` 时被明确取消的未完成 Run。空数组 = 没有要处置的。
     #[serde(default)]
     pub cancelled: Vec<RunId>,
@@ -700,8 +685,7 @@ pub struct ReconcileResponse {
     pub closed: u32,
     /// 墓碑已落、内容还没删完，这次补齐的会话数。
     pub purged: u32,
-    #[serde(with = "time::serde::rfc3339")]
-    pub finished_at: OffsetDateTime,
+    pub finished_at: Timestamp,
 }
 
 // ---- GET /v1/sessions/{id}/events ----
@@ -813,14 +797,9 @@ pub struct RunSummary {
     pub source: PlanSource,
     #[serde(default)]
     pub rounds: u32,
-    #[serde(with = "time::serde::rfc3339")]
-    pub created_at: OffsetDateTime,
-    #[serde(
-        default,
-        with = "time::serde::rfc3339::option",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub ended_at: Option<OffsetDateTime>,
+    pub created_at: Timestamp,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended_at: Option<Timestamp>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -940,8 +919,7 @@ pub struct InterventionSummary {
     #[serde(default)]
     pub verdicts: Vec<InterventionVerdict>,
     #[cfg_attr(feature = "ts", ts(type = "string"))]
-    #[serde(with = "time::serde::rfc3339")]
-    pub created_at: OffsetDateTime,
+    pub created_at: Timestamp,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -1074,8 +1052,7 @@ pub enum InterventionDetail {
         tool: String,
         arguments: serde_json::Value,
         /// 到这一刻还没答就不执行。
-        #[serde(with = "time::serde::rfc3339")]
-        deadline: OffsetDateTime,
+        deadline: Timestamp,
     },
 }
 
@@ -1250,13 +1227,9 @@ pub struct ProviderMemory {
     pub kind: Option<String>,
     pub scope: MemoryScope,
     /// 记下的事发生的时刻。
-    #[serde(
-        default,
-        with = "time::serde::rfc3339::option",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(type = "string"))]
-    pub at: Option<OffsetDateTime>,
+    pub at: Option<Timestamp>,
 }
 
 /// confirm / forget 都携带预期 revision；重复请求幂等（§9.6）。
@@ -1592,9 +1565,8 @@ pub struct ConfigCheckResponse {
     #[serde(default)]
     pub issues: Vec<ConfigIssue>,
     /// 当前**生效**配置的加载时间。
-    #[serde(with = "time::serde::rfc3339")]
     #[cfg_attr(feature = "ts", ts(type = "string"))]
-    pub loaded_at: OffsetDateTime,
+    pub loaded_at: Timestamp,
     /// 各来源文件与它们的 mtime。和 `loaded_at` 对不上就是"文件改了但没装上"（§3）。
     #[serde(default)]
     pub sources: Vec<SourceFile>,

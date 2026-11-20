@@ -12,6 +12,7 @@
 
 use std::collections::BTreeSet;
 
+use jiff::Timestamp;
 use komo_kernel::events::{Event, EventPayload};
 use komo_kernel::protocol::http::MemoryAddRequest;
 use komo_kernel::traits::RepoError;
@@ -21,7 +22,6 @@ use komo_kernel::types::memory::{
     MemoryKind, MemoryState, MemoryUsage, Provenance,
 };
 use komo_kernel::types::plan::PlanSource;
-use time::OffsetDateTime;
 
 use super::extract::{HANDBACK_KEY_PREFIXES, MAX_CONTENT_CHARS, Transcript, looks_like_secret};
 use super::{MemoryError, MemoryManager, SessionEvents};
@@ -238,7 +238,7 @@ impl MemoryManager {
             Option<String>,
             Option<MatterId>,
         ),
-        now: OffsetDateTime,
+        now: Timestamp,
     ) -> Result<MemoryItem, MemoryError> {
         let mut merged = existing.clone();
         let new_application = application.or(existing.application);
@@ -395,7 +395,7 @@ impl MemoryManager {
         &self,
         session: &SessionId,
         run: &RunId,
-        now: OffsetDateTime,
+        now: Timestamp,
     ) -> Result<Vec<Evidence>, MemoryError> {
         let evidence = run_user_evidence(&*self.events, session, run, now).await?;
         if evidence.is_empty() {
@@ -414,7 +414,7 @@ pub async fn run_user_evidence(
     events: &dyn SessionEvents,
     session: &SessionId,
     run: &RunId,
-    now: OffsetDateTime,
+    now: Timestamp,
 ) -> Result<Vec<Evidence>, MemoryError> {
     let events = events.events_of(session).await?;
     Ok(user_inputs(&events, run)

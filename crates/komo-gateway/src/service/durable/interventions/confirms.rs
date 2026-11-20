@@ -324,7 +324,7 @@ impl DurableCore {
         let answer = ConfirmAnswer {
             verdict,
             by,
-            at: (self.clock.now().unix_timestamp_nanos() / 1_000_000) as i64,
+            at: (self.clock.now().as_nanosecond() / 1_000_000) as i64,
         };
         let value = serde_json::to_value(&answer).expect("ConfirmAnswer 可序列化");
         let previous = self

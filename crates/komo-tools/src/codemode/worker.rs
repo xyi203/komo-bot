@@ -528,7 +528,7 @@ fn civil_clock(call: &OsFunctionCall, seconds: f64) -> Result<MontyObject, Strin
         OsFunctionCall::DateTimeNow(Some(tz)) => (tz.offset_seconds, tz.name.clone()),
         _ => (0, None),
     };
-    let wall = timestamp.to_zoned(jiff::tz::TimeZone::UTC).datetime();
+    let wall = jiff::tz::Offset::UTC.to_datetime(timestamp);
     let wall = wall
         .checked_add(jiff::SignedDuration::from_secs(i64::from(offset)))
         .unwrap_or(wall);

@@ -29,6 +29,7 @@ use axum::extract::{Request, State};
 use axum::http::{HeaderMap, HeaderValue, Method, header};
 use axum::middleware::Next;
 use axum::response::Response;
+use jiff::{SignedDuration, Timestamp};
 use komo_config::ConfigHolder;
 use komo_kernel::pkce::{random_token, s256_challenge};
 use komo_kernel::protocol::config::OidcConfig;
@@ -38,7 +39,6 @@ use komo_kernel::protocol::http::{
 use komo_kernel::traits::Clock;
 use komo_kernel::types::digest::ContentHash;
 use komo_store::{AuthKind, AuthSessionRecord, Db, NewAuthSession, TursoAuthRepo};
-use time::{Duration, OffsetDateTime};
 
 use crate::http::error::ApiFailure;
 use crate::oidc::{IdentityClaims, OidcClient, OidcError};
@@ -52,13 +52,13 @@ pub const LOGIN_COOKIE: &str = "komo_oidc";
 /// 设备令牌的前缀，给人认（日志、泄露扫描）；Gateway 只靠哈希查。
 pub const DEVICE_PREFIX: &str = "komodev_";
 /// 网页会话的滑动有效期。
-pub const WEB_TTL: Duration = Duration::days(30);
+pub const WEB_TTL: SignedDuration = SignedDuration::from_hours(24 * 30);
 /// 距上次记录超过这么久才写库续期（别每个请求都写）。
-const TOUCH_AFTER: Duration = Duration::minutes(10);
+const TOUCH_AFTER: SignedDuration = SignedDuration::from_mins(10);
 /// 一次登录从跳出去到回调最多多久。
-const LOGIN_TTL: Duration = Duration::minutes(10);
+const LOGIN_TTL: SignedDuration = SignedDuration::from_mins(10);
 /// 设备登录的一次性授权码、本机登录链接多久失效。
-const CODE_TTL: Duration = Duration::minutes(2);
+const CODE_TTL: SignedDuration = SignedDuration::from_mins(2);
 /// 本机登录链接换出来的网页会话记在哪个账号下（`/v1/auth/sessions` 里显示）。
 pub const LOCAL_SUBJECT: &str = "local";
 /// 内存里同时挂着的待完成登录 / 授权码上限：满了先丢最早的。
@@ -129,14 +129,14 @@ struct PendingLogin {
     nonce: String,
     verifier: String,
     purpose: Purpose,
-    expires: OffsetDateTime,
+    expires: Timestamp,
 }
 
 struct DeviceCode {
     request: DeviceRequest,
     subject: String,
     email: Option<String>,
-    expires: OffsetDateTime,
+    expires: Timestamp,
 }
 
 /// 登录这一步失败的几种，由 handler 翻成页面或错误体。
@@ -189,7 +189,7 @@ pub struct AuthService {
     pending: Mutex<HashMap<String, PendingLogin>>,
     codes: Mutex<HashMap<String, DeviceCode>>,
     /// 本机登录链接里的一次性码 → 到期时间。
-    local_links: Mutex<HashMap<String, OffsetDateTime>>,
+    local_links: Mutex<HashMap<String, Timestamp>>,
 }
 
 impl std::fmt::Debug for AuthService {
@@ -249,7 +249,7 @@ impl AuthService {
     pub fn session_cookie(&self, token: &str) -> String {
         format!(
             "{SESSION_COOKIE}={token}; HttpOnly; SameSite=Lax; Path=/; Max-Age={}{}",
-            WEB_TTL.whole_seconds(),
+            WEB_TTL.as_secs(),
             self.secure_attr()
         )
     }
@@ -264,7 +264,7 @@ impl AuthService {
     pub fn login_cookie(&self, state: &str) -> String {
         format!(
             "{LOGIN_COOKIE}={state}; HttpOnly; SameSite=Lax; Path=/auth; Max-Age={}{}",
-            LOGIN_TTL.whole_seconds(),
+            LOGIN_TTL.as_secs(),
             self.secure_attr()
         )
     }
@@ -284,7 +284,7 @@ impl AuthService {
         }
     }
 
-    fn now(&self) -> OffsetDateTime {
+    fn now(&self) -> Timestamp {
         self.clock.now()
     }
 
@@ -360,8 +360,8 @@ impl AuthService {
     async fn touch(
         &self,
         record: &AuthSessionRecord,
-        now: OffsetDateTime,
-        renew_to: Option<OffsetDateTime>,
+        now: Timestamp,
+        renew_to: Option<Timestamp>,
     ) -> bool {
         if now - record.last_used_at < TOUCH_AFTER {
             return false;
@@ -432,7 +432,7 @@ impl AuthService {
                 &pending.verifier,
                 &pending.nonce,
                 secret.as_deref(),
-                now.unix_timestamp(),
+                now.as_second(),
             )
             .await?;
         if !claims.allowed_by(oidc.config()) {
@@ -634,8 +634,8 @@ fn insert_bounded<V>(
     table: &Mutex<HashMap<String, V>>,
     key: String,
     value: V,
-    now: OffsetDateTime,
-    expires: impl Fn(&V) -> OffsetDateTime,
+    now: Timestamp,
+    expires: impl Fn(&V) -> Timestamp,
 ) {
     let mut table = table.lock().expect("内存表");
     table.retain(|_, entry| expires(entry) > now);
@@ -766,7 +766,6 @@ pub async fn check(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use time::macros::datetime;
 
     #[test]
     fn only_loopback_and_the_deep_link_may_receive_a_device_code() {
@@ -1006,13 +1005,13 @@ mod tests {
         let headers = cookie(&token);
         let authenticate = || f.auth.authenticate(&headers, &Method::GET);
 
-        f.clock.advance(Duration::minutes(5));
+        f.clock.advance(SignedDuration::from_mins(5));
         let early = authenticate().await.unwrap().unwrap();
         assert!(early.reissue_cookie.is_none(), "5 分钟：不续");
         let created = f.auth.list(None).await.unwrap()[0].expires_at.unwrap();
         assert_eq!(created, TestClock::fixed().now() + WEB_TTL, "也没写库");
 
-        f.clock.advance(Duration::minutes(6));
+        f.clock.advance(SignedDuration::from_mins(6));
         let renewed = authenticate().await.unwrap().unwrap();
         assert_eq!(
             renewed.reissue_cookie.as_deref(),
@@ -1035,11 +1034,11 @@ mod tests {
 
         // 每隔不到 30 天用一次就一直有效。
         for _ in 0..3 {
-            f.clock.advance(Duration::days(29));
+            f.clock.advance(SignedDuration::from_hours(24 * 29));
             assert!(authenticate().await.unwrap().is_some());
         }
         // 超过 30 天没用：过期，清单里也没了。
-        f.clock.advance(Duration::days(31));
+        f.clock.advance(SignedDuration::from_hours(24 * 31));
         assert!(authenticate().await.unwrap().is_none());
         assert!(f.auth.list(None).await.unwrap().is_empty());
         assert_eq!(f.auth.purge_expired().await.unwrap(), 1);
@@ -1105,7 +1104,7 @@ mod tests {
         assert!(!f.auth.redeem_local_link("not-issued"));
 
         let late = f.auth.issue_local_link();
-        f.clock.advance(Duration::minutes(3));
+        f.clock.advance(SignedDuration::from_mins(3));
         assert!(!f.auth.redeem_local_link(&late), "过期");
     }
 
@@ -1151,7 +1150,7 @@ mod tests {
             ("过期", verifier.clone(), redirect, 3),
         ] {
             let code = f.auth.issue_code(device_request(&verifier), "u-1", None);
-            f.clock.advance(Duration::minutes(wait));
+            f.clock.advance(SignedDuration::from_mins(wait));
             assert!(
                 matches!(
                     f.auth
@@ -1177,7 +1176,7 @@ mod tests {
         ));
 
         // 设备令牌长期有效，且不会要求重发 cookie。
-        f.clock.advance(Duration::days(400));
+        f.clock.advance(SignedDuration::from_hours(24 * 400));
         let found = f
             .auth
             .authenticate(&bearer_header(&token), &Method::GET)
@@ -1201,7 +1200,7 @@ mod tests {
     async fn revoking_and_logging_out_end_a_session_and_the_list_orders_by_last_use() {
         let f = fixture("t").await;
         let web = f.auth.issue_web("u-1", None, "Firefox/130").await.unwrap();
-        f.clock.advance(Duration::minutes(1));
+        f.clock.advance(SignedDuration::from_mins(1));
         let (device, device_record) = redeem_device(&f).await;
         let list = f.auth.list(None).await.unwrap();
         assert_eq!(list.len(), 2);
@@ -1317,13 +1316,13 @@ mod tests {
     /// 内存里的待完成登录有上限：先清过期的，仍满了就丢最早到期的。
     #[test]
     fn the_pending_table_is_bounded_and_drops_the_oldest_first() {
-        let table: Mutex<HashMap<String, OffsetDateTime>> = Mutex::new(HashMap::new());
-        let now = datetime!(2026-09-15 08:00:00 UTC);
+        let table: Mutex<HashMap<String, Timestamp>> = Mutex::new(HashMap::new());
+        let now = "2026-09-15T08:00:00Z".parse::<jiff::Timestamp>().unwrap();
         for index in 0..(MAX_PENDING + 20) {
             insert_bounded(
                 &table,
                 format!("k{index}"),
-                now + Duration::seconds(index as i64 + 1),
+                now + SignedDuration::from_secs(index as i64 + 1),
                 now,
                 |expires| *expires,
             );
@@ -1335,13 +1334,17 @@ mod tests {
 
         // 过期的在下一次插入时被清掉。
         drop(table);
-        let table: Mutex<HashMap<String, OffsetDateTime>> = Mutex::new(HashMap::from([
-            ("old".to_string(), now - Duration::seconds(1)),
-            ("live".to_string(), now + Duration::seconds(1)),
+        let table: Mutex<HashMap<String, Timestamp>> = Mutex::new(HashMap::from([
+            ("old".to_string(), now - SignedDuration::from_secs(1)),
+            ("live".to_string(), now + SignedDuration::from_secs(1)),
         ]));
-        insert_bounded(&table, "new".into(), now + Duration::seconds(5), now, |e| {
-            *e
-        });
+        insert_bounded(
+            &table,
+            "new".into(),
+            now + SignedDuration::from_secs(5),
+            now,
+            |e| *e,
+        );
         let keys: std::collections::BTreeSet<_> = table.lock().unwrap().keys().cloned().collect();
         assert_eq!(keys, ["live".to_string(), "new".to_string()].into());
     }

@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use time::OffsetDateTime;
+use jiff::Timestamp;
 
 use crate::traits::*;
 use crate::types::ids::*;
@@ -23,7 +23,7 @@ pub struct MemMemoryRepo {
 struct MemoryState_ {
     items: BTreeMap<MemoryId, MemoryItem>,
     vectors: BTreeMap<MemoryId, Vector>,
-    marks: BTreeMap<MemoryId, OffsetDateTime>,
+    marks: BTreeMap<MemoryId, Timestamp>,
     /// 置位后 recall 明示降级。
     vector_backend_down: bool,
 }
@@ -100,7 +100,7 @@ impl MemoryRepo for MemMemoryRepo {
         &self,
         id: &MemoryId,
         expected_revision: u32,
-        at: OffsetDateTime,
+        at: Timestamp,
     ) -> Result<MemoryItem, RepoError> {
         let mut state = self.state.lock().expect("记忆");
         let item = state.items.get_mut(id).ok_or_else(|| RepoError::NotFound {
@@ -121,7 +121,7 @@ impl MemoryRepo for MemMemoryRepo {
         &self,
         id: &MemoryId,
         expected_revision: u32,
-        at: OffsetDateTime,
+        at: Timestamp,
     ) -> Result<MemoryItem, RepoError> {
         let mut state = self.state.lock().expect("记忆");
         let item = state.items.get_mut(id).ok_or_else(|| RepoError::NotFound {
@@ -162,7 +162,7 @@ impl MemoryRepo for MemMemoryRepo {
     async fn consolidation_marks(
         &self,
         ids: &[MemoryId],
-    ) -> Result<Vec<(MemoryId, Option<OffsetDateTime>)>, RepoError> {
+    ) -> Result<Vec<(MemoryId, Option<Timestamp>)>, RepoError> {
         let state = self.state.lock().expect("记忆");
         Ok(ids
             .iter()

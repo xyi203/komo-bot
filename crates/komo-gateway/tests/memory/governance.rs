@@ -252,7 +252,7 @@ async fn an_unknown_memory_is_a_not_found_not_an_empty_answer() {
 /// sweep 先预演、再应用；已确认的不动；遗忘的能 restore 回来，并且重新召回得到。
 #[tokio::test]
 async fn sweep_forgets_by_rule_and_restore_brings_it_back() {
-    let long_ago = time::OffsetDateTime::now_utc() - time::Duration::days(100);
+    let long_ago = jiff::Timestamp::now() - jiff::SignedDuration::from_hours(24 * 100);
     let aged = |id: &str, content: &str| {
         let mut item = seeded(
             id,

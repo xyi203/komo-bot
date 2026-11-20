@@ -101,6 +101,6 @@ fn the_fixed_embedding_client_is_deterministic_and_normalized() {
 fn the_test_clock_can_be_wound_forward() {
     let clock = TestClock::fixed();
     let before = clock.now();
-    clock.advance(time::Duration::hours(2));
-    assert_eq!(clock.now() - before, time::Duration::hours(2));
+    clock.advance(jiff::SignedDuration::from_hours(2));
+    assert_eq!(clock.now() - before, jiff::SignedDuration::from_hours(2));
 }

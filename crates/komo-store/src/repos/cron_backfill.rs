@@ -303,16 +303,15 @@ mod tests {
     use super::*;
     use crate::TursoCronRepo;
     use crate::repos::matter::TursoMatterRepo;
+    use jiff::Timestamp;
     use komo_kernel::cron::{FiringStatus, JobStatus};
     use komo_kernel::traits::{CronRepo, MatterRepo};
     use komo_kernel::types::ids::MatterId;
     use komo_kernel::types::matter::{
         MatterChange, MatterKind, MatterState, NewMatter, transition,
     };
-    use time::OffsetDateTime;
-    use time::macros::datetime;
 
-    const T0: OffsetDateTime = datetime!(2026-10-29 08:00:00 UTC);
+    const T0: Timestamp = jiff::Timestamp::constant(1793260800, 0) /* 2026-10-29T08:00:00Z */;
 
     async fn temp() -> (Db, tempfile::TempDir) {
         let dir = tempfile::tempdir().expect("临时目录");

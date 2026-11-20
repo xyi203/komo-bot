@@ -1,8 +1,8 @@
 //! 浏览器推送订阅仓储（`docs/redesign.md` §1.8）：`aux.db` 的 `push_subscriptions`。
 
+use jiff::Timestamp;
 use komo_kernel::traits::StoreError;
 use komo_kernel::types::ids::uuid_v7_at;
-use time::OffsetDateTime;
 
 use crate::db::{BoxFuture, Db, from_ts, map_toasty, to_ts};
 use crate::models::PushSubscriptionRow;
@@ -15,8 +15,8 @@ pub struct PushSubscription {
     pub p256dh: String,
     pub auth: String,
     pub user_agent: Option<String>,
-    pub created_at: OffsetDateTime,
-    pub updated_at: OffsetDateTime,
+    pub created_at: Timestamp,
+    pub updated_at: Timestamp,
 }
 
 /// 订阅时要存的东西。
@@ -26,7 +26,7 @@ pub struct NewPushSubscription {
     pub p256dh: String,
     pub auth: String,
     pub user_agent: Option<String>,
-    pub now: OffsetDateTime,
+    pub now: Timestamp,
 }
 
 #[derive(Debug, Clone)]
@@ -147,11 +147,10 @@ impl TursoPushRepo {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use time::macros::datetime;
 
-    const T0: OffsetDateTime = datetime!(2026-11-01 08:00:00 UTC);
+    const T0: Timestamp = jiff::Timestamp::constant(1793520000, 0) /* 2026-11-01T08:00:00Z */;
 
-    fn sub(endpoint: &str, p256dh: &str, now: OffsetDateTime) -> NewPushSubscription {
+    fn sub(endpoint: &str, p256dh: &str, now: Timestamp) -> NewPushSubscription {
         NewPushSubscription {
             endpoint: endpoint.into(),
             p256dh: p256dh.into(),
@@ -174,7 +173,7 @@ mod tests {
             .upsert(sub(
                 "https://push.example/b",
                 "k2",
-                T0 + time::Duration::minutes(1),
+                T0 + jiff::SignedDuration::from_mins(1),
             ))
             .await
             .unwrap();
@@ -185,7 +184,7 @@ mod tests {
                 ..sub(
                     "https://push.example/a",
                     "k1-new",
-                    T0 + time::Duration::hours(1),
+                    T0 + jiff::SignedDuration::from_hours(1),
                 )
             })
             .await
@@ -198,7 +197,7 @@ mod tests {
         assert_eq!(list[0].p256dh, "k1-new");
         assert_eq!(list[0].user_agent, None);
         assert_eq!(list[0].created_at, T0, "创建时刻不动");
-        assert_eq!(list[0].updated_at, T0 + time::Duration::hours(1));
+        assert_eq!(list[0].updated_at, T0 + jiff::SignedDuration::from_hours(1));
 
         assert!(repo.remove("https://push.example/a").await.unwrap());
         assert!(

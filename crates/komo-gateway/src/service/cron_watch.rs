@@ -28,7 +28,7 @@ pub struct Watched {
     pub job: CronJobId,
     pub session: SessionId,
     pub run: RunId,
-    pub scheduled_at: time::OffsetDateTime,
+    pub scheduled_at: jiff::Timestamp,
     pub name: String,
     pub notify: NotifyPolicy,
     /// 手动 run 没有触发记录，不回写状态（§10）。
@@ -92,7 +92,7 @@ pub(crate) async fn notify(
         format!(
             "{}@{}",
             watched.job,
-            watched.scheduled_at.unix_timestamp_nanos() / 1_000_000
+            watched.scheduled_at.as_nanosecond() / 1_000_000
         )
     } else {
         format!("{}@run-{}", watched.job, watched.run)

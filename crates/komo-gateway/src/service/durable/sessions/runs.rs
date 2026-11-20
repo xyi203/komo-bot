@@ -22,6 +22,7 @@
 //! 整个 conversation 的投影是 O(历史) 的：`GET /v1/runs/{id}` 与会话详情的 `unfinished` 每次现算。
 //! TODO：长会话上给 run 游标（只投影这条 run 之后的记录）。
 
+use jiff::Timestamp;
 use komo_kernel::durable::legacy_events::legacy_events;
 use komo_kernel::durable::storage::{ConversationQuery, EntryQuery, SubmissionQuery};
 use komo_kernel::durable::{
@@ -39,7 +40,6 @@ use komo_kernel::types::plan::PlanSource;
 use komo_kernel::types::status::{RetryCause, RunState, WaitReason};
 use komo_runtime::durable::harness::{GenerationLive, Harness, WithdrawResult};
 use serde_json::Value;
-use time::OffsetDateTime;
 
 use super::super::DurableCore;
 use super::super::submit::shell::SHELL_ENTRY;
@@ -247,7 +247,7 @@ fn summarize(
     let created_at = of_run(&folded.events, run)
         .find(|event| matches!(event.payload, EventPayload::RunStarted(_)))
         .or(first)
-        .map_or(OffsetDateTime::UNIX_EPOCH, |event| event.ts);
+        .map_or(Timestamp::UNIX_EPOCH, |event| event.ts);
     let ended_at = of_run(&folded.events, run)
         .find(|event| is_terminal_event(event))
         .map(|event| event.ts.max(created_at));
@@ -484,7 +484,7 @@ impl DurableCore {
         }
         let duration_ms = summary.ended_at.map(|ended| {
             (ended - summary.created_at)
-                .whole_milliseconds()
+                .as_millis()
                 .max(0)
                 .try_into()
                 .unwrap_or(u64::MAX)

@@ -19,10 +19,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use base64::Engine as _;
+use jiff::Timestamp;
 use komo_kernel::types::digest::ContentHash;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use time::OffsetDateTime;
 use tokio::sync::Mutex;
 
 use super::transport::{HttpRequest, HttpTransport, TransportError};
@@ -37,7 +37,7 @@ const REDIRECT_URI: &str = "https://auth.openai.com/deviceauth/callback";
 pub const DEVICE_AUTH_URL: &str = "https://auth.openai.com/codex/device";
 
 /// 快过期的余量：剩余寿命小于它就在下一次取用前刷新（§13.3）。
-const REFRESH_MARGIN: time::Duration = time::Duration::minutes(5);
+const REFRESH_MARGIN: jiff::SignedDuration = jiff::SignedDuration::from_mins(5);
 /// 设备码登录最多等这么久（§13.3 背景：约 10 分钟）。
 const DEVICE_LOGIN_TIMEOUT: Duration = Duration::from_secs(600);
 
@@ -95,13 +95,12 @@ pub struct CodexAuth {
     pub email: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan: Option<String>,
-    #[serde(with = "time::serde::rfc3339")]
-    pub expires_at: OffsetDateTime,
+    pub expires_at: Timestamp,
 }
 
 impl CodexAuth {
     /// 剩余寿命小于刷新余量——该在下一次取用前刷新了（§13.3）。
-    pub fn needs_refresh(&self, now: OffsetDateTime) -> bool {
+    pub fn needs_refresh(&self, now: Timestamp) -> bool {
         self.expires_at - now < REFRESH_MARGIN
     }
 }
@@ -122,7 +121,7 @@ pub struct CodexStatus {
     pub account_id: String,
     pub email: Option<String>,
     pub plan: Option<String>,
-    pub expires_at: OffsetDateTime,
+    pub expires_at: Timestamp,
 }
 
 // ---------------------------------------------------------------- JWT
@@ -168,12 +167,12 @@ fn email_from(claims: &Value) -> Option<String> {
         .map(str::to_string)
 }
 
-fn expires_at_from(claims: &Value) -> Result<OffsetDateTime, CodexAuthError> {
+fn expires_at_from(claims: &Value) -> Result<Timestamp, CodexAuthError> {
     let exp = claims
         .get("exp")
         .and_then(Value::as_i64)
         .ok_or_else(|| CodexAuthError::NeedsLogin("access_token 没有 exp".into()))?;
-    OffsetDateTime::from_unix_timestamp(exp)
+    Timestamp::from_second(exp)
         .map_err(|error| CodexAuthError::NeedsLogin(format!("exp 无法解析：{error}")))
 }
 
@@ -506,13 +505,13 @@ impl CodexTokenSource {
 
     pub async fn token(&self) -> Result<CodexAuth, CodexAuthError> {
         let creds = load(&self.path)?;
-        if !creds.needs_refresh(OffsetDateTime::now_utc()) {
+        if !creds.needs_refresh(Timestamp::now()) {
             return Ok(creds);
         }
         let _guard = REFRESH_LOCK.lock().await;
         // 锁内重读：等锁的这段时间里，另一个请求可能已经刷新过了。
         let creds = load(&self.path)?;
-        if !creds.needs_refresh(OffsetDateTime::now_utc()) {
+        if !creds.needs_refresh(Timestamp::now()) {
             return Ok(creds);
         }
         let refreshed = refresh(self.transport.as_ref(), &creds.refresh_token).await?;
@@ -526,7 +525,6 @@ mod tests {
     use super::super::transport::testing::{Reply, ScriptedTransport};
     use super::super::transport::{HttpResponse, RequestBody};
     use super::*;
-    use time::macros::datetime;
 
     /// 一个最小可用的 access_token：`{"alg":"none"}.{claims}.`（不验签，签名段随便写）。
     fn jwt(claims: Value) -> String {
@@ -553,10 +551,18 @@ mod tests {
 
     #[test]
     fn account_id_and_plan_and_expiry_come_from_the_access_token_jwt() {
-        let creds = sample(datetime!(2026-09-23 12:00:00 UTC).unix_timestamp());
+        let creds = sample(
+            "2026-09-23T12:00:00Z"
+                .parse::<jiff::Timestamp>()
+                .unwrap()
+                .as_second(),
+        );
         assert_eq!(creds.account_id, "acct_1");
         assert_eq!(creds.plan.as_deref(), Some("plus"));
-        assert_eq!(creds.expires_at, datetime!(2026-09-23 12:00:00 UTC));
+        assert_eq!(
+            creds.expires_at,
+            "2026-09-23T12:00:00Z".parse::<jiff::Timestamp>().unwrap()
+        );
     }
 
     #[test]
@@ -607,7 +613,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_unexpired_credential_is_not_refreshed() {
-        let far_future = (OffsetDateTime::now_utc() + time::Duration::hours(1)).unix_timestamp();
+        let far_future = (Timestamp::now() + jiff::SignedDuration::from_hours(1)).as_second();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("codex").join("auth.json");
         save(&path, &sample(far_future)).unwrap();
@@ -622,12 +628,12 @@ mod tests {
 
     #[tokio::test]
     async fn an_expiring_credential_is_refreshed_and_the_new_refresh_token_is_saved() {
-        let almost_now = (OffsetDateTime::now_utc() + time::Duration::seconds(30)).unix_timestamp();
+        let almost_now = (Timestamp::now() + jiff::SignedDuration::from_secs(30)).as_second();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("codex").join("auth.json");
         save(&path, &sample(almost_now)).unwrap();
 
-        let new_exp = (OffsetDateTime::now_utc() + time::Duration::hours(1)).unix_timestamp();
+        let new_exp = (Timestamp::now() + jiff::SignedDuration::from_hours(1)).as_second();
         let body = json!({
             "access_token": access_token("acct_1", "plus", new_exp),
             "refresh_token": "refresh-2",
@@ -640,7 +646,7 @@ mod tests {
             token.refresh_token, "refresh-2",
             "换过的 refresh_token 要用新的"
         );
-        assert!(!token.needs_refresh(OffsetDateTime::now_utc()));
+        assert!(!token.needs_refresh(Timestamp::now()));
 
         let saved = load(&path).unwrap();
         assert_eq!(saved.refresh_token, "refresh-2", "写回的也要是新的");
@@ -665,12 +671,12 @@ mod tests {
 
     #[tokio::test]
     async fn two_sources_on_one_file_refresh_only_once() {
-        let almost_now = (OffsetDateTime::now_utc() + time::Duration::seconds(30)).unix_timestamp();
+        let almost_now = (Timestamp::now() + jiff::SignedDuration::from_secs(30)).as_second();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("codex").join("auth.json");
         save(&path, &sample(almost_now)).unwrap();
 
-        let new_exp = (OffsetDateTime::now_utc() + time::Duration::hours(1)).unix_timestamp();
+        let new_exp = (Timestamp::now() + jiff::SignedDuration::from_hours(1)).as_second();
         let body = json!({
             "access_token": access_token("acct_1", "plus", new_exp),
             "refresh_token": "refresh-2",

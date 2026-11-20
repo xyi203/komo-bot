@@ -235,7 +235,7 @@ fn matter_line(matter: &Matter, today: Date) -> String {
             if let Some(due) = matter.due {
                 // 同年省掉年份，跨年才写全，免得 11-01 读成今年。
                 let day = if due.year() == today.year() {
-                    format!("{:02}-{:02}", u8::from(due.month()), due.day())
+                    format!("{:02}-{:02}", due.month(), due.day())
                 } else {
                     due.to_string()
                 };
@@ -300,7 +300,7 @@ fn render_line(item: &MemoryItem, convention: bool) -> String {
         kind_text(item.kind),
         provenance_text(item.provenance),
         confirmation_text(item.confirmation, item.state),
-        item.observed_at.date(),
+        komo_kernel::types::matter::utc_date(item.observed_at),
         item.id,
         item.revision
     )
@@ -399,9 +399,9 @@ mod tests {
 
     use super::*;
 
-    /// 一个固定的观察时刻。**不必让 komo-agent 直接依赖 `time` crate**（§13.4：它只
+    /// 一个固定的观察时刻。**不必让 komo-agent 直接依赖 jiff**（§13.4：它只
     /// 依赖 kernel / serde_json / tracing）：整条记忆经 `MemoryItem` 自己的 RFC3339
-    /// 反序列化（`komo-kernel` 里的 `#[serde(with = "time::serde::rfc3339")]`）造出来，
+    /// 反序列化（jiff `Timestamp` 的 serde）造出来，
     /// 这里只借它的 `observed_at` 字段，类型全程不必写出来。
     fn fixed_item() -> MemoryItem {
         serde_json::from_value(serde_json::json!({
@@ -706,7 +706,7 @@ mod tests {
         komo_kernel::types::matter::parse_due(text).expect("日期")
     }
 
-    /// 事项靠 JSON 造出来，同上不让本 crate 依赖 `time`。`updated` 决定超预算时先丢谁。
+    /// 事项靠 JSON 造出来，同上不让本 crate 依赖 jiff。`updated` 决定超预算时先丢谁。
     fn matter(id: &str, kind: &str, state: &str, title: &str, updated: &str) -> Matter {
         serde_json::from_value(serde_json::json!({
             "id": id,

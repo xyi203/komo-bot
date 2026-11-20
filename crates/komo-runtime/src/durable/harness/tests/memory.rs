@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use jiff::Timestamp;
 use komo_kernel::protocol::config::MemoryConfig;
 use komo_kernel::protocol::http::MemoryAddRequest;
 use komo_kernel::test_support::ScriptedLlm;
@@ -11,7 +12,6 @@ use komo_kernel::types::ids::{RunId, SessionId};
 use komo_kernel::types::memory::{Confirmation, MemoryKind, MemoryScope};
 use komo_store::{Db, TursoMemoryRepo};
 use serde_json::json;
-use time::OffsetDateTime;
 
 use super::super::SubmissionDraft;
 use super::support::*;
@@ -23,8 +23,8 @@ use komo_tools::tools::{bash::BashTool, codemode::CodemodeTool, write::WriteTool
 
 struct WallClock;
 impl Clock for WallClock {
-    fn now(&self) -> OffsetDateTime {
-        OffsetDateTime::now_utc()
+    fn now(&self) -> Timestamp {
+        Timestamp::now()
     }
 }
 

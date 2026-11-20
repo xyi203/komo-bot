@@ -529,7 +529,7 @@ fn run() -> Option<RunId> {
 }
 
 fn fresh_key() -> Option<komo_kernel::types::ids::RequestKey> {
-    Some(RequestKeys::fresh(time::OffsetDateTime::now_utc()))
+    Some(RequestKeys::fresh(jiff::Timestamp::now()))
 }
 
 async fn add(client: &KomoClient, mut request: MatterAddRequest) -> Outcome {

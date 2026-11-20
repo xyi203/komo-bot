@@ -194,9 +194,9 @@ impl ChildRef {
         ChildProcess {
             pid: self.pid,
             pgid: self.pgid,
-            started_at: self.started_at.and_then(|ms| {
-                time::OffsetDateTime::from_unix_timestamp_nanos(i128::from(ms) * 1_000_000).ok()
-            }),
+            started_at: self
+                .started_at
+                .and_then(|ms| jiff::Timestamp::from_nanosecond(i128::from(ms) * 1_000_000).ok()),
             what,
         }
     }

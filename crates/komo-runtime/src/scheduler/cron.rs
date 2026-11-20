@@ -15,12 +15,11 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use jiff::Timestamp;
 use komo_kernel::cron::{CronFiring, CronJob, FiringStatus, JobStatus, OverlapPolicy, Trigger};
 use komo_kernel::traits::{Clock, CronRepo, RepoError, ZoneResolver};
 use komo_kernel::types::ids::{CronJobId, RequestKey, RunId, SessionId};
 use komo_kernel::types::model::ModelConfig;
-use time::OffsetDateTime;
-use time::format_description::well_known::Rfc3339;
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum CronError {
@@ -44,8 +43,8 @@ pub struct FireSpec {
     /// Job 的 effort 已经盖在上面）。
     pub model: ModelConfig,
     /// 计划时间；手动 run 没有。
-    pub slot: Option<OffsetDateTime>,
-    pub at: OffsetDateTime,
+    pub slot: Option<Timestamp>,
+    pub at: Timestamp,
 }
 
 /// 目标受理了触发之后给回的指代。
@@ -75,12 +74,11 @@ pub trait CronTarget: Send + Sync {
 }
 
 /// 定时触发的请求键。
-pub fn firing_key(job: &CronJobId, slot: OffsetDateTime) -> RequestKey {
-    RequestKey::new(format!(
-        "cron:{}:{}",
-        job,
-        slot.format(&Rfc3339).unwrap_or_else(|_| slot.to_string())
-    ))
+///
+/// `Timestamp` 的 Display 是 RFC 3339（UTC、小数秒去尾零），与换 jiff 之前
+/// `time` 的 `Rfc3339` 逐字节相同——键是幂等去重的依据，格式不能变。
+pub fn firing_key(job: &CronJobId, slot: Timestamp) -> RequestKey {
+    RequestKey::new(format!("cron:{job}:{slot}"))
 }
 
 /// 没有 Job 级覆盖时用主模型；Job 的 effort 盖在上面（§10）。
@@ -99,7 +97,7 @@ pub struct Fired {
     pub job_version: u64,
     pub run: RunId,
     pub session: SessionId,
-    pub scheduled_at: OffsetDateTime,
+    pub scheduled_at: Timestamp,
     /// 账本说这是同一请求键的原 Run（重发）——重启后补跑时会看到。
     pub deduplicated: bool,
 }
@@ -108,7 +106,7 @@ pub struct Fired {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Skipped {
     pub job: CronJobId,
-    pub scheduled_at: Option<OffsetDateTime>,
+    pub scheduled_at: Option<Timestamp>,
     pub reason: SkipReason,
 }
 
@@ -207,11 +205,7 @@ impl CronScheduler {
         };
         let now = self.clock.now();
         let session = SessionId::new_at(now);
-        let key = RequestKey::new(format!(
-            "cron-manual:{}:{}",
-            job.id,
-            now.format(&Rfc3339).unwrap_or_else(|_| now.to_string())
-        ));
+        let key = RequestKey::new(format!("cron-manual:{}:{now}", job.id));
         let fired = self
             .target
             .run_now(self.spec(&job, session.clone(), key, None, now))
@@ -226,7 +220,7 @@ impl CronScheduler {
         }))
     }
 
-    async fn fire(&self, mut job: CronJob, now: OffsetDateTime) -> Result<Outcome, CronError> {
+    async fn fire(&self, mut job: CronJob, now: Timestamp) -> Result<Outcome, CronError> {
         let Some(slot) = job.next_run_at else {
             return Ok(Outcome::Skipped(Skipped {
                 job: job.id.clone(),
@@ -343,8 +337,8 @@ impl CronScheduler {
     async fn skip(
         &self,
         mut job: CronJob,
-        slot: OffsetDateTime,
-        now: OffsetDateTime,
+        slot: Timestamp,
+        now: Timestamp,
         reason: SkipReason,
     ) -> Result<Outcome, CronError> {
         let note = reason.note();
@@ -368,7 +362,7 @@ impl CronScheduler {
     pub async fn settle(
         &self,
         job: &CronJobId,
-        scheduled_at: OffsetDateTime,
+        scheduled_at: Timestamp,
         status: FiringStatus,
         error: Option<String>,
     ) -> Result<bool, CronError> {
@@ -401,8 +395,8 @@ impl CronScheduler {
         job: &CronJob,
         session: SessionId,
         request_key: RequestKey,
-        slot: Option<OffsetDateTime>,
-        now: OffsetDateTime,
+        slot: Option<Timestamp>,
+        now: Timestamp,
     ) -> FireSpec {
         FireSpec {
             job: job.clone(),
@@ -426,7 +420,7 @@ impl CronScheduler {
     ///
     /// 写回走 [`CronRepo::advance_from`]：`job` 是这一拍开头读到的快照，触发期间（命令型 Job
     /// 要等命令跑完）操作者暂停或改了时间，库里已经是新的状态，不能拿旧快照盖回去。
-    async fn advance(&self, job: &mut CronJob, now: OffsetDateTime) -> Result<(), CronError> {
+    async fn advance(&self, job: &mut CronJob, now: Timestamp) -> Result<(), CronError> {
         let seen = job.seen();
         if matches!(job.trigger, Trigger::At { .. }) {
             job.status = JobStatus::Done;
@@ -463,17 +457,16 @@ mod tests {
     use komo_kernel::cron::{TimeZone, next_occurrence, parse_schedule};
     use komo_kernel::test_support::{MemCronRepo, TestClock};
     use komo_kernel::types::ids::CronJobId;
-    use time::macros::datetime;
 
     use crate::scheduler::JiffZoneResolver;
 
-    const NOW: OffsetDateTime = datetime!(2026-09-15 08:00:00 UTC);
+    const NOW: Timestamp = jiff::Timestamp::constant(1789459200, 0) /* 2026-09-15T08:00:00Z */;
 
     fn model() -> ModelConfig {
         komo_kernel::test_support::sample_model()
     }
 
-    fn job(id: &str, next_run_at: Option<OffsetDateTime>) -> CronJob {
+    fn job(id: &str, next_run_at: Option<Timestamp>) -> CronJob {
         CronJob {
             id: CronJobId::from_raw(id),
             name: "morning-summary".into(),
@@ -554,7 +547,7 @@ mod tests {
     async fn a_due_job_becomes_one_queued_run() {
         let h = harness();
         h.jobs
-            .put(job("job-1", Some(NOW - time::Duration::minutes(1))))
+            .put(job("job-1", Some(NOW - jiff::SignedDuration::from_mins(1))))
             .await
             .unwrap();
 
@@ -571,7 +564,7 @@ mod tests {
     #[tokio::test]
     async fn the_same_scheduled_time_is_only_ever_claimed_once() {
         let h = harness();
-        let slot = NOW - time::Duration::minutes(1);
+        let slot = NOW - jiff::SignedDuration::from_mins(1);
         h.jobs.put(job("job-1", Some(slot))).await.unwrap();
 
         let first = h.scheduler.tick().await.unwrap();
@@ -597,7 +590,7 @@ mod tests {
     async fn an_unfinished_previous_firing_skips_this_one() {
         let h = harness();
         h.jobs
-            .put(job("job-1", Some(NOW - time::Duration::minutes(1))))
+            .put(job("job-1", Some(NOW - jiff::SignedDuration::from_mins(1))))
             .await
             .unwrap();
         h.target
@@ -640,7 +633,7 @@ mod tests {
     #[tokio::test]
     async fn a_fired_firing_carries_its_session_and_run() {
         let h = harness();
-        let slot = NOW - time::Duration::minutes(1);
+        let slot = NOW - jiff::SignedDuration::from_mins(1);
         h.jobs.put(job("job-1", Some(slot))).await.unwrap();
 
         let tick = h.scheduler.tick().await.unwrap();
@@ -683,7 +676,7 @@ mod tests {
     #[tokio::test]
     async fn a_job_workdir_travels_with_its_firing() {
         let h = harness();
-        let mut with_dir = job("job-1", Some(NOW - time::Duration::minutes(1)));
+        let mut with_dir = job("job-1", Some(NOW - jiff::SignedDuration::from_mins(1)));
         with_dir.workdir = Some(std::path::PathBuf::from("/tmp/komo-cron-ws"));
         h.jobs.put(with_dir).await.unwrap();
 
@@ -699,7 +692,7 @@ mod tests {
     #[tokio::test]
     async fn an_allow_policy_fires_even_when_the_last_one_is_still_running() {
         let h = harness();
-        let mut job = job("job-1", Some(NOW - time::Duration::minutes(1)));
+        let mut job = job("job-1", Some(NOW - jiff::SignedDuration::from_mins(1)));
         job.overlap = OverlapPolicy::Allow;
         h.jobs.put(job).await.unwrap();
         h.target
@@ -718,7 +711,7 @@ mod tests {
     async fn a_slot_missed_by_days_is_not_made_up() {
         let h = harness();
         // 三天前的槽位，机器一直没开。这个 Job 每天一次，迟到三天就不是"迟到"了。
-        let stale = NOW - time::Duration::days(3);
+        let stale = NOW - jiff::SignedDuration::from_hours(24 * 3);
         h.jobs.put(job("job-1", Some(stale))).await.unwrap();
 
         let tick = h.scheduler.tick().await.unwrap();
@@ -761,7 +754,10 @@ mod tests {
     async fn a_slot_missed_by_less_than_the_interval_still_runs_once() {
         let h = harness();
         h.jobs
-            .put(job("job-1", Some(NOW - time::Duration::hours(2))))
+            .put(job(
+                "job-1",
+                Some(NOW - jiff::SignedDuration::from_hours(2)),
+            ))
             .await
             .unwrap();
 
@@ -777,7 +773,7 @@ mod tests {
     #[tokio::test]
     async fn a_one_shot_still_runs_after_a_long_outage() {
         let h = harness();
-        let missed = NOW - time::Duration::days(10);
+        let missed = NOW - jiff::SignedDuration::from_hours(24 * 10);
         let mut one_shot = job("job-1", Some(missed));
         one_shot.trigger = Trigger::At { at: missed };
         h.jobs.put(one_shot).await.unwrap();
@@ -790,9 +786,9 @@ mod tests {
     #[tokio::test]
     async fn a_one_shot_completes_at_claim_time() {
         let h = harness();
-        let mut one_shot = job("job-1", Some(NOW - time::Duration::minutes(1)));
+        let mut one_shot = job("job-1", Some(NOW - jiff::SignedDuration::from_mins(1)));
         one_shot.trigger = Trigger::At {
-            at: NOW - time::Duration::minutes(1),
+            at: NOW - jiff::SignedDuration::from_mins(1),
         };
         h.jobs.put(one_shot).await.unwrap();
 
@@ -813,14 +809,17 @@ mod tests {
     #[tokio::test]
     async fn a_job_with_a_broken_trigger_does_not_take_the_sweep_down() {
         let h = harness();
-        let mut broken = job("job-broken", Some(NOW - time::Duration::minutes(1)));
+        let mut broken = job("job-broken", Some(NOW - jiff::SignedDuration::from_mins(1)));
         broken.trigger = Trigger::Cron {
             expr: "0 9 * * *".into(),
             tz: TimeZone::new("Mars/Olympus_Mons"),
         };
         h.jobs.put(broken).await.unwrap();
         h.jobs
-            .put(job("job-ok", Some(NOW - time::Duration::minutes(1))))
+            .put(job(
+                "job-ok",
+                Some(NOW - jiff::SignedDuration::from_mins(1)),
+            ))
             .await
             .unwrap();
 
@@ -849,33 +848,45 @@ mod tests {
         // 上海：09:00 恒等于 UTC 01:00。
         let shanghai =
             parse_schedule("0 9 * * *", &TimeZone::new("Asia/Shanghai"), NOW, &zones).unwrap();
-        let next = next_occurrence(&shanghai, datetime!(2026-09-15 08:00:00 UTC), &zones)
-            .unwrap()
-            .unwrap();
+        let next = next_occurrence(
+            &shanghai,
+            "2026-09-15T08:00:00Z".parse::<jiff::Timestamp>().unwrap(),
+            &zones,
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(
-            next.to_offset(time::UtcOffset::UTC),
-            datetime!(2026-09-16 01:00:00 UTC)
+            next,
+            "2026-09-16T01:00:00Z".parse::<jiff::Timestamp>().unwrap()
         );
 
         // 柏林：夏令时里 09:00 = UTC 07:00。
         let berlin =
             parse_schedule("0 9 * * *", &TimeZone::new("Europe/Berlin"), NOW, &zones).unwrap();
-        let summer = next_occurrence(&berlin, datetime!(2026-09-15 08:00:00 UTC), &zones)
-            .unwrap()
-            .unwrap();
+        let summer = next_occurrence(
+            &berlin,
+            "2026-09-15T08:00:00Z".parse::<jiff::Timestamp>().unwrap(),
+            &zones,
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(
-            summer.to_offset(time::UtcOffset::UTC),
-            datetime!(2026-09-16 07:00:00 UTC)
+            summer,
+            "2026-09-16T07:00:00Z".parse::<jiff::Timestamp>().unwrap()
         );
 
         // 同一个 Job，冬令时里 09:00 = UTC 08:00。**同一个表达式、同一个区、不同的
         // UTC 时刻**——这正是"时区只存名字、到期现算"要的。
-        let winter = next_occurrence(&berlin, datetime!(2026-11-15 12:00:00 UTC), &zones)
-            .unwrap()
-            .unwrap();
+        let winter = next_occurrence(
+            &berlin,
+            "2026-11-15T12:00:00Z".parse::<jiff::Timestamp>().unwrap(),
+            &zones,
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(
-            winter.to_offset(time::UtcOffset::UTC),
-            datetime!(2026-11-16 08:00:00 UTC)
+            winter,
+            "2026-11-16T08:00:00Z".parse::<jiff::Timestamp>().unwrap()
         );
     }
 
@@ -889,17 +900,19 @@ mod tests {
             .expect("算得出槽位");
         let slot = shanghai.next_run_at.unwrap();
         assert_eq!(
-            slot.to_offset(time::UtcOffset::UTC),
-            datetime!(2026-09-16 01:00:00 UTC),
+            slot,
+            "2026-09-16T01:00:00Z".parse::<jiff::Timestamp>().unwrap(),
             "上海的 9 点是 UTC 的 1 点"
         );
         h.jobs.put(shanghai).await.unwrap();
 
         // UTC 09:00 的前一刻还没到期。
-        h.clock.set(datetime!(2026-09-16 00:59:00 UTC));
+        h.clock
+            .set("2026-09-16T00:59:00Z".parse::<jiff::Timestamp>().unwrap());
         assert!(h.scheduler.tick().await.unwrap().fired.is_empty());
 
-        h.clock.set(datetime!(2026-09-16 01:00:30 UTC));
+        h.clock
+            .set("2026-09-16T01:00:30Z".parse::<jiff::Timestamp>().unwrap());
         assert_eq!(h.scheduler.tick().await.unwrap().fired.len(), 1);
     }
 
@@ -907,7 +920,7 @@ mod tests {
     #[tokio::test]
     async fn a_manual_run_does_not_pretend_to_be_a_scheduled_firing() {
         let h = harness();
-        let slot = NOW + time::Duration::hours(1);
+        let slot = NOW + jiff::SignedDuration::from_hours(1);
         h.jobs.put(job("job-1", Some(slot))).await.unwrap();
 
         let fired = h
@@ -926,7 +939,7 @@ mod tests {
             .unwrap();
         assert!(firings.is_empty(), "手动 run 不写触发记录：{firings:?}");
 
-        h.clock.set(slot + time::Duration::minutes(1));
+        h.clock.set(slot + jiff::SignedDuration::from_mins(1));
         let tick = h.scheduler.tick().await.unwrap();
         assert_eq!(tick.fired.len(), 1);
     }
@@ -935,7 +948,10 @@ mod tests {
     async fn a_job_that_is_not_due_yet_is_left_alone() {
         let h = harness();
         h.jobs
-            .put(job("job-1", Some(NOW + time::Duration::hours(1))))
+            .put(job(
+                "job-1",
+                Some(NOW + jiff::SignedDuration::from_hours(1)),
+            ))
             .await
             .unwrap();
         assert_eq!(h.scheduler.tick().await.unwrap(), CronTick::default());
@@ -945,7 +961,7 @@ mod tests {
     #[tokio::test]
     async fn a_job_model_override_is_a_whole_config() {
         let h = harness();
-        let mut with_override = job("job-1", Some(NOW - time::Duration::minutes(1)));
+        let mut with_override = job("job-1", Some(NOW - jiff::SignedDuration::from_mins(1)));
         with_override.model = Some(ModelConfig {
             provider: "openai_responses".into(),
             base_url: "https://other.example.com/v1".into(),
@@ -970,7 +986,7 @@ mod tests {
     /// 触发期间改定时的目标：模拟命令型 Job 正在跑命令时，操作者在网页上暂停或改了时间。
     struct EditingTarget {
         jobs: Arc<MemCronRepo>,
-        reschedule_to: Option<OffsetDateTime>,
+        reschedule_to: Option<Timestamp>,
     }
 
     #[async_trait]
@@ -1005,9 +1021,9 @@ mod tests {
         }
     }
 
-    async fn fire_while_editing(reschedule_to: Option<OffsetDateTime>) -> CronJob {
+    async fn fire_while_editing(reschedule_to: Option<Timestamp>) -> CronJob {
         let jobs = Arc::new(MemCronRepo::new());
-        jobs.put(job("job-1", Some(NOW - time::Duration::minutes(1))))
+        jobs.put(job("job-1", Some(NOW - jiff::SignedDuration::from_mins(1))))
             .await
             .unwrap();
         let scheduler = CronScheduler::new(
@@ -1038,7 +1054,7 @@ mod tests {
     /// 触发期间改了时间：留着新的下一个槽位，不被触发前的快照推进覆盖。
     #[tokio::test]
     async fn rescheduling_while_a_firing_runs_keeps_the_new_slot() {
-        let new_slot = NOW + time::Duration::hours(5);
+        let new_slot = NOW + jiff::SignedDuration::from_hours(5);
         let stored = fire_while_editing(Some(new_slot)).await;
         assert_eq!(stored.next_run_at, Some(new_slot));
         assert_eq!(stored.status, JobStatus::Active);

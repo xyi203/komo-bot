@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use jiff::Timestamp;
 use komo_kernel::durable::storage::{EntryQuery, TaskQuery};
 use komo_kernel::durable::{
     AssistantMessage, ContentBlock, ConversationId, EntryRecord, MemoryStorage, Message,
@@ -36,7 +37,6 @@ use komo_runtime::durable::{Engine, EngineOptions, Registry};
 use komo_tools::codemode::Worker;
 use komo_tools::tools::{CodemodeTool, ReadTool};
 use serde_json::{Value, json};
-use time::OffsetDateTime;
 
 const CONV: ConversationId = ROOT_CONVERSATION_ID;
 
@@ -47,8 +47,8 @@ fn exe() -> PathBuf {
 struct SystemClock;
 
 impl Clock for SystemClock {
-    fn now(&self) -> OffsetDateTime {
-        OffsetDateTime::now_utc()
+    fn now(&self) -> Timestamp {
+        Timestamp::now()
     }
 }
 

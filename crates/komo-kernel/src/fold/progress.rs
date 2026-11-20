@@ -6,7 +6,7 @@
 
 use std::collections::BTreeMap;
 
-use time::OffsetDateTime;
+use jiff::Timestamp;
 
 use crate::events::{Event, EventPayload};
 use crate::types::ids::ToolCallId;
@@ -41,7 +41,7 @@ where
     let mut accepted_at = None;
     let mut last_at = None;
     let mut note = None;
-    let mut started_at: BTreeMap<ToolCallId, OffsetDateTime> = BTreeMap::new();
+    let mut started_at: BTreeMap<ToolCallId, Timestamp> = BTreeMap::new();
     // 调用 id → (工具名, 参数摘要)：计划内联时取计划，否则取发起它的那条助手回复。
     let mut described: BTreeMap<ToolCallId, (String, String)> = BTreeMap::new();
 
@@ -178,7 +178,6 @@ mod tests {
     use crate::types::plan::{PlanHash, PlanSource};
     use crate::types::refs::{ContentRef, OutputRef, ToolResultStatus};
     use crate::types::turn::ToolCallRequest;
-    use time::macros::datetime;
 
     fn event(seq: u64, run: &str, payload: EventPayload) -> Event {
         Event {
@@ -187,7 +186,8 @@ mod tests {
             event_id: EventId::from_raw(format!("evt-{seq}")),
             session: SessionId::from_raw("task-1"),
             run: Some(RunId::from_raw(run)),
-            ts: datetime!(2026-10-19 08:00:00 UTC) + time::Duration::seconds(seq as i64 * 10),
+            ts: "2026-10-19T08:00:00Z".parse::<jiff::Timestamp>().unwrap()
+                + jiff::SignedDuration::from_secs(seq as i64 * 10),
             payload,
         }
     }
@@ -332,13 +332,22 @@ mod tests {
         assert_eq!(progress.rounds, 2);
         assert_eq!(progress.calls, 2);
         assert_eq!(progress.note.as_deref(), Some("开始跑长任务"));
-        assert_eq!(progress.accepted_at, datetime!(2026-10-19 08:00:10 UTC));
-        assert_eq!(progress.last_at, datetime!(2026-10-19 08:01:30 UTC));
+        assert_eq!(
+            progress.accepted_at,
+            "2026-10-19T08:00:10Z".parse::<jiff::Timestamp>().unwrap()
+        );
+        assert_eq!(
+            progress.last_at,
+            "2026-10-19T08:01:30Z".parse::<jiff::Timestamp>().unwrap()
+        );
         assert_eq!(progress.running.len(), 1);
         let call = &progress.running[0];
         assert_eq!(call.tool, "bash");
         assert_eq!(call.summary, "x", "内联计划里的参数优先");
-        assert_eq!(call.started_at, Some(datetime!(2026-10-19 08:01:30 UTC)));
+        assert_eq!(
+            call.started_at,
+            Some("2026-10-19T08:01:30Z".parse::<jiff::Timestamp>().unwrap())
+        );
         assert_eq!(call.output_tail, None);
     }
 
@@ -381,7 +390,10 @@ mod tests {
         assert_eq!(progress.state, RunState::Completed);
         assert!(progress.running.is_empty());
         assert_eq!(progress.final_message.as_deref(), Some("都跑完了"));
-        assert_eq!(progress.last_at, datetime!(2026-10-19 08:01:50 UTC));
+        assert_eq!(
+            progress.last_at,
+            "2026-10-19T08:01:50Z".parse::<jiff::Timestamp>().unwrap()
+        );
     }
 
     #[test]

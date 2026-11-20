@@ -24,7 +24,6 @@ use komo_kernel::traits::Shutdown;
 use komo_kernel::types::chat::PeerId;
 use komo_runtime::durable::harness::InputEntry;
 use serde_json::json;
-use time::format_description::well_known::Rfc3339;
 
 use crate::push::PushMessage;
 use crate::service::durable::submit::{DEFAULT_INPUT_KIND, InputRequest};
@@ -312,10 +311,7 @@ const HELP: &str = "直接发文字就是在主对话里说话。\n\n\
 /resolve /abandon 答复卡住的运行";
 
 async fn status(state: &Arc<GatewayState>) -> String {
-    let started = state
-        .started_at
-        .format(&Rfc3339)
-        .unwrap_or_else(|_| state.started_at.to_string());
+    let started = state.started_at.to_string();
     let waiting = match pending(state).await {
         Ok(list) => format!("{} 条", list.len()),
         Err(error) => format!("读不出（{error}）"),

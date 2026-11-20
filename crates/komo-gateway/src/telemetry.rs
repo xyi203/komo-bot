@@ -3,8 +3,8 @@
 
 use std::sync::Mutex;
 
+use jiff::Timestamp;
 use komo_kernel::protocol::http::TelemetryHealth;
-use time::OffsetDateTime;
 
 #[derive(Debug)]
 pub struct TelemetryStatus {
@@ -22,7 +22,7 @@ impl TelemetryStatus {
     }
 
     /// 记一次成功。返回 `true` = 上一次是失败（这是"恢复"）。
-    pub fn record_ok(&self, at: OffsetDateTime) -> bool {
+    pub fn record_ok(&self, at: Timestamp) -> bool {
         let mut health = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let recovered = health.last_error_at.is_some() && health.last_ok_at < health.last_error_at;
         health.last_ok_at = Some(at);
@@ -30,7 +30,7 @@ impl TelemetryStatus {
     }
 
     /// 记一次失败。返回 `true` = 此前没在失败（这是"第一次失败"）。
-    pub fn record_err(&self, at: OffsetDateTime, reason: String) -> bool {
+    pub fn record_err(&self, at: Timestamp, reason: String) -> bool {
         let mut health = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let first = health.last_error_at.is_none() || health.last_ok_at >= health.last_error_at;
         health.last_error_at = Some(at);
@@ -46,12 +46,14 @@ impl TelemetryStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use time::macros::datetime;
 
     #[test]
     fn only_the_first_failure_and_the_recovery_are_edges() {
         let status = TelemetryStatus::new(Some("http://127.0.0.1:4318".into()));
-        let t = |s: i64| datetime!(2026-10-19 08:00:00 UTC) + time::Duration::seconds(s);
+        let t = |s: i64| {
+            "2026-10-19T08:00:00Z".parse::<jiff::Timestamp>().unwrap()
+                + jiff::SignedDuration::from_secs(s)
+        };
 
         assert!(!status.record_ok(t(0)), "没失败过就不算恢复");
         assert!(status.record_err(t(1), "refused".into()));

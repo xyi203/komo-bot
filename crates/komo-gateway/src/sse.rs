@@ -226,7 +226,6 @@ mod tests {
     use super::*;
     use komo_kernel::events::{Event, EventPayload, RunCompleted};
     use komo_kernel::types::ids::EventId;
-    use time::macros::datetime;
 
     fn completed(seq: u64) -> Event {
         Event {
@@ -235,7 +234,7 @@ mod tests {
             event_id: EventId::from_raw(format!("evt-{seq}")),
             session: SessionId::from_raw("sess-1"),
             run: Some(RunId::from_raw("run-1")),
-            ts: datetime!(2026-09-16 08:00:00 UTC),
+            ts: "2026-09-16T08:00:00Z".parse::<jiff::Timestamp>().unwrap(),
             payload: EventPayload::RunCompleted(RunCompleted {
                 final_message: Some("好了".into()),
                 final_message_ref: None,
@@ -391,7 +390,7 @@ mod tests {
             event_id: EventId::from_raw("evt-3"),
             session: SessionId::from_raw("sess-1"),
             run: Some(run.clone()),
-            ts: datetime!(2026-09-16 08:00:00 UTC),
+            ts: "2026-09-16T08:00:00Z".parse::<jiff::Timestamp>().unwrap(),
             payload: EventPayload::RunWaiting(komo_kernel::events::RunWaiting { reason }),
         };
         for reason in [
@@ -404,7 +403,7 @@ mod tests {
             },
             komo_kernel::types::status::WaitReason::Retry {
                 attempts: 1,
-                not_before: datetime!(2026-09-16 08:05:00 UTC),
+                not_before: "2026-09-16T08:05:00Z".parse::<jiff::Timestamp>().unwrap(),
                 cause: komo_kernel::types::status::RetryCause::RateLimited,
             },
             komo_kernel::types::status::WaitReason::Dependency {
@@ -436,7 +435,7 @@ mod tests {
             event_id: EventId::from_raw("evt-4"),
             session: SessionId::from_raw("sess-1"),
             run: Some(RunId::from_raw("run-1")),
-            ts: datetime!(2026-09-16 08:00:00 UTC),
+            ts: "2026-09-16T08:00:00Z".parse::<jiff::Timestamp>().unwrap(),
             payload: EventPayload::RunReclaimed(komo_kernel::events::RunReclaimed {
                 executor: Some(komo_kernel::types::ids::ExecutorId::from_raw("exec-0")),
                 reason: "上一次执行没有收尾".into(),

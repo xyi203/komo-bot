@@ -40,7 +40,6 @@ use komo_runtime::durable::harness::inbox::Admitted;
 use komo_runtime::durable::harness::{InputEntry, SubmissionDraft, WhenBusy, WriteDraft};
 use komo_runtime::scheduler::{CronError, CronTarget, FireSpec, FiredRef, firing_key, model_for};
 use serde_json::{Value, json};
-use time::format_description::well_known::Rfc3339;
 
 use super::super::DurableCore;
 use super::super::sessions::{NewSession, create_in};
@@ -147,9 +146,7 @@ fn with_skills(state: &GatewayState, job: &CronJob) -> Result<String, CronError>
 
 /// 触发放置成的输入 entry：`cron.input`，`data {job, slot}`（手动 run 没有 slot，带 `manual`）。
 fn input_data(spec: &FireSpec, hash: &str) -> Value {
-    let slot = spec
-        .slot
-        .map(|slot| slot.format(&Rfc3339).unwrap_or_else(|_| slot.to_string()));
+    let slot = spec.slot.map(|slot| slot.to_string());
     let mut data = json!({ "job": spec.job.id.as_str(), "slot": slot, "inputHash": hash });
     if spec.slot.is_none() {
         data["manual"] = json!(true);
@@ -263,12 +260,12 @@ impl DurableCronTarget {
         .map_err(target_error)?;
         let text = format!("!{command}");
         let hash = ContentHash::of_str(&text).to_string();
-        let now_ms = (core.clock.now().unix_timestamp_nanos() / 1_000_000) as i64;
+        let now_ms = (core.clock.now().as_nanosecond() / 1_000_000) as i64;
         let mut data = ran.data.clone();
         data["inputHash"] = json!(hash);
         data["job"] = json!(spec.job.id.as_str());
         if let Some(slot) = spec.slot {
-            data["slot"] = json!(slot.format(&Rfc3339).unwrap_or_else(|_| slot.to_string()));
+            data["slot"] = json!(slot.to_string());
         }
         let entry = WriteDraft {
             kind: SHELL_ENTRY.to_owned(),

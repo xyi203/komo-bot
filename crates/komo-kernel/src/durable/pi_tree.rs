@@ -51,9 +51,8 @@
 
 use std::collections::HashMap;
 
+use jiff::Timestamp;
 use serde_json::{Map, Value, json};
-use time::OffsetDateTime;
-use time::format_description::well_known::Rfc3339;
 
 use super::compaction::{COMPACTION_ENTRY_KIND, SUMMARY_PREFIX, SUMMARY_SUFFIX};
 use super::context::SYSTEM_ENTRY_KIND;
@@ -338,9 +337,9 @@ pub(crate) fn entry_millis(entry: &EntryRecord) -> Option<i64> {
 }
 
 fn rfc3339(millis: i64) -> String {
-    OffsetDateTime::from_unix_timestamp_nanos(i128::from(millis) * 1_000_000)
+    Timestamp::from_nanosecond(i128::from(millis) * 1_000_000)
         .ok()
-        .and_then(|time| time.format(&Rfc3339).ok())
+        .map(|time| time.to_string())
         .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_owned())
 }
 

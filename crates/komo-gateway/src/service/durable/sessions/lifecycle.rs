@@ -656,7 +656,7 @@ pub async fn reconcile(state: &Arc<GatewayState>) -> Result<ReconcileReport, Ses
 }
 
 impl ReconcileReport {
-    pub fn response(self, finished_at: time::OffsetDateTime) -> ReconcileResponse {
+    pub fn response(self, finished_at: jiff::Timestamp) -> ReconcileResponse {
         ReconcileResponse {
             checked: self.checked,
             resumed: 0,

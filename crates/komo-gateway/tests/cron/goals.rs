@@ -200,12 +200,8 @@ async fn the_scheduler_fires_tracked_goals_only_and_leaves_the_goals_revision_al
         "也不升定时的版本"
     );
     let next = after["schedule"]["job"]["next_run_at"].as_str().unwrap();
-    let next =
-        time::OffsetDateTime::parse(next, &time::format_description::well_known::Rfc3339).unwrap();
-    assert!(
-        next > time::OffsetDateTime::now_utc(),
-        "槽位推进到未来：{after}"
-    );
+    let next = next.parse::<jiff::Timestamp>().unwrap();
+    assert!(next > jiff::Timestamp::now(), "槽位推进到未来：{after}");
     assert!(after["schedule"]["job"]["last_error"].is_null(), "{after}");
 
     // 等待中的目标仍在追踪：照样触发（跨过 1 秒，免得与上一槽同一计划时间被判重）。
@@ -263,14 +259,14 @@ async fn the_detail_overview_and_the_run_history_page() {
         .await
         .unwrap()
         .unwrap();
-    let now = time::OffsetDateTime::now_utc();
+    let now = jiff::Timestamp::now();
     for (days, status, error) in [
         (1, FiringStatus::Skipped, Some("上一次还没结束")),
         (2, FiringStatus::Error, Some("模型后端坏了")),
         (3, FiringStatus::Ok, None),
         (4, FiringStatus::Queued, None),
     ] {
-        let at = now - time::Duration::days(days);
+        let at = now - jiff::SignedDuration::from_hours(24 * days);
         let mut firing = CronFiring::claimed(&job, at);
         assert!(gw.state().cron.claim_firing(firing.clone()).await.unwrap());
         firing.status = status;

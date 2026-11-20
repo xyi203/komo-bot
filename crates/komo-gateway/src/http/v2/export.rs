@@ -37,12 +37,11 @@ use axum::extract::{Path, State};
 use axum::http::header;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
+use jiff::Timestamp;
 use komo_kernel::durable::pi_tree::{ConversationEntries, PiTree, pi_tree};
 use komo_kernel::durable::records::SessionRecord;
 use komo_kernel::session::{EntryKind, SessionEntry, SessionHeader};
 use serde_json::Value;
-use time::OffsetDateTime;
-use time::format_description::well_known::Rfc3339;
 
 use crate::http::Api;
 use crate::http::error::{ApiFailure, ApiResult};
@@ -165,9 +164,9 @@ fn marker(parent: Option<&str>, timestamp: &str, leaf: Option<&str>) -> SessionE
 }
 
 fn rfc3339(millis: i64) -> String {
-    OffsetDateTime::from_unix_timestamp_nanos(i128::from(millis) * 1_000_000)
+    Timestamp::from_nanosecond(i128::from(millis) * 1_000_000)
         .ok()
-        .and_then(|time| time.format(&Rfc3339).ok())
+        .map(|time| time.to_string())
         .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_owned())
 }
 

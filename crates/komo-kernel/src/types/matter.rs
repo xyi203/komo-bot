@@ -17,28 +17,81 @@ use std::fmt;
 use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
-// 渲染函数（`komo-agent`，不依赖 `time`）要在签名里写出日期类型。
-pub use time::Date;
-use time::OffsetDateTime;
+// 渲染函数（`komo-agent`，不依赖 jiff）要在签名里写出日期类型。
+use jiff::Timestamp;
+pub use jiff::civil::Date;
 
 use super::ids::{CronJobId, MatterId, SessionId};
 use super::memory::Evidence;
 
-// `YYYY-MM-DD`：截止日期在线上与库里的写法（只有日期，不带时刻）。
-time::serde::format_description!(
-    pub iso_date,
-    Date,
-    "[year]-[month]-[day]"
-);
+/// `YYYY-MM-DD`：截止日期在线上与库里的写法（只有日期，不带时刻）。
+///
+/// 不用 jiff 自带的 `Date` serde：它走 Temporal 解析器，还收 `20261101`、带时刻的串等写法，
+/// 这里只认一种。
+pub mod iso_date {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    use super::{Date, parse_due};
+
+    pub fn serialize<S: Serializer>(date: &Date, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(&date.strftime("%Y-%m-%d"))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Date, D::Error> {
+        let raw = <std::borrow::Cow<'de, str>>::deserialize(deserializer)?;
+        parse_due(&raw).map_err(serde::de::Error::custom)
+    }
+
+    pub mod option {
+        use serde::{Deserialize, Deserializer, Serializer};
+
+        use super::super::Date;
+
+        pub fn serialize<S: Serializer>(
+            date: &Option<Date>,
+            serializer: S,
+        ) -> Result<S::Ok, S::Error> {
+            match date {
+                Some(date) => super::serialize(date, serializer),
+                None => serializer.serialize_none(),
+            }
+        }
+
+        pub fn deserialize<'de, D: Deserializer<'de>>(
+            deserializer: D,
+        ) -> Result<Option<Date>, D::Error> {
+            #[derive(Deserialize)]
+            struct Wrapped(#[serde(with = "super")] Date);
+            Ok(Option::<Wrapped>::deserialize(deserializer)?.map(|Wrapped(date)| date))
+        }
+    }
+}
+
+/// 一个时刻在 UTC 里的日期（记忆的「观察于」、提取提示里的「当前时间」都按 UTC 日期写）。
+pub fn utc_date(at: Timestamp) -> Date {
+    jiff::tz::Offset::UTC.to_datetime(at).date()
+}
 
 /// 标题的上限（字符数，§3）：一句能独立看懂的话。
 pub const MAX_TITLE_CHARS: usize = 80;
 
 /// 解析 `YYYY-MM-DD`。
 pub fn parse_due(raw: &str) -> Result<Date, String> {
-    let format = time::macros::format_description!("[year]-[month]-[day]");
-    Date::parse(raw.trim(), &format)
-        .map_err(|_| format!("截止日期要写成 YYYY-MM-DD，收到：{}", raw.trim()))
+    let raw = raw.trim();
+    let invalid = || format!("截止日期要写成 YYYY-MM-DD，收到：{raw}");
+    // strptime 的 `%Y` 收任意位数、`%m`/`%d` 收一位数；线上与库里只有一种写法，先卡形状。
+    let shaped = raw.len() == 10
+        && raw.bytes().enumerate().all(|(i, b)| {
+            if i == 4 || i == 7 {
+                b == b'-'
+            } else {
+                b.is_ascii_digit()
+            }
+        });
+    if !shaped {
+        return Err(invalid());
+    }
+    Date::strptime("%Y-%m-%d", raw).map_err(|_| invalid())
 }
 
 /// 事项的种类。
@@ -258,20 +311,14 @@ pub struct Matter {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[cfg_attr(feature = "ts", ts(as = "Option<Vec<MatterTrigger>>"))]
     pub triggers: Vec<MatterTrigger>,
-    #[serde(with = "time::serde::rfc3339")]
     #[cfg_attr(feature = "ts", ts(type = "string"))]
-    pub created_at: OffsetDateTime,
-    #[serde(with = "time::serde::rfc3339")]
+    pub created_at: Timestamp,
     #[cfg_attr(feature = "ts", ts(type = "string"))]
-    pub updated_at: OffsetDateTime,
+    pub updated_at: Timestamp,
     /// 进 `done` / `dropped` / `retired` 时写，重开时清空。
-    #[serde(
-        default,
-        with = "time::serde::rfc3339::option",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(type = "string"))]
-    pub closed_at: Option<OffsetDateTime>,
+    pub closed_at: Option<Timestamp>,
 }
 
 impl Matter {
@@ -320,7 +367,7 @@ pub struct NewMatter {
 
 impl NewMatter {
     /// 造出 `active`、revision 1 的那一条。种类不对的字段（领域带截止日期、目标带标准）报错。
-    pub fn build(self, id: MatterId, now: OffsetDateTime) -> Result<Matter, MatterError> {
+    pub fn build(self, id: MatterId, now: Timestamp) -> Result<Matter, MatterError> {
         match self.kind {
             MatterKind::Goal if self.standard.is_some() => {
                 return Err(MatterError::Invalid("标准只给领域；目标用下一步".into()));
@@ -567,7 +614,7 @@ fn rule(
 pub fn transition(
     matter: &Matter,
     change: &MatterChange,
-    now: OffsetDateTime,
+    now: Timestamp,
 ) -> Result<Option<Matter>, MatterError> {
     let verb = change.verb();
     let Some((allowed, target)) = rule(matter.kind, verb) else {
@@ -685,17 +732,16 @@ pub fn transition(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use time::macros::{date, datetime};
 
-    const T0: OffsetDateTime = datetime!(2026-10-29 08:00 UTC);
-    const T1: OffsetDateTime = datetime!(2026-10-29 09:00 UTC);
+    const T0: Timestamp = jiff::Timestamp::constant(1793260800, 0) /* 2026-10-29T08:00:00Z */;
+    const T1: Timestamp = jiff::Timestamp::constant(1793264400, 0) /* 2026-10-29T09:00:00Z */;
 
     fn goal(state: MatterState) -> Matter {
         let mut matter = NewMatter {
             kind: MatterKind::Goal,
             title: "这周把 owl 的发布观察做完".into(),
             next: Some("看 AB 组的 5xx".into()),
-            due: Some(date!(2026 - 11 - 01)),
+            due: Some(jiff::civil::date(2026, 11, 1)),
             standard: None,
         }
         .build(MatterId::from_raw("g-1"), T0)
@@ -946,7 +992,7 @@ mod tests {
             kind: MatterKind::Area,
             title: "家里的设备".into(),
             next: None,
-            due: Some(date!(2026 - 11 - 01)),
+            due: Some(jiff::civil::date(2026, 11, 1)),
             standard: None,
         };
         assert!(matches!(
@@ -1019,11 +1065,11 @@ mod tests {
     /// 超期：未结案的目标、截止日期早于今天。当天不算；结案的、领域都不算。
     #[test]
     fn overdue_is_read_from_the_due_date_and_today() {
-        let today = date!(2026 - 11 - 02);
+        let today = jiff::civil::date(2026, 11, 2);
         assert!(goal(MatterState::Active).is_overdue(today));
         assert!(goal(MatterState::Waiting).is_overdue(today));
         assert!(goal(MatterState::Parked).is_overdue(today));
-        assert!(!goal(MatterState::Active).is_overdue(date!(2026 - 11 - 01)));
+        assert!(!goal(MatterState::Active).is_overdue(jiff::civil::date(2026, 11, 1)));
         assert!(!goal(MatterState::Done).is_overdue(today));
         assert!(!goal(MatterState::Dropped).is_overdue(today));
         let mut no_due = goal(MatterState::Active);
@@ -1042,7 +1088,10 @@ mod tests {
         assert_eq!(json["state"], "waiting");
         let back: Matter = serde_json::from_value(json).unwrap();
         assert_eq!(back, matter);
-        assert_eq!(parse_due(" 2026-11-01 "), Ok(date!(2026 - 11 - 01)));
+        assert_eq!(
+            parse_due(" 2026-11-01 "),
+            Ok(jiff::civil::date(2026, 11, 1))
+        );
         assert!(parse_due("11/01").is_err());
     }
 

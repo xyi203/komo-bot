@@ -6,8 +6,9 @@
 //! `KOMO_RUN`）：改承诺的操作要这个 Run 里有用户原话；都不带 = 操作者在终端。只给一个报错，
 //! 同 `memory add`。
 
+use jiff::Timestamp;
+use jiff::civil::Date;
 use serde::{Deserialize, Serialize};
-use time::{Date, OffsetDateTime};
 
 use crate::cron::{CronFiring, CronJob, FiringStatus, NotifyPolicy, OverlapPolicy};
 use crate::protocol::http::{ManualCronRunResponse, MonitorSummary, TaskSummary};
@@ -225,12 +226,8 @@ pub struct MatterRunsQuery {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<u32>,
     /// 只要计划时间早于它的（RFC 3339）。
-    #[serde(
-        default,
-        with = "time::serde::rfc3339::option",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub before: Option<OffsetDateTime>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before: Option<Timestamp>,
 }
 
 /// 定时触发的一条记录（`cron_firings` 的一行，加上读出来的实际时间与「在等你」）。
@@ -239,17 +236,12 @@ pub struct MatterRunsQuery {
 #[cfg_attr(feature = "ts", ts(optional_fields))]
 pub struct MatterRun {
     /// 计划时间。
-    #[serde(with = "time::serde::rfc3339")]
     #[cfg_attr(feature = "ts", ts(type = "string"))]
-    pub scheduled_at: OffsetDateTime,
+    pub scheduled_at: Timestamp,
     /// 实际触发的时刻（建出来的会话的创建时刻）；跳过的、没投成的没有。
-    #[serde(
-        default,
-        with = "time::serde::rfc3339::option",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(type = "string"))]
-    pub fired_at: Option<OffsetDateTime>,
+    pub fired_at: Option<Timestamp>,
     /// 记录里的状态：`queued` / `ok` / `error` / `waiting` / `skipped`。
     pub status: FiringStatus,
     /// `skipped` 的原因或 `error` 的错误。
@@ -274,13 +266,9 @@ pub struct MatterRun {
 pub struct MatterRunsResponse {
     pub runs: Vec<MatterRun>,
     /// 还有更早的：下一页的 `before`（这一页最后一条的计划时间）；没有更多就缺省。
-    #[serde(
-        default,
-        with = "time::serde::rfc3339::option",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(type = "string"))]
-    pub next_before: Option<OffsetDateTime>,
+    pub next_before: Option<Timestamp>,
 }
 
 /// 结案时它名下的记忆怎么处理了（`memory.md` §9.6「结案归档」）。
@@ -408,7 +396,6 @@ pub struct MatterActionRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use time::macros::date;
 
     #[test]
     fn an_add_request_carries_the_due_date_as_iso_text() {
@@ -416,7 +403,7 @@ mod tests {
             kind: MatterKind::Goal,
             title: "发布观察".into(),
             next: None,
-            due: Some(date!(2026 - 11 - 01)),
+            due: Some(jiff::civil::date(2026, 11, 1)),
             standard: None,
             description: None,
             schedule: None,

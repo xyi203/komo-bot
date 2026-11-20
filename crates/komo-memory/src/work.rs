@@ -47,7 +47,7 @@ pub trait MemoryWorkLog: Send + Sync {
     /// 到同一个。
     async fn claim(
         &self,
-        idle: time::Duration,
+        idle: jiff::SignedDuration,
         limit: usize,
     ) -> Result<Vec<MemoryBatch>, StoreError>;
 

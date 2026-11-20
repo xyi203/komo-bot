@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use time::OffsetDateTime;
+use jiff::Timestamp;
 
 use crate::traits::*;
 use crate::types::ids::*;
@@ -58,7 +58,7 @@ impl CronRepo for MemCronRepo {
     async fn advance(
         &self,
         id: &CronJobId,
-        next_run_at: Option<OffsetDateTime>,
+        next_run_at: Option<Timestamp>,
         status: JobStatus,
         last_error: Option<String>,
     ) -> Result<(), RepoError> {
@@ -77,7 +77,7 @@ impl CronRepo for MemCronRepo {
         &self,
         id: &CronJobId,
         seen: ScheduleSeen,
-        next_run_at: Option<OffsetDateTime>,
+        next_run_at: Option<Timestamp>,
         status: JobStatus,
         last_error: Option<String>,
     ) -> Result<bool, RepoError> {
@@ -98,7 +98,7 @@ impl CronRepo for MemCronRepo {
         Ok(self.state.lock().expect("cron").jobs.remove(id).is_some())
     }
 
-    async fn due(&self, now: OffsetDateTime) -> Result<Vec<CronJob>, RepoError> {
+    async fn due(&self, now: Timestamp) -> Result<Vec<CronJob>, RepoError> {
         Ok(self
             .state
             .lock()
@@ -162,7 +162,7 @@ mod tests {
             let firing = CronFiring {
                 job: CronJobId::from_raw("job-1"),
                 job_version: 1,
-                scheduled_at: time::macros::datetime!(2026-09-16 01:00:00 UTC),
+                scheduled_at: "2026-09-16T01:00:00Z".parse::<jiff::Timestamp>().unwrap(),
                 prompt: "整理今天的动态".into(),
                 session: None,
                 run: None,
@@ -181,7 +181,7 @@ mod tests {
                 CronJob, FixedOffsetZone, JobStatus, OverlapPolicy, TimeZone, parse_schedule,
             };
 
-            let now = time::macros::datetime!(2026-09-15 08:00:00 UTC);
+            let now = "2026-09-15T08:00:00Z".parse::<jiff::Timestamp>().unwrap();
             let zones = FixedOffsetZone::utc();
             let repo = MemCronRepo::new();
             let job = CronJob {
@@ -206,7 +206,7 @@ mod tests {
             assert_eq!(stored.version, 1, "第一次写就是第一版");
 
             // 推进槽位：版本一个字不动——版本回答的是"定义改没改过"。
-            let next = time::macros::datetime!(2026-09-16 09:00:00 UTC);
+            let next = "2026-09-16T09:00:00Z".parse::<jiff::Timestamp>().unwrap();
             repo.advance(&stored.id, Some(next), JobStatus::Active, None)
                 .await
                 .unwrap();

@@ -7,9 +7,9 @@
 
 use std::path::{Path, PathBuf};
 
+use jiff::Timestamp;
 use komo_kernel::types::ids::ExecutorId;
 use serde::{Deserialize, Serialize};
-use time::OffsetDateTime;
 
 /// 在册的一个子进程。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -20,7 +20,7 @@ pub struct ChildProcess {
     pub pgid: Option<u32>,
     /// 这个 pid 是什么时候起来的。**pid 会被复用**，所以身份要靠它核对。
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub started_at: Option<OffsetDateTime>,
+    pub started_at: Option<Timestamp>,
     /// 给操作者看的一句话。
     #[serde(default)]
     pub what: String,
@@ -103,7 +103,7 @@ impl ProcessProbe for IdentityProbe {
         }
         match (child.started_at, observed.started_at) {
             (Some(recorded), Some(actual)) => {
-                if (recorded.unix_timestamp() - actual).abs() <= START_TOLERANCE_SECS {
+                if (recorded.as_second() - actual).abs() <= START_TOLERANCE_SECS {
                     Liveness::Alive
                 } else {
                     Liveness::Gone
@@ -167,7 +167,7 @@ fn observe(pid: u32) -> Result<Option<Observed>, ()> {
     let started_at = parts
         .next()
         .and_then(parse_etime)
-        .map(|elapsed| time::OffsetDateTime::now_utc().unix_timestamp() - elapsed as i64);
+        .map(|elapsed| jiff::Timestamp::now().as_second() - elapsed as i64);
     Ok(Some(Observed {
         zombie: stat.starts_with('Z'),
         started_at,
@@ -303,7 +303,7 @@ mod tests {
             .expect("spawn sleep")
     }
 
-    fn recorded(pid: u32, started_at: Option<OffsetDateTime>) -> ChildProcess {
+    fn recorded(pid: u32, started_at: Option<Timestamp>) -> ChildProcess {
         ChildProcess {
             pid,
             pgid: Some(pid),
@@ -316,7 +316,7 @@ mod tests {
     fn the_identity_probe_accepts_a_matching_start_time_and_rejects_a_reused_pid() {
         let mut child = sleeper();
         let pid = child.id();
-        let now = OffsetDateTime::now_utc();
+        let now = Timestamp::now();
         assert_eq!(
             IdentityProbe.probe(&recorded(pid, Some(now))),
             Liveness::Alive,
@@ -328,7 +328,10 @@ mod tests {
             "no start time recorded: the pid alone"
         );
         assert_eq!(
-            IdentityProbe.probe(&recorded(pid, Some(now - time::Duration::hours(1)))),
+            IdentityProbe.probe(&recorded(
+                pid,
+                Some(now - jiff::SignedDuration::from_hours(1))
+            )),
             Liveness::Gone,
             "same pid, different start time: not the process we recorded"
         );
@@ -346,7 +349,7 @@ mod tests {
     fn the_identity_probe_treats_a_zombie_as_gone() {
         let mut child = sleeper();
         let pid = child.id();
-        let now = OffsetDateTime::now_utc();
+        let now = Timestamp::now();
         // 杀掉但不 wait：留下僵尸。
         // SAFETY: 给自己刚起的子进程发 SIGKILL。
         unsafe { libc::kill(pid as i32, libc::SIGKILL) };

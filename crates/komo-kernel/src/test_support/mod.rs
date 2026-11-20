@@ -6,7 +6,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use time::OffsetDateTime;
+use jiff::Timestamp;
 
 use crate::traits::Clock;
 use crate::types::ids::{OperationId, SessionId};
@@ -88,11 +88,11 @@ pub fn block_on<F: std::future::Future>(future: F) -> F::Output {
 /// 可拨的时钟。
 #[derive(Debug, Clone)]
 pub struct TestClock {
-    now: Arc<Mutex<OffsetDateTime>>,
+    now: Arc<Mutex<Timestamp>>,
 }
 
 impl TestClock {
-    pub fn at(now: OffsetDateTime) -> Self {
+    pub fn at(now: Timestamp) -> Self {
         Self {
             now: Arc::new(Mutex::new(now)),
         }
@@ -100,21 +100,21 @@ impl TestClock {
 
     /// 2026-09-15 08:00:00 UTC——设计文档里那几条示例事件的时间。
     pub fn fixed() -> Self {
-        Self::at(time::macros::datetime!(2026-09-15 08:00:00 UTC))
+        Self::at("2026-09-15T08:00:00Z".parse::<jiff::Timestamp>().unwrap())
     }
 
-    pub fn advance(&self, by: time::Duration) {
+    pub fn advance(&self, by: jiff::SignedDuration) {
         let mut now = self.now.lock().expect("测试时钟没有别的持有者会 panic");
         *now += by;
     }
 
-    pub fn set(&self, to: OffsetDateTime) {
+    pub fn set(&self, to: Timestamp) {
         *self.now.lock().expect("测试时钟") = to;
     }
 }
 
 impl Clock for TestClock {
-    fn now(&self) -> OffsetDateTime {
+    fn now(&self) -> Timestamp {
         *self.now.lock().expect("测试时钟")
     }
 }

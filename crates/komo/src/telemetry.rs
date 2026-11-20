@@ -8,6 +8,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use jiff::Timestamp;
 use komo_gateway::TelemetryStatus;
 use opentelemetry::KeyValue;
 use opentelemetry::trace::TracerProvider as _;
@@ -18,7 +19,6 @@ use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::error::OTelSdkResult;
 use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider};
 use opentelemetry_sdk::trace::{SdkTracerProvider, SpanData, SpanExporter, Tracer};
-use time::OffsetDateTime;
 use tracing::Subscriber;
 use tracing_opentelemetry::{MetricsLayer, OpenTelemetryLayer};
 use tracing_subscriber::registry::LookupSpan;
@@ -126,7 +126,7 @@ struct ReportingExporter<E> {
 impl<E: SpanExporter> SpanExporter for ReportingExporter<E> {
     async fn export(&self, batch: Vec<SpanData>) -> OTelSdkResult {
         let result = self.inner.export(batch).await;
-        let now = OffsetDateTime::now_utc();
+        let now = Timestamp::now();
         match &result {
             Ok(()) => {
                 if self.status.record_ok(now) {

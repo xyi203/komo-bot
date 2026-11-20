@@ -4,6 +4,7 @@
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use jiff::Timestamp;
 use komo_kernel::protocol::config::{ConsolidateConfig, MemoryConfig, RetrievalConfig};
 use komo_kernel::protocol::http::{
     ConsolidateAction, ConsolidateGroupStatus, ConsolidateOutcome, MemoryConsolidateRequest,
@@ -20,8 +21,6 @@ use komo_kernel::types::memory::{
 use komo_kernel::types::model::{Effort, ModelConfig};
 use komo_kernel::types::turn::{Round, TurnRequest};
 use komo_store::{Db, TursoMemoryRepo};
-use time::OffsetDateTime;
-use time::macros::datetime;
 
 use super::super::consolidate::Consolidator;
 use super::super::{
@@ -29,23 +28,23 @@ use super::super::{
 };
 use super::*;
 
-const NOW: OffsetDateTime = datetime!(2026-10-19 08:00:00 UTC);
-const LATER: OffsetDateTime = datetime!(2026-10-19 09:00:00 UTC);
+const NOW: Timestamp = jiff::Timestamp::constant(1792396800, 0) /* 2026-10-19T08:00:00Z */;
+const LATER: Timestamp = jiff::Timestamp::constant(1792400400, 0) /* 2026-10-19T09:00:00Z */;
 const NOTHING: &str = r#"{"actions":[]}"#;
 
 // ---------------------------------------------------------------- 替身
 
 #[derive(Debug, Clone)]
-struct TestClock(Arc<Mutex<OffsetDateTime>>);
+struct TestClock(Arc<Mutex<Timestamp>>);
 
 impl TestClock {
-    fn set(&self, to: OffsetDateTime) {
+    fn set(&self, to: Timestamp) {
         *self.0.lock().unwrap() = to;
     }
 }
 
 impl Clock for TestClock {
-    fn now(&self) -> OffsetDateTime {
+    fn now(&self) -> Timestamp {
         *self.0.lock().unwrap()
     }
 }
@@ -71,7 +70,7 @@ struct NoWork;
 impl super::super::MemoryWorkLog for NoWork {
     async fn claim(
         &self,
-        _idle: time::Duration,
+        _idle: jiff::SignedDuration,
         _limit: usize,
     ) -> Result<Vec<MemoryBatch>, komo_kernel::traits::StoreError> {
         Ok(vec![])
@@ -226,7 +225,7 @@ impl Rig {
             .unwrap()
     }
 
-    async fn mark(&self, id: &str) -> Option<OffsetDateTime> {
+    async fn mark(&self, id: &str) -> Option<Timestamp> {
         self.repo
             .consolidation_marks(&[MemoryId::from_raw(id)])
             .await
@@ -703,13 +702,13 @@ async fn a_group_left_as_is_goes_last_next_time_and_unchanged_groups_skip_the_mo
 
     // a 组之后有人动过它（updated_at 晚于游标）：它仍然排在从没看过的 b 组之后。
     let mut touched = rig.get("a-1").await;
-    touched.updated_at = LATER + time::Duration::minutes(1);
+    touched.updated_at = LATER + jiff::SignedDuration::from_mins(1);
     rig.repo.put(touched, Some(1)).await.unwrap();
     let second = rig.run(true).await;
     assert_eq!(second.groups.len(), 1);
     assert_eq!(second.groups[0].members[0].memory.as_str(), "b-1");
 
-    rig.clock.set(LATER + time::Duration::hours(1));
+    rig.clock.set(LATER + jiff::SignedDuration::from_hours(1));
     let third = rig.run(true).await;
     assert_eq!(third.groups.len(), 1, "只剩被动过的 a 组");
     assert_eq!(third.groups[0].members[0].memory.as_str(), "a-1");

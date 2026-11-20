@@ -41,6 +41,7 @@ mod startup;
 
 use std::sync::Arc;
 
+use jiff::Timestamp;
 use komo_kernel::test_support::ScriptedLlm;
 use komo_kernel::types::ids::{MemoryId, RunId, SessionId};
 use komo_kernel::types::memory::{
@@ -48,7 +49,6 @@ use komo_kernel::types::memory::{
     MemoryUsage, Provenance,
 };
 use komo_kernel::types::turn::Round;
-use time::OffsetDateTime;
 
 use komo_gateway::service::test_support::driver_stream::{DriverStream, core};
 use komo_kernel::traits::{EmbeddingClient, LlmClient};
@@ -101,7 +101,7 @@ fn scoped_with(
     state: MemoryState,
     scope: MemoryScope,
 ) -> MemoryItem {
-    let now = OffsetDateTime::now_utc();
+    let now = Timestamp::now();
     MemoryItem {
         id: MemoryId::from_raw(id),
         revision: 1,

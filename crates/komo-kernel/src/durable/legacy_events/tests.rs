@@ -212,7 +212,7 @@ fn run_accepted_and_queued_carry_the_submission_time() {
     first.created_at = Some(1_700_000_000_123);
     let entries = vec![user(2, "q1")];
     let backfill = legacy_events(SESSION, &entries, std::slice::from_ref(&first));
-    let millis = |event: &Event| (event.ts.unix_timestamp_nanos() / 1_000_000) as i64;
+    let millis = |event: &Event| (event.ts.as_nanosecond() / 1_000_000) as i64;
     let stamped: Vec<(&str, i64)> = backfill
         .iter()
         .map(|event| (event.type_name(), millis(event)))

@@ -437,7 +437,7 @@ async fn reap_leftover_children(children: &ChildRegistry) {
     let Ok(entries) = std::fs::read_dir(children.dir()) else {
         return;
     };
-    let now = time::OffsetDateTime::now_utc();
+    let now = jiff::Timestamp::now();
     for entry in entries.filter_map(Result::ok) {
         let path = entry.path();
         let Some(id) = path.file_stem().and_then(|stem| stem.to_str()) else {
@@ -450,8 +450,8 @@ async fn reap_leftover_children(children: &ChildRegistry) {
             }
             let same = child.started_at.is_some_and(|started| {
                 elapsed_secs(child.pid).is_some_and(|elapsed| {
-                    let then = now - time::Duration::seconds(elapsed as i64);
-                    (then - started).whole_seconds().abs() <= 10
+                    let then = now - jiff::SignedDuration::from_secs(elapsed as i64);
+                    (then - started).as_secs().abs() <= 10
                 })
             });
             if !same {

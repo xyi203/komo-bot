@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 
+use jiff::Timestamp;
 use komo_kernel::durable::{
     Content, ContentBlock, ConversationId, EntryId, EntryRecord, Message, SessionKind,
     SessionRecord, StopReason, ToolResultMessage,
@@ -13,7 +14,6 @@ use komo_kernel::types::model::Effort;
 use komo_kernel::types::status::RunState;
 use komo_kernel::types::task::{RunProgress, RunningCall, TaskProgress};
 use serde_json::json;
-use time::OffsetDateTime;
 
 use super::{
     BackgroundTask, Cx, FORK_CALL_RESULT, FORK_LATER_CALL_RESULT, FORK_NOTICE, Reply, TaskDoc,
@@ -218,8 +218,8 @@ async fn spawn(cx: &Cx<'_>, request: Request) -> Result<(), TaskError> {
             // 任务有自己的 komo Session 行（`kind=task`）：子 conversation（fork 的也是）属于它，
             // 不继承父的。同一次提交写下，所以不会有"有任务会话、没有 Session 行"的状态。
             let session = SessionId::new_at(
-                OffsetDateTime::from_unix_timestamp_nanos(i128::from(now) * 1_000_000)
-                    .unwrap_or(OffsetDateTime::UNIX_EPOCH),
+                Timestamp::from_nanosecond(i128::from(now) * 1_000_000)
+                    .unwrap_or(Timestamp::UNIX_EPOCH),
             )
             .to_string();
             let child = match &seed {
@@ -423,9 +423,8 @@ async fn follow(cx: &Cx<'_>, raw: &str, request: Request) -> Result<(), TaskErro
 
 // ---------------------------------------------------------------- 查进度
 
-fn at(ms: i64) -> OffsetDateTime {
-    OffsetDateTime::from_unix_timestamp_nanos(i128::from(ms) * 1_000_000)
-        .unwrap_or(OffsetDateTime::UNIX_EPOCH)
+fn at(ms: i64) -> Timestamp {
+    Timestamp::from_nanosecond(i128::from(ms) * 1_000_000).unwrap_or(Timestamp::UNIX_EPOCH)
 }
 
 fn message_time(message: &Message) -> i64 {

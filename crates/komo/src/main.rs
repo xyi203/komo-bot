@@ -981,7 +981,7 @@ mod tests {
                 instance_id: "inst-1".into(),
                 version: "test".into(),
                 protocol_version: PROTOCOL_VERSION,
-                started_at: time::OffsetDateTime::now_utc(),
+                started_at: jiff::Timestamp::now(),
                 data_dir: dir.path().to_string_lossy().to_string(),
                 telemetry: Default::default(),
             };

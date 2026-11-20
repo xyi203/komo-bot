@@ -114,12 +114,10 @@ croner = { version = "4.0.1", default-features = false }
 async-trait = "0.1.92"
 thiserror = "2.0.21"
 uuid = { version = "1.28.0", features = ["v4", "v7", "serde"] }
-time = { version = "0.3.55", features = [
-    "serde",
-    "formatting",
-    "parsing",
-    "macros",
-] }
+# 全工作区唯一的日期时间库（时刻 `Timestamp`、时长 `SignedDuration`、民用日期与 IANA 时区）。
+# `serde` 输出的 RFC 3339 与原先 `time::serde::rfc3339` 逐字节相同，旧数据照读。
+# `time` 仍经 tracing-appender（turso、bin）间接留在依赖树里，工作区代码不直接用它。
+jiff = { version = "1.0.1", features = ["serde"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 sha2 = "0.11.0"
@@ -144,8 +142,6 @@ opentelemetry_sdk = { version = "0.33", default-features = false, features = ["t
 opentelemetry-otlp = { version = "0.33", default-features = false, features = ["http-proto", "reqwest-blocking-client", "trace", "metrics"] }
 tracing-opentelemetry = "0.34"
 tracing-appender = { version = "0.2", default-features = false }
-# runtime 的 ZoneResolver 实现（§10 / §13.5）：自带 tzdb，kernel 侧仍只用 `time`，靠 unix 时间戳换算。
-jiff = "0.2.38"
 futures-util = { version = "0.3", default-features = false, features = [
     "std",
     "sink",

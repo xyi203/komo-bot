@@ -7,10 +7,10 @@
 
 use std::path::{Path, PathBuf};
 
+use jiff::Timestamp;
 use komo_kernel::protocol::PROTOCOL_VERSION;
 use komo_kernel::protocol::http::HealthResponse;
 use serde::{Deserialize, Serialize};
-use time::OffsetDateTime;
 
 use crate::api::KomoClient;
 use crate::error::ClientError;
@@ -46,12 +46,8 @@ pub struct GatewayDiscovery {
     // 读取处。)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token: Option<String>,
-    #[serde(
-        default,
-        with = "time::serde::rfc3339::option",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub started_at: Option<OffsetDateTime>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<Timestamp>,
 }
 
 /// 核对通过的一个实例：地址簿那一行，加上它自己报的健康状态。
@@ -268,7 +264,6 @@ pub async fn wait_ready(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use time::macros::datetime;
 
     fn discovery() -> GatewayDiscovery {
         GatewayDiscovery {
@@ -279,7 +274,7 @@ mod tests {
             pid: Some(4242),
             data_dir: Some("/home/u/.komo".into()),
             token: Some("t".into()),
-            started_at: Some(datetime!(2026-09-16 08:00:00 UTC)),
+            started_at: Some("2026-09-16T08:00:00Z".parse::<jiff::Timestamp>().unwrap()),
         }
     }
 
@@ -288,7 +283,7 @@ mod tests {
             instance_id: instance.into(),
             version: "0.8.0".into(),
             protocol_version: protocol,
-            started_at: datetime!(2026-09-16 08:00:00 UTC),
+            started_at: "2026-09-16T08:00:00Z".parse::<jiff::Timestamp>().unwrap(),
             data_dir: data_dir.into(),
             telemetry: Default::default(),
         }

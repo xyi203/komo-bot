@@ -21,9 +21,9 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+use jiff::Timestamp;
 use komo_tools::recovery::{ChildProcess, Liveness, ProcessProbe, SysProcessProbe};
 use serde::{Deserialize, Serialize};
-use time::OffsetDateTime;
 
 /// 发现文件在数据目录下的相对路径。与 `komo_client::discovery::DISCOVERY_PATH` 是同
 /// 一个串——客户端读的就是它。
@@ -49,8 +49,7 @@ pub enum LockError {
 pub struct LockFile {
     pub instance_id: String,
     pub pid: u32,
-    #[serde(with = "time::serde::rfc3339")]
-    pub started_at: OffsetDateTime,
+    pub started_at: Timestamp,
 }
 
 /// 握在手里的锁。drop 时删除自己那一份（并且只删自己那一份）。
@@ -62,7 +61,7 @@ pub struct InstanceLock {
 
 impl InstanceLock {
     /// 试着拿到数据目录的进程锁。
-    pub fn acquire(home: &Path, instance_id: &str, now: OffsetDateTime) -> Result<Self, LockError> {
+    pub fn acquire(home: &Path, instance_id: &str, now: Timestamp) -> Result<Self, LockError> {
         Self::acquire_with(home, instance_id, now, &SysProcessProbe)
     }
 
@@ -70,7 +69,7 @@ impl InstanceLock {
     pub fn acquire_with(
         home: &Path,
         instance_id: &str,
-        now: OffsetDateTime,
+        now: Timestamp,
         probe: &dyn ProcessProbe,
     ) -> Result<Self, LockError> {
         let path = home.join(LOCK_PATH);
@@ -143,7 +142,7 @@ impl InstanceLock {
         })
     }
 
-    fn create(path: &Path, instance_id: &str, now: OffsetDateTime) -> std::io::Result<()> {
+    fn create(path: &Path, instance_id: &str, now: Timestamp) -> std::io::Result<()> {
         let mut file = fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -265,12 +264,8 @@ pub struct GatewayDiscovery {
     pub data_dir: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token: Option<String>,
-    #[serde(
-        default,
-        with = "time::serde::rfc3339::option",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub started_at: Option<OffsetDateTime>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<Timestamp>,
 }
 
 /// 32 字节随机数的 base64url（无填充）。认证令牌用它。
@@ -322,8 +317,8 @@ mod tests {
         }
     }
 
-    fn now() -> OffsetDateTime {
-        time::macros::datetime!(2026-09-16 08:00:00 UTC)
+    fn now() -> Timestamp {
+        "2026-09-16T08:00:00Z".parse::<jiff::Timestamp>().unwrap()
     }
 
     #[test]

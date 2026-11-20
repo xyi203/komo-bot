@@ -1,7 +1,7 @@
 //! 值类型：ID、状态机、执行计划、渠道身份、模型角色、记忆数据模型。
 //!
 //! 这里没有 I/O，没有时钟，没有 tokio（§13.4）。需要"现在几点"的地方一律由调用方
-//! 从 [`crate::traits::Clock`] 取一个 `OffsetDateTime` 传进来。
+//! 从 [`crate::traits::Clock`] 取一个 `Timestamp` 传进来。
 
 pub mod agent;
 pub mod chat;

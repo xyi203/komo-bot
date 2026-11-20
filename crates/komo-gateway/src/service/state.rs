@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use jiff::Timestamp;
 use komo_config::ConfigHolder;
 use komo_kernel::protocol::config::ConfigSnapshot;
 use komo_kernel::traits::{Clock, CronRepo, EmbeddingClient, GatewayError, LlmClient, MemoryRepo};
@@ -18,7 +19,6 @@ use komo_memory::{MemoryManager, MemoryParts};
 use komo_runtime::durable::harness::RetryPolicy;
 use komo_store::{Db, TursoCronRepo, TursoMatterRepo, TursoMemoryRepo};
 use komo_tools::executor::ToolExecutor;
-use time::OffsetDateTime;
 
 use crate::sse::{EventHub, SharedHub};
 
@@ -27,8 +27,8 @@ use crate::sse::{EventHub, SharedHub};
 pub struct SystemClock;
 
 impl Clock for SystemClock {
-    fn now(&self) -> OffsetDateTime {
-        OffsetDateTime::now_utc()
+    fn now(&self) -> Timestamp {
+        Timestamp::now()
     }
 }
 
@@ -110,7 +110,7 @@ pub struct GatewayState {
     pub shared_home: Option<PathBuf>,
     pub instance_id: String,
     pub token: String,
-    pub started_at: OffsetDateTime,
+    pub started_at: Timestamp,
     pub executor: ExecutorId,
     pub clock: Arc<dyn Clock>,
     pub config: Arc<ConfigHolder>,

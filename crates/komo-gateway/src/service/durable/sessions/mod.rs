@@ -24,6 +24,7 @@ pub mod tasks;
 pub mod titles;
 pub mod tree;
 
+use jiff::Timestamp;
 use komo_kernel::durable::storage::{EntryQuery, SessionQuery};
 use komo_kernel::durable::{
     ConversationId, EntryId, ScanOrder, SessionCursor, SessionKind, SessionLifecycle,
@@ -34,7 +35,6 @@ use komo_kernel::types::ids::{RunId, SessionId};
 use komo_kernel::types::status::{RunState, SessionState};
 use komo_runtime::durable::harness::{InboxItem, SubmitError};
 use komo_runtime::durable::{ConversationOwnership, DurableError, Tx};
-use time::OffsetDateTime;
 
 use super::DurableCore;
 use agent_doc::AgentDoc;
@@ -126,10 +126,9 @@ pub(super) fn ensure_open(record: &SessionRecord) -> Result<(), SessionError> {
     }
 }
 
-/// 毫秒时间戳 → `OffsetDateTime`（0 与越界落到 Unix 纪元）。
-pub fn time_of(ms: i64) -> OffsetDateTime {
-    OffsetDateTime::from_unix_timestamp_nanos(i128::from(ms) * 1_000_000)
-        .unwrap_or(OffsetDateTime::UNIX_EPOCH)
+/// 毫秒时间戳 → `Timestamp`（0 与越界落到 Unix 纪元）。
+pub fn time_of(ms: i64) -> Timestamp {
+    Timestamp::from_nanosecond(i128::from(ms) * 1_000_000).unwrap_or(Timestamp::UNIX_EPOCH)
 }
 
 /// `SessionKind` 在协议里的词：`main` / `normal` / `task`。cron 触发建的会话对客户端就是普通会话。

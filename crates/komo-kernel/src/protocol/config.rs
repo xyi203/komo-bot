@@ -19,8 +19,8 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::path::PathBuf;
 
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
-use time::OffsetDateTime;
 
 use crate::compaction::CompactionEconomics;
 use crate::projection::{DecayPolicy, ProjectionContext};
@@ -782,9 +782,8 @@ pub struct PathsConfig {
 pub struct SourceFile {
     #[cfg_attr(feature = "ts", ts(type = "string"))]
     pub path: PathBuf,
-    #[serde(with = "time::serde::rfc3339")]
     #[cfg_attr(feature = "ts", ts(type = "string"))]
-    pub mtime: OffsetDateTime,
+    pub mtime: Timestamp,
 }
 
 /// 一份完整的配置快照。
@@ -815,8 +814,7 @@ pub struct ConfigSnapshot {
     /// 没有"。
     #[serde(default)]
     pub credentials: BTreeMap<String, ContentHash>,
-    #[serde(with = "time::serde::rfc3339")]
-    pub loaded_at: OffsetDateTime,
+    pub loaded_at: Timestamp,
     #[serde(default)]
     pub sources: Vec<SourceFile>,
 }
@@ -894,7 +892,6 @@ pub enum IssueSeverity {
 mod tests {
     use super::*;
     use crate::types::model::Effort;
-    use time::macros::datetime;
 
     use crate::types::AgentProfile;
 
@@ -957,7 +954,7 @@ mod tests {
                 "KOMO_LLM_API_KEY".into(),
                 ContentHash::of_str("secret-1"),
             )]),
-            loaded_at: datetime!(2026-09-15 08:00:00 UTC),
+            loaded_at: "2026-09-15T08:00:00Z".parse::<jiff::Timestamp>().unwrap(),
             sources: vec![],
         }
     }
@@ -965,7 +962,7 @@ mod tests {
     #[test]
     fn an_identical_snapshot_has_no_diff() {
         let mut later = snapshot();
-        later.loaded_at = datetime!(2026-09-15 09:00:00 UTC);
+        later.loaded_at = "2026-09-15T09:00:00Z".parse::<jiff::Timestamp>().unwrap();
         assert_eq!(snapshot().diff(&later), vec![]);
     }
 

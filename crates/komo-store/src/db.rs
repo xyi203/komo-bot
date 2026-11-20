@@ -27,8 +27,8 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::time::Duration;
 
+use jiff::Timestamp;
 use komo_kernel::traits::StoreError;
-use time::OffsetDateTime;
 use toasty::Executor;
 use toasty_driver_turso::Turso;
 
@@ -667,29 +667,29 @@ fn column(row: &toasty::stmt::Value, index: usize) -> Option<&toasty::stmt::Valu
 
 // ---------------------------------------------------------------- 时间
 
-/// `OffsetDateTime` → 列里存的 i64（unix **纳秒**）。
+/// `Timestamp` → 列里存的 i64（unix **纳秒**）。
 ///
 /// 秒精度会把 `MemoryItem` 这种带时间戳的值类型在一次 put / get 之后改掉——存进去什么
 /// 读出来就该是什么，所以存全精度。i64 纳秒覆盖 1970 ± 292 年。
-pub fn to_ts(at: OffsetDateTime) -> i64 {
-    i64::try_from(at.unix_timestamp_nanos()).unwrap_or(i64::MAX)
+pub fn to_ts(at: Timestamp) -> i64 {
+    i64::try_from(at.as_nanosecond()).unwrap_or(i64::MAX)
 }
 
-/// 列里的 i64 → `OffsetDateTime`。
-pub fn from_ts(raw: i64) -> OffsetDateTime {
-    OffsetDateTime::from_unix_timestamp_nanos(i128::from(raw)).unwrap_or(OffsetDateTime::UNIX_EPOCH)
+/// 列里的 i64 → `Timestamp`。
+pub fn from_ts(raw: i64) -> Timestamp {
+    Timestamp::from_nanosecond(i128::from(raw)).unwrap_or(Timestamp::UNIX_EPOCH)
 }
 
 /// 可选时间 → i64，`None` 记作哨兵 `0`。
 ///
 /// **`0` 就是 1970-01-01T00:00:00Z**，而那个时刻在 komo 里没有意义（§8 的每个时间都是
 /// 运行期产生的），所以用它当"未设置"比多开一列可空时间省事。
-pub fn to_ts_opt(at: Option<OffsetDateTime>) -> i64 {
+pub fn to_ts_opt(at: Option<Timestamp>) -> i64 {
     at.map(to_ts).unwrap_or(0)
 }
 
 /// i64 → 可选时间，哨兵 `0` 读作 `None`。
-pub fn from_ts_opt(raw: i64) -> Option<OffsetDateTime> {
+pub fn from_ts_opt(raw: i64) -> Option<Timestamp> {
     (raw != 0).then(|| from_ts(raw))
 }
 
@@ -1054,7 +1054,7 @@ mod tests {
             "旧行没有定时"
         );
         // 旧行上设定时、被调度器读到：新列真的读写得通。
-        let at = time::OffsetDateTime::now_utc();
+        let at = jiff::Timestamp::now();
         cron.put(CronJob {
             id: CronJobId::from_raw("g-old"),
             name: String::new(),
@@ -1073,7 +1073,7 @@ mod tests {
             skills: vec![],
             max_rounds: None,
             notify: Default::default(),
-            next_run_at: Some(at - time::Duration::minutes(1)),
+            next_run_at: Some(at - jiff::SignedDuration::from_mins(1)),
             last_error: None,
         })
         .await
@@ -1306,7 +1306,9 @@ mod tests {
     /// 时间列是 unix 纳秒，`0` 是"未设置"。
     #[test]
     fn a_timestamp_round_trips_at_full_precision() {
-        let at = time::macros::datetime!(2026-09-15 08:00:00.123456789 UTC);
+        let at = "2026-09-15T08:00:00.123456789Z"
+            .parse::<jiff::Timestamp>()
+            .unwrap();
         assert_eq!(from_ts(to_ts(at)), at);
         assert_eq!(to_ts_opt(None), 0);
         assert_eq!(from_ts_opt(0), None);

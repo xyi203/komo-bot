@@ -1041,7 +1041,7 @@ async fn an_end_to_end_turn_completes_and_reaches_the_event_stream() {
             .map(|event| event.ts)
             .unwrap_or_else(|| panic!("有 {name}"));
         assert!(
-            (first_started - at).abs() < time::Duration::seconds(30),
+            (first_started - at).abs() < jiff::SignedDuration::from_secs(30),
             "{name} 的时间 {at} 离 run.started（{first_started}）太远"
         );
     }

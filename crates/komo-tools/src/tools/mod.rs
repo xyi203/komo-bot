@@ -189,8 +189,8 @@ pub fn unique_suffix() -> String {
 ///
 /// `Tool::prepare` 的签名里没有 [`Clock`](komo_kernel::traits::Clock)，而这个时间只
 /// 用来让 ID 按生成顺序排，不参与任何判决（判决的 `now` 由 executor 从时钟取）。
-pub fn plan_time() -> time::OffsetDateTime {
-    time::OffsetDateTime::now_utc()
+pub fn plan_time() -> jiff::Timestamp {
+    jiff::Timestamp::now()
 }
 
 #[cfg(test)]

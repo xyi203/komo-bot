@@ -188,7 +188,6 @@ mod tests {
     use crate::types::digest::ContentHash;
     use crate::types::ids::{AttemptId, EventId, Seq, SessionId, ToolCallId};
     use crate::types::refs::{ContentRef, OutputRef};
-    use time::macros::datetime;
 
     const RUN: &str = "run-1";
 
@@ -199,7 +198,7 @@ mod tests {
             event_id: EventId::from_raw(format!("evt-{seq}")),
             session: SessionId::from_raw("sess-1"),
             run: Some(RunId::from_raw(run)),
-            ts: datetime!(2026-09-15 08:00:00 UTC),
+            ts: "2026-09-15T08:00:00Z".parse::<jiff::Timestamp>().unwrap(),
             payload,
         }
     }

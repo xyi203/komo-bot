@@ -35,7 +35,7 @@ async fn device_token(gw: &Gw, label: &str) -> String {
             subject: "u-1".into(),
             email: None,
             label: label.into(),
-            now: time::OffsetDateTime::now_utc(),
+            now: jiff::Timestamp::now(),
             expires_at: None,
         })
         .await

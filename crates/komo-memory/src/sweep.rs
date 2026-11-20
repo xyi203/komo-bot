@@ -10,9 +10,9 @@
 
 use std::path::Path;
 
+use jiff::{SignedDuration, Timestamp};
 use komo_kernel::protocol::http::{SweepAction, SweepRule};
 use komo_kernel::types::memory::{Confirmation, MemoryItem, MemoryState};
-use time::{Duration, OffsetDateTime};
 
 use super::stale::missing_paths;
 
@@ -20,16 +20,16 @@ use super::stale::missing_paths;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SweepPolicy {
     /// 入库超过这么久、一次都没被用过的，遗忘。
-    pub never_used: Duration,
+    pub never_used: SignedDuration,
     /// 最近这么久没被用过的，遗忘。
-    pub idle: Duration,
+    pub idle: SignedDuration,
 }
 
 impl SweepPolicy {
     pub fn from_days(never_used: u32, idle: u32) -> Self {
         SweepPolicy {
-            never_used: Duration::days(i64::from(never_used)),
-            idle: Duration::days(i64::from(idle)),
+            never_used: SignedDuration::from_hours(24 * i64::from(never_used)),
+            idle: SignedDuration::from_hours(24 * i64::from(idle)),
         }
     }
 }
@@ -37,7 +37,7 @@ impl SweepPolicy {
 /// 对每条记忆给出处理意见；不处理的不出现在结果里。
 pub fn plan(
     items: &[MemoryItem],
-    now: OffsetDateTime,
+    now: Timestamp,
     policy: SweepPolicy,
     home: Option<&Path>,
 ) -> Vec<SweepAction> {
@@ -49,7 +49,7 @@ pub fn plan(
 
 fn judge(
     item: &MemoryItem,
-    now: OffsetDateTime,
+    now: Timestamp,
     policy: SweepPolicy,
     home: Option<&Path>,
 ) -> Option<SweepAction> {
@@ -65,7 +65,10 @@ fn judge(
     {
         return forget(
             SweepRule::Expired,
-            format!("有效期到 {} 为止", until.date()),
+            format!(
+                "有效期到 {} 为止",
+                komo_kernel::types::matter::utc_date(until)
+            ),
         );
     }
     match item.usage.last_used_at {
@@ -74,7 +77,7 @@ fn judge(
                 SweepRule::NeverUsed,
                 format!(
                     "入库 {} 天，从没被用过",
-                    (now - item.created_at).whole_days()
+                    (now - item.created_at).as_hours() / 24
                 ),
             );
         }
@@ -83,7 +86,7 @@ fn judge(
                 SweepRule::Idle,
                 format!(
                     "{} 天没被用过（之前用过 {} 次）",
-                    (now - last).whole_days(),
+                    (now - last).as_hours() / 24,
                     item.usage.count
                 ),
             );
@@ -124,13 +127,13 @@ mod tests {
         ExtractionMetadata, MemoryKind, MemoryScope, MemoryUsage, Provenance,
     };
 
-    const DAY: Duration = Duration::days(1);
+    const DAY: SignedDuration = SignedDuration::from_hours(24);
 
-    fn now() -> OffsetDateTime {
-        OffsetDateTime::UNIX_EPOCH + Duration::days(1000)
+    fn now() -> Timestamp {
+        Timestamp::UNIX_EPOCH + SignedDuration::from_hours(24 * 1000)
     }
 
-    fn item(content: &str, age: Duration, last_used: Option<Duration>) -> MemoryItem {
+    fn item(content: &str, age: SignedDuration, last_used: Option<SignedDuration>) -> MemoryItem {
         MemoryItem {
             id: MemoryId::from_raw(content),
             revision: 2,

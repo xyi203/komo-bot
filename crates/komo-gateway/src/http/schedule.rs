@@ -353,7 +353,7 @@ fn resolve_workdir(dir: Option<&str>) -> Result<Option<std::path::PathBuf>, ApiF
 fn trigger_of(
     schedule: &str,
     zone: &TimeZone,
-    now: time::OffsetDateTime,
+    now: jiff::Timestamp,
 ) -> Result<Trigger, ApiFailure> {
     let zones = komo_runtime::scheduler::JiffZoneResolver::new();
     parse_schedule(schedule, zone, now, &zones).map_err(|error| {
@@ -380,10 +380,6 @@ fn zone_of(trigger: &Trigger) -> TimeZone {
 fn schedule_text(trigger: &Trigger) -> String {
     match trigger {
         Trigger::Cron { expr, .. } => expr.clone(),
-        Trigger::At { at } => format!(
-            "@at {}",
-            at.format(&time::format_description::well_known::Rfc3339)
-                .unwrap_or_default()
-        ),
+        Trigger::At { at } => format!("@at {at}"),
     }
 }

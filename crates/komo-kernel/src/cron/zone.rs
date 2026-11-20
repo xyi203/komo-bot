@@ -8,8 +8,10 @@
 use std::cmp::Ordering;
 
 use croner::time::{CivilDateTime, CronDateTime, Resolution, Weekday as CronWeekday};
+use jiff::civil::DateTime;
+use jiff::tz::Offset;
+use jiff::{SignedDuration, Timestamp};
 use serde::{Deserialize, Serialize};
-use time::{Date, Duration, Month, OffsetDateTime, PrimitiveDateTime, Time, UtcOffset};
 
 use crate::traits::ZoneResolver;
 
@@ -44,10 +46,10 @@ impl std::fmt::Display for TimeZone {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ZoneResolution {
     /// 只对应一个瞬时——绝大多数时候。
-    Single(UtcOffset),
+    Single(Offset),
     /// 对应两个：时钟往回拨，这段本地时间出现了两次。**先早后晚**（较早的那个瞬时
     /// 偏移更大）。§10：两次不同 UTC 时刻分别视为计划时间。
-    Ambiguous(UtcOffset, UtcOffset),
+    Ambiguous(Offset, Offset),
     /// 一个都不对应：时钟往前拨，这个本地时间不存在。§10：跳过。
     Gap,
 }
@@ -69,27 +71,27 @@ pub enum ZoneError {
 /// 时的区，得到的就是"当这个区没有夏令时"——这是一个应当被知道的降级，不是默认行为。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FixedOffsetZone {
-    offset: UtcOffset,
+    offset: Offset,
 }
 
 impl FixedOffsetZone {
-    pub fn new(offset: UtcOffset) -> Self {
+    pub fn new(offset: Offset) -> Self {
         Self { offset }
     }
 
     pub fn utc() -> Self {
         Self {
-            offset: UtcOffset::UTC,
+            offset: Offset::UTC,
         }
     }
 }
 
 impl ZoneResolver for FixedOffsetZone {
-    fn resolve(&self, _zone: &str, _local: PrimitiveDateTime) -> Result<ZoneResolution, ZoneError> {
+    fn resolve(&self, _zone: &str, _local: DateTime) -> Result<ZoneResolution, ZoneError> {
         Ok(ZoneResolution::Single(self.offset))
     }
 
-    fn offset_at(&self, _zone: &str, _instant: OffsetDateTime) -> Result<UtcOffset, ZoneError> {
+    fn offset_at(&self, _zone: &str, _instant: Timestamp) -> Result<Offset, ZoneError> {
         Ok(self.offset)
     }
 }
@@ -98,24 +100,23 @@ impl ZoneResolver for FixedOffsetZone {
 #[derive(Debug, Clone, Copy)]
 pub(super) struct LaterFold {
     /// 时钟往回拨的那个瞬时，也就是后一半的起点。
-    pub(super) transition: OffsetDateTime,
+    pub(super) transition: Timestamp,
     /// 前一半（较早的孪生瞬时）用的偏移，较大的那个。
-    pub(super) earlier_offset: UtcOffset,
+    pub(super) earlier_offset: Offset,
     /// 后一半用的偏移。
-    pub(super) later_offset: UtcOffset,
+    pub(super) later_offset: Offset,
 }
 
 impl LaterFold {
-    pub(super) fn shift(&self) -> Duration {
-        Duration::seconds(
-            (self.earlier_offset.whole_seconds() - self.later_offset.whole_seconds()) as i64,
+    pub(super) fn shift(&self) -> SignedDuration {
+        SignedDuration::from_secs(
+            i64::from(self.earlier_offset.seconds()) - i64::from(self.later_offset.seconds()),
         )
     }
 
     /// 重复的那段墙上时间的起点。
-    pub(super) fn wall_start(&self) -> PrimitiveDateTime {
-        let local = self.transition.to_offset(self.later_offset);
-        PrimitiveDateTime::new(local.date(), local.time())
+    pub(super) fn wall_start(&self) -> DateTime {
+        self.later_offset.to_datetime(self.transition)
     }
 }
 
@@ -124,29 +125,28 @@ impl LaterFold {
 /// 用 `offset_at` 在 24 小时窗口里二分找时钟往回拨的瞬时——没有哪个时区一次拨超过几个
 /// 钟头，一天是很宽的余量，而这十几次 resolver 调用只在切换那天付。
 pub(super) fn later_fold(
-    after: OffsetDateTime,
+    after: Timestamp,
     zone: &str,
     zones: &dyn ZoneResolver,
 ) -> Result<Option<LaterFold>, ZoneError> {
     let offset = zones.offset_at(zone, after)?;
-    let local = after.to_offset(offset);
-    let wall = PrimitiveDateTime::new(local.date(), local.time());
+    let wall = offset.to_datetime(after);
     let ZoneResolution::Ambiguous(earlier_offset, later_offset) = zones.resolve(zone, wall)? else {
         return Ok(None);
     };
     // 已经在后一半上了，另一半在身后。
-    if offset != earlier_offset || after >= wall.assume_offset(later_offset) {
+    if offset != earlier_offset || after >= assume_offset(wall, later_offset)? {
         return Ok(None);
     }
 
     let mut inside = after;
-    let mut outside = after + Duration::hours(24);
+    let mut outside = after + SignedDuration::from_hours(24);
     if zones.offset_at(zone, outside)? == earlier_offset {
         // 一天之内没拨回来——不是这里该处理的情形。
         return Ok(None);
     }
-    while (outside - inside).whole_seconds() > 1 {
-        let middle = inside + Duration::seconds((outside - inside).whole_seconds() / 2);
+    while (outside - inside).as_secs() > 1 {
+        let middle = inside + SignedDuration::from_secs((outside - inside).as_secs() / 2);
         if zones.offset_at(zone, middle)? == earlier_offset {
             inside = middle;
         } else {
@@ -160,46 +160,66 @@ pub(super) fn later_fold(
     }))
 }
 
-/// `time::OffsetDateTime` + 一个 [`ZoneResolver`] 的 [`CronDateTime`] 实现。
+/// 墙上时间 + 偏移 → 瞬时。偏移由 resolver 给出，结果越界只可能是 resolver 给了荒谬的偏移。
+pub(super) fn assume_offset(local: DateTime, offset: Offset) -> Result<Timestamp, ZoneError> {
+    offset
+        .to_timestamp(local)
+        .map_err(|error| ZoneError::Unavailable(error.to_string()))
+}
+
+/// `jiff::Timestamp` + 一个 [`ZoneResolver`] 的 [`CronDateTime`] 实现。
 ///
-/// 内部按**瞬时**保存（`instant` 的偏移只是渲染用），墙上时间每次经 resolver 算出来，
-/// 所以跨过一次夏令时切换时它跟着变——这正是 croner 在绝对时间线上推进时需要的。
+/// 内部按**瞬时**保存，`offset` 是这个瞬时在该区里的偏移（墙上时间由它算出），每次换瞬时都经
+/// resolver 重取，所以跨过一次夏令时切换时它跟着变——这正是 croner 在绝对时间线上推进时需要的。
 #[derive(Clone, Copy)]
 pub(super) struct Zoned<'a> {
-    instant: OffsetDateTime,
+    instant: Timestamp,
+    offset: Offset,
     zone: &'a str,
     zones: &'a dyn ZoneResolver,
 }
 
 impl<'a> Zoned<'a> {
     pub(super) fn at(
-        instant: OffsetDateTime,
+        instant: Timestamp,
         zone: &'a str,
         zones: &'a dyn ZoneResolver,
     ) -> Result<Self, ZoneError> {
         let offset = zones.offset_at(zone, instant)?;
         Ok(Zoned {
-            instant: instant.to_offset(offset),
+            instant,
+            offset,
             zone,
             zones,
         })
     }
 
-    /// 带着它自己那个区的偏移的时刻——调用方看到的就是"在它自己的时区里几点"。
-    pub(super) fn local(&self) -> OffsetDateTime {
+    pub(super) fn instant(&self) -> Timestamp {
         self.instant
     }
 
-    fn with_instant(&self, instant: OffsetDateTime) -> Self {
+    fn with_instant(&self, instant: Timestamp) -> Self {
         let offset = self
             .zones
             .offset_at(self.zone, instant)
-            .unwrap_or_else(|_| instant.offset());
+            .unwrap_or(self.offset);
         Zoned {
-            instant: instant.to_offset(offset),
+            instant,
+            offset,
             zone: self.zone,
             zones: self.zones,
         }
+    }
+
+    fn resolved(&self, local: DateTime, offset: Offset) -> Result<Self, croner::errors::CronError> {
+        Ok(Zoned {
+            instant: offset
+                .to_timestamp(local)
+                .map_err(|_| croner::errors::CronError::InvalidDate)?,
+            offset,
+            zone: self.zone,
+            zones: self.zones,
+        })
     }
 }
 
@@ -207,6 +227,7 @@ impl std::fmt::Debug for Zoned<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Zoned")
             .field("instant", &self.instant)
+            .field("offset", &self.offset)
             .field("zone", &self.zone)
             .finish_non_exhaustive()
     }
@@ -214,66 +235,54 @@ impl std::fmt::Debug for Zoned<'_> {
 
 impl CronDateTime for Zoned<'_> {
     fn to_civil(&self) -> CivilDateTime {
+        let local = self.offset.to_datetime(self.instant);
         CivilDateTime::from_ymd_hms_opt(
-            self.instant.year(),
-            self.instant.month() as u32,
-            self.instant.day() as u32,
-            self.instant.hour() as u32,
-            self.instant.minute() as u32,
-            self.instant.second() as u32,
+            i32::from(local.year()),
+            local.month() as u32,
+            local.day() as u32,
+            local.hour() as u32,
+            local.minute() as u32,
+            local.second() as u32,
         )
-        .expect("OffsetDateTime 的各部分本来就是合法日期")
+        .expect("civil::DateTime 的各部分本来就是合法日期")
     }
 
     fn civil_weekday(&self) -> CronWeekday {
-        CronWeekday::from_days_from_sunday(self.instant.weekday().number_days_from_sunday() as u32)
+        let local = self.offset.to_datetime(self.instant);
+        CronWeekday::from_days_from_sunday(local.weekday().to_sunday_zero_offset() as u32)
     }
 
     fn resolve_civil(
         &self,
         civil: CivilDateTime,
     ) -> Result<Resolution<Self>, croner::errors::CronError> {
-        let month = Month::try_from(civil.month() as u8)
+        let year =
+            i16::try_from(civil.year()).map_err(|_| croner::errors::CronError::InvalidDate)?;
+        let date = jiff::civil::Date::new(year, civil.month() as i8, civil.day() as i8)
             .map_err(|_| croner::errors::CronError::InvalidDate)?;
-        let date = Date::from_calendar_date(civil.year(), month, civil.day() as u8)
-            .map_err(|_| croner::errors::CronError::InvalidDate)?;
-        let time = Time::from_hms(
-            civil.hour() as u8,
-            civil.minute() as u8,
-            civil.second() as u8,
+        let time = jiff::civil::Time::new(
+            civil.hour() as i8,
+            civil.minute() as i8,
+            civil.second() as i8,
+            0,
         )
         .map_err(|_| croner::errors::CronError::InvalidTime)?;
-        let local = PrimitiveDateTime::new(date, time);
+        let local = date.to_datetime(time);
 
         match self
             .zones
             .resolve(self.zone, local)
             .map_err(|_| croner::errors::CronError::InvalidDate)?
         {
-            ZoneResolution::Single(offset) => Ok(Resolution::Single(Zoned {
-                instant: local.assume_offset(offset),
-                zone: self.zone,
-                zones: self.zones,
-            })),
+            ZoneResolution::Single(offset) => Ok(Resolution::Single(self.resolved(local, offset)?)),
             ZoneResolution::Ambiguous(earlier, later) => {
-                let mut first = local.assume_offset(earlier);
-                let mut second = local.assume_offset(later);
+                let mut first = self.resolved(local, earlier)?;
+                let mut second = self.resolved(local, later)?;
                 // croner 要求第一个是较早的瞬时；resolver 说错了也不至于让搜索乱掉。
-                if first > second {
+                if first.instant > second.instant {
                     std::mem::swap(&mut first, &mut second);
                 }
-                Ok(Resolution::Ambiguous(
-                    Zoned {
-                        instant: first,
-                        zone: self.zone,
-                        zones: self.zones,
-                    },
-                    Zoned {
-                        instant: second,
-                        zone: self.zone,
-                        zones: self.zones,
-                    },
-                ))
+                Ok(Resolution::Ambiguous(first, second))
             }
             ZoneResolution::Gap => Ok(Resolution::Gap),
         }
@@ -281,13 +290,12 @@ impl CronDateTime for Zoned<'_> {
 
     fn checked_add_seconds(&self, seconds: i64) -> Option<Self> {
         self.instant
-            .checked_add(Duration::seconds(seconds))
+            .checked_add(SignedDuration::from_secs(seconds))
+            .ok()
             .map(|instant| self.with_instant(instant))
     }
 
     fn cmp_instant(&self, other: &Self) -> Ordering {
-        self.instant
-            .unix_timestamp_nanos()
-            .cmp(&other.instant.unix_timestamp_nanos())
+        self.instant.cmp(&other.instant)
     }
 }

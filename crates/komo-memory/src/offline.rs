@@ -15,6 +15,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
+use jiff::Timestamp;
 use komo_kernel::protocol::http::{
     ConsolidateAction, ConsolidateActionReport, ConsolidateGroupReport, ConsolidateGroupStatus,
     ConsolidateMember, ConsolidateOutcome, MemoryConsolidateRequest, MemoryConsolidateResponse,
@@ -27,7 +28,6 @@ use komo_kernel::types::memory::{
 };
 use komo_kernel::types::turn::{ReplayMessage, RoundInput, TurnRequest};
 use serde::Deserialize;
-use time::OffsetDateTime;
 use tracing::Instrument;
 use tracing::field::Empty;
 
@@ -94,7 +94,7 @@ impl MemoryManager {
             .flatten()
             .map(|item| item.id.clone())
             .collect();
-        let marks: HashMap<MemoryId, Option<OffsetDateTime>> = self
+        let marks: HashMap<MemoryId, Option<Timestamp>> = self
             .repo
             .consolidation_marks(&ids)
             .await?
@@ -183,7 +183,7 @@ impl MemoryManager {
         group: Vec<MemoryItem>,
         instruction: Option<&str>,
         apply: bool,
-        now: OffsetDateTime,
+        now: Timestamp,
     ) -> ConsolidateGroupReport {
         let span = tracing::info_span!(
             "komo.memory.consolidate",
@@ -243,7 +243,7 @@ impl MemoryManager {
         group: &[MemoryItem],
         instruction: Option<&str>,
         apply: bool,
-        now: OffsetDateTime,
+        now: Timestamp,
     ) -> ConsolidateGroupReport {
         let mut report = ConsolidateGroupReport {
             scope: group[0].scope.clone(),
@@ -314,7 +314,7 @@ impl MemoryManager {
                     item.kind,
                     item.provenance,
                     item.confirmation,
-                    item.observed_at.date(),
+                    komo_kernel::types::matter::utc_date(item.observed_at),
                     super::extract::application_label(item),
                     item.content
                 )
@@ -601,7 +601,7 @@ struct Decided {
 
 /// 把模型说的关系换成能做的动作（§9.8 的全部授权规则）。**纯函数**：只看组里条目当前
 /// 的样子，按顺序在工作副本上应用；后一个动作看见的是前一个动作之后的状态。
-fn authorize(group: &[MemoryItem], raw: &[RawAction], now: OffsetDateTime) -> Decided {
+fn authorize(group: &[MemoryItem], raw: &[RawAction], now: Timestamp) -> Decided {
     let mut work: Vec<MemoryItem> = group.to_vec();
     let mut consumed = vec![false; group.len()];
     let mut dirty: BTreeSet<usize> = BTreeSet::new();
@@ -701,7 +701,7 @@ fn merge(
     dirty: &mut BTreeSet<usize>,
     keep: usize,
     absorb: &[usize],
-    now: OffsetDateTime,
+    now: Timestamp,
 ) -> Verdict {
     let mut absorb: Vec<usize> = absorb.to_vec();
     absorb.sort_unstable();
@@ -798,7 +798,7 @@ fn supersede(
     dirty: &mut BTreeSet<usize>,
     old: usize,
     by: usize,
-    now: OffsetDateTime,
+    now: Timestamp,
 ) -> Verdict {
     if old == by || consumed[old] || consumed[by] {
         return Verdict::Skip("条目已被本组前一个动作处理，或两端是同一条".into());
@@ -840,7 +840,7 @@ fn contest(
     dirty: &mut BTreeSet<usize>,
     a: usize,
     b: usize,
-    now: OffsetDateTime,
+    now: Timestamp,
 ) {
     for index in [a, b] {
         if work[index].state != MemoryState::Contested {

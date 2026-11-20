@@ -267,13 +267,12 @@ fn matter_from_row(row: &MatterRow) -> Result<Matter, StoreError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use jiff::Timestamp;
     use komo_kernel::types::ids::{CronJobId, EventId, RunId, Seq, SessionId};
     use komo_kernel::types::matter::{MatterChange, NewMatter, transition};
     use komo_kernel::types::memory::{EvidenceRef, Provenance};
-    use time::OffsetDateTime;
-    use time::macros::{date, datetime};
 
-    const T0: OffsetDateTime = datetime!(2026-10-29 08:00:00.123456789 UTC);
+    const T0: Timestamp = jiff::Timestamp::constant(1793260800, 123456789) /* 2026-10-29T08:00:00.123456789Z */;
 
     async fn temp() -> (TursoMatterRepo, tempfile::TempDir) {
         let dir = tempfile::tempdir().expect("临时目录");
@@ -288,7 +287,7 @@ mod tests {
             kind: MatterKind::Goal,
             title: "这周把 owl 的发布观察做完".into(),
             next: Some("看 AB 组的 5xx".into()),
-            due: Some(date!(2026 - 11 - 01)),
+            due: Some(jiff::civil::date(2026, 11, 1)),
             standard: None,
         }
         .build(MatterId::from_raw(id), T0)

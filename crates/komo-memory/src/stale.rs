@@ -107,11 +107,11 @@ fn path_char(c: char) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use jiff::Timestamp;
     use komo_kernel::types::ids::MemoryId;
     use komo_kernel::types::memory::{
         Confirmation, ExtractionMetadata, MemoryKind, MemoryScope, MemoryState, Provenance,
     };
-    use time::OffsetDateTime;
 
     fn item(content: &str) -> MemoryItem {
         MemoryItem {
@@ -124,10 +124,10 @@ mod tests {
             confirmation: Confirmation::Unconfirmed,
             state: MemoryState::Active,
             evidence: vec![],
-            observed_at: OffsetDateTime::UNIX_EPOCH,
+            observed_at: Timestamp::UNIX_EPOCH,
             valid_until: None,
-            created_at: OffsetDateTime::UNIX_EPOCH,
-            updated_at: OffsetDateTime::UNIX_EPOCH,
+            created_at: Timestamp::UNIX_EPOCH,
+            updated_at: Timestamp::UNIX_EPOCH,
             extraction: ExtractionMetadata::new("memory-model", None, "v1"),
             usage: Default::default(),
             supersedes: None,

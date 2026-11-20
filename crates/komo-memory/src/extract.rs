@@ -13,6 +13,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use jiff::Timestamp;
 use komo_kernel::events::{Event, EventPayload};
 use komo_kernel::traits::{Clock, LlmClient};
 use komo_kernel::types::ids::{EventId, MatterId, MemoryId, RunId, Seq, SessionId};
@@ -25,7 +26,6 @@ use komo_kernel::types::model::ModelConfig;
 use komo_kernel::types::status::RunState;
 use komo_kernel::types::turn::{MemoryUse, RoundInput, ToolCallRequest, TurnRequest};
 use serde::Deserialize;
-use time::OffsetDateTime;
 
 use super::MemoryError;
 use super::consolidate::{RawVerdict, Verdict, map_verdicts};
@@ -131,8 +131,8 @@ pub struct Observation {
     /// 入库时的初始状态：用户原话 / 工具观察 `active`，模型推断 `candidate`（§9.2）。
     pub state: MemoryState,
     pub evidence: Vec<Evidence>,
-    pub observed_at: OffsetDateTime,
-    pub valid_until: Option<OffsetDateTime>,
+    pub observed_at: Timestamp,
+    pub valid_until: Option<Timestamp>,
     pub extraction: ExtractionMetadata,
     /// 与已有记忆的关系，编号已映射成 id（§9.9）。
     pub relations: Vec<Verdict>,
@@ -539,7 +539,7 @@ impl Transcript {
         model: &ModelConfig,
         candidates: &[MemoryItem],
         matters: &[Matter],
-        now: OffsetDateTime,
+        now: Timestamp,
     ) -> Vec<Observation> {
         let mut out = Vec::new();
         for candidate in raw.into_iter().take(max_observations) {
@@ -559,7 +559,7 @@ impl Transcript {
         model: &ModelConfig,
         candidates: &[MemoryItem],
         matters: &[Matter],
-        now: OffsetDateTime,
+        now: Timestamp,
     ) -> Result<Observation, String> {
         let content = raw.content.trim().to_string();
         if content.is_empty() {
@@ -834,8 +834,8 @@ fn one_line(text: &str) -> String {
     }
 }
 
-fn parse_time(raw: &str) -> Option<OffsetDateTime> {
-    OffsetDateTime::parse(raw, &time::format_description::well_known::Rfc3339).ok()
+fn parse_time(raw: &str) -> Option<Timestamp> {
+    raw.parse::<Timestamp>().ok()
 }
 
 /// 粗筛"看起来像凭证"的正文。宁可丢掉一条记忆，也不把一把密钥存成长期事实（§9.3）。
@@ -1049,7 +1049,7 @@ pub(super) fn user_prompt(
     candidates: &[MemoryItem],
     injected: &[MemoryItem],
     matters: &[Matter],
-    now: OffsetDateTime,
+    now: Timestamp,
 ) -> String {
     // 编号落在自己的命名空间（m0、m1…），与上面候选的 [0]、[1] 不混。
     let injected = if injected.is_empty() {
@@ -1115,7 +1115,7 @@ pub(super) fn user_prompt(
     format!(
         "当前时间：{}\n会话：{}\n\n--- 已有的相关记忆 ---\n{existing}\n--- 记忆结束 ---\n\n{injected}{matters}\
          --- 会话记录 ---\n{}\n--- 记录结束 ---",
-        now.date(),
+        komo_kernel::types::matter::utc_date(now),
         transcript.session,
         transcript.rendered
     )

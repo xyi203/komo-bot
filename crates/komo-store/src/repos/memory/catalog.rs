@@ -5,6 +5,7 @@
 //! 少条可索引、哪一代生效。MemoryManager 通过自己那边的 `MemoryCatalog` trait 认它们，
 //! 于是 kernel 的接口不必为索引器再长一截。
 
+use jiff::Timestamp;
 use komo_kernel::protocol::http::IndexState;
 use komo_kernel::traits::{RepoError, StoreError};
 use komo_kernel::types::ids::{MatterId, MemoryId, SessionId};
@@ -12,7 +13,6 @@ use komo_kernel::types::memory::{
     EvidenceRef, MemoryApplication, MemoryItem, MemoryScope, MemoryState,
 };
 use komo_kernel::types::model::EmbeddingSpace;
-use time::OffsetDateTime;
 
 use crate::db::{BoxFuture, column_i64, column_string, decode, encode, map_toasty, to_ts};
 use crate::models::{MemoryEvidenceRow, MemoryIndexGenerationRow, MemoryItemRow, MemoryVectorRow};
@@ -39,7 +39,7 @@ pub struct GenerationRecord {
     pub state: IndexState,
     pub dimensions: u32,
     pub active: bool,
-    pub created_at: OffsetDateTime,
+    pub created_at: Timestamp,
     /// 最近一轮留下的错误（`set_generation_progress` 写的那一份）。
     pub errors: Vec<String>,
 }
@@ -437,7 +437,7 @@ impl TursoMemoryRepo {
     /// query vector 和旧代次的向量放在一起比——那正是代次这件事要防的。
     pub async fn activate_generation(&self, generation: &str) -> Result<(), RepoError> {
         let generation = generation.to_string();
-        let now = OffsetDateTime::now_utc();
+        let now = Timestamp::now();
         self.db()
             .with_write_retry(move |ex| {
                 let generation = generation.clone();
@@ -507,7 +507,7 @@ impl TursoMemoryRepo {
     }
 
     /// 记一次使用。**只度量使用，不增加真实性**（§9.2）——所以它碰的只有这两列。
-    pub async fn record_use(&self, ids: &[MemoryId], at: OffsetDateTime) -> Result<(), RepoError> {
+    pub async fn record_use(&self, ids: &[MemoryId], at: Timestamp) -> Result<(), RepoError> {
         if ids.is_empty() {
             return Ok(());
         }
@@ -542,11 +542,7 @@ impl TursoMemoryRepo {
 
     /// 记一次采纳（§9.10）：一批提取里被指认用上的记忆各 +1。与 [`Self::record_use`]
     /// 一样只碰自己的两列——不升 revision、不动状态与确认。
-    pub async fn record_adoption(
-        &self,
-        ids: &[MemoryId],
-        at: OffsetDateTime,
-    ) -> Result<(), RepoError> {
+    pub async fn record_adoption(&self, ids: &[MemoryId], at: Timestamp) -> Result<(), RepoError> {
         if ids.is_empty() {
             return Ok(());
         }

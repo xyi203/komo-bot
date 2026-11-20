@@ -17,6 +17,7 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use jiff::Timestamp;
 use komo_kernel::protocol::config::HindsightConfig;
 use komo_kernel::types::memory::MemoryScope;
 use komo_memory::provider::{
@@ -24,8 +25,6 @@ use komo_memory::provider::{
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
-use time::OffsetDateTime;
-use time::format_description::well_known::Rfc3339;
 use tokio::sync::OnceCell;
 
 /// 单次请求的上限；核心另有召回 5 秒、写入 15 秒的时限。
@@ -165,7 +164,7 @@ impl Fact {
             at: self
                 .date
                 .as_deref()
-                .and_then(|date| OffsetDateTime::parse(date, &Rfc3339).ok()),
+                .and_then(|date| date.parse::<Timestamp>().ok()),
             id: self.id,
             text: self.text,
             kind: self.fact_type,
@@ -245,10 +244,7 @@ impl MemoryProvider for Hindsight {
 
     async fn ingest(&self, batch: &EvidenceBatch<'_>) -> Result<(), ProviderError> {
         self.ensure_bank().await?;
-        let timestamp = batch
-            .at
-            .format(&Rfc3339)
-            .unwrap_or_else(|_| batch.at.to_string());
+        let timestamp = batch.at.to_string();
         let response = self
             .send(
                 self.http
@@ -452,7 +448,7 @@ mod tests {
                     session: &session,
                     scope: MemoryScope::Personal,
                     text: "[用户] 以后都选 saas",
-                    at: time::OffsetDateTime::UNIX_EPOCH,
+                    at: jiff::Timestamp::UNIX_EPOCH,
                 })
                 .await
                 .unwrap();
@@ -475,7 +471,7 @@ mod tests {
         assert_eq!(page.items.len(), 2);
         assert_eq!(page.items[0].kind.as_deref(), Some("world"));
         assert_eq!(
-            page.items[0].at.map(|at| at.unix_timestamp()),
+            page.items[0].at.map(|at| at.as_second()),
             Some(1_794_989_280)
         );
         assert_eq!(page.items[1].at, None, "读不出来的时间不编");
@@ -517,7 +513,7 @@ mod tests {
                 session: &session,
                 scope: MemoryScope::Personal,
                 text: "[用户] 以后发布工单 Platform 都选 saas。\n[助手] 好的。",
-                at: time::OffsetDateTime::now_utc(),
+                at: jiff::Timestamp::now(),
             })
             .await
             .unwrap();

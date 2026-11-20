@@ -95,7 +95,7 @@ pub fn inject_memory_events(events: &mut Vec<Event>, doc: &MemoryDoc) {
     let mut chosen: Option<RunId> = None;
     for event in events.iter() {
         if let (EventPayload::RunStarted(_), Some(run)) = (&event.payload, &event.run) {
-            let millis = (event.ts.unix_timestamp_nanos() / 1_000_000) as i64;
+            let millis = (event.ts.as_nanosecond() / 1_000_000) as i64;
             if at == 0 {
                 chosen = Some(run.clone());
                 break;
@@ -435,7 +435,7 @@ fn store_kind(kind: DurableSessionKind) -> SessionKind {
 impl MemoryWorkLog for DurableMemoryWork {
     async fn claim(
         &self,
-        idle: time::Duration,
+        idle: jiff::SignedDuration,
         limit: usize,
     ) -> Result<Vec<MemoryBatch>, StoreError> {
         let now = self.clock.now();
@@ -520,8 +520,8 @@ impl DurableMemoryWork {
     async fn evaluate(
         &self,
         session: &komo_kernel::durable::SessionRecord,
-        idle: time::Duration,
-        now: time::OffsetDateTime,
+        idle: jiff::SignedDuration,
+        now: jiff::Timestamp,
     ) -> Result<Option<MemoryBatch>, StoreError> {
         let conversations = session_conversations(&*self.storage, &session.id).await?;
         // 先只看 submission：有没有没结算的输入、已结算输入的最大 ID。
@@ -572,7 +572,7 @@ impl DurableMemoryWork {
         let source_agent = session.agent.as_deref();
         let (mode, agent_id) = (self.modes)(source_agent);
         let mut items: Vec<MemoryWorkItem> = Vec::new();
-        let mut last_end: Option<time::OffsetDateTime> = None;
+        let mut last_end: Option<jiff::Timestamp> = None;
         let mut pending = false;
         for event in &events {
             let (Some(status), Some(run)) = (terminal_state(&event.payload), &event.run) else {

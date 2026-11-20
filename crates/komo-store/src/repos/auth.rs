@@ -7,9 +7,9 @@
 //! 过期是读时判的：[`TursoAuthRepo::find`] 对过期的行答 `None`，不顺手删（读不抢写锁）；清理走
 //! [`TursoAuthRepo::purge_expired`]。
 
+use jiff::Timestamp;
 use komo_kernel::traits::StoreError;
 use komo_kernel::types::ids::uuid_v7_at;
-use time::OffsetDateTime;
 
 use crate::db::{BoxFuture, Db, from_ts, from_ts_opt, map_toasty, to_ts, to_ts_opt};
 use crate::models::AuthSessionRow;
@@ -48,10 +48,10 @@ pub struct AuthSessionRecord {
     pub subject: String,
     pub email: Option<String>,
     pub label: String,
-    pub created_at: OffsetDateTime,
-    pub last_used_at: OffsetDateTime,
+    pub created_at: Timestamp,
+    pub last_used_at: Timestamp,
     /// `None` = 不过期。
-    pub expires_at: Option<OffsetDateTime>,
+    pub expires_at: Option<Timestamp>,
 }
 
 /// 新建一条要的东西。
@@ -63,8 +63,8 @@ pub struct NewAuthSession {
     pub subject: String,
     pub email: Option<String>,
     pub label: String,
-    pub now: OffsetDateTime,
-    pub expires_at: Option<OffsetDateTime>,
+    pub now: Timestamp,
+    pub expires_at: Option<Timestamp>,
 }
 
 /// Turso 上的登录状态仓储。
@@ -119,7 +119,7 @@ impl TursoAuthRepo {
         &self,
         kind: AuthKind,
         token_hash: &str,
-        now: OffsetDateTime,
+        now: Timestamp,
     ) -> Result<Option<AuthSessionRecord>, StoreError> {
         let token_hash = token_hash.to_string();
         self.db
@@ -147,8 +147,8 @@ impl TursoAuthRepo {
     pub async fn touch(
         &self,
         id: &str,
-        now: OffsetDateTime,
-        expires_at: Option<OffsetDateTime>,
+        now: Timestamp,
+        expires_at: Option<Timestamp>,
     ) -> Result<(), StoreError> {
         let id = id.to_string();
         self.db
@@ -177,7 +177,7 @@ impl TursoAuthRepo {
     }
 
     /// 没过期的全部，最近用过的在前。
-    pub async fn list(&self, now: OffsetDateTime) -> Result<Vec<AuthSessionRecord>, StoreError> {
+    pub async fn list(&self, now: Timestamp) -> Result<Vec<AuthSessionRecord>, StoreError> {
         self.db
             .read(move |ex| {
                 Box::pin(async move {
@@ -253,7 +253,7 @@ impl TursoAuthRepo {
     }
 
     /// 删掉已过期的，返回删了几条。
-    pub async fn purge_expired(&self, now: OffsetDateTime) -> Result<usize, StoreError> {
+    pub async fn purge_expired(&self, now: Timestamp) -> Result<usize, StoreError> {
         self.db
             .with_write_retry(move |ex| {
                 Box::pin(async move {
@@ -273,7 +273,7 @@ impl TursoAuthRepo {
     }
 }
 
-fn expired(record: &AuthSessionRecord, now: OffsetDateTime) -> bool {
+fn expired(record: &AuthSessionRecord, now: Timestamp) -> bool {
     record.expires_at.is_some_and(|at| at <= now)
 }
 
@@ -294,12 +294,11 @@ fn record_of(row: &AuthSessionRow) -> Option<AuthSessionRecord> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use time::Duration;
-    use time::macros::datetime;
+    use jiff::SignedDuration;
 
-    const T0: OffsetDateTime = datetime!(2026-11-01 08:00:00 UTC);
+    const T0: Timestamp = jiff::Timestamp::constant(1793520000, 0) /* 2026-11-01T08:00:00Z */;
 
-    fn new(kind: AuthKind, hash: &str, expires: Option<OffsetDateTime>) -> NewAuthSession {
+    fn new(kind: AuthKind, hash: &str, expires: Option<Timestamp>) -> NewAuthSession {
         NewAuthSession {
             kind,
             token_hash: hash.into(),
@@ -318,7 +317,11 @@ mod tests {
         let db = Db::open_memory().await.unwrap();
         let repo = TursoAuthRepo::new(db);
         let web = repo
-            .create(new(AuthKind::Web, "h-web", Some(T0 + Duration::days(30))))
+            .create(new(
+                AuthKind::Web,
+                "h-web",
+                Some(T0 + SignedDuration::from_hours(24 * 30)),
+            ))
             .await
             .unwrap();
         let device = repo
@@ -345,9 +348,9 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        let edge = T0 + Duration::days(30);
+        let edge = T0 + SignedDuration::from_hours(24 * 30);
         assert!(
-            repo.find(AuthKind::Web, "h-web", edge - Duration::seconds(1))
+            repo.find(AuthKind::Web, "h-web", edge - SignedDuration::from_secs(1))
                 .await
                 .unwrap()
                 .is_some()
@@ -360,14 +363,18 @@ mod tests {
             "到点即过期"
         );
         assert!(
-            repo.find(AuthKind::Device, "h-dev", T0 + Duration::days(9999))
-                .await
-                .unwrap()
-                .is_some()
+            repo.find(
+                AuthKind::Device,
+                "h-dev",
+                T0 + SignedDuration::from_hours(24 * 9999)
+            )
+            .await
+            .unwrap()
+            .is_some()
         );
 
         // 续期：给了新的过期时间才动它；不给只记使用时刻。
-        let later = T0 + Duration::hours(1);
+        let later = T0 + SignedDuration::from_hours(1);
         repo.touch(&web.id, later, None).await.unwrap();
         let record = repo
             .find(AuthKind::Web, "h-web", later)
@@ -375,16 +382,26 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(record.last_used_at, later);
-        assert_eq!(record.expires_at, Some(T0 + Duration::days(30)));
-        repo.touch(&web.id, later, Some(later + Duration::days(30)))
-            .await
-            .unwrap();
+        assert_eq!(
+            record.expires_at,
+            Some(T0 + SignedDuration::from_hours(24 * 30))
+        );
+        repo.touch(
+            &web.id,
+            later,
+            Some(later + SignedDuration::from_hours(24 * 30)),
+        )
+        .await
+        .unwrap();
         let record = repo
             .find(AuthKind::Web, "h-web", later)
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(record.expires_at, Some(later + Duration::days(30)));
+        assert_eq!(
+            record.expires_at,
+            Some(later + SignedDuration::from_hours(24 * 30))
+        );
         // 设备令牌没有过期时间，带不带 `expires_at` 以外都不会凭空长出一个。
         repo.touch(&device.id, later, None).await.unwrap();
         assert_eq!(
@@ -421,17 +438,31 @@ mod tests {
     async fn purge_removes_only_what_has_expired() {
         let db = Db::open_memory().await.unwrap();
         let repo = TursoAuthRepo::new(db);
-        repo.create(new(AuthKind::Web, "a", Some(T0 + Duration::days(1))))
-            .await
-            .unwrap();
-        repo.create(new(AuthKind::Web, "b", Some(T0 + Duration::days(3))))
-            .await
-            .unwrap();
+        repo.create(new(
+            AuthKind::Web,
+            "a",
+            Some(T0 + SignedDuration::from_hours(24)),
+        ))
+        .await
+        .unwrap();
+        repo.create(new(
+            AuthKind::Web,
+            "b",
+            Some(T0 + SignedDuration::from_hours(24 * 3)),
+        ))
+        .await
+        .unwrap();
         repo.create(new(AuthKind::Device, "c", None)).await.unwrap();
-        let now = T0 + Duration::days(2);
+        let now = T0 + SignedDuration::from_hours(24 * 2);
         assert_eq!(repo.list(now).await.unwrap().len(), 2, "清单不含过期的");
         assert_eq!(repo.purge_expired(now).await.unwrap(), 1);
         assert_eq!(repo.purge_expired(now).await.unwrap(), 0);
-        assert_eq!(repo.list(T0 + Duration::days(4)).await.unwrap().len(), 1);
+        assert_eq!(
+            repo.list(T0 + SignedDuration::from_hours(24 * 4))
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
     }
 }

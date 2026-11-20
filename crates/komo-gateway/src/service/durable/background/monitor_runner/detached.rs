@@ -109,7 +109,7 @@ struct Adopted {
     ending: Arc<Mutex<Option<Ending>>>,
     log: PathBuf,
     reference: String,
-    started_at: time::OffsetDateTime,
+    started_at: jiff::Timestamp,
     title: String,
 }
 
@@ -254,9 +254,7 @@ impl GatewayMonitorRunner {
             }
         };
         let decided = ending.lock().expect("结束原因").clone();
-        let elapsed = (time::OffsetDateTime::now_utc() - started_at)
-            .whole_seconds()
-            .max(0) as u64;
+        let elapsed = (jiff::Timestamp::now() - started_at).as_secs().max(0) as u64;
         // `(reason, headline)`；没有 = 不交回（停机、`monitor_stop`）。
         let (finished, tail) = match driven {
             Ok(Driven::Done(outcome)) => {

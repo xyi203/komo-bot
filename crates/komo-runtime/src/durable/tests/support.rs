@@ -7,8 +7,8 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use futures_util::future::BoxFuture;
+use jiff::Timestamp;
 use serde_json::{Value, json};
-use time::OffsetDateTime;
 
 use komo_kernel::durable::records::{JoinPolicy, TaskOutcome, TaskOutcomeError};
 use komo_kernel::durable::storage::{
@@ -32,25 +32,25 @@ use super::super::{
 
 /// 跟着 tokio（暂停）时钟走的墙钟：`start_paused` 下 `sleep` 自动快进，这个钟同步前进。
 pub struct TokioClock {
-    base: OffsetDateTime,
+    base: Timestamp,
     start: tokio::time::Instant,
 }
 
 impl TokioClock {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
-            base: time::macros::datetime!(2026-10-23 08:00:00 UTC),
+            base: "2026-10-23T08:00:00Z".parse::<jiff::Timestamp>().unwrap(),
             start: tokio::time::Instant::now(),
         })
     }
 
     pub fn now_ms(&self) -> i64 {
-        (self.now().unix_timestamp_nanos() / 1_000_000) as i64
+        (self.now().as_nanosecond() / 1_000_000) as i64
     }
 }
 
 impl Clock for TokioClock {
-    fn now(&self) -> OffsetDateTime {
+    fn now(&self) -> Timestamp {
         self.base + self.start.elapsed()
     }
 }

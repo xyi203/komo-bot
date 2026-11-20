@@ -1,17 +1,19 @@
 //! 真 tzdb 的 [`ZoneResolver`]（§10、§13.5）。
 //!
-//! kernel 不带 tzdb——它是一份随操作系统更新的数据，属于运行环境而不是领域——所以
+//! kernel 不查 tzdb——它是一份随操作系统更新的数据，属于运行环境而不是领域——所以
 //! 「Europe/Berlin 在 2026-03-29 02:30 是几点」这个问题由这里回答。jiff 自带一份
-//! tzdb（系统有 `/usr/share/zoneinfo` 就用系统的），于是这个文件只做两件事：
-//! **名字 → 规则**，以及 `time` 与 jiff 之间按 **unix 秒 + 纳秒** 换算。
+//! tzdb（系统有 `/usr/share/zoneinfo` 就用系统的），于是这个文件只做一件事：
+//! **名字 → 规则**。
 //!
 //! 两个方向都要（§13.5）：`resolve` 是本地民用时间 → 瞬时（可能零个、一个或两个），
 //! `offset_at` 是瞬时 → 本地偏移。§10 的两条夏令时规则由 kernel 的 `cron` 实现，这里
 //! 只负责**把三种情形如实报上去**——把 `Fold` 报成 `Single` 就等于当这个区没有夏令时。
 
+use jiff::Timestamp;
+use jiff::civil::DateTime;
+use jiff::tz::Offset;
 use komo_kernel::cron::{ZoneError, ZoneResolution};
 use komo_kernel::traits::ZoneResolver;
-use time::{OffsetDateTime, PrimitiveDateTime, UtcOffset};
 
 /// 用 jiff 的 tzdb 回答时区问题。
 ///
@@ -30,67 +32,44 @@ impl JiffZoneResolver {
 }
 
 impl ZoneResolver for JiffZoneResolver {
-    fn resolve(&self, zone: &str, local: PrimitiveDateTime) -> Result<ZoneResolution, ZoneError> {
+    fn resolve(&self, zone: &str, local: DateTime) -> Result<ZoneResolution, ZoneError> {
         use jiff::tz::AmbiguousOffset;
 
         let tz = Self::zone(zone)?;
-        let civil = to_civil(local)?;
-        Ok(match tz.to_ambiguous_timestamp(civil).offset() {
-            AmbiguousOffset::Unambiguous { offset } => {
-                ZoneResolution::Single(to_utc_offset(offset)?)
-            }
+        Ok(match tz.to_ambiguous_timestamp(local).offset() {
+            AmbiguousOffset::Unambiguous { offset } => ZoneResolution::Single(offset),
             // 时钟往回拨：`before` 是较早那个瞬时的偏移（更大的那个），`after` 是较晚
             // 的——正是 kernel 要求的"先早后晚"。
-            AmbiguousOffset::Fold { before, after } => {
-                ZoneResolution::Ambiguous(to_utc_offset(before)?, to_utc_offset(after)?)
-            }
+            AmbiguousOffset::Fold { before, after } => ZoneResolution::Ambiguous(before, after),
             // 时钟往前拨：这个本地时间不存在。§10 说跳过，所以这里如实报 Gap，不替
             // 调用方挑一个"最接近的"瞬时。
             AmbiguousOffset::Gap { .. } => ZoneResolution::Gap,
         })
     }
 
-    fn offset_at(&self, zone: &str, instant: OffsetDateTime) -> Result<UtcOffset, ZoneError> {
-        let tz = Self::zone(zone)?;
-        to_utc_offset(tz.to_offset(to_timestamp(instant)?))
+    fn offset_at(&self, zone: &str, instant: Timestamp) -> Result<Offset, ZoneError> {
+        Ok(Self::zone(zone)?.to_offset(instant))
     }
-}
-
-fn to_civil(local: PrimitiveDateTime) -> Result<jiff::civil::DateTime, ZoneError> {
-    jiff::civil::DateTime::new(
-        local.year() as i16,
-        local.month() as i8,
-        local.day() as i8,
-        local.hour() as i8,
-        local.minute() as i8,
-        local.second() as i8,
-        local.nanosecond() as i32,
-    )
-    .map_err(|e| ZoneError::Unavailable(format!("{local} 不是一个可表示的民用时间：{e}")))
-}
-
-/// `time` → jiff，按 unix 秒 + 纳秒。
-fn to_timestamp(instant: OffsetDateTime) -> Result<jiff::Timestamp, ZoneError> {
-    jiff::Timestamp::new(instant.unix_timestamp(), instant.nanosecond() as i32)
-        .map_err(|e| ZoneError::Unavailable(format!("{instant} 超出可表示范围：{e}")))
-}
-
-fn to_utc_offset(offset: jiff::tz::Offset) -> Result<UtcOffset, ZoneError> {
-    UtcOffset::from_whole_seconds(offset.seconds())
-        .map_err(|e| ZoneError::Unavailable(format!("偏移 {offset} 表示不了：{e}")))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use komo_kernel::cron::{ScheduleError, TimeZone, Trigger, next_occurrence, parse_schedule};
-    use time::macros::{datetime, offset};
 
     /// 这五条和 kernel `test_support::zones` 里那五条是**同一组断言**，只是那边跑的是
     /// 可编脚本的假时区，这里跑的是真 tzdb 的 Europe/Berlin。假的答对了而真的答错，
     /// 说明这个 resolver 有问题；反过来说明 kernel 的规则实现有问题。
     fn berlin() -> TimeZone {
         TimeZone::new("Europe/Berlin")
+    }
+
+    /// 这个瞬时在柏林的墙上时间与偏移。
+    fn wall(at: Timestamp) -> (DateTime, Offset) {
+        let offset = JiffZoneResolver::new()
+            .offset_at("Europe/Berlin", at)
+            .unwrap();
+        (offset.to_datetime(at), offset)
     }
 
     fn daily_at_0230() -> Trigger {
@@ -106,42 +85,49 @@ mod tests {
         let zones = JiffZoneResolver::new();
         let trigger = daily_at_0230();
 
-        let before = datetime!(2026-10-24 12:00:00 UTC);
+        let before = "2026-10-24T12:00:00Z".parse::<jiff::Timestamp>().unwrap();
         let first = next_occurrence(&trigger, before, &zones).unwrap().unwrap();
         let second = next_occurrence(&trigger, first, &zones).unwrap().unwrap();
 
         assert_eq!(
-            first.to_offset(UtcOffset::UTC),
-            datetime!(2026-10-25 00:30:00 UTC)
+            first,
+            "2026-10-25T00:30:00Z".parse::<jiff::Timestamp>().unwrap()
         );
         assert_eq!(
-            second.to_offset(UtcOffset::UTC),
-            datetime!(2026-10-25 01:30:00 UTC)
+            second,
+            "2026-10-25T01:30:00Z".parse::<jiff::Timestamp>().unwrap()
         );
         assert_ne!(first, second, "两个不同的 UTC 时刻");
-        assert_eq!(first.hour(), 2, "两次在墙上都是 02:30");
-        assert_eq!(second.hour(), 2);
-        assert_eq!(first.minute(), 30);
-        assert_eq!(second.minute(), 30);
-        assert_eq!(first.offset(), offset!(+2));
-        assert_eq!(second.offset(), offset!(+1));
+        let (first_wall, first_offset) = wall(first);
+        let (second_wall, second_offset) = wall(second);
+        assert_eq!(first_wall.hour(), 2, "两次在墙上都是 02:30");
+        assert_eq!(second_wall.hour(), 2);
+        assert_eq!(first_wall.minute(), 30);
+        assert_eq!(second_wall.minute(), 30);
+        assert_eq!(first_offset, jiff::tz::offset(2));
+        assert_eq!(second_offset, jiff::tz::offset(1));
     }
 
     /// §10：「不存在的本地时间跳过」。
     #[test]
     fn a_local_time_that_does_not_exist_is_skipped() {
         let zones = JiffZoneResolver::new();
-        let next = next_occurrence(&daily_at_0230(), datetime!(2026-03-28 12:00:00 UTC), &zones)
-            .unwrap()
-            .unwrap();
+        let next = next_occurrence(
+            &daily_at_0230(),
+            "2026-03-28T12:00:00Z".parse::<jiff::Timestamp>().unwrap(),
+            &zones,
+        )
+        .unwrap()
+        .unwrap();
 
         assert_eq!(
-            next.to_offset(UtcOffset::UTC),
-            datetime!(2026-03-30 00:30:00 UTC)
+            next,
+            "2026-03-30T00:30:00Z".parse::<jiff::Timestamp>().unwrap()
         );
-        assert_eq!(next.day(), 30, "29 日那一槽被跳过，不是挪到 03:30");
-        assert_eq!(next.hour(), 2);
-        assert_eq!(next.minute(), 30);
+        let (next_wall, _) = wall(next);
+        assert_eq!(next_wall.day(), 30, "29 日那一槽被跳过，不是挪到 03:30");
+        assert_eq!(next_wall.hour(), 2);
+        assert_eq!(next_wall.minute(), 30);
     }
 
     /// 一次性触发写到一个不存在的本地时间上——当场拒绝，趁打字的人还在。
@@ -151,7 +137,7 @@ mod tests {
         let err = parse_schedule(
             "@at 2026-03-29 02:30",
             &berlin(),
-            datetime!(2026-03-01 00:00:00 UTC),
+            "2026-03-01T00:00:00Z".parse::<jiff::Timestamp>().unwrap(),
             &zones,
         )
         .unwrap_err();
@@ -168,7 +154,7 @@ mod tests {
         let trigger = parse_schedule(
             "@at 2026-10-25 02:30",
             &berlin(),
-            datetime!(2026-10-01 00:00:00 UTC),
+            "2026-10-01T00:00:00Z".parse::<jiff::Timestamp>().unwrap(),
             &zones,
         )
         .unwrap();
@@ -176,8 +162,8 @@ mod tests {
             panic!("@at 解析成了别的东西")
         };
         assert_eq!(
-            at.to_offset(UtcOffset::UTC),
-            datetime!(2026-10-25 00:30:00 UTC)
+            at,
+            "2026-10-25T00:30:00Z".parse::<jiff::Timestamp>().unwrap()
         );
     }
 
@@ -185,14 +171,18 @@ mod tests {
     #[test]
     fn an_ordinary_day_still_fires_once() {
         let zones = JiffZoneResolver::new();
-        let first = next_occurrence(&daily_at_0230(), datetime!(2026-07-01 12:00:00 UTC), &zones)
-            .unwrap()
-            .unwrap();
+        let first = next_occurrence(
+            &daily_at_0230(),
+            "2026-07-01T12:00:00Z".parse::<jiff::Timestamp>().unwrap(),
+            &zones,
+        )
+        .unwrap()
+        .unwrap();
         let second = next_occurrence(&daily_at_0230(), first, &zones)
             .unwrap()
             .unwrap();
-        assert_eq!(second - first, time::Duration::hours(24));
-        assert_eq!(first.offset(), offset!(+2), "七月是夏令时");
+        assert_eq!(second - first, jiff::SignedDuration::from_hours(24));
+        assert_eq!(wall(first).1, jiff::tz::offset(2), "七月是夏令时");
     }
 
     // ---- resolver 自己的两个方向 ----
@@ -202,22 +192,31 @@ mod tests {
         let zones = JiffZoneResolver::new();
         assert_eq!(
             zones
-                .resolve("Europe/Berlin", datetime!(2026-03-29 02:30:00))
+                .resolve(
+                    "Europe/Berlin",
+                    jiff::civil::date(2026, 3, 29).at(2, 30, 0, 0)
+                )
                 .unwrap(),
             ZoneResolution::Gap
         );
         assert_eq!(
             zones
-                .resolve("Europe/Berlin", datetime!(2026-10-25 02:30:00))
+                .resolve(
+                    "Europe/Berlin",
+                    jiff::civil::date(2026, 10, 25).at(2, 30, 0, 0)
+                )
                 .unwrap(),
-            ZoneResolution::Ambiguous(offset!(+2), offset!(+1)),
+            ZoneResolution::Ambiguous(jiff::tz::offset(2), jiff::tz::offset(1)),
             "先早后晚"
         );
         assert_eq!(
             zones
-                .resolve("Europe/Berlin", datetime!(2026-07-01 12:00:00))
+                .resolve(
+                    "Europe/Berlin",
+                    jiff::civil::date(2026, 7, 1).at(12, 0, 0, 0)
+                )
                 .unwrap(),
-            ZoneResolution::Single(offset!(+2))
+            ZoneResolution::Single(jiff::tz::offset(2))
         );
     }
 
@@ -226,15 +225,21 @@ mod tests {
         let zones = JiffZoneResolver::new();
         assert_eq!(
             zones
-                .offset_at("Europe/Berlin", datetime!(2026-10-25 00:59:00 UTC))
+                .offset_at(
+                    "Europe/Berlin",
+                    "2026-10-25T00:59:00Z".parse::<jiff::Timestamp>().unwrap()
+                )
                 .unwrap(),
-            offset!(+2)
+            jiff::tz::offset(2)
         );
         assert_eq!(
             zones
-                .offset_at("Europe/Berlin", datetime!(2026-10-25 01:01:00 UTC))
+                .offset_at(
+                    "Europe/Berlin",
+                    "2026-10-25T01:01:00Z".parse::<jiff::Timestamp>().unwrap()
+                )
                 .unwrap(),
-            offset!(+1)
+            jiff::tz::offset(1)
         );
     }
 
@@ -242,12 +247,12 @@ mod tests {
     fn a_zone_without_daylight_saving_is_one_offset_all_year() {
         let zones = JiffZoneResolver::new();
         for instant in [
-            datetime!(2026-01-15 00:00:00 UTC),
-            datetime!(2026-07-15 00:00:00 UTC),
+            "2026-01-15T00:00:00Z".parse::<jiff::Timestamp>().unwrap(),
+            "2026-07-15T00:00:00Z".parse::<jiff::Timestamp>().unwrap(),
         ] {
             assert_eq!(
                 zones.offset_at("Asia/Shanghai", instant).unwrap(),
-                offset!(+8)
+                jiff::tz::offset(8)
             );
         }
     }
@@ -256,7 +261,10 @@ mod tests {
     fn an_unknown_zone_name_says_so_rather_than_defaulting_to_utc() {
         let zones = JiffZoneResolver::new();
         let error = zones
-            .offset_at("Mars/Olympus_Mons", datetime!(2026-01-01 00:00:00 UTC))
+            .offset_at(
+                "Mars/Olympus_Mons",
+                "2026-01-01T00:00:00Z".parse::<jiff::Timestamp>().unwrap(),
+            )
             .unwrap_err();
         assert!(matches!(error, ZoneError::UnknownZone(_)), "{error}");
     }

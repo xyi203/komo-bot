@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 use super::{EntryKind, SessionEntry, SessionTree};
 
@@ -182,8 +182,9 @@ fn entry_messages(entry: &SessionEntry) -> Vec<Value> {
 /// Session entries use ISO strings; generated AgentMessages use Unix millis.
 /// Invalid dates match JSON.stringify(new Date(invalid).getTime()): null.
 fn timestamp(value: &str) -> Value {
-    OffsetDateTime::parse(value, &Rfc3339)
+    value
+        .parse::<Timestamp>()
         .ok()
-        .and_then(|time| i64::try_from(time.unix_timestamp_nanos().div_euclid(1_000_000)).ok())
+        .and_then(|time| i64::try_from(time.as_nanosecond().div_euclid(1_000_000)).ok())
         .map_or(Value::Null, |millis| json!(millis))
 }

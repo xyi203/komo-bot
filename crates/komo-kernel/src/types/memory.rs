@@ -6,8 +6,8 @@
 use std::fmt;
 use std::str::FromStr;
 
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
-use time::OffsetDateTime;
 
 use super::ids::{EventId, MatterId, MemoryId, RunId, Seq, SessionId};
 use super::matter::{Matter, MatterState};
@@ -199,9 +199,8 @@ pub enum EvidenceRef {
 pub struct Evidence {
     pub reference: EvidenceRef,
     pub provenance: Provenance,
-    #[serde(with = "time::serde::rfc3339")]
     #[cfg_attr(feature = "ts", ts(type = "string"))]
-    pub observed_at: OffsetDateTime,
+    pub observed_at: Timestamp,
     /// 哪一次 Run 的处理提取出来的。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub extracted_from_run: Option<RunId>,
@@ -243,24 +242,16 @@ impl ExtractionMetadata {
 pub struct MemoryUsage {
     #[serde(default)]
     pub count: u64,
-    #[serde(
-        default,
-        with = "time::serde::rfc3339::option",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(type = "string"))]
-    pub last_used_at: Option<OffsetDateTime>,
+    pub last_used_at: Option<Timestamp>,
     /// 用上次数：提取时模型指认"这一批的回复或工具调用确实依赖了它"并通过校验的批数
     /// （§9.10）。`count` 只数曝光，这里数采纳。
     #[serde(default)]
     pub adopted_count: u64,
-    #[serde(
-        default,
-        with = "time::serde::rfc3339::option",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(type = "string"))]
-    pub last_adopted_at: Option<OffsetDateTime>,
+    pub last_adopted_at: Option<Timestamp>,
 }
 
 /// 这条内容取代了**哪一条记忆的哪个版本**（§9.6）。
@@ -294,22 +285,15 @@ pub struct MemoryItem {
     #[cfg_attr(feature = "ts", ts(as = "Option<Vec<Evidence>>"))]
     pub evidence: Vec<Evidence>,
     /// 事实的**观察**时间，区别于入库时间。
-    #[serde(with = "time::serde::rfc3339")]
     #[cfg_attr(feature = "ts", ts(type = "string"))]
-    pub observed_at: OffsetDateTime,
-    #[serde(
-        default,
-        with = "time::serde::rfc3339::option",
-        skip_serializing_if = "Option::is_none"
-    )]
+    pub observed_at: Timestamp,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(type = "string"))]
-    pub valid_until: Option<OffsetDateTime>,
-    #[serde(with = "time::serde::rfc3339")]
+    pub valid_until: Option<Timestamp>,
     #[cfg_attr(feature = "ts", ts(type = "string"))]
-    pub created_at: OffsetDateTime,
-    #[serde(with = "time::serde::rfc3339")]
+    pub created_at: Timestamp,
     #[cfg_attr(feature = "ts", ts(type = "string"))]
-    pub updated_at: OffsetDateTime,
+    pub updated_at: Timestamp,
     pub extraction: ExtractionMetadata,
     #[serde(default)]
     pub usage: MemoryUsage,
@@ -345,7 +329,7 @@ impl MemoryItem {
     }
 
     /// 在 `now` 这一刻能不能进入自动召回：状态可召回，且没过有效期（§9.4）。
-    pub fn is_recallable_at(&self, now: OffsetDateTime) -> bool {
+    pub fn is_recallable_at(&self, now: Timestamp) -> bool {
         self.state.is_recallable() && self.valid_until.is_none_or(|until| until > now)
     }
 }
@@ -407,8 +391,7 @@ pub struct RecallQuery {
     pub top_k: u32,
     pub max_tokens: u32,
     /// 有效期与状态都按这一刻判定。kernel 不读时钟。
-    #[serde(with = "time::serde::rfc3339")]
-    pub now: OffsetDateTime,
+    pub now: Timestamp,
     /// 查询向量（§9.4 的向量臂）。**由 MemoryManager 算好交下来**——仓储不认识
     /// embedding 端点，也不该在一次读事务里发网络请求（§9.5「模型调用期间不持有数据库
     /// 事务」）。`None` + 非 keyword 模式 = 向量臂这一次不可用，实现要如实标 degraded。
@@ -630,7 +613,6 @@ impl Eq for Injection {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use time::macros::datetime;
 
     fn item(state: MemoryState) -> MemoryItem {
         MemoryItem {
@@ -643,10 +625,10 @@ mod tests {
             confirmation: Confirmation::Unconfirmed,
             state,
             evidence: vec![],
-            observed_at: datetime!(2026-09-01 00:00:00 UTC),
+            observed_at: "2026-09-01T00:00:00Z".parse::<jiff::Timestamp>().unwrap(),
             valid_until: None,
-            created_at: datetime!(2026-09-01 00:00:00 UTC),
-            updated_at: datetime!(2026-09-01 00:00:00 UTC),
+            created_at: "2026-09-01T00:00:00Z".parse::<jiff::Timestamp>().unwrap(),
+            updated_at: "2026-09-01T00:00:00Z".parse::<jiff::Timestamp>().unwrap(),
             extraction: ExtractionMetadata::new("m", None, "v1"),
             usage: MemoryUsage::default(),
             supersedes: None,
@@ -665,7 +647,7 @@ mod tests {
             candidate_limit: 40,
             top_k: 8,
             max_tokens: 1500,
-            now: datetime!(2026-09-15 00:00:00 UTC),
+            now: "2026-09-15T00:00:00Z".parse::<jiff::Timestamp>().unwrap(),
             query_vector: None,
             include_states,
             min_similarity: 0.0,
@@ -685,13 +667,13 @@ mod tests {
         );
         // 过期仍然是过期——列出状态不等于放行有效期。
         let mut expired = item(MemoryState::Contested);
-        expired.valid_until = Some(datetime!(2026-09-10 00:00:00 UTC));
+        expired.valid_until = Some("2026-09-10T00:00:00Z".parse::<jiff::Timestamp>().unwrap());
         assert!(!any_query(vec![MemoryState::Contested]).admits(&expired));
     }
 
     #[test]
     fn only_active_memories_are_recalled_automatically() {
-        let now = datetime!(2026-09-15 00:00:00 UTC);
+        let now = "2026-09-15T00:00:00Z".parse::<jiff::Timestamp>().unwrap();
         assert!(item(MemoryState::Active).is_recallable_at(now));
         for state in [
             MemoryState::Candidate,
@@ -706,9 +688,9 @@ mod tests {
     #[test]
     fn an_expired_memory_is_not_recalled() {
         let mut m = item(MemoryState::Active);
-        m.valid_until = Some(datetime!(2026-09-10 00:00:00 UTC));
-        assert!(!m.is_recallable_at(datetime!(2026-09-15 00:00:00 UTC)));
-        assert!(m.is_recallable_at(datetime!(2026-09-05 00:00:00 UTC)));
+        m.valid_until = Some("2026-09-10T00:00:00Z".parse::<jiff::Timestamp>().unwrap());
+        assert!(!m.is_recallable_at("2026-09-15T00:00:00Z".parse::<jiff::Timestamp>().unwrap()));
+        assert!(m.is_recallable_at("2026-09-05T00:00:00Z".parse::<jiff::Timestamp>().unwrap()));
     }
 
     #[test]
@@ -783,7 +765,10 @@ mod tests {
             due: None,
             standard: None,
         }
-        .build(MatterId::from_raw(id), datetime!(2026-10-29 08:00 UTC))
+        .build(
+            MatterId::from_raw(id),
+            "2026-10-29T08:00:00Z".parse::<jiff::Timestamp>().unwrap(),
+        )
         .unwrap();
         matter.state = state;
         matter

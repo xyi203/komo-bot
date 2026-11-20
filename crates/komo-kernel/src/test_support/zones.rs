@@ -5,7 +5,9 @@
 //! 报告 [`ZoneResolution::Ambiguous`] 与 [`ZoneResolution::Gap`] 的区，而这两条恰恰是
 //! [`FixedOffsetZone`](crate::cron::FixedOffsetZone) **答不出**的。
 
-use time::{Duration, OffsetDateTime, PrimitiveDateTime, UtcOffset};
+use jiff::civil::DateTime;
+use jiff::tz::Offset;
+use jiff::{SignedDuration, Timestamp};
 
 use crate::cron::{ZoneError, ZoneResolution};
 use crate::traits::ZoneResolver;
@@ -22,18 +24,18 @@ use crate::traits::ZoneResolver;
 /// `30 2 * * *` 能同时踩到两条规则。
 #[derive(Debug, Clone, Copy)]
 pub struct ScriptedZoneResolver {
-    standard: UtcOffset,
-    daylight: UtcOffset,
-    spring_forward: PrimitiveDateTime,
-    fall_back: PrimitiveDateTime,
+    standard: Offset,
+    daylight: Offset,
+    spring_forward: DateTime,
+    fall_back: DateTime,
 }
 
 impl ScriptedZoneResolver {
     pub fn new(
-        standard: UtcOffset,
-        daylight: UtcOffset,
-        spring_forward: PrimitiveDateTime,
-        fall_back: PrimitiveDateTime,
+        standard: Offset,
+        daylight: Offset,
+        spring_forward: DateTime,
+        fall_back: DateTime,
     ) -> Self {
         Self {
             standard,
@@ -47,30 +49,34 @@ impl ScriptedZoneResolver {
     /// 03:00 退回 02:00。
     pub fn european_2026() -> Self {
         Self::new(
-            time::macros::offset!(+1),
-            time::macros::offset!(+2),
-            time::macros::datetime!(2026-03-29 02:00:00),
-            time::macros::datetime!(2026-10-25 02:00:00),
+            jiff::tz::offset(1),
+            jiff::tz::offset(2),
+            jiff::civil::date(2026, 3, 29).at(2, 0, 0, 0),
+            jiff::civil::date(2026, 10, 25).at(2, 0, 0, 0),
         )
     }
 
-    fn shift(&self) -> Duration {
-        Duration::seconds((self.daylight.whole_seconds() - self.standard.whole_seconds()) as i64)
+    fn shift(&self) -> SignedDuration {
+        SignedDuration::from_secs(i64::from(self.daylight.seconds() - self.standard.seconds()))
     }
 
     /// 夏令时开始的那个瞬时。
-    fn daylight_starts(&self) -> OffsetDateTime {
-        self.spring_forward.assume_offset(self.standard)
+    fn daylight_starts(&self) -> Timestamp {
+        self.standard
+            .to_timestamp(self.spring_forward)
+            .expect("脚本里的切换时刻在范围内")
     }
 
     /// 夏令时结束的那个瞬时。
-    fn daylight_ends(&self) -> OffsetDateTime {
-        self.fall_back.assume_offset(self.standard)
+    fn daylight_ends(&self) -> Timestamp {
+        self.standard
+            .to_timestamp(self.fall_back)
+            .expect("脚本里的切换时刻在范围内")
     }
 }
 
 impl ZoneResolver for ScriptedZoneResolver {
-    fn resolve(&self, _zone: &str, local: PrimitiveDateTime) -> Result<ZoneResolution, ZoneError> {
+    fn resolve(&self, _zone: &str, local: DateTime) -> Result<ZoneResolution, ZoneError> {
         let shift = self.shift();
         let gap = self.spring_forward..(self.spring_forward + shift);
         let overlap = self.fall_back..(self.fall_back + shift);
@@ -90,7 +96,7 @@ impl ZoneResolver for ScriptedZoneResolver {
         }))
     }
 
-    fn offset_at(&self, _zone: &str, instant: OffsetDateTime) -> Result<UtcOffset, ZoneError> {
+    fn offset_at(&self, _zone: &str, instant: Timestamp) -> Result<Offset, ZoneError> {
         Ok(
             if instant >= self.daylight_starts() && instant < self.daylight_ends() {
                 self.daylight
@@ -105,6 +111,12 @@ impl ZoneResolver for ScriptedZoneResolver {
 mod tests {
     use super::*;
 
+    /// 这个瞬时在脚本时区里的墙上时间与偏移。
+    fn wall(zones: &ScriptedZoneResolver, at: Timestamp) -> (DateTime, Offset) {
+        let offset = zones.offset_at("Europe/Berlin", at).unwrap();
+        (offset.to_datetime(at), offset)
+    }
+
     /// §10：「同一日历时间因夏令时出现两次时，两次不同 UTC 时刻分别视为计划时间」。
     #[test]
     fn a_repeated_local_time_fires_at_both_utc_instants() {
@@ -117,26 +129,28 @@ mod tests {
             tz: TimeZone::new("Europe/Berlin"),
         };
 
-        let before = time::macros::datetime!(2026-10-24 12:00:00 UTC);
+        let before = "2026-10-24T12:00:00Z".parse::<jiff::Timestamp>().unwrap();
         let first = next_occurrence(&trigger, before, &zones).unwrap().unwrap();
         let second = next_occurrence(&trigger, first, &zones).unwrap().unwrap();
 
         // 第一次是夏令时里的 02:30（+2 → 00:30Z），第二次是退回之后的 02:30（+1 → 01:30Z）。
         assert_eq!(
-            first.to_offset(time::UtcOffset::UTC),
-            time::macros::datetime!(2026-10-25 00:30:00 UTC)
+            first,
+            "2026-10-25T00:30:00Z".parse::<jiff::Timestamp>().unwrap()
         );
         assert_eq!(
-            second.to_offset(time::UtcOffset::UTC),
-            time::macros::datetime!(2026-10-25 01:30:00 UTC)
+            second,
+            "2026-10-25T01:30:00Z".parse::<jiff::Timestamp>().unwrap()
         );
         assert_ne!(first, second, "两个不同的 UTC 时刻");
-        assert_eq!(first.hour(), 2, "两次在墙上都是 02:30");
-        assert_eq!(second.hour(), 2);
-        assert_eq!(first.minute(), 30);
-        assert_eq!(second.minute(), 30);
-        assert_eq!(first.offset(), time::macros::offset!(+2));
-        assert_eq!(second.offset(), time::macros::offset!(+1));
+        let (first_wall, first_offset) = wall(&zones, first);
+        let (second_wall, second_offset) = wall(&zones, second);
+        assert_eq!(first_wall.hour(), 2, "两次在墙上都是 02:30");
+        assert_eq!(second_wall.hour(), 2);
+        assert_eq!(first_wall.minute(), 30);
+        assert_eq!(second_wall.minute(), 30);
+        assert_eq!(first_offset, jiff::tz::offset(2));
+        assert_eq!(second_offset, jiff::tz::offset(1));
     }
 
     /// §10：「不存在的本地时间跳过」。
@@ -151,17 +165,18 @@ mod tests {
             tz: TimeZone::new("Europe/Berlin"),
         };
 
-        let before = time::macros::datetime!(2026-03-28 12:00:00 UTC);
+        let before = "2026-03-28T12:00:00Z".parse::<jiff::Timestamp>().unwrap();
         let next = next_occurrence(&trigger, before, &zones).unwrap().unwrap();
 
         // 28 日的 02:30 已经过去了（before 是当天中午），29 日的不存在，所以落到 30 日。
         assert_eq!(
-            next.to_offset(time::UtcOffset::UTC),
-            time::macros::datetime!(2026-03-30 00:30:00 UTC)
+            next,
+            "2026-03-30T00:30:00Z".parse::<jiff::Timestamp>().unwrap()
         );
-        assert_eq!(next.day(), 30, "29 日那一槽被跳过，不是挪到 03:30");
-        assert_eq!(next.hour(), 2);
-        assert_eq!(next.minute(), 30);
+        let (next_wall, _) = wall(&zones, next);
+        assert_eq!(next_wall.day(), 30, "29 日那一槽被跳过，不是挪到 03:30");
+        assert_eq!(next_wall.hour(), 2);
+        assert_eq!(next_wall.minute(), 30);
     }
 
     /// 一次性触发写到一个不存在的本地时间上——当场拒绝，趁打字的人还在。
@@ -173,7 +188,7 @@ mod tests {
         let err = parse_schedule(
             "@at 2026-03-29 02:30",
             &TimeZone::new("Europe/Berlin"),
-            time::macros::datetime!(2026-03-01 00:00:00 UTC),
+            "2026-03-01T00:00:00Z".parse::<jiff::Timestamp>().unwrap(),
             &zones,
         )
         .unwrap_err();
@@ -192,7 +207,7 @@ mod tests {
         let trigger = parse_schedule(
             "@at 2026-10-25 02:30",
             &TimeZone::new("Europe/Berlin"),
-            time::macros::datetime!(2026-10-01 00:00:00 UTC),
+            "2026-10-01T00:00:00Z".parse::<jiff::Timestamp>().unwrap(),
             &zones,
         )
         .unwrap();
@@ -200,8 +215,8 @@ mod tests {
             panic!()
         };
         assert_eq!(
-            at.to_offset(time::UtcOffset::UTC),
-            time::macros::datetime!(2026-10-25 00:30:00 UTC)
+            at,
+            "2026-10-25T00:30:00Z".parse::<jiff::Timestamp>().unwrap()
         );
     }
 
@@ -217,13 +232,13 @@ mod tests {
         };
         let first = next_occurrence(
             &trigger,
-            time::macros::datetime!(2026-07-01 12:00:00 UTC),
+            "2026-07-01T12:00:00Z".parse::<jiff::Timestamp>().unwrap(),
             &zones,
         )
         .unwrap()
         .unwrap();
         let second = next_occurrence(&trigger, first, &zones).unwrap().unwrap();
-        assert_eq!(second - first, time::Duration::hours(24));
-        assert_eq!(first.offset(), time::macros::offset!(+2), "七月是夏令时");
+        assert_eq!(second - first, jiff::SignedDuration::from_hours(24));
+        assert_eq!(wall(&zones, first).1, jiff::tz::offset(2), "七月是夏令时");
     }
 }

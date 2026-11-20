@@ -119,7 +119,7 @@ pub fn snapshot_fixture() -> ConfigSnapshot {
             ("KOMO_MEMORY_API_KEY".into(), ContentHash::of_str("b")),
             ("KOMO_EMBEDDING_API_KEY".into(), ContentHash::of_str("c")),
         ]),
-        loaded_at: time::macros::datetime!(2026-09-15 08:00:00 UTC),
+        loaded_at: "2026-09-15T08:00:00Z".parse::<jiff::Timestamp>().unwrap(),
         sources: vec![],
     }
 }

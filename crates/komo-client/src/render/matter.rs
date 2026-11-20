@@ -4,9 +4,9 @@
 //! 「已超期」，领域另带标准。Agent 经 bash 读它，所以一行就是一条，没有表头和对齐空格。
 //! 超期按响应里 Gateway 的今天读（`Matter::is_overdue`），不按本机时区再算。
 
+use jiff::civil::Date;
 use komo_kernel::protocol::http::{MatterDetail, MatterListResponse, TaskState};
 use komo_kernel::types::matter::{Matter, MatterKind, MatterState};
-use time::Date;
 
 use super::{evidence_ref, provenance, schedule_brief, schedule_lines, stamp};
 
@@ -173,7 +173,7 @@ pub fn matter_show(detail: &MatterDetail) -> String {
         Some(schedule) => {
             out.push("定时".into());
             out.extend(
-                schedule_lines(schedule, time::OffsetDateTime::now_utc())
+                schedule_lines(schedule, jiff::Timestamp::now())
                     .into_iter()
                     .map(|line| format!("  {line}")),
             );
@@ -279,19 +279,18 @@ fn flat(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use jiff::Timestamp;
     use komo_kernel::types::ids::{CronJobId, MatterId};
     use komo_kernel::types::matter::{MatterTrigger, NewMatter};
-    use time::OffsetDateTime;
-    use time::macros::{date, datetime};
 
-    const T0: OffsetDateTime = datetime!(2026-10-29 08:00 UTC);
+    const T0: Timestamp = jiff::Timestamp::constant(1793260800, 0) /* 2026-10-29T08:00:00Z */;
 
     fn goal(id: &str, state: MatterState) -> Matter {
         let mut matter = NewMatter {
             kind: MatterKind::Goal,
             title: "这周把 owl 的发布观察做完".into(),
             next: Some("看 AB 组的 5xx".into()),
-            due: Some(date!(2026 - 11 - 01)),
+            due: Some(jiff::civil::date(2026, 11, 1)),
             standard: None,
         }
         .build(MatterId::from_raw(id), T0)
@@ -327,7 +326,7 @@ mod tests {
                 goal("g-2", MatterState::Waiting),
                 area(),
             ],
-            today: date!(2026 - 11 - 02),
+            today: jiff::civil::date(2026, 11, 2),
         };
         assert_eq!(
             matter_list(&response),
@@ -343,7 +342,7 @@ mod tests {
                 goal("g-1", MatterState::Active),
                 goal("g-3", MatterState::Done),
             ],
-            today: date!(2026 - 11 - 01),
+            today: jiff::civil::date(2026, 11, 1),
         };
         assert!(!matter_list(&on_time).contains("已超期"));
         assert_eq!(
@@ -351,7 +350,7 @@ mod tests {
                 schedules: vec![],
                 waiting: Default::default(),
                 matters: vec![],
-                today: date!(2026 - 11 - 01)
+                today: jiff::civil::date(2026, 11, 1)
             }),
             "没有事项"
         );
@@ -372,7 +371,7 @@ mod tests {
             overview: None,
             still_linked: Vec::new(),
             matter: done.clone(),
-            today: date!(2026 - 11 - 02),
+            today: jiff::civil::date(2026, 11, 2),
             closure: Some(MatterClosure {
                 archived: 3,
                 restored: 0,
@@ -396,7 +395,7 @@ mod tests {
             overview: None,
             still_linked: Vec::new(),
             matter: goal("g-1", MatterState::Active),
-            today: date!(2026 - 11 - 02),
+            today: jiff::civil::date(2026, 11, 2),
             closure: Some(MatterClosure {
                 restored: 2,
                 ..MatterClosure::default()
@@ -412,7 +411,7 @@ mod tests {
             overview: None,
             still_linked: Vec::new(),
             matter: done,
-            today: date!(2026 - 11 - 02),
+            today: jiff::civil::date(2026, 11, 2),
             closure: None,
         });
         assert_eq!(plain.lines().count(), 1);
@@ -426,7 +425,7 @@ mod tests {
             overview: None,
             closure: None,
             matter: goal("g-2", MatterState::Waiting),
-            today: date!(2026 - 11 - 02),
+            today: jiff::civil::date(2026, 11, 2),
             still_linked: Vec::new(),
         };
         let shown = matter_show(&detail);
@@ -442,7 +441,7 @@ mod tests {
             overview: None,
             closure: None,
             matter: area(),
-            today: date!(2026 - 11 - 02),
+            today: jiff::civil::date(2026, 11, 2),
             still_linked: Vec::new(),
         });
         assert!(area.contains("标准    每周一前完成"), "{area}");
@@ -457,7 +456,7 @@ mod tests {
             MatterTrigger::cron(CronJobId::from_raw("job-1")),
             MatterTrigger::parse_monitor("sess-1:#3f2a").unwrap(),
         ];
-        let today = date!(2026 - 11 - 02);
+        let today = jiff::civil::date(2026, 11, 2);
         let detail = MatterDetail {
             schedule: None,
             fired: None,

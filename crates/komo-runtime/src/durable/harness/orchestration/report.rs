@@ -97,7 +97,7 @@ fn status_of(text: &str) -> Status {
 fn facts(run: &live::RunControl, now: i64, continued: bool) -> String {
     let mut out = format!(" · {} 轮工具调用", run.rounds);
     if run.started_at > 0 {
-        let span = time::Duration::milliseconds(now - run.started_at);
+        let span = jiff::SignedDuration::from_millis(now - run.started_at);
         out.push_str(&format!(" · {}", duration_words(span)));
     }
     if continued {

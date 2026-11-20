@@ -6,6 +6,7 @@
 //! 一条贯穿的规矩：**不知道就说不知道**。`??` 是 uncertain 的记号（§8.6：副作用是否
 //! 发生未知，不能在这里假装失败）。
 
+use jiff::Timestamp;
 use komo_kernel::cron::{CronJob, FiringStatus, JobStatus, NotifyPolicy, OverlapPolicy, Trigger};
 use komo_kernel::protocol::config::{ConfigIssue, IssueSeverity, SourceFile};
 use komo_kernel::protocol::http::{
@@ -22,7 +23,6 @@ use komo_kernel::types::memory::{
     RecallDiagnostics, RetrievalMode,
 };
 use komo_kernel::types::status::{RetryCause, RunState, SessionState, ToolCallState, WaitReason};
-use time::OffsetDateTime;
 
 mod matter;
 pub use matter::{matter_changed, matter_line, matter_list, matter_show};
@@ -34,7 +34,7 @@ pub use matter::{matter_changed, matter_line, matter_list, matter_show};
 ///
 /// `Dependency` 只在这里与人见面：它**不进** §7.5 的清单（等前一条 Run 不是"等人"），
 /// 于是"前面那条还没跑完"唯一说得清的地方就是这一格。
-fn run_state_cell(state: RunState, wait: Option<&WaitReason>, now: OffsetDateTime) -> String {
+fn run_state_cell(state: RunState, wait: Option<&WaitReason>, now: Timestamp) -> String {
     match (state, wait) {
         (RunState::Waiting, Some(reason)) => format!(
             "{} · {}",
@@ -54,7 +54,7 @@ fn run_state_cell(state: RunState, wait: Option<&WaitReason>, now: OffsetDateTim
 /// **在这一列唯一的区别**。
 ///
 /// `now` 由调用方给（这个模块不读时钟）：等待理由里的"还有多久"要它才算得出来。
-pub fn session_list(response: &SessionListResponse, now: OffsetDateTime) -> String {
+pub fn session_list(response: &SessionListResponse, now: Timestamp) -> String {
     if response.sessions.is_empty() {
         return "没有会话".into();
     }
@@ -117,7 +117,7 @@ pub fn session_search(response: &SessionSearchResponse) -> String {
 
 /// `komo monitor list`：一个监听一行——短号、状态、已跑多久、距截止还有多久、标题、挂它的会话；
 /// 脚本缩进在下一行。`now` 由调用方给。
-pub fn monitor_list(response: &MonitorListResponse, now: OffsetDateTime) -> String {
+pub fn monitor_list(response: &MonitorListResponse, now: Timestamp) -> String {
     if response.monitors.is_empty() {
         return "没有监听".into();
     }
@@ -194,7 +194,7 @@ fn task_marker(session: &SessionSummary) -> Option<String> {
 /// `komo run inspect RUN_ID`。
 ///
 /// `now` 由调用方给：`Waiting` 那一格的理由里"还有多久"要它才算得出来。
-pub fn run_inspect(detail: &RunDetail, now: OffsetDateTime) -> String {
+pub fn run_inspect(detail: &RunDetail, now: Timestamp) -> String {
     let mut out = Vec::new();
     let summary = &detail.summary;
     out.push(format!("Run    {}", summary.run));
@@ -438,12 +438,7 @@ pub fn intervention_detail(detail: &InterventionDetail) -> String {
             let mut out = intervention_head(summary);
             out.push(format!("调用   {tool}"));
             out.push(format!("参数   {arguments}"));
-            out.push(format!(
-                "截止   {}（到点没答就不执行）",
-                deadline
-                    .format(&time::format_description::well_known::Rfc3339)
-                    .unwrap_or_default()
-            ));
+            out.push(format!("截止   {}（到点没答就不执行）", deadline));
             out.join("\n")
         }
     }
@@ -476,7 +471,7 @@ fn intervention_head(summary: &InterventionSummary) -> Vec<String> {
 ///
 /// 每一行是"这个定时是什么"，下一行是"它上一次怎么样了"——§10 的
 /// 「Cron 的结果去原 Session 查看」需要先知道有没有结果、是哪一个 Session。
-pub fn schedule_list(schedules: &[MatterSchedule], now: OffsetDateTime) -> String {
+pub fn schedule_list(schedules: &[MatterSchedule], now: Timestamp) -> String {
     if schedules.is_empty() {
         return "没有定时".into();
     }
@@ -491,7 +486,7 @@ pub fn schedule_list(schedules: &[MatterSchedule], now: OffsetDateTime) -> Strin
 }
 
 /// 一个目标的定时：第一行是配置与下一次，往下是命令、上一次触发、触发层面的问题。
-pub fn schedule_lines(schedule: &MatterSchedule, now: OffsetDateTime) -> Vec<String> {
+pub fn schedule_lines(schedule: &MatterSchedule, now: Timestamp) -> Vec<String> {
     let job = &schedule.job;
     let mut out = vec![format!(
         "{:<38} {:<10} {:<8} {:<8} {:<36} {} · {}",
@@ -1307,7 +1302,7 @@ fn issues_text(issues: &[ConfigIssue]) -> String {
     out.join("\n")
 }
 
-fn source_lines(loaded_at: OffsetDateTime, sources: &[SourceFile]) -> Vec<String> {
+fn source_lines(loaded_at: Timestamp, sources: &[SourceFile]) -> Vec<String> {
     sources
         .iter()
         .map(|source| {
@@ -1322,7 +1317,7 @@ fn source_lines(loaded_at: OffsetDateTime, sources: &[SourceFile]) -> Vec<String
 }
 
 /// 文件比生效的那份新 = 「文件改了但没装上」（§3）。
-fn stale_warning(loaded_at: OffsetDateTime, sources: &[SourceFile]) -> Option<String> {
+fn stale_warning(loaded_at: Timestamp, sources: &[SourceFile]) -> Option<String> {
     let stale: Vec<String> = sources
         .iter()
         .filter(|source| source.mtime > loaded_at)
@@ -1344,25 +1339,20 @@ fn stale_warning(loaded_at: OffsetDateTime, sources: &[SourceFile]) -> Option<St
 /// 本机时区的墙钟时刻，带偏移（`2026-09-25 14:00:00 +08:00`）。
 ///
 /// 偏移必须印出来：这些输出也会被 agent 经 shell 读到，不带偏移的时刻会被当成本机时间。
-/// 偏移按时刻本身取（夏令时两侧不同），所以走 jiff 的系统时区，不在启动时抓一个固定偏移；
-/// `time` 的 `current_local_offset` 在多线程进程里还会直接拒绝。
-pub fn stamp(at: OffsetDateTime) -> String {
+/// 偏移按时刻本身取（夏令时两侧不同），所以走 jiff 的系统时区，不在启动时抓一个固定偏移。
+pub fn stamp(at: Timestamp) -> String {
     stamp_in(at, &jiff::tz::TimeZone::system())
 }
 
-fn stamp_in(at: OffsetDateTime, zone: &jiff::tz::TimeZone) -> String {
-    match jiff::Timestamp::from_second(at.unix_timestamp()) {
-        Ok(ts) => ts
-            .to_zoned(zone.clone())
-            .strftime("%Y-%m-%d %H:%M:%S %:z")
-            .to_string(),
-        Err(_) => at.to_string(),
-    }
+fn stamp_in(at: Timestamp, zone: &jiff::tz::TimeZone) -> String {
+    at.to_zoned_datetime(zone.clone())
+        .strftime("%Y-%m-%d %H:%M:%S %:z")
+        .to_string()
 }
 
-fn relative(at: OffsetDateTime, now: OffsetDateTime) -> String {
+fn relative(at: Timestamp, now: Timestamp) -> String {
     let delta = at - now;
-    let seconds = delta.whole_seconds();
+    let seconds = delta.as_secs();
     if seconds < 0 {
         return format!("已过 {}", human_span(-seconds));
     }
@@ -1433,7 +1423,7 @@ pub fn status_text(state: RunState) -> &'static str {
 /// 「停着，而且在等什么」。§8.4：**排队二十分钟不知道为什么**正是这一格要答的问题。
 ///
 /// `now` 由驱动传进来（状态机不读时钟）；`Retry` 那一句要算"还有多久"才算说得清。
-pub fn wait_text(reason: &WaitReason, now: Option<OffsetDateTime>) -> String {
+pub fn wait_text(reason: &WaitReason, now: Option<Timestamp>) -> String {
     match reason {
         // 句柄（Run ID）才是操作者要用的东西，而这一格只报"在等谁"：具体那一条在 §7.5 的
         // 清单里，状态行不复述它、也不替它编一个 id。
@@ -1474,8 +1464,8 @@ fn retry_cause_text(cause: RetryCause) -> &'static str {
 }
 
 /// 一段时长的人话。
-fn wait_span(duration: time::Duration) -> String {
-    let seconds = duration.whole_seconds().max(0);
+fn wait_span(duration: jiff::SignedDuration) -> String {
+    let seconds = duration.as_secs().max(0);
     if seconds < 60 {
         format!("{seconds}s")
     } else if seconds < 3600 {

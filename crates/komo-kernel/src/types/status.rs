@@ -1,7 +1,7 @@
 //! Run / ToolCall / Attempt 的状态机（§6、§8.1、§8.4）。
 
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
-use time::OffsetDateTime;
 
 use super::ids::{EventId, InterventionId, RunId};
 
@@ -238,9 +238,8 @@ pub enum WaitReason {
     Retry {
         /// 已经用掉的次数。**重启不重置预算**（§8.5）。
         attempts: u32,
-        #[serde(with = "time::serde::rfc3339")]
         #[cfg_attr(feature = "ts", ts(type = "string"))]
-        not_before: OffsetDateTime,
+        not_before: Timestamp,
         cause: RetryCause,
     },
     /// 停在一条 Intervention 上等人答复（§7.5）：结果不明，或者前提没了。
@@ -337,7 +336,6 @@ pub struct FinalEventRef {
 mod tests {
     use super::*;
     use crate::types::ids::ToolCallId;
-    use time::macros::datetime;
 
     /// 终态**恰好五个**，而且状态机里没有"停在外面却说不出在等什么"的那种状态。
     #[test]
@@ -373,7 +371,7 @@ mod tests {
     fn a_wait_reason_says_who_is_being_waited_on() {
         let retry = WaitReason::Retry {
             attempts: 2,
-            not_before: datetime!(2026-09-15 08:05:00 UTC),
+            not_before: "2026-09-15T08:05:00Z".parse::<jiff::Timestamp>().unwrap(),
             cause: RetryCause::RateLimited,
         };
         assert!(!retry.needs_a_person(), "等时钟不是等人");
@@ -417,7 +415,7 @@ mod tests {
     fn a_retry_cause_survives_the_round_trip() {
         let retry = WaitReason::Retry {
             attempts: 1,
-            not_before: datetime!(2026-09-15 08:00:30 UTC),
+            not_before: "2026-09-15T08:00:30Z".parse::<jiff::Timestamp>().unwrap(),
             cause: RetryCause::Contended,
         };
         let text = serde_json::to_string(&retry).unwrap();

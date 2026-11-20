@@ -293,7 +293,7 @@ mod tests {
     async fn chatgpt_auth_reads_slug_shape_with_account_header_and_client_version() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("codex").join("auth.json");
-        let expires = time::OffsetDateTime::now_utc() + time::Duration::hours(1);
+        let expires = jiff::Timestamp::now() + jiff::SignedDuration::from_hours(1);
         codex_auth::save(
             &path,
             &CodexAuth {

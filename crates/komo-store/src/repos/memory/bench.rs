@@ -17,6 +17,7 @@
 
 use std::time::Instant;
 
+use jiff::Timestamp;
 use komo_kernel::protocol::http::IndexState;
 use komo_kernel::traits::MemoryRepo;
 use komo_kernel::types::ids::MemoryId;
@@ -25,7 +26,6 @@ use komo_kernel::types::memory::{
     MemoryUsage, Provenance, RecallQuery, RetrievalMode,
 };
 use komo_kernel::types::model::{DistanceRule, EmbeddingSpace, Vector};
-use time::OffsetDateTime;
 
 use super::TursoMemoryRepo;
 use crate::db::Db;
@@ -58,7 +58,7 @@ const PREDICATES: [&str; 10] = [
     "两周浇一次水",
 ];
 
-fn synthetic(index: usize, now: OffsetDateTime) -> MemoryItem {
+fn synthetic(index: usize, now: Timestamp) -> MemoryItem {
     let subject = SUBJECTS[index % SUBJECTS.len()];
     let predicate = PREDICATES[(index / SUBJECTS.len()) % PREDICATES.len()];
     MemoryItem {
@@ -139,7 +139,7 @@ fn query(text: &str, mode: RetrievalMode, probe: Option<Vector>) -> RecallQuery 
         candidate_limit: 40,
         top_k: 8,
         max_tokens: 1500,
-        now: OffsetDateTime::now_utc(),
+        now: Timestamp::now(),
         query_vector: probe,
         include_states: vec![],
         min_similarity: 0.0,
@@ -154,7 +154,7 @@ async fn measure(count: usize) {
     let path = dir.path().join("state.db");
     let db = Db::connect(&path).await.expect("打开库");
     let repo = TursoMemoryRepo::new(db);
-    let now = OffsetDateTime::now_utc();
+    let now = Timestamp::now();
 
     // ---- 写入（正文 + 关键词索引，`put` 一步做完）
     let write_started = Instant::now();

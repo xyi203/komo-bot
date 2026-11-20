@@ -18,8 +18,8 @@ mod views;
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
-use time::OffsetDateTime;
 
 pub use progress::{progress_of, summarize_args};
 pub use views::{
@@ -64,12 +64,8 @@ pub struct Surface {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     last_role: Option<Role>,
     /// 最近一条事件的时间。
-    #[serde(
-        default,
-        with = "time::serde::rfc3339::option",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub last_at: Option<OffsetDateTime>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_at: Option<Timestamp>,
 }
 
 /// 把一串事件折成 [`Surface`]。
@@ -520,7 +516,6 @@ mod tests {
     use crate::types::plan::PlanHash;
     use crate::types::plan::PlanSource;
     use crate::types::refs::{ContentRef, OutputRef, ToolResultStatus};
-    use time::macros::datetime;
 
     fn event(seq: u64, run: Option<&str>, payload: EventPayload) -> Event {
         Event {
@@ -529,7 +524,8 @@ mod tests {
             event_id: EventId::from_raw(format!("evt-{seq}")),
             session: SessionId::from_raw("sess-1"),
             run: run.map(RunId::from_raw),
-            ts: datetime!(2026-09-15 08:00:00 UTC) + time::Duration::seconds(seq as i64),
+            ts: "2026-09-15T08:00:00Z".parse::<jiff::Timestamp>().unwrap()
+                + jiff::SignedDuration::from_secs(seq as i64),
             payload,
         }
     }

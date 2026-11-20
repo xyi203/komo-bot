@@ -15,9 +15,9 @@
 //! - **未知 `v`** 也是错误：§8.3 要求「影响执行、权限或调用配对的未知版本必须暂停恢复
 //!   并要求兼容版本」，把它降格成 Unknown 会让恢复接着往下跑。
 
+use jiff::Timestamp;
 use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use time::OffsetDateTime;
 
 use crate::compaction::{CompactionDebt, CompactionDecision};
 use crate::types::chat::PeerId;
@@ -43,7 +43,7 @@ pub struct Event {
     pub event_id: EventId,
     pub session: SessionId,
     pub run: Option<RunId>,
-    pub ts: OffsetDateTime,
+    pub ts: Timestamp,
     pub payload: EventPayload,
 }
 
@@ -121,8 +121,7 @@ struct RawEvent {
     session: SessionId,
     #[serde(rename = "run_id", default, skip_serializing_if = "Option::is_none")]
     run: Option<RunId>,
-    #[serde(with = "time::serde::rfc3339")]
-    at: OffsetDateTime,
+    at: Timestamp,
     #[serde(rename = "type")]
     event_type: String,
     #[serde(default)]
@@ -643,7 +642,6 @@ pub enum ContextCompacted {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use time::macros::datetime;
 
     fn line(event_type: &str, data: &str) -> String {
         format!(
@@ -939,7 +937,7 @@ mod tests {
             event_id: EventId::from_raw("evt-1"),
             session: SessionId::from_raw("sess-1"),
             run: None,
-            ts: datetime!(2026-09-15 08:00:00 UTC),
+            ts: "2026-09-15T08:00:00Z".parse::<jiff::Timestamp>().unwrap(),
             payload: EventPayload::ConversationBoundary(ConversationBoundary { by: None }),
         };
         let line = event.to_line().unwrap();
@@ -957,7 +955,7 @@ mod tests {
             event_id: EventId::from_raw("evt-2"),
             session: SessionId::from_raw("sess-1"),
             run: Some(RunId::from_raw("run-1")),
-            ts: datetime!(2026-09-15 08:00:00 UTC),
+            ts: "2026-09-15T08:00:00Z".parse::<jiff::Timestamp>().unwrap(),
             payload: EventPayload::MessageUser(MessageUser {
                 text: Some("第一行\n第二行".into()),
                 text_ref: None,
@@ -978,7 +976,7 @@ mod tests {
             event_id: EventId::from_raw(format!("evt-{seq}")),
             session: SessionId::from_raw("sess-1"),
             run: Some(RunId::from_raw("run-1")),
-            ts: datetime!(2026-09-15 08:00:00 UTC),
+            ts: "2026-09-15T08:00:00Z".parse::<jiff::Timestamp>().unwrap(),
             payload: EventPayload::ContextCompacted(payload),
         };
 

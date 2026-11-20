@@ -9,13 +9,13 @@
 //! [`MemoryProvider::list`]。
 
 use async_trait::async_trait;
+use jiff::Timestamp;
 use komo_kernel::types::ids::{MemoryId, SessionId};
 use komo_kernel::types::memory::{
     Confirmation, ExtractionMetadata, MemoryApplication, MemoryItem, MemoryKind, MemoryScope,
     MemoryState, MemoryUsage, Provenance,
 };
 use komo_kernel::types::model::EffortSetting;
-use time::OffsetDateTime;
 
 pub use komo_kernel::protocol::config::ProviderMode;
 
@@ -39,7 +39,7 @@ pub struct ProviderListed {
     pub kind: Option<String>,
     pub scope: MemoryScope,
     /// 它记下的事发生在什么时候；读不出来是 `None`。
-    pub at: Option<OffsetDateTime>,
+    pub at: Option<Timestamp>,
 }
 
 /// 清单的一页。
@@ -68,7 +68,7 @@ pub struct EvidenceBatch<'a> {
     pub scope: MemoryScope,
     /// 渲染好的窗口正文（与给记忆模型看的同一份）。
     pub text: &'a str,
-    pub at: OffsetDateTime,
+    pub at: Timestamp,
 }
 
 /// 提供方的失败。只记日志与召回诊断，不拦这一轮。
@@ -121,7 +121,7 @@ pub(crate) fn external_id<'a>(name: &str, id: &'a MemoryId) -> Option<&'a str> {
 
 /// 外部的一条包成核心认得的线索：**只读的 reference**——不是约定（约定要用户原话作证，§9.2）、没有归属、
 /// 不进候选生命周期。`revision` 取正文的哈希：提供方改了正文，旧注入就按"版本变了"失效（§9.4）。
-pub(crate) fn external_item(name: &str, hit: ProviderHit, now: OffsetDateTime) -> MemoryItem {
+pub(crate) fn external_item(name: &str, hit: ProviderHit, now: Timestamp) -> MemoryItem {
     MemoryItem {
         id: MemoryId::from_raw(format!("{name}:{}", hit.id)),
         revision: revision_of(&hit.text),
@@ -167,7 +167,7 @@ mod tests {
 
     #[test]
     fn an_external_item_is_a_read_only_clue_whose_revision_follows_its_text() {
-        let now = OffsetDateTime::UNIX_EPOCH;
+        let now = Timestamp::UNIX_EPOCH;
         let hit = |text: &str| ProviderHit {
             id: "abc".into(),
             text: text.into(),

@@ -8,8 +8,8 @@
 
 use std::fmt::Write as _;
 
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
-use time::OffsetDateTime;
 
 use super::delegate::DelegateContract;
 use super::ids::{AttemptId, RunId, SessionId, ToolCallId};
@@ -57,11 +57,9 @@ pub struct RunProgress {
     pub run: RunId,
     pub state: RunState,
     /// `run.accepted` 的时间。
-    #[serde(with = "time::serde::rfc3339")]
-    pub accepted_at: OffsetDateTime,
+    pub accepted_at: Timestamp,
     /// 这条 Run 最近一条事件的时间。
-    #[serde(with = "time::serde::rfc3339")]
-    pub last_at: OffsetDateTime,
+    pub last_at: Timestamp,
     pub rounds: u32,
     pub calls: u32,
     /// 还没出结果的调用（`Planned` / `Started`）。
@@ -91,12 +89,8 @@ pub struct RunningCall {
     /// 计划参数的一行摘要。
     pub summary: String,
     /// `tool.started` 的时间；还没 started 就是 `None`。
-    #[serde(
-        default,
-        with = "time::serde::rfc3339::option",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub started_at: Option<OffsetDateTime>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<Timestamp>,
     /// 输出尾部。kernel 没有 I/O，不填；Gateway 读 `.partial` 的尾部补上。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_tail: Option<String>,
@@ -104,7 +98,7 @@ pub struct RunningCall {
 
 impl TaskProgress {
     /// 给模型看的中文快照。`now` 由调用方从 [`crate::traits::Clock`] 取。挂着监听时末尾列出它们。
-    pub fn render(&self, now: OffsetDateTime) -> String {
+    pub fn render(&self, now: Timestamp) -> String {
         let mut out = self.run_text(now);
         if !self.monitors.is_empty() {
             let _ = write!(out, "\n挂着的监听：{}", self.monitors.join("、"));
@@ -112,7 +106,7 @@ impl TaskProgress {
         out
     }
 
-    fn run_text(&self, now: OffsetDateTime) -> String {
+    fn run_text(&self, now: Timestamp) -> String {
         let head = format!("#{}「{}」", self.short_id, self.title);
         let Some(run) = &self.run else {
             return format!("{head}：还没有开始跑");
@@ -205,8 +199,8 @@ impl TaskProgress {
 }
 
 /// 一段时间的人话：不到一分钟说秒，不到一小时说分秒，再长说时分。负数按 0。
-pub fn duration_words(span: time::Duration) -> String {
-    let secs = span.whole_seconds().max(0);
+pub fn duration_words(span: jiff::SignedDuration) -> String {
+    let secs = span.as_secs().max(0);
     if secs < 60 {
         format!("{secs} 秒")
     } else if secs < 3600 {
@@ -227,7 +221,6 @@ pub fn short_id(session: &SessionId) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use time::macros::datetime;
 
     fn session(raw: &str) -> SessionId {
         SessionId::from_raw(raw)
@@ -243,8 +236,8 @@ mod tests {
         RunProgress {
             run: RunId::from_raw("run-1"),
             state,
-            accepted_at: datetime!(2026-10-19 08:00:00 UTC),
-            last_at: datetime!(2026-10-19 08:47:04 UTC),
+            accepted_at: "2026-10-19T08:00:00Z".parse::<jiff::Timestamp>().unwrap(),
+            last_at: "2026-10-19T08:47:04Z".parse::<jiff::Timestamp>().unwrap(),
             rounds: 31,
             calls: 52,
             running: vec![],
@@ -267,7 +260,7 @@ mod tests {
     /// 挂着的监听列在末尾，跑着与跑完都列；没有就不提。
     #[test]
     fn live_monitors_are_listed_after_the_run() {
-        let now = OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(100);
+        let now = Timestamp::UNIX_EPOCH + jiff::SignedDuration::from_secs(100);
         let mut task = snapshot(None);
         assert!(!task.render(now).contains("监听"));
         task.monitors = vec!["#7「CI」".into()];
@@ -282,11 +275,12 @@ mod tests {
             attempt: None,
             tool: "bash".into(),
             summary: "cd /tmp/x && for i in …".into(),
-            started_at: Some(datetime!(2026-10-19 08:40:32 UTC)),
+            started_at: Some("2026-10-19T08:40:32Z".parse::<jiff::Timestamp>().unwrap()),
             output_tail: Some("t=380 done=4\nrunning=8\n".into()),
         });
         run.note = Some("在等第二批".into());
-        let text = snapshot(Some(run)).render(datetime!(2026-10-19 08:47:12 UTC));
+        let text =
+            snapshot(Some(run)).render("2026-10-19T08:47:12Z".parse::<jiff::Timestamp>().unwrap());
         assert!(
             text.contains("#2a9c「抓数据」：运行中，已跑 47 分 12 秒"),
             "{text}"
@@ -310,7 +304,8 @@ mod tests {
     fn a_completed_snapshot_says_how_long_it_took_and_that_the_result_is_handed_back() {
         let mut run = progress(RunState::Completed);
         run.final_message = Some("都跑完了".into());
-        let text = snapshot(Some(run)).render(datetime!(2026-10-19 09:00:00 UTC));
+        let text =
+            snapshot(Some(run)).render("2026-10-19T09:00:00Z".parse::<jiff::Timestamp>().unwrap());
         assert!(text.contains("已完成，用时 47 分 4 秒"), "{text}");
         assert!(text.contains("最终回复：都跑完了"), "{text}");
         assert!(text.contains("交回"), "{text}");
@@ -320,7 +315,8 @@ mod tests {
     fn a_failed_snapshot_carries_the_reason() {
         let mut run = progress(RunState::Failed);
         run.reason = Some("模型一直 429".into());
-        let text = snapshot(Some(run)).render(datetime!(2026-10-19 09:00:00 UTC));
+        let text =
+            snapshot(Some(run)).render("2026-10-19T09:00:00Z".parse::<jiff::Timestamp>().unwrap());
         assert!(
             text.contains("已失败") && text.contains("原因：模型一直 429"),
             "{text}"
@@ -329,7 +325,7 @@ mod tests {
 
     #[test]
     fn queued_waiting_and_empty_snapshots_each_say_so() {
-        let now = datetime!(2026-10-19 08:10:00 UTC);
+        let now = "2026-10-19T08:10:00Z".parse::<jiff::Timestamp>().unwrap();
         assert!(
             snapshot(Some(progress(RunState::Queued)))
                 .render(now)
@@ -347,12 +343,15 @@ mod tests {
 
     #[test]
     fn durations_switch_unit_at_a_minute_and_an_hour() {
-        assert_eq!(duration_words(time::Duration::seconds(8)), "8 秒");
-        assert_eq!(duration_words(time::Duration::seconds(125)), "2 分 5 秒");
+        assert_eq!(duration_words(jiff::SignedDuration::from_secs(8)), "8 秒");
         assert_eq!(
-            duration_words(time::Duration::seconds(3 * 3600 + 7 * 60 + 9)),
+            duration_words(jiff::SignedDuration::from_secs(125)),
+            "2 分 5 秒"
+        );
+        assert_eq!(
+            duration_words(jiff::SignedDuration::from_secs(3 * 3600 + 7 * 60 + 9)),
             "3 时 7 分"
         );
-        assert_eq!(duration_words(time::Duration::seconds(-3)), "0 秒");
+        assert_eq!(duration_words(jiff::SignedDuration::from_secs(-3)), "0 秒");
     }
 }

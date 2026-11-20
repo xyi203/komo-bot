@@ -1,7 +1,7 @@
 //! Cron：触发器、到期计算与调度表达式解析（§10）。
 //!
-//! **kernel 不带时区数据库。**`time` 只能表示一个固定偏移，IANA 名字到偏移的解析需要
-//! tzdb，那是上层的事。所以 [`TimeZone`] 只存**名字**（写进 `cron_jobs`，是权威），而
+//! **kernel 不查时区数据库。**IANA 名字到偏移的解析需要 tzdb（随操作系统更新的数据），
+//! 那是上层的事；kernel 只用 jiff 的时刻、民用时间与固定偏移。所以 [`TimeZone`] 只存**名字**（写进 `cron_jobs`，是权威），而
 //! 「这个本地时间在这个区里对应哪个瞬时」由调用方传进来的
 //! [`ZoneResolver`](crate::traits::ZoneResolver) 回答。
 //!
@@ -14,17 +14,18 @@
 //! croner 用 `default-features = false`：默认特性会拉进 chrono，而 kernel 只允许一套
 //! 日期时间库（§13.4）。去掉 chrono 之后 croner 依然可用——它 4.0 起把搜索建在自己
 //! 的民用时间类型上，日期库通过 [`croner::time::CronDateTime`] 接进去，下面的
-//! [`Zoned`] 就是 `time::OffsetDateTime` + 一个 `ZoneResolver` 的那个实现。
+//! [`Zoned`] 就是 `jiff::Timestamp` + 一个 `ZoneResolver` 的那个实现。
 
 mod zone;
 
 use croner::Cron;
 use croner::parser::{CronParser, Seconds, Year};
+use jiff::civil::{Date, DateTime, Time};
+use jiff::{SignedDuration, Timestamp};
 use serde::{Deserialize, Serialize};
-use time::{Date, Duration, Month, OffsetDateTime, PrimitiveDateTime, Time};
 
 pub use zone::{FixedOffsetZone, TimeZone, ZoneError, ZoneResolution};
-use zone::{LaterFold, Zoned, later_fold};
+use zone::{LaterFold, Zoned, assume_offset, later_fold};
 
 use crate::traits::ZoneResolver;
 use crate::types::ids::{CronJobId, RunId, SessionId};
@@ -41,9 +42,8 @@ pub enum Trigger {
     Cron { expr: String, tz: TimeZone },
     /// 一次性：`@at YYYY-MM-DD HH:MM`，创建时就解析成了它的瞬时。
     At {
-        #[serde(with = "time::serde::rfc3339")]
         #[cfg_attr(feature = "ts", ts(type = "string"))]
-        at: OffsetDateTime,
+        at: Timestamp,
     },
 }
 
@@ -86,7 +86,7 @@ pub enum ScheduleError {
 pub fn parse_schedule(
     input: &str,
     zone: &TimeZone,
-    now: OffsetDateTime,
+    now: Timestamp,
     zones: &dyn ZoneResolver,
 ) -> Result<Trigger, ScheduleError> {
     let trimmed = input.trim();
@@ -148,7 +148,7 @@ fn parse_at(
     raw: &str,
     zone: &TimeZone,
     zones: &dyn ZoneResolver,
-) -> Result<OffsetDateTime, ScheduleError> {
+) -> Result<Timestamp, ScheduleError> {
     let invalid = || ScheduleError::InvalidAt {
         input: raw.to_string(),
     };
@@ -167,21 +167,20 @@ fn parse_at(
         return Err(invalid());
     }
 
-    let year: i32 = year.parse().map_err(|_| invalid())?;
-    let month: u8 = month.parse().map_err(|_| invalid())?;
-    let day: u8 = day.parse().map_err(|_| invalid())?;
-    let hour: u8 = hour.parse().map_err(|_| invalid())?;
-    let minute: u8 = minute.parse().map_err(|_| invalid())?;
+    let year: i16 = year.parse().map_err(|_| invalid())?;
+    let month: i8 = month.parse().map_err(|_| invalid())?;
+    let day: i8 = day.parse().map_err(|_| invalid())?;
+    let hour: i8 = hour.parse().map_err(|_| invalid())?;
+    let minute: i8 = minute.parse().map_err(|_| invalid())?;
 
-    let month = Month::try_from(month).map_err(|_| invalid())?;
-    let date = Date::from_calendar_date(year, month, day).map_err(|_| invalid())?;
-    let time = Time::from_hms(hour, minute, 0).map_err(|_| invalid())?;
-    let local = PrimitiveDateTime::new(date, time);
+    let date = Date::new(year, month, day).map_err(|_| invalid())?;
+    let time = Time::new(hour, minute, 0, 0).map_err(|_| invalid())?;
+    let local: DateTime = date.to_datetime(time);
 
     match zones.resolve(zone.name(), local)? {
-        ZoneResolution::Single(offset) => Ok(local.assume_offset(offset)),
+        ZoneResolution::Single(offset) => Ok(assume_offset(local, offset)?),
         // 两个瞬时都是真的；取较早的那个。
-        ZoneResolution::Ambiguous(earlier, _) => Ok(local.assume_offset(earlier)),
+        ZoneResolution::Ambiguous(earlier, _) => Ok(assume_offset(local, earlier)?),
         ZoneResolution::Gap => Err(ScheduleError::LocalTimeDoesNotExist {
             at: raw.to_string(),
             zone: zone.name().to_string(),
@@ -207,9 +206,9 @@ fn parse_at(
 ///   所以时钟往回拨那天额外从**后一半的起点**再走一遍，取两个答案里近的那个。
 pub fn next_occurrence(
     trigger: &Trigger,
-    after: OffsetDateTime,
+    after: Timestamp,
     zones: &dyn ZoneResolver,
-) -> Result<Option<OffsetDateTime>, ScheduleError> {
+) -> Result<Option<Timestamp>, ScheduleError> {
     match trigger {
         Trigger::At { at } => Ok((*at > after).then_some(*at)),
         Trigger::Cron { expr, tz } => {
@@ -240,15 +239,15 @@ pub fn next_occurrence(
 fn repeated_twin(
     cron: &Cron,
     fold: &LaterFold,
-    after: OffsetDateTime,
+    after: Timestamp,
     zone: &str,
     zones: &dyn ZoneResolver,
-) -> Result<Option<OffsetDateTime>, ScheduleError> {
+) -> Result<Option<Timestamp>, ScheduleError> {
     let wall_start = fold.wall_start();
     let first_earlier = fold.transition - fold.shift();
     let Some(found) = search_from(
         cron,
-        first_earlier - Duration::seconds(1),
+        first_earlier - SignedDuration::from_secs(1),
         false,
         zone,
         zones,
@@ -257,24 +256,23 @@ fn repeated_twin(
         return Ok(None);
     };
 
-    let local = found.to_offset(fold.earlier_offset);
-    let wall = PrimitiveDateTime::new(local.date(), local.time());
+    let wall = fold.earlier_offset.to_datetime(found);
     if wall < wall_start || wall >= wall_start + fold.shift() {
         // 这一段里没有匹配的墙上时刻。
         return Ok(None);
     }
-    let twin = wall.assume_offset(fold.later_offset);
+    let twin = assume_offset(wall, fold.later_offset)?;
     Ok((twin > after).then_some(twin))
 }
 
 /// 一次搜索，外加"跳过不存在的本地时间"。
 fn search_from(
     cron: &Cron,
-    from: OffsetDateTime,
+    from: Timestamp,
     inclusive: bool,
     zone: &str,
     zones: &dyn ZoneResolver,
-) -> Result<Option<OffsetDateTime>, ScheduleError> {
+) -> Result<Option<Timestamp>, ScheduleError> {
     /// 连着八次都落在缺口里是不可能的；到这个数说明别处错了，报错胜过默默返回 None。
     const MAX_GAP_SKIPS: u32 = 8;
 
@@ -289,9 +287,9 @@ fn search_from(
         };
         // 被缺口抬起来的结果，墙上时间不再匹配表达式。
         if cron.is_time_matching(&found).unwrap_or(true) {
-            return Ok(Some(found.local()));
+            return Ok(Some(found.instant()));
         }
-        cursor = found.local();
+        cursor = found.instant();
         inclusive = false;
     }
     Err(ScheduleError::NoOccurrence(format!(
@@ -305,7 +303,7 @@ fn search_from(
 /// 是跳过的。
 pub fn matches(
     trigger: &Trigger,
-    at: OffsetDateTime,
+    at: Timestamp,
     zones: &dyn ZoneResolver,
 ) -> Result<bool, ScheduleError> {
     match trigger {
@@ -482,13 +480,9 @@ pub struct CronJob {
     #[serde(default)]
     pub notify: NotifyPolicy,
     /// 下一个槽位。`next_occurrence` 算出来的那个。
-    #[serde(
-        default,
-        with = "time::serde::rfc3339::option",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(type = "string"))]
-    pub next_run_at: Option<OffsetDateTime>,
+    pub next_run_at: Option<Timestamp>,
     /// 触发 / 配置层面的问题。执行失败记在 firing 上，不记这里。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
@@ -501,7 +495,7 @@ pub struct CronJob {
 pub struct ScheduleSeen {
     pub version: u64,
     pub status: JobStatus,
-    pub next_run_at: Option<OffsetDateTime>,
+    pub next_run_at: Option<Timestamp>,
 }
 
 impl CronJob {
@@ -515,7 +509,7 @@ impl CronJob {
     }
 
     /// 在 `now` 这一刻该不该触发。
-    pub fn is_due(&self, now: OffsetDateTime) -> bool {
+    pub fn is_due(&self, now: Timestamp) -> bool {
         self.status == JobStatus::Active && self.next_run_at.is_some_and(|slot| slot <= now)
     }
 
@@ -532,8 +526,8 @@ impl CronJob {
     // 应当是一个显式的 Job 字段而不是一个藏在这里的常数。)
     pub fn slot_missed_by_too_much(
         &self,
-        slot: OffsetDateTime,
-        now: OffsetDateTime,
+        slot: Timestamp,
+        now: Timestamp,
         zones: &dyn ZoneResolver,
     ) -> bool {
         let Some(interval) = self.own_interval(slot, zones) else {
@@ -543,7 +537,11 @@ impl CronJob {
     }
 
     /// 这个触发器自己的间隔：这一槽到下一槽。一次性触发没有间隔。
-    pub fn own_interval(&self, slot: OffsetDateTime, zones: &dyn ZoneResolver) -> Option<Duration> {
+    pub fn own_interval(
+        &self,
+        slot: Timestamp,
+        zones: &dyn ZoneResolver,
+    ) -> Option<SignedDuration> {
         match &self.trigger {
             Trigger::At { .. } => None,
             Trigger::Cron { .. } => next_occurrence(&self.trigger, slot, zones)
@@ -557,7 +555,7 @@ impl CronJob {
     /// 区名解析不了的 Job 应当在清单里看得见，而不是安静地再也不响。
     pub fn advance(
         &mut self,
-        after: OffsetDateTime,
+        after: Timestamp,
         zones: &dyn ZoneResolver,
     ) -> Result<(), ScheduleError> {
         match next_occurrence(&self.trigger, after, zones) {
@@ -583,9 +581,8 @@ impl CronJob {
 pub struct CronFiring {
     pub job: CronJobId,
     pub job_version: u64,
-    #[serde(with = "time::serde::rfc3339")]
     #[cfg_attr(feature = "ts", ts(type = "string"))]
-    pub scheduled_at: OffsetDateTime,
+    pub scheduled_at: Timestamp,
     /// 不可变的触发快照：据此可以补完尚未写入的触发输入（§8.5）。
     pub prompt: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -602,7 +599,7 @@ pub struct CronFiring {
 
 impl CronFiring {
     /// 一条只有触发本身、还没有 Session / Run 的记录。
-    pub fn claimed(job: &CronJob, scheduled_at: OffsetDateTime) -> CronFiring {
+    pub fn claimed(job: &CronJob, scheduled_at: Timestamp) -> CronFiring {
         CronFiring {
             job: job.id.clone(),
             job_version: job.version,
@@ -618,7 +615,7 @@ impl CronFiring {
     /// 一条"这一槽没有跑"的记录。
     pub fn skipped(
         job: &CronJob,
-        scheduled_at: OffsetDateTime,
+        scheduled_at: Timestamp,
         reason: impl Into<String>,
     ) -> CronFiring {
         CronFiring {
@@ -632,8 +629,7 @@ impl CronFiring {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use time::UtcOffset;
-    use time::macros::{datetime, offset};
+    use jiff::tz::Offset;
 
     fn shanghai() -> TimeZone {
         TimeZone::new("Asia/Shanghai")
@@ -641,10 +637,10 @@ mod tests {
 
     /// 上海没有夏令时，固定 +8 就是它的全部真相。
     fn shanghai_zone() -> FixedOffsetZone {
-        FixedOffsetZone::new(offset!(+8))
+        FixedOffsetZone::new(jiff::tz::offset(8))
     }
 
-    const NOW: OffsetDateTime = datetime!(2026-09-15 08:00:00 UTC);
+    const NOW: Timestamp = jiff::Timestamp::constant(1789459200, 0) /* 2026-09-15T08:00:00Z */;
 
     #[test]
     fn a_five_field_expression_parses() {
@@ -692,8 +688,8 @@ mod tests {
         };
         // 上海的 9 点是 UTC 的 1 点。
         assert_eq!(
-            at.to_offset(UtcOffset::UTC),
-            datetime!(2026-09-16 01:00:00 UTC)
+            at,
+            "2026-09-16T01:00:00Z".parse::<jiff::Timestamp>().unwrap()
         );
     }
 
@@ -731,21 +727,24 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(
-            next.to_offset(UtcOffset::UTC),
-            datetime!(2026-09-16 01:00:00 UTC)
+            next,
+            "2026-09-16T01:00:00Z".parse::<jiff::Timestamp>().unwrap()
         );
-        assert_eq!(next.offset(), offset!(+8));
-        assert_eq!(next.hour(), 9, "在它自己的时区里就是 9 点");
+        assert_eq!(
+            jiff::tz::offset(8).to_datetime(next).hour(),
+            9,
+            "在它自己的时区里就是 9 点"
+        );
     }
 
     #[test]
     fn the_next_occurrence_is_strictly_after_the_given_moment() {
         let utc = FixedOffsetZone::utc();
         let trigger = parse_schedule("0 9 * * *", &TimeZone::utc(), NOW, &utc).unwrap();
-        let nine = datetime!(2026-09-15 09:00:00 UTC);
+        let nine = "2026-09-15T09:00:00Z".parse::<jiff::Timestamp>().unwrap();
         assert_eq!(
             next_occurrence(&trigger, nine, &utc).unwrap().unwrap(),
-            datetime!(2026-09-16 09:00:00 UTC)
+            "2026-09-16T09:00:00Z".parse::<jiff::Timestamp>().unwrap()
         );
         assert!(matches(&trigger, nine, &utc).unwrap());
     }
@@ -756,8 +755,14 @@ mod tests {
         // 每周五 18:00。2026-09-15 是星期二。
         let trigger = parse_schedule("0 18 * * FRI", &TimeZone::utc(), NOW, &utc).unwrap();
         let next = next_occurrence(&trigger, NOW, &utc).unwrap().unwrap();
-        assert_eq!(next, datetime!(2026-09-18 18:00:00 UTC));
-        assert_eq!(next.weekday(), time::Weekday::Friday);
+        assert_eq!(
+            next,
+            "2026-09-18T18:00:00Z".parse::<jiff::Timestamp>().unwrap()
+        );
+        assert_eq!(
+            Offset::UTC.to_datetime(next).weekday(),
+            jiff::civil::Weekday::Friday
+        );
     }
 
     #[test]
@@ -806,18 +811,14 @@ mod tests {
         /// 一个什么区都不认识的 resolver。
         struct NoZones;
         impl ZoneResolver for NoZones {
-            fn resolve(
-                &self,
-                zone: &str,
-                _local: PrimitiveDateTime,
-            ) -> Result<ZoneResolution, ZoneError> {
+            fn resolve(&self, zone: &str, _local: DateTime) -> Result<ZoneResolution, ZoneError> {
                 Err(ZoneError::UnknownZone(zone.into()))
             }
             fn offset_at(
                 &self,
                 zone: &str,
-                _instant: OffsetDateTime,
-            ) -> Result<UtcOffset, ZoneError> {
+                _instant: Timestamp,
+            ) -> Result<jiff::tz::Offset, ZoneError> {
                 Err(ZoneError::UnknownZone(zone.into()))
             }
         }
@@ -923,23 +924,37 @@ mod tests {
             next_run_at: None,
             last_error: None,
         };
-        let slot = datetime!(2026-09-15 09:00:00 UTC);
+        let slot = "2026-09-15T09:00:00Z".parse::<jiff::Timestamp>().unwrap();
 
         // 迟到一小时：照跑。
-        assert!(!daily.slot_missed_by_too_much(slot, slot + Duration::hours(1), &zone));
+        assert!(!daily.slot_missed_by_too_much(slot, slot + SignedDuration::from_hours(1), &zone));
         // 迟到两天：这一槽过去了。
-        assert!(daily.slot_missed_by_too_much(slot, slot + Duration::days(2), &zone));
-        assert_eq!(daily.own_interval(slot, &zone), Some(Duration::days(1)));
+        assert!(daily.slot_missed_by_too_much(
+            slot,
+            slot + SignedDuration::from_hours(24 * 2),
+            &zone
+        ));
+        assert_eq!(
+            daily.own_interval(slot, &zone),
+            Some(SignedDuration::from_hours(24))
+        );
 
         // 同一段延迟，对每分钟的 Job 早就太久了——一个全局宽限期对两端一定有一端是错的。
         daily.trigger = parse_schedule("* * * * *", &TimeZone::utc(), NOW, &zone).unwrap();
-        assert_eq!(daily.own_interval(slot, &zone), Some(Duration::minutes(1)));
-        assert!(daily.slot_missed_by_too_much(slot, slot + Duration::hours(1), &zone));
+        assert_eq!(
+            daily.own_interval(slot, &zone),
+            Some(SignedDuration::from_mins(1))
+        );
+        assert!(daily.slot_missed_by_too_much(slot, slot + SignedDuration::from_hours(1), &zone));
 
         // 一次性触发**永不过期**：人指定了一个时刻要它跑一次。
         daily.trigger = Trigger::At { at: slot };
         assert_eq!(daily.own_interval(slot, &zone), None);
-        assert!(!daily.slot_missed_by_too_much(slot, slot + Duration::days(30), &zone));
+        assert!(!daily.slot_missed_by_too_much(
+            slot,
+            slot + SignedDuration::from_hours(24 * 30),
+            &zone
+        ));
     }
 
     /// 一条 `skipped` 的触发记录是**留痕**，不是一个空行：它说得出为什么。
@@ -964,7 +979,7 @@ mod tests {
             next_run_at: None,
             last_error: None,
         };
-        let slot = datetime!(2026-09-15 09:00:00 UTC);
+        let slot = "2026-09-15T09:00:00Z".parse::<jiff::Timestamp>().unwrap();
 
         let claimed = CronFiring::claimed(&job, slot);
         assert_eq!(claimed.status, FiringStatus::Queued);
@@ -989,10 +1004,10 @@ mod tests {
 
     #[test]
     fn a_fixed_offset_zone_never_reports_a_gap_or_an_overlap() {
-        let zone = FixedOffsetZone::new(offset!(+8));
+        let zone = FixedOffsetZone::new(jiff::tz::offset(8));
         assert_eq!(
-            zone.resolve("whatever", datetime!(2026-03-29 02:30:00)),
-            Ok(ZoneResolution::Single(offset!(+8)))
+            zone.resolve("whatever", jiff::civil::date(2026, 3, 29).at(2, 30, 0, 0)),
+            Ok(ZoneResolution::Single(jiff::tz::offset(8)))
         );
     }
 }

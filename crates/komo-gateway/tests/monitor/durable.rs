@@ -601,7 +601,7 @@ async fn a_monitor_triggered_reply_is_pushed_but_the_operators_own_turn_is_not()
             p256dh: "BCVxsr7N_eNgVRqvHtD0zTZsEc6-VV-JvLexhqUzORcxaOzi6-AYWXvTBHm4bjyPjs7Vd8pZGH6SRpkNtoIAiw4".into(),
             auth: "BTBZMqHH6r4Tts7J_aSIgg".into(),
             user_agent: None,
-            now: time::OffsetDateTime::now_utc(),
+            now: jiff::Timestamp::now(),
         })
         .await
         .unwrap();

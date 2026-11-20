@@ -19,7 +19,7 @@ komo-client = { workspace = true }
 komo-gateway = { workspace = true }
 # 隐藏子命令 `__codemode-worker` 的函数体在 komo-tools（`codemode::worker::run`）；bin 只分发。
 komo-tools = { workspace = true }
-time = { workspace = true }
+jiff = { workspace = true }
 clap = { workspace = true }
 rustls = { workspace = true }
 # "fs" / "io-util" 是 `komo update` 下载落盘要的；"net" 只有测试里的假服务端用。

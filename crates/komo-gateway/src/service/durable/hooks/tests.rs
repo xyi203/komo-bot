@@ -525,7 +525,7 @@ async fn task_sessions_lack_task_but_keep_monitor_in_schema() {
 // ---------------------------------------------------------------- 系统段
 
 fn seeded_memory(id: &str, content: &str) -> MemoryItem {
-    let now = time::OffsetDateTime::now_utc();
+    let now = jiff::Timestamp::now();
     MemoryItem {
         id: MemoryId::from_raw(id),
         revision: 1,

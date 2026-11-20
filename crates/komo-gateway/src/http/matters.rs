@@ -10,6 +10,8 @@
 
 use axum::Json;
 use axum::extract::{Path, Query, State};
+use jiff::Timestamp;
+use jiff::civil::Date;
 use komo_kernel::durable::SessionKind;
 use komo_kernel::protocol::http::{
     ActivityWaiting, ClosureConvention, ErrorCode, MATTER_ACTIVITY_LIMIT, MATTER_MEMORY_LIMIT,
@@ -22,7 +24,6 @@ use komo_kernel::types::ids::{CronJobId, MatterId, SessionId};
 use komo_kernel::types::matter::{Matter, MatterError, MatterTrigger, MatterVerb};
 use komo_kernel::types::memory::MemoryState;
 use komo_memory::matter::{Caller, MatterFailure};
-use time::{Date, Month, OffsetDateTime};
 
 use super::Api;
 use super::error::{ApiFailure, ApiResult};
@@ -615,41 +616,36 @@ fn failure(error: MatterFailure) -> ApiFailure {
     }
 }
 
-/// Gateway 本地时区的今天（§3「超期」）。时区走系统的（同 `komo cron` 的时刻显示）；
-/// 换算不出来退回 UTC 的日期。
+/// Gateway 本地时区的今天（§3「超期」）。时区走系统的（同 `komo cron` 的时刻显示）。
 fn today(api: &Api) -> Date {
     local_date(api.state.clock.now(), &jiff::tz::TimeZone::system())
 }
 
-fn local_date(now: OffsetDateTime, zone: &jiff::tz::TimeZone) -> Date {
-    let civil = jiff::Timestamp::from_second(now.unix_timestamp())
-        .map(|ts| ts.to_zoned(zone.clone()).date())
-        .ok();
-    civil
-        .and_then(|day| {
-            let month = Month::try_from(u8::try_from(day.month()).ok()?).ok()?;
-            Date::from_calendar_date(i32::from(day.year()), month, u8::try_from(day.day()).ok()?)
-                .ok()
-        })
-        .unwrap_or_else(|| now.date())
+fn local_date(now: Timestamp, zone: &jiff::tz::TimeZone) -> Date {
+    now.to_zoned_datetime(zone.clone()).date()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use time::macros::{date, datetime};
 
     /// UTC 的 10-31 16:30 在上海已经是 11-01：超期按 Gateway 本地的日期读。
     #[test]
     fn today_is_the_local_calendar_date() {
         let shanghai = jiff::tz::TimeZone::get("Asia/Shanghai").unwrap();
         assert_eq!(
-            local_date(datetime!(2026-10-31 16:30 UTC), &shanghai),
-            date!(2026 - 11 - 01)
+            local_date(
+                "2026-10-31T16:30:00Z".parse::<jiff::Timestamp>().unwrap(),
+                &shanghai
+            ),
+            jiff::civil::date(2026, 11, 1)
         );
         assert_eq!(
-            local_date(datetime!(2026-10-31 16:30 UTC), &jiff::tz::TimeZone::UTC),
-            date!(2026 - 10 - 31)
+            local_date(
+                "2026-10-31T16:30:00Z".parse::<jiff::Timestamp>().unwrap(),
+                &jiff::tz::TimeZone::UTC
+            ),
+            jiff::civil::date(2026, 10, 31)
         );
     }
 }

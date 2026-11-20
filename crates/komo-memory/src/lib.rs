@@ -40,6 +40,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, RwLock};
 
 use async_trait::async_trait;
+use jiff::Timestamp;
+use jiff::civil::Date;
 use komo_kernel::events::{Event, EventPayload};
 use komo_kernel::protocol::config::{ConsolidateConfig, MemoryConfig, RetrievalConfig};
 use komo_kernel::protocol::http::{
@@ -60,7 +62,6 @@ use komo_kernel::types::memory::{
 use komo_kernel::types::model::{EmbeddingSpace, InputKind, ModelConfig, Vector};
 use komo_kernel::types::turn::{LlmError, MemoryUse};
 use komo_store::repos::memory::{GenerationRecord, IndexCandidate};
-use time::{Date, Month, OffsetDateTime};
 
 pub use add::{BelongsChange, run_user_evidence};
 pub use belongs::BelongsOutcome;
@@ -195,10 +196,10 @@ pub trait MemoryCatalog: Send + Sync {
 
     async fn prune_generations(&self, keep: &str) -> Result<u64, RepoError>;
 
-    async fn record_use(&self, ids: &[MemoryId], at: OffsetDateTime) -> Result<(), RepoError>;
+    async fn record_use(&self, ids: &[MemoryId], at: Timestamp) -> Result<(), RepoError>;
 
     /// 一批提取里被指认用上的记忆各 +1（§9.10）。
-    async fn record_adoption(&self, ids: &[MemoryId], at: OffsetDateTime) -> Result<(), RepoError>;
+    async fn record_adoption(&self, ids: &[MemoryId], at: Timestamp) -> Result<(), RepoError>;
 }
 
 #[async_trait]
@@ -300,11 +301,11 @@ impl MemoryCatalog for komo_store::TursoMemoryRepo {
         komo_store::TursoMemoryRepo::prune_generations(self, keep).await
     }
 
-    async fn record_use(&self, ids: &[MemoryId], at: OffsetDateTime) -> Result<(), RepoError> {
+    async fn record_use(&self, ids: &[MemoryId], at: Timestamp) -> Result<(), RepoError> {
         komo_store::TursoMemoryRepo::record_use(self, ids, at).await
     }
 
-    async fn record_adoption(&self, ids: &[MemoryId], at: OffsetDateTime) -> Result<(), RepoError> {
+    async fn record_adoption(&self, ids: &[MemoryId], at: Timestamp) -> Result<(), RepoError> {
         komo_store::TursoMemoryRepo::record_adoption(self, ids, at).await
     }
 }
@@ -348,18 +349,10 @@ pub struct PassReport {
 pub type RenderInjection =
     fn(&[MemoryItem], &[MemoryItem], &[Matter], Date, u32, u32, u32) -> Injection;
 
-/// Gateway 本地时区的今天（`docs/goals.md` §3「超期」）。时区走系统的；换算不出来退回 UTC 的日期。
+/// Gateway 本地时区的今天（`docs/goals.md` §3「超期」）。时区走系统的。
 /// 与 `komo-gateway` 的 `http::matters` 读同一个口径。
-fn local_today(now: OffsetDateTime) -> Date {
-    jiff::Timestamp::from_second(now.unix_timestamp())
-        .ok()
-        .map(|ts| ts.to_zoned(jiff::tz::TimeZone::system()).date())
-        .and_then(|day| {
-            let month = Month::try_from(u8::try_from(day.month()).ok()?).ok()?;
-            Date::from_calendar_date(i32::from(day.year()), month, u8::try_from(day.day()).ok()?)
-                .ok()
-        })
-        .unwrap_or_else(|| now.date())
+fn local_today(now: Timestamp) -> Date {
+    now.to_zoned_datetime(jiff::tz::TimeZone::system()).date()
 }
 
 /// 装配一台 MemoryManager 要的东西。
@@ -459,7 +452,7 @@ struct Live {
     retrieval: RetrievalConfig,
     consolidate: ConsolidateConfig,
     /// 会话空闲多久之后才领来提取（§9.10）。
-    extract_idle: time::Duration,
+    extract_idle: jiff::SignedDuration,
     /// 一批最多收几条观察（§9.10）。
     max_observations: usize,
     llm: Arc<dyn LlmClient>,
@@ -483,8 +476,8 @@ fn plain_result(items: Vec<MemoryItem>, mode: RetrievalMode) -> RecallResult {
 /// 一次后台处理最多领几个会话（每个会话一批，§9.10）。
 pub const WORK_BATCH: usize = 8;
 
-fn extract_idle(config: &MemoryConfig) -> time::Duration {
-    time::Duration::seconds(i64::try_from(config.extract_idle_secs).unwrap_or(i64::MAX))
+fn extract_idle(config: &MemoryConfig) -> jiff::SignedDuration {
+    jiff::SignedDuration::from_secs(i64::try_from(config.extract_idle_secs).unwrap_or(i64::MAX))
 }
 
 /// 索引构建失败后第一次重试等多久；之后每次翻倍，封顶 [`INDEX_RETRY_MAX`]（§9.5）。
@@ -497,8 +490,8 @@ const RERANK_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
 const PROVIDER_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
 const INGEST_DEADLINE: std::time::Duration = std::time::Duration::from_secs(15);
 
-const INDEX_RETRY_FIRST: time::Duration = time::Duration::seconds(30);
-const INDEX_RETRY_MAX: time::Duration = time::Duration::minutes(30);
+const INDEX_RETRY_FIRST: jiff::SignedDuration = jiff::SignedDuration::from_secs(30);
+const INDEX_RETRY_MAX: jiff::SignedDuration = jiff::SignedDuration::from_mins(30);
 
 /// 索引调度的账。
 #[derive(Debug, Default)]
@@ -510,11 +503,11 @@ struct IndexSchedule {
     /// 连着失败了几轮；成功一轮清零。
     failures: u32,
     /// 退避中：下一次自动重试的时刻。
-    retry_at: Option<OffsetDateTime>,
+    retry_at: Option<Timestamp>,
 }
 
 /// 第 `failures` 次连续失败之后等多久。
-fn index_backoff(failures: u32) -> time::Duration {
+fn index_backoff(failures: u32) -> jiff::SignedDuration {
     let doublings = failures.saturating_sub(1).min(16);
     (INDEX_RETRY_FIRST * 2_i32.pow(doublings)).min(INDEX_RETRY_MAX)
 }
@@ -1178,11 +1171,7 @@ impl MemoryManager {
 
     /// 这一次放行作用域里全部 active + convention 的条目（未过期、按创建先后）。读不出来就当
     /// 没有：约定是召回的增益，读失败不拦这一轮，只留一条日志。
-    async fn scoped_conventions(
-        &self,
-        scopes: &[MemoryScope],
-        now: OffsetDateTime,
-    ) -> Vec<MemoryItem> {
+    async fn scoped_conventions(&self, scopes: &[MemoryScope], now: Timestamp) -> Vec<MemoryItem> {
         match self.catalog.conventions().await {
             Ok(items) => items
                 .into_iter()
@@ -1196,7 +1185,7 @@ impl MemoryManager {
     }
 
     /// 记使用计数（§9.2）：这一块注入里的每条记忆都算用了一次。
-    async fn record_usage(&self, injection: &Injection, now: OffsetDateTime) {
+    async fn record_usage(&self, injection: &Injection, now: Timestamp) {
         let ids: Vec<MemoryId> = injection
             .uses
             .iter()
@@ -1214,7 +1203,7 @@ impl MemoryManager {
     ///
     /// 外部提供方的条目（附录 G）问提供方现状：删了、作废了、正文改了都掉出去；问不通也掉出去——核对不了的
     /// 不留在模型眼前，与内置条目"读不出来先不沿用"同一条规矩。
-    pub async fn revalidate(&self, uses: &[MemoryUse], now: OffsetDateTime) -> Vec<MemoryItem> {
+    pub async fn revalidate(&self, uses: &[MemoryUse], now: Timestamp) -> Vec<MemoryItem> {
         let mut alive = Vec::new();
         let installed = self.provider();
         let mut external: Vec<&MemoryUse> = Vec::new();
@@ -1752,7 +1741,7 @@ impl MemoryManager {
         &self,
         id: &MemoryId,
         expected_revision: u32,
-        at: OffsetDateTime,
+        at: Timestamp,
     ) -> Result<(), MemoryError> {
         let mut item = self
             .repo

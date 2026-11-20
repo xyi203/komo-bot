@@ -1271,8 +1271,8 @@ komo-kernel    值类型、`durable/` 模块（entry / conversation / task / sub
                上下文推导、fork 遍历、Task 状态机的纯逻辑 `durable/task/`、压缩的纯逻辑、`Storage` trait、
                内存实现 `durable/memory.rs` 与 conformance 用例、`pi_tree` / `legacy_events` 投影）、
                Session 生命周期、cron 到期计算、协议线格式、全部 trait（§13.5）。
-               deps: serde, serde_json, uuid, time, thiserror, async-trait, sha2, croner（`default-features = false`，
-               无 chrono；它自己仍拉 derive_builder / darling / strum，接受）。不依赖 tokio，不带 tzdb。
+               deps: serde, serde_json, uuid, jiff, thiserror, async-trait, sha2, croner（`default-features = false`，
+               无 chrono；它自己仍拉 derive_builder / darling / strum，接受）。不依赖 tokio，不查 tzdb。
 
 komo-store     `durable/`：`Line`（一条提交线，唯一写连接）、Turso `Storage` 实现、新库 DDL 与字节对等测试、
                `blob`（先写文件后提交引用）、`ids`（取号器与高水位）——**裸 `turso`，不经 toasty**；
@@ -1365,9 +1365,9 @@ durable 引擎（约 1.5 万行生产代码）与 harness 是汇聚点，没有�
 | `axum` | 默认 + `tower-http/cors` | 仅 gateway；gateway 自己直接声明 `tokio`（`rt-multi-thread`, `signal`, `fs`），不靠 axum 传递 |
 | `tower-http` | `0.6`，`default-features = false, features = ["cors"]` | 与 reqwest 对齐（两个大版本都要 `^0.6`）；选 0.7 只会多一条自找的重复版本 |
 | `sha2` | `0.11` | 工作区自己用的版本；`monty`（codemode）仍带一份 0.10，所以 `digest` / `block-buffer` / `crypto-common` / `cpufeatures` 还有两份（2026-11-13 渠道删除后，原先的另一个来源 openlark-core 已不在） |
-| `croner` | `default-features = false`（W2 确认无 chrono 时的时刻表达） | kernel 已有 `time`，不要第二套日期时间库；croner 4 默认特性拉进 chrono + derive_builder / darling / strum |
+| `croner` | `default-features = false`（W2 确认无 chrono 时的时刻表达） | 工作区只有 jiff 一套日期时间库；croner 4 默认特性拉进 chrono + derive_builder / darling / strum |
 | `grep` + `ignore` | `0.4`，`default-features = false`；komo-tools（`rg` 工具），`grep` 另有 komo-llm（上下文超长的报错匹配） | 内嵌 ripgrep 的搜索与遍历，不起子进程：外部 `rg` 要么没装、要么各家版本不同，而遍历规则（隐藏文件、`.gitignore`、覆盖 glob）本来就该用这套实现。默认特性集是空的，写出来是钉住两件事：**不开 `pcre2`**（"正则语法 = Rust regex"是对模型可见的契约）与不引 SIMD 的 `avx-accel`。带进来的 13 个包（`globset`、`walkdir`、`termcolor`、`crossbeam-deque`、`encoding_rs_io`、`memmap2`、`bstr` 等）全是纯 Rust、无 C 工具链，且没有新的重复版本（2026-09-21 对 `cargo tree -d` 核过） |
-| `jiff` | `0.2`，默认特性（系统 tzdb + 系统时区）；komo-runtime、komo-memory、komo-tools、komo-client、与 komo-gateway | runtime：cron 的 `ZoneResolver`（IANA 区名 → 偏移，§10）；memory 与 tools（codemode）：本地日期与时刻。client：CLI 的时刻一律印成本机墙钟 + 偏移（`2026-09-25 14:00:00 +08:00`），偏移按每个时刻各自取，夏令时两侧不同。gateway：目标/领域接口的本地日期；飞书插件：话题上下文里每条消息的 `HH:MM`（§11.3，本机时区）；不用 `time` 的 `local-offset`，它只能取"现在"的偏移，且在多线程进程里拒绝返回。kernel 仍只用 `time` |
+| `jiff` | `1.0`，默认特性（系统 tzdb + 系统时区）+ `serde`；除 komo-agent 外的全部 crate | **工作区唯一的日期时间库**（2026-11-20 起取代 `time` 0.3）：时刻 `Timestamp`、时长 `SignedDuration`、民用日期 `civil::Date`。`Timestamp` 自带的 serde 输出 RFC 3339，与原先 `time::serde::rfc3339` 逐字节相同（UTC、小数秒去尾零），旧 durable.db / 协议数据照读；截止日期仍只认 `YYYY-MM-DD`（`types::matter::iso_date`）。时区：runtime 的 cron `ZoneResolver`（IANA 区名 → 偏移，§10）；memory、gateway：Gateway 本地的今天；client：CLI 的时刻一律印成本机墙钟 + 偏移（`2026-09-25 14:00:00 +08:00`），偏移按每个时刻各自取。kernel 只用时刻、民用时间与固定偏移，不查 tzdb。**已知重复**：`monty-types`（codemode）仍带一份 jiff 0.2；`time` 0.3 经 `tracing-appender`（bin 与 turso）间接留在树里，工作区代码不直接用 |
 | `ring` | `0.17.14`，`default-features = false, features = ["alloc"]`；仅 komo-gateway | **Web Push（2026-11-14）也手写在它上面，不引 web-push crate**：RFC 8291 的 ECDH P-256（`agreement`）、HKDF-SHA256（`hkdf`）、AES-128-GCM（`aead`），RFC 8292 的 ES256 JWT（`ECDSA_P256_SHA256_FIXED_SIGNING`，签名正好是 JWT 要的 r‖s），无新依赖。OIDC ID token 的验签（RS256 `RSA_PKCS1_2048_8192_SHA256` / ES256 / EdDSA），`ring::signature` 直接验 JWK 里的公钥，不引 JWT / OIDC 库（`jsonwebtoken`、`openidconnect` 都要另选密码后端或再拉一串依赖）。**已在依赖树里**：rustls 的 ring provider 拉进来的同一个包，Cargo.lock 只在 komo-gateway 的依赖列表里多一行，不新增包也不新增重复版本 |
 | `base64` | `0.23.1`（工作区那份）；komo-gateway 新增直接依赖 | 解 JWT 的三段与 JWKS 的 `n` / `e` / `x` / `y`（base64url）；不新增包 |
 | `uuid` | 工作区特性加 `v4`（原有 `v7`、`serde`） | `komo-kernel::pkce::random_token` 用 `Uuid::new_v4` 取操作系统随机数拼 32 字节令牌（Gateway 的 `lock::random_token` 早就这么用，只是靠别的 crate 把 `v4` 带进来；kernel 单独编译时要自己声明）。不新增包 |
@@ -1380,7 +1380,7 @@ durable 引擎（约 1.5 万行生产代码）与 harness 是汇聚点，没有�
 | `opentelemetry-otlp` | `0.33`，`default-features = false, features = ["http-proto", "reqwest-blocking-client", "trace", "metrics"]`；仅 bin | OTLP/HTTP + protobuf，走工作区同一份 reqwest 0.13（多开其 `blocking` 特性）；不开 `grpc-tonic` / `logs`。**blocking 而非 async 客户端**：SDK 在无 tokio reactor 的线程上 `block_on` 导出。`opentelemetry-otlp` 12.7s、`opentelemetry-http` 25.9s、`opentelemetry-proto` 6.9s；`cargo tree -d` 重复项与加之前逐条相同（95 个根），无新重复 |
 | `tracing-opentelemetry` | `0.34`，默认特性（含 `metrics`）；仅 bin | `OpenTelemetryLayer` + `MetricsLayer`（6.1s） |
 | `tracing-appender` | `0.2`，`default-features = false`；仅 bin | Gateway 日志按天轮转、留 7 个（`docs/observability.md` §6）（6.3s） |
-| `ts-rs` | `12`，`default-features = false, features = ["serde-compat", "no-serde-warnings"]`；仅 komo-kernel，且在 `ts` feature 后面（默认关，不进发布构建与冷编预算） | 协议类型 → TypeScript（`docs/clients.md` D3），生成物提交在 `packages/protocol/src/generated/`；`cargo test -p komo-kernel --features ts` 里有一条测试核对生成物是最新的，类型改了用 `KOMO_UPDATE_TS=1` 重新生成。只用 serde 属性兼容，不开 chrono / uuid 等类型适配（`OffsetDateTime` 与大整数在类型上显式标 `string` / `number`） |
+| `ts-rs` | `12`，`default-features = false, features = ["serde-compat", "no-serde-warnings"]`；仅 komo-kernel，且在 `ts` feature 后面（默认关，不进发布构建与冷编预算） | 协议类型 → TypeScript（`docs/clients.md` D3），生成物提交在 `packages/protocol/src/generated/`；`cargo test -p komo-kernel --features ts` 里有一条测试核对生成物是最新的，类型改了用 `KOMO_UPDATE_TS=1` 重新生成。只用 serde 属性兼容，不开 chrono / uuid 等类型适配（`Timestamp` / `Date` 与大整数在类型上显式标 `string` / `number`） |
 | `clap` | `derive` | 仅 bin |
 | `flate2` / `tar` | `flate2` 显式 `default-features = false, features = ["rust_backend"]`（miniz_oxide），`tar 0.4` | 仅 bin：`komo update` 解发布包（§13.6）。两者都是纯 Rust（不带 C 工具链），且**不进 gateway / runtime 的图**——它们谁也不更新自己；`rust_backend` 写死是不跟上游默认后端变 |
 | `syntect` / `two-face`（代码高亮） | 可选，按编译预算实测再定 | 纯 UI 增强，不是需求 |
@@ -1534,17 +1534,17 @@ pub trait EmbeddingClient: Send + Sync {
     async fn embed(&self, kind: InputKind, texts: &[String]) -> Result<Vec<Vector>, EmbedError>;
 }
 
-/// kernel 不带 tzdb；两个方向都要，cron 的搜索两头都走。
+/// kernel 不查 tzdb；两个方向都要，cron 的搜索两头都走。
 pub trait ZoneResolver: Send + Sync {
-    fn resolve(&self, zone: &str, local: PrimitiveDateTime) -> Result<ZoneResolution, ZoneError>; // Single / Ambiguous(早, 晚) / Gap
-    fn offset_at(&self, zone: &str, instant: OffsetDateTime) -> Result<UtcOffset, ZoneError>;
+    fn resolve(&self, zone: &str, local: jiff::civil::DateTime) -> Result<ZoneResolution, ZoneError>; // Single / Ambiguous(早, 晚) / Gap
+    fn offset_at(&self, zone: &str, instant: jiff::Timestamp) -> Result<jiff::tz::Offset, ZoneError>;
 }
 
 // `Channel` / `Inbound` / `Notifier`（飞书、Telegram、WeChat 渠道的入站与主动投递）已于 2026-11-13 随聊天渠道删除（§11），
 // kernel 里不再有这三个 trait。
 
 pub trait Clock: Send + Sync {
-    fn now(&self) -> OffsetDateTime;
+    fn now(&self) -> jiff::Timestamp;
 }
 ```
 

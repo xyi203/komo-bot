@@ -13,22 +13,20 @@ use komo_kernel::types::refs::{ContentRef, OutputRef};
 use komo_kernel::types::status::{RetryCause, WaitReason};
 use komo_kernel::types::turn::MemoryUse;
 use std::path::PathBuf;
-use time::macros::datetime;
 
-const NOW: OffsetDateTime = datetime!(2026-09-16 08:00:00 UTC);
+const NOW: Timestamp = jiff::Timestamp::constant(1789545600, 0) /* 2026-09-16T08:00:00Z */;
 
 /// 测试用的固定样本。
 mod fixture {
+    use jiff::Timestamp;
     use komo_kernel::protocol::http::{InterventionKind, InterventionSummary};
     use komo_kernel::types::digest::ContentHash;
     use komo_kernel::types::ids::{OperationId, RunId, SessionId, ToolCallId};
     use komo_kernel::types::plan::{
         ExecutionPlan, Operation, PlanSource, PlanTarget, PlanVersions, RecoveryMode, TargetAccess,
     };
-    use time::OffsetDateTime;
-    use time::macros::datetime;
 
-    pub const T0: OffsetDateTime = datetime!(2026-09-16 08:00:00 UTC);
+    pub const T0: Timestamp = jiff::Timestamp::constant(1789545600, 0) /* 2026-09-16T08:00:00Z */;
 
     pub fn session() -> SessionId {
         SessionId::from_raw("sess-1")
@@ -104,8 +102,8 @@ fn a_monitor_list_shows_age_deadline_title_and_session() {
         session: Some(SessionId::from_raw("sess-1")),
         state: "running".into(),
         reason: None,
-        started_at: NOW - time::Duration::minutes(90),
-        deadline: NOW + time::Duration::minutes(30),
+        started_at: NOW - jiff::SignedDuration::from_mins(90),
+        deadline: NOW + jiff::SignedDuration::from_mins(30),
         command: "gh run watch 1".into(),
         detached: false,
     };
@@ -177,7 +175,7 @@ fn a_session_list_shows_status_and_title() {
                 // 「为什么它不动」那一格：`session list` 就靠它答（§8.4）。
                 current_wait: Some(WaitReason::Retry {
                     attempts: 2,
-                    not_before: NOW + time::Duration::seconds(30),
+                    not_before: NOW + jiff::SignedDuration::from_secs(30),
                     cause: RetryCause::RateLimited,
                 }),
                 applied_seq: Seq(9),
@@ -365,7 +363,7 @@ fn run_detail(state: ToolCallState) -> RunDetail {
             },
             rounds: 2,
             created_at: NOW,
-            ended_at: Some(NOW + time::Duration::seconds(9)),
+            ended_at: Some(NOW + jiff::SignedDuration::from_secs(9)),
         },
         calls: vec![ToolCallSummary {
             call: fixture::call(),
@@ -626,7 +624,7 @@ fn an_intervention_detail_says_what_to_check_and_what_it_takes() {
 #[allow(dead_code)]
 struct CronJobStatus {
     job: CronJobId,
-    next_run_at: Option<OffsetDateTime>,
+    next_run_at: Option<Timestamp>,
     last: Option<komo_kernel::cron::CronFiring>,
 }
 
@@ -635,7 +633,7 @@ struct CronListResponse {
     status: Vec<CronJobStatus>,
 }
 
-fn cron_list(response: &CronListResponse, now: OffsetDateTime) -> String {
+fn cron_list(response: &CronListResponse, now: Timestamp) -> String {
     let schedules: Vec<MatterSchedule> = response
         .jobs
         .iter()
@@ -672,7 +670,7 @@ fn a_cron_list_shows_the_next_slot_and_how_far_off_it_is() {
             skills: vec![],
             max_rounds: None,
             notify: Default::default(),
-            next_run_at: Some(NOW + time::Duration::hours(2)),
+            next_run_at: Some(NOW + jiff::SignedDuration::from_hours(2)),
             last_error: None,
         },
         CronJob {
@@ -703,7 +701,7 @@ fn a_cron_list_shows_the_next_slot_and_how_far_off_it_is() {
                 last: Some(komo_kernel::cron::CronFiring {
                     job: CronJobId::from_raw("job-1"),
                     job_version: 3,
-                    scheduled_at: NOW - time::Duration::hours(22),
+                    scheduled_at: NOW - jiff::SignedDuration::from_hours(22),
                     prompt: "把昨天的事说一遍".into(),
                     session: Some(SessionId::from_raw("sess-9")),
                     run: Some(RunId::from_raw("run-9")),
@@ -719,7 +717,7 @@ fn a_cron_list_shows_the_next_slot_and_how_far_off_it_is() {
                 last: Some(komo_kernel::cron::CronFiring {
                     job: CronJobId::from_raw("job-2"),
                     job_version: 1,
-                    scheduled_at: NOW - time::Duration::days(1),
+                    scheduled_at: NOW - jiff::SignedDuration::from_hours(24),
                     prompt: "x".into(),
                     session: None,
                     run: None,
@@ -775,7 +773,7 @@ fn a_waiting_firing_says_it_is_waiting_for_a_person() {
         skills: vec![],
         max_rounds: None,
         notify: komo_kernel::cron::NotifyPolicy::OnError,
-        next_run_at: Some(NOW + time::Duration::hours(5)),
+        next_run_at: Some(NOW + jiff::SignedDuration::from_hours(5)),
         last_error: None,
     }];
     let response = CronListResponse {
@@ -785,7 +783,7 @@ fn a_waiting_firing_says_it_is_waiting_for_a_person() {
             last: Some(komo_kernel::cron::CronFiring {
                 job: CronJobId::from_raw("job-3"),
                 job_version: 1,
-                scheduled_at: NOW - time::Duration::hours(19),
+                scheduled_at: NOW - jiff::SignedDuration::from_hours(19),
                 prompt: "整理".into(),
                 session: Some(SessionId::from_raw("sess-3")),
                 run: Some(RunId::from_raw("run-3")),
@@ -823,7 +821,7 @@ fn a_command_job_shows_its_command_truncated() {
         skills: vec![],
         max_rounds: None,
         notify: Default::default(),
-        next_run_at: Some(NOW + time::Duration::hours(1)),
+        next_run_at: Some(NOW + jiff::SignedDuration::from_hours(1)),
         last_error: None,
     }];
     let response = CronListResponse {
@@ -868,7 +866,7 @@ fn memory_item() -> MemoryItem {
             observed_at: NOW,
             extracted_from_run: Some(RunId::from_raw("run-1")),
         }],
-        observed_at: NOW - time::Duration::days(3),
+        observed_at: NOW - jiff::SignedDuration::from_hours(24 * 3),
         valid_until: None,
         created_at: NOW,
         updated_at: NOW,
@@ -1013,8 +1011,8 @@ fn issues() -> Vec<ConfigIssue> {
 
 fn config_response(
     issues: Vec<ConfigIssue>,
-    loaded_at: OffsetDateTime,
-    mtime: OffsetDateTime,
+    loaded_at: Timestamp,
+    mtime: Timestamp,
 ) -> ConfigCheckResponse {
     ConfigCheckResponse {
         issues,
@@ -1070,7 +1068,7 @@ fn config_check_calls_out_a_file_edited_after_the_config_was_loaded() {
     let printed = config_check(&config_response(
         vec![],
         NOW,
-        NOW + time::Duration::minutes(5),
+        NOW + jiff::SignedDuration::from_mins(5),
     ));
     assert!(printed.contains("⚠ 文件改了但没装上"), "{printed}");
 }
@@ -1193,7 +1191,7 @@ fn doctor_calls_out_a_file_that_was_edited_after_the_config_was_loaded() {
         Some(&config_response(
             issues(),
             NOW,
-            NOW + time::Duration::minutes(5),
+            NOW + jiff::SignedDuration::from_mins(5),
         )),
     );
     insta_like(
@@ -1201,7 +1199,7 @@ fn doctor_calls_out_a_file_that_was_edited_after_the_config_was_loaded() {
         &[
             "实例      inst-1",
             &format!("配置装载  {}", stamp(NOW)),
-            &format!("mtime {}", stamp(NOW + time::Duration::minutes(5))),
+            &format!("mtime {}", stamp(NOW + jiff::SignedDuration::from_mins(5))),
             "⚠ 文件改了但没装上：/home/u/.komo/config.toml",
             "komo config reload",
             // 上一次校验错误一并印出来。
@@ -1218,7 +1216,7 @@ fn doctor_is_quiet_about_staleness_when_the_file_has_not_moved() {
         Some(&config_response(
             vec![],
             NOW,
-            NOW - time::Duration::minutes(1),
+            NOW - jiff::SignedDuration::from_mins(1),
         )),
     );
     assert!(!printed.contains("没装上"), "{printed}");
@@ -1247,11 +1245,17 @@ fn insta_like(printed: &str, fragments: &[&str]) {
 fn a_stamp_is_wall_clock_in_the_given_zone_with_its_offset() {
     let shanghai = jiff::tz::TimeZone::fixed(jiff::tz::offset(8));
     assert_eq!(
-        stamp_in(datetime!(2026-09-25 06:00:00 UTC), &shanghai),
+        stamp_in(
+            "2026-09-25T06:00:00Z".parse::<jiff::Timestamp>().unwrap(),
+            &shanghai
+        ),
         "2026-09-25 14:00:00 +08:00"
     );
     assert_eq!(
-        stamp_in(datetime!(2026-09-25 06:00:00 UTC), &jiff::tz::TimeZone::UTC),
+        stamp_in(
+            "2026-09-25T06:00:00Z".parse::<jiff::Timestamp>().unwrap(),
+            &jiff::tz::TimeZone::UTC
+        ),
         "2026-09-25 06:00:00 +00:00"
     );
 }
@@ -1260,11 +1264,17 @@ fn a_stamp_is_wall_clock_in_the_given_zone_with_its_offset() {
 fn a_stamp_takes_the_offset_of_its_own_instant_across_dst() {
     let new_york = jiff::tz::TimeZone::get("America/New_York").unwrap();
     assert_eq!(
-        stamp_in(datetime!(2026-07-01 16:00:00 UTC), &new_york),
+        stamp_in(
+            "2026-07-01T16:00:00Z".parse::<jiff::Timestamp>().unwrap(),
+            &new_york
+        ),
         "2026-07-01 12:00:00 -04:00"
     );
     assert_eq!(
-        stamp_in(datetime!(2026-12-01 17:00:00 UTC), &new_york),
+        stamp_in(
+            "2026-12-01T17:00:00Z".parse::<jiff::Timestamp>().unwrap(),
+            &new_york
+        ),
         "2026-12-01 12:00:00 -05:00"
     );
 }

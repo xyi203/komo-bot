@@ -24,8 +24,8 @@ mod validate;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use jiff::Timestamp;
 use komo_kernel::protocol::config::{ConfigIssue, ConfigSnapshot, IssueSeverity, KeyPath};
-use time::OffsetDateTime;
 
 use komo_llm::{EffortCapabilities, Secrets};
 
@@ -118,7 +118,7 @@ fn assemble_checked(
     secrets: Secrets,
     caps: &EffortCapabilities,
 ) -> Result<Loaded, ConfigError> {
-    let snapshot = file::assemble(file, &home, &sources, &secrets, OffsetDateTime::now_utc())?;
+    let snapshot = file::assemble(file, &home, &sources, &secrets, Timestamp::now())?;
 
     let mut issues = validate_with(&snapshot, caps);
     if has_errors(&issues) {

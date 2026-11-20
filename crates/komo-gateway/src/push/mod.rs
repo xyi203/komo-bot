@@ -212,7 +212,7 @@ impl PushService {
             serde_json::to_vec(&message).map_err(|error| PushError::Invalid(error.to_string()))?;
         let payload = payload.as_slice();
         let vapid = self.vapid().await?;
-        let expires = self.clock.now().unix_timestamp() + JWT_TTL_SECS;
+        let expires = self.clock.now().as_second() + JWT_TTL_SECS;
         let sends = subscriptions.iter().map(|sub| async move {
             (
                 sub,

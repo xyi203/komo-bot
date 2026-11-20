@@ -216,7 +216,7 @@ async fn a_safe_call_interrupted_mid_execute_is_rerun_as_a_new_attempt() {
 async fn the_child_pid_survives_reopening_the_database_and_drives_the_probe_phase() {
     let dir = tempfile::tempdir().unwrap();
     let world = World::turso(dir.path());
-    let started = (time::OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000) as i64;
+    let started = (jiff::Timestamp::now().as_nanosecond() / 1_000_000) as i64;
     let bash = Arc::new(
         TestTool::writer("bash", &world.log)
             .with_child(ChildStarted {

@@ -239,12 +239,11 @@ async fn a_one_shot_is_done_after_it_fires_and_refuses_to_run_again() {
         .start(FakeLlm::always(vec![text_round(1, "做完了")]))
         .await;
 
-    let at = time::OffsetDateTime::now_utc() + time::Duration::hours(1);
+    let at = jiff::Timestamp::now() + jiff::SignedDuration::from_hours(1);
     let job = gw
         .add_job(serde_json::json!({
             "name": "一次性",
-            "schedule": format!("@at {:04}-{:02}-{:02} {:02}:{:02}",
-                at.year(), u8::from(at.month()), at.day(), at.hour(), at.minute()),
+            "schedule": format!("@at {}", at.strftime("%Y-%m-%d %H:%M")),
             "timezone": "UTC",
             "prompt": "提醒我一下",
         }))

@@ -17,6 +17,7 @@
 //! 说的话。
 
 use async_trait::async_trait;
+use jiff::Timestamp;
 use komo_kernel::protocol::http::{IndexState, MemoryIndexStatus};
 use komo_kernel::traits::{ConsolidationWrite, MemoryRepo, RepoError, StoreError};
 use komo_kernel::types::digest::ContentHash;
@@ -26,7 +27,6 @@ use komo_kernel::types::memory::{
     RetrievalMode, scope_allowed,
 };
 use komo_kernel::types::model::Vector;
-use time::OffsetDateTime;
 use toasty::Executor;
 
 #[cfg(test)]
@@ -68,7 +68,7 @@ impl TursoMemoryRepo {
     ) -> Result<(), RepoError> {
         let generation = generation.to_string();
         let space = space.cloned();
-        let now = OffsetDateTime::now_utc();
+        let now = Timestamp::now();
         self.db
             .with_write_retry(move |ex| {
                 let (generation, space) = (generation.clone(), space.clone());
@@ -190,7 +190,7 @@ impl MemoryRepo for TursoMemoryRepo {
         &self,
         id: &MemoryId,
         expected_revision: u32,
-        at: OffsetDateTime,
+        at: Timestamp,
     ) -> Result<MemoryItem, RepoError> {
         let id = id.to_string();
         self.db
@@ -230,7 +230,7 @@ impl MemoryRepo for TursoMemoryRepo {
         &self,
         id: &MemoryId,
         expected_revision: u32,
-        at: OffsetDateTime,
+        at: Timestamp,
     ) -> Result<MemoryItem, RepoError> {
         let id = id.to_string();
         self.db
@@ -262,7 +262,7 @@ impl MemoryRepo for TursoMemoryRepo {
     ) -> Result<(), RepoError> {
         let id = id.to_string();
         let generation = generation.to_string();
-        let now = OffsetDateTime::now_utc();
+        let now = Timestamp::now();
         self.db
             .with_write_retry(move |ex| {
                 let (id, generation, vector) = (id.clone(), generation.clone(), vector.clone());
@@ -325,7 +325,7 @@ impl MemoryRepo for TursoMemoryRepo {
     async fn consolidation_marks(
         &self,
         ids: &[MemoryId],
-    ) -> Result<Vec<(MemoryId, Option<OffsetDateTime>)>, RepoError> {
+    ) -> Result<Vec<(MemoryId, Option<Timestamp>)>, RepoError> {
         consolidate::marks(&self.db, ids).await
     }
 
@@ -1033,9 +1033,8 @@ mod tests {
         Confirmation, Evidence, EvidenceRef, ExtractionMetadata, MemoryApplication, MemoryKind,
         MemoryUsage, Provenance,
     };
-    use time::macros::datetime;
 
-    const NOW: OffsetDateTime = datetime!(2026-09-15 08:00:00 UTC);
+    const NOW: Timestamp = jiff::Timestamp::constant(1789459200, 0) /* 2026-09-15T08:00:00Z */;
 
     async fn temp() -> (Db, tempfile::TempDir) {
         let dir = tempfile::tempdir().expect("临时目录");
@@ -1397,7 +1396,7 @@ mod tests {
             .await
             .unwrap();
         let mut expired = item("m-3", "客厅空调很吵", MemoryState::Active);
-        expired.valid_until = Some(NOW - time::Duration::days(1));
+        expired.valid_until = Some(NOW - jiff::SignedDuration::from_hours(24));
         repo.put(expired, None).await.unwrap();
 
         assert!(
@@ -1997,7 +1996,7 @@ mod tests {
         let ids = [MemoryId::from_raw("m-1")];
         assert_eq!(repo.consolidation_marks(&ids).await.unwrap()[0].1, None);
 
-        let at = NOW + time::Duration::hours(1);
+        let at = NOW + jiff::SignedDuration::from_hours(1);
         repo.apply_consolidation(ConsolidationWrite {
             expected: vec![(one.id.clone(), one.revision, one.updated_at)],
             puts: vec![],
@@ -2025,9 +2024,13 @@ mod tests {
             .await
             .unwrap();
         // 操作者在判定期间 confirm 了 m-2：revision 不变，updated_at 变了。
-        repo.confirm(&two.id, two.revision, NOW + time::Duration::minutes(5))
-            .await
-            .unwrap();
+        repo.confirm(
+            &two.id,
+            two.revision,
+            NOW + jiff::SignedDuration::from_mins(5),
+        )
+        .await
+        .unwrap();
 
         let mut changed = one.clone();
         changed.state = MemoryState::Contested;
@@ -2039,7 +2042,7 @@ mod tests {
                 ],
                 puts: vec![changed],
                 forgets: vec![],
-                stamp_at: NOW + time::Duration::hours(1),
+                stamp_at: NOW + jiff::SignedDuration::from_hours(1),
             })
             .await;
         assert!(matches!(result, Err(RepoError::VersionConflict { .. })));

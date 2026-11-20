@@ -12,8 +12,8 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use arc_swap::ArcSwap;
+use jiff::Timestamp;
 use komo_kernel::protocol::config::{ConfigIssue, ConfigSnapshot, KeyPath, SourceFile};
-use time::OffsetDateTime;
 
 use super::error::ConfigError;
 use super::file::Sources;
@@ -30,7 +30,7 @@ pub struct ReloadReport {
     pub start_only: Vec<KeyPath>,
     /// 校验通过但值得说的（例如某渠道 enabled 而 allow_from 为空）。
     pub warnings: Vec<ConfigIssue>,
-    pub loaded_at: OffsetDateTime,
+    pub loaded_at: Timestamp,
 }
 
 impl ReloadReport {

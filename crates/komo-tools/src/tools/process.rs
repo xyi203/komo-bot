@@ -142,7 +142,7 @@ pub struct LiveChild {
     child: tokio::process::Child,
     pub pgid: u32,
     /// 进程起来的时刻，给 pid 复用核对用（与在册登记同一个事实）。
-    pub started_at: time::OffsetDateTime,
+    pub started_at: jiff::Timestamp,
     stdout: Option<tokio::process::ChildStdout>,
     stderr: Option<tokio::process::ChildStderr>,
     outcome: ChildOutcome,
@@ -219,7 +219,7 @@ pub async fn run_child_detachable(
     let pgid = child
         .id()
         .ok_or_else(|| ProcessError::Spawn("子进程没有 pid".into()))?;
-    let started_at = time::OffsetDateTime::now_utc();
+    let started_at = jiff::Timestamp::now();
 
     // 在册：留下 pid、进程组与起来的时刻。`started_at` 走真实时钟——它是给 pid 复用
     // 核对用的事实，不是一个判决输入。登记失败只是少了一条恢复线索，不该让命令跑不起来。
@@ -240,7 +240,7 @@ pub async fn run_child_detachable(
     sink.child_started(ChildStarted {
         pid: pgid,
         pgid,
-        started_at_ms: (started_at.unix_timestamp_nanos() / 1_000_000) as i64,
+        started_at_ms: (started_at.as_nanosecond() / 1_000_000) as i64,
     });
     // 无论怎么收尾都要销号：正常退出、超时、取消、读输出出错，都从这个函数出去。
     let forget = ForgetOnDrop {
@@ -612,7 +612,7 @@ mod tests {
             inner: writer(),
             heard: Vec::new(),
         };
-        let before = time::OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000;
+        let before = jiff::Timestamp::now().as_nanosecond() / 1_000_000;
         run_child(spec("true"), &mut spy, &CancelToken::new())
             .await
             .unwrap();

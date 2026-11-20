@@ -25,7 +25,7 @@ fn ghost(pid: u32, started_at_ms: i64) -> ChildStarted {
 }
 
 fn now_ms() -> i64 {
-    (time::OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000) as i64
+    (jiff::Timestamp::now().as_nanosecond() / 1_000_000) as i64
 }
 
 fn only_task(tasks: Vec<komo_kernel::durable::TaskRecord>) -> komo_kernel::durable::TaskRecord {

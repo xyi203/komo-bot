@@ -108,7 +108,7 @@ impl Provider {
 
     fn sign(&self, mint: &Mint, nonce: &str) -> String {
         let header = json!({ "alg": "ES256", "typ": "JWT", "kid": "k1" });
-        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        let now = jiff::Timestamp::now().as_second();
         let mut claims = json!({
             "iss": self.origin,
             "sub": mint.sub,

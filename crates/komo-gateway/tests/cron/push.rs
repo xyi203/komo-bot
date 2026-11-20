@@ -168,7 +168,7 @@ async fn subscribe_direct(gw: &Gw, endpoint: &str, browser: &Browser) {
             p256dh: browser.p256dh.clone(),
             auth: browser.auth(),
             user_agent: None,
-            now: time::OffsetDateTime::now_utc(),
+            now: jiff::Timestamp::now(),
         })
         .await
         .unwrap();
@@ -202,7 +202,7 @@ async fn assert_vapid(gw: &Gw, hit: &Hit, origin: &str) {
     assert_eq!(claims["aud"], origin);
     assert_eq!(claims["sub"], SUBJECT);
     let exp = claims["exp"].as_i64().unwrap();
-    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+    let now = jiff::Timestamp::now().as_second();
     assert!(
         exp > now && exp <= now + 24 * 3600,
         "exp 在 24 小时之内：{exp}"

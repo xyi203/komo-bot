@@ -97,7 +97,7 @@ fn spoken(detail: &InterventionDetail, origin: &str) -> String {
             arguments,
             deadline,
         } => {
-            let minutes = ((*deadline - summary.created_at).whole_minutes()).max(1);
+            let minutes = ((*deadline - summary.created_at).as_mins()).max(1);
             let wait = if minutes % 60 == 0 {
                 format!("{} 小时", minutes / 60)
             } else {
@@ -158,7 +158,7 @@ fn summary_of(detail: &InterventionDetail) -> &InterventionSummary {
 fn key_of(summary: &InterventionSummary) -> String {
     let base = format!("intervention:{}:{}", summary.kind.as_str(), summary.handle);
     if summary.verdicts.contains(&InterventionVerdict::Resolve) {
-        format!("{base}:{}", summary.created_at.unix_timestamp())
+        format!("{base}:{}", summary.created_at.as_second())
     } else {
         base
     }

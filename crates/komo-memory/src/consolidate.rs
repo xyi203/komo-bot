@@ -20,13 +20,13 @@
 //! 「使用次数和多次模型复述不能增加确认等级」（§9.6）落在 `Same` 这一支：它只补证据，
 //! 一个字都不改 `state` 与 `confirmation`——候选反复被提取出来，仍然是候选。
 
+use jiff::Timestamp;
 use komo_kernel::types::ids::MemoryId;
 use komo_kernel::types::memory::{
     Confirmation, MemoryApplication, MemoryItem, MemoryScope, MemoryState, MemoryUsage, Provenance,
     RetrievalMode, SupersededRef,
 };
 use serde::Deserialize;
-use time::OffsetDateTime;
 
 use super::extract::Observation;
 use super::{MemoryError, MemoryManager};
@@ -338,7 +338,7 @@ impl<'a> Consolidator<'a> {
         &self,
         existing: &MemoryItem,
         observation: &Observation,
-        now: OffsetDateTime,
+        now: Timestamp,
     ) -> Result<usize, MemoryError> {
         let mut merged = existing.clone();
         let before = merged.evidence.len();
@@ -365,11 +365,7 @@ impl<'a> Consolidator<'a> {
     }
 
     /// 标 contested：暂停正常召回，**保留证据**，等用户纠正（§9.6）。
-    async fn contest(
-        &self,
-        existing: &MemoryItem,
-        now: OffsetDateTime,
-    ) -> Result<usize, MemoryError> {
+    async fn contest(&self, existing: &MemoryItem, now: Timestamp) -> Result<usize, MemoryError> {
         if existing.state == MemoryState::Contested {
             return Ok(0);
         }
@@ -388,7 +384,7 @@ impl<'a> Consolidator<'a> {
         &self,
         existing: &MemoryItem,
         by: SupersededRef,
-        now: OffsetDateTime,
+        now: Timestamp,
     ) -> Result<usize, MemoryError> {
         let mut old = existing.clone();
         old.state = MemoryState::Superseded;
@@ -403,7 +399,7 @@ impl<'a> Consolidator<'a> {
         id: MemoryId,
         observation: &Observation,
         supersedes: Option<SupersededRef>,
-        now: OffsetDateTime,
+        now: Timestamp,
     ) -> Result<MemoryItem, MemoryError> {
         let item = MemoryItem {
             id,

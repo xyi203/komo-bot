@@ -509,7 +509,7 @@ async fn run_and_land(
         .map_err(|error| SessionError::Internal(error.to_string()))?;
     // 只有停机会举这面旗（[`RunningShells::shutdown`]）。
     let interrupted = shell.cancel.is_cancelled();
-    let now_ms = (core.clock.now().unix_timestamp_nanos() / 1_000_000) as i64;
+    let now_ms = (core.clock.now().as_nanosecond() / 1_000_000) as i64;
     let mut data = ran.data.clone();
     data["inputHash"] = json!(shell.hash);
     // TUI 按它撤掉自己那条待确认的行（`MessageUser::shell.request_key`）。

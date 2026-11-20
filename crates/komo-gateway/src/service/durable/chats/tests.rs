@@ -373,7 +373,7 @@ async fn last_message_at_moves_with_input_final_reply_and_a_posted_line() {
         .unwrap();
     let list = chats(&gw).await;
     let row = list.chats.iter().find(|row| row.id == session).unwrap();
-    assert_eq!(row.last_message_at.unix_timestamp(), 1_700_000_000);
+    assert_eq!(row.last_message_at.as_second(), 1_700_000_000);
     gw.stop().await;
 }
 

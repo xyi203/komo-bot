@@ -17,6 +17,7 @@
 //!   干净重跑一次后看见行已在，答 `false`。
 
 use async_trait::async_trait;
+use jiff::Timestamp;
 use komo_kernel::cron::{
     CronFiring, CronJob, FiringStatus, JobStatus, NotifyPolicy, OverlapPolicy, ScheduleSeen,
     Trigger,
@@ -27,7 +28,6 @@ use komo_kernel::types::ids::{CronJobId, RunId, SessionId};
 use komo_kernel::types::matter::MatterState;
 use komo_kernel::types::model::{Effort, ModelConfig};
 use serde::{Deserialize, Serialize};
-use time::OffsetDateTime;
 
 use crate::db::{
     BoxFuture, Db, decode, encode, from_ts, from_ts_opt, map_toasty, to_ts, to_ts_opt,
@@ -91,7 +91,7 @@ impl ScheduleDef {
 }
 
 /// 唯一键 `job_id + scheduled_at` 的确定性行 ID。
-pub fn firing_id(job: &CronJobId, scheduled_at: OffsetDateTime) -> String {
+pub fn firing_id(job: &CronJobId, scheduled_at: Timestamp) -> String {
     ContentHash::of_str(&format!("{job}@{}", to_ts(scheduled_at)))
         .as_str()
         .to_string()
@@ -210,7 +210,7 @@ impl CronRepo for TursoCronRepo {
     async fn advance(
         &self,
         id: &CronJobId,
-        next_run_at: Option<OffsetDateTime>,
+        next_run_at: Option<Timestamp>,
         status: JobStatus,
         last_error: Option<String>,
     ) -> Result<(), RepoError> {
@@ -252,7 +252,7 @@ impl CronRepo for TursoCronRepo {
         &self,
         id: &CronJobId,
         seen: ScheduleSeen,
-        next_run_at: Option<OffsetDateTime>,
+        next_run_at: Option<Timestamp>,
         status: JobStatus,
         last_error: Option<String>,
     ) -> Result<bool, RepoError> {
@@ -326,7 +326,7 @@ impl CronRepo for TursoCronRepo {
             .map_err(RepoError::from)
     }
 
-    async fn due(&self, now: OffsetDateTime) -> Result<Vec<CronJob>, RepoError> {
+    async fn due(&self, now: Timestamp) -> Result<Vec<CronJob>, RepoError> {
         self.db
             .read(move |ex| {
                 Box::pin(async move {
@@ -362,7 +362,7 @@ impl CronRepo for TursoCronRepo {
     }
 
     async fn claim_firing(&self, firing: CronFiring) -> Result<bool, RepoError> {
-        let now = OffsetDateTime::now_utc();
+        let now = Timestamp::now();
         self.db
             .with_write_retry(move |ex| {
                 let firing = firing.clone();
@@ -514,9 +514,8 @@ mod tests {
     use komo_kernel::traits::MatterRepo;
     use komo_kernel::types::ids::MatterId;
     use komo_kernel::types::matter::{MatterChange, MatterKind, NewMatter, transition};
-    use time::macros::datetime;
 
-    const NOW: OffsetDateTime = datetime!(2026-09-15 08:00:00 UTC);
+    const NOW: Timestamp = jiff::Timestamp::constant(1789459200, 0) /* 2026-09-15T08:00:00Z */;
 
     async fn temp() -> (Db, tempfile::TempDir) {
         let dir = tempfile::tempdir().expect("临时目录");
@@ -562,12 +561,12 @@ mod tests {
             skills: vec!["memos".into()],
             max_rounds: Some(12),
             notify: Default::default(),
-            next_run_at: Some(NOW - time::Duration::minutes(1)),
+            next_run_at: Some(NOW - jiff::SignedDuration::from_mins(1)),
             last_error: None,
         }
     }
 
-    fn firing(job: &CronJobId, at: OffsetDateTime) -> CronFiring {
+    fn firing(job: &CronJobId, at: Timestamp) -> CronFiring {
         CronFiring {
             job: job.clone(),
             job_version: 1,
@@ -645,7 +644,7 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        let next = NOW + time::Duration::days(1);
+        let next = NOW + jiff::SignedDuration::from_hours(24);
         repo.advance(&id, Some(next), JobStatus::Active, None)
             .await
             .unwrap();
@@ -697,7 +696,7 @@ mod tests {
             .unwrap();
 
         // 这时调度器推进了槽位。
-        let next = NOW + time::Duration::days(1);
+        let next = NOW + jiff::SignedDuration::from_hours(24);
         repo.advance(
             &id,
             Some(next),
@@ -816,7 +815,7 @@ mod tests {
         let (repo, _db, _dir) = repo_with(&["g-1"]).await;
         let id = CronJobId::from_raw("g-1");
         let read = repo.put(job("g-1")).await.unwrap();
-        let later = Some(NOW + time::Duration::days(1));
+        let later = Some(NOW + jiff::SignedDuration::from_hours(24));
 
         // 期间暂停了：不写。
         repo.advance(&id, read.next_run_at, JobStatus::Paused, None)
@@ -859,7 +858,7 @@ mod tests {
         let id = stored.id.clone();
         assert!(repo.claim_firing(firing(&id, NOW)).await.unwrap());
         for minute in 1..=60 {
-            let at = NOW + time::Duration::minutes(minute);
+            let at = NOW + jiff::SignedDuration::from_mins(minute);
             assert!(
                 repo.claim_firing(CronFiring::skipped(&stored, at, "overlap"))
                     .await
@@ -882,7 +881,7 @@ mod tests {
         assert!(repo.claim_firing(firing(&id, NOW)).await.unwrap());
         assert!(!repo.claim_firing(firing(&id, NOW)).await.unwrap());
         assert!(
-            repo.claim_firing(firing(&id, NOW + time::Duration::days(1)))
+            repo.claim_firing(firing(&id, NOW + jiff::SignedDuration::from_hours(24)))
                 .await
                 .unwrap()
         );
@@ -979,7 +978,7 @@ mod tests {
         repo.put(paused).await.unwrap();
 
         let mut later = job("g-3");
-        later.next_run_at = Some(NOW + time::Duration::hours(1));
+        later.next_run_at = Some(NOW + jiff::SignedDuration::from_hours(1));
         repo.put(later).await.unwrap();
 
         // 搁置的目标：不再追踪，定时不触发。

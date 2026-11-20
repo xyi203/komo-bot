@@ -7,9 +7,9 @@
 use std::fmt;
 use std::str::FromStr;
 
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
-use time::OffsetDateTime;
-use uuid::{NoContext, Timestamp, Uuid};
+use uuid::{NoContext, Uuid};
 
 /// 解析标识符失败。
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -17,12 +17,12 @@ use uuid::{NoContext, Timestamp, Uuid};
 pub struct IdParseError(String);
 
 /// 由一个时刻生成 UUIDv7。
-pub fn uuid_v7_at(now: OffsetDateTime) -> Uuid {
-    let unix = now.unix_timestamp();
+pub fn uuid_v7_at(now: Timestamp) -> Uuid {
+    let unix = now.as_second();
     // 1970 之前的时刻在 v7 里没有表示；夹到 0 而不是 panic。
     let seconds = u64::try_from(unix).unwrap_or(0);
-    let nanos = now.nanosecond();
-    Uuid::new_v7(Timestamp::from_unix(NoContext, seconds, nanos))
+    let nanos = u32::try_from(now.subsec_nanosecond()).unwrap_or(0);
+    Uuid::new_v7(uuid::Timestamp::from_unix(NoContext, seconds, nanos))
 }
 
 macro_rules! id_type {
@@ -35,7 +35,7 @@ macro_rules! id_type {
 
         impl $name {
             /// 由一个时刻生成一个新 ID。
-            pub fn new_at(now: OffsetDateTime) -> Self {
+            pub fn new_at(now: Timestamp) -> Self {
                 Self(uuid_v7_at(now).to_string())
             }
 
@@ -198,7 +198,7 @@ impl fmt::Display for Seq {
 pub struct EventId(String);
 
 impl EventId {
-    pub fn new_at(now: OffsetDateTime) -> Self {
+    pub fn new_at(now: Timestamp) -> Self {
         Self(uuid_v7_at(now).to_string())
     }
 
@@ -242,19 +242,18 @@ impl fmt::Display for RequestKey {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use time::macros::datetime;
 
     #[test]
     fn id_generated_at_a_time_is_a_v7_uuid() {
-        let id = SessionId::new_at(datetime!(2026-09-15 08:00:00 UTC));
+        let id = SessionId::new_at("2026-09-15T08:00:00Z".parse::<jiff::Timestamp>().unwrap());
         let parsed = Uuid::parse_str(id.as_str()).expect("是 UUID");
         assert_eq!(parsed.get_version_num(), 7);
     }
 
     #[test]
     fn ids_generated_later_sort_after_earlier_ones() {
-        let early = RunId::new_at(datetime!(2026-09-15 08:00:00 UTC));
-        let late = RunId::new_at(datetime!(2026-09-15 09:00:00 UTC));
+        let early = RunId::new_at("2026-09-15T08:00:00Z".parse::<jiff::Timestamp>().unwrap());
+        let late = RunId::new_at("2026-09-15T09:00:00Z".parse::<jiff::Timestamp>().unwrap());
         assert!(early.as_str() < late.as_str());
     }
 

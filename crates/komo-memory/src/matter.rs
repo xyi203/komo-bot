@@ -399,20 +399,19 @@ fn optional_text(what: &str, raw: Option<&str>) -> Result<Option<Option<String>>
 mod tests {
     use super::*;
     use async_trait::async_trait;
+    use jiff::Timestamp;
     use komo_kernel::events::{Event, EventPayload, MessageUser};
     use komo_kernel::types::ids::{EventId, Seq};
     use komo_kernel::types::matter::MatterState;
     use komo_kernel::types::memory::EvidenceRef;
     use komo_store::{Db, TursoMatterRepo};
-    use time::OffsetDateTime;
-    use time::macros::datetime;
 
-    const NOW: OffsetDateTime = datetime!(2026-10-29 08:00 UTC);
+    const NOW: Timestamp = jiff::Timestamp::constant(1793260800, 0) /* 2026-10-29T08:00:00Z */;
 
     struct FixedClock;
 
     impl Clock for FixedClock {
-        fn now(&self) -> OffsetDateTime {
+        fn now(&self) -> Timestamp {
             NOW
         }
     }

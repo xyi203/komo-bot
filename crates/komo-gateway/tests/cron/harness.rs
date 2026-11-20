@@ -60,7 +60,7 @@ pub struct CronList {
 /// 一个定时的运行面：下一次，上一次。
 pub struct CronJobStatus {
     pub job: CronJobId,
-    pub next_run_at: Option<time::OffsetDateTime>,
+    pub next_run_at: Option<jiff::Timestamp>,
     pub last: Option<komo_kernel::cron::CronFiring>,
 }
 
@@ -197,7 +197,7 @@ impl CronOps for Gw {
             .cron
             .advance(
                 id,
-                Some(time::OffsetDateTime::now_utc() - time::Duration::seconds(1)),
+                Some(jiff::Timestamp::now() - jiff::SignedDuration::from_secs(1)),
                 job.status,
                 None,
             )

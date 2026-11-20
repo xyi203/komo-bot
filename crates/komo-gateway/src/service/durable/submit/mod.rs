@@ -548,12 +548,8 @@ impl DurableCore {
     ) -> Result<SubmissionId, SessionError> {
         let record = self.session(session).await?;
         ensure_open(&record)?;
-        let handoff = handoff.map(|text| {
-            Message::user(
-                text,
-                (self.clock.now().unix_timestamp_nanos() / 1_000_000) as i64,
-            )
-        });
+        let handoff = handoff
+            .map(|text| Message::user(text, (self.clock.now().as_nanosecond() / 1_000_000) as i64));
         Ok(self
             .harness
             .reset(&self.engine, record.current_branch, handoff)

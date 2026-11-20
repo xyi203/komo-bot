@@ -1,9 +1,9 @@
 //! 离线整理的两处落库（§9.8）：读游标、一组一个事务地写。
 
+use jiff::Timestamp;
 use komo_kernel::traits::{ConsolidationWrite, RepoError, StoreError};
 use komo_kernel::types::ids::MemoryId;
 use komo_kernel::types::memory::MemoryState;
-use time::OffsetDateTime;
 
 use super::{clear_index_in, enum_str, put_in, require_revision};
 use crate::db::{BoxFuture, Db, from_ts, map_toasty, to_ts};
@@ -12,7 +12,7 @@ use crate::models::MemoryItemRow;
 pub(super) async fn marks(
     db: &Db,
     ids: &[MemoryId],
-) -> Result<Vec<(MemoryId, Option<OffsetDateTime>)>, RepoError> {
+) -> Result<Vec<(MemoryId, Option<Timestamp>)>, RepoError> {
     let ids: Vec<String> = ids.iter().map(|id| id.to_string()).collect();
     db.read(move |ex| {
         let ids = ids.clone();
@@ -30,7 +30,7 @@ pub(super) async fn marks(
                 ));
             }
             Ok(out)
-        }) as BoxFuture<'_, Result<Vec<(MemoryId, Option<OffsetDateTime>)>, StoreError>>
+        }) as BoxFuture<'_, Result<Vec<(MemoryId, Option<Timestamp>)>, StoreError>>
     })
     .await
     .map_err(RepoError::from)

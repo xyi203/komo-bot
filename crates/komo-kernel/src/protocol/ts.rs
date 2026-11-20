@@ -8,7 +8,7 @@
 //! 再把它列进 [`export_all`]。
 //!
 //! 与线上 JSON 的几处约定：
-//! - `OffsetDateTime` 是 RFC 3339 字符串；`Seq` 是 JSON 数字（大整数配置成 `number`）。
+//! - `Timestamp` 是 RFC 3339 字符串；`Seq` 是 JSON 数字（大整数配置成 `number`）。
 //! - `Event` 没有 derive 能描述的形状（自定义序列化），线上给 [`WireEvent`] 这个裸信封；`data` 随
 //!   `type` 变，客户端按 `type` 自己收窄。
 //! - `skip_serializing_if` 的 `Vec` 字段（如 `ApiError.keys`）线上为空时不出现，TS 里仍写成必填，

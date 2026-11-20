@@ -737,7 +737,7 @@ pub struct RequestKeys;
 impl RequestKeys {
     /// 一次新的操作：UUIDv7，前 48 位就是这一刻。重发同一次操作要**复用**返回的键，
     /// 不是再调一次这个函数。
-    pub fn fresh(now: time::OffsetDateTime) -> RequestKey {
+    pub fn fresh(now: jiff::Timestamp) -> RequestKey {
         RequestKey::new(uuid_v7_at(now).to_string())
     }
 
@@ -826,7 +826,7 @@ mod tests {
 
     #[test]
     fn two_fresh_request_keys_are_different() {
-        let now = time::OffsetDateTime::now_utc();
+        let now = jiff::Timestamp::now();
         assert_ne!(RequestKeys::fresh(now), RequestKeys::fresh(now));
         // 派生的键则是稳定的：重发同一次操作带同一个键。
         assert_eq!(

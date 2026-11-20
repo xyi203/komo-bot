@@ -8,6 +8,7 @@
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use jiff::Timestamp;
 use komo_kernel::events::{Event, EventPayload, MessageAssistant, RunAccepted, ToolResult};
 use komo_kernel::protocol::config::{MemoryConfig, RetrievalConfig};
 use komo_kernel::protocol::http::MemoryAddRequest;
@@ -30,12 +31,10 @@ use komo_kernel::types::status::RunState;
 use komo_kernel::types::turn::{MemoryUse, Round};
 use komo_store::models::SessionKind;
 use komo_store::{Db, TursoMemoryRepo};
-use time::OffsetDateTime;
-use time::macros::datetime;
 
 use super::*;
 
-const NOW: OffsetDateTime = datetime!(2026-09-17 08:00:00 UTC);
+const NOW: Timestamp = jiff::Timestamp::constant(1789632000, 0) /* 2026-09-17T08:00:00Z */;
 
 mod belongs;
 
@@ -45,7 +44,7 @@ mod belongs;
 struct FixedClock;
 
 impl Clock for FixedClock {
-    fn now(&self) -> OffsetDateTime {
+    fn now(&self) -> Timestamp {
         NOW
     }
 }
@@ -218,7 +217,7 @@ impl MemWork {
 impl MemoryWorkLog for MemWork {
     async fn claim(
         &self,
-        _idle: time::Duration,
+        _idle: jiff::SignedDuration,
         limit: usize,
     ) -> Result<Vec<MemoryBatch>, StoreError> {
         // 空闲与否由 store 的测试管；这里只按会话把队列里的 Run 成批交出去。
@@ -1099,11 +1098,11 @@ async fn a_failing_first_build_reports_its_progress_and_a_manual_rebuild_wakes_t
 
 #[test]
 fn index_retries_back_off_up_to_thirty_minutes() {
-    assert_eq!(index_backoff(1), time::Duration::seconds(30));
-    assert_eq!(index_backoff(2), time::Duration::seconds(60));
-    assert_eq!(index_backoff(3), time::Duration::seconds(120));
-    assert_eq!(index_backoff(7), time::Duration::minutes(30));
-    assert_eq!(index_backoff(u32::MAX), time::Duration::minutes(30));
+    assert_eq!(index_backoff(1), jiff::SignedDuration::from_secs(30));
+    assert_eq!(index_backoff(2), jiff::SignedDuration::from_secs(60));
+    assert_eq!(index_backoff(3), jiff::SignedDuration::from_secs(120));
+    assert_eq!(index_backoff(7), jiff::SignedDuration::from_mins(30));
+    assert_eq!(index_backoff(u32::MAX), jiff::SignedDuration::from_mins(30));
 }
 
 // =========================================================== ⑥ 降级
@@ -2414,7 +2413,7 @@ async fn adoption_harness(events: Vec<Event>, replies: &[&str]) -> Harness {
     harness
 }
 
-async fn adoption_of(harness: &Harness) -> (u64, Option<OffsetDateTime>, MemoryState, u32) {
+async fn adoption_of(harness: &Harness) -> (u64, Option<Timestamp>, MemoryState, u32) {
     let item = harness
         .repo
         .get(&MemoryId::from_raw("m-1"))

@@ -259,7 +259,7 @@ async fn firing_twice_with_the_same_session_returns_the_same_run() {
     let home = Home::new();
     let gw = home.start(FakeLlm::always(vec![text_round(1, "好")])).await;
     let job = gw.add_job(daily()).await;
-    let slot = time::OffsetDateTime::now_utc();
+    let slot = jiff::Timestamp::now();
     let spec = FireSpec {
         job: job.clone(),
         session: komo_kernel::types::ids::SessionId::new_at(slot),

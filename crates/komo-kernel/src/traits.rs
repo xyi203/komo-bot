@@ -13,7 +13,7 @@
 //! 安全，一次堆分配相对模型往返可忽略。
 
 use async_trait::async_trait;
-use time::OffsetDateTime;
+use jiff::Timestamp;
 
 use crate::cron::{
     CronFiring, CronJob, FiringStatus, JobStatus, ScheduleSeen, ZoneError, ZoneResolution,
@@ -226,7 +226,7 @@ pub trait CronRepo: Send + Sync {
     async fn advance(
         &self,
         id: &CronJobId,
-        next_run_at: Option<OffsetDateTime>,
+        next_run_at: Option<Timestamp>,
         status: JobStatus,
         last_error: Option<String>,
     ) -> Result<(), RepoError>;
@@ -241,7 +241,7 @@ pub trait CronRepo: Send + Sync {
         &self,
         id: &CronJobId,
         seen: ScheduleSeen,
-        next_run_at: Option<OffsetDateTime>,
+        next_run_at: Option<Timestamp>,
         status: JobStatus,
         last_error: Option<String>,
     ) -> Result<bool, RepoError>;
@@ -250,7 +250,7 @@ pub trait CronRepo: Send + Sync {
     async fn remove(&self, id: &CronJobId) -> Result<bool, RepoError>;
 
     /// 到期的 Job：只含目标还在追踪（进行中 / 等待中）、定时启用的。
-    async fn due(&self, now: OffsetDateTime) -> Result<Vec<CronJob>, RepoError>;
+    async fn due(&self, now: Timestamp) -> Result<Vec<CronJob>, RepoError>;
 
     /// 插入一条触发记录并占住它。唯一键是 `job_id + scheduled_at`，**已经存在就返回
     /// `false`**——同一计划时间不重复创建运行（§10）。
@@ -286,7 +286,7 @@ pub trait CronRepo: Send + Sync {
     async fn firings_page(
         &self,
         id: &CronJobId,
-        before: Option<OffsetDateTime>,
+        before: Option<Timestamp>,
         limit: u32,
     ) -> Result<Vec<CronFiring>, RepoError> {
         // 默认实现整张读出来再切：存储本来就是整目标读出来排序的（见 `TursoCronRepo::firings`）。
@@ -307,13 +307,13 @@ pub trait CronRepo: Send + Sync {
 pub struct ConsolidationWrite {
     /// 判定时看到的每个成员：id、revision、updated_at。任何一个对不上（被后台提取、
     /// 操作者的 confirm / forget 动过）整组一个字都不写、也不盖游标。
-    pub expected: Vec<(MemoryId, u32, OffsetDateTime)>,
+    pub expected: Vec<(MemoryId, u32, Timestamp)>,
     /// 要写的新形态。revision 与 `expected` 里的相同——整理不升 revision。
     pub puts: Vec<MemoryItem>,
     /// 走 forget 同一条路停用的条目（状态、关键词与向量一起失效）。
     pub forgets: Vec<MemoryId>,
     /// 写完后给 `expected` 里每条盖上的 `consolidated_at`。
-    pub stamp_at: OffsetDateTime,
+    pub stamp_at: Timestamp,
 }
 
 /// `MemoryManager` 的全部状态读写。**召回排序逻辑要在无数据库下可测**，所以它是
@@ -339,7 +339,7 @@ pub trait MemoryRepo: Send + Sync {
         &self,
         id: &MemoryId,
         expected_revision: u32,
-        at: OffsetDateTime,
+        at: Timestamp,
     ) -> Result<MemoryItem, RepoError>;
 
     /// 停用某个 revision，并使关键词、向量与检查点里的引用失效（§9.6）。
@@ -347,7 +347,7 @@ pub trait MemoryRepo: Send + Sync {
         &self,
         id: &MemoryId,
         expected_revision: u32,
-        at: OffsetDateTime,
+        at: Timestamp,
     ) -> Result<MemoryItem, RepoError>;
 
     /// 写入一条记忆在当前代次的向量。入库前实现要再确认正文、版本、状态与指纹未变；
@@ -364,7 +364,7 @@ pub trait MemoryRepo: Send + Sync {
     async fn consolidation_marks(
         &self,
         ids: &[MemoryId],
-    ) -> Result<Vec<(MemoryId, Option<OffsetDateTime>)>, RepoError>;
+    ) -> Result<Vec<(MemoryId, Option<Timestamp>)>, RepoError>;
 
     /// 离线整理一组的落库（§9.8）：见 [`ConsolidationWrite`]。对不上预期就
     /// [`RepoError::VersionConflict`]，什么都不写。
@@ -538,15 +538,14 @@ pub enum MonitorError {
 /// Cron 到期、`valid_until`、重试退避全部依赖时间，所以它必须可拨。
 /// **kernel 里没有第二个读时钟的地方。**
 pub trait Clock: Send + Sync {
-    fn now(&self) -> OffsetDateTime;
+    fn now(&self) -> Timestamp;
 }
 
 /// IANA 时区名 → 偏移。
 ///
-/// 这是 kernel 唯一的"外部世界知识"缺口：`time` 表示得了偏移，表示不了**规则**，而
-/// 「Asia/Shanghai 在 2026-03-29 02:30 是几点」要查 tzdb。kernel 不带 tzdb（它是一份
-/// 随操作系统更新的数据，属于运行环境而不是领域），所以这里留一个 port：生产实现在
-/// runtime（读系统 zoneinfo 或一个 tzdb crate），kernel 自带
+/// 这是 kernel 唯一的"外部世界知识"缺口：「Asia/Shanghai 在 2026-03-29 02:30 是几点」
+/// 要查 tzdb。kernel 不查 tzdb（它是一份随操作系统更新的数据，属于运行环境而不是领域），
+/// 所以这里留一个 port：生产实现在 runtime（jiff 读系统 zoneinfo 或自带的 tzdb），kernel 自带
 /// [`FixedOffsetZone`](crate::cron::FixedOffsetZone) 作为 UTC 与"无 tzdb"时的明确降级，
 /// test_support 里有一个可编脚本的假实现用来测夏令时的两条规则。
 ///
@@ -560,11 +559,11 @@ pub trait ZoneResolver: Send + Sync {
     fn resolve(
         &self,
         zone: &str,
-        local: time::PrimitiveDateTime,
+        local: jiff::civil::DateTime,
     ) -> Result<ZoneResolution, ZoneError>;
 
     /// 这个瞬时在这个区里的偏移。
-    fn offset_at(&self, zone: &str, instant: OffsetDateTime) -> Result<time::UtcOffset, ZoneError>;
+    fn offset_at(&self, zone: &str, instant: Timestamp) -> Result<jiff::tz::Offset, ZoneError>;
 }
 
 #[cfg(test)]

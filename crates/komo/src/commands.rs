@@ -44,7 +44,7 @@ pub async fn session_list(
         })
         .await
         .map_err(failed)?;
-    let mut out = render::session_list(&response, time::OffsetDateTime::now_utc());
+    let mut out = render::session_list(&response, jiff::Timestamp::now());
     if let Some(next) = &response.next_cursor {
         out.push_str(&format!(
             "\n\n还有更多：komo session list{}{} --cursor {next}（--limit 0 一次列完）",
@@ -77,10 +77,7 @@ pub async fn monitor_list(client: &KomoClient, all: bool) -> Outcome {
         .list_monitors(&MonitorListQuery { all })
         .await
         .map_err(failed)?;
-    Ok(render::monitor_list(
-        &response,
-        time::OffsetDateTime::now_utc(),
-    ))
+    Ok(render::monitor_list(&response, jiff::Timestamp::now()))
 }
 
 /// `komo session delete`：**逻辑删除**（§8.10）。
@@ -153,10 +150,7 @@ pub async fn session_export(
 pub async fn run_inspect(client: &KomoClient, run: &str) -> Outcome {
     let run = RunId::from_raw(run);
     let detail = client.run(&run).await.map_err(failed)?;
-    Ok(render::run_inspect(
-        &detail,
-        time::OffsetDateTime::now_utc(),
-    ))
+    Ok(render::run_inspect(&detail, jiff::Timestamp::now()))
 }
 
 pub async fn run_cancel(client: &KomoClient, run: &str) -> Outcome {
@@ -165,7 +159,7 @@ pub async fn run_cancel(client: &KomoClient, run: &str) -> Outcome {
         .cancel_run(
             &run,
             &CancelRunRequest {
-                request_key: Some(RequestKeys::fresh(time::OffsetDateTime::now_utc())),
+                request_key: Some(RequestKeys::fresh(jiff::Timestamp::now())),
             },
         )
         .await
@@ -369,7 +363,7 @@ pub async fn memory_add(
             scope,
             session: from_env("KOMO_SESSION").map(SessionId::from_raw),
             run: from_env("KOMO_RUN").map(RunId::from_raw),
-            request_key: Some(RequestKeys::fresh(time::OffsetDateTime::now_utc())),
+            request_key: Some(RequestKeys::fresh(jiff::Timestamp::now())),
             application,
             applies_when: applies_when.map(str::to_string),
             belongs_to: belongs_to.map(MatterId::from_raw),
@@ -424,7 +418,7 @@ pub async fn memory_classify(
                 belongs_to,
                 clear_belongs_to,
                 session,
-                request_key: Some(RequestKeys::fresh(time::OffsetDateTime::now_utc())),
+                request_key: Some(RequestKeys::fresh(jiff::Timestamp::now())),
             },
         )
         .await
@@ -454,7 +448,7 @@ pub async fn memory_forget(client: &KomoClient, id: &str, revision: u32) -> Outc
             &MemoryId::from_raw(id),
             &MemoryRevisionRequest {
                 expected_revision: revision,
-                request_key: Some(RequestKeys::fresh(time::OffsetDateTime::now_utc())),
+                request_key: Some(RequestKeys::fresh(jiff::Timestamp::now())),
             },
         )
         .await
@@ -468,7 +462,7 @@ pub async fn memory_restore(client: &KomoClient, id: &str, revision: u32) -> Out
             &MemoryId::from_raw(id),
             &MemoryRevisionRequest {
                 expected_revision: revision,
-                request_key: Some(RequestKeys::fresh(time::OffsetDateTime::now_utc())),
+                request_key: Some(RequestKeys::fresh(jiff::Timestamp::now())),
             },
         )
         .await
@@ -527,7 +521,7 @@ pub async fn memory_index(client: &KomoClient) -> Outcome {
 pub async fn memory_rebuild(client: &KomoClient) -> Outcome {
     let response = client
         .rebuild_memory_index(&RebuildIndexRequest {
-            request_key: Some(RequestKeys::fresh(time::OffsetDateTime::now_utc())),
+            request_key: Some(RequestKeys::fresh(jiff::Timestamp::now())),
         })
         .await
         .map_err(failed)?;
@@ -694,7 +688,7 @@ pub fn auth_mcp_status(home: &Path) -> Outcome {
             Some(status) => {
                 let expiry = status
                     .expires_at
-                    .and_then(|secs| time::OffsetDateTime::from_unix_timestamp(secs as i64).ok())
+                    .and_then(|secs| jiff::Timestamp::from_second(secs as i64).ok())
                     .map_or("未给过期时间".to_string(), |at| {
                         format!("过期 {}", render::stamp(at))
                     });

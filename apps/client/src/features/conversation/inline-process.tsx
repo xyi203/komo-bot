@@ -6,18 +6,19 @@ import { useEffect, useRef, useState } from "react";
 import { Icon } from "@/components/icon";
 import { cn } from "@/lib/utils";
 import { StepsFold } from "./steps";
+import { UserBubble } from "./user-bubble";
 
 /**
  * 一轮的过程放进回复里，照 Claude Desktop 的做法：思考与工具调用按时间顺序排在回复上方，
  * 相邻的并成一组、一组一行（点开看每一步），中间说的话照常穿插在组之间；在跑的那组标题扫光，
  * 写的是此刻在做什么。还没有任何过程时是一行「正在思考」（排队时「排队中」）。
  *
- * 召回在回复下面的「用了 N 条记忆」里，插话已经是上面的用户气泡，这里不重复。
+ * 插话（在跑时又发的话）按时间顺序作为用户气泡穿插在过程里；召回在回复下面的「用了 N 条记忆」里。
  * 右侧过程面板仍在（回复下的「查看过程」）：那里有轨迹、改动与这一轮的完整统计。
  */
 export function InlineProcess({ turn, streaming, thinking = "" }: { turn: Turn; streaming: boolean; thinking?: string }) {
   const live = turn.status === "running" || turn.status === "queued";
-  const parts = segments(turn.process).filter((part) => part.kind === "steps" || part.kind === "text");
+  const parts = segments(turn.process).filter((part) => part.kind === "steps" || part.kind === "text" || part.kind === "steer");
   const lastIndex = parts.length - 1;
   // 这一轮的思考正在流进来：由下面的思考框说话，上一组过程不再标「在跑」
   const thinkingLive = live && !!thinking;
@@ -33,6 +34,10 @@ export function InlineProcess({ turn, streaming, thinking = "" }: { turn: Turn; 
           </div>
         ) : part.kind === "text" ? (
           <Markdown key={part.id} text={part.text} className="process-in my-3" />
+        ) : part.kind === "steer" ? (
+          <div key={part.id} className="process-in my-4">
+            <UserBubble text={part.text} at={part.at} />
+          </div>
         ) : null,
       )}
       {thinkingLive && <LiveThinking text={thinking} answering={streaming} />}

@@ -28,7 +28,7 @@ export interface Call {
 }
 
 export type ProcessItem =
-  | { kind: "steer"; id: string; text: string }
+  | { kind: "steer"; id: string; text: string; at: string }
   | { kind: "recall"; id: string; uses: MemoryUse[] }
   | { kind: "text"; id: string; text: string }
   | { kind: "think"; id: string; text: string }
@@ -114,7 +114,7 @@ function apply(view: View, event: WireEvent): void {
   switch (event.type) {
     case "message.user": {
       const { text = "" } = payload<{ text: string }>(event);
-      if (turn && turn.status === "running" && turn.users.length) turn.process.push({ kind: "steer", id: event.event_id, text });
+      if (turn && turn.status === "running" && turn.users.length) turn.process.push({ kind: "steer", id: event.event_id, text, at: event.at });
       else if (turn) turn.users.push({ text, at: event.at });
       else view.items.push({ kind: "user", id: event.event_id, text, at: event.at });
       break;
@@ -202,7 +202,7 @@ function apply(view: View, event: WireEvent): void {
       // 插话：这条排队的输入被正在跑的那一轮并了进去，话挪到宿主那一轮的过程里
       const host = view.turns.get(payload<RunPayload>(event).into ?? "");
       if (turn && host) {
-        for (const user of turn.users) host.process.push({ kind: "steer", id: `${turn.id}-${user.at}`, text: user.text });
+        for (const user of turn.users) host.process.push({ kind: "steer", id: `${turn.id}-${user.at}`, text: user.text, at: user.at });
         view.items.splice(view.items.indexOf(turn), 1);
         view.turns.delete(turn.run);
       }

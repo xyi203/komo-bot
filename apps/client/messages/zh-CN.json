@@ -812,6 +812,7 @@
   "proc_meta": "用时 {time} · 调用 {steps} 次",
   "proc_next": "下一轮",
   "proc_prev": "上一轮",
+  "proc_resize": "拖动调整宽度，双击恢复默认",
   "proc_tab_changes": "改动",
   "proc_tab_steps": "步骤",
   "proc_tab_trace": "轨迹",

@@ -12,7 +12,8 @@ import { m } from "@/paraglide/messages.js";
 import type { Turn, View } from "./model";
 import { AttachmentList, splitAttachments } from "./attachments";
 import { ReplyView } from "./reply";
-import { TurnView, UserBubble } from "./turn";
+import { TurnView } from "./turn";
+import { UserBubble } from "./user-bubble";
 
 export interface PendingSend {
   id: string;

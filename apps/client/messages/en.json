@@ -820,6 +820,7 @@
   "proc_meta": "{time} · {steps} tool calls",
   "proc_next": "Next turn",
   "proc_prev": "Previous turn",
+  "proc_resize": "Drag to resize, double-click to reset",
   "proc_tab_changes": "Changes",
   "proc_tab_steps": "Steps",
   "proc_tab_trace": "Trace",

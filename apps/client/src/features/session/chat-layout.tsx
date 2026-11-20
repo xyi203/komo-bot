@@ -27,7 +27,7 @@ export function ChatLayout({
   scroller?: RefObject<HTMLDivElement | null>;
   onScroll?: (el: HTMLDivElement) => void;
   aside?: ReactNode;
-  /** 过程面板（有才出现）：宽 380 占一列；≤1180 时面板自己浮在上面，不占列。 */
+  /** 过程面板（有才出现）：占一列，宽度由面板自己定（默认 380，可拖）；≤1180 时面板自己浮在上面，不占列。 */
   panel?: ReactNode;
   /** 右上角的小按钮（桌面壳的浏览器开关）。 */
   corner?: ReactNode;
@@ -40,10 +40,10 @@ export function ChatLayout({
         "grid h-full min-h-0 overflow-hidden",
         aside
           ? panel
-            ? "grid-cols-[minmax(0,1fr)_minmax(0,1fr)_380px] max-[1180px]:grid-cols-[minmax(0,1fr)_minmax(0,1fr)]"
+            ? "grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto] max-[1180px]:grid-cols-[minmax(0,1fr)_minmax(0,1fr)]"
             : "grid-cols-[minmax(0,1fr)_minmax(0,1fr)]"
           : panel
-            ? "grid-cols-[minmax(0,1fr)_380px] max-[1180px]:grid-cols-[minmax(0,1fr)]"
+            ? "grid-cols-[minmax(0,1fr)_auto] max-[1180px]:grid-cols-[minmax(0,1fr)]"
             : "grid-cols-[minmax(0,1fr)]",
       )}
     >

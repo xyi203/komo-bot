@@ -1015,6 +1015,7 @@ mod wire_tests {
     /// 连不上（网关还没起来）时刷新不会假装成功，错误照旧报出来。
     #[tokio::test]
     async fn refresh_does_not_invent_an_instance_when_nothing_is_listening() {
+        crate::test_server::install_crypto_provider();
         let home = tempfile::tempdir().expect("临时数据目录");
         write_discovery(home.path(), "http://127.0.0.1:1", "inst-gone", "token");
         let client = KomoClient::with_home(

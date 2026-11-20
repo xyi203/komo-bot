@@ -512,6 +512,13 @@ mod tests {
     use serde_json::json;
     use tokio::task::JoinHandle;
 
+    /// 建客户端要 rustls 的加密实现：生产里 `main` 启动时装，测试里自己装——
+    /// 不能指望同一个测试程序里别的测试先装过（单跑一条、或 nextest 一条一个进程都会失败）。
+    fn client() -> Result<reqwest::Client, String> {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        super::client()
+    }
+
     /// 一个假 GitHub：`/latest` 给一份 release 报文，`/files/<名字>` 给资产本体。
     struct Fake {
         addr: SocketAddr,

@@ -114,24 +114,12 @@ pub(crate) fn failure_prefix(error: &str, calls: &[NestedCall], names: &[String]
 
 /// 只匹配已经复现的异常，不根据脚本文字猜错因，也不重写或重跑代码。
 fn diagnostic(reason: &str) -> Option<String> {
-    if ["fromtimestamp", "utcfromtimestamp"].iter().any(|method| {
-        reason
-            == format!(
-                "AttributeError: type object 'datetime.datetime' has no attribute '{method}'"
-            )
-    }) {
-        return Some("当前 Monty 未实现这个时间 API。Unix 秒转 UTC：import time；time.strftime(\"%Y-%m-%d %H:%M:%S\", time.gmtime(float(ts)))；固定 UTC+8 在 gmtime 入参加 8*3600（不处理地区夏令时）。".into());
-    }
-    // 2026-10-20 复盘 session 实测：`json.load(open(p))`。
-    if ["load", "dump"].iter().any(|method| {
-        reason.starts_with(&format!(
-            "AttributeError: module 'json' has no attribute '{method}'"
-        ))
-    }) {
-        return Some(
-            "当前 Monty 的 json 只有 loads / dumps：读文件写 json.loads(open(p).read())；写文件用 write 工具。"
-                .into(),
-        );
+    // Monty 1.6.0 起有 `datetime.fromtimestamp` 与 `json.load` / `dump`（1.1.0 没有，原先这里教绕法）；
+    // `utcfromtimestamp` 仍没有（CPython 3.12 起也弃用了），指向带时区的写法。
+    if reason
+        == "AttributeError: type object 'datetime.datetime' has no attribute 'utcfromtimestamp'"
+    {
+        return Some("Monty 没有 utcfromtimestamp：写 datetime.fromtimestamp(ts, timezone.utc)（from datetime import datetime, timezone）；固定 UTC+8 用 timezone(timedelta(hours=8))。".into());
     }
     for module in [
         "json",
@@ -247,7 +235,7 @@ mod tests {
     #[test]
     fn diagnostics_do_not_guess_from_unrelated_names_or_attributes() {
         for error in [
-            "AttributeError: type object 'Widget' has no attribute 'fromtimestamp'",
+            "AttributeError: type object 'Widget' has no attribute 'utcfromtimestamp'",
             "NameError: name 'json_data' is not defined",
             "KeyError: json",
             "AttributeError: module 'json' has no attribute 'loader'",
@@ -257,10 +245,15 @@ mod tests {
     }
 
     #[test]
-    fn json_load_points_at_loads_of_the_file_text() {
-        let hint = super::diagnostic("AttributeError: module 'json' has no attribute 'load'")
-            .expect("复现过的异常");
-        assert!(hint.contains("json.loads(open(p).read())"), "{hint}");
+    fn utcfromtimestamp_points_at_fromtimestamp_with_a_timezone() {
+        let hint = super::diagnostic(
+            "AttributeError: type object 'datetime.datetime' has no attribute 'utcfromtimestamp'",
+        )
+        .expect("复现过的异常");
+        assert!(
+            hint.contains("datetime.fromtimestamp(ts, timezone.utc)"),
+            "{hint}"
+        );
     }
 
     #[test]

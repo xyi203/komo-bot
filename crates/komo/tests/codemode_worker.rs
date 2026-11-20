@@ -82,6 +82,44 @@ text([time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(float(ts) + offset))
     );
 }
 
+/// Monty 1.6.0 起有 `json.load` 与 `datetime.fromtimestamp`（1.1.0 都没有，此前靠修复提示教绕法）。
+/// 带 `tz` 才和机器时区无关；`utcfromtimestamp` 仍没有（CPython 也已弃用）。
+#[tokio::test]
+async fn json_load_and_fromtimestamp_work_in_the_real_worker() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("data.json");
+    std::fs::write(&file, r#"{"items": [1, 2, 3], "name": "komo"}"#).unwrap();
+    let code = format!(
+        r#"
+import json
+from datetime import datetime, timezone, timedelta
+data = json.load(open("{file}"))
+text(data["name"] + " " + str(sum(data["items"])))
+utc = datetime.fromtimestamp(1729324800.25, timezone.utc)
+text(utc.strftime("%Y-%m-%d %H:%M:%S"))
+text(datetime.fromtimestamp(1729324800, timezone(timedelta(hours=8))).isoformat())
+try:
+    datetime.utcfromtimestamp(0)
+    text("utcfromtimestamp exists")
+except AttributeError as e:
+    text(str(e))
+"#,
+        file = file.display()
+    );
+    let outcome = run(&Worker::exe(exe()), &code, Duration::from_secs(30)).await;
+    assert_eq!(outcome.error, None);
+    assert_eq!(
+        outcome.outputs,
+        vec![
+            "komo 6".to_string(),
+            "2024-10-19 08:00:00".to_string(),
+            "2024-10-19T16:00:00+08:00".to_string(),
+            // komo-runtime 的 `codemode_text::diagnostic` 认这句原文。
+            "type object 'datetime.datetime' has no attribute 'utcfromtimestamp'".to_string(),
+        ]
+    );
+}
+
 #[tokio::test]
 async fn the_worker_process_reads_files_but_cannot_write_them_and_has_no_environment() {
     let dir = tempfile::tempdir().unwrap();

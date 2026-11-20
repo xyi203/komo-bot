@@ -80,13 +80,9 @@ impl Tool for CodemodeTool {
                           读不到环境变量，只有 json、re、math、time、datetime、collections、itertools \
                           等少数标准库，没有第三方库。要写文件用 write / edit，要完整的 Python \
                           （第三方库、写文件、联网）用 bash 跑 python3。每次调用都是独立脚本，\
-                          json、re、time 等必须在本段显式 import。json 只有 loads / dumps，\
-                          读 JSON 文件写 json.loads(open(p).read())。datetime.fromtimestamp / \
-                          utcfromtimestamp 未实现；Unix 秒转 UTC 用：\n\
-                          import time\n\
-                          ts = 1729324800.25\n\
-                          text(time.strftime(\"%Y-%m-%d %H:%M:%S\", time.gmtime(float(ts))))\n\
-                          固定 UTC+8 在 gmtime 入参加 8*3600；只展示到秒，不处理地区夏令时。\n\
+                          json、re、time 等必须在本段显式 import。读 JSON 文件用 json.load(open(p))。\
+                          Unix 秒转时间写 datetime.fromtimestamp(ts, timezone.utc)，固定 UTC+8 用 \
+                          timezone(timedelta(hours=8))；不带 tz 是机器时区，没有 utcfromtimestamp。\n\
                           - tools.<name>(**args)：调工具，返回 {\"status\", \"text\", \"result\"}；\
                           text 是工具的正文输出（read 是文件内容，rg 是匹配行），result 是结构化\
                           结果。先检查 status；failed 也可能正常返回字典，并不自动抛 ToolError。\

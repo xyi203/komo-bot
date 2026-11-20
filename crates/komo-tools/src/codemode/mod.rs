@@ -24,7 +24,7 @@ pub mod worker;
 
 /// 脚本引擎的版本：写进 journal 的 `start` 指纹，升级后在途的 codemode 调用恢复时按分歧处理。
 /// 与根 `Cargo.toml` 里 `monty` 的精确钉版本同步（有测试守着）。
-pub const MONTY_VERSION: &str = "1.1.0";
+pub const MONTY_VERSION: &str = "1.6.0";
 /// worker 协议版本：请求 / 消息 / 脚本前置代码（`prelude.py`）任一变了就加一。
 /// 3：延后调用（`atools`）与 `wait`。
 pub const WORKER_PROTOCOL: u32 = 3;

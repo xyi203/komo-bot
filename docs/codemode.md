@@ -47,7 +47,7 @@ Monty 是 Rust 写的 Python 子集解释器，语言本身没有文件、网络
   codemode 只管汇总与过滤，不追求完整 Python。2026-10-15 POC 用 381 段真实 codemode 脚本验证：
   全部能编译；130 段有完整子调用录像的回放全部行为一致。
 - 异常类型是封闭枚举，没有用户子类：`ToolError` 只能是 `RuntimeError` 的别名（§6）。
-- Monty 版本钉死（`=1.1.0`）：它的快照与 `unstable` 访问器没有兼容保证，升级必须重跑回放集。
+- Monty 版本钉死（`=1.6.0`，2026-11-20 从 1.1.0 升上来）：它的快照与 `unstable` 访问器没有兼容保证，升级必须重跑回放集。
 - 引擎是进程内的 Rust 代码，不是内核隔离：Monty 自身的 bug 理论上能越界。所以仍放进独立的 worker 进程
   （§4），宿主管限制与杀进程；这一层不是 OS 沙箱，不挡一个能利用 Monty 漏洞的脚本。
 
@@ -212,7 +212,7 @@ stdout/stderr 底层写失败由宿主独立锁存；即使工具将其转成普
 工具自己的失败（`status: failed`，如 bash 非零退出）照常是正常返回的字典，不算 rejected。没被 await 的延后调用
 也已发出，宿主在脚本结束后等它们落下结果再收尾。256 次上限两种调用合计；超限的延后调用在 `await` 处抛
 `ToolError`。宿主致命错误（uncertain 等）锁住之后，还没准入的延后调用不再执行；已经准入的在跑完后照常落账。
-`asyncio.sleep` 不支持（worker 不答它的 OsCall，脚本里抛错；要等用 `time.sleep`），`create_task` Monty 1.1.0 没有。
+`asyncio.sleep` 不支持（worker 不答它的 OsCall，脚本里抛错；要等用 `time.sleep`），`create_task` Monty 1.6.0 仍没有。
 
 例如，有副作用 MCP 可以和只读查询放进同一段脚本：
 
@@ -229,10 +229,10 @@ MCP 的 `read_only` 仍由操作者声明，只决定中断后能否安全重做
 
 工具 `codemode`，参数 `{"code": "<Python 源码>"}`。脚本是模块级代码：
 
-每次调用都是独立脚本，`json`、`re`、`time` 等要在本段显式 import。Monty 1.1.0 的 `json` 只有
-`loads` / `dumps`（`json.load` 报 AttributeError，失败首部会提示改写 `json.loads(open(p).read())`）；
-也没有 `datetime.datetime.fromtimestamp` / `utcfromtimestamp`；Unix 秒的展示使用已在真实 worker
-验证的写法（支持小数与负时间戳，只展示到秒）：
+每次调用都是独立脚本，`json`、`re`、`time` 等要在本段显式 import。2026-11-20 升到 Monty 1.6.0 之后，
+`json.load` / `json.dump` 与 `datetime.fromtimestamp` 都有了（1.1.0 没有，当时靠失败首部的修复提示教绕法，
+这两条提示已删）；`utcfromtimestamp` 仍没有，失败首部提示改写成 `datetime.fromtimestamp(ts, timezone.utc)`。
+不带 `tz` 的 `fromtimestamp` 是机器时区，所以工具说明教带时区的写法。原先的 `time.gmtime` 写法照样能用：
 
 ```python
 import time
@@ -269,7 +269,7 @@ worker 在脚本前拼一段前置代码（`codemode/prelude.py`：`ToolError = 
 
 `tools` 也在前置代码里造：一个普通对象，`TOOLS` 里每个名字（`-` 换成 `_`）`setattr` 成一个闭包，闭包
 再调宿主给的 `_call(name, args)`——所以 `f = tools.read`、`{"rg": tools.rg}`、`getattr(tools, name)(...)`
-都能用。Monty 不支持 `__getattr__`（1.1.0 里 `class T: def __getattr__` 定义得了、但属性缺失时不调它，
+都能用。Monty 不支持 `__getattr__`（1.1.0 起直到 1.6.0 都是： `class T: def __getattr__` 定义得了、但属性缺失时不调它，
 仍是 `AttributeError`），写错工具名（或调不在表里的名字）得到的是 `AttributeError: 'Tools'
 object has no attribute 'x'`，不是原来的 `ToolError`（那条错误会列出能调的名字；2026-11-20 起失败首部的修复提示按相似度补上最接近的几个名字）；要找工具用 `TOOLS` /
 `search_tools`——`codemode` 的工具说明点明了 `TOOLS`，发现函数的接口在 `tool://codemode/doc`（2026-10-23 起，长说明按需读、不进工具定义，`docs/komo_bot.md` §4）。（POC 试过把 `tools` 做成宿主类实例、调用时暂停：未知名字能给出 `ToolError`，但

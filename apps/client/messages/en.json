@@ -48,8 +48,8 @@
   "cat_write_done_then": "wrote files",
   "cat_write_live": "Writing files",
   "changes_binary": "Binary",
-  "changes_card_collapse": "Show less",
-  "changes_card_expand": "Show {count} more",
+  "changes_card_collapse": "Hide files",
+  "changes_card_expand": "Show files",
   "changes_card_files": [
     {
       "declarations": [

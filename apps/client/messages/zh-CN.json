@@ -49,7 +49,7 @@
   "cat_write_live": "正在写入文件",
   "changes_binary": "二进制",
   "changes_card_collapse": "收起",
-  "changes_card_expand": "展开其余 {count} 个",
+  "changes_card_expand": "展开文件列表",
   "changes_card_files": [
     {
       "declarations": [

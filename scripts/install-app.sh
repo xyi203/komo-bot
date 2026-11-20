@@ -14,7 +14,9 @@
 #   1. pnpm install --frozen-lockfile，再 pnpm desktop:build（SPA → Electron TS → electron-builder --dir，
 #      产物 apps/desktop/release/mac-arm64/komo.app，未签名，本机用）。只改了 Rust 不需要跑这个，用 install-local.sh。
 #   2. 新 App 和网页先复制到目标旁边的临时目录；正在跑的 App（按安装路径认，不碰别处的 komo.app）
-#      用 AppleScript 正常退出，等它退干净再 mv 换上。旧的 App 与网页挪进 ~/.komo/backups/komo-app-<时间>/。
+#      用 AppleScript 正常退出，等它退干净再 mv 换上。旧的 App 挪进 ~/.komo/backups/komo-app-<时间>/。
+#      网页与 install-local.sh、install.sh 同一布局：产物放 <prefix>/komo-web/app-<时间>/，<prefix>/web 是指过去的
+#      符号链接，换上后清掉被换下的那一代。以前这里直接放真目录，install-local.sh 会拒绝覆盖；遇到就挪进备份。
 #   3. 网页是 Gateway 每次请求现读磁盘，不用重启 Gateway；浏览器刷新、桌面 App 重开即生效。
 set -euo pipefail
 
@@ -71,8 +73,9 @@ backup_root="${HOME}/.komo/backups"
 backup="${backup_root}/komo-app-${stamp_ts}"
 
 staged_app="${app_dir}/.komo.app.new-$$"
-staged_web="${prefix}/.web.new-$$"
-cleanup() { rm -rf "${staged_app}" "${staged_web}"; }
+web_generation="app-${stamp_ts}"
+staged_web="${prefix}/komo-web/.${web_generation}.new-$$"
+cleanup() { rm -rf "${staged_app}" "${staged_web}" "${prefix}/web.new-$$"; }
 trap cleanup EXIT
 
 echo "==> 构建 $(git -C "${root}" log -1 --format='%h %s' 2>/dev/null | cut -c1-72)"
@@ -98,7 +101,7 @@ echo "    komo.app ${version}，用时 $(( $(date +%s) - started ))s"
 mkdir -p "${app_dir}"
 ditto "${built_app}" "${staged_app}"
 if [ "${install_web}" = 1 ]; then
-  mkdir -p "${prefix}"
+  mkdir -p "${prefix}/komo-web"
   ditto "${built_web}" "${staged_web}"
 fi
 
@@ -122,9 +125,15 @@ mkdir -p "${backup}"
 mv "${staged_app}" "${dest_app}"
 echo "==> 已安装 ${dest_app}"
 if [ "${install_web}" = 1 ]; then
-  [ -e "${dest_web}" ] && mv "${dest_web}" "${backup}/web"
-  mv "${staged_web}" "${dest_web}"
-  echo "==> 已更新 ${dest_web}（Gateway 现读磁盘，不用重启）"
+  [ -d "${dest_web}" ] && [ ! -L "${dest_web}" ] && mv "${dest_web}" "${backup}/web"
+  previous_web="$(readlink "${dest_web}" 2>/dev/null || true)"
+  mv "${staged_web}" "${prefix}/komo-web/${web_generation}"
+  ln -sfn "komo-web/${web_generation}" "${prefix}/web.new-$$"
+  mv -fh "${prefix}/web.new-$$" "${dest_web}"
+  case "${previous_web}" in
+    komo-web/?*) [ "${previous_web}" != "komo-web/${web_generation}" ] && rm -rf "${prefix:?}/${previous_web}" ;;
+  esac
+  echo "==> 已更新 ${dest_web} -> komo-web/${web_generation}（Gateway 现读磁盘，不用重启）"
 fi
 if [ -z "$(ls -A "${backup}")" ]; then
   rmdir "${backup}"

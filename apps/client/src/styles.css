@@ -76,6 +76,8 @@
 
 /* 窄屏（单栏、底部标签栏）的断点，用法 `narrow:hidden`。和 `src/lib/hooks.ts` 的 NARROW_QUERY 是同一个值，要改两处一起改。 */
 @custom-variant narrow (@media (max-width: 900px));
+/* macOS 桌面壳（data-desktop="darwin"）：图标栏在那里更宽，带文字标签 */
+@custom-variant mac ([data-desktop="darwin"] &);
 
 @layer base {
   html,
@@ -124,19 +126,17 @@
   -webkit-app-region: no-drag;
   app-region: no-drag;
 }
-/* 红绿灯从 x=18 排到 80 左右，比 64 宽的图标栏宽，压在图标栏和对话列的顶部。顶上 48px 当一条空着的标题栏带：
-   komo 标志与对话列的「对话」标题都挪到红绿灯下面（一样下移 36px，两者仍对齐）；图标栏的分隔线从这条带下面才开始画，
-   不然它正好从绿灯中间穿过去。 */
+/* 红绿灯从 x=18 排到 78 左右，比网页上 64 宽的图标栏宽：桌面壳里把图标栏加宽到 92，红绿灯整个落在图标栏里，
+   分隔线从顶画到底（截在红绿灯下面的那版看着像断了一截）。顶上 48px 仍是标题栏带，komo 标志与对话列的「对话」标题
+   都挪到红绿灯下面（一样下移 36px，两者仍对齐）。 */
+:root {
+  --rail-width: 64px;
+}
+[data-desktop="darwin"] {
+  --rail-width: 92px;
+}
 [data-desktop="darwin"] :is(.rail-logo, .chats-header) {
   margin-top: 36px;
-}
-[data-desktop="darwin"] .rail {
-  border-right-color: transparent;
-  background-image: linear-gradient(var(--color-border), var(--color-border));
-  background-size: 1px calc(100% - 48px);
-  background-position: right bottom;
-  background-origin: border-box;
-  background-repeat: no-repeat;
 }
 
 /* ---------- 动效与正文 ---------- */

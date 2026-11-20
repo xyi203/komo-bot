@@ -69,7 +69,7 @@ export function AppShell() {
           {!hidesTabBar(pathname) && <TabBar />}
         </div>
       ) : (
-        <div className={cn("grid h-svh overflow-hidden", chatPage ? "grid-cols-[64px_264px_minmax(0,1fr)]" : "grid-cols-[64px_minmax(0,1fr)]")}>
+        <div className={cn("grid h-svh overflow-hidden", chatPage ? "grid-cols-[var(--rail-width)_264px_minmax(0,1fr)]" : "grid-cols-[var(--rail-width)_minmax(0,1fr)]")}>
           <Rail />
           {chatPage && <ChatColumn />}
           <main className="flex min-h-0 min-w-0 flex-col overflow-y-auto bg-surface">{page}</main>

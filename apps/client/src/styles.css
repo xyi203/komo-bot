@@ -172,6 +172,11 @@
 }
 
 /* 回复正文：代码块、标题、列表、表格、行内代码、粗体、链接（原型 styles.css「回复正文」那一段） */
+/* 长链接、长路径没有断点，不许折行时会把对话滚动区撑宽，手机上整页能左右滑。
+   用 break-word 不用 anywhere：它不改 min-content，表格列宽照旧，宽表格仍走 .table-wrap 自己横滑；pre 是 white-space: pre，不受影响。 */
+.prose-komo {
+  overflow-wrap: break-word;
+}
 .prose-komo p,
 .prose-komo ul,
 .prose-komo ol {

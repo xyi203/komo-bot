@@ -154,12 +154,13 @@ Monty 的 `max_turn_duration` 不含等宿主答复的时间，所以墙钟由�
    `monitor_stop` 不能在脚本里调（`tools/codemode.rs` 的 `NOT_IN_SCRIPTS`），也不进 `TOOLS`。
    字面调用（`tools.` 与 `atools.` 都认）在 `prepare` 阶段拒绝、整段不运行，避免执行一半才被拒；`getattr` 的绕法在子调用上仍受相同检查。
    2026-10-26 起 `bash`、`edit`、`write` 已从名单移除（照 pi）。
+   写错工具名是 Monty 的裸 AttributeError；2026-11-20 起结果开头的「修复提示」按名字相似度给出最接近的几个工具名（`codemode_text.rs` 的 `unknown_tool`，MCP 名字少写下划线、丢了 `mcp__` 前缀都认得）。
 2. `tool.prepare(args)` 验证参数和约束（版本绑定、komo 状态的保护名单照旧由工具自己做）。允许 `ReadFile`（read、rg）、
-   `WriteFile`（write、edit）、`ShellCommand`（bash）与 `McpCall`（含写操作）；编排、`then_run` 仍在脚本外执行。
+   `WriteFile`（write、edit）、`ShellCommand`（bash）、`McpCall`（含写操作）与 `komo` 工具的只读动作（`Operation::Komo` 且计划可安全重做：memory.search、goal.list、session.search / list、task.list、intervention.list；2026-11-20 起，此前 `komo` 在 `TOOLS` 里却一调就被拒）；komo 的写动作、编排、`then_run` 仍在脚本外执行。
    并行的两个 `edit` 改同一个文件时，后执行的那个按自己 prepare 时绑定的版本检查，得到“版本冲突”的 `ToolError`
    （`settle` 里是 `ok: False`），不会悄悄覆盖前一个的改动（gateway `tests/codemode/durable.rs` 实测）。
 3. 嵌套任务走和顶层调用同一条 `call → execute → 结果`：能力面（`ToolSet::get`）、`NOT_IN_SCRIPTS`、`Tool::prepare`、
-   只放行 `ReadFile` / `WriteFile` / `ShellCommand` / `McpCall` 且没有 `then_run`，意图 checkpoint（完整 `ExecutionPlan` 与 `plan.recovery.replay().and(tool.replay())`）
+   只放行 `ReadFile` / `WriteFile` / `ShellCommand` / `McpCall` / 只读的 `Komo` 且没有 `then_run`，意图 checkpoint（完整 `ExecutionPlan` 与 `plan.recovery.replay().and(tool.replay())`）
    提交成功之后才允许执行工具。
 4. 流式 stdout / stderr 保存在嵌套任务自己的尝试目录（`tool-output/{conversation}/{嵌套任务}/{attempt}/`）；工具返回后发布完整原始输出，
    再在一次提交里终结嵌套任务并把脚本将接收的精确 dict 或错误写进 `komo.nested` 的槽位（`commit_nested`），之后才回送 Python。
@@ -270,7 +271,7 @@ worker 在脚本前拼一段前置代码（`codemode/prelude.py`：`ToolError = 
 再调宿主给的 `_call(name, args)`——所以 `f = tools.read`、`{"rg": tools.rg}`、`getattr(tools, name)(...)`
 都能用。Monty 不支持 `__getattr__`（1.1.0 里 `class T: def __getattr__` 定义得了、但属性缺失时不调它，
 仍是 `AttributeError`），写错工具名（或调不在表里的名字）得到的是 `AttributeError: 'Tools'
-object has no attribute 'x'`，不是原来的 `ToolError`（那条错误会列出能调的名字）；要找工具用 `TOOLS` /
+object has no attribute 'x'`，不是原来的 `ToolError`（那条错误会列出能调的名字；2026-11-20 起失败首部的修复提示按相似度补上最接近的几个名字）；要找工具用 `TOOLS` /
 `search_tools`——`codemode` 的工具说明点明了 `TOOLS`，发现函数的接口在 `tool://codemode/doc`（2026-10-23 起，长说明按需读、不进工具定义，`docs/komo_bot.md` §4）。（POC 试过把 `tools` 做成宿主类实例、调用时暂停：未知名字能给出 `ToolError`，但
 `f = tools.read` 取不到属性，`getattr` 动态派发全断，所以没采用。）
 

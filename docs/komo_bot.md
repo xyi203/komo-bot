@@ -250,7 +250,7 @@ task(prompt, title, task_id?, model?, effort?, contract?, context?)
 - **在 Gateway 进程里执行，不经 shell，不走 HTTP 回环。** 工具本体在 `komo-tools`（它不能依赖 gateway）：`prepare` 把 `params` 反序列化成 kernel 里现成的请求类型（`MemoryAddRequest`、`MatterAddRequest`、`MatterActionRequest`、`ScheduleSpec` …），`execute` 经 `KomoService` 这个接缝交给 Gateway——接缝是个空槽（同 `bash` 的 `DetachSlot`：服务要等整份 `GatewayState` 才造得出来，装配完再接上），Gateway 的实现调 HTTP 路由背后的**同一个处理函数**，不另写业务逻辑，规则只有一份：`docs/goals.md` §4 的"改承诺类操作要有这个 Run 里的用户原话、任务会话与 Cron 被拒"、`memory = off` / `private` 的会话被拒、版本冲突，工具与路由自然一致。
 - **身份取自 `ToolContext`**，不读 `KOMO_SESSION` / `KOMO_RUN`：会话是这个会话，Run 是输入 Run（与 `bash` 子进程的 `KOMO_RUN` 同一个口径）；`params` 里给 `session` / `run` 会被当成未知字段拒绝。请求键取这次工具调用的 id。
 - **只读动作**（`*.search`、`*.list`）：计划是 `Operation::Komo` + `SafeReread`，可与相邻的只读调用并发、中断后可直接重跑；写动作是 `NoSafeRecovery`，顺序执行、中断后不重跑，交给模型判断。同一个工具里读写混着，所以 `Tool::replay` 声明 `Safe`（只否决不放行：两边都 `Safe` 才重跑），并发分组按动作判断（`Tool::parallel_for`，分组在 `prepare` 之前，只看工具名与原始参数）。`memory.search` 的输出首行带 `MEMORY_QUERY_MARKER`，记忆提取据此不把查到的已有记忆当新证据（§9.4）。
-- **不含** `memory.confirm`（那是用户的动作）、`area.*`（领域并进约定）、Gateway 的重启与停止。所有会话都挂（主会话、任务会话、定时任务会话）；codemode 脚本里能否调用跟随现有规则（只放行读写文件、bash、MCP），不单独处理。现有的 `komo memory|goal|area|session|cron …` 子命令并存一个版本，之后 Agent 用的那几组再删。
+- **不含** `memory.confirm`（那是用户的动作）、`area.*`（领域并进约定）、Gateway 的重启与停止。所有会话都挂（主会话、任务会话、定时任务会话）；codemode 脚本里只放行它的只读动作（memory.search、goal.list、session.search / list、task.list、intervention.list；2026-11-20 起，此前跟随"只放行读写文件、bash、MCP"一律被拒），写动作到顶层调。现有的 `komo memory|goal|area|session|cron …` 子命令并存一个版本，之后 Agent 用的那几组再删。
 - 系统提示的「komo 自查」段（下文）随之只在挂了 `komo` 工具时出现，指向这个工具。
 
 工具执行的公共能力放在 ToolExecutor：参数校验、执行计划生成、执行状态保存、取消和输出限制。

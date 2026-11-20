@@ -527,6 +527,17 @@ impl ToolTask {
             );
             return self.settle_unrun(rt, &set, &call, message).await;
         }
+        // komo 工具的只读动作（查记忆、查会话、列目标 / 任务 / 介入）在脚本里照常执行：和 read
+        // 一样重做只是重新观察，恢复走同一条 SafeReread。写动作改的是 komo 自己的状态，留在顶层。
+        if call.nested.is_some()
+            && let Operation::Komo { action } = &plan.operation
+            && plan.recovery.replay() != Replay::Safe
+        {
+            let message = format!(
+                "komo 的 {action} 会改 komo 的状态，不能在脚本里用；脚本里只能调它的只读动作，这个到顶层直接调 komo"
+            );
+            return self.settle_unrun(rt, &set, &call, message).await;
+        }
         // 文件工具仍执行自己的 prepare / 版本检查 / 保护路径；编排由模型直接调用。
         if call.nested.is_some()
             && !matches!(
@@ -535,6 +546,7 @@ impl ToolTask {
                     | Operation::WriteFile
                     | Operation::ShellCommand { .. }
                     | Operation::McpCall { .. }
+                    | Operation::Komo { .. }
             )
         {
             let message = format!(

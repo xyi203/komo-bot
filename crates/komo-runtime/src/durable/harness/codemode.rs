@@ -233,7 +233,7 @@ async fn run_script(
         .iter()
         .any(|call| !call.ok || call.status == Some(ToolResultStatus::Failed));
     let mut text = match &outcome.error {
-        Some(error) => failure_prefix(error, &calls),
+        Some(error) => failure_prefix(error, &calls, &names),
         None if child_failed => format!("（{}；脚本已正常结束）\n", summary(&calls)),
         None => String::new(),
     };

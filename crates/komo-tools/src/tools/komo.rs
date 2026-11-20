@@ -424,7 +424,11 @@ const SPECS: [Spec; 21] = [
         read_only: true,
         summary: "跨会话找回（只读）：在会话标题与正文里按关键词找，返回会话与命中片段。别 export 整个会话去 grep",
         fields: &[
-            field("q", true, "关键词；空白分开的几个词要在同一条消息里都出现"),
+            field(
+                "query",
+                true,
+                "关键词；空白分开的几个词要在同一条消息里都出现",
+            ),
             field("limit", false, "最多几个会话，默认 10，上限 50"),
         ],
     },
@@ -656,13 +660,21 @@ fn doc() -> String {
 /// 身份在 [`build`] 里加，计划哈希不依赖它。
 fn normalize(action: Action, params: &Value) -> Result<Map<String, Value>, ToolError> {
     let spec = action.spec();
-    let map = match params {
+    let mut map = match params {
         Value::Null => Map::new(),
         Value::Object(map) => map.clone(),
         other => {
             return Err(wrong(spec, format!("params 要是一个对象，收到 {other}")));
         }
     };
+    // session.search 的字段原先叫 `q`（与 HTTP 接口同名），模型照 memory.search 写成 `query` 就报错；
+    // 2026-11-20 起统一成 `query`，照旧写 `q` 的调用与旧计划照收（重启后重读旧计划也要解得出来）。
+    if action == Action::SessionSearch
+        && !map.contains_key("query")
+        && let Some(q) = map.remove("q")
+    {
+        map.insert("query".into(), q);
+    }
     if let Some(unknown) = map
         .keys()
         .find(|key| !spec.fields.iter().any(|field| field.name == key.as_str()))
@@ -843,7 +855,13 @@ fn build(
         Action::GoalUnschedule => matter(&mut map, MatterVerb::Unschedule),
         Action::GoalRun => matter(&mut map, MatterVerb::Run),
         Action::GoalRetire => matter(&mut map, MatterVerb::Retire),
-        Action::SessionSearch => Ok(KomoCall::SessionSearch(decode(spec, map)?)),
+        Action::SessionSearch => {
+            // 请求类型的字段仍是 `q`。
+            if let Some(query) = map.remove("query") {
+                map.insert("q".into(), query);
+            }
+            Ok(KomoCall::SessionSearch(decode(spec, map)?))
+        }
         Action::SessionList => Ok(KomoCall::SessionList(decode(spec, map)?)),
         Action::TaskList => Ok(KomoCall::TaskList(decode(spec, map)?)),
         Action::InterventionList => Ok(KomoCall::InterventionList),
@@ -1036,7 +1054,7 @@ mod tests {
             ("goal.unschedule", json!({ "id": "g-1" })),
             ("goal.run", json!({ "id": "g-1" })),
             ("goal.retire", json!({ "id": "a-1" })),
-            ("session.search", json!({ "q": "飞书" })),
+            ("session.search", json!({ "query": "飞书" })),
             ("session.list", json!({ "all": true, "limit": 5 })),
             ("task.list", json!({})),
             ("intervention.list", json!({})),
@@ -1175,6 +1193,38 @@ mod tests {
         assert_eq!(query.limit, Some(3));
     }
 
+    /// session.search 的字段是 `query`（与 memory.search 一致）；原先的 `q` 照收，计划里规整成 `query`。
+    #[tokio::test]
+    async fn session_search_takes_query_and_still_accepts_the_old_q() {
+        let (tool, recorder) = tool();
+        for params in [
+            json!({ "query": "飞书" }),
+            json!({ "q": "飞书", "limit": 3 }),
+        ] {
+            let args = json!({ "action": "session.search", "params": params });
+            let dir = tempfile::tempdir().unwrap();
+            let plan = tool
+                .prepare(args.clone(), &context(dir.path()))
+                .await
+                .unwrap();
+            assert_eq!(plan.args["params"]["query"], "飞书", "{}", plan.args);
+            assert!(plan.args["params"].get("q").is_none(), "{}", plan.args);
+            run_action(&tool, args).await.unwrap();
+        }
+        let calls = recorder.calls.lock().unwrap();
+        let queries: Vec<_> = calls
+            .iter()
+            .map(|call| match call {
+                KomoCall::SessionSearch(query) => (query.q.clone(), query.limit),
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            queries,
+            [("飞书".to_string(), None), ("飞书".to_string(), Some(3))]
+        );
+    }
+
     #[tokio::test]
     async fn a_memory_scope_is_accepted_as_text_and_the_run_is_the_input_run() {
         let (tool, recorder) = tool();
@@ -1307,7 +1357,7 @@ mod tests {
             "goal.link" => json!({ "id": "g", "monitor": "s:m" }),
             "goal.schedule" => json!({ "id": "g", "schedule": "0 9 * * *" }),
             "goal.unschedule" | "goal.run" | "goal.retire" => json!({ "id": "g" }),
-            "session.search" => json!({ "q": "x" }),
+            "session.search" => json!({ "query": "x" }),
             "intervention.answer" => json!({ "handle": "7", "verdict": "approve" }),
             _ => json!({}),
         };

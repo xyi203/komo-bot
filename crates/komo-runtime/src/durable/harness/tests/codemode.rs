@@ -540,6 +540,43 @@ async fn a_file_write_inside_a_script_runs_but_other_operations_are_refused_afte
     engine.close().await.unwrap();
 }
 
+/// komo 工具的只读动作（计划可安全重做）在脚本里照常执行；写动作在 prepare 之后被拒、不执行，
+/// 报错说清到顶层调。
+#[tokio::test]
+async fn komo_reads_run_inside_a_script_but_komo_writes_are_refused() {
+    let world = World::new();
+    let lookup = Arc::new(TestTool {
+        operation: Operation::Komo {
+            action: "session.search".into(),
+        },
+        ..TestTool::reader("lookup", &world.log)
+    });
+    let record = Arc::new(TestTool {
+        operation: Operation::Komo {
+            action: "goal.add".into(),
+        },
+        ..TestTool::writer("record", &world.log)
+    });
+    setup(&world, vec![lookup.clone(), record.clone()]);
+    script_round(
+        &world,
+        "text(tools.lookup()['status'])\ntry:\n    tools.record()\nexcept ToolError as e:\n    text('refused: ' + str(e))",
+    );
+    let engine = world.open().await;
+    let id = world.submit(&engine, "go").await;
+    world.harness.wait(&engine, id).await.unwrap();
+
+    let (_, view) = only_result(&world).await;
+    assert!(view.contains("completed"), "{view}");
+    assert!(
+        view.contains("komo 的 goal.add 会改 komo 的状态，不能在脚本里用"),
+        "{view}"
+    );
+    assert_eq!(lookup.runs(), 1);
+    assert_eq!(record.runs(), 0);
+    engine.close().await.unwrap();
+}
+
 /// 没接 worker 的 Gateway：codemode 调用以失败结果收场，不建任何嵌套任务。
 #[tokio::test]
 async fn without_a_worker_the_call_fails_and_creates_no_nested_task() {

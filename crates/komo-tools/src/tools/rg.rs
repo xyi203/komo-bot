@@ -506,7 +506,19 @@ fn matcher(args: &RgArgs) -> Result<RegexMatcher, String> {
         .case_insensitive(args.ignore_case)
         .fixed_strings(args.fixed_strings)
         .build(&args.pattern)
-        .map_err(|error| format!("正则不合法：{error}"))
+        .map_err(|error| {
+            let error = error.to_string();
+            // Rust regex 为了保证线性时间不支持环视与反向引用，原文只说"不支持"，模型容易换个
+            // 同类写法再撞一次；这里直接给出能走的路。
+            if error.contains("look-around") || error.contains("backreferences") {
+                format!(
+                    "正则不合法：{error}\n这里的 rg 用 Rust regex，不支持环视（(?= (?! (?<= (?<!）和反向引用（\\1）：\
+                     改写成不用它们的正则，或先放宽模式搜出来再看结果；确实需要时用 bash 跑 rg -P（PCRE2）。"
+                )
+            } else {
+                format!("正则不合法：{error}")
+            }
+        })
 }
 
 /// 一条待写下的字节。`stderr` 那一半放"读不了"这类话——和子进程工具同一个分工。
@@ -1193,6 +1205,28 @@ mod tests {
             panic!("{error:?}")
         };
         assert!(message.contains("正则"), "{message}");
+        assert!(
+            !message.contains("rg -P"),
+            "普通语法错不给环视的提示：{message}"
+        );
+    }
+
+    /// 环视与反向引用是 Rust regex 有意不支持的：报错里直接给出改写或改用 `rg -P` 的路。
+    #[tokio::test]
+    async fn look_around_and_backreferences_are_rejected_with_a_way_out() {
+        let dir = workspace();
+        let ctx = context(dir.path());
+        for pattern in ["foo(?!bar)", "(?<=\\$)\\d+", "(a)\\1"] {
+            let error = RgTool::new()
+                .prepare(serde_json::json!({ "pattern": pattern }), &ctx)
+                .await
+                .unwrap_err();
+            let ToolError::InvalidArguments { message } = &error else {
+                panic!("{error:?}")
+            };
+            assert!(message.contains("正则不合法"), "{pattern}：{message}");
+            assert!(message.contains("rg -P"), "{pattern}：{message}");
+        }
     }
 
     /// glob 什么都没匹配上（包括写歪了的 glob）是**结果**，不是失败：gitignore 那套 glob

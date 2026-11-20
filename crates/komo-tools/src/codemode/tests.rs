@@ -80,6 +80,12 @@ async fn an_unknown_tool_name_is_an_attribute_error() {
     let error = outcome.error.unwrap();
     assert!(error.contains("AttributeError"), "{error}");
     assert!(error.contains("nope"), "{error}");
+    // komo-runtime 的 `codemode_text::unknown_tool` 认的就是最后这一行，Monty 改了措辞要一起改。
+    assert_eq!(
+        error.lines().rev().find(|line| !line.trim().is_empty()),
+        Some("AttributeError: 'Tools' object has no attribute 'nope'"),
+        "{error}"
+    );
 }
 
 /// `tools.<name>` 是真的属性：绑到变量、放进列表、`getattr` 动态取，都能调。

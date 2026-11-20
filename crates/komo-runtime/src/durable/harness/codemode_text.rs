@@ -72,14 +72,14 @@ pub(crate) fn summary(calls: &[NestedCall]) -> String {
     text
 }
 
-pub(crate) fn failure_prefix(error: &str, calls: &[NestedCall]) -> String {
+pub(crate) fn failure_prefix(error: &str, calls: &[NestedCall], names: &[String]) -> String {
     let reason = error
         .lines()
         .rev()
         .find(|line| !line.trim().is_empty())
         .unwrap_or(error);
     let mut text = format!("脚本出错：{}\n", truncate(reason, 1024));
-    if let Some(hint) = diagnostic(reason) {
+    if let Some(hint) = diagnostic(reason).or_else(|| unknown_tool(reason, names)) {
         text.push_str(&format!("修复提示：{hint}\n"));
     }
     if !calls.is_empty() {
@@ -151,6 +151,69 @@ fn diagnostic(reason: &str) -> Option<String> {
     None
 }
 
+/// 脚本里写错工具名（`tools.<名字>` / `atools.<名字>`）：Monty 不支持 `__getattr__`，只给一句裸的
+/// AttributeError（`komo-tools` 的 `codemode/prelude.py`）。2026-11 的统计里这类失败都出在 MCP
+/// 名字的转写上（`mcp__服务__工具` 少写、多写下划线，或丢了前缀），所以按"去掉 `_` `-` 之后
+/// 相同或互相包含"优先、再按编辑距离挑最像的几个名字给回去，模型下一轮就能照着改。
+fn unknown_tool(reason: &str, names: &[String]) -> Option<String> {
+    let wrong = reason
+        .strip_prefix("AttributeError: 'Tools' object has no attribute '")?
+        .strip_suffix('\'')?;
+    let compact = |name: &str| {
+        name.chars()
+            .filter(|c| *c != '_' && *c != '-')
+            .flat_map(char::to_lowercase)
+            .collect::<String>()
+    };
+    let wanted = compact(wrong);
+    // 脚本里的写法：工具名里的 `-` 换成 `_`（prelude 的 `setattr`）。
+    // 排序键：(不是包含关系, 差了几个字符, 名字)。
+    let mut ranked: Vec<(bool, usize, String)> = names
+        .iter()
+        .map(|name| name.replace('-', "_"))
+        .filter_map(|name| {
+            let have = compact(&name);
+            if have.contains(&wanted) || wanted.contains(&have) {
+                return Some((false, have.len().abs_diff(wanted.len()), name));
+            }
+            let distance = levenshtein(&wanted, &have);
+            // 太远的不算"像"：最多改动名字的一半。
+            (distance <= wanted.chars().count().div_ceil(2)).then_some((true, distance, name))
+        })
+        .collect();
+    ranked.sort();
+    let close: Vec<String> = ranked
+        .into_iter()
+        .take(3)
+        .map(|(_, _, name)| format!("tools.{name}"))
+        .collect();
+    Some(if close.is_empty() {
+        format!("没有叫 {wrong} 的工具；工具名里的 - 写成 _，能调的名字见 TOOLS。")
+    } else {
+        format!(
+            "没有叫 {wrong} 的工具，最接近的是 {}；工具名里的 - 写成 _，能调的名字见 TOOLS。",
+            close.join("、")
+        )
+    })
+}
+
+fn levenshtein(a: &str, b: &str) -> usize {
+    let b: Vec<char> = b.chars().collect();
+    let mut row: Vec<usize> = (0..=b.len()).collect();
+    for (i, ca) in a.chars().enumerate() {
+        let mut previous = row[0];
+        row[0] = i + 1;
+        for (j, cb) in b.iter().enumerate() {
+            let current = row[j + 1];
+            row[j + 1] = (previous + usize::from(ca != *cb))
+                .min(row[j] + 1)
+                .min(current + 1);
+            previous = current;
+        }
+    }
+    row[b.len()]
+}
+
 /// 多段 `text()` 拼起来：两段以上时每段前加 `==> text N/M <==`（学 pi 1.1.0）——直接用换行
 /// 拼，模型分不清一段多行输出和两段输出的边界。只有一段时原样给，不多一个字。
 pub(crate) fn join_outputs(outputs: &[String]) -> String {
@@ -198,6 +261,58 @@ mod tests {
         let hint = super::diagnostic("AttributeError: module 'json' has no attribute 'load'")
             .expect("复现过的异常");
         assert!(hint.contains("json.loads(open(p).read())"), "{hint}");
+    }
+
+    #[test]
+    fn a_mistyped_tool_name_points_at_the_closest_names() {
+        let names: Vec<String> = [
+            "bash",
+            "read",
+            "rg",
+            "komo",
+            "mcp__memos__search_memos",
+            "mcp__memos__create_memo",
+            "mcp__dev-radius__search_issues",
+        ]
+        .map(String::from)
+        .to_vec();
+        let hint = |wrong: &str| {
+            super::unknown_tool(
+                &format!("AttributeError: 'Tools' object has no attribute '{wrong}'"),
+                &names,
+            )
+            .expect("工具名写错一定有提示")
+        };
+        // 下划线少写 / 丢了前缀：最像的排第一。
+        for wrong in [
+            "mcp_memos_search_memos",
+            "memos__search_memos",
+            "mcp__memos__search",
+        ] {
+            let text = hint(wrong);
+            assert!(
+                text.contains("最接近的是 tools.mcp__memos__search_memos"),
+                "{wrong}：{text}"
+            );
+        }
+        // 名字里的 - 在脚本里是 _，提示给脚本里的写法。
+        assert!(
+            hint("mcp__dev_radius__search_issue").contains("tools.mcp__dev_radius__search_issues")
+        );
+        // 拼错一两个字母。
+        assert!(hint("raed").contains("最接近的是 tools.read"));
+        // 毫不相干：只指向 TOOLS，不硬猜。
+        let far = hint("send_email");
+        assert!(!far.contains("最接近"), "{far}");
+        assert!(far.contains("TOOLS"), "{far}");
+        // 别的对象的 AttributeError 不是工具名写错。
+        assert!(
+            super::unknown_tool(
+                "AttributeError: 'dict' object has no attribute 'read'",
+                &names
+            )
+            .is_none()
+        );
     }
 
     #[test]

@@ -17,7 +17,7 @@ RUN cargo build --release --locked -p komo
 
 FROM debian:trixie-slim
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates git procps \
+    && apt-get install -y --no-install-recommends ca-certificates git openssh-client procps \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /src/target/release/komo /usr/local/bin/komo
 # 网页壳按「二进制旁的 web/」找（komo-gateway/src/web.rs）。

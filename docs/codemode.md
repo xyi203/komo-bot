@@ -229,7 +229,11 @@ MCP 的 `read_only` 仍由操作者声明，只决定中断后能否安全重做
 
 工具 `codemode`，参数 `{"code": "<Python 源码>"}`。脚本是模块级代码：
 
-每次调用都是独立脚本，`json`、`re`、`time` 等要在本段显式 import。2026-11-20 升到 Monty 1.6.0 之后，
+每次调用都是独立脚本。2026-11-23 起前置代码预先导入 `json`、`re`、`math`、`time`、`collections`、`itertools`
+（近 45 天 1649 次调用里 111 次脚本报错，11 次是忘了 import，其中 `json` 6、`re` 4；实测导入这几个不改变
+启动时间，空脚本仍是 6 ms 左右），其他模块仍要显式 import。`datetime` 不预导入：脚本里它有时指模块、有时指类，
+缺的时候失败首部提示怎么导。前置代码变了，worker 协议升到 4，升级时在途的 codemode 调用恢复按分歧记 uncertain。
+2026-11-20 升到 Monty 1.6.0 之后，
 `json.load` / `json.dump` 与 `datetime.fromtimestamp` 都有了（1.1.0 没有，当时靠失败首部的修复提示教绕法，
 这两条提示已删）；`utcfromtimestamp` 仍没有，失败首部提示改写成 `datetime.fromtimestamp(ts, timezone.utc)`。
 不带 `tz` 的 `fromtimestamp` 是机器时区，所以工具说明教带时区的写法。原先的 `time.gmtime` 写法照样能用：
@@ -241,7 +245,7 @@ text(time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(float(ts))))
 ```
 
 固定 UTC+8 在 `gmtime` 入参加 `8 * 3600`，不处理地区夏令时。这里仅补工具契约与精确的
-错误提示，不自动导入、不改前置代码、Monty 版本或恢复指纹。
+错误提示，不改 Monty 版本（2026-10-20 当时也不自动导入；2026-11-23 起见上）。
 
 子工具的外层固定为 `{status, text, result}`：先检查 `status`，`failed` 可以正常返回字典，
 不自动抛 `ToolError`；脚本可自行处理后继续。`read` 的正文是 `text`，MCP 的 `result` 是原生

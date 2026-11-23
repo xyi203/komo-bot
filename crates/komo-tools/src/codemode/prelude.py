@@ -2,6 +2,12 @@
 # 只能是 `RuntimeError` 的别名；这段占着脚本前面的行，worker 把回溯里的行号按它的行数减回去。
 # `_call` / `_acall` / `TOOLS` / `_CATALOG` 是宿主交进来的输入：调一次工具（等结果 / 先发出、
 # 拿回 awaitable）、能调的工具名、工具说明与所属组。
+#
+# 常用模块先导入：每次调用都是独立脚本，模型常忘了 import（2026-11 的统计里 json / re 占了忘 import
+# 的绝大多数）。实测导入这几个不改变启动时间。`datetime` 不在内：脚本里它有时指模块、有时指类，
+# 替脚本选一个只会把 NameError 换成更难懂的 AttributeError。
+import collections, itertools, json, math, re, time
+
 ToolError = RuntimeError
 
 
@@ -48,7 +54,7 @@ async def settle(*awaitables):
 #
 # 照 pi 的 searchTools / describeTool / describeNamespace（BM25、同一套分词与停用词），全在 worker 里
 # 对 catalog 做，不经宿主、不进 journal。pi 的分词只认 a-z0-9，这里另把
-# 中日韩字切成单字与相邻两字，中文说明才搜得到。re / math 用到才导入：不搜的脚本不多付启动时间。
+# 中日韩字切成单字与相邻两字，中文说明才搜得到。
 
 DEFAULT_SEARCH_LIMIT = 8
 _STOP_WORDS = {
@@ -59,8 +65,6 @@ _CJK_PATTERN = r"[\u3400-\u9fff\uf900-\ufaff\u3040-\u30ff\uac00-\ud7af]+"
 
 
 def _stem(term):
-    import re
-
     if len(term) > 4 and term.endswith("ies"):
         return term[:-3] + "y"
     if len(term) > 4 and re.search(r"(ches|shes|sses|xes|zes)$", term):
@@ -71,8 +75,6 @@ def _stem(term):
 
 
 def _tokenize(value):
-    import re
-
     value = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", value)
     value = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1 \2", value).lower()
     terms = [
@@ -105,8 +107,6 @@ def _schema_text(schema, parts):
 
 
 def _identifier(name):
-    import re
-
     return re.sub(r"[^A-Za-z0-9_]", "_", name)
 
 
@@ -142,8 +142,6 @@ class _Catalog:
         return {"name": _identifier(tool["name"]), "description": tool.get("description") or ""}
 
     def search(self, query, limit=DEFAULT_SEARCH_LIMIT, namespace=None):
-        import math
-
         if not isinstance(query, str):
             raise ToolError("search_tools() 要一个查询字符串")
         if not isinstance(limit, int) or isinstance(limit, bool) or limit <= 0:

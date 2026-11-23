@@ -121,20 +121,12 @@ fn diagnostic(reason: &str) -> Option<String> {
     {
         return Some("Monty 没有 utcfromtimestamp：写 datetime.fromtimestamp(ts, timezone.utc)（from datetime import datetime, timezone）；固定 UTC+8 用 timezone(timedelta(hours=8))。".into());
     }
-    for module in [
-        "json",
-        "re",
-        "time",
-        "datetime",
-        "math",
-        "collections",
-        "itertools",
-    ] {
-        if reason.starts_with(&format!("NameError: name '{module}' is not defined")) {
-            return Some(format!(
-                "每次调用都是独立脚本，请在本段先 import {module}。"
-            ));
-        }
+    // json / re / math / time / collections / itertools 由前置代码导入（`codemode/prelude.py`），
+    // 不会再缺；`datetime` 不预导入（模块还是类由脚本定），仍在这里提示。
+    if reason.starts_with("NameError: name 'datetime' is not defined") {
+        return Some(
+            "每次调用都是独立脚本，datetime 没有预先导入：先写 from datetime import datetime, timezone（或 import datetime）。".into(),
+        );
     }
     None
 }
@@ -254,6 +246,17 @@ mod tests {
             hint.contains("datetime.fromtimestamp(ts, timezone.utc)"),
             "{hint}"
         );
+    }
+
+    #[test]
+    fn only_datetime_still_needs_an_import_hint() {
+        let hint = super::diagnostic("NameError: name 'datetime' is not defined").unwrap();
+        assert!(
+            hint.contains("from datetime import datetime, timezone"),
+            "{hint}"
+        );
+        // 预导入的模块不会再缺；真缺了（脚本自己 del）也不猜。
+        assert!(super::diagnostic("NameError: name 'json' is not defined").is_none());
     }
 
     #[test]

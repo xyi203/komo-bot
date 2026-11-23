@@ -80,14 +80,15 @@ impl Tool for CodemodeTool {
                           读不到环境变量，只有 json、re、math、time、datetime、collections、itertools \
                           等少数标准库，没有第三方库。要写文件用 write / edit，要完整的 Python \
                           （第三方库、写文件、联网）用 bash 跑 python3。每次调用都是独立脚本，\
-                          json、re、time 等必须在本段显式 import。读 JSON 文件用 json.load(open(p))。\
+                          json、re、math、time、collections、itertools 已导入，其他模块（如 datetime）\
+                          要在本段显式 import。读 JSON 文件用 json.load(open(p))。\
                           Unix 秒转时间写 datetime.fromtimestamp(ts, timezone.utc)，固定 UTC+8 用 \
                           timezone(timedelta(hours=8))；不带 tz 是机器时区，没有 utcfromtimestamp。\n\
                           - tools.<name>(**args)：调工具，返回 {\"status\", \"text\", \"result\"}；\
                           text 是工具的正文输出（read 是文件内容，rg 是匹配行），result 是结构化\
                           结果。先检查 status；failed 也可能正常返回字典，并不自动抛 ToolError。\
                           MCP 的 result 是原生 CallToolResult，业务数据可能在 structuredContent，\
-                          或需 import json 后解析 content 中的 text；不要猜外层有 data。路径先用 \
+                          或需用 json 解析 content 中的 text；不要猜外层有 data。路径先用 \
                           rg / list_files 定位，独立项可逐项捕获 ToolError 并保留成功项。\
                           工具名里的 - 写成 _，写错名字得到 AttributeError，能调的名字见 TOOLS。\
                           能调 read、rg、edit、write、bash 与 MCP 工具（MCP 含写操作）；\

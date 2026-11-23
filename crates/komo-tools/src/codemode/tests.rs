@@ -538,6 +538,37 @@ text([{"k": 1}])
 }
 
 #[tokio::test]
+async fn common_modules_are_imported_before_the_script_and_ask_the_host_nothing() {
+    let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let count = Arc::clone(&asked);
+    let outcome = Worker::in_process()
+        .with_nondet(Arc::new(move |_| {
+            count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(json!(0))
+        }))
+        .run(
+            "text(json.dumps([re.sub('a', 'b', 'aa'), math.floor(2.5), \
+             list(itertools.chain([1], [2])), collections.Counter('aab')['a'], \
+             time.strftime('%Y', time.gmtime(0))]))\nundefined_name",
+            &[],
+            &ScriptCatalog::default(),
+            TIMEOUT,
+            |_, _| async { Err(String::new()) },
+        )
+        .await;
+    assert_eq!(outcome.outputs, [r#"["bb", 2, [1, 2], 2, "1970"]"#]);
+    // 导入本身不读时钟、不要随机数：恢复指纹之外不多一条 memo。
+    assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 0);
+    // 回溯行号仍是脚本自己的（前置代码多了几行）。
+    let error = outcome.error.unwrap();
+    assert!(error.contains("line 2"), "{error}");
+    assert!(
+        error.contains("NameError: name 'undefined_name'"),
+        "{error}"
+    );
+}
+
+#[tokio::test]
 async fn the_clock_and_entropy_come_from_the_host() {
     let seen: Arc<std::sync::Mutex<Vec<Nondet>>> = Arc::default();
     let log = Arc::clone(&seen);

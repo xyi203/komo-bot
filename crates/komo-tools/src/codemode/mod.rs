@@ -26,8 +26,8 @@ pub mod worker;
 /// 与根 `Cargo.toml` 里 `monty` 的精确钉版本同步（有测试守着）。
 pub const MONTY_VERSION: &str = "1.6.0";
 /// worker 协议版本：请求 / 消息 / 脚本前置代码（`prelude.py`）任一变了就加一。
-/// 3：延后调用（`atools`）与 `wait`。
-pub const WORKER_PROTOCOL: u32 = 3;
+/// 3：延后调用（`atools`）与 `wait`。4：前置代码预先导入 json / re 等常用模块。
+pub const WORKER_PROTOCOL: u32 = 4;
 /// 一次 `os.urandom` / `random` 起始状态最多向宿主要这么多字节（Monty 给 `random` 起状态要 2496）。
 const MAX_URANDOM: usize = 1 << 16;
 

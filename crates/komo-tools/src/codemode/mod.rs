@@ -25,7 +25,8 @@ pub mod worker;
 /// 脚本引擎的版本：写进 journal 的 `start` 指纹，升级后在途的 codemode 调用恢复时按分歧处理。
 /// 与根 `Cargo.toml` 里 `monty` 的精确钉版本同步（有测试守着）。
 pub const MONTY_VERSION: &str = "1.6.0";
-/// worker 协议版本：请求 / 消息 / 脚本前置代码（`prelude.py`）任一变了就加一。
+/// worker 协议版本：请求 / 消息 / 脚本前置代码（`prelude.py`）/ worker 的行为任一变了就加一——握手只比它与
+/// [`MONTY_VERSION`]，`komo` 版本号不同照常跑（[`Hello::compatible_with`]）。
 /// 3：延后调用（`atools`）与 `wait`。4：前置代码预先导入 json / re 等常用模块。
 pub const WORKER_PROTOCOL: u32 = 4;
 /// 一次 `os.urandom` / `random` 起始状态最多向宿主要这么多字节（Monty 给 `random` 起状态要 2496）。
@@ -37,7 +38,7 @@ const WATCHDOG_INTERVAL: Duration = Duration::from_millis(100);
 
 /// worker 启动后的第一行：它是哪一版。宿主与 worker 是同一个可执行文件，但磁盘上的二进制会在
 /// Gateway 重启之前被换掉（`komo update` / `scripts/install-local.sh`），新起的 worker 就可能
-/// 不是 Gateway 的那一版，对不上就干净地失败（`docs/codemode.md` §4）。
+/// 不是 Gateway 的那一版：协议或 monty 对不上就干净地失败，只差 `komo` 版本号照常跑（`docs/codemode.md` §4）。
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Hello {
     pub protocol: u32,
@@ -52,6 +53,13 @@ impl Hello {
             monty: MONTY_VERSION.to_string(),
             komo: env!("CARGO_PKG_VERSION").to_string(),
         }
+    }
+
+    /// 能不能把脚本交给这个 worker：只看协议号与 monty 版本。`komo` 版本不同（`komo update` 换了
+    /// 磁盘上的二进制、Gateway 还没重启）只要协议没变就照常跑——会改 worker 行为的变化都要升
+    /// [`WORKER_PROTOCOL`]（`docs/optimization-design.md` §5.4）。
+    pub fn compatible_with(&self, ours: &Hello) -> bool {
+        self.protocol == ours.protocol && self.monty == ours.monty
     }
 }
 
@@ -285,12 +293,19 @@ impl Worker {
                 Err(error) => return Err(format!("读不到 worker 输出：{error}").into()),
             };
             let ours = Hello::current();
-            if hello != ours {
+            if !hello.compatible_with(&ours) {
                 return Err(Stop::Incompatible(format!(
                     "codemode 的 worker 与 Gateway 不是同一版（worker：协议 {} / monty {} / komo {}；Gateway：协议 {} / monty {} / komo {}）。\
                      磁盘上的 komo 在 Gateway 启动之后被换过，需要重启 Gateway（komo gateway restart）；脚本没有运行。",
                     hello.protocol, hello.monty, hello.komo, ours.protocol, ours.monty, ours.komo
                 )));
+            }
+            if hello.komo != ours.komo {
+                tracing::warn!(
+                    worker = %hello.komo,
+                    gateway = %ours.komo,
+                    "codemode worker 与 Gateway 的 komo 版本不同（协议与 monty 一致，照常运行）；磁盘上的 komo 已更新，重启 Gateway 才用上新版"
+                );
             }
             if let Err(error) = write_line(&mut link.writer, &first).await {
                 return Err(format!("脚本交不进 worker：{error}").into());

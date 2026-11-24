@@ -606,9 +606,9 @@ async fn the_clock_and_entropy_come_from_the_host() {
 }
 
 #[tokio::test]
-async fn a_worker_that_is_another_build_is_refused_before_the_script_runs() {
+async fn a_worker_that_speaks_another_protocol_is_refused_before_the_script_runs() {
     let stale = Hello {
-        komo: "0.0.0".into(),
+        protocol: WORKER_PROTOCOL - 1,
         ..Hello::current()
     };
     let outcome = Worker::in_process_as(stale)
@@ -622,6 +622,45 @@ async fn a_worker_that_is_another_build_is_refused_before_the_script_runs() {
         .await;
     assert!(outcome.incompatible.unwrap().contains("重启 Gateway"));
     assert!(outcome.outputs.is_empty());
+}
+
+#[tokio::test]
+async fn a_worker_from_another_monty_is_refused_before_the_script_runs() {
+    let stale = Hello {
+        monty: "0.0.0".into(),
+        ..Hello::current()
+    };
+    let outcome = Worker::in_process_as(stale)
+        .run(
+            "text('ran')",
+            &[],
+            &ScriptCatalog::default(),
+            TIMEOUT,
+            |_, _| async { Err(String::new()) },
+        )
+        .await;
+    assert!(outcome.incompatible.unwrap().contains("重启 Gateway"));
+    assert!(outcome.outputs.is_empty());
+}
+
+/// `komo update` 换了磁盘上的二进制、Gateway 还没重启：协议与 monty 没变就照常跑。
+#[tokio::test]
+async fn a_worker_from_another_komo_build_on_the_same_protocol_still_runs() {
+    let newer = Hello {
+        komo: "99.0.0".into(),
+        ..Hello::current()
+    };
+    let outcome = Worker::in_process_as(newer)
+        .run(
+            "text('ran')",
+            &[],
+            &ScriptCatalog::default(),
+            TIMEOUT,
+            |_, _| async { Err(String::new()) },
+        )
+        .await;
+    assert!(outcome.incompatible.is_none(), "{:?}", outcome.incompatible);
+    assert_eq!(outcome.outputs, vec!["ran".to_string()]);
 }
 
 /// 两个调用都在路上时才放行：串行执行会卡死在第一个上，到墙钟为止。

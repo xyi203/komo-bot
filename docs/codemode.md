@@ -111,7 +111,9 @@ Monty 是 Rust 写的 Python 子集解释器，语言本身没有文件、网络
 `current_exe()` 解析一次的路径。不用进程池：每次起一个 6 ms，换来每段脚本独立的内存与崩溃边界。
 版本握手：`komo update` / `scripts/install-local.sh` 原子换掉磁盘上的二进制之后、Gateway 重启之前，这台 Gateway
 起的 worker 是新版本（路径没变）。所以 worker 的**第一行输出**是握手 `{"hello": {protocol, monty, komo}}`，
-宿主与自己的版本比，对不上就在发脚本之前干净失败（`ScriptOutcome.incompatible`）：工具结果是 Failed，
+宿主只比协议号与 monty 版本（2026-11-23 起，`docs/optimization-design.md` §5.4）：`komo` 版本号不同照常跑，
+只记一条 warn 提示重启 Gateway——所以凡是会改 worker 行为的变化都要升 `WORKER_PROTOCOL`。
+协议或 monty 对不上就在发脚本之前干净失败（`ScriptOutcome.incompatible`）：工具结果是 Failed，
 消息说明两边的版本并让 operator 重启 Gateway（`komo gateway restart`）；脚本一行没跑，不记 `finished`，
 重启之后同一个调用能照常跑。只有恢复中（前几次尝试已经做过子调用）碰上它才记 uncertain。
 worker 在专用的大栈（64 MiB）线程里跑 Monty，不经 tokio。

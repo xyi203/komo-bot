@@ -138,13 +138,51 @@
     "hasOwnProperty",
   ]);
 
-  // ---------------------------------------------------------------- 工具发现（BM25，含 CJK）
+  // ---------------------------------------------------------------- 工具发现（BM25F + 弱同义词扩展，含 CJK）
   const DEFAULT_SEARCH_LIMIT = 8;
   const _STOP_WORDS = new Set([
     "a", "an", "and", "are", "as", "at", "be", "by", "for", "from", "in", "is", "it",
     "of", "on", "or", "that", "the", "this", "to", "with",
   ]);
   const _CJK_RE = /[\u3400-\u9fff\uf900-\ufaff\u3040-\u30ff\uac00-\ud7af]+/g;
+
+  // 常见工具动词的弱权重同义扩展：精确命中始终权重 1.0 排第一；
+  // 当服务端没有字面匹配的 `search_*` 而用 `list_*(filter=...)` 等形式建模时仍能稳进前排。
+  const _SYNONYMS = Object.freeze({
+    search: [["find", 0.45], ["query", 0.45], ["filter", 0.45], ["lookup", 0.4], ["grep", 0.4], ["list", 0.25]],
+    find: [["search", 0.45], ["query", 0.45], ["filter", 0.45], ["lookup", 0.4], ["grep", 0.4], ["list", 0.25]],
+    query: [["search", 0.45], ["find", 0.45], ["filter", 0.45], ["list", 0.25]],
+    filter: [["search", 0.45], ["query", 0.45], ["find", 0.4], ["list", 0.3]],
+    list: [["get", 0.25], ["search", 0.25], ["find", 0.25], ["filter", 0.25]],
+    get: [["read", 0.4], ["fetch", 0.4], ["show", 0.35], ["view", 0.35], ["describe", 0.3]],
+    read: [["get", 0.4], ["fetch", 0.35], ["view", 0.35], ["open", 0.3]],
+    create: [["add", 0.45], ["new", 0.4], ["insert", 0.4], ["post", 0.3]],
+    add: [["create", 0.45], ["new", 0.4], ["insert", 0.4], ["append", 0.35]],
+    update: [["edit", 0.45], ["modify", 0.45], ["patch", 0.45], ["set", 0.35]],
+    edit: [["update", 0.45], ["modify", 0.45], ["patch", 0.45], ["write", 0.3]],
+    delete: [["remove", 0.45], ["rm", 0.4], ["drop", 0.35], ["destroy", 0.35], ["archive", 0.25]],
+    remove: [["delete", 0.45], ["rm", 0.4], ["drop", 0.35]],
+    "搜索": [["search", 0.45], ["find", 0.4], ["query", 0.4], ["filter", 0.4], ["list", 0.25]],
+    "查找": [["search", 0.45], ["find", 0.45], ["query", 0.4], ["filter", 0.4], ["list", 0.25]],
+    "查询": [["query", 0.45], ["search", 0.45], ["filter", 0.4], ["get", 0.3], ["list", 0.25]],
+    "筛选": [["filter", 0.45], ["search", 0.4], ["query", 0.4], ["list", 0.25]],
+    "列出": [["list", 0.45], ["get", 0.25]],
+    "列表": [["list", 0.45], ["get", 0.25]],
+    "创建": [["create", 0.45], ["add", 0.4], ["new", 0.35]],
+    "新建": [["create", 0.45], ["add", 0.4], ["new", 0.4]],
+    "修改": [["update", 0.45], ["edit", 0.45], ["patch", 0.4]],
+    "更新": [["update", 0.45], ["edit", 0.4], ["patch", 0.4]],
+    "删除": [["delete", 0.45], ["remove", 0.45]],
+    "读取": [["read", 0.45], ["get", 0.4], ["fetch", 0.35]],
+    "获取": [["get", 0.45], ["read", 0.4], ["fetch", 0.4]],
+  });
+
+  const _FIELDS = Object.freeze([
+    { w: 3.0, b: 0.5 },  // 0: 工具名 + 命名空间名
+    { w: 2.0, b: 0.5 },  // 1: 工具描述 + 参数名
+    { w: 1.0, b: 0.3 },  // 2: 参数 schema 描述
+    { w: 0.35, b: 0.25 }, // 3: 命名空间描述与 instructions（独立归一，不稀释单工具长度）
+  ]);
 
   function _stem(term) {
     if (term.length > 4 && term.endsWith("ies")) return term.slice(0, -3) + "y";
@@ -154,6 +192,7 @@
   }
 
   function _tokenize(value) {
+    if (!value) return [];
     const lowered = value
       .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
       .replace(/([A-Z]+)([A-Z][a-z])/g, "$1 $2")
@@ -172,19 +211,19 @@
     return terms;
   }
 
-  function _schemaText(schema, parts) {
+  function _schemaParts(schema, propNames, descParts) {
     if (!schema || typeof schema !== "object" || Array.isArray(schema)) return;
-    if (typeof schema.description === "string") parts.push(schema.description);
+    if (typeof schema.description === "string") descParts.push(schema.description);
     if (schema.properties && typeof schema.properties === "object") {
       for (const [name, prop] of Object.entries(schema.properties)) {
-        parts.push(name);
-        _schemaText(prop, parts);
+        propNames.push(name);
+        _schemaParts(prop, propNames, descParts);
       }
     }
-    _schemaText(schema.items, parts);
+    _schemaParts(schema.items, propNames, descParts);
     for (const key of ["anyOf", "oneOf", "allOf"]) {
       if (Array.isArray(schema[key])) {
-        for (const variant of schema[key]) _schemaText(variant, parts);
+        for (const variant of schema[key]) _schemaParts(variant, propNames, descParts);
       }
     }
   }
@@ -208,14 +247,21 @@
     return tool.namespace ? _catalogNamespaces.get(tool.namespace) : undefined;
   }
 
-  function _toolDocument(tool) {
-    const parts = [tool.name, tool.name.replace(/_/g, " "), tool.description || ""];
-    _schemaText(tool.parameters, parts);
+  function _toolFieldTexts(tool) {
     const ns = _namespaceOf(tool);
-    if (ns) {
-      parts.push(ns.name, ns.description || "", ns.instructions || "");
-    }
-    return parts.filter((p) => p && p.trim()).join(" ");
+    const propNames = [];
+    const schemaDescs = [];
+    _schemaParts(tool.parameters, propNames, schemaDescs);
+    const ident = [
+      tool.name,
+      tool.name.replace(/[_-]/g, " "),
+      ns ? ns.name : "",
+      ns ? ns.server || "" : "",
+    ].join(" ");
+    const meta = [tool.description || "", propNames.join(" ")].join(" ");
+    const schema = schemaDescs.join(" ");
+    const nsDoc = ns ? [ns.description || "", ns.instructions || ""].join(" ") : "";
+    return [ident, meta, schema, nsDoc];
   }
 
   function _toolEntry(tool) {
@@ -235,40 +281,93 @@
       const ns = _namespaceOf(tool);
       return Boolean(ns && _namespaceMatches(ns, namespace));
     });
-    const queryTerms = Array.from(new Set(_tokenize(query)));
-    if (!queryTerms.length || !pool.length) return [];
+    const rawTerms = Array.from(new Set(_tokenize(query)));
+    if (!rawTerms.length || !pool.length) return [];
 
-    const counts = pool.map((tool) => {
-      const tf = new Map();
-      for (const term of _tokenize(_toolDocument(tool))) {
-        tf.set(term, (tf.get(term) || 0) + 1);
+    const rawSet = new Set(rawTerms);
+    const allLookupTerms = new Set(rawTerms);
+    const concepts = rawTerms.map((term) => {
+      const cands = [{ term, w: 1.0, exact: true }];
+      const syns = _SYNONYMS[term];
+      if (syns) {
+        for (const [syn, w] of syns) {
+          if (!rawSet.has(syn)) {
+            cands.push({ term: syn, w, exact: false });
+            allLookupTerms.add(syn);
+          }
+        }
       }
-      return tf;
+      return cands;
     });
-    const lengths = counts.map((tf) => {
-      let sum = 0;
-      for (const c of tf.values()) sum += c;
-      return sum;
-    });
-    const average = lengths.reduce((a, b) => a + b, 0) / pool.length || 1;
+
+    const fieldCount = _FIELDS.length;
+    const toolTfs = [];
+    const toolLens = [];
+    const fieldSums = new Array(fieldCount).fill(0);
+    const docFreq = new Map();
+
+    for (const tool of pool) {
+      const texts = _toolFieldTexts(tool);
+      const tfs = [];
+      const lens = [];
+      const seenInTool = new Set();
+      for (let f = 0; f < fieldCount; f++) {
+        const tf = new Map();
+        const terms = _tokenize(texts[f]);
+        lens.push(terms.length);
+        fieldSums[f] += terms.length;
+        for (const t of terms) {
+          tf.set(t, (tf.get(t) || 0) + 1);
+          if (allLookupTerms.has(t)) seenInTool.add(t);
+        }
+        tfs.push(tf);
+      }
+      for (const t of seenInTool) {
+        docFreq.set(t, (docFreq.get(t) || 0) + 1);
+      }
+      toolTfs.push(tfs);
+      toolLens.push(lens);
+    }
+
+    const avgLens = fieldSums.map((s) => s / pool.length || 1);
     const idf = new Map();
-    for (const term of queryTerms) {
-      let freq = 0;
-      for (const tf of counts) if (tf.has(term)) freq++;
+    for (const term of allLookupTerms) {
+      const freq = docFreq.get(term) || 0;
       idf.set(term, Math.log(1 + (pool.length - freq + 0.5) / (freq + 0.5)));
     }
+
     const k1 = 1.2;
-    const b = 0.75;
     const scored = [];
     for (let i = 0; i < pool.length; i++) {
-      let score = 0;
-      for (const term of queryTerms) {
-        const count = counts[i].get(term);
-        if (!count) continue;
-        const norm = k1 * (1 - b + (b * lengths[i]) / average);
-        score += (idf.get(term) * (count * (k1 + 1))) / (count + norm);
+      let rawScore = 0;
+      let coveredWeight = 0;
+      for (const cands of concepts) {
+        let best = 0;
+        let bestW = 0;
+        for (const cand of cands) {
+          let pseudoTf = 0;
+          for (let f = 0; f < fieldCount; f++) {
+            const c = toolTfs[i][f].get(cand.term);
+            if (!c) continue;
+            const { w, b } = _FIELDS[f];
+            pseudoTf += w * (c / (1 - b + (b * toolLens[i][f]) / avgLens[f]));
+          }
+          if (pseudoTf <= 0) continue;
+          const s = cand.w * idf.get(cand.term) * ((pseudoTf * (k1 + 1)) / (pseudoTf + k1));
+          if (s > best) {
+            best = s;
+            bestW = cand.w;
+          }
+        }
+        if (best > 0) {
+          rawScore += best;
+          coveredWeight += bestW;
+        }
       }
-      if (score > 0) scored.push([score, i]);
+      if (rawScore > 0) {
+        const boost = concepts.length > 1 ? 1 + 0.5 * (coveredWeight / concepts.length) : 1;
+        scored.push([rawScore * boost, i]);
+      }
     }
     scored.sort((a, b) => b[0] - a[0] || a[1] - b[1]);
     return scored.slice(0, limit).map(([, idx]) => _toolEntry(pool[idx]));
@@ -329,7 +428,9 @@
         const hint = close.length
           ? `没有叫 ${prop} 的工具，最接近的是 ${close.join("、")}；能调的名字见 TOOLS。`
           : `没有叫 ${prop} 的工具；能调的名字见 TOOLS。`;
-        throw new ToolError(hint);
+        return async function unknownTool() {
+          throw new ToolError(hint);
+        };
       },
       has(t, prop) {
         return typeof prop === "string" && (Object.hasOwn(t, prop) || Object.hasOwn(aliases, prop));

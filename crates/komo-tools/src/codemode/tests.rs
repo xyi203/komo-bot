@@ -144,6 +144,44 @@ async fn an_unknown_tool_name_throws_tool_error_with_closest_suggestions() {
 }
 
 #[tokio::test]
+async fn unknown_tool_name_is_caught_by_promise_all_settled_without_aborting_peers() {
+    let outcome = Worker::in_process()
+        .run(
+            r#"
+const [bad, good] = await Promise.allSettled([
+  tools.mcp__memos__memo_search_memos({ query: "x" }),
+  tools.read({ path: "ok.txt" }),
+]);
+text({
+  badStatus: bad.status,
+  badIsToolError: bad.status === "rejected" && bad.reason instanceof ToolError,
+  badMsg: bad.status === "rejected" ? bad.reason.message : "",
+  goodStatus: good.status,
+  goodVal: good.status === "fulfilled" ? good.value.text : "",
+});
+"#,
+            &["read".into(), "mcp__memos__memo_list_memos".into()],
+            &ScriptCatalog::default(),
+            TIMEOUT,
+            |name, _| async move { Ok(json!({ "status": "completed", "text": name })) },
+        )
+        .await;
+    assert_eq!(outcome.error, None);
+    let parsed: Value = serde_json::from_str(&outcome.outputs[0]).unwrap();
+    assert_eq!(parsed["badStatus"], "rejected");
+    assert_eq!(parsed["badIsToolError"], true);
+    assert!(
+        parsed["badMsg"]
+            .as_str()
+            .unwrap()
+            .contains("最接近的是 tools.mcp__memos__memo_list_memos"),
+        "{parsed}"
+    );
+    assert_eq!(parsed["goodStatus"], "fulfilled");
+    assert_eq!(parsed["goodVal"], "read");
+}
+
+#[tokio::test]
 async fn tools_can_be_bound_stored_and_checked_with_in() {
     let outcome = Worker::in_process()
         .run(
@@ -325,6 +363,117 @@ text({ cjk, en, toolName: tool?.name, nsTools: ns?.tools, all: ALL_TOOLS.map((t)
             "mcp__dev_radius__search_issues",
             "mcp__notes__find_notes"
         ])
+    );
+}
+
+#[tokio::test]
+async fn search_tools_ranks_filtered_list_for_search_query_across_large_catalog() {
+    let mut tools = vec![
+        ScriptTool {
+            name: "rg".into(),
+            description: "Search files with ripgrep regex".into(),
+            parameters: json!({ "type": "object", "properties": { "pattern": { "type": "string" } } }),
+            namespace: None,
+        },
+        ScriptTool {
+            name: "read".into(),
+            description: "Read local file contents".into(),
+            parameters: json!({ "type": "object", "properties": { "path": { "type": "string" } } }),
+            namespace: None,
+        },
+        ScriptTool {
+            name: "mcp__memos__memo_list_memos".into(),
+            description: "List memos.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "filter": { "type": "string", "description": "CEL expression such as content.contains(\"xxx\") or tag in [\"work\"]. Supports pagination and ordering across all fields." },
+                    "pageSize": { "type": "integer", "description": "Maximum number of memos to return per page" },
+                    "pageToken": { "type": "string", "description": "Page token from previous ListMemos call" }
+                }
+            }),
+            namespace: Some("mcp__memos".into()),
+        },
+    ];
+    for action in [
+        "get_memo",
+        "create_memo",
+        "update_memo",
+        "delete_memo",
+        "list_memo_comments",
+        "create_memo_comment",
+        "list_memo_reactions",
+        "upsert_memo_reaction",
+        "delete_memo_reaction",
+        "list_memo_attachments",
+        "set_memo_attachments",
+        "list_memo_relations",
+        "set_memo_relations",
+        "rename_memo_tag",
+        "delete_memo_tag",
+    ] {
+        tools.push(ScriptTool {
+            name: format!("mcp__memos__memo_{action}"),
+            description: format!("Memo {action}"),
+            parameters: json!({ "type": "object", "properties": { "name": { "type": "string" } } }),
+            namespace: Some("mcp__memos".into()),
+        });
+    }
+    for i in 0..30 {
+        tools.push(ScriptTool {
+            name: format!("mcp__grafana__search_resource_{i}"),
+            description: format!("Search Grafana resource {i}"),
+            parameters: json!({ "type": "object", "properties": { "query": { "type": "string" } } }),
+            namespace: Some("mcp__grafana".into()),
+        });
+    }
+    let catalog = ScriptCatalog {
+        tools,
+        namespaces: vec![
+            ToolNamespace {
+                name: "mcp__memos".into(),
+                server: "memos".into(),
+                description: Some("Personal memos server".into()),
+                instructions: Some(
+                    "Long memos API instructions repeated across every memos tool.".into(),
+                ),
+            },
+            ToolNamespace {
+                name: "mcp__grafana".into(),
+                server: "grafana".into(),
+                description: Some("Grafana observability".into()),
+                instructions: None,
+            },
+        ],
+    };
+    let tool_names: Vec<String> = catalog.tools.iter().map(|t| t.name.clone()).collect();
+    let outcome = Worker::in_process()
+        .run(
+            r#"
+const en = searchTools("search memos");
+const zh = searchTools("搜索 memos");
+text({
+  enTop3: en.slice(0, 3).map((t) => t.name),
+  zhTop3: zh.slice(0, 3).map((t) => t.name),
+});
+"#,
+            &tool_names,
+            &catalog,
+            TIMEOUT,
+            |_, _| async { Err(String::new()) },
+        )
+        .await;
+    assert_eq!(outcome.error, None);
+    let parsed: Value = serde_json::from_str(&outcome.outputs[0]).unwrap();
+    let en_top3 = parsed["enTop3"].as_array().unwrap();
+    assert_eq!(
+        en_top3[0], "mcp__memos__memo_list_memos",
+        "expected memo_list_memos #1 for 'search memos', got {en_top3:?}"
+    );
+    let zh_top3 = parsed["zhTop3"].as_array().unwrap();
+    assert_eq!(
+        zh_top3[0], "mcp__memos__memo_list_memos",
+        "expected memo_list_memos #1 for '搜索 memos', got {zh_top3:?}"
     );
 }
 

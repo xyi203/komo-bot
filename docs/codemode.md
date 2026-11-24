@@ -140,7 +140,7 @@ worker → 宿主   {"call": name, "args": {…}, "id", "defer": true}（不等�
 2. **名字与别名**：
    - 名字必须在当前 Run 的 `AgentSurface` 及 executor 工具表里；不回退到全局目录。
    - `tools` 是一个冻结的 `Proxy`：支持 `-` 与 `_` 互通别名（`tools.mcp__dev_radius__search` 与 `tools["mcp__dev-radius__search"]` 指向同一工具）、支持 `in` / `Object.keys` / 解构 / 存为变量。
-   - 调用未知工具名时立即抛出真正的 `ToolError`，并用编辑距离（Levenshtein）给出最接近的候选工具名建议。
+   - 调用未知工具名时返回一个 reject `ToolError` 的异步函数（不破坏 `Promise.allSettled` 并发容错），并用编辑距离（Levenshtein）给出最接近的候选工具名建议。
    - 参数对象里值为 `undefined` 的键在桥接前自动剥离。
 3. **计划与准入**：
    - `tool.prepare(args)` 验证参数和约束（版本绑定、komo 状态的保护名单照旧由工具自己做）。允许 `ReadFile`（`read`、`rg`）、`WriteFile`（`write`、`edit`）、`ShellCommand`（`bash`）、`McpCall`（含写操作）与 `komo` 工具的只读动作（`Operation::Komo` 且计划可安全重做）；komo 的写动作、编排、`then_run` 仍在脚本外执行。
@@ -198,11 +198,11 @@ bash 非零退出正常返回 `status: "failed"` 与 `result.exit_code`，脚本
 | `console.log / warn / error / info / debug` | 进输出末尾的 `<console>` 段 |
 | `TOOLS` | 这次脚本能调的工具名只读列表 |
 | `ALL_TOOLS` | 常量数组：能调的工具 `[{ name, description }]`，含没声明给模型的 MCP 工具（`docs/mcp.md` §3） |
-| `searchTools(query, limit = 8, namespace?)` | 按相关度排的 `[{ name, description }]`（BM25 + 中日韩单字/双字分词）；保留 `search_tools` 别名 |
+| `searchTools(query, limit = 8, namespace?)` | 按相关度排的 `[{ name, description }]`（BM25F 字段加权 + 弱动词同义扩展 + CJK 分词）；保留 `search_tools` 别名 |
 | `describeTool(name)` | `{ name, description, parameters, namespace? }`，没有返回 `null`；保留 `describe_tool` 别名 |
 | `describeNamespace(name)` | 一台 MCP 服务器的 `{ name, description?, instructions?, tools }`；认 `mcp__dev_radius` / `mcp__dev-radius` / `dev-radius` / `dev_radius`；保留 `describe_namespace` 别名 |
 
-发现函数在 `prelude.js` 里本地做完（BM25 + CJK 分词），不经宿主、不记账，也不进指纹。
+发现函数在 `prelude.js` 里本地做完（BM25F 字段加权 + 弱动词同义扩展 + CJK 分词），不经宿主、不记账，也不进指纹。
 
 结果正文：正常时 `text()` 各段按顺序，`<console>` 段随后，最后是调用摘要（`调用了 3 次工具：read×2、rg×1`）。
 子调用失败但脚本处理后正常结束时，失败计数放到正文首部，外层状态仍为 completed。

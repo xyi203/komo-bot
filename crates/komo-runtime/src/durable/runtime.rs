@@ -417,10 +417,10 @@ impl TaskRuntime {
         Ok(self.sched.line.now_ms())
     }
 
-    /// 转发非致命失败。
+    /// 转发非致命失败（同调度器自己的失败：先记 warn 日志，再交给 `EngineOptions.report`）。
     pub fn report(&self, message: &str) -> Result<(), DurableError> {
         self.check()?;
-        (self.sched.report)(message);
+        self.sched.report_text(message);
         Ok(())
     }
 }

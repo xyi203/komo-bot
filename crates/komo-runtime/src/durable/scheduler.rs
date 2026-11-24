@@ -229,7 +229,7 @@ impl Sched {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn report_text(&self, text: &str) {
+    pub(super) fn report_text(&self, text: &str) {
         tracing::warn!("{text}");
         (self.report)(text);
     }

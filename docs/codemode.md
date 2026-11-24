@@ -365,7 +365,9 @@ BM25 在 Monty 里做完（原来 `driver.py` 的那份，逻辑未动），不�
 |---|---|
 | `komo-kernel` `types/plan.rs` | `Operation::Codemode` |
 | `komo-tools` `codemode/mod.rs` | `Worker`：起 worker 进程、协议对话、墙钟 / 内存看门狗 / 杀进程；`ScriptCatalog` |
-| `komo-tools` `codemode/worker.rs` | worker 本体（`komo __codemode-worker` 的函数体）：握手、跑 Monty、翻译暂停、只读文件挂载与状态名单、时钟 / 熵问宿主 |
+| `komo-tools` `codemode/engine.rs` | 脚本引擎接缝（2026-11-24）：`ScriptEngine`（编译检查、运行）与 `EngineHost`（同步 / 延后工具调用、成批等待、时钟 / 熵、`text()`）。换引擎只换实现，宿主、恢复与重放不动 |
+| `komo-tools` `codemode/worker.rs` | worker 本体（`komo __codemode-worker` 的函数体），与引擎无关：握手、行协议、`EngineHost` 的实现（调用次数上限、延后调用成批等待、`text()` 总量上限） |
+| `komo-tools` `codemode/monty.rs` | `MontyEngine`：跑 Monty、翻译暂停、前置代码、只读文件挂载与状态名单、时钟换算 |
 | `komo-tools` `codemode/convert.rs` | `serde_json::Value` ↔ `MontyObject` |
 | `komo-tools` `codemode/prelude.py` | 拼在脚本前面：`ToolError`、`tools` / `atools`、`settle`、BM25 发现函数 |
 | `komo-tools` `limits.rs` | `resident_bytes`：worker 的常驻内存读数 |

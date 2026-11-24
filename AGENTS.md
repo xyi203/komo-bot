@@ -66,7 +66,7 @@ komo-llm       Model layer: protocol adapters (stateless `ModelStream`, `Routing
 komo-config    config.toml / .env parse + validate · `ConfigHolder` (hot reload) · `edit`.
                Depends on kernel + llm.
 komo-tools     tools/{read,write,edit,rg,bash,task,monitor,…} · tool catalog
-               (`executor::ToolExecutor`) · codemode (Monty worker) · MCP client + login ·
+               (`executor::ToolExecutor`) · codemode (worker + `ScriptEngine` seam, Monty engine) · MCP client + login ·
                child-process registry. Depends on kernel + llm + config; no store, no
                durable engine (the harness drives tool tasks).
 komo-memory    MemoryManager (§9) · matters (goals / areas) · `provider` seam for an external

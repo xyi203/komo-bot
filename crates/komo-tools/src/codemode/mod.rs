@@ -20,6 +20,8 @@ use futures_util::stream::{FuturesUnordered, StreamExt};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 
 mod convert;
+pub mod engine;
+mod monty;
 pub mod worker;
 
 /// 脚本引擎的版本：写进 journal 的 `start` 指纹，升级后在途的 codemode 调用恢复时按分歧处理。
@@ -103,7 +105,7 @@ pub fn live(request: &Nondet) -> Result<serde_json::Value, String> {
 /// 脚本前置代码（`prelude.py`）的哈希：写进 journal 的 `start` 指纹，它变了意味着同一段脚本
 /// 的行为可能变了。
 pub fn prelude_hash() -> komo_kernel::types::digest::ContentHash {
-    komo_kernel::types::digest::ContentHash::of_str(worker::PRELUDE)
+    komo_kernel::types::digest::ContentHash::of_str(monty::PRELUDE)
 }
 
 /// 怎么起一个 worker。

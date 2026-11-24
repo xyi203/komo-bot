@@ -39,11 +39,9 @@ async fn run(worker: &Worker, code: &str, timeout: Duration) -> ScriptOutcome {
 #[tokio::test]
 async fn a_script_reads_twice_and_only_the_filtered_text_comes_back() {
     let code = r#"
-hits = []
-for name in ["a.log", "b.log"]:
-    body = tools.read(path=name)["text"]
-    hits += [line for line in body.splitlines() if "ERROR" in line]
-text("\n".join(hits))
+const rs = await Promise.all(["a.log", "b.log"].map((path) => tools.read({ path })));
+const hits = rs.flatMap((r) => r.text.split("\n").filter((line: string) => line.includes("ERROR")));
+text(hits.join("\n"));
 "#;
     let outcome = run(&Worker::exe(exe()), code, Duration::from_secs(30)).await;
     assert_eq!(outcome.error, None);
@@ -56,17 +54,26 @@ text("\n".join(hits))
 
 #[tokio::test]
 async fn a_failed_sub_call_is_a_tool_error_the_script_can_catch() {
-    let code = "try:\n    tools.fail()\nexcept ToolError as e:\n    text('caught ' + str(e))";
+    let code = r#"
+try {
+  await tools.fail();
+} catch (e) {
+  if (e instanceof ToolError) text("caught " + e.message);
+}
+"#;
     let outcome = run(&Worker::exe(exe()), code, Duration::from_secs(30)).await;
+    assert_eq!(outcome.error, None);
     assert_eq!(outcome.outputs, vec!["caught boom".to_string()]);
 }
 
 #[tokio::test]
-async fn timestamp_formatting_uses_explicit_imports_and_handles_utc_offsets_and_fractions() {
+async fn date_formatting_and_typescript_syntax_work_in_the_real_worker() {
     let code = r#"
-import time
-text([time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(float(ts) + offset))
-      for ts, offset in [(0, 0), (1729324800.25, 0), (1729324800.25, 8*3600), (-1, 0), (-0.25, 0)]])
+const fmt = (sec: number, offsetHours = 0): string => {
+  const d = new Date((sec + offsetHours * 3600) * 1000);
+  return d.toISOString().slice(0, 19).replace("T", " ");
+};
+text([fmt(0), fmt(1729324800.25), fmt(1729324800.25, 8), fmt(-1)]);
 "#;
     let outcome = run(&Worker::exe(exe()), code, Duration::from_secs(30)).await;
     assert_eq!(outcome.error, None);
@@ -77,109 +84,30 @@ text([time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(float(ts) + offset))
             "2024-10-19 08:00:00",
             "2024-10-19 16:00:00",
             "1969-12-31 23:59:59",
-            "1969-12-31 23:59:59",
-        ]
-    );
-}
-
-/// Monty 1.6.0 起有 `json.load` 与 `datetime.fromtimestamp`（1.1.0 都没有，此前靠修复提示教绕法）。
-/// 带 `tz` 才和机器时区无关；`utcfromtimestamp` 仍没有（CPython 也已弃用）。
-#[tokio::test]
-async fn json_load_and_fromtimestamp_work_in_the_real_worker() {
-    let dir = tempfile::tempdir().unwrap();
-    let file = dir.path().join("data.json");
-    std::fs::write(&file, r#"{"items": [1, 2, 3], "name": "komo"}"#).unwrap();
-    let code = format!(
-        r#"
-import json
-from datetime import datetime, timezone, timedelta
-data = json.load(open("{file}"))
-text(data["name"] + " " + str(sum(data["items"])))
-utc = datetime.fromtimestamp(1729324800.25, timezone.utc)
-text(utc.strftime("%Y-%m-%d %H:%M:%S"))
-text(datetime.fromtimestamp(1729324800, timezone(timedelta(hours=8))).isoformat())
-try:
-    datetime.utcfromtimestamp(0)
-    text("utcfromtimestamp exists")
-except AttributeError as e:
-    text(str(e))
-"#,
-        file = file.display()
-    );
-    let outcome = run(&Worker::exe(exe()), &code, Duration::from_secs(30)).await;
-    assert_eq!(outcome.error, None);
-    assert_eq!(
-        outcome.outputs,
-        vec![
-            "komo 6".to_string(),
-            "2024-10-19 08:00:00".to_string(),
-            "2024-10-19T16:00:00+08:00".to_string(),
-            // komo-runtime 的 `codemode_text::diagnostic` 认这句原文。
-            "type object 'datetime.datetime' has no attribute 'utcfromtimestamp'".to_string(),
         ]
     );
 }
 
 #[tokio::test]
-async fn the_worker_process_reads_files_but_cannot_write_them_and_has_no_environment() {
-    let dir = tempfile::tempdir().unwrap();
-    let probe = dir.path().join("probe");
-    let code = format!(
-        r#"
-import os
-from pathlib import Path
-text(open("/etc/hosts").read() != "")
-try:
-    open("{probe}", "w").write("x")
-    text("wrote")
-except PermissionError:
-    text("write denied")
-text(os.getenv("HOME"))
-"#,
-        probe = probe.display()
-    );
-    let outcome = run(&Worker::exe(exe()), &code, Duration::from_secs(30)).await;
+async fn the_worker_process_has_no_fs_network_or_environment() {
+    let code = r#"
+text({
+  fetch: typeof (globalThis as any).fetch,
+  process: typeof (globalThis as any).process,
+  require: typeof (globalThis as any).require,
+  open: typeof (globalThis as any).open,
+});
+"#;
+    let outcome = run(&Worker::exe(exe()), code, Duration::from_secs(30)).await;
     assert_eq!(outcome.error, None);
     assert_eq!(
-        outcome.outputs,
-        vec![
-            "true".to_string(),
-            "write denied".to_string(),
-            "null".to_string()
-        ]
-    );
-    assert!(!probe.exists());
-}
-
-#[tokio::test]
-async fn the_worker_process_refuses_komo_state_even_for_reads() {
-    let dir = tempfile::tempdir().unwrap();
-    let home = dir.path().canonicalize().unwrap();
-    std::fs::write(home.join(".env"), "SECRET=1").unwrap();
-    std::fs::write(home.join("state.db"), "db").unwrap();
-    std::fs::create_dir_all(home.join("workspace")).unwrap();
-    std::fs::write(home.join("workspace/ok.txt"), "fine").unwrap();
-    std::os::unix::fs::symlink(home.join(".env"), home.join("workspace/link")).unwrap();
-    let worker = Worker::exe(exe())
-        .in_dir(home.join("workspace"))
-        .protecting(vec![home.join(".env"), home.join("state.db")]);
-    let code = format!(
-        r#"
-def verdict(path):
-    try:
-        open(path).read()
-        return "read"
-    except PermissionError:
-        return "denied"
-text([verdict(p) for p in ["ok.txt", "../.env", "link", "{home}/state.db"]])
-"#,
-        home = home.display()
-    );
-    let outcome = run(&worker, &code, Duration::from_secs(30)).await;
-    assert_eq!(outcome.error, None);
-    assert_eq!(
-        serde_json::from_str::<Vec<String>>(&outcome.outputs[0]).unwrap(),
-        ["read", "denied", "denied", "denied"]
+        serde_json::from_str::<serde_json::Value>(&outcome.outputs[0]).unwrap(),
+        json!({
+            "fetch": "undefined",
+            "process": "undefined",
+            "require": "undefined",
+            "open": "undefined",
+        })
     );
 }
 
@@ -190,13 +118,10 @@ async fn a_worker_from_another_build_is_refused_before_the_script_runs() {
     let fake = dir.path().join("komo");
     std::fs::write(
         &fake,
-        "#!/bin/sh\necho '{\"hello\":{\"protocol\":999,\"monty\":\"0.0.0\",\"komo\":\"0.0.0\"}}'\ncat > /dev/null\n",
+        "#!/bin/sh\necho '{\"hello\":{\"protocol\":999,\"engine\":\"djs-00000000\",\"komo\":\"0.0.0\"}}'\ncat > /dev/null\n",
     )
     .unwrap();
     std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
-    // 刚写完就 exec：同进程别的测试线程此刻 fork，会带着还开着的写句柄让 execve 得到
-    // ETXTBSY（worker 没起来，就看不到握手）。先试跑一次、遇到就退避重试；成功之后写句柄
-    // 已全部关掉，下面 Worker 的 spawn 不会再撞上。
     komo_tools::spawn::retry_text_file_busy(|| {
         std::process::Command::new(&fake)
             .stdin(std::process::Stdio::null())
@@ -233,7 +158,7 @@ async fn discovery_works_in_the_real_worker() {
     };
     let outcome = Worker::exe(exe())
         .run(
-            "text([t['name'] for t in search_tools('搜索')])",
+            "text(searchTools('搜索').map((t) => t.name));",
             &names(&["read", "mcp__dev__search"]),
             &catalog,
             Duration::from_secs(30),
@@ -251,7 +176,7 @@ async fn discovery_works_in_the_real_worker() {
 async fn an_infinite_loop_is_killed_at_the_deadline_and_the_parent_carries_on() {
     let worker = Worker::exe(exe());
     let started = Instant::now();
-    let outcome = run(&worker, "while True:\n    pass", Duration::from_secs(1)).await;
+    let outcome = run(&worker, "while (true) {}", Duration::from_secs(1)).await;
     assert!(outcome.error.unwrap().contains("超时"));
     assert!(started.elapsed() < Duration::from_secs(10));
 
@@ -260,18 +185,18 @@ async fn an_infinite_loop_is_killed_at_the_deadline_and_the_parent_carries_on() 
 }
 
 #[tokio::test]
-async fn slow_memory_growth_is_stopped_before_it_takes_the_machine() {
-    let worker = Worker::exe(exe()).with_memory_limit(256 << 20);
+async fn memory_growth_is_stopped_cleanly_at_the_hard_heap_cap() {
+    let worker = Worker::exe(exe()).with_memory_limit(64 << 20);
     let started = Instant::now();
     let outcome = run(
         &worker,
-        "chunks = []\nwhile True:\n    chunks.append('x' * 1000)",
+        "const chunks = []; while (true) chunks.push('x'.repeat(1000));",
         Duration::from_secs(60),
     )
     .await;
     let error = outcome.error.unwrap();
     assert!(error.contains("脚本内存超限"), "{error}");
-    assert!(started.elapsed() < Duration::from_secs(30));
+    assert!(started.elapsed() < Duration::from_secs(15));
 }
 
 #[test]

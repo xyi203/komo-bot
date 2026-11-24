@@ -1,9 +1,18 @@
-//! 进程内 worker 上的协议与语言限制；要杀进程的（死循环、内存看门狗）在 `crates/komo/tests`。
+//! 进程内 worker 上的 djs 引擎、流式并发协议与安全边界测试；真子进程的验收在 `crates/komo/tests`。
+
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 use komo_kernel::types::tool::ToolNamespace;
-use serde_json::json;
-use std::sync::Arc;
+use serde_json::{Value, json};
+use tokio::sync::Notify;
 
+use super::djs::DjsEngine;
+use super::engine::{EngineHost, ScriptEngine, ToolCall};
+use super::worker::{Limits, Request};
 use super::*;
 
 const TIMEOUT: Duration = Duration::from_secs(30);
@@ -22,10 +31,15 @@ async fn run(code: &str, tools: &[&str]) -> ScriptOutcome {
 }
 
 #[tokio::test]
-async fn a_script_talks_to_the_host_and_returns_only_its_text() {
+async fn typescript_script_talks_to_the_host_and_returns_only_its_text() {
     let outcome = Worker::in_process()
         .run(
-            "r = tools.read(path='a.txt')\ntext(r['text'].upper())\nprint('done')",
+            r#"
+interface ReadRes { status: string; text: string }
+const r = (await tools.read({ path: "a.txt" })) as ReadRes;
+text(r.text.toUpperCase());
+console.log("done", 42);
+"#,
             &["read".to_string()],
             &ScriptCatalog::default(),
             TIMEOUT,
@@ -38,14 +52,30 @@ async fn a_script_talks_to_the_host_and_returns_only_its_text() {
         .await;
     assert_eq!(outcome.error, None);
     assert_eq!(outcome.outputs, vec!["HELLO".to_string()]);
-    assert_eq!(outcome.console, "done\n");
+    assert_eq!(outcome.console, "done 42\n");
 }
 
 #[tokio::test]
-async fn hyphens_in_tool_names_are_written_as_underscores_and_a_dict_merges_into_the_keywords() {
+async fn top_level_return_works_without_calling_text() {
+    let outcome = run(
+        "const nums: number[] = [1, 2, 3, 4]; return { sum: nums.reduce((a, b) => a + b, 0) };",
+        &[],
+    )
+    .await;
+    assert_eq!(outcome.error, None);
+    let parsed: Value = serde_json::from_str(&outcome.outputs[0]).unwrap();
+    assert_eq!(parsed, json!({ "sum": 10 }));
+}
+
+#[tokio::test]
+async fn hyphens_and_underscores_alias_the_same_tool_and_undefined_args_are_stripped() {
     let outcome = Worker::in_process()
         .run(
-            "text(tools.mcp__dev_radius__search({'q': 'x'}, limit=2))",
+            r#"
+const a = await tools.mcp__dev_radius__search({ q: "x", limit: 2, empty: undefined });
+const b = await tools["mcp__dev-radius__search"]({ q: "y" });
+text([a.args, b.args, tools["mcp__dev-radius__search"] === tools.mcp__dev_radius__search]);
+"#,
             &["mcp__dev-radius__search".to_string()],
             &ScriptCatalog::default(),
             TIMEOUT,
@@ -56,47 +86,76 @@ async fn hyphens_in_tool_names_are_written_as_underscores_and_a_dict_merges_into
         )
         .await;
     assert_eq!(outcome.error, None);
-    let echoed: serde_json::Value = serde_json::from_str(&outcome.outputs[0]).unwrap();
-    assert_eq!(echoed, json!({ "args": { "q": "x", "limit": 2 } }));
+    let echoed: Value = serde_json::from_str(&outcome.outputs[0]).unwrap();
+    assert_eq!(
+        echoed,
+        json!([{ "q": "x", "limit": 2 }, { "q": "y" }, true])
+    );
 }
 
 #[tokio::test]
-async fn a_refused_call_raises_a_tool_error_the_script_can_catch() {
+async fn a_refused_call_rejects_with_a_real_tool_error_distinct_from_type_error() {
     let outcome = Worker::in_process()
         .run(
-            "try:\n    tools.write(path='x')\nexcept ToolError as e:\n    text('拒了：' + str(e))",
+            r#"
+let caughtTool = false;
+let msg = "";
+try {
+  await tools.write({ path: "x" });
+} catch (e) {
+  caughtTool = e instanceof ToolError;
+  msg = (e as Error).message;
+}
+let ownIsTool = false;
+try {
+  throw new TypeError("plain");
+} catch (e) {
+  ownIsTool = e instanceof ToolError;
+}
+text({ caughtTool, msg, ownIsTool });
+"#,
             &["write".to_string()],
             &ScriptCatalog::default(),
             TIMEOUT,
             |_, _| async { Err("会改东西".to_string()) },
         )
         .await;
-    assert_eq!(outcome.outputs, vec!["拒了：会改东西".to_string()]);
+    assert_eq!(outcome.error, None);
+    let parsed: Value = serde_json::from_str(&outcome.outputs[0]).unwrap();
+    assert_eq!(
+        parsed,
+        json!({ "caughtTool": true, "msg": "会改东西", "ownIsTool": false })
+    );
 }
 
 #[tokio::test]
-async fn an_unknown_tool_name_is_an_attribute_error() {
-    let outcome = run("tools.nope()", &["read", "rg"]).await;
+async fn an_unknown_tool_name_throws_tool_error_with_closest_suggestions() {
+    let outcome = run(
+        "await tools.mcp_memos_search_memos({})",
+        &["read", "rg", "mcp__memos__search_memos"],
+    )
+    .await;
     let error = outcome.error.unwrap();
-    assert!(error.contains("AttributeError"), "{error}");
-    assert!(error.contains("nope"), "{error}");
-    // komo-runtime 的 `codemode_text::unknown_tool` 认的就是最后这一行，Monty 改了措辞要一起改。
-    assert_eq!(
-        error.lines().rev().find(|line| !line.trim().is_empty()),
-        Some("AttributeError: 'Tools' object has no attribute 'nope'"),
+    assert!(error.contains("ToolError"), "{error}");
+    assert!(
+        error.contains("最接近的是 tools.mcp__memos__search_memos"),
         "{error}"
     );
 }
 
-/// `tools.<name>` 是真的属性：绑到变量、放进列表、`getattr` 动态取，都能调。
 #[tokio::test]
-async fn tools_can_be_bound_stored_and_fetched_by_name() {
+async fn tools_can_be_bound_stored_and_checked_with_in() {
     let outcome = Worker::in_process()
         .run(
             r#"
-read = tools.read
-fns = {"rg": tools.rg}
-text([read(path="a")["n"], fns["rg"](pattern="b")["n"], getattr(tools, "read")(path="c")["n"], hasattr(tools, "nope")])
+const read = tools.read;
+const fns = { rg: tools.rg };
+const [a, b, c] = await Promise.all([
+  read({ path: "a" }),
+  fns.rg({ pattern: "b" }),
+  tools["read"]({ path: "c" }),
+]);
+text([a.n, b.n, c.n, "nope" in tools, "read" in tools]);
 "#,
             &["read".to_string(), "rg".to_string()],
             &ScriptCatalog::default(),
@@ -105,504 +164,205 @@ text([read(path="a")["n"], fns["rg"](pattern="b")["n"], getattr(tools, "read")(p
         )
         .await;
     assert_eq!(outcome.error, None);
-    let seen: serde_json::Value = serde_json::from_str(&outcome.outputs[0]).unwrap();
-    assert_eq!(seen, json!(["read", "rg", "read", false]));
+    let seen: Value = serde_json::from_str(&outcome.outputs[0]).unwrap();
+    assert_eq!(seen, json!(["read", "rg", "read", false, true]));
 }
 
 #[tokio::test]
-async fn an_exception_keeps_the_partial_output_and_reports_the_script_line() {
-    let outcome = run("text('前半')\nx = 1\nraise ValueError('坏了')", &[]).await;
+async fn an_exception_keeps_the_partial_output_and_reports_the_exact_user_line() {
+    let outcome = run("text('前半');\nconst x = 1;\nthrow new Error('坏了');", &[]).await;
     assert_eq!(outcome.outputs, vec!["前半".to_string()]);
     let error = outcome.error.unwrap();
-    assert!(error.contains("ValueError: 坏了"), "{error}");
-    assert!(error.contains("line 3"), "{error}");
+    assert!(error.contains("Error: 坏了"), "{error}");
+    assert!(error.contains("codemode.ts:3"), "{error}");
 }
 
 #[tokio::test]
 async fn a_script_makes_at_most_256_tool_calls() {
-    let tools = ["echo".to_string()];
     let outcome = Worker::in_process()
         .run(
-            "n = 0\nfor i in range(300):\n    tools.echo()\n    n += 1\ntext(n)",
-            &tools,
+            r#"
+const ps = [];
+for (let i = 0; i < 300; i++) ps.push(tools.echo({ i }));
+const rs = await Promise.allSettled(ps);
+text(rs.filter((r) => r.status === "rejected").length);
+"#,
+            &["echo".to_string()],
             &ScriptCatalog::default(),
             TIMEOUT,
             |_, _| async { Ok(json!({})) },
         )
         .await;
-    let error = outcome.error.unwrap();
-    assert!(error.contains("一段脚本最多调 256 次工具"), "{error}");
-    assert!(outcome.outputs.is_empty());
+    assert_eq!(outcome.error, None);
+    assert_eq!(outcome.outputs, vec!["44".to_string()]);
 }
 
 #[tokio::test]
-async fn the_language_has_no_network_subprocess_or_environment() {
+async fn the_sandbox_has_no_io_or_env_and_freezes_builtins() {
     let outcome = run(
         r#"
-def blocked(f):
-    try:
-        f()
-        return False
-    except Exception:
-        return True
-
-import os
+let frozen = false;
+try { (Array.prototype as any).hack = 1; } catch { frozen = true; }
 text({
-    "subprocess": blocked(lambda: __import__("subprocess")),
-    "socket": blocked(lambda: __import__("socket")),
-    "env": os.getenv("HOME"),
-    "environ": dict(os.environ),
-})
+  frozen,
+  fetch: typeof (globalThis as any).fetch,
+  process: typeof (globalThis as any).process,
+  require: typeof (globalThis as any).require,
+  Deno: typeof (globalThis as any).Deno,
+  Bun: typeof (globalThis as any).Bun,
+});
 "#,
         &[],
     )
     .await;
     assert_eq!(outcome.error, None);
-    let verdict: serde_json::Value = serde_json::from_str(&outcome.outputs[0]).unwrap();
+    let verdict: Value = serde_json::from_str(&outcome.outputs[0]).unwrap();
     assert_eq!(
         verdict,
-        json!({ "subprocess": true, "socket": true, "env": null, "environ": {} })
+        json!({
+            "frozen": true,
+            "fetch": "undefined",
+            "process": "undefined",
+            "require": "undefined",
+            "Deno": "undefined",
+            "Bun": "undefined",
+        })
     );
 }
 
-/// 一个像数据目录的临时目录：`sessions/` `runtime/` `state.db*` `.env`，外加一个允许读的工作区。
-struct Home {
-    dir: tempfile::TempDir,
-}
-
-impl Home {
-    fn new() -> Self {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().canonicalize().unwrap();
-        for path in ["sessions", "runtime", "workspace/sub"] {
-            std::fs::create_dir_all(root.join(path)).unwrap();
-        }
-        for (path, body) in [
-            ("sessions/x", "session"),
-            ("runtime/x", "runtime"),
-            ("state.db", "db"),
-            ("state.db-wal", "wal"),
-            (".env", "SECRET=1"),
-            ("workspace/a.txt", "alpha"),
-            ("workspace/sub/b.txt", "beta"),
-        ] {
-            std::fs::write(root.join(path), body).unwrap();
-        }
-        std::os::unix::fs::symlink(root.join(".env"), root.join("workspace/link")).unwrap();
-        std::os::unix::fs::symlink(root.join("workspace/a.txt"), root.join("workspace/alias"))
-            .unwrap();
-        Self { dir }
-    }
-
-    fn root(&self) -> std::path::PathBuf {
-        self.dir.path().canonicalize().unwrap()
-    }
-
-    fn worker(&self) -> Worker {
-        let root = self.root();
-        Worker::in_process()
-            .in_dir(root.join("workspace"))
-            .protecting(vec![
-                root.join("sessions"),
-                root.join("state.db"),
-                root.join("runtime"),
-                root.join(".env"),
-            ])
-    }
-
-    async fn run(&self, code: &str) -> ScriptOutcome {
-        self.worker()
-            .run(
-                &code.replace("{root}", &self.root().to_string_lossy()),
-                &[],
-                &ScriptCatalog::default(),
-                TIMEOUT,
-                |_, _| async { Err("本测试不调工具".to_string()) },
-            )
-            .await
-    }
-}
-
 #[tokio::test]
-async fn files_are_readable_through_open_and_pathlib() {
-    let home = Home::new();
-    let outcome = home
-        .run(
-            r#"
-import os
-from pathlib import Path
-text(open("/etc/hosts").read() != "")
-text(Path("{root}/workspace/a.txt").read_text())
-text(open("a.txt").read())
-text(open("alias").read())
-text(sorted(p.name for p in Path("{root}/workspace").iterdir()))
-text([Path("a.txt").exists(), Path("nope").exists(), Path("sub").is_dir(), Path("a.txt").stat().st_size])
-text(os.getcwd() == "{root}/workspace")
+async fn text_formats_objects_sets_maps_bigints_and_utf8() {
+    let outcome = run(
+        r#"
+text({ z: 1, a: [1, 2.5, true, null], 中: "文\n", s: new Set([1, 2]), b: 9007199254740993n });
+text(7);
 "#,
-        )
-        .await;
+        &[],
+    )
+    .await;
     assert_eq!(outcome.error, None);
-    assert_eq!(outcome.outputs[0], "true");
-    assert_eq!(outcome.outputs[1], "alpha");
-    assert_eq!(outcome.outputs[2], "alpha");
-    assert_eq!(outcome.outputs[3], "alpha");
-    let names: Vec<String> = serde_json::from_str(&outcome.outputs[4]).unwrap();
-    assert!(names.contains(&"a.txt".to_string()) && names.contains(&"sub".to_string()));
-    assert_eq!(outcome.outputs[5], "[\n  true,\n  false,\n  true,\n  5\n]");
-    assert_eq!(outcome.outputs[6], "true");
-}
-
-#[tokio::test]
-async fn komo_own_state_is_unreadable_even_through_dotdot_and_symlinks() {
-    let home = Home::new();
-    let outcome = home
-        .run(
-            r#"
-from pathlib import Path
-def verdict(path):
-    try:
-        Path(path).read_text()
-        return "read"
-    except PermissionError:
-        return "denied"
-    except Exception as e:
-        return "other " + type(e).__name__
-
-paths = [
-    "{root}/.env", "{root}/state.db", "{root}/state.db-wal", "{root}/sessions/x", "{root}/runtime/x",
-    "../.env", "sub/../../state.db", "{root}/workspace/../sessions/x", "link",
-]
-text({p: verdict(p) for p in paths})
-text(verdict("a.txt"))
-try:
-    open("../.env").read()
-    text("open read")
-except PermissionError:
-    text("open denied")
-"#,
-        )
-        .await;
-    assert_eq!(outcome.error, None);
-    let verdicts: std::collections::BTreeMap<String, String> =
-        serde_json::from_str(&outcome.outputs[0]).unwrap();
-    for (path, verdict) in &verdicts {
-        assert_eq!(verdict, "denied", "{path}");
-    }
-    assert_eq!(verdicts.len(), 9);
-    assert_eq!(outcome.outputs[1], "read");
-    assert_eq!(outcome.outputs[2], "open denied");
-}
-
-#[tokio::test]
-async fn every_write_form_is_refused_and_leaves_the_disk_alone() {
-    let home = Home::new();
-    let outcome = home
-        .run(
-            r#"
-from pathlib import Path
-attempts = {
-    "write_text": lambda: Path("new.txt").write_text("x"),
-    "write_bytes": lambda: Path("new.bin").write_bytes(b"x"),
-    "overwrite": lambda: Path("a.txt").write_text("x"),
-    "open_w": lambda: open("new2.txt", "w").write("x"),
-    "open_a": lambda: open("a.txt", "a").write("x"),
-    "open_rplus": lambda: open("a.txt", "r+").write("x"),
-    "mkdir": lambda: Path("d").mkdir(),
-    "unlink": lambda: Path("a.txt").unlink(),
-    "rmdir": lambda: Path("sub").rmdir(),
-    "rename": lambda: Path("a.txt").rename("c.txt"),
-}
-result = {}
-for name, attempt in attempts.items():
-    try:
-        attempt()
-        result[name] = "done"
-    except PermissionError as e:
-        result[name] = "write / edit" in str(e)
-    except Exception as e:
-        result[name] = "other " + type(e).__name__
-text(result)
-"#,
-        )
-        .await;
-    assert_eq!(outcome.error, None);
-    let result: std::collections::BTreeMap<String, serde_json::Value> =
-        serde_json::from_str(&outcome.outputs[0]).unwrap();
-    for (name, verdict) in &result {
-        assert!(
-            *verdict == json!(true) || name == "open_rplus",
-            "{name}: {verdict}"
-        );
-    }
-    let workspace = home.root().join("workspace");
-    let mut names: Vec<_> = std::fs::read_dir(&workspace)
-        .unwrap()
-        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
-        .collect();
-    names.sort();
-    assert_eq!(names, ["a.txt", "alias", "link", "sub"]);
+    let parsed: Value = serde_json::from_str(&outcome.outputs[0]).unwrap();
     assert_eq!(
-        std::fs::read_to_string(workspace.join("a.txt")).unwrap(),
-        "alpha"
+        parsed,
+        json!({
+            "z": 1,
+            "a": [1, 2.5, true, null],
+            "中": "文\n",
+            "s": [1, 2],
+            "b": "9007199254740993",
+        })
     );
+    assert_eq!(outcome.outputs[1], "7");
 }
 
-fn discovery_catalog() -> ScriptCatalog {
-    let tool =
-        |name: &str, description: &str, parameters: serde_json::Value, namespace: Option<&str>| {
-            ScriptTool {
-                name: name.into(),
-                description: description.into(),
-                parameters,
-                namespace: namespace.map(str::to_string),
-            }
-        };
-    let string = |description: &str| json!({ "type": "string", "description": description });
-    let object =
-        |properties: serde_json::Value| json!({ "type": "object", "properties": properties });
-    ScriptCatalog {
+#[tokio::test]
+async fn discovery_ranks_cjk_and_english_queries_and_describes_namespaces() {
+    let catalog = ScriptCatalog {
         tools: vec![
-            tool(
-                "read",
-                "Read a file from the workspace",
-                object(json!({ "path": string("file path") })),
-                None,
-            ),
-            tool(
-                "rg",
-                "Search file contents with a regex",
-                object(json!({ "pattern": string("regex to search") })),
-                None,
-            ),
-            tool(
-                "mcp__dev-radius__search",
-                "搜索代码仓库里的符号与文件",
-                object(json!({ "query": string("搜索关键词") })),
-                Some("mcp__dev-radius"),
-            ),
-            tool(
-                "mcp__dev-radius__open_issue",
-                "打开一个 issue 并返回详情",
-                object(json!({ "id": { "type": "integer", "description": "issue 编号" } })),
-                Some("mcp__dev-radius"),
-            ),
-            tool(
-                "mcp__notes__find_notes",
-                "Find notes by title or tag, searches the notebook",
-                object(json!({ "tag": { "type": "string" } })),
-                Some("mcp__notes"),
-            ),
+            ScriptTool {
+                name: "read".into(),
+                description: "读取本地文件内容".into(),
+                parameters: json!({ "type": "object", "properties": { "path": { "type": "string" } } }),
+                namespace: None,
+            },
+            ScriptTool {
+                name: "mcp__dev-radius__search_issues".into(),
+                description: "按关键词搜索线上工单与缺陷".into(),
+                parameters: json!({ "type": "object", "properties": { "query": { "type": "string" } } }),
+                namespace: Some("mcp__dev-radius".into()),
+            },
+            ScriptTool {
+                name: "mcp__notes__find_notes".into(),
+                description: "Find personal notes by query".into(),
+                parameters: json!({ "type": "object" }),
+                namespace: Some("mcp__notes".into()),
+            },
         ],
         namespaces: vec![
             ToolNamespace {
                 name: "mcp__dev-radius".into(),
                 server: "dev-radius".into(),
-                description: Some("代码仓库平台".into()),
-                instructions: Some("先搜索再打开".into()),
+                description: Some("研发工单系统".into()),
+                instructions: Some("查询工单时先限定项目".into()),
             },
             ToolNamespace {
                 name: "mcp__notes".into(),
                 server: "notes".into(),
-                description: Some("Notebook".into()),
+                description: Some("Notes".into()),
                 instructions: None,
             },
         ],
-    }
-}
-
-/// 期望值是 2026-10-15 用迁移前的 CPython `driver.py` 对同一份目录跑出来的：BM25 排序、
-/// 中文分词、`describe_*` 的形状都不许因为换了引擎而变。（`parameters` 里的键序是排过的：目录经
-/// `serde_json::Value` 交进来，那边对象按键排序，迁移前后一样。）
-#[tokio::test]
-async fn discovery_ranks_and_describes_exactly_as_the_cpython_driver_did() {
-    let catalog = discovery_catalog();
-    let names: Vec<String> = catalog.tools.iter().map(|tool| tool.name.clone()).collect();
+    };
     let outcome = Worker::in_process()
         .run(
             r#"
-text([
-    search_tools("搜索"),
-    search_tools("search files", 2),
-    search_tools("issue 编号"),
-    search_tools("notes tag"),
-    search_tools("仓库", namespace="dev-radius"),
-    search_tools("nothing-matches-zzz"),
-])
-text(describe_tool("mcp__dev_radius__open_issue"))
-text(describe_namespace("dev_radius"))
-text(describe_tool("nope"))
-text([tool["name"] for tool in ALL_TOOLS])
+const cjk = searchTools("搜索工单");
+const en = search_tools("personal note", 5, "notes");
+const tool = describeTool("mcp__dev_radius__search_issues");
+const ns = describeNamespace("dev_radius");
+text({ cjk, en, toolName: tool?.name, nsTools: ns?.tools, all: ALL_TOOLS.map((t) => t.name) });
 "#,
-            &names,
+            &[
+                "read".into(),
+                "mcp__dev-radius__search_issues".into(),
+                "mcp__notes__find_notes".into(),
+            ],
             &catalog,
             TIMEOUT,
             |_, _| async { Err(String::new()) },
         )
         .await;
     assert_eq!(outcome.error, None);
-    let hit = |name: &str, description: &str| json!({ "name": name, "description": description });
-    let search = hit("mcp__dev_radius__search", "搜索代码仓库里的符号与文件");
-    let issue = hit("mcp__dev_radius__open_issue", "打开一个 issue 并返回详情");
-    let notes = hit(
-        "mcp__notes__find_notes",
-        "Find notes by title or tag, searches the notebook",
-    );
-    let rankings: serde_json::Value = serde_json::from_str(&outcome.outputs[0]).unwrap();
+    let parsed: Value = serde_json::from_str(&outcome.outputs[0]).unwrap();
+    assert_eq!(parsed["cjk"][0]["name"], "mcp__dev_radius__search_issues");
+    assert_eq!(parsed["en"][0]["name"], "mcp__notes__find_notes");
+    assert_eq!(parsed["toolName"], "mcp__dev_radius__search_issues");
+    assert_eq!(parsed["nsTools"], json!(["mcp__dev_radius__search_issues"]));
     assert_eq!(
-        rankings,
+        parsed["all"],
         json!([
-            [search, issue],
-            [
-                hit("rg", "Search file contents with a regex"),
-                hit("read", "Read a file from the workspace")
-            ],
-            [issue, search],
-            [notes],
-            [search, issue],
-            [],
+            "read",
+            "mcp__dev_radius__search_issues",
+            "mcp__notes__find_notes"
         ])
     );
-    assert_eq!(
-        outcome.outputs[1],
-        r#"{
-  "name": "mcp__dev_radius__open_issue",
-  "description": "打开一个 issue 并返回详情",
-  "parameters": {
-    "properties": {
-      "id": {
-        "description": "issue 编号",
-        "type": "integer"
-      }
-    },
-    "type": "object"
-  },
-  "namespace": "mcp__dev-radius"
-}"#
-    );
-    assert_eq!(
-        outcome.outputs[2],
-        r#"{
-  "name": "mcp__dev-radius",
-  "description": "代码仓库平台",
-  "instructions": "先搜索再打开",
-  "tools": [
-    "mcp__dev_radius__search",
-    "mcp__dev_radius__open_issue"
-  ]
-}"#
-    );
-    assert_eq!(outcome.outputs[3], "null");
-    let all: Vec<String> = serde_json::from_str(&outcome.outputs[4]).unwrap();
-    assert_eq!(
-        all,
-        [
-            "read",
-            "rg",
-            "mcp__dev_radius__search",
-            "mcp__dev_radius__open_issue",
-            "mcp__notes__find_notes"
-        ]
-    );
-}
-
-#[test]
-fn the_engine_version_in_the_fingerprint_is_the_pinned_one() {
-    let manifest = include_str!("../../../../Cargo.toml");
-    assert!(
-        manifest.contains(&format!("monty = \"={MONTY_VERSION}\"")),
-        "Cargo.toml 里 monty 的钉版本与 MONTY_VERSION 不一致"
-    );
-}
-
-/// `text()` 的非字符串输出逐字节同 Python 的 `json.dumps(indent=2, ensure_ascii=False, default=str)`：
-/// dict 保留插入序、空容器不换行、非 ASCII 原样、tuple 是数组。（期望值由 CPython 3 跑出。）
-#[tokio::test]
-async fn text_renders_non_strings_like_python_json_dumps() {
-    let outcome = run(
-        r#"
-d = {"z": 1, "a": [1, 2.5, True, None], "中": "文\n", "e": {}, "l": [], "t": (1, 2), 3: "n"}
-text(d)
-text(7)
-text([{"k": 1}])
-"#,
-        &[],
-    )
-    .await;
-    assert_eq!(outcome.error, None);
-    assert_eq!(
-        outcome.outputs[0],
-        "{\n  \"z\": 1,\n  \"a\": [\n    1,\n    2.5,\n    true,\n    null\n  ],\n  \"中\": \"文\\n\",\n  \"e\": {},\n  \"l\": [],\n  \"t\": [\n    1,\n    2\n  ],\n  \"3\": \"n\"\n}"
-    );
-    assert_eq!(outcome.outputs[1], "7");
-    assert_eq!(outcome.outputs[2], "[\n  {\n    \"k\": 1\n  }\n]");
 }
 
 #[tokio::test]
-async fn common_modules_are_imported_before_the_script_and_ask_the_host_nothing() {
-    let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let count = Arc::clone(&asked);
-    let outcome = Worker::in_process()
-        .with_nondet(Arc::new(move |_| {
-            count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Ok(json!(0))
-        }))
+async fn the_clock_and_entropy_come_from_the_host_and_are_deterministic() {
+    let make_nondet = || -> NondetHandler {
+        Arc::new(|request| match request {
+            Nondet::Clock => Ok(json!(86_400.5)),
+            Nondet::Urandom { size } => Ok(json!("ab".repeat(*size))),
+            Nondet::Deliver { .. } => Err("unexpected".into()),
+        })
+    };
+    let code = "text([Date.now(), new Date().toISOString(), Math.random(), Math.random()]);";
+    let a = Worker::in_process()
+        .with_nondet(make_nondet())
         .run(
-            "text(json.dumps([re.sub('a', 'b', 'aa'), math.floor(2.5), \
-             list(itertools.chain([1], [2])), collections.Counter('aab')['a'], \
-             time.strftime('%Y', time.gmtime(0))]))\nundefined_name",
+            code,
             &[],
             &ScriptCatalog::default(),
             TIMEOUT,
             |_, _| async { Err(String::new()) },
         )
         .await;
-    assert_eq!(outcome.outputs, [r#"["bb", 2, [1, 2], 2, "1970"]"#]);
-    // 导入本身不读时钟、不要随机数：恢复指纹之外不多一条 memo。
-    assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 0);
-    // 回溯行号仍是脚本自己的（前置代码多了几行）。
-    let error = outcome.error.unwrap();
-    assert!(error.contains("line 2"), "{error}");
-    assert!(
-        error.contains("NameError: name 'undefined_name'"),
-        "{error}"
-    );
-}
-
-#[tokio::test]
-async fn the_clock_and_entropy_come_from_the_host() {
-    let seen: Arc<std::sync::Mutex<Vec<Nondet>>> = Arc::default();
-    let log = Arc::clone(&seen);
-    let outcome = Worker::in_process()
-        .with_nondet(Arc::new(move |request| {
-            log.lock().unwrap().push(request.clone());
-            match request {
-                Nondet::Clock => Ok(json!(86_400.5)),
-                Nondet::Urandom { size } => Ok(json!("ab".repeat(*size))),
-            }
-        }))
+    let b = Worker::in_process()
+        .with_nondet(make_nondet())
         .run(
-            "import time, os\nfrom datetime import datetime, date\ntext([time.time(), str(datetime.now()), str(date.today()), os.urandom(2).hex()])\ntime.sleep(0.01)",
+            code,
             &[],
             &ScriptCatalog::default(),
             TIMEOUT,
             |_, _| async { Err(String::new()) },
         )
         .await;
-    assert_eq!(outcome.error, None);
-    let read: serde_json::Value = serde_json::from_str(&outcome.outputs[0]).unwrap();
-    assert_eq!(
-        read,
-        json!([86_400.5, "1970-01-02 00:00:00.500000", "1970-01-02", "abab"])
-    );
-    assert_eq!(
-        *seen.lock().unwrap(),
-        [
-            Nondet::Clock,
-            Nondet::Clock,
-            Nondet::Clock,
-            Nondet::Urandom { size: 2 }
-        ]
-    );
+    assert_eq!(a.error, None);
+    assert_eq!(a.outputs, b.outputs);
+    let parsed: Value = serde_json::from_str(&a.outputs[0]).unwrap();
+    assert_eq!(parsed[0], 86_400_500i64);
+    assert_eq!(parsed[1], "1970-01-02T00:00:00.500Z");
 }
 
 #[tokio::test]
@@ -625,9 +385,9 @@ async fn a_worker_that_speaks_another_protocol_is_refused_before_the_script_runs
 }
 
 #[tokio::test]
-async fn a_worker_from_another_monty_is_refused_before_the_script_runs() {
+async fn a_worker_from_another_engine_build_is_refused_before_the_script_runs() {
     let stale = Hello {
-        monty: "0.0.0".into(),
+        engine: "djs-00000000".into(),
         ..Hello::current()
     };
     let outcome = Worker::in_process_as(stale)
@@ -643,7 +403,7 @@ async fn a_worker_from_another_monty_is_refused_before_the_script_runs() {
     assert!(outcome.outputs.is_empty());
 }
 
-/// `komo update` 换了磁盘上的二进制、Gateway 还没重启：协议与 monty 没变就照常跑。
+/// `komo update` 换了磁盘上的二进制、Gateway 还没重启：协议与引擎构建号没变就照常跑。
 #[tokio::test]
 async fn a_worker_from_another_komo_build_on_the_same_protocol_still_runs() {
     let newer = Hello {
@@ -663,32 +423,32 @@ async fn a_worker_from_another_komo_build_on_the_same_protocol_still_runs() {
     assert_eq!(outcome.outputs, vec!["ran".to_string()]);
 }
 
-/// 两个调用都在路上时才放行：串行执行会卡死在第一个上，到墙钟为止。
-fn rendezvous() -> impl FnMut(
-    String,
-    serde_json::Value,
-) -> std::pin::Pin<
-    Box<dyn Future<Output = Result<serde_json::Value, String>> + Send>,
-> {
+fn rendezvous()
+-> impl FnMut(String, Value) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send>> {
     let barrier = Arc::new(tokio::sync::Barrier::new(2));
     move |name, args| {
         let barrier = barrier.clone();
         Box::pin(async move {
             barrier.wait().await;
-            Ok(
-                json!({ "status": "completed", "text": format!("{name}:{}", args["path"].as_str().unwrap_or_default()) }),
-            )
+            Ok(json!({
+                "status": "completed",
+                "text": format!("{name}:{}", args["path"].as_str().unwrap_or_default())
+            }))
         })
     }
 }
 
 #[tokio::test]
-async fn atools_calls_run_at_the_same_time_and_come_back_in_argument_order() {
+async fn promise_all_runs_calls_concurrently_and_returns_in_argument_order() {
     let outcome = Worker::in_process()
         .run(
-            "import asyncio\n\
-             a, b = await asyncio.gather(atools.read(path='a'), atools.read(path='b'))\n\
-             text([a['text'], b['text']])",
+            r#"
+const [a, b] = await Promise.all([
+  tools.read({ path: "a" }),
+  tools.read({ path: "b" }),
+]);
+text([a.text, b.text]);
+"#,
             &["read".to_string()],
             &ScriptCatalog::default(),
             Duration::from_secs(5),
@@ -700,11 +460,17 @@ async fn atools_calls_run_at_the_same_time_and_come_back_in_argument_order() {
 }
 
 #[tokio::test]
-async fn settle_keeps_every_result_when_one_call_fails() {
+async fn promise_all_settled_keeps_every_result_when_one_call_fails() {
     let outcome = Worker::in_process()
         .run(
-            "rs = await settle(atools.read(path='a'), atools.read(path='missing'), atools.read(path='c'))\n\
-             text([r['value']['text'] if r['ok'] else r['error'] for r in rs])",
+            r#"
+const rs = await Promise.allSettled([
+  tools.read({ path: "a" }),
+  tools.read({ path: "missing" }),
+  tools.read({ path: "c" }),
+]);
+text(rs.map((r) => r.status === "fulfilled" ? r.value.text : r.reason.message));
+"#,
             &["read".to_string()],
             &ScriptCatalog::default(),
             TIMEOUT,
@@ -717,62 +483,65 @@ async fn settle_keeps_every_result_when_one_call_fails() {
         )
         .await;
     assert_eq!(outcome.error, None);
-    let seen: serde_json::Value = serde_json::from_str(&outcome.outputs[0]).unwrap();
+    let seen: Value = serde_json::from_str(&outcome.outputs[0]).unwrap();
     assert_eq!(seen, json!(["a", "没有这个文件", "c"]));
 }
 
+/// 流式 `wait` 核心验收：慢调用 `slow` 在闸门上卡住时，快链 `fast -> hop2` 不被批次屏障拖住，
+/// `hop2` 到达宿主后主动放开 `slow` 的闸门——如果还是旧的全量批次屏障，这个测试必死锁超时！
 #[tokio::test]
-async fn gather_raises_the_first_tool_error_like_promise_all() {
+async fn streaming_wait_lets_a_fast_chain_start_its_second_hop_while_a_slow_call_is_blocked() {
+    let slow_gate = Arc::new(Notify::new());
     let outcome = Worker::in_process()
         .run(
-            "import asyncio\n\
-             try:\n    await asyncio.gather(atools.read(path='a'), atools.read(path='missing'))\n\
-             except ToolError as e:\n    text('caught: ' + str(e))",
-            &["read".to_string()],
+            r#"
+const [slow, fastChain] = await Promise.all([
+  tools.slow({}),
+  tools.fast({}).then((r) => tools.hop2({ from: r.v })),
+]);
+text([slow.v, fastChain.v]);
+"#,
+            &["slow".to_string(), "fast".to_string(), "hop2".to_string()],
             &ScriptCatalog::default(),
-            TIMEOUT,
-            |_, args| async move {
-                match args["path"].as_str() {
-                    Some("missing") => Err("没有这个文件".to_string()),
-                    _ => Ok(json!({})),
+            Duration::from_secs(5),
+            move |name, args| {
+                let gate = slow_gate.clone();
+                async move {
+                    match name.as_str() {
+                        "slow" => {
+                            gate.notified().await;
+                            Ok(json!({ "v": "S" }))
+                        }
+                        "fast" => Ok(json!({ "v": "F1" })),
+                        "hop2" => {
+                            // 第二跳启动证明 fast 已经在 slow 未完成前被流式交付！放开 slow。
+                            gate.notify_one();
+                            Ok(json!({ "v": format!("{}+H2", args["from"].as_str().unwrap()) }))
+                        }
+                        other => Err(format!("unknown {other}")),
+                    }
                 }
             },
         )
         .await;
     assert_eq!(outcome.error, None);
-    assert_eq!(outcome.outputs, vec!["caught: 没有这个文件".to_string()]);
-}
-
-#[tokio::test]
-async fn a_plain_call_is_answered_while_an_atools_call_is_still_running() {
-    let outcome = Worker::in_process()
-        .run(
-            "pending = atools.read(path='slow')\n\
-             fast = tools.read(path='fast')\n\
-             slow = await pending\n\
-             text([fast['text'], slow['text']])",
-            &["read".to_string()],
-            &ScriptCatalog::default(),
-            Duration::from_secs(5),
-            rendezvous(),
-        )
-        .await;
-    assert_eq!(outcome.error, None);
-    let seen: serde_json::Value = serde_json::from_str(&outcome.outputs[0]).unwrap();
-    assert_eq!(seen, json!(["read:fast", "read:slow"]));
+    let seen: Value = serde_json::from_str(&outcome.outputs[0]).unwrap();
+    assert_eq!(seen, json!(["S", "F1+H2"]));
 }
 
 #[tokio::test]
 async fn calls_reach_the_host_in_script_order_and_unawaited_ones_still_finish() {
     let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let finished = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let finished = Arc::new(AtomicUsize::new(0));
     let (log, done) = (seen.clone(), finished.clone());
     let outcome = Worker::in_process()
         .run(
-            "fs = [atools.read(path=str(i)) for i in range(5)]\n\
-             atools.read(path='forgotten')\n\
-             rs = await settle(*fs)\n\
-             text(len(rs))",
+            r#"
+const ps = [0, 1, 2, 3, 4].map((i) => tools.read({ path: String(i) }));
+tools.read({ path: "forgotten" });
+const rs = await Promise.all(ps);
+text(rs.length);
+"#,
             &["read".to_string()],
             &ScriptCatalog::default(),
             TIMEOUT,
@@ -782,8 +551,8 @@ async fn calls_reach_the_host_in_script_order_and_unawaited_ones_still_finish() 
                     .push(args["path"].as_str().unwrap().to_string());
                 let done = done.clone();
                 async move {
-                    tokio::time::sleep(Duration::from_millis(20)).await;
-                    done.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(15)).await;
+                    done.fetch_add(1, Ordering::SeqCst);
                     Ok(json!({}))
                 }
             },
@@ -795,21 +564,75 @@ async fn calls_reach_the_host_in_script_order_and_unawaited_ones_still_finish() 
         *seen.lock().unwrap(),
         ["0", "1", "2", "3", "4", "forgotten"]
     );
-    assert_eq!(finished.load(std::sync::atomic::Ordering::SeqCst), 6);
+    assert_eq!(finished.load(Ordering::SeqCst), 6);
 }
 
 #[tokio::test]
-async fn atools_count_toward_the_256_call_limit() {
+async fn memory_cap_is_hard_and_cannot_be_caught_by_script() {
     let outcome = Worker::in_process()
+        .with_memory_limit(8 << 20)
         .run(
-            "rs = await settle(*[atools.echo() for i in range(300)])\n\
-             text(len([r for r in rs if not r['ok']]))",
-            &["echo".to_string()],
+            r#"
+const chunks: string[] = [];
+try {
+  while (true) chunks.push("x".repeat(1 << 20));
+} catch {
+  text("swallowed");
+}
+"#,
+            &[],
             &ScriptCatalog::default(),
             TIMEOUT,
-            |_, _| async { Ok(json!({})) },
+            |_, _| async { Err(String::new()) },
         )
         .await;
-    assert_eq!(outcome.error, None);
-    assert_eq!(outcome.outputs, vec!["44".to_string()]);
+    assert!(outcome.outputs.is_empty(), "OOM 绝不能被脚本 catch 吞掉");
+    let err = outcome.error.unwrap();
+    assert!(err.contains("内存超限"), "{err}");
+}
+
+#[test]
+fn infinite_loop_stops_cleanly_in_process_by_fuel_and_deadline() {
+    struct DummyHost;
+    impl EngineHost for DummyHost {
+        fn call(&mut self, _: Result<ToolCall, String>) -> Result<Value, String> {
+            Err("unused".into())
+        }
+        fn defer(&mut self, _: u32, _: Result<ToolCall, String>) {}
+        fn wait(&mut self, _: &[u32]) -> Vec<(u32, Result<Value, String>)> {
+            Vec::new()
+        }
+        fn nondet(&mut self, ask: &Nondet) -> Result<Value, String> {
+            match ask {
+                Nondet::Clock => Ok(json!(0.0)),
+                Nondet::Urandom { size } => Ok(json!("01".repeat(*size))),
+                Nondet::Deliver { .. } => Err("unused".into()),
+            }
+        }
+        fn text(&mut self, _: String) -> Result<(), String> {
+            Ok(())
+        }
+    }
+    let req = Request {
+        code: "while (true) {}".into(),
+        limits: Limits {
+            max_memory: Some(16 << 20),
+            max_turn_ms: Some(100),
+            max_calls: Some(256),
+        },
+        ..Request::default()
+    };
+    let started = Instant::now();
+    let end = DjsEngine.run(&req, &mut DummyHost);
+    assert!(started.elapsed() < Duration::from_secs(2));
+    assert!(end.error.unwrap().contains("超时"));
+}
+
+#[test]
+fn compile_check_rejects_python_syntax_with_migration_hint() {
+    let err =
+        worker::compile_check("import json\nfor p in ['a']:\n    tools.read(path=p)").unwrap_err();
+    assert!(err.contains("SyntaxError"), "{err}");
+    assert!(err.contains("TypeScript / JavaScript"), "{err}");
+    assert!(worker::compile_check("const r = await tools.read({ path: 'a' }); text(r);").is_ok());
 }

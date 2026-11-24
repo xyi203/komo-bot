@@ -1,8 +1,8 @@
-//! 升级 Monty 或改前置代码（`prelude.py`）之后的回归：拿真实会话里的 codemode 脚本与录像
+//! 升级 djs 或改前置脚本（`prelude.js`）之后的回归：拿真实会话里的 codemode 脚本与录像
 //! （`docs/codemode.md` §10）回放一遍，核对脚本能编译、调用序列与录下来的一致。
 //!
-//! 脚本与录像是从本机会话（只读）里抽出来的数据，不进仓库：每个脚本一个 `codemode/<name>.py`，
-//! 有完整子调用录像的另有 `replay/<name>.py.json`
+//! 脚本与录像是从本机会话（只读）里抽出来的数据，不进仓库：每个脚本一个 `codemode/<name>.ts`，
+//! 有完整子调用录像的另有 `replay/<name>.ts.json`
 //! （`{"tools": [..], "cwd": ".."|null, "calls": [{"name", "args", "value", "error"}]}`）。
 //!
 //! cargo run --release -p komo --example codemode_replay -- <komo 可执行文件> <目录>

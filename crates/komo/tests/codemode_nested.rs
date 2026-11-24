@@ -349,9 +349,13 @@ async fn a_real_worker_script_reads_two_files_through_nested_tasks() {
     std::fs::write(dir.path().join("a.log"), "ok 1\nERROR a\nok 2\n").unwrap();
     std::fs::write(dir.path().join("b.log"), "ERROR b\nok 3\n").unwrap();
     let code = format!(
-        "hits = []\nfor name in ['a.log', 'b.log']:\n    body = tools.read(path='{}/' + name)['text']\n    \
-         hits += [line for line in body.splitlines() if 'ERROR' in line]\ntext('\\n'.join(hits))",
-        dir.path().display()
+        "const hits: string[] = [];\n\
+         for (const name of ['a.log', 'b.log']) {{\n\
+           const body = (await tools.read({{ path: {:?} + '/' + name }})).text;\n\
+           for (const line of body.split('\\n')) if (line.includes('ERROR')) hits.push(line);\n\
+         }}\n\
+         text(hits.join('\\n'));",
+        dir.path().display().to_string()
     );
     let world = World::new(
         &code,
@@ -386,8 +390,10 @@ async fn a_killed_real_worker_is_replayed_from_the_nested_slots_after_a_restart(
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("a.log"), "alpha\n").unwrap();
     let code = format!(
-        "a = tools.read(path='{}/a.log')['text']\nb = tools.tick()['text']\ntext(a.strip() + ' ' + b)",
-        dir.path().display()
+        "const a = (await tools.read({{ path: {:?} }})).text;\n\
+         const b = (await tools.tick()).text;\n\
+         text(a.trim() + ' ' + b);",
+        dir.path().join("a.log").display().to_string()
     );
     let tick = Arc::new(Tick {
         runs: AtomicUsize::new(0),
@@ -429,8 +435,8 @@ async fn a_killed_real_worker_is_replayed_from_the_nested_slots_after_a_restart(
 async fn a_real_worker_can_call_bash_and_handle_a_nonzero_exit_as_a_value() {
     let dir = tempfile::tempdir().unwrap();
     let world = World::new(
-        "r = tools.bash(command='printf hello; printf stderr >&2; exit 7')\n\
-         text(r['status'])\ntext(r['result']['exit_code'])\ntext(r['text'])\ntext('continued')",
+        "const r = await tools.bash({ command: 'printf hello; printf stderr >&2; exit 7' });\n\
+         text(r.status); text(r.result.exit_code); text(r.text); text('continued');",
         dir.path().to_path_buf(),
         Arc::new(Tick {
             runs: AtomicUsize::new(0),
@@ -475,11 +481,20 @@ async fn a_real_worker_settles_parallel_calls_like_promise_all_settled() {
         )
     };
     let code = format!(
-        "rs = await settle(\n    atools.read(path='{root}/a.log'),\n    atools.read(path='{root}/missing.log'),\n    \
-         atools.bash(command={x:?}),\n    atools.bash(command={y:?}),\n)\n\
-         for i, r in enumerate(rs):\n    \
-         v = r['value'] if r['ok'] else {{}}\n    \
-         text({{'i': i, 'ok': r['ok'], 'status': v.get('status'), 'text': v.get('text', r.get('error', '')).strip()}})",
+        "const rs = await Promise.allSettled([\n\
+           tools.read({{ path: {:?} }}),\n\
+           tools.read({{ path: {:?} }}),\n\
+           tools.bash({{ command: {x:?} }}),\n\
+           tools.bash({{ command: {y:?} }}),\n\
+         ]);\n\
+         for (let i = 0; i < rs.length; i++) {{\n\
+           const r = rs[i];\n\
+           const ok = r.status === 'fulfilled';\n\
+           const v = ok ? r.value : {{}};\n\
+           text({{ i, ok, status: v.status ?? null, text: (ok ? v.text : r.reason.message).trim() }});\n\
+         }}",
+        dir.path().join("a.log").display().to_string(),
+        dir.path().join("missing.log").display().to_string(),
         x = meet("x", "y"),
         y = meet("y", "x"),
     );

@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
-# §13.4：tools/{read,write,edit,rg,bash,…}、工具目录（`ToolExecutor`）、codemode（Monty worker，
+# §13.4：tools/{read,write,edit,rg,bash,…}、工具目录（`ToolExecutor`）、codemode（djs worker，
 # `komo __codemode-worker` 的函数体也在这里）、MCP 客户端与登录、子进程登记。不碰 store，
 # 冷编时与 turso 并行；工具任务由 runtime 的 harness 驱动。
 [features]
@@ -36,11 +36,9 @@ jiff = { workspace = true }
 futures-util = { workspace = true }
 base64 = { workspace = true }
 tempfile = { workspace = true }
-# codemode 的脚本引擎（docs/codemode.md §2）；num-bigint 是 Monty 的大整数与 JSON 之间的桥。
-monty = { workspace = true }
-monty-types = { workspace = true }
-monty-fs = { workspace = true }
-num-bigint = { workspace = true }
+# codemode 的脚本引擎（docs/codemode.md §2）：earendil-works/djs（纯 Rust JS/TS，零第三方依赖）。
+djs-core = { workspace = true }
+djs-prelude = { workspace = true }
 
 # Gateway 起来时抬"能开的文件数"软上限（limits.rs，launchd 默认只有 256）；codemode worker 的
 # RSS 看门狗与 SIGKILL；子进程登记的存活探测。

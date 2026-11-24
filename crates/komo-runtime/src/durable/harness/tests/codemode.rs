@@ -1,6 +1,6 @@
 //! codemode 嵌套调用（设计 §4.7、§5、§12.4；`docs/codemode.md` §7；pi-durable spec §7.3、§7.6）：
 //! 外层是一个 `komo.tool` 任务，脚本里的每个子调用是它名下 `kind: "nested"` 的工具任务，结果写进
-//! `komo.nested` 的成员而不是 transcript。脚本跑在进程内的 Monty worker 上（真引擎，同一套协议）；
+//! `komo.nested` 的成员而不是 transcript。脚本跑在进程内的 djs worker 上（真引擎，同一套协议）；
 //! 真 `komo __codemode-worker` 子进程的端到端在 `crates/komo/tests/codemode_nested.rs`。
 //! 用真时钟：worker 在另一个线程里算，暂停的时钟会在它算的时候空转着把超时跳过去。
 
@@ -108,7 +108,7 @@ async fn a_script_with_two_sub_calls_returns_only_its_text_and_leaves_one_nested
     setup(&world, vec![read.clone(), rg.clone()]);
     script_round(
         &world,
-        "a = tools.read(path='a.txt')\nb = tools.rg(pattern='x')\ntext(a['text'] + ' | ' + b['text'])",
+        "const a = await tools.read({ path: 'a.txt' });\nconst b = await tools.rg({ pattern: 'x' });\ntext(a.text + ' | ' + b.text);",
     );
     let engine = world.open().await;
     let id = world.submit(&engine, "go").await;
@@ -156,7 +156,7 @@ async fn a_restart_during_the_second_sub_call_replays_the_first_and_reruns_the_s
     setup(&world, vec![read.clone(), rg.clone()]);
     script_round(
         &world,
-        "a = tools.read(path='a.txt')\nb = tools.rg(pattern='x')\ntext(a['text'] + ' / ' + b['text'])",
+        "const a = await tools.read({ path: 'a.txt' });\nconst b = await tools.rg({ pattern: 'x' });\ntext(a.text + ' / ' + b.text);",
     );
     let engine = world.open().await;
     let id = world.submit(&engine, "go").await;
@@ -187,7 +187,7 @@ async fn a_restart_during_an_unsafe_sub_call_ends_the_script_uncertain_and_never
     setup(&world, vec![read.clone(), bump.clone(), after.clone()]);
     script_round(
         &world,
-        "a = tools.read(path='a.txt')\nb = tools.mcp__demo__bump(n=1)\ntools.rg(pattern='x')\ntext('unreachable')",
+        "const a = await tools.read({ path: 'a.txt' });\nconst b = await tools.mcp__demo__bump({ n: 1 });\nawait tools.rg({ pattern: 'x' });\ntext('unreachable');",
     );
     let engine = world.open().await;
     let id = world.submit(&engine, "go").await;
@@ -224,8 +224,8 @@ async fn atools_calls_run_as_concurrent_nested_tasks_keyed_in_script_order() {
     setup(&world, vec![read.clone(), rg.clone()]);
     script_round(
         &world,
-        "import asyncio\na, b = await asyncio.gather(atools.read(path='a'), atools.rg(pattern='x'))\n\
-         text(a['text'] + ' | ' + b['text'])",
+        "const [a, b] = await Promise.all([tools.read({ path: 'a' }), tools.rg({ pattern: 'x' })]);\n\
+         text(a.text + ' | ' + b.text);",
     );
     let engine = world.open().await;
     let id = world.submit(&engine, "go").await;
@@ -260,8 +260,9 @@ async fn a_restart_during_parallel_calls_replays_the_delivered_one_and_continues
     setup(&world, vec![read.clone(), rg.clone(), ls.clone()]);
     script_round(
         &world,
-        "rs = await settle(atools.read(path='a'), atools.rg(pattern='x'))\nc = tools.ls()\n\
-         text(' / '.join([r['value']['text'] for r in rs] + [c['text']]))",
+        "const rs = await Promise.allSettled([tools.read({ path: 'a' }), tools.rg({ pattern: 'x' })]);\n\
+         const c = await tools.ls();\n\
+         text([...rs.map((r: any) => r.value.text), c.text].join(' / '));",
     );
     let engine = world.open().await;
     let id = world.submit(&engine, "go").await;
@@ -306,8 +307,8 @@ async fn clock_and_random_readings_are_memoized_on_the_outer_task_and_replayed_u
     setup(&world, vec![read.clone(), rg.clone()]);
     script_round(
         &world,
-        "import time, random\nstamp = repr(time.time())\nroll = repr(random.random())\n\
-         tools.read(path=stamp + roll)\ntools.rg(pattern='x')\ntext('stamp ' + stamp)",
+        "const stamp = String(Date.now());\nconst roll = String(Math.random());\n\
+         await tools.read({ path: stamp + roll });\nawait tools.rg({ pattern: 'x' });\ntext('stamp ' + stamp);",
     );
     let engine = world.open().await;
     let id = world.submit(&engine, "go").await;
@@ -330,12 +331,14 @@ async fn clock_and_random_readings_are_memoized_on_the_outer_task_and_replayed_u
             .any(|entry| entry["request"]["op"] == "urandom"),
         "{batch:?}"
     );
-    let clock = batch
+    let clock_ms = (batch
         .iter()
         .find(|entry| entry["request"]["op"] == "clock")
         .unwrap()["value"]
         .as_f64()
-        .unwrap();
+        .unwrap()
+        * 1000.0)
+        .floor();
 
     let engine = world.restart(engine).await;
     world.harness.wait(&engine, id).await.unwrap();
@@ -349,7 +352,7 @@ async fn clock_and_random_readings_are_memoized_on_the_outer_task_and_replayed_u
         .trim()
         .parse()
         .unwrap();
-    assert_eq!(replayed, clock, "the replayed clock is the memoized one");
+    assert_eq!(replayed, clock_ms, "the replayed clock is the memoized one");
     assert_eq!(read.runs(), 1, "replayed, not redone");
     engine.close().await.unwrap();
 }
@@ -363,7 +366,7 @@ async fn a_script_that_reads_differently_on_replay_diverges_and_runs_nothing_new
     setup(&world, vec![read.clone(), rg.clone()]);
     script_round(
         &world,
-        "import time\nt = time.time()\ntools.read(path='a')\ntools.rg(pattern='x')\ntext('done')",
+        "const t = Date.now();\nawait tools.read({ path: 'a' });\nawait tools.rg({ pattern: 'x' });\ntext('done');",
     );
     let engine = world.open().await;
     let id = world.submit(&engine, "go").await;
@@ -391,7 +394,10 @@ async fn aborting_the_outer_task_aborts_the_running_nested_task_first() {
     let world = World::new();
     let read = Arc::new(TestTool::reader("read", &world.log).hanging_first(1));
     setup(&world, vec![read.clone()]);
-    script_round(&world, "tools.read(path='a')\ntext('unreachable')");
+    script_round(
+        &world,
+        "await tools.read({ path: 'a' });\ntext('unreachable');",
+    );
     let engine = world.open().await;
     let _id = world.submit(&engine, "go").await;
     world.until_log("start read #1").await;
@@ -434,7 +440,7 @@ async fn a_sub_call_to_a_tool_the_surface_no_longer_allows_is_refused_and_the_sc
     setup(&world, vec![read.clone(), rg.clone()]);
     script_round(
         &world,
-        "tools.read(path='a')\ntry:\n    tools.rg(pattern='x')\nexcept ToolError as e:\n    text('refused: ' + str(e))",
+        "await tools.read({ path: 'a' });\ntry {\n  await tools.rg({ pattern: 'x' });\n} catch (e) {\n  if (e instanceof ToolError) text('refused: ' + e.message);\n}",
     );
     let engine = world.open().await;
     let id = world.submit(&engine, "go").await;
@@ -471,7 +477,7 @@ async fn the_outer_result_lists_each_sub_call_with_bounded_args_and_its_failure(
     setup(&world, vec![read, rg]);
     script_round(
         &world,
-        "tools.read(path='a' * 300)\ntry:\n    tools.rg(pattern='x')\nexcept ToolError:\n    pass\ntext('done')",
+        "await tools.read({ path: 'a'.repeat(300) });\ntry {\n  await tools.rg({ pattern: 'x' });\n} catch (e) {\n  if (!(e instanceof ToolError)) throw e;\n}\ntext('done');",
     );
     let engine = world.open().await;
     let id = world.submit(&engine, "go").await;
@@ -523,7 +529,7 @@ async fn a_file_write_inside_a_script_runs_but_other_operations_are_refused_afte
     setup(&world, vec![mutate.clone(), remember.clone()]);
     script_round(
         &world,
-        "text(tools.mutate()['status'])\ntry:\n    tools.remember()\nexcept ToolError as e:\n    text('refused: ' + str(e))",
+        "text((await tools.mutate()).status);\ntry {\n  await tools.remember();\n} catch (e) {\n  if (e instanceof ToolError) text('refused: ' + e.message);\n}",
     );
     let engine = world.open().await;
     let id = world.submit(&engine, "go").await;
@@ -560,7 +566,7 @@ async fn komo_reads_run_inside_a_script_but_komo_writes_are_refused() {
     setup(&world, vec![lookup.clone(), record.clone()]);
     script_round(
         &world,
-        "text(tools.lookup()['status'])\ntry:\n    tools.record()\nexcept ToolError as e:\n    text('refused: ' + str(e))",
+        "text((await tools.lookup()).status);\ntry {\n  await tools.record();\n} catch (e) {\n  if (e instanceof ToolError) text('refused: ' + e.message);\n}",
     );
     let engine = world.open().await;
     let id = world.submit(&engine, "go").await;
@@ -659,7 +665,10 @@ async fn a_script_timeout_aborts_the_in_flight_sub_call_and_ends_uncertain() {
         .with_codemode(Some(Worker::in_process())),
     );
     harness.install(&world.registry);
-    script_round(&world, "tools.read(path='a')\ntext('unreachable')");
+    script_round(
+        &world,
+        "await tools.read({ path: 'a' });\ntext('unreachable');",
+    );
     let engine = world.open().await;
     let id = harness
         .submit(&engine, CONV, SubmissionDraft::input("go"))
@@ -691,7 +700,7 @@ async fn a_nested_task_the_scheduler_faulted_is_an_unknown_result_for_the_script
     setup(&world, vec![read.clone(), rg.clone()]);
     script_round(
         &world,
-        "tools.read(path='a')\ntools.rg(pattern='x')\ntext('unreachable')",
+        "await tools.read({ path: 'a' });\nawait tools.rg({ pattern: 'x' });\ntext('unreachable');",
     );
     let engine = world.open().await;
     let id = world.submit(&engine, "go").await;
@@ -722,7 +731,7 @@ async fn a_nested_task_the_scheduler_faulted_is_an_unknown_result_for_the_script
 async fn nested_documents_retire_with_the_outer_task() {
     let world = World::new();
     setup(&world, vec![Arc::new(TestTool::reader("read", &world.log))]);
-    script_round(&world, "tools.read(path='a')\ntext('x')");
+    script_round(&world, "await tools.read({ path: 'a' });\ntext('x');");
     let engine = world.open().await;
     let id = world.submit(&engine, "go").await;
     world.harness.wait(&engine, id).await.unwrap();
@@ -755,8 +764,8 @@ async fn on_a_turso_database_a_restart_in_the_second_sub_call_replays_the_first(
     setup(&world, vec![read.clone(), rg.clone()]);
     script_round(
         &world,
-        "import time\nstamp = repr(time.time())\ntools.read(path=stamp)\n\
-         tools.rg(pattern='x')\ntext('stamp ' + stamp)",
+        "const stamp = String(Date.now());\nawait tools.read({ path: stamp });\n\
+         await tools.rg({ pattern: 'x' });\ntext('stamp ' + stamp);",
     );
     let engine = world.open().await;
     let id = world.submit(&engine, "go").await;
@@ -845,7 +854,7 @@ async fn nested_live_slots_follow_admission_intent_progress_and_delivery_then_di
     setup(&world, vec![bash, read]);
     script_round(
         &world,
-        "r = tools.bash(command='test')\ntools.read(path='hold')\ntext(r['text'])",
+        "const r = await tools.bash({ command: 'test' });\nawait tools.read({ path: 'hold' });\ntext(r.text);",
     );
     let engine = world.open().await;
     let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -908,7 +917,7 @@ async fn a_bash_view_is_bounded_in_the_nested_receipt_while_the_complete_stdout_
     setup(&world, vec![bash, read]);
     script_round(
         &world,
-        "r = tools.bash(command='test')\ntools.read(path='hold')\ntext('last: ' + str('LAST_OUT' in r['text']))",
+        "const r = await tools.bash({ command: 'test' });\nawait tools.read({ path: 'hold' });\ntext('last: ' + String(r.text.includes('LAST_OUT')));",
     );
     let engine = world.open().await;
     let id = world.submit(&engine, "go").await;
@@ -965,7 +974,7 @@ async fn an_unsafe_nested_bash_probes_a_surviving_child_before_becoming_uncertai
     quick_probe(&world);
     script_round(
         &world,
-        "tools.bash(command='test')\ntools.rg(pattern='never')",
+        "await tools.bash({ command: 'test' });\nawait tools.rg({ pattern: 'never' });",
     );
     world.probe.set(Liveness::Alive);
     let engine = world.open().await;
@@ -1002,7 +1011,7 @@ async fn cancelling_a_nested_bash_in_probe_records_its_surviving_pid_and_clears_
     );
     setup(&world, vec![bash.clone()]);
     quick_probe(&world);
-    script_round(&world, "tools.bash(command='test')");
+    script_round(&world, "await tools.bash({ command: 'test' });");
     world.probe.set(Liveness::Alive);
     let engine = world.open().await;
     let id = world.submit(&engine, "go").await;
@@ -1048,7 +1057,7 @@ async fn a_complete_truncated_bash_output_is_reused_from_disk_before_probing_the
     quick_probe(&world);
     script_round(
         &world,
-        "r = tools.bash(command='test')\ntools.read(path='hold')\ntext('done')",
+        "const r = await tools.bash({ command: 'test' });\nawait tools.read({ path: 'hold' });\ntext('done');",
     );
     world.probe.set(Liveness::Alive);
     let engine = world.open().await;
@@ -1119,7 +1128,7 @@ async fn a_nested_host_timeout_stays_uncertain_on_disk_and_stops_following_calls
     setup(&world, vec![bash, after.clone()]);
     script_round(
         &world,
-        "try:\n    tools.bash(command='test')\nexcept ToolError:\n    pass\ntools.rg(pattern='never')",
+        "try {\n  await tools.bash({ command: 'test' });\n} catch {}\nawait tools.rg({ pattern: 'never' });",
     );
     let engine = world.open().await;
     let id = world.submit(&engine, "go").await;
@@ -1159,7 +1168,10 @@ async fn a_safe_nested_call_reruns_after_probe_and_clears_the_old_attempts_progr
     let after = Arc::new(TestTool::reader("rg", &world.log).with_gate(&gate));
     setup(&world, vec![read.clone(), after]);
     quick_probe(&world);
-    script_round(&world, "tools.read(path='test')\ntools.rg(pattern='hold')");
+    script_round(
+        &world,
+        "await tools.read({ path: 'test' });\nawait tools.rg({ pattern: 'hold' });",
+    );
     world.probe.set(Liveness::Alive);
     let engine = world.open().await;
     let id = world.submit(&engine, "go").await;
@@ -1193,7 +1205,7 @@ async fn an_outward_sub_call_in_an_unattended_run_is_refused_without_running() {
     setup(&world, vec![send.clone()]);
     script_round(
         &world,
-        "try:\n    tools.send(to='x')\nexcept ToolError as e:\n    text('refused: ' + str(e))",
+        "try {\n  await tools.send({ to: 'x' });\n} catch (e) {\n  if (e instanceof ToolError) text('refused: ' + e.message);\n}",
     );
     let engine = world.open().await;
     let id = world
@@ -1212,5 +1224,42 @@ async fn an_outward_sub_call_in_an_unattended_run_is_refused_without_running() {
     assert_eq!(status, "completed");
     assert!(view.contains("请在顶层直接调用 send"), "{view}");
     assert_eq!(send.runs(), 0);
+    engine.close().await.unwrap();
+}
+
+/// 流式多跳并发 + 崩溃重放确定性：`slow` 卡住时 `fast` 先交付并立刻发出第二跳 `hop2`（`c3`）；
+/// 重启后 `c1`（Safe）重跑、`c2`/`c3` 从槽位回放，宿主按录下的 `Nondet::Deliver` 交付序精准重放，
+/// 零分歧完成整段脚本。
+#[tokio::test]
+async fn streaming_pipeline_replays_exact_delivery_order_after_restart() {
+    let world = World::new();
+    let slow = Arc::new(TestTool::reader("slow", &world.log).hanging_first(1));
+    let fast = Arc::new(TestTool::reader("fast", &world.log));
+    let hop2 = Arc::new(TestTool::reader("hop2", &world.log));
+    setup(&world, vec![slow.clone(), fast.clone(), hop2.clone()]);
+    script_round(
+        &world,
+        "const [s, f] = await Promise.all([\n\
+           tools.slow({}),\n\
+           tools.fast({}).then((r) => tools.hop2({ prev: r.text })),\n\
+         ]);\n\
+         text(s.text + ' | ' + f.text);",
+    );
+    let engine = world.open().await;
+    let id = world.submit(&engine, "go").await;
+    // `slow` 第一次挂住，`fast` 先流式交付并驱动 `hop2` 跑完！
+    world.until_log("start slow #1").await;
+    world.until_log("finish hop2 #1").await;
+
+    // 此时崩溃重启：c2 (fast) 与 c3 (hop2) 都已交付，c1 (slow, Safe) 重跑。
+    let engine = world.restart(engine).await;
+    world.harness.wait(&engine, id).await.unwrap();
+
+    let (status, view) = only_result(&world).await;
+    assert_eq!(status, "completed", "流式交付序回放必须零分歧：{view}");
+    assert!(view.contains("slow output | hop2 output"), "{view}");
+    assert_eq!(slow.runs(), 2, "未交付的 Safe slow 重跑一次");
+    assert_eq!(fast.runs(), 1, "已交付的 fast 从槽位回放不重做");
+    assert_eq!(hop2.runs(), 1, "已交付的 hop2 从槽位回放不重做");
     engine.close().await.unwrap();
 }

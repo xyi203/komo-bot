@@ -402,9 +402,8 @@ async fn build_tools(
     #[cfg(any(test, feature = "test-support"))]
     tools.extend(test_support::test_tools(config.home()));
 
-    // 脚本里的文件是只读的；komo 自己的状态除会话日志外连读也不行（`sessions/` 与 `read` 一样可读）。
-    let unreadable = state::codemode_unreadable_paths(&snapshot, config.home());
-    let codemode = codemode_worker().map(|worker| worker.protecting(unreadable));
+    // djs 引擎纯内存零 I/O，没有直接文件访问；文件读写一律走工具（由 write / edit / read 各自把关）。
+    let codemode = codemode_worker();
     if codemode.is_some() {
         tools.push(Arc::new(komo_tools::tools::CodemodeTool::new()));
     }

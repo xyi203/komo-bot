@@ -153,7 +153,7 @@ pub enum Operation {
     /// 只读动作的计划是 [`RecoveryMode::SafeReread`]，写动作是 `NoSafeRecovery`：同一个工具两种
     /// 恢复方式，重启后只有前者会被重跑。
     Komo { action: String },
-    /// 一段在 Monty 里跑的 Python 脚本（`docs/codemode.md`）。
+    /// 一段在 djs 里跑的 TypeScript / JavaScript 脚本（`docs/codemode.md`）。
     ///
     /// 脚本自己碰不到文件、网络与进程；工具调用经 executor 的 durable journal。
     /// 允许只读操作及 MCP（包括写操作），所以整段是调度屏障；恢复接回已记录子结果。

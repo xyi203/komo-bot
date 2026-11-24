@@ -153,8 +153,8 @@ const MAX_SERVER_DESCRIPTION_CHARS: usize = 250;
 /// 后面的服务器不列，最后一行说还有几台。
 const MAX_SERVERS_SECTION_CHARS: usize = 4096;
 
-const SERVERS_INTRO: &str = "MCP 服务器（工具没有声明给你，在 codemode 脚本里调用；用 search_tools / \
-                             describe_tool / describe_namespace 找工具、看参数与服务器的说明）：";
+const SERVERS_INTRO: &str = "MCP 服务器（工具没有声明给你，在 codemode 脚本里调用；用 searchTools / \
+                             describeTool / describeNamespace 找工具、看参数与服务器的说明）：";
 
 /// 只在 codemode 里调的工具所属的服务器，每台一行（照 pi 的 `renderServersSection`）。
 /// 一台都没有就不出这一段。
@@ -171,7 +171,7 @@ fn servers_block(servers: &[ToolNamespace]) -> Option<String> {
     let omitted = |count: usize| -> Vec<String> {
         match count {
             0 => Vec::new(),
-            n => vec![format!("- …还有 {n} 台，用 search_tools() 找它们的工具")],
+            n => vec![format!("- …还有 {n} 台，用 searchTools() 找它们的工具")],
         }
     };
     let size = |kept: usize| -> usize {

@@ -41,7 +41,7 @@ use crate::durable::harness::codemode_text::{
 };
 use crate::durable::runtime::TaskRuntime;
 use crate::durable::tx::{Ownership, TaskOptions};
-use komo_tools::codemode::{Nondet, ScriptCatalog, ScriptTool, live};
+use komo_tools::codemode::{DeliverOracle, Nondet, ScriptCatalog, ScriptTool, live};
 use komo_tools::executor::ToolExecutor;
 use komo_tools::tools::codemode::NOT_IN_SCRIPTS;
 
@@ -189,10 +189,12 @@ async fn run_script(
     // 这里按工具表现在有的算。
     let catalog = script_catalog(set, &names);
     let reads = script.state.clone();
+    let deliver = Arc::new(StateDeliver(script.state.clone()));
     let script = &script;
     let outcome = worker
         .in_dir(ctx.cwd.clone())
         .with_nondet(Arc::new(move |request| read(&reads, request)))
+        .with_deliver(deliver)
         .run(code, &names, &catalog, ctx.call_timeout, |name, args| {
             // 序号按 worker 发来的顺序定，不等 future 被轮询。
             let index = script.reserve();
@@ -628,6 +630,60 @@ fn read(state: &Mutex<State>, request: &Nondet) -> Result<Value, String> {
         value: value.clone(),
     });
     Ok(value)
+}
+
+/// 流式 `wait` 交付序的回放与记账：共用外层任务的 `codemode.nondet` memo 序列。
+struct StateDeliver(Arc<Mutex<State>>);
+
+impl DeliverOracle for StateDeliver {
+    fn next_recorded(&self, waiting: &[u32]) -> Result<Option<Vec<u32>>, String> {
+        let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(error) = &state.fatal {
+            return Err(error.to_string());
+        }
+        let Some(entry) = state.replay.get(state.replay_cursor) else {
+            return Ok(None);
+        };
+        let expected = Nondet::Deliver {
+            waiting: waiting.to_vec(),
+        };
+        if entry.request != expected {
+            let error = uncertain(format!(
+                "codemode 回放分歧：第 {} 条不确定事件与记录不符（记录 {:?}，现在 {:?}）",
+                state.replay_cursor + 1,
+                entry.request,
+                expected
+            ));
+            let message = error.to_string();
+            state.fatal = Some(error);
+            return Err(message);
+        }
+        let ids: Vec<u32> = serde_json::from_value(entry.value.clone()).map_err(|e| {
+            let error = uncertain(format!("codemode 交付序记录损坏：{e}"));
+            let message = error.to_string();
+            state.fatal = Some(error);
+            message
+        })?;
+        state.replay_cursor += 1;
+        Ok(Some(ids))
+    }
+
+    fn record(&self, waiting: &[u32], delivered: &[u32]) -> Result<(), String> {
+        let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(error) = &state.fatal {
+            return Err(error.to_string());
+        }
+        if state.replay.len() + state.pending.len() >= MAX_NONDET {
+            return Err(format!("一段脚本最多记 {MAX_NONDET} 条不确定事件"));
+        }
+        state.pending.push(NondetEntry {
+            request: Nondet::Deliver {
+                waiting: waiting.to_vec(),
+            },
+            value: json!(delivered),
+        });
+        Ok(())
+    }
 }
 
 /// 提交被拒：几乎总是因为 invocation 结束了（取消、关闭）。那就等外层的取消信号到，让

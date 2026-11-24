@@ -1,11 +1,11 @@
 //! codemode 的脚本引擎与 worker 协议（`docs/codemode.md`）。
 //!
-//! 这里只管"在 worker 里跑一段 Python、把它的工具调用交出去"。工具调用怎么判、怎么执行在
-//! executor（`run_codemode` / `nested_call`）——这里拿到的只是一个回调。
+//! 这里只管“在 worker 里跑一段 TypeScript / JavaScript、把它的工具调用交出去”。工具调用怎么判、
+//! 怎么执行在 executor / harness（`durable::harness::codemode`）——这里拿到的只是一个回调。
 //!
-//! 引擎是 pydantic Monty：语言本身没有文件、网络、子进程，所以不需要操作系统沙箱，也就没有
-//! "沙箱起不来就不注册 codemode"这回事。每次调用起一个 worker 进程（`komo __codemode-worker`，
-//! 本模块的 [`worker`]），宿主管墙钟、内存与取消，到限就 SIGKILL。
+//! 引擎是 `earendil-works/djs`（纯 Rust JS/TS 引擎）：语言本身零 I/O（没有文件、网络、子进程、
+//! 环境变量），自带不可捕获堆上限与 Fuel 切片中断，不需要操作系统沙箱。每次调用仍起一个独立 worker
+//! 进程（`komo __codemode-worker`，本模块的 [`worker`]），宿主管墙钟、RSS 看门狗与取消。
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -19,32 +19,34 @@ use futures_util::FutureExt;
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 
-mod convert;
+pub mod djs;
 pub mod engine;
-mod monty;
 pub mod worker;
 
-/// 脚本引擎的版本：写进 journal 的 `start` 指纹，升级后在途的 codemode 调用恢复时按分歧处理。
-/// 与根 `Cargo.toml` 里 `monty` 的精确钉版本同步（有测试守着）。
-pub const MONTY_VERSION: &str = "1.6.0";
-/// worker 协议版本：请求 / 消息 / 脚本前置代码（`prelude.py`）/ worker 的行为任一变了就加一——握手只比它与
-/// [`MONTY_VERSION`]，`komo` 版本号不同照常跑（[`Hello::compatible_with`]）。
-/// 3：延后调用（`atools`）与 `wait`。4：前置代码预先导入 json / re 等常用模块。
-pub const WORKER_PROTOCOL: u32 = 4;
-/// 一次 `os.urandom` / `random` 起始状态最多向宿主要这么多字节（Monty 给 `random` 起状态要 2496）。
+/// worker 协议版本：请求 / 消息 / 前置脚本（`prelude.js`）/ worker 行为任一变了就加一——握手只比它与
+/// 引擎构建标识（[`engine_version`]），`komo` 版本号不同照常跑（[`Hello::compatible_with`]）。
+/// 5：切换为 djs（JS/TS）引擎与流式 `wait`（先完先交付 + 交付序记账）。
+pub const WORKER_PROTOCOL: u32 = 5;
+/// 一次熵请求最多向宿主要这么多字节。
 const MAX_URANDOM: usize = 1 << 16;
 
-/// 脚本和 worker 合计的常驻内存上限：既是 Monty 的软限，也是宿主看门狗的杀线。
+/// 脚本和 worker 合计的内存上限：既是 djs 的硬堆上限，也是宿主看门狗的杀线。
 const DEFAULT_MEMORY_LIMIT: u64 = 1 << 30;
 const WATCHDOG_INTERVAL: Duration = Duration::from_millis(100);
 
+/// 当前脚本引擎的构建标识：写进握手与 `codemode.start` 指纹。
+pub fn engine_version() -> String {
+    djs::build_id()
+}
+
 /// worker 启动后的第一行：它是哪一版。宿主与 worker 是同一个可执行文件，但磁盘上的二进制会在
 /// Gateway 重启之前被换掉（`komo update` / `scripts/install-local.sh`），新起的 worker 就可能
-/// 不是 Gateway 的那一版：协议或 monty 对不上就干净地失败，只差 `komo` 版本号照常跑（`docs/codemode.md` §4）。
+/// 不是 Gateway 的那一版：协议或引擎构建号对不上就干净地失败，只差 `komo` 版本号照常跑
+/// （`docs/codemode.md` §4）。
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Hello {
     pub protocol: u32,
-    pub monty: String,
+    pub engine: String,
     pub komo: String,
 }
 
@@ -52,33 +54,42 @@ impl Hello {
     pub fn current() -> Self {
         Self {
             protocol: WORKER_PROTOCOL,
-            monty: MONTY_VERSION.to_string(),
+            engine: engine_version(),
             komo: env!("CARGO_PKG_VERSION").to_string(),
         }
     }
 
-    /// 能不能把脚本交给这个 worker：只看协议号与 monty 版本。`komo` 版本不同（`komo update` 换了
-    /// 磁盘上的二进制、Gateway 还没重启）只要协议没变就照常跑——会改 worker 行为的变化都要升
-    /// [`WORKER_PROTOCOL`]（`docs/optimization-design.md` §5.4）。
+    /// 能不能把脚本交给这个 worker：只看协议号与引擎构建标识。`komo` 版本不同（`komo update`
+    /// 换了磁盘上的二进制、Gateway 还没重启）只要协议与引擎没变就照常跑——会改 worker 行为的变化
+    /// 都要升 [`WORKER_PROTOCOL`]（`docs/optimization-design.md` §5.4）。
     pub fn compatible_with(&self, ours: &Hello) -> bool {
-        self.protocol == ours.protocol && self.monty == ours.monty
+        self.protocol == ours.protocol && self.engine == ours.engine
     }
 }
 
-/// 脚本要宿主回答的、本身不确定的读数：时钟与熵。Monty 的 `DateTimeSource::CallHost` /
-/// `RandomStart::CallHost` 把它们都交到宿主手里，宿主记进 journal，恢复时按序原样还回去
+/// 脚本或流式调度需要宿主记账、恢复时原样回放的不确定事件：时钟、熵与流式 `wait` 的交付批次
 /// （`docs/codemode.md` §7）。
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Nondet {
-    /// 当前时刻，答 Unix 秒（f64）；`time.*` / `datetime.now` / `date.today` 都读它。
+    /// 当前时刻，答 Unix 秒（f64）。
     Clock,
     /// `size` 个随机字节，答小写十六进制串。
     Urandom { size: usize },
+    /// 流式 `wait` 在 `waiting` 上挂起时，宿主实际交付的那一批 id（用于多跳并发重放确定性）。
+    Deliver { waiting: Vec<u32> },
 }
 
-/// 回答一次 [`Nondet`]。默认是真值（[`live`]）；executor 换成"先还录下来的、录完了再读真的并记账"。
+/// 回答一次 [`Nondet`]。默认是真值（[`live`]）；harness 换成“先还录下来的、录完了再读真的并记账”。
 pub type NondetHandler = Arc<dyn Fn(&Nondet) -> Result<serde_json::Value, String> + Send + Sync>;
+
+/// 流式 `wait` 交付序的回放与记账接口：
+/// - 回放中：`next_recorded(waiting)` 返回首次运行记下的那批交付 id，宿主等这批全齐再按同序交付；
+/// - 越过记录之后：`next_recorded` 返回 `Ok(None)`，宿主等任一完成先交付并调 `record(waiting, delivered)`。
+pub trait DeliverOracle: Send + Sync {
+    fn next_recorded(&self, waiting: &[u32]) -> Result<Option<Vec<u32>>, String>;
+    fn record(&self, waiting: &[u32], delivered: &[u32]) -> Result<(), String>;
+}
 
 /// 真实的时钟与熵。
 pub fn live(request: &Nondet) -> Result<serde_json::Value, String> {
@@ -99,13 +110,14 @@ pub fn live(request: &Nondet) -> Result<serde_json::Value, String> {
                 bytes.iter().map(|byte| format!("{byte:02x}")).collect(),
             ))
         }
+        Nondet::Deliver { .. } => Err("Deliver 不走 live()".to_owned()),
     }
 }
 
-/// 脚本前置代码（`prelude.py`）的哈希：写进 journal 的 `start` 指纹，它变了意味着同一段脚本
-/// 的行为可能变了。
+/// 脚本前置代码（`prelude.js`）的哈希：写进 `codemode.start` 指纹，它变了意味着同一段脚本的
+/// 行为可能变了。
 pub fn prelude_hash() -> komo_kernel::types::digest::ContentHash {
-    komo_kernel::types::digest::ContentHash::of_str(monty::PRELUDE)
+    komo_kernel::types::digest::ContentHash::of_str(djs::PRELUDE)
 }
 
 /// 怎么起一个 worker。
@@ -113,11 +125,10 @@ pub fn prelude_hash() -> komo_kernel::types::digest::ContentHash {
 pub struct Worker {
     launch: Launch,
     memory_limit: u64,
-    /// 脚本的工作目录（`os.getcwd()`，相对路径按它解析）。
+    /// 脚本的工作目录。
     cwd: Option<PathBuf>,
-    /// 脚本读不了的路径：komo 自己的状态，与 `write` / `edit` 同一份名单。
-    protected: Vec<PathBuf>,
     nondet: NondetHandler,
+    deliver: Option<Arc<dyn DeliverOracle>>,
 }
 
 impl std::fmt::Debug for Worker {
@@ -133,8 +144,8 @@ impl std::fmt::Debug for Worker {
 enum Launch {
     /// 起 `<exe> __codemode-worker`。
     Process(PathBuf),
-    /// 测试用：同进程里的一个线程，经 socketpair 说同一套协议。杀不掉，只靠 Monty 自己的
-    /// 时间限制收尾，所以死循环、内存看门狗这类要杀进程的验收走真进程（`crates/komo/tests`）。
+    /// 测试用：同进程里的一个线程，经 socketpair 说同一套协议。djs 自带 Fuel 切片与硬内存限额，
+    /// 进程内即可精确中断。
     #[cfg(any(test, feature = "test-support"))]
     InProcess(Hello),
 }
@@ -160,7 +171,7 @@ pub struct ScriptTool {
 pub struct ScriptOutcome {
     pub outputs: Vec<String>,
     pub console: String,
-    /// 脚本抛出的异常（traceback）或 worker 层的失败。`None` = 正常跑完。
+    /// 脚本抛出的异常或 worker 层的失败。`None` = 正常跑完。
     pub error: Option<String>,
     /// worker 与宿主不是同一版（[`Hello`] 对不上）：脚本一行都没跑，宿主不该把它记成脚本的结果。
     pub incompatible: Option<String>,
@@ -203,8 +214,8 @@ impl Worker {
             launch: Launch::Process(PathBuf::new()),
             memory_limit: DEFAULT_MEMORY_LIMIT,
             cwd: None,
-            protected: Vec::new(),
             nondet: Arc::new(live),
+            deliver: None,
         }
     }
 
@@ -222,12 +233,6 @@ impl Worker {
         }
     }
 
-    /// 脚本读不了的路径（`tools::protect::Protected` 的那份名单，Gateway 装配时给）。
-    pub fn protecting(mut self, paths: Vec<PathBuf>) -> Self {
-        self.protected = paths;
-        self
-    }
-
     /// 这一次运行的工作目录。
     pub fn in_dir(mut self, cwd: impl Into<PathBuf>) -> Self {
         self.cwd = Some(cwd.into());
@@ -240,16 +245,21 @@ impl Worker {
         self
     }
 
+    /// 流式 `wait` 的交付序记账/回放口（harness 注入）。
+    pub fn with_deliver(mut self, oracle: Arc<dyn DeliverOracle>) -> Self {
+        self.deliver = Some(oracle);
+        self
+    }
+
     pub fn with_memory_limit(mut self, bytes: u64) -> Self {
         self.memory_limit = bytes;
         self
     }
 
     /// 跑一段脚本。`on_call(name, args)` 回答脚本里的每一次工具调用，按收到的顺序同步地调它
-    /// （编号之类要在这里定），返回的 future 可能与别的调用并发跑（脚本里的 `atools`）；
-    /// 脚本结束时还在跑的也等它们跑完再返回。`catalog` 是脚本里
-    /// `ALL_TOOLS` / `search_tools` / `describe_tool` / `describe_namespace` 要的说明
-    /// （`docs/codemode.md` §6），发现在 worker 里本地做完，不经宿主、不进 journal。
+    /// （编号之类要在这里定），返回的 future 可与别的调用并发跑；脚本结束时还在跑的也等它们
+    /// 跑完再返回。`catalog` 是脚本里 `ALL_TOOLS` / `searchTools` / `describeTool` /
+    /// `describeNamespace` 要的说明（`docs/codemode.md` §6），发现在 worker 里本地做完。
     ///
     /// 时限到了、内存超了都 SIGKILL worker；外层 future 被丢掉（取消）时进程随之被杀
     /// （`kill_on_drop`）。
@@ -278,7 +288,6 @@ impl Worker {
                 "tools": tools,
                 "catalog": catalog,
                 "cwd": self.cwd,
-                "protected": self.protected,
                 "limits": {
                     "max_memory": self.memory_limit,
                     "max_turn_ms": self.in_process_turn_limit(),
@@ -297,25 +306,25 @@ impl Worker {
             let ours = Hello::current();
             if !hello.compatible_with(&ours) {
                 return Err(Stop::Incompatible(format!(
-                    "codemode 的 worker 与 Gateway 不是同一版（worker：协议 {} / monty {} / komo {}；Gateway：协议 {} / monty {} / komo {}）。\
+                    "codemode 的 worker 与 Gateway 不是同一版（worker：协议 {} / 引擎 {} / komo {}；Gateway：协议 {} / 引擎 {} / komo {}）。\
                      磁盘上的 komo 在 Gateway 启动之后被换过，需要重启 Gateway（komo gateway restart）；脚本没有运行。",
-                    hello.protocol, hello.monty, hello.komo, ours.protocol, ours.monty, ours.komo
+                    hello.protocol, hello.engine, hello.komo, ours.protocol, ours.engine, ours.komo
                 )));
             }
             if hello.komo != ours.komo {
                 tracing::warn!(
                     worker = %hello.komo,
                     gateway = %ours.komo,
-                    "codemode worker 与 Gateway 的 komo 版本不同（协议与 monty 一致，照常运行）；磁盘上的 komo 已更新，重启 Gateway 才用上新版"
+                    "codemode worker 与 Gateway 的 komo 版本不同（协议与引擎一致，照常运行）；磁盘上的 komo 已更新，重启 Gateway 才用上新版"
                 );
             }
             if let Err(error) = write_line(&mut link.writer, &first).await {
                 return Err(format!("脚本交不进 worker：{error}").into());
             }
-            // 延后调用：在跑的与跑完还没交给 worker 的。等 worker 下一行、等一次同步调用时，
+            // 异步调用：在跑的与跑完还没交给 worker 的。等 worker 下一行、等同步调用时，
             // 它们都照样往前跑。
             let mut inflight = FuturesUnordered::new();
-            let mut finished: HashMap<u64, Result<serde_json::Value, String>> = HashMap::new();
+            let mut finished: HashMap<u32, Result<serde_json::Value, String>> = HashMap::new();
             loop {
                 let next = tokio::select! {
                     line = lines.next_line() => line,
@@ -338,17 +347,78 @@ impl Worker {
                         .map_err(|error| format!("结束消息读不懂：{error}").into());
                 }
                 if let Some(ids) = message.get("wait") {
-                    let ids: Vec<u64> = serde_json::from_value(ids.clone())
+                    let ids: Vec<u32> = serde_json::from_value(ids.clone())
                         .map_err(|error| format!("wait 读不懂：{error}"))?;
-                    while !ids.iter().all(|id| finished.contains_key(id)) {
-                        match inflight.next().await {
-                            Some((id, result)) => {
+                    let deliver_ids = match self
+                        .deliver
+                        .as_ref()
+                        .map(|oracle| oracle.next_recorded(&ids))
+                        .transpose()
+                    {
+                        Ok(Some(Some(recorded))) => {
+                            // 回放模式：等录下的这一批全部就绪，再按原顺序交付。
+                            while !recorded.iter().all(|id| finished.contains_key(id)) {
+                                match inflight.next().await {
+                                    Some((id, result)) => {
+                                        finished.insert(id, result);
+                                    }
+                                    None => break,
+                                }
+                            }
+                            recorded
+                        }
+                        Ok(Some(None)) | Ok(None) => {
+                            // 流式模式：只要 ids 里有至少 1 个已完成就立刻交付，不卡在慢调用上。
+                            while !ids.iter().any(|id| finished.contains_key(id)) {
+                                match inflight.next().await {
+                                    Some((id, result)) => {
+                                        finished.insert(id, result);
+                                    }
+                                    None => break,
+                                }
+                            }
+                            // 同一拍已经一起跑完的顺手捎上，减少往返次数。
+                            while let Some(Some((id, result))) = inflight.next().now_or_never() {
                                 finished.insert(id, result);
                             }
-                            None => break,
+                            let ready: Vec<u32> = ids
+                                .iter()
+                                .copied()
+                                .filter(|id| finished.contains_key(id))
+                                .collect();
+                            let ready = if ready.is_empty() { ids.clone() } else { ready };
+                            if let Some(oracle) = &self.deliver
+                                && let Err(error) = oracle.record(&ids, &ready)
+                            {
+                                let results: Vec<serde_json::Value> = ids
+                                    .iter()
+                                    .map(|id| serde_json::json!({ "id": id, "error": error }))
+                                    .collect();
+                                write_line(
+                                    &mut link.writer,
+                                    &serde_json::json!({ "results": results }),
+                                )
+                                .await
+                                .map_err(|e| format!("答复交不进 worker：{e}"))?;
+                                continue;
+                            }
+                            ready
                         }
-                    }
-                    let results: Vec<serde_json::Value> = ids
+                        Err(error) => {
+                            let results: Vec<serde_json::Value> = ids
+                                .iter()
+                                .map(|id| serde_json::json!({ "id": id, "error": error }))
+                                .collect();
+                            write_line(
+                                &mut link.writer,
+                                &serde_json::json!({ "results": results }),
+                            )
+                            .await
+                            .map_err(|e| format!("答复交不进 worker：{e}"))?;
+                            continue;
+                        }
+                    };
+                    let results: Vec<serde_json::Value> = deliver_ids
                         .iter()
                         .map(|id| match finished.remove(id) {
                             Some(Ok(value)) => serde_json::json!({ "id": id, "ok": value }),
@@ -385,10 +455,10 @@ impl Worker {
                     let Some(id) = message.get("id").and_then(|id| id.as_u64()) else {
                         return Err(format!("延后调用没有 id：{line}").into());
                     };
-                    inflight.push(call.map(move |result| (id, result)));
+                    inflight.push(call.map(move |result| (id as u32, result)));
                     continue;
                 }
-                // 同步调用：worker 在等这一个，在跑的延后调用照样往前走。
+                // 同步调用：worker 在等这一个，在跑的异步调用照样往前走。
                 let mut call = std::pin::pin!(call);
                 let result = loop {
                     tokio::select! {
@@ -477,8 +547,7 @@ impl Worker {
         }
     }
 
-    /// 进程内的 worker 杀不掉，让 Monty 自己在时限后停下，免得死循环的线程在测试进程里
-    /// 一直占着一个核。
+    /// 进程内的 worker 杀不掉，让 djs 自己在时限后停下，免得死循环的线程在测试进程里一直占着一个核。
     fn in_process_turn_limit(&self) -> Option<u64> {
         match self.launch {
             Launch::Process(_) => None,

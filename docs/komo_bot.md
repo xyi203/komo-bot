@@ -8,7 +8,7 @@ v0.8 相对 v0.7 的变化：状态数据库改为 Turso + toasty（§8.2；2026
 
 2026-10-25：存储与 agent loop 整套采用 pi-durable 的提交模型（`docs/storage-durable.md`）：`durable.db` 是唯一权威（entry 不可变、task / submission / document、一条提交线、effect sandwich），events.jsonl 退成导出格式，会话树用 fork 表达，loop 按 pi 的钩子组织、跑在 Task 引擎上（§6、§8）。不迁移旧数据：旧 `sessions/*/events.jsonl` 与 `state.db*` 原地留着，新版本不读。§6、§8 与下文凡写到存储的地方都按新存储；被替换的旧机制已在 v0.8 存储重写中移除。
 
-2026-10-11：删掉整套 Policy 与审批（§7）。单操作者、一直跑 `mode = "auto"`，审批不在做判断；之后模型要的 komo 就执行，唯一的硬限制是 `write` / `edit` 不碰 komo 自己的状态，真正的边界只来自执行环境（codemode 的 Monty 引擎）。旧数据里的审批痕迹不再读取（§7.4）。
+2026-10-11：删掉整套 Policy 与审批（§7）。单操作者、一直跑 `mode = "auto"`，审批不在做判断；之后模型要的 komo 就执行，唯一的硬限制是 `write` / `edit` 不碰 komo 自己的状态，真正的边界只来自执行环境（codemode 的 djs 引擎，2026-11-24 起取代 Monty）。旧数据里的审批痕迹不再读取（§7.4）。
 
 ## 1. 已确定的范围
 
@@ -200,9 +200,9 @@ Fedora 使用 systemd 管理，Mac 使用 launchd；服务管理器运行前台�
 | `edit`   | 路径、`edits[]`（每处：明确匹配内容、替换内容、可选 `replace_all`）；可选 `then_run` | 匹配失败返回错误，不模糊猜测；多处对原文件匹配、互不重叠，一处失败文件不动（见下文）。带 `then_run` 见下文 |
 | `rg`     | 正则、搜索路径、文件 glob；返回「路径:行号:正文」    | 只读（`Operation::ReadFile`，与 `read` 同属可并发的一类）；这台机器上没有 ripgrep 就不挂这个工具 |
 | `bash`   | 命令、工作目录、超时；返回退出码和输出               | 管理进程组、限制输出、支持取消；超时也交回到点前的输出 |
-| `codemode` | 一段 Python 脚本；返回脚本的输出                   | 跑在 Monty 里，文件只读；脚本里经 `tools.<name>()` 调只读工具、bash 与 MCP（见下文与 `docs/codemode.md`） |
+| `codemode` | 一段 TypeScript / JavaScript 脚本；返回脚本的输出 | 跑在 djs 里，零直接文件 / 网络 / env / 进程访问；脚本里经 `await tools.<name>()` 调只读工具、写工具、bash 与 MCP（见下文与 `docs/codemode.md`） |
 
-**`python` 工具删除**（2026-10-15）。模型不再有 `python`：`codemode`（Monty，文件只读，经 `tools.*` 调其他工具）覆盖聚合与过滤，需要完整 Python（第三方库、写文件、联网）就用 `bash` 跑 `python3`；Gateway 不再管理 Python 虚拟环境（`python-envs/`、`[paths] python_env_root`、`PythonHost`、`env_version`、`KOMO_ARTIFACT_DIR` 都没有了）。旧记录照常解码与回放：`Operation::PythonCode` 与 `PlanVersions.env` 只为解码旧计划保留（没有构造方、没有写入方），投影只认落盘事实、不认工具名，所以历史 `python` 结果逐字节不变；`artifact://files/…` 仍读得到会话目录 `artifacts/` 里已有的产物，只是不再有新的写入方。恢复时的通用规则见 §8.6。
+**`python` 工具删除**（2026-10-15）。模型不再有 `python`：`codemode`（2026-11-24 起为 djs TS/JS 引擎，经 `tools.*` 调其他工具；此前为 Monty）覆盖并发编排、聚合与过滤，需要完整 Python（第三方库、本地脚本）就用 `bash` 跑 `python3`；Gateway 不再管理 Python 虚拟环境（`python-envs/`、`[paths] python_env_root`、`PythonHost`、`env_version`、`KOMO_ARTIFACT_DIR` 都没有了）。旧记录照常解码与回放：`Operation::PythonCode` 与 `PlanVersions.env` 只为解码旧计划保留（没有构造方、没有写入方），投影只认落盘事实、不认工具名，所以历史 `python` 结果逐字节不变；`artifact://files/…` 仍读得到会话目录 `artifacts/` 里已有的产物，只是不再有新的写入方。恢复时的通用规则见 §8.6。
 
 **`shell` 改名 `bash`**（2026-10-15）。模型看见的工具名从 `shell` 改成 `bash`——它本来就是 `/bin/bash -c`（没有 bash 退到 `/bin/sh`）。`Operation::ShellCommand`（序列化标签 `shell_command`）不动。改名前落账的记录照旧叫 `shell`：投影（`komo-kernel::projection`）与 TUI 对 `shell` / `bash` 两个名字同样处理，回放逐字节不变；恢复时一条按 `shell` 落账、已 `started` 而无结果的调用走 §8.6 那条通用规则（工具名已不在工具表里的在途调用记 `uncertain` 交给模型），不重跑也不当"没有这个工具"。Profile / skill 里写的 `tools = ["shell"]`、`requires_tools: [shell]` 要自己改成 `bash`，没有别名。
 
@@ -243,9 +243,9 @@ task(prompt, title, task_id?, model?, effort?, contract?, context?)
 
 **`update_plan` 已退役（2026-10-16）。** 它曾让模型报一份整份的工作计划，唯一的消费方是在线压缩的"计划边界"；压缩改为只按上下文窗口触发之后就没有用处了，工具、提示里那句话、计划折叠一并删掉。
 
-**`codemode` 是组合，不是新能力。** 模型写一段 Python，在 Monty（pydantic 的 Python 子集解释器）里跑，跑在 komo 自己起的 worker 子进程中——语言本身没有网络、子进程，文件只读（宿主 `/` 只读挂载，komo 自己的状态除 `sessions/` 外连读也拒，写类一律拒；要写文件走 `write` / `edit`，要完整 Python 走 `bash` 的 `python3`（`python` 工具已于 2026-10-15 删除）；2026-10-15 起取代此前的 CPython + 操作系统沙箱：Seatbelt / Landlock + seccomp，以及启动自检），脚本里经 `tools.<name>()` 调其他工具——放行 `Operation::ReadFile`（`read`、`rg`）、`Operation::ShellCommand`（`bash`）与 `Operation::McpCall`（含写操作）的计划；本地 `write` / `edit`、带 `then_run` 的、编排操作与 codemode 自己仍要在脚本外调。只有脚本的输出回到模型。2026-10-11 之前还要"Policy 直接 Allow"；Policy 删掉之后范围外的读也放行（与当时的 auto 一致），边界是语言本身（§7）。**脚本里的子调用逐次持久化**（2026-10-13；2026-10-25 起是外层任务名下 `kind: "nested"` 的工具子任务，交付结果在 `komo.nested` 槽位，不进 transcript，模型只看见外层结果）：中断后整段重跑脚本：已交付的子结果按序原样接回，停在 `execute` 而没交付的按双 Safe 准则判（§8.6），unsafe 的那次先核实记录的存活子进程（probe），完整输出可验证且能重建脚本视图就复用，余下绝不重做；脚本的时钟与随机数经宿主、记成外层任务的 memo，恢复时原样还回去，所以重跑是确定的，越过已记录的前缀之后新调用照常执行（2026-10-15）；分歧（工具名 / 参数 / 读数对不上）或结果不明整段记 uncertain 交给模型。因为脚本里可能有 bash 或 MCP 写，codemode 不再算只读计划（`is_read_only()` 为 false），是同一轮里的屏障（§6）。见 `docs/codemode.md` §5、§7。工具发现函数、子调用持久化与重跑语义、256 次上限、输出落盘与结果预算的说明在 `tool://codemode/doc`，不在工具定义里（见上文「工具定义瘦身」）。
+**`codemode` 是组合，不是新能力。** 模型写一段 TypeScript / JavaScript（`async` 函数体，顶层可用 `await` / `return`），在 djs（纯 `no_std` Rust JS/TS 引擎，2026-11-24 起取代 Monty）里跑，跑在 komo 自己起的 worker 子进程中——语言本身没有任何直接文件、网络、环境变量或子进程访问，所有外部操作一律经 `await tools.<name>({ ... })` 调其他工具——放行 `Operation::ReadFile`（`read`、`rg`）、`Operation::WriteFile`（`write`、`edit`）、`Operation::ShellCommand`（`bash`）、`Operation::McpCall`（含写操作）与只读 `Operation::Komo` 的计划；带 `then_run` 的、编排操作与 codemode 自己仍要在脚本外调。只有脚本的输出回到模型。2026-10-11 之前还要"Policy 直接 Allow"；Policy 删掉之后范围外的读也放行（与当时的 auto 一致），边界是语言本身（§7）。**脚本里的子调用逐次持久化**（2026-10-13；2026-10-25 起是外层任务名下 `kind: "nested"` 的工具子任务，交付结果在 `komo.nested` 槽位，不进 transcript，模型只看见外层结果）：中断后整段重跑脚本：已交付的子结果按序原样接回，停在 `execute` 而没交付的按双 Safe 准则判（§8.6），unsafe 的那次先核实记录的存活子进程（probe），完整输出可验证且能重建脚本视图就复用，余下绝不重做；脚本的时钟、随机数种子与流式并行交付批次（`Nondet::Deliver`）经宿主、记成外层任务的 memo，恢复时原样还回去，所以重跑完全确定，越过已记录的前缀之后新调用照常执行；分歧（工具名 / 参数 / 读数 / 交付批次对不上）或结果不明整段记 uncertain 交给模型。因为脚本里可能有写工具、bash 或 MCP 写，codemode 不再算只读计划（`is_read_only()` 为 false），是同一轮里的屏障（§6）；脚本内部通过原生 `Promise.all` / `Promise.allSettled` 与流式 `wait` 支持多跳并发流水线。见 `docs/codemode.md` §5、§7。工具发现函数、子调用持久化与重跑语义、256 次上限、输出落盘与结果预算的说明在 `tool://codemode/doc`，不在工具定义里（见上文「工具定义瘦身」）。
 
-**MCP 工具也不是第七个工具，是操作者接进来的外部能力。** `[mcp.servers.<name>]` 里配的服务器在 Gateway 启动时连上（要登录的，登录后下一条 Run 受理时连上，不用重启；`docs/mcp.md` §2.2），每个工具注册成 `mcp__<server>__<tool>`，与内置工具走同一条 `prepare` / 落账的路；只读与否由操作者声明，不信服务器自报——它决定恢复时能不能直接重读（§8.6）。codemode 脚本里 MCP 工具都能调，只读声明只决定中断后能不能重做（2026-10-13 之前它还决定 codemode 能不能调）。**默认不声明给模型**（2026-10-14，照 pi 的 `exposure`）：`exposure = "codemode"` 的 MCP 工具不进 schema、只在 codemode 脚本里调，脚本用 `search_tools` / `describe_tool` / `describe_namespace` 找；系统提示只给每台服务器一行摘要（配置的 `description`，没写就是服务器 instructions 的第一行），instructions 全文只在脚本里读。`direct` 照常声明，`hidden` 不挂。见 `docs/mcp.md` §3。
+**MCP 工具也不是第七个工具，是操作者接进来的外部能力。** `[mcp.servers.<name>]` 里配的服务器在 Gateway 启动时连上（要登录的，登录后下一条 Run 受理时连上，不用重启；`docs/mcp.md` §2.2），每个工具注册成 `mcp__<server>__<tool>`，与内置工具走同一条 `prepare` / 落账的路；只读与否由操作者声明，不信服务器自报——它决定恢复时能不能直接重读（§8.6）。codemode 脚本里 MCP 工具都能调，只读声明只决定中断后能不能重做（2026-10-13 之前它还决定 codemode 能不能调）。**默认不声明给模型**（2026-10-14，照 pi 的 `exposure`）：`exposure = "codemode"` 的 MCP 工具不进 schema、只在 codemode 脚本里调，脚本用 `searchTools` / `describeTool` / `describeNamespace`（保留 snake_case 别名）找；系统提示只给每台服务器一行摘要（配置的 `description`，没写就是服务器 instructions 的第一行），instructions 全文只在脚本里读。`direct` 照常声明，`hidden` 不挂。见 `docs/mcp.md` §3。
 
 **`komo` 工具也不是第七个基础工具，是"自己的状态"这一层（2026-11-11 定，理由见 `docs/tasks.md` §4.4）。** 它不做事——读写文件、搜索、跑命令仍是上面那六个——只让模型操作 komo 自己的状态：记忆、目标（含它们的定时）、找会话、任务清单。此前这些由系统提示教模型在 `bash` 里跑 `komo <子命令>`，而命令执行的地方不一定有 `komo` 二进制、也不一定连得到 Gateway。参数只有 `action`（"领域.动作"，enum：`memory.add` / `memory.search` / `memory.forget`、`goal.add` / `goal.next` / `goal.wait` / `goal.resume` / `goal.done` / `goal.link` / `goal.list` / `goal.attach` / `goal.detach`、`goal.retire` / `goal.schedule` / `goal.unschedule` / `goal.run`、`session.search` / `session.list`、`task.list`，共 17 个）与 `params`（对象）；`goal.attach` / `goal.detach` 是任务把自己挂到目标上 / 摘下（见 `docs/goals.md` §10），只有任务会话里能用、不要用户原话；`task.list` 认 `goal` 过滤，`goal.list` 每项带 `tasks` 计数；各动作的字段不进 schema，写在 `tool://komo/doc`，`params` 填错时 `prepare` 的报错列出该动作认的字段。
 
@@ -1292,11 +1292,11 @@ komo-config    config.toml / .env 的解析与校验、`ConfigHolder`（§3 热�
                dotenvy, arc-swap, reqwest（只用 `Url`）
 
 komo-tools     tools/{read,write,edit,rg,bash,task,monitor,…}、工具目录（`executor::ToolExecutor`）、
-               codemode（Monty worker 与协议，`komo __codemode-worker` 的函数体也在这里）、MCP 客户端与登录
+               codemode（djs worker 与协议，`komo __codemode-worker` 的函数体也在这里）、MCP 客户端与登录
                （`mcp` / `mcp_auth`）、子进程登记（`recovery`）、`limits` / `spawn` / `cancel` 小件。
                不碰 store，也不认识 durable 引擎：工具任务由 runtime 的 harness 驱动。
                deps: kernel, komo-llm, komo-config, reqwest, tokio, grep + ignore（`rg` 工具）, rmcp,
-               monty + monty-fs（codemode 的脚本引擎与只读文件挂载）, num-bigint, libc（unix）
+               djs-core + djs-prelude（codemode 的纯 Rust JS/TS 脚本引擎）, libc（unix）
 
 komo-memory    记忆（MemoryManager、提取与合并、索引、代次，§9）与事项（goals / areas 的操作，`matter`）。
                仓储在 store 的 aux.db；Durable 上的两个接缝（`SessionEvents` / `MemoryWorkLog` 的实现）要
@@ -1366,10 +1366,10 @@ durable 引擎（约 1.5 万行生产代码）与 harness 是汇聚点，没有�
 | `tokio` | 按需特性，不用 `full` | kernel 不依赖 tokio |
 | `axum` | 默认 + `tower-http/cors` | 仅 gateway；gateway 自己直接声明 `tokio`（`rt-multi-thread`, `signal`, `fs`），不靠 axum 传递 |
 | `tower-http` | `0.6`，`default-features = false, features = ["cors"]` | 与 reqwest 对齐（两个大版本都要 `^0.6`）；选 0.7 只会多一条自找的重复版本 |
-| `sha2` | `0.11` | 工作区自己用的版本；`monty`（codemode）仍带一份 0.10，所以 `digest` / `block-buffer` / `crypto-common` / `cpufeatures` 还有两份（2026-11-13 渠道删除后，原先的另一个来源 openlark-core 已不在） |
+| `sha2` | `0.11` | 工作区自己用的版本（2026-11-24 移除 Monty 后依赖树里不再有它拉入的 `sha1` / 旧版摘要包） |
 | `croner` | `default-features = false`（W2 确认无 chrono 时的时刻表达） | 工作区只有 jiff 一套日期时间库；croner 4 默认特性拉进 chrono + derive_builder / darling / strum |
 | `grep` + `ignore` | `0.4`，`default-features = false`；komo-tools（`rg` 工具），`grep` 另有 komo-llm（上下文超长的报错匹配） | 内嵌 ripgrep 的搜索与遍历，不起子进程：外部 `rg` 要么没装、要么各家版本不同，而遍历规则（隐藏文件、`.gitignore`、覆盖 glob）本来就该用这套实现。默认特性集是空的，写出来是钉住两件事：**不开 `pcre2`**（"正则语法 = Rust regex"是对模型可见的契约）与不引 SIMD 的 `avx-accel`。带进来的 13 个包（`globset`、`walkdir`、`termcolor`、`crossbeam-deque`、`encoding_rs_io`、`memmap2`、`bstr` 等）全是纯 Rust、无 C 工具链，且没有新的重复版本（2026-09-21 对 `cargo tree -d` 核过） |
-| `jiff` | `1.0`，默认特性（系统 tzdb + 系统时区）+ `serde`；除 komo-agent 外的全部 crate | **工作区唯一的日期时间库**（2026-11-20 起取代 `time` 0.3）：时刻 `Timestamp`、时长 `SignedDuration`、民用日期 `civil::Date`。`Timestamp` 自带的 serde 输出 RFC 3339，与原先 `time::serde::rfc3339` 逐字节相同（UTC、小数秒去尾零），旧 durable.db / 协议数据照读；截止日期仍只认 `YYYY-MM-DD`（`types::matter::iso_date`）。时区：runtime 的 cron `ZoneResolver`（IANA 区名 → 偏移，§10）；memory、gateway：Gateway 本地的今天；client：CLI 的时刻一律印成本机墙钟 + 偏移（`2026-09-25 14:00:00 +08:00`），偏移按每个时刻各自取。kernel 只用时刻、民用时间与固定偏移，不查 tzdb。**已知重复**：`monty-types`（codemode）仍带一份 jiff 0.2；`time` 0.3 经 `tracing-appender`（bin 与 turso）间接留在树里，工作区代码不直接用 |
+| `jiff` | `1.0`，默认特性（系统 tzdb + 系统时区）+ `serde`；除 komo-agent 外的全部 crate | **工作区唯一的日期时间库**（2026-11-20 起取代 `time` 0.3）：时刻 `Timestamp`、时长 `SignedDuration`、民用日期 `civil::Date`。`Timestamp` 自带的 serde 输出 RFC 3339，与原先 `time::serde::rfc3339` 逐字节相同（UTC、小数秒去尾零），旧 durable.db / 协议数据照读；截止日期仍只认 `YYYY-MM-DD`（`types::matter::iso_date`）。时区：runtime 的 cron `ZoneResolver`（IANA 区名 → 偏移，§10）；memory、gateway：Gateway 本地的今天；client：CLI 的时刻一律印成本机墙钟 + 偏移（`2026-09-25 14:00:00 +08:00`），偏移按每个时刻各自取。kernel 只用时刻、民用时间与固定偏移，不查 tzdb。2026-11-24 移除 `monty-types` 后 `jiff 0.2` 重复版本彻底消失；`time` 0.3 经 `tracing-appender`（bin 与 turso）间接留在树里，工作区代码不直接用 |
 | `ring` | `0.17.14`，`default-features = false, features = ["alloc"]`；仅 komo-gateway | **Web Push（2026-11-14）也手写在它上面，不引 web-push crate**：RFC 8291 的 ECDH P-256（`agreement`）、HKDF-SHA256（`hkdf`）、AES-128-GCM（`aead`），RFC 8292 的 ES256 JWT（`ECDSA_P256_SHA256_FIXED_SIGNING`，签名正好是 JWT 要的 r‖s），无新依赖。OIDC ID token 的验签（RS256 `RSA_PKCS1_2048_8192_SHA256` / ES256 / EdDSA），`ring::signature` 直接验 JWK 里的公钥，不引 JWT / OIDC 库（`jsonwebtoken`、`openidconnect` 都要另选密码后端或再拉一串依赖）。**已在依赖树里**：rustls 的 ring provider 拉进来的同一个包，Cargo.lock 只在 komo-gateway 的依赖列表里多一行，不新增包也不新增重复版本 |
 | `base64` | `0.23.1`（工作区那份）；komo-gateway 新增直接依赖 | 解 JWT 的三段与 JWKS 的 `n` / `e` / `x` / `y`（base64url）；不新增包 |
 | `uuid` | 工作区特性加 `v4`（原有 `v7`、`serde`） | `komo-kernel::pkce::random_token` 用 `Uuid::new_v4` 取操作系统随机数拼 32 字节令牌（Gateway 的 `lock::random_token` 早就这么用，只是靠别的 crate 把 `v4` 带进来；kernel 单独编译时要自己声明）。不新增包 |
@@ -1387,8 +1387,7 @@ durable 引擎（约 1.5 万行生产代码）与 harness 是汇聚点，没有�
 | `flate2` / `tar` | `flate2` 显式 `default-features = false, features = ["rust_backend"]`（miniz_oxide），`tar 0.4` | 仅 bin：`komo update` 解发布包（§13.6）。两者都是纯 Rust（不带 C 工具链），且**不进 gateway / runtime 的图**——它们谁也不更新自己；`rust_backend` 写死是不跟上游默认后端变 |
 | `syntect` / `two-face`（代码高亮） | 可选，按编译预算实测再定 | 纯 UI 增强，不是需求 |
 | `libc` | `0.2`，仅 komo-tools 的 unix 目标 | Gateway 起来时 `setrlimit` 抬能开的文件数（`limits.rs`，launchd 默认软上限 256，子进程跑 `cargo test` 不够）；codemode worker 的内存看门狗读 RSS（macOS `proc_pid_rusage`、Linux `/proc/<pid>/statm` 的页大小）。原本就被 tokio 等拉进依赖树，不新增包、不新增重复版本。（2026-10-15 之前还用于 codemode 的 Linux 沙箱：Landlock / seccomp 的系统调用号，随沙箱删除。） |
-| `monty` / `monty-types` / `monty-fs` | `=1.6.0`（精确钉版本；2026-11-20 从 1.1.0 升级，带来 `json.load` / `dump`、`datetime.fromtimestamp` 等）；仅 komo-tools | codemode 的脚本引擎（`docs/codemode.md` §2）：pydantic 的 Python 子集解释器，语言层没有文件 / 网络 / 子进程。精确钉：快照格式与 `monty_types::unstable`（JSON 转换用的节点访问器）没有兼容保证，升级必须重跑回放集。**不用 `monty-alloc`**：它要占 `#[global_allocator]`，与 turso 的 `mimalloc` 冲突（`the #[global_allocator] in this crate conflicts with global allocator in: turso`），内存限制改用 Monty 的 `max_memory` 软限 + 宿主的 RSS 看门狗。`monty-fs`（只读文件挂载，`=1.6.0`，同样精确钉；带进 `cap-std` 一族）。没用 `monty-pool`（进程池）。带进来约 76 个新包（ruff 解析栈、`unicode_names2` 等），新增重复版本见下 |
-| `num-bigint` | `0.4`；仅 komo-tools | Monty 的大整数与 JSON 之间的转换（`codemode/convert.rs`）；已在依赖树里（Monty 与 toasty 一侧都拉），不新增包 |
+| `djs-core` / `djs-prelude` | 钉 git rev `dd9480eb`（`https://github.com/earendil-works/djs.git`），`djs-core` 开 `["embed", "unicode"]`、`djs-prelude` 开 `["raw", "embed", "unicode"]`；仅 komo-tools；dev profile 对 `djs-core` / `djs-libm` 设 `opt-level = 1` | codemode 的脚本引擎（2026-11-24 起取代 `monty` / `monty-types` / `monty-fs` / `num-bigint`，`docs/codemode.md` §2）：纯 `no_std` Rust 实现的 TypeScript / JavaScript 引擎，零第三方依赖（仅自研 `djs-libm` 与 `djs-lzrc`），无文件 / 网络 / env / 子进程，支持 `Goal::AsyncBody` + `typescript: true`、`Vm::from_bytes_trusted` 预编译快照复原、`fatal_out_of_memory = true` 硬内存上限与确定性 PRNG/时钟。替换后 `Cargo.lock` 净减 94 个包，`cargo tree -d` 重复根由 82 降至 64（`djs-core` 仅因同时作为 `djs-prelude` 的 build-dep 出现一条构建依赖项） |
 | `rmcp` | `3.x`，`default-features = false, features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest", "reqwest-tls-no-provider", "auth"]`；仅 komo-tools | MCP 客户端（`docs/mcp.md`），官方 Rust SDK。HTTP 走工作区同一个 reqwest 0.13（rustls-no-provider），不开 server 与宏。`auth`（2026-10-14，`oauth = true` 的服务器，`docs/mcp.md` §2.1）新拉 `oauth2 5.0`（不开默认特性），它的 chrono / rand / url 等依赖图里已有，Cargo.lock 只多这一个包。新拉 `process-wrap`、`sse-stream`、`futures`，新增一条重复版本 `nix 0.31`（process-wrap；既有 0.29）。实测（2026-10-08，增量重编）：rmcp 2.8s + 构建脚本 0.3s + process-wrap / sse-stream 各 0.2–0.3s |
 | **不引入** | image | — |
 | `tantivy` / `zstd-sys`（经 `turso` 默认特性 `fts`） | **已做**：工作区的 `turso` 写 `default-features = false, features = ["mimalloc"]`；`toasty-driver-turso` 0.11 起上游自己对 `turso` 关了默认特性，原先 `vendor/toasty-driver-turso` 那份补丁（只改 manifest 里 `turso` 那几行）已删 | 实测（2026-09-16）：冷编 71.5s → 64.2s，编译单元 577 → 515，单元耗时总和 −36s CPU，`tantivy` / `zstd` / `lz4_flex` 从依赖树消失，少一条 C 工具链。墙钟只省 7s 是因为它们与 `aws-lc-sys` 并行、不在关键路径。功能零损失：turso 的 FTS 是索引方法，MVCC 直接拒绝。升级 toasty 时核对驱动对 `turso` 的版本与特性，CI 用 `cargo tree -e features -i turso` 断言只剩 `mimalloc`；见 `vendor/README.md` |
@@ -1451,6 +1450,12 @@ load average 11–40，绝对数只能看相对。拆分前用 `git archive 1f36
   跑测试拆前 905 条约 19–23s，拆后 163 条约 2–3s。
 - `cargo tree -d`：没有新的重复版本（少了 toml 一族同版本按特性分开的四行）。全量 `cargo test --workspace`
   2597 通过 / 0 失败 / 12 忽略，与拆前相同。
+
+**2026-11-24 codemode 由 Monty 换 djs 的构建账**（本机 macOS，`cargo build --timings`）：
+
+- `Cargo.lock` 包数 **567 → 473（−94 个包）**：移除 `monty`、`monty-types`、`monty-fs`、`num-bigint` 及 ruff / `cap-std` / `fancy-regex` / `unicode_names2` 等整条依赖链，新增 `djs-core` / `djs-prelude` / `djs-libm` / `djs-lzrc` 共 4 个纯 Rust 包（0 第三方依赖）。
+- `cargo tree -d` 重复根 **82 → 64（−18）**：彻底消除了 `jiff 0.2` / `jiff-core 0.1`、`io-lifetimes 2.0/3.0`、`phf* 0.11/0.12`、`itertools 0.15`、`hashbrown 0.16`、`unicode-width 0.1`、`bit-set` / `bit-vec 0.8` 等重复版本；`djs-core` 仅因 `djs-prelude` 的 build script 在 `[build-dependencies]` 里多出现一条。
+- 增量 dev `cargo build --timings` **29.92s**（`komo-tools` 3.03s，报告 `cargo-timing-20261124T104535881Z-ce4345f6994bcbbc.html`）。全量 `cargo test --workspace --no-fail-fast` **2205 通过 / 0 失败 / 11 忽略**（`komo-kernel --features ts` 398 通过）。
 
 ### 13.5 trait 边界
 

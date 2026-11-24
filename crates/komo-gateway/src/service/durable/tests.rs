@@ -8,7 +8,7 @@ use komo_kernel::durable::{
 use komo_kernel::types::turn::{Role, RoundInput};
 use komo_llm::{ModelRequest, ModelStream};
 
-use crate::service::state::{codemode_unreadable_paths, protected_paths};
+use crate::service::state::protected_paths;
 use crate::service::test_support::harness::{FakeLlm, GatewayBuilder, call_round, text_round};
 use crate::service::test_support::{TestGateway, config_toml, sample_snapshot};
 
@@ -220,11 +220,6 @@ fn write_refuses_the_durable_databases() {
         assert!(protected.denies(&home.join(name)), "{name} 受保护");
     }
     assert!(!protected.denies(&home.join("notes.txt")));
-
-    // 脚本里连读也不行（`sessions/` 以外同一份名单）。
-    let unreadable = codemode_unreadable_paths(&snapshot, home);
-    assert!(unreadable.contains(&home.join("durable.db")));
-    assert!(unreadable.contains(&home.join("aux.db")));
 }
 
 fn user(text: &str) -> Message {

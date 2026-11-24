@@ -114,13 +114,13 @@ command = "/nonexistent/mcp-server"
 async fn codemode_exposure_keeps_mcp_out_of_the_schema_and_reachable_from_scripts() {
     let (home, counter) = home_with_demo("");
     let code = r#"
-ns = describe_namespace("demo")
-text(ns["instructions"])
-text(ns["tools"])
-hits = search_tools("计数文件")
-text(hits[0]["name"])
-text(describe_tool(hits[0]["name"])["parameters"])
-tools.mcp__demo__bump()
+const ns = describeNamespace("demo");
+text(ns.instructions);
+text(ns.tools);
+const hits = searchTools("计数文件");
+text(hits[0].name);
+text(describeTool(hits[0].name).parameters);
+await tools.mcp__demo__bump();
 "#;
     let llm = FakeLlm::new(vec![vec![
         call_round(1, "pc-1", "codemode", serde_json::json!({ "code": code })),
@@ -223,7 +223,7 @@ async fn codemode_side_effecting_mcp_is_journaled_and_only_parent_enters_model_m
             "pc-cm",
             "codemode",
             serde_json::json!({
-                "code": "text(tools.mcp__demo__bump()['text'])"
+                "code": "text((await tools.mcp__demo__bump()).text)"
             }),
         ),
         text_round(2, "好了"),
@@ -447,7 +447,7 @@ fn echo_twice() -> Arc<FakeLlm> {
             "pc-2",
             "codemode",
             serde_json::json!({
-                "code": "text(tools.mcp__demo__echo(text='nested')['text'])"
+                "code": "text((await tools.mcp__demo__echo({ text: 'nested' })).text)"
             }),
         ),
         text_round(3, "好了"),

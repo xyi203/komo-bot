@@ -238,7 +238,7 @@ MCP 工具默认**不声明给模型**，只在 codemode 脚本里调：一台�
 
 | 值 | 模型 schema | codemode 脚本 | 用途 |
 |---|---|---|---|
-| `codemode`（默认） | 不声明 | 能调；脚本用 `search_tools` / `describe_tool` / `describe_namespace` / `ALL_TOOLS` 找 | 一般的服务器 |
+| `codemode`（默认） | 不声明 | 能调；脚本用 `searchTools` / `describeTool` / `describeNamespace` / `ALL_TOOLS` 找（保留 snake_case 别名） | 一般的服务器 |
 | `direct` | 像内置工具一样声明 | 能调 | 工具少、几乎每次都用 |
 | `hidden` | — | — | 不挂（不进工具目录，能力面里也就没有） |
 
@@ -255,10 +255,10 @@ MCP 工具默认**不声明给模型**，只在 codemode 脚本里调：一台�
   调"也调不到。内容只取决于能力面与连上过的服务器：同一条 Run 里不变；登录后才连上的服务器从下一条
   Run 起多出一行（§2.2），此外 Gateway 不重启就不变，不破坏前缀缓存。
 - **instructions 全文不进任何提示**（照 pi）：握手时服务器交回的 `instructions` 是外部文本，只在脚本里
-  `describe_namespace("<server>")` 读得到，系统提示只取它的第一行作摘要。
+  `describeNamespace("<server>")`（亦兼容 `describe_namespace`）读得到，系统提示只取它的第一行作摘要。
 - codemode 调不到（Profile 没给它）时**不自动改成直接声明**（照 pi）：这些工具这次调不到，要直接
   调就把那台服务器写成 `exposure = "direct"`。（2026-10-15 之前"沙箱自检没过"也会让 codemode 不挂、启动时 warn
-  列出被搁浅的工具；Monty 没有自检，这一条随之没了。）
+  列出被搁浅的工具；djs 及此前 Monty 都没有自检，这一条随之没了。）
 
 脚本里的发现函数在 worker 里本地做完，不经宿主、不进 journal（`docs/codemode.md` §6）。
 

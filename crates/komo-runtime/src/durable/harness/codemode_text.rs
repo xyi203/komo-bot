@@ -1,4 +1,4 @@
-//! codemode 结果的正文帮手（`docs/codemode.md` §5）：嵌套调用的摘要、失败提示、多段输出拼接。
+//! codemode 结果的正文帮手（`docs/codemode.md` §5）：嵌套调用的摘要、失败首部、多段输出拼接。
 //! 脚本本身由 `durable::harness::codemode` 跑，这里只管交给模型的那段文字。
 
 use komo_kernel::types::refs::ToolResultStatus;
@@ -72,16 +72,13 @@ pub(crate) fn summary(calls: &[NestedCall]) -> String {
     text
 }
 
-pub(crate) fn failure_prefix(error: &str, calls: &[NestedCall], names: &[String]) -> String {
+pub(crate) fn failure_prefix(error: &str, calls: &[NestedCall], _names: &[String]) -> String {
+    // JS 异常格式为首行 `ErrorName: message`，随后是 `    at ...` 栈帧；取第一条非空行作为错因。
     let reason = error
         .lines()
-        .rev()
         .find(|line| !line.trim().is_empty())
         .unwrap_or(error);
     let mut text = format!("脚本出错：{}\n", truncate(reason, 1024));
-    if let Some(hint) = diagnostic(reason).or_else(|| unknown_tool(reason, names)) {
-        text.push_str(&format!("修复提示：{hint}\n"));
-    }
     if !calls.is_empty() {
         text.push_str(&format!("（{}）\n", summary(calls)));
         if calls.iter().any(|call| call.output.is_some()) {
@@ -112,88 +109,6 @@ pub(crate) fn failure_prefix(error: &str, calls: &[NestedCall], names: &[String]
     text
 }
 
-/// 只匹配已经复现的异常，不根据脚本文字猜错因，也不重写或重跑代码。
-fn diagnostic(reason: &str) -> Option<String> {
-    // Monty 1.6.0 起有 `datetime.fromtimestamp` 与 `json.load` / `dump`（1.1.0 没有，原先这里教绕法）；
-    // `utcfromtimestamp` 仍没有（CPython 3.12 起也弃用了），指向带时区的写法。
-    if reason
-        == "AttributeError: type object 'datetime.datetime' has no attribute 'utcfromtimestamp'"
-    {
-        return Some("Monty 没有 utcfromtimestamp：写 datetime.fromtimestamp(ts, timezone.utc)（from datetime import datetime, timezone）；固定 UTC+8 用 timezone(timedelta(hours=8))。".into());
-    }
-    // json / re / math / time / collections / itertools 由前置代码导入（`codemode/prelude.py`），
-    // 不会再缺；`datetime` 不预导入（模块还是类由脚本定），仍在这里提示。
-    if reason.starts_with("NameError: name 'datetime' is not defined") {
-        return Some(
-            "每次调用都是独立脚本，datetime 没有预先导入：先写 from datetime import datetime, timezone（或 import datetime）。".into(),
-        );
-    }
-    None
-}
-
-/// 脚本里写错工具名（`tools.<名字>` / `atools.<名字>`）：Monty 不支持 `__getattr__`，只给一句裸的
-/// AttributeError（`komo-tools` 的 `codemode/prelude.py`）。2026-11 的统计里这类失败都出在 MCP
-/// 名字的转写上（`mcp__服务__工具` 少写、多写下划线，或丢了前缀），所以按"去掉 `_` `-` 之后
-/// 相同或互相包含"优先、再按编辑距离挑最像的几个名字给回去，模型下一轮就能照着改。
-fn unknown_tool(reason: &str, names: &[String]) -> Option<String> {
-    let wrong = reason
-        .strip_prefix("AttributeError: 'Tools' object has no attribute '")?
-        .strip_suffix('\'')?;
-    let compact = |name: &str| {
-        name.chars()
-            .filter(|c| *c != '_' && *c != '-')
-            .flat_map(char::to_lowercase)
-            .collect::<String>()
-    };
-    let wanted = compact(wrong);
-    // 脚本里的写法：工具名里的 `-` 换成 `_`（prelude 的 `setattr`）。
-    // 排序键：(不是包含关系, 差了几个字符, 名字)。
-    let mut ranked: Vec<(bool, usize, String)> = names
-        .iter()
-        .map(|name| name.replace('-', "_"))
-        .filter_map(|name| {
-            let have = compact(&name);
-            if have.contains(&wanted) || wanted.contains(&have) {
-                return Some((false, have.len().abs_diff(wanted.len()), name));
-            }
-            let distance = levenshtein(&wanted, &have);
-            // 太远的不算"像"：最多改动名字的一半。
-            (distance <= wanted.chars().count().div_ceil(2)).then_some((true, distance, name))
-        })
-        .collect();
-    ranked.sort();
-    let close: Vec<String> = ranked
-        .into_iter()
-        .take(3)
-        .map(|(_, _, name)| format!("tools.{name}"))
-        .collect();
-    Some(if close.is_empty() {
-        format!("没有叫 {wrong} 的工具；工具名里的 - 写成 _，能调的名字见 TOOLS。")
-    } else {
-        format!(
-            "没有叫 {wrong} 的工具，最接近的是 {}；工具名里的 - 写成 _，能调的名字见 TOOLS。",
-            close.join("、")
-        )
-    })
-}
-
-fn levenshtein(a: &str, b: &str) -> usize {
-    let b: Vec<char> = b.chars().collect();
-    let mut row: Vec<usize> = (0..=b.len()).collect();
-    for (i, ca) in a.chars().enumerate() {
-        let mut previous = row[0];
-        row[0] = i + 1;
-        for (j, cb) in b.iter().enumerate() {
-            let current = row[j + 1];
-            row[j + 1] = (previous + usize::from(ca != *cb))
-                .min(row[j] + 1)
-                .min(current + 1);
-            previous = current;
-        }
-    }
-    row[b.len()]
-}
-
 /// 多段 `text()` 拼起来：两段以上时每段前加 `==> text N/M <==`（学 pi 1.1.0）——直接用换行
 /// 拼，模型分不清一段多行输出和两段输出的边界。只有一段时原样给，不多一个字。
 pub(crate) fn join_outputs(outputs: &[String]) -> String {
@@ -222,92 +137,16 @@ pub(crate) fn truncate(text: &str, limit: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::join_outputs;
+    use super::{failure_prefix, join_outputs};
 
     #[test]
-    fn diagnostics_do_not_guess_from_unrelated_names_or_attributes() {
-        for error in [
-            "AttributeError: type object 'Widget' has no attribute 'utcfromtimestamp'",
-            "NameError: name 'json_data' is not defined",
-            "KeyError: json",
-            "AttributeError: module 'json' has no attribute 'loader'",
-        ] {
-            assert!(super::diagnostic(error).is_none(), "{error}");
-        }
-    }
-
-    #[test]
-    fn utcfromtimestamp_points_at_fromtimestamp_with_a_timezone() {
-        let hint = super::diagnostic(
-            "AttributeError: type object 'datetime.datetime' has no attribute 'utcfromtimestamp'",
-        )
-        .expect("复现过的异常");
+    fn failure_prefix_extracts_the_first_line_of_a_js_stack_trace() {
+        let err =
+            "ToolError: 没有叫 raed 的工具，最接近的是 tools.read\n    at <eval> (codemode.ts:2:7)";
+        let prefix = failure_prefix(err, &[], &[]);
         assert!(
-            hint.contains("datetime.fromtimestamp(ts, timezone.utc)"),
-            "{hint}"
-        );
-    }
-
-    #[test]
-    fn only_datetime_still_needs_an_import_hint() {
-        let hint = super::diagnostic("NameError: name 'datetime' is not defined").unwrap();
-        assert!(
-            hint.contains("from datetime import datetime, timezone"),
-            "{hint}"
-        );
-        // 预导入的模块不会再缺；真缺了（脚本自己 del）也不猜。
-        assert!(super::diagnostic("NameError: name 'json' is not defined").is_none());
-    }
-
-    #[test]
-    fn a_mistyped_tool_name_points_at_the_closest_names() {
-        let names: Vec<String> = [
-            "bash",
-            "read",
-            "rg",
-            "komo",
-            "mcp__memos__search_memos",
-            "mcp__memos__create_memo",
-            "mcp__dev-radius__search_issues",
-        ]
-        .map(String::from)
-        .to_vec();
-        let hint = |wrong: &str| {
-            super::unknown_tool(
-                &format!("AttributeError: 'Tools' object has no attribute '{wrong}'"),
-                &names,
-            )
-            .expect("工具名写错一定有提示")
-        };
-        // 下划线少写 / 丢了前缀：最像的排第一。
-        for wrong in [
-            "mcp_memos_search_memos",
-            "memos__search_memos",
-            "mcp__memos__search",
-        ] {
-            let text = hint(wrong);
-            assert!(
-                text.contains("最接近的是 tools.mcp__memos__search_memos"),
-                "{wrong}：{text}"
-            );
-        }
-        // 名字里的 - 在脚本里是 _，提示给脚本里的写法。
-        assert!(
-            hint("mcp__dev_radius__search_issue").contains("tools.mcp__dev_radius__search_issues")
-        );
-        // 拼错一两个字母。
-        assert!(hint("raed").contains("最接近的是 tools.read"));
-        // 毫不相干：只指向 TOOLS，不硬猜。
-        let far = hint("send_email");
-        assert!(!far.contains("最接近"), "{far}");
-        assert!(far.contains("TOOLS"), "{far}");
-        // 别的对象的 AttributeError 不是工具名写错。
-        assert!(
-            super::unknown_tool(
-                "AttributeError: 'dict' object has no attribute 'read'",
-                &names
-            )
-            .is_none()
+            prefix.starts_with("脚本出错：ToolError: 没有叫 raed 的工具，最接近的是 tools.read\n"),
+            "{prefix}"
         );
     }
 

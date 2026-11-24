@@ -786,21 +786,6 @@ async fn a_failed_run_reports_why() {
     assert!(reason.contains("额度用完了"), "{reason}");
 }
 
-/// codemode 脚本读得到会话日志（与 `read` 一致），数据库、`runtime/` 与 `.env` 仍读不到；
-/// write / edit 的名单不变，`sessions/` 照旧改不了。
-#[test]
-fn codemode_scripts_may_read_session_logs_but_not_the_rest_of_komo_state() {
-    use crate::service::state::{codemode_unreadable_paths, protected_paths};
-    let snapshot = crate::service::test_support::sample_snapshot();
-    let home = std::path::Path::new("/tmp/komo");
-    let unreadable = codemode_unreadable_paths(&snapshot, home);
-    assert!(!unreadable.contains(&snapshot.paths.sessions_dir));
-    assert!(unreadable.contains(&snapshot.start_only.db_path));
-    assert!(unreadable.contains(&snapshot.paths.runtime_dir));
-    assert!(unreadable.contains(&home.join(".env")));
-    assert!(protected_paths(&snapshot, home).contains(&snapshot.paths.sessions_dir));
-}
-
 /// 被删掉的东西（`delegate` / `dispatch` / `follow` 工具、审批式的 `y`）没有踪影。
 ///
 /// - `the_catalog_has_task_and_none_of_the_retired_names`：读的是 `tool_names()`（`ToolExecutor` 目录）；

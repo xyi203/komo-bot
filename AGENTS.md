@@ -66,7 +66,7 @@ komo-llm       Model layer: protocol adapters (stateless `ModelStream`, `Routing
 komo-config    config.toml / .env parse + validate · `ConfigHolder` (hot reload) · `edit`.
                Depends on kernel + llm.
 komo-tools     tools/{read,write,edit,rg,bash,task,monitor,…} · tool catalog
-               (`executor::ToolExecutor`) · codemode (worker + `ScriptEngine` seam, Monty engine) · MCP client + login ·
+               (`executor::ToolExecutor`) · codemode (worker + `ScriptEngine` seam, djs TS/JS engine) · MCP client + login ·
                child-process registry. Depends on kernel + llm + config; no store, no
                durable engine (the harness drives tool tasks).
 komo-memory    MemoryManager (§9) · matters (goals / areas) · `provider` seam for an external
@@ -128,10 +128,9 @@ depend on `store`; `client` knows only protocol types.
   state (`sessions/`, `durable.db*`, `aux.db*`, `runtime/`, `.env` under the data dir; the
   list also keeps the old `state.db*`).
   bash cannot be stopped; real boundaries come only from an execution
-  environment (codemode's Monty engine: no network or subprocesses, files
-  read-only with the same protected list denied even for reads, except
-  `sessions/`, which `read` and bash can read anyway; it runs in a
-  `komo __codemode-worker` child the host can kill).
+  environment (codemode's djs engine: pure `no_std` JS/TS VM with no direct
+  filesystem, network, env, or subprocess access — all external I/O goes through
+  `tools.*`; it runs in a `komo __codemode-worker` child the host can kill).
 - **Side effects are an effect sandwich** (§8.5): commit the intent (the
   `komo.live` slot + the `execute` checkpoint carrying the full
   `ExecutionPlan`), do the effect, finish the blob (sync → rename → sync dir),

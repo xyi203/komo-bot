@@ -1,17 +1,14 @@
-//! codemode 的 worker：脚本引擎（[`ScriptEngine`]，现在是 [`MontyEngine`]）跑在这个进程里，worker
+//! codemode 的 worker：脚本引擎（[`ScriptEngine`]，现为 [`DjsEngine`]）跑在这个进程里，worker
 //! 把引擎对宿主的每一次需要翻译成 stdio 上的行 JSON（`docs/codemode.md` §3、§4）。这一层与引擎无关。
 //!
 //! 协议（每行一个 JSON）：
-//!   宿主 → worker  第一行 [`Request`]；之后每行是一次工具调用的答复 `{"ok": ..}` / `{"error": ".."}`
-//!   worker → 宿主  `{"call": name, "args": {..}}`，最后一行 `{"done": {..}}`
+//!   宿主 → worker  第一行 [`Request`]；之后每行是一次调用答复 `{"ok": ..}` / `{"error": ".."}`
+//!                  或 `{"results": [{"id", "ok"} | {"id", "error"}..]}`（答 `wait`）
+//!   worker → 宿主  `{"call": name, "args": {..}[, "id", "defer": true]}` / `{"wait": [id..]}`
+//!                  / `{"os": {..}}` / 最后一行 `{"done": {..}}`
 //!
-//! `atools.<name>(..)` 是延后调用：`{"call", "args", "id", "defer": true}` 不等答复，脚本拿到一个
-//! awaitable 接着跑；脚本卡在 `await` 上时 worker 发 `{"wait": [id..]}`，宿主等**所有**发出未答的
-//! 延后调用都有了结果，一次答 `{"results": [{"id", "ok"} | {"id", "error"}..]}`。结果总是成批
-//! 交给引擎，不按完成先后，所以同一段脚本、同一批答复，跑出来的调用顺序每次一样（恢复靠它）。
-//!
-//! 第一行输出是握手 `{"hello": {..}}`（版本，见 [`Hello`]）；时钟与熵走 `{"os": {..}}`，由宿主
-//! 回答并记账（[`Nondet`]）。
+//! `wait` 支持流式返回：宿主只需交付已完成的一批（至少 1 个）id，未完成的继续在宿主侧并发执行，
+//! 这样多跳链式并发不被慢调用拖住；宿主侧同时记录交付批次，重启回放时按同序交付。
 
 use std::collections::HashMap;
 use std::io::{BufRead, Write};
@@ -20,16 +17,16 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use super::djs::DjsEngine;
 use super::engine::{EngineHost, ScriptEngine, ToolCall};
-use super::monty::MontyEngine;
 use super::{Hello, Nondet};
 
-/// 脚本里 `print` 与 `text()` 各自最多收这么多字节；超了脚本里抛错，不拖垮 worker。
+/// 脚本里 `console` 与 `text()` 各自最多收这么多字节；超了脚本里抛错，不拖垮 worker。
 pub(super) const OUTPUT_CAP: usize = 1 << 20;
-/// 跑引擎的线程栈：递归深度由引擎自己的上限管，栈要给够（`docs/codemode.md` §8）。
-pub(super) const STACK_SIZE: usize = 64 << 20;
+/// 跑引擎的线程栈：djs 的 JS 栈帧在堆里，8 MiB 足够编译器解析深层嵌套。
+pub(super) const STACK_SIZE: usize = 8 << 20;
 /// worker 用的引擎。
-const ENGINE: MontyEngine = MontyEngine;
+const ENGINE: DjsEngine = DjsEngine;
 
 /// 宿主交进来的一次运行：脚本、能调的工具名、发现工具用的说明与限制。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -41,20 +38,17 @@ pub struct Request {
     pub catalog: Value,
     #[serde(default)]
     pub limits: Limits,
-    /// 脚本的工作目录；没有就是 `/`。
+    /// 脚本的工作目录（保留用于上下文透传与指纹）。
     #[serde(default)]
     pub cwd: Option<PathBuf>,
-    /// 读写都拒的路径（komo 自己的状态）。
-    #[serde(default)]
-    pub protected: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Limits {
-    /// 引擎自己的内存上限（Monty：软限，预检单次大分配；缓慢增长挡不住，那由宿主的 RSS 看门狗管）。
+    /// 引擎自己的堆内存硬上限（djs 不可捕获 OOM，外加宿主的 RSS 看门狗双保险）。
     pub max_memory: Option<usize>,
-    /// 引擎自己数的"脚本时间"（不含等宿主答复的时间）。墙钟上限在宿主；这条只给不能被杀的
-    /// 进程内 worker（测试）兜底。
+    /// 引擎自己数的“脚本计算时间”（不含等宿主答复的时间）。墙钟上限在宿主；这条同时给
+    /// 进程内测试 worker 兜底。
     pub max_turn_ms: Option<u64>,
     pub max_calls: Option<u32>,
 }
@@ -81,7 +75,16 @@ pub fn run() -> i32 {
 }
 
 /// 在一对读写端上跑一次请求。进程内的测试 worker 与子命令共用它。
-pub(super) fn serve(mut input: impl BufRead, mut output: impl Write, hello: Hello) -> i32 {
+pub(super) fn serve(input: impl BufRead, output: impl Write, hello: Hello) -> i32 {
+    serve_with(&ENGINE, input, output, hello)
+}
+
+pub(super) fn serve_with(
+    engine: &dyn ScriptEngine,
+    mut input: impl BufRead,
+    mut output: impl Write,
+    hello: Hello,
+) -> i32 {
     send(&mut output, &json!({ "hello": hello }));
     let mut line = String::new();
     if !matches!(input.read_line(&mut line), Ok(n) if n > 0) {
@@ -97,13 +100,12 @@ pub(super) fn serve(mut input: impl BufRead, mut output: impl Write, hello: Hell
             return 2;
         }
     };
-    let done = execute(&ENGINE, request, &mut input, &mut output);
+    let done = execute(engine, request, &mut input, &mut output);
     send(&mut output, &json!({ "done": done }));
     0
 }
 
-/// 只编译不运行：脚本拼上引擎的前置代码之后能不能过解析与编译。升级引擎或改前置代码时，
-/// 拿真实脚本集跑一遍（`crates/komo/examples/codemode_replay.rs`）。
+/// 只编译不运行：脚本能不能过 djs（TypeScript AsyncBody）解析与编译。
 pub fn compile_check(code: &str) -> Result<(), String> {
     ENGINE.compile_check(code)
 }
@@ -132,7 +134,7 @@ fn execute(
     }
 }
 
-/// [`EngineHost`] 的 worker 实现：调用次数上限、`text()` 总量上限、延后调用的成批等待，以及
+/// [`EngineHost`] 的 worker 实现：调用次数上限、`text()` 总量上限、流式延后调用等待，以及
 /// 它们在行协议上的样子。
 struct WorkerHost<'a, I, O> {
     input: &'a mut I,
@@ -141,9 +143,9 @@ struct WorkerHost<'a, I, O> {
     calls: u32,
     text_bytes: usize,
     outputs: Vec<String>,
-    /// 发出未答的延后调用。
+    /// 发出未答的异步调用（流式返回后，未答的继续留在这里）。
     outstanding: Vec<u32>,
-    /// 已经有结果、还没交给引擎的延后调用（含被拒的）。
+    /// 已经有结果、还没交给引擎的异步调用（含本地被拒的）。
     settled: HashMap<u32, Result<Value, String>>,
 }
 
@@ -185,36 +187,56 @@ impl<I: BufRead, O: Write> EngineHost for WorkerHost<'_, I, O> {
     }
 
     fn wait(&mut self, ids: &[u32]) -> Vec<(u32, Result<Value, String>)> {
-        if !self.outstanding.is_empty() {
-            let asked = std::mem::take(&mut self.outstanding);
-            match ask_host(self.input, self.output, &json!({ "wait": asked })) {
-                Ok(reply) => {
-                    for item in reply
-                        .get("results")
-                        .and_then(Value::as_array)
-                        .into_iter()
-                        .flatten()
-                    {
-                        if let Some(id) = item.get("id").and_then(Value::as_u64) {
-                            self.settled.insert(id as u32, answer(item));
-                        }
-                    }
-                    for id in asked {
-                        self.settled
-                            .entry(id)
-                            .or_insert_with(|| Err("宿主没有答这次调用".to_owned()));
+        // 先把已经在本地结算（比如超 256 次被拒）的直接交回，避免多余往返。
+        let already: Vec<(u32, Result<Value, String>)> = ids
+            .iter()
+            .filter_map(|id| self.settled.remove(id).map(|result| (*id, result)))
+            .collect();
+        if !already.is_empty() {
+            return already;
+        }
+
+        let waiting: Vec<u32> = ids
+            .iter()
+            .copied()
+            .filter(|id| self.outstanding.contains(id))
+            .collect();
+        if waiting.is_empty() {
+            return Vec::new();
+        }
+        match ask_host(self.input, self.output, &json!({ "wait": waiting })) {
+            Ok(reply) => {
+                let mut returned = Vec::new();
+                for item in reply
+                    .get("results")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                {
+                    if let Some(id) = item.get("id").and_then(Value::as_u64) {
+                        let id = id as u32;
+                        self.outstanding.retain(|&p| p != id);
+                        returned.push((id, answer(item)));
                     }
                 }
-                Err(message) => {
-                    for id in asked {
-                        self.settled.insert(id, Err(message.clone()));
+                if returned.is_empty() {
+                    // 宿主答复为空，标记本次等待的全部失败，避免空转。
+                    for id in waiting {
+                        self.outstanding.retain(|&p| p != id);
+                        returned.push((id, Err("宿主没有答这次调用".to_owned())));
                     }
                 }
+                returned
+            }
+            Err(message) => {
+                let mut failed = Vec::with_capacity(waiting.len());
+                for id in waiting {
+                    self.outstanding.retain(|&p| p != id);
+                    failed.push((id, Err(message.clone())));
+                }
+                failed
             }
         }
-        ids.iter()
-            .filter_map(|id| self.settled.remove(id).map(|result| (*id, result)))
-            .collect()
     }
 
     fn nondet(&mut self, ask: &Nondet) -> Result<Value, String> {
@@ -267,7 +289,7 @@ mod tests {
     use super::*;
     use crate::codemode::engine::RunEnd;
 
-    /// 不是 Monty 的引擎：一次延后调用、一次被拒的延后调用、一次同步调用、等延后的、把结果写进 text。
+    /// 非 djs 的脚本引擎桩：验证 worker 协议对引擎透明、支持流式分批 wait。
     struct Scripted;
 
     impl ScriptEngine for Scripted {
@@ -284,9 +306,11 @@ mod tests {
             };
             host.defer(7, call("slow"));
             host.defer(8, Err("参数不对".to_owned()));
-            let quick = host.call(call("quick"));
-            let waited = host.wait(&[7, 8]);
-            let _ = host.text(format!("{quick:?} {waited:?}"));
+            host.defer(9, call("fast"));
+            let local_err = host.wait(&[7, 8, 9]);
+            let first = host.wait(&[7, 9]);
+            let second = host.wait(&[7]);
+            let _ = host.text(format!("{local_err:?} | {first:?} | {second:?}"));
             RunEnd {
                 console: String::new(),
                 error: None,
@@ -295,9 +319,9 @@ mod tests {
     }
 
     #[test]
-    fn the_worker_speaks_the_same_protocol_for_any_engine() {
+    fn the_worker_speaks_the_same_streaming_protocol_for_any_engine() {
         let mut input = std::io::Cursor::new(
-            "{\"ok\": \"Q\"}\n{\"results\": [{\"id\": 7, \"ok\": \"S\"}]}\n".as_bytes(),
+            "{\"results\": [{\"id\": 9, \"ok\": \"F\"}]}\n{\"results\": [{\"id\": 7, \"ok\": \"S\"}]}\n".as_bytes(),
         );
         let mut output = Vec::new();
         let done = execute(&Scripted, Request::default(), &mut input, &mut output);
@@ -311,14 +335,15 @@ mod tests {
             sent,
             [
                 json!({ "call": "slow", "args": {}, "id": 7, "defer": true }),
-                json!({ "call": "quick", "args": {} }),
+                json!({ "call": "fast", "args": {}, "id": 9, "defer": true }),
+                json!({ "wait": [7, 9] }),
                 json!({ "wait": [7] }),
             ],
-            "被拒的延后调用不上线，wait 只问发出去的"
+            "本地被拒的 8 直接先回不上线；第一次 wait 只回了 9，7 留在 outstanding 供下次 wait"
         );
         assert_eq!(
             done.outputs,
-            [r#"Ok(String("Q")) [(7, Ok(String("S"))), (8, Err("参数不对"))]"#]
+            [r#"[(8, Err("参数不对"))] | [(9, Ok(String("F")))] | [(7, Ok(String("S")))]"#]
         );
     }
 }

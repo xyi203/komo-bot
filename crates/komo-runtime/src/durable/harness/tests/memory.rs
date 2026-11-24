@@ -92,7 +92,7 @@ async fn bash_input_run_finds_user_evidence_without_changing_output_paths() {
             "bash" => ("bash", json!({"command": command})),
             "codemode" => (
                 "codemode",
-                json!({"code": format!("r = tools.bash(command={})\ntext(r)", serde_json::to_string(command).unwrap())}),
+                json!({"code": format!("const r = await tools.bash({{ command: {} }}); text(r);", serde_json::to_string(command).unwrap())}),
             ),
             _ => (
                 "write",

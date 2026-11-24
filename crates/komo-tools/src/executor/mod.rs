@@ -76,9 +76,9 @@ impl ToolExecutor {
         ctx: &ToolContext,
     ) -> serde_json::Value {
         serde_json::json!({
-            "version": 3,
+            "version": 4,
             "code": ContentHash::of_str(code),
-            "engine": format!("monty-{}", crate::codemode::MONTY_VERSION),
+            "engine": crate::codemode::engine_version(),
             "worker": crate::codemode::WORKER_PROTOCOL,
             "prelude": crate::codemode::prelude_hash(),
             "tools": names,

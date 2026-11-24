@@ -76,10 +76,15 @@ enum Command {
         #[command(subcommand)]
         action: InterventionCommand,
     },
-    /// 监听清单（`monitor` 工具挂的、转后台的 bash）；只读，停监听用 monitor_stop 或删会话（docs/monitor.md）。
+    /// 监听（`monitor` 工具挂的、转后台的 bash，docs/monitor.md）：清单与停下。
     Monitor {
         #[command(subcommand)]
         action: MonitorCommand,
+    },
+    /// 后台任务：停下一个（撤回排队输入、停掉名下监听、取消当前一轮）。
+    Task {
+        #[command(subcommand)]
+        action: TaskCommand,
     },
     /// 查看自动记忆、来源与确认状态（§9）。
     Memory {
@@ -187,6 +192,20 @@ enum MonitorCommand {
         /// 带上已结束的（登记里留着的最近几十条）。
         #[arg(long)]
         all: bool,
+    },
+    /// 停一个监听；结束消息照常交回挂它的会话。
+    Stop {
+        /// 短号（`komo monitor list` 里的 `#xxxxxx`，`#` 可省）。
+        handle: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum TaskCommand {
+    /// 停下一个任务；之后晚到的监听事件不再起轮次。
+    Stop {
+        /// 任务的短号（派出回执里的 `#xxxxxx`，`#` 可省）或会话 id。
+        id: String,
     },
 }
 
@@ -733,6 +752,10 @@ async fn operator(command: Command, client: &komo_client::KomoClient) -> Result<
         },
         Command::Monitor { action } => match action {
             MonitorCommand::List { all } => commands::monitor_list(client, all).await,
+            MonitorCommand::Stop { handle } => commands::monitor_stop(client, &handle).await,
+        },
+        Command::Task { action } => match action {
+            TaskCommand::Stop { id } => commands::task_stop(client, &id).await,
         },
         Command::Goal { action } => matters::goal(client, action).await,
         Command::Area { action } => matters::area(client, action).await,

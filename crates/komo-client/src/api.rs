@@ -338,6 +338,24 @@ impl KomoClient {
         self.get_with("/v1/monitors", &params).await
     }
 
+    /// 停一个监听（`komo monitor stop`），短号带不带 `#` 都行。答停下之后的那一行。
+    pub async fn stop_monitor(&self, handle: &str) -> ClientResult<MonitorSummary> {
+        self.post(
+            &format!("/v1/monitors/{}/stop", path_segment(handle)),
+            &serde_json::json!({}),
+        )
+        .await
+    }
+
+    /// 停下一个任务（`komo task stop`）：会话 id 或短号。答停下之后的任务行。
+    pub async fn stop_task(&self, id: &str) -> ClientResult<TaskSummary> {
+        self.post(
+            &format!("/v1/tasks/{}/stop", path_segment(id)),
+            &serde_json::json!({}),
+        )
+        .await
+    }
+
     pub async fn session_tree(&self, session: &SessionId) -> ClientResult<SessionTreeResponse> {
         self.get(&format!("/v1/sessions/{session}/tree")).await
     }

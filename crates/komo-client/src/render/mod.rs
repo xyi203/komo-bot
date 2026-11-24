@@ -25,7 +25,7 @@ use komo_kernel::types::memory::{
 use komo_kernel::types::status::{RetryCause, RunState, SessionState, ToolCallState, WaitReason};
 
 mod matter;
-pub use matter::{matter_changed, matter_line, matter_list, matter_show};
+pub use matter::{matter_changed, matter_line, matter_list, matter_show, task_stopped};
 
 /// 状态那一格：`Waiting` 时把**理由**接上（§8.4）。
 ///

@@ -130,7 +130,37 @@ async fn a_stopped_task_drops_queued_and_late_monitor_events() {
         }
     ));
 
-    core.stop_task(task.root_conversation).await.unwrap();
+    // 操作者经 HTTP 停（`komo task stop`）：按任务行的短号认，带 `#` 也行；认不出是 404。
+    let (_, list) = gateway.get_json("/v1/tasks").await;
+    let handle = list["tasks"]
+        .as_array()
+        .expect("数组")
+        .iter()
+        .find(|row| row["session"] == task.id.as_str())
+        .and_then(|row| row["handle"].as_str())
+        .unwrap_or_else(|| panic!("清单里没有任务：{list}"))
+        .to_owned();
+    let (status, body) = gateway
+        .post_json("/v1/tasks/nosuch/stop", serde_json::json!({}))
+        .await;
+    assert_eq!(status, 404, "{body}");
+    let (status, body) = gateway
+        .post_json(
+            &format!("/v1/tasks/%23{handle}/stop"),
+            serde_json::json!({}),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["session"], task.id.as_str(), "{body}");
+    assert_eq!(body["outcome"], "not_completed", "{body}");
+    // 幂等：再停一次（这次用会话 id）照样 200。
+    let (status, body) = gateway
+        .post_json(
+            &format!("/v1/tasks/{}/stop", task.id),
+            serde_json::json!({}),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
 
     assert!(
         matches!(

@@ -5,7 +5,7 @@
 //! 超期按响应里 Gateway 的今天读（`Matter::is_overdue`），不按本机时区再算。
 
 use jiff::civil::Date;
-use komo_kernel::protocol::http::{MatterDetail, MatterListResponse, TaskState};
+use komo_kernel::protocol::http::{MatterDetail, MatterListResponse, TaskState, TaskSummary};
 use komo_kernel::types::matter::{Matter, MatterKind, MatterState};
 
 use super::{evidence_ref, provenance, schedule_brief, schedule_lines, stamp};
@@ -259,6 +259,16 @@ pub fn matter_show(detail: &MatterDetail) -> String {
         }
     }
     out.join("\n")
+}
+
+/// `komo task stop` 的回执。
+pub fn task_stopped(task: &TaskSummary) -> String {
+    format!(
+        "#{} 「{}」已停下（现在{}）",
+        task.handle,
+        flat(&task.title),
+        state_word(task.state)
+    )
 }
 
 fn state_word(state: TaskState) -> &'static str {

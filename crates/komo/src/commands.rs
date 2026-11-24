@@ -13,8 +13,8 @@ use komo_gateway::skills::{OfferContext, SkillRegistry, one_line};
 use komo_kernel::protocol::http::{
     CancelRunRequest, InterventionAnswerRequest, InterventionListQuery, InterventionVerdict,
     MemoryAddRequest, MemoryClassifyRequest, MemoryConsolidateRequest, MemoryListQuery,
-    MemoryRevisionRequest, MemorySweepRequest, MonitorListQuery, RebuildIndexRequest,
-    SessionListQuery, SessionSearchQuery,
+    MemoryRevisionRequest, MemorySweepRequest, MonitorListQuery, MonitorListResponse,
+    RebuildIndexRequest, SessionListQuery, SessionSearchQuery,
 };
 use komo_kernel::types::ids::{MatterId, MemoryId, RunId, SessionId};
 use komo_kernel::types::memory::{
@@ -78,6 +78,23 @@ pub async fn monitor_list(client: &KomoClient, all: bool) -> Outcome {
         .await
         .map_err(failed)?;
     Ok(render::monitor_list(&response, jiff::Timestamp::now()))
+}
+
+/// `komo monitor stop`：停一个监听，回显停下之后的那一行。
+pub async fn monitor_stop(client: &KomoClient, handle: &str) -> Outcome {
+    let monitor = client.stop_monitor(handle).await.map_err(failed)?;
+    Ok(render::monitor_list(
+        &MonitorListResponse {
+            monitors: vec![monitor],
+        },
+        jiff::Timestamp::now(),
+    ))
+}
+
+/// `komo task stop`：停下一个任务（会话 id 或短号）。
+pub async fn task_stop(client: &KomoClient, id: &str) -> Outcome {
+    let task = client.stop_task(id).await.map_err(failed)?;
+    Ok(render::task_stopped(&task))
 }
 
 /// `komo session delete`：**逻辑删除**（§8.10）。

@@ -223,18 +223,26 @@ impl DurableCore {
             .map(|record| record.id)
             .collect();
         for id in live {
-            self.harness
-                .finish_monitor(
-                    &self.engine,
-                    id,
-                    "stopped",
-                    Some(&format!("已停：{why}")),
-                    format!("[监听 #{} 已停：{why}]", short_handle(id)),
-                )
-                .await?;
-            if let Err(error) = self.harness.deps().orchestration.stop_monitor(id).await {
-                tracing::warn!(%error, monitor = id, "停监听进程没停掉：{why}");
-            }
+            self.stop_monitor(id, why).await?;
+        }
+        Ok(())
+    }
+
+    /// 停一个监听：先登记 `ended{stopped}`（同一笔提交排上结束消息，挂它的会话还在就交回去起一轮，
+    /// 让模型知道它被停了），再停进程；停进程失败只记一笔。已结束的再停一次是空操作。
+    /// 操作者的 `POST /v1/monitors/{handle}/stop` 与 [`Self::stop_monitors`] 共用。
+    pub async fn stop_monitor(&self, id: u64, why: &str) -> Result<(), SessionError> {
+        self.harness
+            .finish_monitor(
+                &self.engine,
+                id,
+                "stopped",
+                Some(&format!("已停：{why}")),
+                format!("[监听 #{} 已停：{why}]", short_handle(id)),
+            )
+            .await?;
+        if let Err(error) = self.harness.deps().orchestration.stop_monitor(id).await {
+            tracing::warn!(%error, monitor = id, "停监听进程没停掉：{why}");
         }
         Ok(())
     }

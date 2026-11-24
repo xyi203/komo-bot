@@ -1,11 +1,14 @@
-//! `GET /v1/monitors`：监听清单（`komo monitor list`，roadmap-muse S4）。只读：登记在 `durable.db` 的
-//! `komo.monitors`（`docs/monitor.md`），这里只把它翻成协议类型、补上挂它的会话。停监听仍走
-//! `monitor_stop`（模型在挂它的会话里调）或删会话。
+//! `GET /v1/monitors`：监听清单（`komo monitor list`，roadmap-muse S4）。登记在 `durable.db` 的
+//! `komo.monitors`（`docs/monitor.md`），这里只把它翻成协议类型、补上挂它的会话。
+//!
+//! `POST /v1/monitors/{handle}/stop`：操作者停一个监听（`komo monitor stop`）。与模型的 `monitor_stop`
+//! 同一套登记（`ended{stopped}`），结束消息照常交回挂它的会话。
 
-use axum::extract::{Query, State};
-use axum::routing::get;
+use axum::extract::{Path, Query, State};
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use komo_kernel::protocol::http::{MonitorListQuery, MonitorListResponse, MonitorSummary};
+use komo_kernel::types::handle::{parse_handle, short_handle};
 use komo_kernel::types::ids::SessionId;
 use komo_runtime::durable::harness::orchestration::monitor::{self, MonitorState};
 
@@ -18,7 +21,38 @@ use crate::service::durable::sessions::{SessionError, time_of};
 const COMMAND_CHARS: usize = 120;
 
 pub fn routes() -> Router<Api> {
-    Router::new().route("/v1/monitors", get(list))
+    Router::new()
+        .route("/v1/monitors", get(list))
+        .route("/v1/monitors/{handle}/stop", post(stop))
+}
+
+/// 停一个监听（短号，带不带 `#` 都行）。已结束的再停是空操作，照样答它现在的样子。
+async fn stop(
+    State(api): State<Api>,
+    Path(handle): Path<String>,
+) -> ApiResult<Json<MonitorSummary>> {
+    let core = api.state.core()?;
+    let records = monitor::list(&*core.storage)
+        .await
+        .map_err(SessionError::from)?;
+    let mut found: Vec<_> = parse_handle(&handle)
+        .into_iter()
+        .filter(|id| records.iter().any(|record| record.id == *id))
+        .collect();
+    if found.len() != 1 {
+        return Err(
+            SessionError::NotFound(format!("监听 #{}", handle.trim_start_matches('#'))).into(),
+        );
+    }
+    let id = found.remove(0);
+    core.stop_monitor(id, "操作者停下").await?;
+    let wanted = short_handle(id);
+    summaries(core, true)
+        .await?
+        .into_iter()
+        .find(|summary| summary.handle == wanted)
+        .map(Json)
+        .ok_or_else(|| SessionError::NotFound(format!("监听 #{wanted}")).into())
 }
 
 /// 还在跑的在前（按开始时刻），`all` 时已结束的接在后面。

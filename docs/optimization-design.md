@@ -4,6 +4,11 @@
 > 本文针对 `komo-bot` 在完成存储重写（pi-durable）与产品重设计（[`redesign.md`](redesign.md)）后暴露出的 6 类系统性优化点，给出可落地的设计方案、涉及模块与分波次实施计划。
 > 凡经操作者拍板的项，落地时按仓内规范写回对应权威文档：记忆相关写回 [`memory.md`](memory.md)（不另立独立记忆规格），目标写回 [`goals.md`](goals.md)，工具/运行时写回 [`komo_bot.md`](komo_bot.md) / [`codemode.md`](codemode.md) / [`confirm.md`](confirm.md)，客户端与部署写回 [`web.md`](web.md) / [`clients.md`](clients.md) / [`deploy.md`](deploy.md)。
 
+### 落地进度
+
+- **2026-11-23**：§2.2 第 1、2 条的后端与 CLI（`POST /v1/tasks/{id}/stop` + `komo task stop`、`POST /v1/monitors/{handle}/stop` + `komo monitor stop`；操作者停的监听交回结束消息，模型自己停的照旧不交回）；§2.3 第 3 条的第一步（harness 经 `Runtime::report` 报的非致命失败——部分回复 / 工具进度提交失败——先记 `warn` 再交 `EngineOptions.report`，不再静默）；§5.4 / §6.1 的握手放宽（只比协议号与 monty，`komo` 版本号不同记 `warn` 照常跑）。
+- 未做：上述两条的网页「停止」按钮、错误指标与核心 span、`/healthz` 增补、`komo update --restart`。
+
 ## 0. 源码核实基线与待拍板决策
 
 撰写本方案前已逐项核对当前源码，先澄清**已在代码中落地、但旧文档仍记为缺口**的四件事，避免重复施工：

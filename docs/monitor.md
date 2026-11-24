@@ -38,7 +38,10 @@
   （`docs/background-tasks.md` §2d）。
 - **清单（2026-10-31，roadmap-muse S4）。** `komo monitor list [--all]`（`GET /v1/monitors`，gateway
   `http/v2/monitors.rs`）只读列出登记：还在跑的按开始时刻在前，`--all` 带上已结束的与原因；每项带短号、
-  挂它的会话、开始与截止时刻、脚本开头 120 字；`detached` 标出转到后台的 `bash` 命令（2026-11-03，网页右栏"在后台"用它）。停监听仍是 `monitor_stop` 或删会话。
+  挂它的会话、开始与截止时刻、脚本开头 120 字；`detached` 标出转到后台的 `bash` 命令（2026-11-03，网页右栏"在后台"用它）。
+- **操作者停监听（2026-11-23，`docs/optimization-design.md` §2.2）。** `komo monitor stop <短号>`（`POST /v1/monitors/{handle}/stop`）
+  按短号在全部登记里认（不限会话），与 `monitor_stop` 同一套登记 `ended{stopped}` 后停进程；不同的是结束消息
+  `[监听 #… 已停：操作者停下]` 照常交回挂它的会话（模型自己停的不交回），让模型知道它被停了。已结束的再停是空操作。
 - **任务会话里也能挂（2026-10-31，roadmap-muse S2）。** 事件进任务会话，那一轮的回答照常交回派它的会话；
   只由事件起的那一轮回答是 NO_REPLY 时不交回，也不自动续跑。删会话（任何会话）时先登记 `ended{stopped}`
   再停进程，所在 Session 已在删时不交回结束消息（`docs/background-tasks.md` §2e）。
@@ -115,8 +118,6 @@
 
 ## 6. 没做的
 
-- 没有 `komo monitor list|stop` 命令与 HTTP 接口：现在只有模型能停，操作者要停就让模型停，
-  或者重启 Gateway。
 - 事件 Run 的回复照常投给来源对端：模型没法"这条不用说"。要少打扰，靠脚本过滤。
 - 没有 WebSocket 模式。要订阅推送流，脚本自己连（`websocat` 之类），每帧打一行。
 

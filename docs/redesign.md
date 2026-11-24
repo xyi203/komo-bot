@@ -201,7 +201,7 @@
 - [x] 删：分发判断（`komo-agent/src/router.rs`、`context/router.rs`）、分发的引擎任务与持久协议、结果直投与主线展示消息（`komo-gateway/.../dispatch/`）、话题的路由归属、`router_model`（2026-11-13 已删。网页的 `POST` 与渠道私聊主线进来的消息都直接进主会话；渠道、群的入站按 Router 之前的办法恢复：私聊主线进主会话，群与带话题的消息各按 `chat:{peer}` 开普通会话，渠道命令 `/new` `/cancel` `/status` 回到对普通会话的含义，下一步整个渠道删掉时一并走）
 - [x] 已落盘的 `main.user` / `main.reply`（Router 时期主会话里写下的展示 entry）不再写，读取与事件投影保留（`MessageUser` / `LineReply`，`komo-kernel/src/durable/legacy_events.rs`）；它们没有 `model`，不进上下文。`komo.task` 里 Router 时期写的 `reply` / `thread` / `session` 与 `komo.live` 里的 `activityAt` 读到时被忽略（两处都不拒绝未知字段）
 - [x] 主会话恢复成会跑模型的普通会话：有 Run、有压缩与提示缓存（`kind = main` 与普通会话走同一条受理与 Run 路径，能力面是完整的做事能力面）
-- [x] 留下：模型调用的容错（T2a）、`komo` 工具（含 `goal.list` / `goal.attach` / `goal.detach`）、`task` 工具（长活可以派到后台）、任务清单接口 `GET /v1/tasks`（去留见 §2.5）、任务带目标的键、"停下"（`DurableCore::stop_task`：标已停、撤回排队输入、停监听、丢弃晚到的监听事件，任务清单里算"没有完成"）。注意 `stop_task` 现在没有生产调用方（原来只有分发的 `stop` 与渠道 `/cancel` 用它），只有测试在用
+- [x] 留下：模型调用的容错（T2a）、`komo` 工具（含 `goal.list` / `goal.attach` / `goal.detach`）、`task` 工具（长活可以派到后台）、任务清单接口 `GET /v1/tasks`（去留见 §2.5）、任务带目标的键、"停下"（`DurableCore::stop_task`：标已停、撤回排队输入、停监听、丢弃晚到的监听事件，任务清单里算"没有完成"）。`stop_task` 原来只有分发的 `stop` 与渠道 `/cancel` 用它，2026-11-23 起由 `POST /v1/tasks/{id}/stop` / `komo task stop` 接上（`docs/optimization-design.md` §2.2）
 - [x] 「不许沉默」的补救、卡死检测、"用户消息派出的任务视同用户发起 / 可改承诺"这类规则：已核实，全部只对 `komo.task.reply`（分发派出的任务）生效，与任务会话共用的部分没有，整套删除（含 `[execution] stall_model_secs` / `stall_tool_secs`、`komo.live.activityAt`、`task.stall` 输入）。`task` 工具派出的任务本来就走"交回父会话"的老路，那条路的末行状态行与自动续跑一直是独立的，未动
 - [x] 目标的定时结果与提问投到主对话：作为主会话里的一条消息落下，下一轮进上下文（2026-11-14：定时结果按 `notify` 投、提问由介入投；**绑定了支线时改投那段支线留给 3a**，接缝 `chats::cron_route`）
 - [x] 主对话的上下文：同一个会话加自动压缩，见 §2.8

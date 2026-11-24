@@ -37,7 +37,8 @@ komo gateway [--foreground] | gateway status|stop|restart
 komo config check | config reload
 komo session list|delete|purge|export SESSION_ID [-o FILE]   # export = pi v3 树形 JSONL
 komo session search 关键词     # 跨会话找回（标题与正文）
-komo monitor list [--all]      # 监听清单（只读）
+komo monitor list [--all] | monitor stop HANDLE   # 监听清单；操作者停一个监听
+komo task stop ID              # 停下一个后台任务（短号或会话 id）
 komo intervention list|show|answer
 komo memory … | komo goal … | komo area …（含 schedule / unschedule / run，定时是目标的配置）| komo skills … | komo doctor
 komo update                    # swap the on-disk binary from the GitHub release (§13.6)

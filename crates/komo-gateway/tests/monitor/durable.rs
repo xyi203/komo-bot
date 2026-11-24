@@ -199,6 +199,53 @@ async fn the_monitor_list_shows_live_ones_with_their_session() {
     gateway.stop().await;
 }
 
+/// `POST /v1/monitors/{handle}/stop`（`komo monitor stop`）：操作者停监听——进程组没了、登记
+/// `ended{stopped}`，结束消息交回挂它的会话（与模型自己 `monitor_stop` 不同，模型得知道它被停了）；
+/// 再停一次是空操作，认不出的短号 404。
+#[tokio::test]
+async fn the_operator_stops_a_monitor_over_http_and_the_session_is_told() {
+    let llm = MonitorLlm::new(Duration::ZERO);
+    let mut gateway = start(&llm, None).await;
+
+    let marker = gateway.home.join("still-running");
+    let (_session, id) = arm(
+        &gateway,
+        &format!("while true; do touch {}; sleep 0.2; done", marker.display()),
+    )
+    .await;
+
+    let (status, body) = gateway
+        .post_json("/v1/monitors/zzzzzz/stop", serde_json::json!({}))
+        .await;
+    assert_eq!(status, 404, "{body}");
+
+    let (status, body) = gateway
+        .post_json(&format!("/v1/monitors/%23{id}/stop"), serde_json::json!({}))
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["handle"], id.as_str(), "{body}");
+    assert_eq!(body["state"], "ended", "{body}");
+    assert_eq!(body["reason"], "stopped", "{body}");
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let _ = std::fs::remove_file(&marker);
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    assert!(!marker.exists(), "停掉之后脚本还在跑");
+    assert_eq!(
+        submissions_keyed(&gateway, "monitor-end:").await.len(),
+        1,
+        "操作者停的，结束消息该交回挂它的会话"
+    );
+
+    let (status, body) = gateway
+        .post_json(&format!("/v1/monitors/{id}/stop"), serde_json::json!({}))
+        .await;
+    assert_eq!(status, 200, "再停一次是幂等的：{body}");
+    assert_eq!(submissions_keyed(&gateway, "monitor-end:").await.len(), 1);
+
+    gateway.stop().await;
+}
+
 /// `GET /v1/tasks`（T1）：任务行上"还活着的监听数"跟着登记走——挂上是 1，停掉之后归零。
 #[tokio::test]
 async fn the_task_list_counts_live_monitors_and_drops_to_zero_after_stop() {

@@ -87,6 +87,8 @@ Gateway 持有模型连接、数据库与提交线、工具环境和运行状态
 | `komo session list [--all] [--limit N] [--cursor C]` | 查看会话列表和状态（最新创建的在前）；`--all` 才列出已逻辑删除的会话（§8.10）。一页 50 条，还有更多时末尾印出接着列的 `--cursor`；`--limit 0` 一次列完 |
 | `komo session search 关键词 [--limit N]`         | 跨会话找回：在会话标题与正文里找，给会话、片段与能接着查的 ID（§8.11「跨会话找回」） |
 | `komo monitor list [--all]`                   | 监听清单（`monitor` 挂的与转后台的 bash）：短号、已跑多久、距截止、标题、挂它的会话、脚本；只读（`docs/monitor.md`） |
+| `komo monitor stop HANDLE`                    | 操作者停一个监听（`POST /v1/monitors/{handle}/stop`），结束消息交回挂它的会话（`docs/monitor.md` §2） |
+| `komo task stop ID`                           | 停下一个后台任务（短号或会话 id，`POST /v1/tasks/{id}/stop` → `DurableCore::stop_task`）：撤回排队输入、停名下监听、取消当前一轮 |
 | `komo session delete/purge SESSION_ID`       | 逻辑删除（`closing` → `deleted`）与回收（`purged`）。**删除只有这一条路**：`--now` 把未完成 Run 各写一条明确取消，`purge` 前先算引用（§8.10） |
 | `komo session export SESSION_ID [-o FILE]`   | 导出成 pi v3 树形 JSONL（header + 全部分支 entry，当前位置落在末条；blob 保持引用，`komoBlobRoot` 指向 Session 目录）；默认写 stdout，只读，不导入（`docs/storage-durable.md` §9 D6） |
 | `komo run inspect RUN_ID`                    | 查看执行过程、工具结果与产物                                                |

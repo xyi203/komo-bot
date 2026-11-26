@@ -90,8 +90,7 @@ pub struct ToolImage {
 }
 
 /// 一张图片最多多大才交给模型。Anthropic 单张上限 5 MB（按 base64 计），3.5 MiB 的原图编码后
-/// 约 4.7 MiB。不引入 `image`（§13.4）：`read` 与 MCP 先借本机的 `sips` / ImageMagick 缩小
-/// （`komo_tools::images::fit`），缩不下来才报错或不附。
+/// 约 4.7 MiB。`read` 与 MCP 超过它先缩成 JPEG（`komo_tools::images::fit`），缩不下来才报错或不附。
 pub const IMAGE_LIMIT_BYTES: usize = 3584 * 1024;
 
 /// 按文件头认图片格式。只认三家接口都收的四种：PNG、JPEG、GIF、WebP。

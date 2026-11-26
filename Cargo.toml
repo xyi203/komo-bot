@@ -22,7 +22,7 @@ license = "MIT"
 
 # 依赖清单与禁用项照 docs/komo_bot.md §13.4。特性在这里写死，成员 crate 只写
 # `workspace = true`（必要时按 §13.4 的 crate 行补自己需要的可加特性）。
-# 不引入 image / strum / derive_more / bon。
+# 不引入 strum / derive_more / bon。
 [workspace.dependencies]
 # 内部 crate，依赖只向下：kernel ← store ← memory ← runtime ← gateway；
 # kernel ← llm ← config ← tools ← runtime；llm ← memory；kernel ← agent ← gateway；kernel ← client。
@@ -125,6 +125,9 @@ jiff = { version = "1.0.1", features = ["serde"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 sha2 = "0.11.0"
+# 给模型的图片超过上限时缩小（komo_tools::images）。只开四种格式的解码与 JPEG 编码，
+# 不开 rayon / avif / exr / tiff（§13.4）。
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 # ChatGPT OAuth 的 access_token / id_token 是 JWT：只 base64url 解 payload，不验签
 # （§13.3）。0.22 已经是依赖树里解得最多的一份（reqwest 等间接拉入），钉住它不再添一份
 # 重复版本。

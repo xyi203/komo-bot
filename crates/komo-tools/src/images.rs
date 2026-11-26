@@ -1,54 +1,52 @@
 //! 给模型的图片超过上限时缩小（pi-durable 1.6 的 `images/fit`）。
 //!
-//! 不引入 `image`（§13.4，冷编预算）：借本机已有的转换器——macOS 自带的 `sips`，其次是
-//! ImageMagick（`magick`，老版本叫 `convert`）。缩成 JPEG、长边逐级变短，直到放得下
-//! [`IMAGE_LIMIT_BYTES`]；ImageMagick 顺手去掉 EXIF 并按方向摆正。都没有或都失败时原样交回错误，
-//! 调用方照旧报"太大"。没超限的图一个字节都不动。
+//! 用 `image`（§13.4，只开 PNG / JPEG / GIF / WebP）：解码、按 EXIF 方向摆正、透明铺到白底、
+//! 长边逐级变短、编成 JPEG，直到放得下 [`IMAGE_LIMIT_BYTES`]。重新编码不带 EXIF。动图只取第一帧。
+//! 没超限的图一个字节都不动。解码按 `image` 的默认上限（单张至多分配 512 MiB），防解压炸弹。
 
-use std::path::Path;
-use std::time::Duration;
+use std::io::Cursor;
 
-use komo_kernel::types::tool::{IMAGE_LIMIT_BYTES, ToolImage, image_mime};
-use tokio::process::Command;
+use image::codecs::jpeg::JpegEncoder;
+use image::imageops::FilterType;
+use image::{DynamicImage, ImageDecoder, ImageFormat, ImageReader, RgbImage};
+use komo_kernel::types::tool::{IMAGE_LIMIT_BYTES, ToolImage};
 
-/// 依次试的长边（像素）。
-const EDGES: [u32; 4] = [2048, 1600, 1200, 800];
-/// 一次转换最多等多久。
-const CONVERT_TIMEOUT: Duration = Duration::from_secs(30);
+/// 依次试的长边（像素）。原图更短的那几档跳过。
+const EDGES: [u32; 5] = [2048, 1600, 1200, 800, 512];
+/// JPEG 质量。
+const QUALITY: u8 = 80;
 
-/// 放得下就原样交回；放不下就缩，缩不下来是 `Err(原因)`。
+/// 放得下就原样交回；放不下就缩，缩不下来是 `Err(原因)`。解码与编码是 CPU 活，放在阻塞线程上。
 pub async fn fit(image: ToolImage) -> Result<ToolImage, String> {
     if image.bytes.len() <= IMAGE_LIMIT_BYTES {
         return Ok(image);
     }
-    let Some(converter) = Converter::find() else {
-        return Err("本机没有 sips 或 ImageMagick，缩不了图".into());
-    };
-    let dir = tempfile::tempdir().map_err(|error| error.to_string())?;
-    let input = dir.path().join(format!("in.{}", extension(&image.mime)));
-    tokio::fs::write(&input, &image.bytes)
+    tokio::task::spawn_blocking(move || shrink(&image))
         .await
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| format!("缩图的线程没跑完：{error}"))?
+}
+
+fn shrink(image: &ToolImage) -> Result<ToolImage, String> {
+    let decoded = decode(image)?;
+    let flat = on_white(&decoded);
+    let longest = flat.width().max(flat.height());
     let mut last = String::new();
-    for edge in EDGES {
-        let output = dir.path().join(format!("out-{edge}.jpg"));
-        if let Err(error) = converter.shrink(&input, &output, edge).await {
-            last = error;
-            break;
-        }
-        let bytes = tokio::fs::read(&output)
-            .await
-            .map_err(|error| error.to_string())?;
-        if image_mime(&bytes) != Some("image/jpeg") {
-            last = format!("{} 交回的不是 JPEG", converter.name());
-            break;
-        }
+    // 原图本来就不大（只是编码得胖）：先按原尺寸重编一次。
+    let edges = std::iter::once(longest).chain(EDGES.into_iter().filter(|edge| *edge < longest));
+    for edge in edges {
+        let resized = if edge < longest {
+            DynamicImage::ImageRgb8(flat.clone())
+                .resize(edge, edge, FilterType::Triangle)
+                .into_rgb8()
+        } else {
+            flat.clone()
+        };
+        let bytes = encode(&resized)?;
         if bytes.len() <= IMAGE_LIMIT_BYTES {
             tracing::debug!(
                 from = image.bytes.len(),
                 to = bytes.len(),
                 edge,
-                converter = converter.name(),
                 "图片缩小后交给模型"
             );
             return Ok(ToolImage {
@@ -58,109 +56,81 @@ pub async fn fit(image: ToolImage) -> Result<ToolImage, String> {
         }
         last = format!("长边 {edge} 像素仍有 {} 字节", bytes.len());
     }
-    Err(format!("{} 没能缩到上限以内：{last}", converter.name()))
+    Err(format!("没能缩到上限以内：{last}"))
 }
 
-fn extension(mime: &str) -> &'static str {
-    match mime {
-        "image/png" => "png",
-        "image/jpeg" => "jpg",
-        "image/gif" => "gif",
-        "image/webp" => "webp",
-        _ => "bin",
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-enum Converter {
-    Sips,
-    Magick,
-    Convert,
-}
-
-impl Converter {
-    fn find() -> Option<Self> {
-        if cfg!(target_os = "macos") && Path::new("/usr/bin/sips").is_file() {
-            return Some(Self::Sips);
-        }
-        [Self::Magick, Self::Convert]
-            .into_iter()
-            .find(|converter| on_path(converter.name()))
-    }
-
-    fn name(self) -> &'static str {
-        match self {
-            Self::Sips => "sips",
-            Self::Magick => "magick",
-            Self::Convert => "convert",
+/// 解码并按 EXIF 方向摆正。格式按 mime 定（调用方已经按文件头认过），认不了的再猜一次。
+fn decode(image: &ToolImage) -> Result<DynamicImage, String> {
+    let mut reader = ImageReader::new(Cursor::new(&image.bytes));
+    match ImageFormat::from_mime_type(&image.mime) {
+        Some(format) => reader.set_format(format),
+        None => {
+            reader = reader
+                .with_guessed_format()
+                .map_err(|error| format!("认不出图片格式：{error}"))?;
         }
     }
-
-    async fn shrink(self, input: &Path, output: &Path, edge: u32) -> Result<(), String> {
-        let mut command = match self {
-            Self::Sips => {
-                let mut command = Command::new("/usr/bin/sips");
-                command
-                    .args(["-Z", &edge.to_string()])
-                    .args(["-s", "format", "jpeg", "-s", "formatOptions", "80"])
-                    .arg(input)
-                    .arg("--out")
-                    .arg(output);
-                command
-            }
-            Self::Magick | Self::Convert => {
-                let mut command = Command::new(self.name());
-                // `[0]`：动图只取第一帧。`>`：只缩不放。
-                let mut first = input.as_os_str().to_owned();
-                first.push("[0]");
-                command
-                    .arg(first)
-                    .args(["-auto-orient", "-strip"])
-                    .args(["-background", "white", "-flatten"])
-                    .args(["-resize", &format!("{edge}x{edge}>")])
-                    .args(["-quality", "80"])
-                    .arg(output);
-                command
-            }
-        };
-        command
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true);
-        let run = command.output();
-        let finished = tokio::time::timeout(CONVERT_TIMEOUT, run)
-            .await
-            .map_err(|_| {
-                format!(
-                    "{} 超过 {} 秒没跑完",
-                    self.name(),
-                    CONVERT_TIMEOUT.as_secs()
-                )
-            })?
-            .map_err(|error| format!("{} 起不来：{error}", self.name()))?;
-        if finished.status.success() {
-            Ok(())
-        } else {
-            let stderr = String::from_utf8_lossy(&finished.stderr);
-            Err(format!(
-                "{} 失败（{}）：{}",
-                self.name(),
-                finished.status,
-                stderr.lines().next().unwrap_or_default()
-            ))
-        }
+    let mut decoder = reader
+        .into_decoder()
+        .map_err(|error| format!("解不开这张 {}：{error}", image.mime))?;
+    let orientation = decoder.orientation().ok();
+    let mut decoded = DynamicImage::from_decoder(decoder)
+        .map_err(|error| format!("解不开这张 {}：{error}", image.mime))?;
+    if let Some(orientation) = orientation {
+        decoded.apply_orientation(orientation);
     }
+    Ok(decoded)
 }
 
-fn on_path(program: &str) -> bool {
-    std::env::var_os("PATH")
-        .is_some_and(|paths| std::env::split_paths(&paths).any(|dir| dir.join(program).is_file()))
+/// JPEG 没有透明：按 alpha 铺到白底上。
+fn on_white(image: &DynamicImage) -> RgbImage {
+    if !image.color().has_alpha() {
+        return image.to_rgb8();
+    }
+    let rgba = image.to_rgba8();
+    RgbImage::from_fn(rgba.width(), rgba.height(), |x, y| {
+        let [r, g, b, a] = rgba.get_pixel(x, y).0;
+        let blend =
+            |c: u8| ((u16::from(c) * u16::from(a) + 255 * (255 - u16::from(a))) / 255) as u8;
+        image::Rgb([blend(r), blend(g), blend(b)])
+    })
+}
+
+fn encode(image: &RgbImage) -> Result<Vec<u8>, String> {
+    let mut bytes = Vec::new();
+    JpegEncoder::new_with_quality(&mut bytes, QUALITY)
+        .encode_image(image)
+        .map_err(|error| format!("编不成 JPEG：{error}"))?;
+    Ok(bytes)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use komo_kernel::types::tool::image_mime;
+
+    /// 一张压不小的 PNG：每个像素都不一样（简单的线性同余噪点，确定性）。
+    fn noisy_png(width: u32, height: u32, alpha: bool) -> Vec<u8> {
+        let mut state: u32 = 12345;
+        let mut next = || {
+            state = state.wrapping_mul(1_103_515_245).wrapping_add(12345);
+            (state >> 16) as u8
+        };
+        let image = if alpha {
+            DynamicImage::ImageRgba8(image::RgbaImage::from_fn(width, height, |_, _| {
+                image::Rgba([next(), next(), next(), next()])
+            }))
+        } else {
+            DynamicImage::ImageRgb8(RgbImage::from_fn(width, height, |_, _| {
+                image::Rgb([next(), next(), next()])
+            }))
+        };
+        let mut bytes = Vec::new();
+        image
+            .write_to(&mut Cursor::new(&mut bytes), ImageFormat::Png)
+            .unwrap();
+        bytes
+    }
 
     #[tokio::test]
     async fn an_image_within_the_limit_is_left_untouched() {
@@ -182,22 +152,9 @@ mod tests {
         assert!(fit(image).await.is_err());
     }
 
-    /// 一张真的大图（随机噪点的 PNG，压不小）缩成放得下的 JPEG。造图要 ImageMagick，没有就跳过。
     #[tokio::test]
     async fn an_oversized_image_is_shrunk_to_a_jpeg_within_the_limit() {
-        if !on_path("magick") {
-            eprintln!("没有 magick，跳过");
-            return;
-        }
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("noise.png");
-        let status = std::process::Command::new("magick")
-            .args(["-size", "1400x1400", "xc:", "+noise", "Random"])
-            .arg(&path)
-            .status()
-            .unwrap();
-        assert!(status.success());
-        let bytes = std::fs::read(&path).unwrap();
+        let bytes = noisy_png(1400, 1400, false);
         assert!(bytes.len() > IMAGE_LIMIT_BYTES, "{}", bytes.len());
         let fitted = fit(ToolImage {
             mime: "image/png".into(),
@@ -206,6 +163,31 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(fitted.mime, "image/jpeg");
+        assert_eq!(image_mime(&fitted.bytes), Some("image/jpeg"));
         assert!(fitted.bytes.len() <= IMAGE_LIMIT_BYTES);
+    }
+
+    #[tokio::test]
+    async fn a_very_large_image_has_its_long_edge_cut_and_keeps_its_aspect() {
+        let bytes = noisy_png(4000, 2000, true);
+        let fitted = fit(ToolImage {
+            mime: "image/png".into(),
+            bytes,
+        })
+        .await
+        .unwrap();
+        let decoded = image::load_from_memory(&fitted.bytes).unwrap();
+        assert!(decoded.width() <= 2048, "{}", decoded.width());
+        assert_eq!(decoded.width(), decoded.height() * 2);
+    }
+
+    #[test]
+    fn transparency_is_laid_on_white() {
+        let clear = DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            1,
+            1,
+            image::Rgba([0, 0, 0, 0]),
+        ));
+        assert_eq!(on_white(&clear).get_pixel(0, 0).0, [255, 255, 255]);
     }
 }

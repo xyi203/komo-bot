@@ -35,6 +35,8 @@ tracing = { workspace = true }
 jiff = { workspace = true }
 futures-util = { workspace = true }
 base64 = { workspace = true }
+# 超过上限的图片缩成 JPEG（images.rs）。
+image = { workspace = true }
 tempfile = { workspace = true }
 # codemode 的脚本引擎（docs/codemode.md §2）：earendil-works/djs（纯 Rust JS/TS，零第三方依赖）。
 djs-core = { workspace = true }

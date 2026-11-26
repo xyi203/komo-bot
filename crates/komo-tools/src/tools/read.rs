@@ -240,7 +240,7 @@ async fn image_output(
     .map_err(|reason| ToolError::Failed {
         message: format!(
             "{display} 是一张 {mime} 图片，{original} 字节，超过可以交给模型的上限 {IMAGE_LIMIT_BYTES} 字节，\
-             自动缩小也没成（{reason}）。先缩小再读（macOS 上可以 `sips -Z 1600 原图 --out 新文件`）"
+             自动缩小也没成（{reason}）。先裁剪或转换成更小的图再读"
         ),
     })?;
     let mut preview = format!(
@@ -513,7 +513,7 @@ mod tests {
             .execute(plan, &ctx, &mut writer(&ctx))
             .await
             .unwrap_err();
-        assert!(error.to_string().contains("sips"), "{error}");
+        assert!(error.to_string().contains("自动缩小也没成"), "{error}");
     }
 
     /// 磁盘上的资源走的是和本地路径**同一套**读法：计划里逻辑 URI 与真实目标都在，正文的

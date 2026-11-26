@@ -618,7 +618,7 @@ impl ToolTask {
 
     // ------------------------------------------------------------------ confirm
 
-    /// `confirm` 阶段：每拍读一次 `komo.confirm`，直到有答复或到点。批准了按当前工具集执行（等的
+    /// `confirm` 阶段：等 `komo.confirm` 被写下（答复一提交就醒，不轮询），直到有答复或到点。批准了按当前工具集执行（等的
     /// 时候工具可能被移走）；拒绝、到点都按没执行收尾，结果交给模型。取消时 `sleep_until` 拒绝，
     /// 由 abort handler 收尾。
     async fn confirm(
@@ -631,17 +631,7 @@ impl ToolTask {
     ) -> Result<(), TaskError> {
         let input = parse_input(task)?;
         let call = self.read_call(rt, &input).await?;
-        let interval = self.deps.settings().probe_interval.as_millis() as i64;
-        let answer = loop {
-            if let Some(answer) = confirm::answer(rt).await? {
-                break Some(answer);
-            }
-            let now = rt.now()?;
-            if now >= deadline {
-                break None;
-            }
-            rt.sleep_until((now + interval).min(deadline)).await?;
-        };
+        let answer = confirm::wait_answer(rt, deadline).await?;
         let set = self.tools(rt.conversation()).await?;
         match answer.map(|answer| answer.verdict) {
             Some(ConfirmVerdict::Approve) => {

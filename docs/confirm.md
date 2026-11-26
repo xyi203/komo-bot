@@ -74,8 +74,9 @@ Call ──prepare──▶ Confirm{arguments, plan, replay, asked_at, deadline}
 - 只有 `!attended && tool.outward()` 才进 `Confirm`；其余照旧直达 `Execute`，有人值守的 Run 行为一字不变。
 - `Confirm` 是持久 checkpoint：计划已定、确认没执行。重启后任务回到 `pending`，从 `Confirm` 接着等，不会
   因为重启而执行或重复发卡（卡的投递键已幂等，§11.4）。
-- 等的办法：任务每拍读会话文档 `komo.confirm`（`{handle → verdict}`）里有没有这张卡的答复，没有就
-  `sleep_until(min(下一拍, deadline))`，同 `Probe` 的写法。答复路由只写这份文档，不碰任务。
+- 等的办法：任务等会话文档 `komo.confirm`（`{handle → verdict}`）里出现这张卡的答复
+  （`TaskRuntime::wait_document`：订阅提交线，写这份文档的提交一发布就醒，最晚到 deadline）。答复路由只写
+  这份文档，不碰任务。
 - 结果交给模型的文字：
   - 拒绝：`操作者拒绝了这次 <工具> 调用，没有执行。`
   - 到点：`等了 <N> 分钟没有确认，没有执行。`
@@ -159,7 +160,9 @@ system entry 的增量换一次工具表。有人值守的 Run 里嵌套调用�
   entry：外部往正在跑的 conversation 里插 entry 会打乱 Run 的上下文。document 不随任务退役，purge 时随会话删。
 - **卡的正文**没有"事项"那一行（Cron Job 与目标 / 领域的挂接要读 aux.db，放到 P4 一起做）；时限写成"N 小时内"，
   不写具体时刻（不依赖时区）。
-- **轮询**：`confirm` 阶段在进程内每 5 秒读一次 `komo.confirm`（同 `probe` 的间隔），不每拍提交 checkpoint。
+- **不轮询**（2026-11-26 起）：`confirm` 阶段订阅提交线，答复一提交就醒（以前每 5 秒读一次 `komo.confirm`，
+  答复最多晚 5 秒生效）；不每拍提交 checkpoint。参考 pi-durable 1.6 的 signal（先到的值先存着，开始等时第一次
+  读就拿到）——komo 的等待本来不占调用槽，没有照搬 park / gate 与 `pi.tool` v4 的存储改动。
 - **`config check` / `doctor`**：`outward` 写了 `tools` 白名单之外的名字（且没有模式能匹配上）报 warn；有服务器
   声明了对外工具、却没有任何 enabled 渠道配 `home_chat` 时也报 warn。
 

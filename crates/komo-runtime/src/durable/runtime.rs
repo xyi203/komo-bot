@@ -8,7 +8,7 @@ use std::sync::Arc;
 use serde_json::Value;
 
 use komo_kernel::durable::records::TaskOutcome;
-use komo_kernel::durable::storage::EntryQuery;
+use komo_kernel::durable::storage::{EntryQuery, StorageWrite};
 use komo_kernel::durable::task::{NextTaskState, RunningTask, memo_of, put_memo};
 use komo_kernel::durable::{
     ContextView, ConversationId, Cursor, DocumentAddress, DocumentRecord, EntryId, EntryRecord,
@@ -138,6 +138,58 @@ impl TaskRuntime {
                 }
             }
         }
+    }
+
+    /// 等地址上出现 document，至多等到时钟 `until_ms`：到点还没有就是 `None`。
+    ///
+    /// 外部给一个等待中的任务投递一个值（pi-durable 1.6 的 signal）的最小形：写入方把值提交成这个
+    /// 地址上的 document，提交一发布这里就醒，不按间隔轮询。先到的值本来就落在库里，开始等时
+    /// 第一次读就拿到；重启后从 checkpoint 重新进来再等一遍也一样。invocation 被发信号或结束时拒绝。
+    pub async fn wait_document(
+        &self,
+        address: &DocumentAddress,
+        until_ms: i64,
+    ) -> Result<Option<DocumentRecord>, DurableError> {
+        const MAX_STEP_MS: i64 = 3_600_000;
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let subscription = {
+            let notify = notify.clone();
+            let address = address.clone();
+            self.sched.line.subscribe_commits(move |publication| {
+                let written = publication.writes.iter().any(|write| {
+                    matches!(write, StorageWrite::DocumentCreate(create) if create.address == address)
+                });
+                if written {
+                    notify.notify_waiters();
+                }
+            })
+        };
+        let result = async {
+            loop {
+                let notified = notify.notified();
+                tokio::pin!(notified);
+                // 先登记再读，免得写入的发布落在两者之间。
+                notified.as_mut().enable();
+                if let Some(document) = self.find_document(address).await? {
+                    return Ok(Some(document));
+                }
+                let remaining = until_ms - self.sched.line.now_ms();
+                if remaining <= 0 {
+                    return Ok(None);
+                }
+                let step = std::time::Duration::from_millis(remaining.min(MAX_STEP_MS) as u64);
+                tokio::select! {
+                    _ = &mut notified => {}
+                    _ = tokio::time::sleep(step) => {}
+                    _ = self.invocation.token.cancelled() => {
+                        return Err(DurableError::InvocationEnded(self.invocation.task));
+                    }
+                }
+            }
+        }
+        .await;
+        subscription.dispose();
+        result
     }
 
     /// 已提交的任务记录。

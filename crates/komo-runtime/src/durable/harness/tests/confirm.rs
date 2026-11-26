@@ -94,9 +94,16 @@ async fn a_cron_run_waits_for_approval_and_then_runs_the_outward_call_once() {
     assert_eq!(send.prepares.load(std::sync::atomic::Ordering::SeqCst), 1);
     assert_eq!(send.runs(), 0, "nothing runs before the answer");
 
+    let answered = tokio::time::Instant::now();
     answer(&engine, task.id, ConfirmVerdict::Approve).await;
     world.harness.wait(&engine, id).await.unwrap();
     assert_eq!(send.runs(), 1);
+    // 答复一提交就醒：不等下一拍探测（暂停的时钟在空闲时才跳，轮询会跳过一整个间隔）。
+    assert!(
+        answered.elapsed() < std::time::Duration::from_secs(1),
+        "{:?}",
+        answered.elapsed()
+    );
     let (data, _) = result_view(&world).await;
     assert_eq!(data["status"], "completed");
     engine.close().await.unwrap();

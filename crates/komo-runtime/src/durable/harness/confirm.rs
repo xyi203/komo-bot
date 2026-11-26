@@ -2,7 +2,7 @@
 //! `confirm` 阶段，等操作者的答复。
 //!
 //! 答复只写一份 conversation 级 document（`komo.confirm`，key = 工具任务 ID），不碰任务；工具任务
-//! 每拍读它。任务结束后 document 留着，事后能查谁、什么时候、答了什么。
+//! 等它被提交（[`TaskRuntime::wait_document`]，写入即醒）。任务结束后 document 留着，事后能查谁、什么时候、答了什么。
 
 use komo_kernel::durable::{
     ConversationId, DocumentAddress, DocumentScope, InputState, SubmissionKind, TaskId,
@@ -84,10 +84,13 @@ pub(super) async fn attended(env: &ToolEnv, rt: &TaskRuntime) -> Result<bool, Ta
     Ok(!is_trigger_input(&entry.kind))
 }
 
-/// 已有的答复（没答是 `None`）。
-pub(super) async fn answer(rt: &TaskRuntime) -> Result<Option<ConfirmAnswer>, TaskError> {
+/// 等操作者的答复，至多到 `deadline`（到点没答是 `None`）。答复一提交就醒。
+pub(super) async fn wait_answer(
+    rt: &TaskRuntime,
+    deadline: i64,
+) -> Result<Option<ConfirmAnswer>, TaskError> {
     let address = confirm_address(rt.conversation(), rt.task_id());
-    let Some(document) = rt.find_document(&address).await? else {
+    let Some(document) = rt.wait_document(&address, deadline).await? else {
         return Ok(None);
     };
     serde_json::from_value(document.value)

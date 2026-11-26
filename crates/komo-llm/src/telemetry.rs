@@ -62,8 +62,43 @@ pub fn chat_span(role: &'static str, model: &str, effort: Option<&str>, attempt:
         komo.usage.cache_read_tokens = Empty,
         komo.usage.cache_write_tokens = Empty,
         komo.usage.reasoning_tokens = Empty,
+        komo.llm.reasoning_removed = Empty,
         error.type = Empty,
     )
+}
+
+/// 服务端报了它扔掉的回放 reasoning（`wire::reasoning_removals`，已去掉 `turn_boundary`）：
+/// 记到当前 `chat` span 上，按原因计数，并留一条 warn。
+///
+/// 同一项在之后每次回放都会再报，所以计数是「请求 × 被扔的项」，不是去重后的项数；看趋势与
+/// 原因分布够用。正文与加密内容不上报。
+pub fn note_reasoning_removed(model: Option<&str>, removals: &[crate::wire::ReasoningRemoval]) {
+    if removals.is_empty() {
+        return;
+    }
+    let span = Span::current();
+    span.record("komo.llm.reasoning_removed", removals.len() as u64);
+    let mut reasons: Vec<&str> = removals.iter().map(|r| r.reason.as_str()).collect();
+    reasons.sort_unstable();
+    reasons.dedup();
+    tracing::warn!(
+        count = removals.len(),
+        reasons = %reasons.join(","),
+        model = model.unwrap_or("?"),
+        "服务端扔掉了回放的 reasoning"
+    );
+    for reason in reasons {
+        let count = removals.iter().filter(|r| r.reason == reason).count() as u64;
+        tracing::event!(
+            target: "komo::metrics",
+            tracing::Level::DEBUG,
+            {
+            monotonic_counter.komo.llm.reasoning_removed = count,
+            gen_ai.response.model = model,
+            komo.reasoning.removed_reason = reason,
+            }
+        );
+    }
 }
 
 /// 适配器在读到服务商给的响应 id / 实际模型时调用：记到当前的 `chat` span 上（没有

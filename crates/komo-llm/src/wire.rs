@@ -203,6 +203,46 @@ pub struct ResponseBody {
     pub error: Option<ErrorDetail>,
     #[serde(default)]
     pub incomplete_details: Option<IncompleteDetails>,
+    /// 服务端改了哪些输入（GPT-6.2 起会报被扔掉的 reasoning 项）。原样留 JSON：老服务端和
+    /// 代理不给这个字段，Codex 也会给格式不对的条目，见 [`reasoning_removals`]。
+    #[serde(default)]
+    pub input_transformations: Option<Value>,
+}
+
+/// 服务端扔掉的一条回放 reasoning。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReasoningRemoval {
+    pub id: Option<String>,
+    pub reason: String,
+}
+
+/// `input_transformations` 里被扔掉的 reasoning 项（pi 1.6.0 `appendReasoningRemovals`）。
+///
+/// GPT-6.2 起，前面的输入改过（`prefix_mismatch`，衰减与压缩都会）之后回放的 reasoning 会被
+/// 整段扔掉，来自别的组织 / 用户 / 模型的也会。`turn_boundary` 不算：GPT-5.6 之前的模型只用
+/// 本回合的 reasoning，每次请求都把更早回合的全报一遍，那是它们的常态。同一项在之后每次回放
+/// 都会再报一次。
+pub fn reasoning_removals(transformations: Option<&Value>) -> Vec<ReasoningRemoval> {
+    let Some(Value::Array(items)) = transformations else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .filter(|item| {
+            item.get("type").and_then(Value::as_str) == Some("reasoning")
+                && item.get("action").and_then(Value::as_str) == Some("removed")
+        })
+        .filter_map(|item| {
+            let reason = item
+                .get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            (reason != "turn_boundary").then(|| ReasoningRemoval {
+                id: item.get("id").and_then(Value::as_str).map(str::to_string),
+                reason: reason.to_string(),
+            })
+        })
+        .collect()
 }
 
 #[derive(Debug, Default, Deserialize)]

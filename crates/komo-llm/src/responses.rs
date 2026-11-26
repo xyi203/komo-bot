@@ -616,6 +616,10 @@ impl Assembled {
             items = response.output.as_ref().map(Vec::len).unwrap_or(0),
             "response 终态"
         );
+        crate::telemetry::note_reasoning_removed(
+            response.model.as_deref(),
+            &wire::reasoning_removals(response.input_transformations.as_ref()),
+        );
         if let Some(usage) = response.usage {
             self.usage = usage.to_kernel();
         }
@@ -953,6 +957,60 @@ mod tests {
             panic!()
         };
         assert_eq!(items[0]["type"], json!("function_call"), "回放里要有这一条");
+    }
+
+    // ---- input_transformations ----
+
+    /// GPT-6.2 起服务端会扔掉回放的 reasoning 并在终态里报原因：记到 `chat` span 与指标上，
+    /// `turn_boundary`（老模型的常态）与不是被移除的条目不算。
+    #[test]
+    fn dropped_reasoning_is_recorded_on_the_chat_span_and_metrics() {
+        use crate::telemetry::capture::Capture;
+        let capture = Capture::default();
+        let _guard = capture.install();
+        let span = crate::telemetry::chat_span("main", "gpt-6.2", None, 1);
+        let _entered = span.enter();
+        assemble(&[(
+            wire::RESPONSE_COMPLETED,
+            r#"{"response":{"model":"gpt-6.2","output":[],"input_transformations":[
+                {"type":"reasoning","id":"rs_1","action":"removed","reason":"prefix_mismatch"},
+                {"type":"reasoning","id":"rs_2","action":"removed","reason":"prefix_mismatch"},
+                {"type":"reasoning","id":"rs_0","action":"removed","reason":"turn_boundary"},
+                {"type":"reasoning","id":"rs_3","action":"kept"},
+                "坏条目"
+            ]}}"#,
+        )])
+        .unwrap();
+        drop(_entered);
+        let chat = &capture.spans("chat")[0];
+        assert_eq!(
+            chat.fields
+                .get("komo.llm.reasoning_removed")
+                .map(String::as_str),
+            Some("2")
+        );
+        let metrics = capture.metrics("monotonic_counter.komo.llm.reasoning_removed");
+        assert_eq!(metrics.len(), 1, "{metrics:?}");
+        assert_eq!(
+            metrics[0].fields["komo.reasoning.removed_reason"],
+            "prefix_mismatch"
+        );
+        assert_eq!(
+            metrics[0].fields["monotonic_counter.komo.llm.reasoning_removed"],
+            "2"
+        );
+    }
+
+    #[test]
+    fn no_transformations_or_only_turn_boundary_records_nothing() {
+        assert!(wire::reasoning_removals(None).is_empty());
+        assert!(wire::reasoning_removals(Some(&json!("不是数组"))).is_empty());
+        assert!(
+            wire::reasoning_removals(Some(&json!([
+                {"type":"reasoning","id":"rs_0","action":"removed","reason":"turn_boundary"}
+            ])))
+            .is_empty()
+        );
     }
 
     // ---- 回放 ----

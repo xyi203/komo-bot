@@ -110,6 +110,7 @@ komo.submit                    一次受理（一条输入 / write）：受理�
 | `gen_ai.client.operation.duration`（秒） | histogram | `gen_ai.request.model`、`komo.llm.role`、`error.type` | 同上 |
 | `komo.llm.first_chunk.duration`（秒） | histogram | `gen_ai.request.model`、`komo.llm.role` | **新增**（pi `pi.ai.first_chunk.duration`） |
 | `komo.llm.retries` | counter | `gen_ai.request.model`、`komo.retry.cause` | **待补**（generation 的 `retry` 阶段） |
+| `komo.llm.reasoning_removed` | counter | `gen_ai.response.model`、`komo.reasoning.removed_reason`（`prefix_mismatch` 等；`turn_boundary` 不计） | **已有**（2026-11-26）：Responses 终态的 `input_transformations` 里服务端扔掉的回放 reasoning（GPT-6.2 起，前缀被衰减 / 压缩改过就会扔），同时留一条 warn 日志；有 `chat` span 时记 `komo.llm.reasoning_removed`。同一项之后每次回放都会再报，计数是「请求 × 项」 |
 | `komo.run.duration`（秒）· `komo.run.rounds` | histogram | `komo.run.outcome`、`komo.run.source`、`komo.session.kind` | **待补**（run 结束的那次提交之后） |
 | `komo.tool.duration`（秒） | histogram | `gen_ai.tool.name`、`komo.tool.status` | **待补** |
 | `komo.phase.duration`（秒） | histogram | `komo.task.name`、`komo.phase`、`komo.phase.outcome` | **新增**（pi `pi.durable.phase.duration`） |

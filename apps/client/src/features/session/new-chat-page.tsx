@@ -8,6 +8,7 @@ import type { SendOptions } from "@/features/composer/use-send";
 import { foldEvents } from "@/features/conversation/model";
 import { Thread, type PendingSend } from "@/features/conversation/thread";
 import { errorText } from "@/lib/errors";
+import { useNarrow } from "@/lib/hooks";
 import { m } from "@/paraglide/messages.js";
 import { ChatLayout } from "./chat-layout";
 
@@ -25,11 +26,13 @@ interface Job {
 /**
  * 新支线对话（`/chats/new`）：一个空的对话页，还没有会话。发第一句话时才 `POST /v1/sessions` 建会话、再提交这句话，
  * 然后换到 `/chats/$id`；标题由服务端从第一句话取。建会话或提交失败时留在这里，气泡标红给重试（同一请求键，不会建出两个会话）。
+ * 还没发话时标题和输入框一起居中；窄屏（≤900）输入框留在底部，拇指够得着、软键盘也不会把它顶到半屏中间。
  */
 export function NewChatPage() {
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   const models = useModels();
+  const narrow = useNarrow();
   const [pending, setPending] = useState<PendingSend[]>([]);
   const jobs = useRef(new Map<string, Job>());
   const context = useMemo(() => contextView(undefined, undefined, models.data), [models.data]);
@@ -66,9 +69,18 @@ export function NewChatPage() {
     void run(id);
   };
 
+  const hero =
+    pending.length === 0 && !narrow ? (
+      <>
+        <h2 className="text-[28px] leading-9 font-medium tracking-[-0.01em] text-text">{m.new_chat_title()}</h2>
+        <p className="mt-2 text-body text-muted">{m.thread_empty_hint()}</p>
+      </>
+    ) : undefined;
+
   return (
     <ChatLayout
       name={m.nav_new_session()}
+      hero={hero}
       composer={
         <Composer
           sessionId={DRAFT_KEY}
@@ -80,7 +92,7 @@ export function NewChatPage() {
         />
       }
     >
-      <Thread view={EMPTY} delta={null} pending={pending} kids={NO_RUNS} isHome={false} busy={false} onRetry={(id) => void run(id)} />
+      {!hero && <Thread view={EMPTY} delta={null} pending={pending} kids={NO_RUNS} isHome={false} busy={false} onRetry={(id) => void run(id)} />}
     </ChatLayout>
   );
 }

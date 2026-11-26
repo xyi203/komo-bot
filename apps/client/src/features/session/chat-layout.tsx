@@ -9,6 +9,7 @@ import { m } from "@/paraglide/messages.js";
  * 对话页的外框：左上角的名字，正文区，下面的输入框；`aside` 是桌面壳的内置浏览器（有才出现）。
  * 名字照 Claude 桌面端放左上角、不加框，`title` 给了就用它代替纯文字（对话页是带下拉箭头的对话菜单）。
  * 名字浮在正文上面（不占高度），与右上角的按钮同高对齐；正文顶上留出它的位置，再叠一段白到透明的渐隐，滚上去的字不会在名字后面被切成半行。
+ * 给了 `hero`（还没说过话的新对话）就不画正文，标题与输入框一起居中，发出第一句话后由调用方去掉它，回到输入框在底部的样子。
  */
 export function ChatLayout({
   name,
@@ -19,6 +20,7 @@ export function ChatLayout({
   panel,
   corner,
   composer,
+  hero,
   children,
 }: {
   name: string;
@@ -32,7 +34,9 @@ export function ChatLayout({
   /** 右上角的小按钮（桌面壳的浏览器开关）。 */
   corner?: ReactNode;
   composer: ReactNode;
-  children: ReactNode;
+  /** 居中的空状态：标题在上、输入框紧跟在下，整组略高于正中。 */
+  hero?: ReactNode;
+  children?: ReactNode;
 }) {
   return (
     <div
@@ -62,15 +66,25 @@ export function ChatLayout({
           <h1 className={cn("max-w-full min-w-0 text-body font-medium", title ? "flex" : "truncate px-2")}>{title ?? name}</h1>
         </header>
         {corner && <div className="absolute top-3 right-4 z-20 flex gap-1 narrow:top-2.5 narrow:right-2">{corner}</div>}
-        <div
-          ref={scroller}
-          onScroll={onScroll ? (event) => onScroll(event.currentTarget) : undefined}
-          className="min-h-0 flex-1 overflow-auto px-8 pt-14 pb-6 max-[600px]:px-4 max-[600px]:pb-4"
-        >
-          <div className="mx-auto max-w-180">{children}</div>
-        </div>
-        <ConnectionNotice />
-        {composer}
+        {hero ? (
+          <div className="flex min-h-0 flex-1 flex-col justify-center overflow-auto pt-14 pb-[14vh]">
+            <div className="mb-7 px-8 text-center max-[600px]:px-4">{hero}</div>
+            <ConnectionNotice />
+            {composer}
+          </div>
+        ) : (
+          <>
+            <div
+              ref={scroller}
+              onScroll={onScroll ? (event) => onScroll(event.currentTarget) : undefined}
+              className="min-h-0 flex-1 overflow-auto px-8 pt-14 pb-6 max-[600px]:px-4 max-[600px]:pb-4"
+            >
+              <div className="mx-auto max-w-180">{children}</div>
+            </div>
+            <ConnectionNotice />
+            {composer}
+          </>
+        )}
       </div>
       {aside}
       {panel}

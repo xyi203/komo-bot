@@ -19,8 +19,7 @@ import { TraceView } from "@/features/trace/trace-view";
 import { formatElapsed } from "@/lib/format";
 import { useNow } from "@/lib/hooks";
 import { m } from "@/paraglide/messages.js";
-import { useRef, type CSSProperties } from "react";
-import { ResizeEdge, usePanelWidth } from "./resize";
+import { PanelShell, panelNavClass as nav } from "./panel-shell";
 
 /**
  * 过程面板（docs/redesign.md P5，docs/web.md §4）：对话右侧滑出，默认宽 380、拖左边缘可调并记住（`resize.tsx`；≤1180 浮在对话上面；窄屏 ≤900 是盖住整屏、从右滑入的全屏层）。
@@ -71,17 +70,8 @@ export function ProcessPanel({
   const steps = parts.reduce((sum, p) => sum + (p.kind === "steps" ? p.steps.filter((x) => x.kind === "call").length : 0), 0);
   const spent = turn ? formatDuration((turn.end ? new Date(turn.end).getTime() : now) - new Date(turn.start).getTime()) : "";
 
-  const ref = useRef<HTMLElement>(null);
-  const [width, setWidth] = usePanelWidth();
-  const nav = "grid size-7 max-[900px]:size-11 cursor-pointer place-items-center rounded-control text-muted transition-colors hover:bg-hover-on-white hover:text-text disabled:cursor-default disabled:opacity-35 disabled:hover:bg-transparent";
   return (
-    <aside
-      ref={ref}
-      aria-label={m.proc_title()}
-      style={{ "--proc-w": `${width}px` } as CSSProperties}
-      className="relative flex min-h-0 w-(--proc-w) max-w-[calc(100vw-720px)] flex-col border-l border-border bg-surface max-[1180px]:fixed max-[1180px]:inset-y-0 max-[1180px]:right-0 max-[1180px]:z-20 max-[1180px]:max-w-[calc(100vw-48px)] max-[1180px]:shadow-[-16px_0_48px_rgb(0_0_0/0.12)] max-[900px]:inset-x-0 max-[900px]:top-[var(--app-top,0px)] max-[900px]:bottom-auto max-[900px]:z-30 max-[900px]:h-[var(--app-height,100dvh)] max-[900px]:w-full max-[900px]:max-w-none max-[900px]:animate-[sheet-in-right_220ms_var(--ease-out-expo)] max-[900px]:border-l-0 max-[900px]:shadow-none"
-    >
-      <ResizeEdge panel={ref} width={width} onWidth={setWidth} />
+    <PanelShell label={m.proc_title()}>
       <header className="flex h-14 shrink-0 items-center gap-1 pr-3 pl-5 max-[900px]:pr-1.5 max-[900px]:pl-4">
         <h2 className="text-section-title font-semibold">{m.proc_title()}</h2>
         {turns.length > 1 && (
@@ -131,7 +121,7 @@ export function ProcessPanel({
           </TabsContent>
         </div>
       </Tabs>
-    </aside>
+    </PanelShell>
   );
 }
 

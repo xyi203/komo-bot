@@ -1084,7 +1084,6 @@
   "typing_label": "Typing",
   "live_queued": "Queued",
   "browser_title": "Browser",
-  "browser_open": "Open browser",
   "browser_close": "Close browser",
   "browser_back": "Back",
   "browser_forward": "Forward",
@@ -1217,5 +1216,15 @@
   "memory_provider_kind_world": "Fact",
   "memory_provider_none": "Nothing stored here yet",
   "memory_provider_primary": "Read-only · in use: relevant clues are recalled from here",
-  "memory_provider_shadow": "Read-only · shadow mode: recorded for comparison, not brought into chats"
+  "memory_provider_shadow": "Read-only · shadow mode: recorded for comparison, not brought into chats",
+  "new_chat_title": "What's on your mind?",
+  "panel_open": "Open panel",
+  "panel_close": "Close panel",
+  "panel_launcher_title": "Open a panel",
+  "panel_process_hint": "Thinking and tool calls for this turn",
+  "panel_changes_hint": "Files changed in the latest turn",
+  "panel_trace_hint": "Trace of the whole chat",
+  "panel_browser_hint": "Browse the web inside komo",
+  "panel_none_yet": "Available after your first message",
+  "panel_no_changes": "No file changes yet"
 }

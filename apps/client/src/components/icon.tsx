@@ -57,6 +57,9 @@ const PATHS = {
   "sidebar": (
     <><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M9 4v16"/></>
   ),
+  "panel-right": (
+    <><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M15 4v16"/></>
+  ),
   "x": (
     <><path d="M6 6l12 12M18 6 6 18"/></>
   ),

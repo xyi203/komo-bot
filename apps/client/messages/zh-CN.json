@@ -1076,7 +1076,6 @@
   "typing_label": "正在输入",
   "live_queued": "排队中",
   "browser_title": "浏览器",
-  "browser_open": "打开浏览器",
   "browser_close": "关闭浏览器",
   "browser_back": "后退",
   "browser_forward": "前进",
@@ -1209,5 +1208,15 @@
   "memory_provider_kind_world": "事实",
   "memory_provider_none": "这里还没有条目",
   "memory_provider_primary": "只读 · 主用：相关线索从这里召回",
-  "memory_provider_shadow": "只读 · 影子模式：只记录对比，不带进对话"
+  "memory_provider_shadow": "只读 · 影子模式：只记录对比，不带进对话",
+  "new_chat_title": "想聊点什么？",
+  "panel_open": "打开面板",
+  "panel_close": "关闭面板",
+  "panel_launcher_title": "打开一个面板",
+  "panel_process_hint": "这一轮的思考与工具调用",
+  "panel_changes_hint": "最近一轮改过的文件",
+  "panel_trace_hint": "整段对话的轨迹",
+  "panel_browser_hint": "在 komo 里看网页",
+  "panel_none_yet": "发出第一句话后可用",
+  "panel_no_changes": "还没有改过文件"
 }

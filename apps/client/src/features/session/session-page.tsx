@@ -12,8 +12,9 @@ import { contextView } from "@/features/composer/context-usage";
 import { Composer } from "@/features/composer/composer";
 import { useSend } from "@/features/composer/use-send";
 import { ConversationProvider, type ConversationContext, type ProcessTab } from "@/features/conversation/context";
-import { foldEvents } from "@/features/conversation/model";
+import { foldEvents, type Turn } from "@/features/conversation/model";
 import { Thread } from "@/features/conversation/thread";
+import { PanelLauncher, type PanelEntry } from "@/features/process/panel-launcher";
 import { ProcessPanel } from "@/features/process/process-panel";
 import { isArchived, isLive } from "@/features/sessions/model";
 import { sessionTitle } from "@/features/sessions/title";
@@ -86,13 +87,18 @@ function SessionBody({ sessionId, main }: { sessionId: string; main: boolean }) 
 
   // 过程面板：开着、看哪一轮、哪个标签。换对话整页重挂，状态跟着清掉
   const [panel, setPanel] = useState<{ run: string; tab: ProcessTab } | null>(null);
+  // 面板入口（右上角侧栏开关）：右栏还没选面板时显示；选了就换成那个面板
+  const [launcher, setLauncher] = useState(false);
   // 会话树很大，首屏不取：过程面板的系统提示要它；上下文占用只在还没有实报用量时拿它估算
   const tree = useSessionTree(sessionId, !!panel || (!!view && !view.usage));
   const context = useMemo(() => contextView(view, tree.data, models.data), [view, tree.data, models.data]);
   const changes = useMemo(() => new Map((changesQuery.data?.runs ?? []).map((r): [string, RunChanges] => [r.run, r])), [changesQuery.data]);
   const [openFiles, setOpenFiles] = useState<Record<string, boolean>>({});
   const [reviewAt, setReviewAt] = useState<string | null>(null);
-  const openProcess = useCallback((run: string, tab: ProcessTab = "steps") => setPanel({ run, tab }), []);
+  const openProcess = useCallback((run: string, tab: ProcessTab = "steps") => {
+    setLauncher(false);
+    setPanel({ run, tab });
+  }, []);
   const inspect = useCallback(
     (resultEvent: string) => {
       setPanel((prev) => prev && { ...prev, tab: "trace" });
@@ -106,10 +112,44 @@ function SessionBody({ sessionId, main }: { sessionId: string; main: boolean }) 
     (run: string, index: number) => {
       setOpenFiles((previous) => ({ ...previous, [`${run}:${index}`]: true }));
       setReviewAt(`cg-${run}-${index}`);
+      setLauncher(false);
       setPanel({ run, tab: "changes" });
     },
     [],
   );
+
+  // 入口里的几项：过程与轨迹定位到最近一轮，改动定位到最近改过文件的那一轮；浏览器只在桌面壳里有
+  const closeLauncher = useCallback(() => setLauncher(false), []);
+  const entries = useMemo<PanelEntry[]>(() => {
+    const turns = (view?.items ?? []).filter((item): item is Turn => item.kind === "turn");
+    const last = turns.at(-1)?.run;
+    const changed = [...turns].reverse().find((t) => (changes.get(t.run)?.total ?? 0) > 0)?.run;
+    const list: PanelEntry[] = [
+      { key: "p", icon: "details", label: m.proc_title(), hint: last ? m.panel_process_hint() : m.panel_none_yet(), disabled: !last, onOpen: () => last && openProcess(last, "steps") },
+      {
+        key: "c",
+        icon: "diff",
+        label: m.proc_tab_changes(),
+        hint: changed ? m.panel_changes_hint() : last ? m.panel_no_changes() : m.panel_none_yet(),
+        disabled: !changed,
+        onOpen: () => changed && openProcess(changed, "changes"),
+      },
+      { key: "t", icon: "clock", label: m.proc_tab_trace(), hint: last ? m.panel_trace_hint() : m.panel_none_yet(), disabled: !last, onOpen: () => last && openProcess(last, "trace") },
+    ];
+    if (browserApi)
+      list.push({
+        key: "b",
+        icon: "globe",
+        label: m.browser_title(),
+        hint: showBrowser ? m.browser_close() : m.panel_browser_hint(),
+        active: showBrowser,
+        onOpen: () => {
+          setBrowserOpen(!showBrowser);
+          setLauncher(false);
+        },
+      });
+    return list;
+  }, [view, changes, browserApi, showBrowser, setBrowserOpen, openProcess]);
 
   // 全部未答复的介入：投进对话的提问按句柄认领自己那条（`ReplyView`）
   const interventions = pendingInterventions.data?.interventions ?? NO_INTERVENTIONS;
@@ -137,6 +177,13 @@ function SessionBody({ sessionId, main }: { sessionId: string; main: boolean }) 
   // 「正在输入」只给真在跑的 Run；停住等你答复的（`waiting`）由投进对话的提问和对话列的黄点表示
   const busy = [...(view?.runs.values() ?? [])].some((run) => !run.waiting);
   const closePanel = () => setPanel(null);
+  const sideOpen = !!panel || launcher;
+  const toggleSide = () => {
+    if (sideOpen) {
+      setPanel(null);
+      setLauncher(false);
+    } else setLauncher(true);
+  };
   return (
     <ConversationProvider value={conversation}>
       <ChatLayout
@@ -159,21 +206,19 @@ function SessionBody({ sessionId, main }: { sessionId: string; main: boolean }) 
                 <span className="truncate">{goal.title}</span>
               </Link>
             )}
-            {browserApi && (
-              <IconButton
-                name="globe"
-                label={showBrowser ? m.browser_close() : m.browser_open()}
-                aria-expanded={showBrowser}
-                onClick={() => setBrowserOpen(!showBrowser)}
-                className={cn("max-[600px]:hidden", showBrowser && "bg-active text-text")}
-              />
-            )}
             {!main && archived && (
               <Button type="button" disabled={restoring} onClick={() => void restore()}>
                 <Icon name="reload" className="size-4" />
                 {m.chat_restore()}
               </Button>
             )}
+            <IconButton
+              name="panel-right"
+              label={sideOpen ? m.panel_close() : m.panel_open()}
+              aria-expanded={sideOpen}
+              onClick={toggleSide}
+              className={cn(sideOpen && "bg-active text-text")}
+            />
           </>
         }
         aside={showBrowser && browserApi ? <BrowserPane api={browserApi} sessionId={sessionId} onClose={() => setBrowserOpen(false)} /> : undefined}
@@ -200,6 +245,8 @@ function SessionBody({ sessionId, main }: { sessionId: string; main: boolean }) 
               onRun={(run) => setPanel({ ...panel, run })}
               onClose={closePanel}
             />
+          ) : launcher ? (
+            <PanelLauncher entries={entries} onClose={closeLauncher} />
           ) : undefined
         }
         composer={

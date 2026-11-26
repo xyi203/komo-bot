@@ -20,7 +20,7 @@ use komo_kernel::types::tool::{
     ToolContext, ToolDefinition, ToolError, ToolExposure, ToolImage, ToolNamespace, ToolOutput,
     image_mime,
 };
-use rmcp::model::{CallToolResult, ContentBlock};
+use rmcp::model::{CallToolResult, ContentBlock, ResourceContents};
 
 use super::plan_time;
 use crate::mcp::{CallError, McpConnection};
@@ -166,7 +166,29 @@ impl Tool for McpTool {
                         }
                     }
                 })?;
-        let (text, images) = render(&result);
+        let (mut text, rendered) = render(&result);
+        // 超过上限的截图先缩小；缩不下来的原样交出，落地时按「太大、没附上」补一句。
+        let mut images = Vec::with_capacity(rendered.len());
+        for image in rendered {
+            let original = image.bytes.len();
+            match crate::images::fit(image.clone()).await {
+                Ok(fitted) => {
+                    if fitted.bytes.len() != original {
+                        text.push_str(&format!(
+                            "\n[一张 {} 图片 {original} 字节，超过上限，已缩成 {} 字节的 {}]",
+                            image.mime,
+                            fitted.bytes.len(),
+                            fitted.mime
+                        ));
+                    }
+                    images.push(fitted);
+                }
+                Err(reason) => {
+                    tracing::warn!(%reason, mime = %image.mime, "MCP 结果里的图片没能缩小");
+                    images.push(image);
+                }
+            }
+        }
         sink.write_stdout(text.as_bytes())
             .await
             .map_err(|error| ToolError::Failed {
@@ -189,8 +211,9 @@ impl Tool for McpTool {
 }
 
 /// 给模型看的正文与图片：文本原样；认得出的图片（PNG / JPEG / GIF / WebP）解出来随结果附给
-/// 模型，正文里留一句说明；认不出的图片和音频只留一句说明（base64 不是给模型读的）；资源给
-/// 出它的文本或 URI。一段文本都没有时退回结构化结果的 JSON。
+/// 模型，正文里留一句说明；认不出的图片和音频只留一句说明（base64 不是给模型读的）；资源照
+/// pi-mcp 的 `toMcpModelContent`：文本给文本，二进制里的图片附上、文本类型解成文本、其余只留一句说明，
+/// 链接给出 URI、名字、类型、大小与说明。一段文本都没有时退回结构化结果的 JSON。
 fn render(result: &CallToolResult) -> (String, Vec<ToolImage>) {
     let mut parts: Vec<String> = Vec::new();
     let mut images = Vec::new();
@@ -213,10 +236,42 @@ fn render(result: &CallToolResult) -> (String, Vec<ToolImage>) {
                 audio.mime_type,
                 audio.data.len()
             )),
-            ContentBlock::Resource(resource) => {
-                parts.push(serde_json::to_string(&resource.resource).unwrap_or_default())
+            ContentBlock::Resource(embedded) => match &embedded.resource {
+                ResourceContents::TextResourceContents { uri, text, .. } => {
+                    parts.push(format!("[资源 {uri}]\n{text}"))
+                }
+                ResourceContents::BlobResourceContents {
+                    uri,
+                    mime_type,
+                    blob,
+                    ..
+                } => parts.push(render_blob(uri, mime_type.as_deref(), blob, &mut images)),
+                other => parts.push(serde_json::to_string(other).unwrap_or_default()),
+            },
+            ContentBlock::ResourceLink(link) => {
+                let mut details = Vec::new();
+                if let Some(mime) = &link.mime_type {
+                    details.push(mime.clone());
+                }
+                if let Some(size) = link.size {
+                    details.push(format_size(size));
+                }
+                let details = if details.is_empty() {
+                    String::new()
+                } else {
+                    format!("（{}）", details.join("，"))
+                };
+                let description = link
+                    .description
+                    .as_deref()
+                    .map(|text| format!("：{text}"))
+                    .unwrap_or_default();
+                let name = link.title.as_deref().unwrap_or(&link.name);
+                parts.push(format!(
+                    "[资源 {} 「{name}」{details}{description}]",
+                    link.uri
+                ));
             }
-            ContentBlock::ResourceLink(link) => parts.push(format!("[资源 {}]", link.uri)),
             other => parts.push(serde_json::to_string(other).unwrap_or_default()),
         }
     }
@@ -226,6 +281,54 @@ fn render(result: &CallToolResult) -> (String, Vec<ToolImage>) {
         parts.push(serde_json::to_string_pretty(structured).unwrap_or_default());
     }
     (parts.join("\n"), images)
+}
+
+/// 内嵌的二进制资源：认得出的图片附上，文本类型解成文本，其余只说它是什么——base64 不进上下文，
+/// 完整的内容留在这次调用的 `output.json` 里。
+fn render_blob(uri: &str, mime: Option<&str>, blob: &str, images: &mut Vec<ToolImage>) -> String {
+    let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(blob.trim()) else {
+        return format!("[二进制资源 {uri}，base64 解不开，未展开]");
+    };
+    if let Some(image_mime) = image_mime(&bytes) {
+        images.push(ToolImage {
+            mime: image_mime.to_string(),
+            bytes,
+        });
+        return format!("[资源 {uri}：图片 {image_mime}，已附在结果里]");
+    }
+    let kind = format!(
+        "{}，{}",
+        mime.unwrap_or("未知类型"),
+        format_size(bytes.len() as u64)
+    );
+    if mime.is_some_and(is_text_mime)
+        && let Ok(text) = String::from_utf8(bytes)
+    {
+        return format!("[资源 {uri}]\n{text}");
+    }
+    format!("[二进制资源 {uri}（{kind}），未展开；完整内容在这次调用的原始结果里]")
+}
+
+/// 这些类型的 blob 当文本给模型。
+fn is_text_mime(mime: &str) -> bool {
+    let kind = mime
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    kind.starts_with("text/")
+        || kind == "application/json"
+        || kind.ends_with("+json")
+        || kind.ends_with("+xml")
+}
+
+fn format_size(bytes: u64) -> String {
+    match bytes {
+        0..1024 => format!("{bytes}B"),
+        1024..1_048_576 => format!("{:.1}KB", bytes as f64 / 1024.0),
+        _ => format!("{:.1}MB", bytes as f64 / 1_048_576.0),
+    }
 }
 
 /// 解 base64、按文件头认格式。格式以字节为准，不信服务器报的 `mimeType`。
@@ -263,5 +366,53 @@ mod tests {
         );
         assert!(text.contains("[图片 image/png，已附在结果里]"), "{text}");
         assert!(text.contains("未展开"), "认不出的那张只留说明：{text}");
+    }
+
+    /// 内嵌资源不再整个 JSON 序列化：二进制的 base64 不进正文。
+    #[test]
+    fn embedded_resources_give_text_images_or_a_note_never_base64() {
+        let b64 = |bytes: &[u8]| base64::engine::general_purpose::STANDARD.encode(bytes);
+        let png = b"\x89PNG\r\n\x1a\nfake".to_vec();
+        let zip = vec![0x50, 0x4b, 0x03, 0x04, 0, 1, 2, 3];
+        let blob = |data: String, uri: &str, mime: &str| {
+            ContentBlock::resource(ResourceContents::BlobResourceContents {
+                uri: uri.into(),
+                mime_type: Some(mime.into()),
+                blob: data,
+                meta: None,
+            })
+        };
+        let result = CallToolResult::success(vec![
+            ContentBlock::embedded_text("file:///a.md", "# 标题"),
+            blob(b64(b"{\"k\":1}"), "file:///a.json", "application/json"),
+            blob(b64(&png), "file:///shot.png", "image/png"),
+            blob(b64(&zip), "file:///a.zip", "application/zip"),
+        ]);
+        let (text, images) = render(&result);
+        assert!(text.contains("[资源 file:///a.md]\n# 标题"), "{text}");
+        assert!(text.contains("[资源 file:///a.json]\n{\"k\":1}"), "{text}");
+        assert!(text.contains("图片 image/png，已附在结果里"), "{text}");
+        assert!(
+            text.contains("[二进制资源 file:///a.zip（application/zip，8B），未展开"),
+            "{text}"
+        );
+        assert!(!text.contains(&b64(&zip)), "base64 不进正文：{text}");
+        assert_eq!(images.len(), 1);
+    }
+
+    #[test]
+    fn a_resource_link_names_its_title_type_size_and_description() {
+        let mut link = rmcp::model::Resource::new("file:///r.csv", "r.csv");
+        link.title = Some("报表".into());
+        link.mime_type = Some("text/csv".into());
+        link.size = Some(2048);
+        link.description = Some("本周数据".into());
+        let (text, _) = render(&CallToolResult::success(vec![ContentBlock::resource_link(
+            link,
+        )]));
+        assert_eq!(
+            text,
+            "[资源 file:///r.csv 「报表」（text/csv，2.0KB）：本周数据]"
+        );
     }
 }

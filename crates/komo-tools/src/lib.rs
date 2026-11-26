@@ -5,6 +5,7 @@
 pub mod cancel;
 pub mod codemode;
 pub mod executor;
+pub mod images;
 pub mod limits;
 pub mod mcp;
 pub mod mcp_auth;

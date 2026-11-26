@@ -170,6 +170,9 @@ mtime、`komo config reload`、`SIGHUP`）的变化键有 `mcp` / `mcp.*` 时，
   顶层调用（`begin`）、codemode 子调用（`durable_nested_call`；脚本的发现目录装配前也先等一次）。
 - **怎么认归属**：工具还没 `tools/list` 之前只有名字可用。冻结的能力面（`AgentSurface`）只存名字、不存
   来源，所以按命名规则认：`mcp__<server>__<tool>`，`<server>` 照 `tool_name` 的规则换掉特殊字符后比前缀。
+- 名字超过 64 个字符，或换掉特殊字符之后与已挂的工具撞名（`a.b` 与 `a_b`、别的服务器）：截断并接
+  `_<8 位 hash>`（`hashed_tool_name`，hash 只看服务器原名与工具原名，跨重启、跨版本不变），工具不再被跳过。
+  撞名时谁拿到不带后缀的名字取决于挂的先后（同 pi-mcp）。
   服务器名里可以有 `__`，一个名字可能被不止一台认领，几台一起等。认不出服务器的名字（不是 MCP 的、
   服务器已从配置删掉的）照旧报"没有这个工具"；服务器连上了却没列出这个工具的，同理。
 - 受理时那次"等登录的凭证变了没有"（`McpHub::refresh`）**不等正在连的服务器**：它握着连接锁，等它会把
@@ -282,8 +285,10 @@ journal，已交付的写结果原样接回，不会重做（`docs/codemode.md` 
 
 ## 5. 结果
 
-- 模型看到的正文：文本块原样；图片 / 音频只留一句说明（不把 base64 塞进上下文）；资源给出它
-  的文本或 URI；一段文本都没有时用 `structuredContent` 的 JSON。超长时照常由投影截头尾、给
+- 模型看到的正文：文本块原样；认得出的图片随结果附上（超过上限先缩小，见 `komo_tools::images`），
+  其余图片 / 音频只留一句说明（不把 base64 塞进上下文）；内嵌资源照 pi-mcp 的 `toMcpModelContent`：
+  文本资源给文本，二进制里的图片附上、文本类型（`text/*`、JSON、`+xml`）解成文本、其余只说 URI / 类型 /
+  大小；资源链接给出 URI、名字、类型、大小与说明；一段文本都没有时用 `structuredContent` 的 JSON。超长时照常由投影截头尾、给
   `artifact://` 引用（§8.3）。
 - 完整的 `CallToolResult`（含 `structuredContent`、`isError`）存进 `output.json` 的 `result`。
 - `isError: true` → `tool.result` 状态 `failed`，正文照常交给模型。

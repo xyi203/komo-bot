@@ -203,7 +203,7 @@ impl Tool for ReadTool {
                     None => args.path.clone(),
                 };
                 if let Some(mime) = image_mime(&bytes) {
-                    return image_output(display, mime, bytes, &version);
+                    return image_output(display, mime, bytes, &version).await;
                 }
                 let text = as_text(bytes, path)?;
                 slice(&text, &version, &args, self.byte_limit, &display)
@@ -224,42 +224,49 @@ impl Tool for ReadTool {
 }
 
 /// 读到的是一张图片：整张交给执行器附在结果里，正文只说它是什么。行范围对图片没有意义，忽略。
-/// 不引入 `image`（§13.4），缩不了图：超过上限就失败，告诉模型怎么办。
-fn image_output(
+/// 超过上限的先缩小（[`crate::images::fit`]），缩不下来才失败，告诉模型怎么办。
+async fn image_output(
     display: String,
     mime: &str,
     bytes: Vec<u8>,
     version: &FileVersion,
 ) -> Result<ToolOutput, ToolError> {
-    if bytes.len() > IMAGE_LIMIT_BYTES {
-        return Err(ToolError::Failed {
-            message: format!(
-                "{display} 是一张 {mime} 图片，{} 字节，超过可以交给模型的上限 {} 字节。\
-                 先缩小再读（macOS 上可以 `sips -Z 1600 原图 --out 新文件`）",
-                bytes.len(),
-                IMAGE_LIMIT_BYTES
-            ),
-        });
-    }
-    let preview = format!(
-        "{display} 是一张 {mime} 图片，{} 字节 · 版本 {}",
-        bytes.len(),
+    let original = bytes.len();
+    let image = crate::images::fit(ToolImage {
+        mime: mime.to_string(),
+        bytes,
+    })
+    .await
+    .map_err(|reason| ToolError::Failed {
+        message: format!(
+            "{display} 是一张 {mime} 图片，{original} 字节，超过可以交给模型的上限 {IMAGE_LIMIT_BYTES} 字节，\
+             自动缩小也没成（{reason}）。先缩小再读（macOS 上可以 `sips -Z 1600 原图 --out 新文件`）"
+        ),
+    })?;
+    let mut preview = format!(
+        "{display} 是一张 {mime} 图片，{original} 字节 · 版本 {}",
         version.shown()
     );
+    let mut result = serde_json::json!({
+        "path": display,
+        "version": version,
+        "mime": mime,
+        "bytes": original,
+    });
+    if image.bytes.len() != original {
+        preview.push_str(&format!(
+            "（超过上限，已缩成 {} 字节的 {} 交给模型）",
+            image.bytes.len(),
+            image.mime
+        ));
+        result["sent"] = serde_json::json!({ "mime": image.mime, "bytes": image.bytes.len() });
+    }
     Ok(ToolOutput {
         status: ToolResultStatus::Completed,
-        result: serde_json::json!({
-            "path": display,
-            "version": version,
-            "mime": mime,
-            "bytes": bytes.len(),
-        }),
+        result,
         exit_code: None,
         artifacts: vec![],
-        images: vec![ToolImage {
-            mime: mime.to_string(),
-            bytes,
-        }],
+        images: vec![image],
         preview: Some(preview),
     })
 }

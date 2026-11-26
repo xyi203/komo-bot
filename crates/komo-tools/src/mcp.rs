@@ -261,10 +261,44 @@ fn forward_stderr(server: String, stderr: tokio::process::ChildStderr) {
 }
 
 /// 模型看到的工具名：`mcp__<server>__<tool>`，JS / OpenAI 标识符里不能有的字符换成 `_`。
-/// 超过 [`MAX_TOOL_NAME`] 就是 `None`——截断会让两个工具撞成一个名字。
-pub fn tool_name(server: &str, tool: &str) -> Option<String> {
+/// 超过 [`MAX_TOOL_NAME`] 时是 [`hashed_tool_name`]（pi-mcp 的 `createMcpToolName`），工具不丢。
+pub fn tool_name(server: &str, tool: &str) -> String {
     let name = format!("mcp__{}__{}", clean(server), clean(tool));
-    (name.len() <= MAX_TOOL_NAME).then_some(name)
+    if name.len() <= MAX_TOOL_NAME {
+        name
+    } else {
+        hashed_tool_name(server, tool)
+    }
+}
+
+/// 截断到放得下、末尾接 `_<8 位 hash>` 的工具名：名字太长，或者换掉特殊字符之后和别的服务器
+/// 的工具撞名时用。hash 只取决于原始的服务器名与工具名，重启、换版本都不变——落盘的调用靠它
+/// 找回同一个工具。
+pub fn hashed_tool_name(server: &str, tool: &str) -> String {
+    let name = format!("mcp__{}__{}", clean(server), clean(tool));
+    let hash = format!(
+        "{:016x}",
+        fnv1a(&[server.as_bytes(), b"\0", tool.as_bytes()])
+    );
+    let hash = &hash[..8];
+    // `clean` 之后只剩 ASCII，按字节截不会切坏字符。
+    let keep = name.len().min(MAX_TOOL_NAME - hash.len() - 1);
+    format!("{}_{hash}", &name[..keep])
+}
+
+/// 这个工具可能挂在的两个名字：平时的和撞名时换的。
+fn tool_names(server: &str, tool: &str) -> [String; 2] {
+    [tool_name(server, tool), hashed_tool_name(server, tool)]
+}
+
+/// FNV-1a 64。不用 `DefaultHasher`：它不保证跨 Rust 版本稳定，工具名却要跨版本不变。
+fn fnv1a(parts: &[&[u8]]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in parts.iter().flat_map(|part| part.iter()) {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    hash
 }
 
 fn clean(raw: &str) -> String {
@@ -1020,9 +1054,9 @@ pub struct McpChange {
 pub struct McpHub {
     /// 名字 → 连接。
     connections: Mutex<BTreeMap<String, Arc<McpConnection>>>,
-    /// 已经挂进工具目录的名字 → 属于哪台服务器。服务器移除时它的那些一起撤
-    /// （[`McpChange::withdrawn`]）。
-    registered: Mutex<BTreeMap<String, String>>,
+    /// 已经挂进工具目录的名字 → 属于哪台服务器的哪个工具（服务器原名、工具原名）。服务器移除时
+    /// 它的那些一起撤（[`McpChange::withdrawn`]）。
+    registered: Mutex<BTreeMap<String, (String, String)>>,
     /// 热重载新加的服务器用它找登录凭证。
     data_dir: PathBuf,
     /// 等第一次连接的上限，生产里是 [`STARTUP_WAIT`]。
@@ -1166,7 +1200,7 @@ impl McpHub {
                 }
                 None => connection.removed_message(),
             };
-            registered.retain(|tool, owner| {
+            registered.retain(|tool, (owner, _)| {
                 if *owner == name {
                     change.withdrawn.push((tool.clone(), reason.clone()));
                     false
@@ -1185,18 +1219,17 @@ impl McpHub {
             };
             let (closed, _reopened) = connection.set_disabled_tools(&config.disabled_tools);
             for tool in closed {
-                let Some(model_name) = tool_name(name, &tool) else {
-                    continue;
-                };
-                if registered
-                    .get(&model_name)
-                    .is_some_and(|owner| owner == name)
-                {
-                    registered.remove(&model_name);
-                    change.withdrawn.push((
-                        model_name,
-                        format!("MCP 工具 {tool}（服务器 {name}）已在设置里关闭，不能再调"),
-                    ));
+                for model_name in tool_names(name, &tool) {
+                    if registered
+                        .get(&model_name)
+                        .is_some_and(|(owner, remote)| owner == name && *remote == tool)
+                    {
+                        registered.remove(&model_name);
+                        change.withdrawn.push((
+                            model_name,
+                            format!("MCP 工具 {tool}（服务器 {name}）已在设置里关闭，不能再调"),
+                        ));
+                    }
                 }
             }
         }
@@ -1341,7 +1374,7 @@ impl McpHub {
                     .lock()
                     .expect("MCP 关着的工具")
                     .iter()
-                    .any(|tool| tool_name(owner.name(), tool).as_deref() == Some(name.as_str()))
+                    .any(|tool| tool_names(owner.name(), tool).contains(name))
             }) {
                 unresolved.insert(name.clone(), "这个工具已在设置里关闭，不能调".to_string());
             }
@@ -1362,7 +1395,7 @@ impl McpHub {
     }
 
     /// 连上过的服务器里还没挂的工具（启动时连上的、后来登录连上的、断线重连后新列出来的、
-    /// 热重载新加的）。名字太长、跨服务器撞名的记 warn 跳过。
+    /// 热重载新加的）。名字太长、撞名的换成带 hash 后缀的名字（[`hashed_tool_name`]）。
     pub fn new_tools(&self) -> Vec<Arc<dyn Tool>> {
         let connections = self.connections();
         let mut registered = self.registered.lock().expect("MCP 工具名表");
@@ -1386,19 +1419,23 @@ impl McpHub {
                     McpExposure::Codemode => ToolExposure::Codemode,
                     McpExposure::Direct => ToolExposure::Direct,
                 };
-                let Some(tool_name) = tool_name(name, &remote.name) else {
-                    tracing::warn!(server = %name, tool = %remote.name, "工具名太长，放不进模型的工具表");
+                let owner = (name.to_string(), remote.name.to_string());
+                let candidates = tool_names(name, &remote.name);
+                if candidates
+                    .iter()
+                    .any(|candidate| registered.get(candidate) == Some(&owner))
+                {
+                    continue;
+                }
+                // 换掉特殊字符之后和已挂的工具撞名（`a.b` 与 `a_b`，或别的服务器）：换成带 hash 的那个名字。
+                let Some(tool_name) = candidates
+                    .into_iter()
+                    .find(|candidate| !registered.contains_key(candidate))
+                else {
+                    tracing::warn!(server = %name, tool = %remote.name, "带 hash 的名字也撞了，跳过");
                     continue;
                 };
-                match registered.get(&tool_name) {
-                    Some(owner) if owner == name => continue,
-                    Some(_) => {
-                        tracing::warn!(server = %name, tool = %remote.name, %tool_name, "换掉特殊字符之后撞名，跳过");
-                        continue;
-                    }
-                    None => {}
-                }
-                registered.insert(tool_name.clone(), name.to_string());
+                registered.insert(tool_name.clone(), owner);
                 let read_only = config
                     .read_only
                     .iter()
@@ -1424,10 +1461,26 @@ mod tests {
     #[test]
     fn tool_names_are_namespaced_and_cleaned() {
         assert_eq!(
-            tool_name("dev-radius", "search.issues").as_deref(),
-            Some("mcp__dev-radius__search_issues")
+            tool_name("dev-radius", "search.issues"),
+            "mcp__dev-radius__search_issues"
         );
-        assert_eq!(tool_name("s", &"x".repeat(80)), None);
+    }
+
+    #[test]
+    fn a_long_tool_name_is_cut_with_a_stable_hash_suffix() {
+        let long = "x".repeat(80);
+        let name = tool_name("s", &long);
+        assert_eq!(name.len(), MAX_TOOL_NAME);
+        assert!(name.starts_with("mcp__s__xxx"), "{name}");
+        // hash 只看原名：同一个工具每次都是同一个名字，别的工具不是。
+        assert_eq!(name, tool_name("s", &long));
+        assert_ne!(name, tool_name("s", &"x".repeat(81)));
+        let suffix = &name[name.len() - 9..];
+        assert!(suffix.starts_with('_') && suffix[1..].chars().all(|c| c.is_ascii_hexdigit()));
+        // 撞名时换的名字也是同一套：放得下的名字只是多了后缀。
+        let hashed = hashed_tool_name("a", "b.c");
+        assert!(hashed.starts_with("mcp__a__b_c_"), "{hashed}");
+        assert_ne!(hashed, hashed_tool_name("a", "b_c"));
     }
 
     fn tool(name: &str) -> rmcp::model::Tool {
